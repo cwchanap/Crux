@@ -1,0 +1,44 @@
+[project]
+name = "drum-transcription-api"
+version = "0.1.0"
+description = "FastAPI server for drum audio transcription using Magenta"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.23.0",
+    "python-multipart>=0.0.6",
+    "aiofiles>=23.2.1",
+    "pydantic>=2.0.0",
+    "librosa>=0.10.0",
+    "tensorflow>=2.13.0",
+    "numpy>=1.24.0",
+    "scipy>=1.11.0",
+    "pretty-midi>=0.2.10",
+    "note-seq>=0.0.5",
+    "redis>=5.0.1",
+    "celery>=5.3.4",
+    "soundfile>=0.12.1",
+    "httpx>=0.25.2",
+    "uuid6>=2024.1.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.3",
+    "pytest-asyncio>=0.21.1",
+    "black>=23.11.0",
+    "ruff>=0.1.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.4.3",
+    "pytest-asyncio>=0.21.1",
+]

@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Drum Transcription Service</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 800px;
+            width: 100%;
+            padding: 40px;
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+            text-align: center;
+        }
+        
+        .subtitle {
+            color: #666;
+            text-align: center;
+            margin-bottom: 40px;
+            font-size: 1.1em;
+        }
+        
+        .upload-area {
+            border: 3px dashed #667eea;
+            border-radius: 15px;
+            padding: 40px;
+            text-align: center;
+            transition: all 0.3s ease;
+            cursor: pointer;
+            background: #f8f9ff;
+        }
+        
+        .upload-area:hover {
+            border-color: #764ba2;
+            background: #f0f2ff;
+        }
+        
+        .upload-area.dragover {
+            background: #e8ebff;
+            border-color: #764ba2;
+            transform: scale(1.02);
+        }
+        
+        .upload-icon {
+            font-size: 3em;
+            margin-bottom: 20px;
+        }
+        
+        .upload-text {
+            color: #666;
+            font-size: 1.2em;
+            margin-bottom: 10px;
+        }
+        
+        .upload-subtext {
+            color: #999;
+            font-size: 0.9em;
+        }
+        
+        input[type="file"] {
+            display: none;
+        }
+        
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 25px;
+            font-size: 1em;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-top: 20px;
+            display: inline-block;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .jobs-section {
+            margin-top: 40px;
+            padding-top: 40px;
+            border-top: 1px solid #eee;
+        }
+        
+        .jobs-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        
+        .jobs-title {
+            font-size: 1.5em;
+            color: #333;
+        }
+        
+        .refresh-btn {
+            background: #f0f2ff;
+            color: #667eea;
+            border: 2px solid #667eea;
+            padding: 8px 20px;
+            border-radius: 20px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 0.9em;
+        }
+        
+        .refresh-btn:hover {
+            background: #667eea;
+            color: white;
+        }
+        
+        .job-card {
+            background: #f8f9ff;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: all 0.3s ease;
+        }
+        
+        .job-card:hover {
+            transform: translateX(5px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        }
+        
+        .job-info {
+            flex: 1;
+        }
+        
+        .job-id {
+            font-family: 'Courier New', monospace;
+            color: #666;
+            font-size: 0.9em;
+            margin-bottom: 5px;
+        }
+        
+        .job-filename {
+            color: #333;
+            font-weight: 500;
+            margin-bottom: 5px;
+        }
+        
+        .job-status {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.85em;
+            font-weight: 500;
+        }
+        
+        .status-pending {
+            background: #fff3cd;
+            color: #856404;
+        }
+        
+        .status-processing {
+            background: #cce5ff;
+            color: #004085;
+        }
+        
+        .status-completed {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .status-failed {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        
+        .progress-bar {
+            width: 200px;
+            height: 6px;
+            background: #e0e0e0;
+            border-radius: 3px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            transition: width 0.3s ease;
+        }
+        
+        .download-btn {
+            background: #28a745;
+            color: white;
+            border: none;
+            padding: 8px 20px;
+            border-radius: 20px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 0.9em;
+            text-decoration: none;
+            display: inline-block;
+        }
+        
+        .download-btn:hover {
+            background: #218838;
+            transform: translateY(-2px);
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #999;
+        }
+        
+        .loading-spinner {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-left: 10px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .toast {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            background: white;
+            padding: 15px 25px;
+            border-radius: 10px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            display: none;
+            animation: slideIn 0.3s ease;
+        }
+        
+        .toast.show {
+            display: block;
+        }
+        
+        .toast.success {
+            border-left: 4px solid #28a745;
+        }
+        
+        .toast.error {
+            border-left: 4px solid #dc3545;
+        }
+        
+        @keyframes slideIn {
+            from {
+                transform: translateX(100%);
+                opacity: 0;
+            }
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🥁 Drum Transcription</h1>
+        <p class="subtitle">Upload your drum audio and get MIDI transcription powered by AI</p>
+        
+        <div class="upload-area" id="uploadArea">
+            <div class="upload-icon">📁</div>
+            <div class="upload-text">Drop your audio file here or click to browse</div>
+            <div class="upload-subtext">Supports MP3, WAV, M4A, FLAC (max 50MB)</div>
+            <input type="file" id="fileInput" accept=".mp3,.wav,.m4a,.flac">
+        </div>
+        
+        <div class="jobs-section">
+            <div class="jobs-header">
+                <h2 class="jobs-title">Recent Jobs</h2>
+                <button class="refresh-btn" onclick="loadJobs()">🔄 Refresh</button>
+            </div>
+            <div id="jobsList">
+                <div class="empty-state">No jobs yet. Upload an audio file to get started!</div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="toast" id="toast"></div>
+    
+    <script>
+        const API_BASE = '/api';
+        let currentJobs = [];
+        let autoRefreshInterval = null;
+        
+        // File upload handling
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        
+        uploadArea.addEventListener('click', () => fileInput.click());
+        
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+        
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+        
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                handleFileUpload(files[0]);
+            }
+        });
+        
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleFileUpload(e.target.files[0]);
+            }
+        });
+        
+        async function handleFileUpload(file) {
+            // Validate file size
+            if (file.size > 50 * 1024 * 1024) {
+                showToast('File too large. Maximum size is 50MB.', 'error');
+                return;
+            }
+            
+            // Validate file type
+            const validTypes = ['audio/mpeg', 'audio/wav', 'audio/x-wav', 'audio/mp4', 'audio/x-m4a', 'audio/flac'];
+            if (!validTypes.includes(file.type) && !file.name.match(/\.(mp3|wav|m4a|flac)$/i)) {
+                showToast('Invalid file type. Please upload MP3, WAV, M4A, or FLAC.', 'error');
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            try {
+                showToast('Uploading file...', 'success');
+                
+                const response = await fetch(`${API_BASE}/transcribe`, {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`Upload failed: ${response.statusText}`);
+                }
+                
+                const result = await response.json();
+                showToast(`Job created: ${result.job_id}`, 'success');
+                
+                // Start auto-refresh
+                startAutoRefresh();
+                
+                // Load jobs immediately
+                loadJobs();
+                
+            } catch (error) {
+                console.error('Upload error:', error);
+                showToast(`Upload failed: ${error.message}`, 'error');
+            }
+        }
+        
+        async function loadJobs() {
+            try {
+                const response = await fetch(`${API_BASE}/jobs?limit=10`);
+                if (!response.ok) throw new Error('Failed to load jobs');
+                
+                const data = await response.json();
+                currentJobs = data.jobs;
+                renderJobs();
+                
+                // Check if any jobs are still processing
+                const hasProcessing = currentJobs.some(job => 
+                    job.status === 'pending' || job.status === 'processing'
+                );
+                
+                if (hasProcessing && !autoRefreshInterval) {
+                    startAutoRefresh();
+                } else if (!hasProcessing && autoRefreshInterval) {
+                    stopAutoRefresh();
+                }
+                
+            } catch (error) {
+                console.error('Error loading jobs:', error);
+                showToast('Failed to load jobs', 'error');
+            }
+        }
+        
+        function renderJobs() {
+            const jobsList = document.getElementById('jobsList');
+            
+            if (currentJobs.length === 0) {
+                jobsList.innerHTML = '<div class="empty-state">No jobs yet. Upload an audio file to get started!</div>';
+                return;
+            }
+            
+            jobsList.innerHTML = currentJobs.map(job => `
+                <div class="job-card">
+                    <div class="job-info">
+                        <div class="job-id">ID: ${job.job_id.substring(0, 8)}...</div>
+                        <div class="job-filename">${job.metadata?.filename || 'Unknown file'}</div>
+                        <span class="job-status status-${job.status}">${job.status}</span>
+                        ${job.status === 'processing' ? `
+                            <div class="progress-bar">
+                                <div class="progress-fill" style="width: ${job.progress}%"></div>
+                            </div>
+                        ` : ''}
+                    </div>
+                    <div>
+                        ${job.status === 'completed' ? `
+                            <a href="${API_BASE}/jobs/${job.job_id}/download" 
+                               class="download-btn" download>
+                                ⬇️ Download MIDI
+                            </a>
+                        ` : ''}
+                        ${job.status === 'processing' ? '<div class="loading-spinner"></div>' : ''}
+                    </div>
+                </div>
+            `).join('');
+        }
+        
+        function startAutoRefresh() {
+            if (autoRefreshInterval) return;
+            autoRefreshInterval = setInterval(loadJobs, 2000);
+        }
+        
+        function stopAutoRefresh() {
+            if (autoRefreshInterval) {
+                clearInterval(autoRefreshInterval);
+                autoRefreshInterval = null;
+            }
+        }
+        
+        function showToast(message, type = 'success') {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.className = `toast ${type} show`;
+            
+            setTimeout(() => {
+                toast.classList.remove('show');
+            }, 3000);
+        }
+        
+        // Load jobs on page load
+        loadJobs();
+    </script>
+</body>
+</html>

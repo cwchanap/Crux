@@ -1,0 +1,26 @@
+name = "drum-transcription-api"
+main = "src/worker.py"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["python_workers"]
+
+[env.production]
+vars = { ENVIRONMENT = "production" }
+
+[[kv_namespaces]]
+binding = "JOBS_KV"
+id = "your-kv-namespace-id"
+preview_id = "your-preview-kv-namespace-id"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "drum-transcription"
+database_id = "your-d1-database-id"
+
+[site]
+bucket = "./static"
+
+[build]
+command = ""
+
+[triggers]
+crons = ["*/5 * * * *"]
