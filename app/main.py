@@ -17,11 +17,6 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Drum Transcription API", version="1.0.0")
 
-# Mount static files
-static_path = Path(__file__).parent.parent / "static"
-if static_path.exists():
-    app.mount("/static", StaticFiles(directory=str(static_path)), name="static")
-
 # CORS configuration for Cloudflare Workers
 app.add_middleware(
     CORSMiddleware,
@@ -57,8 +52,18 @@ class JobResponse(BaseModel):
 async def root():
     """Serve the main UI"""
     html_path = Path(__file__).parent.parent / "static" / "index.html"
+    if not html_path.exists():
+        return HTMLResponse(
+            content="<h1>Please build the UI first: cd ui && npm install && npm run build</h1>"
+        )
     with open(html_path, "r") as f:
         return HTMLResponse(content=f.read())
+
+
+# Mount static files for the SPA (must be after API routes)
+static_path = Path(__file__).parent.parent / "static"
+if static_path.exists():
+    app.mount("/", StaticFiles(directory=str(static_path), html=True), name="static")
 
 
 @app.post("/api/transcribe", response_model=JobResponse)
