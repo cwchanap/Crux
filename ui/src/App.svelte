@@ -3,6 +3,7 @@
   import FileUpload from './components/FileUpload.svelte';
   import JobsList from './components/JobsList.svelte';
   import Toast from './components/Toast.svelte';
+  import MidiPreview from './components/MidiPreview.svelte';
   import { jobsStore } from './stores/jobs';
   import { toastStore } from './stores/toast';
 
@@ -32,3 +33,4 @@
 </div>
 
 <Toast />
+<MidiPreview />
