@@ -9,7 +9,7 @@ from pathlib import Path
 
 import tensorflow as tf
 
-from app.tf2_magenta_model import create_drum_model
+from src.app.tf2_magenta_model import create_drum_model
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

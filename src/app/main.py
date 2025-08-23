@@ -29,6 +29,7 @@ app.add_middleware(
 # In-memory storage for demo (will be replaced with Cloudflare KV/D1)
 jobs_store: Dict[str, Dict[str, Any]] = {}
 midi_store: Dict[str, bytes] = {}
+uploads_store: Dict[str, Dict[str, Any]] = {}
 
 
 class JobStatus(BaseModel):
@@ -46,6 +47,17 @@ class JobResponse(BaseModel):
     job_id: str
     message: str
     status_url: str
+
+
+class UploadResponse(BaseModel):
+    upload_id: str
+    filename: str
+    file_size: int
+    message: str
+
+
+class StartJobRequest(BaseModel):
+    upload_id: str
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -66,14 +78,11 @@ if static_path.exists():
     app.mount("/", StaticFiles(directory=str(static_path), html=True), name="static")
 
 
-@app.post("/api/transcribe", response_model=JobResponse)
-async def transcribe_audio(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-):
+@app.post("/api/upload", response_model=UploadResponse)
+async def upload_audio(file: UploadFile = File(...)):
     """
-    Upload an audio file for drum transcription
-    Returns a job ID for tracking progress
+    Upload an audio file without starting transcription
+    Returns an upload ID for later processing
     """
     # Validate file type
     if not file.filename.lower().endswith((".mp3", ".wav", ".m4a", ".flac")):
@@ -81,17 +90,53 @@ async def transcribe_audio(
             status_code=400, detail="Invalid file format. Please upload MP3, WAV, M4A, or FLAC"
         )
 
-    # Generate job ID
-    job_id = str(uuid.uuid4())
+    # Generate upload ID
+    upload_id = str(uuid.uuid4())
 
     # Save file temporarily
     temp_dir = Path("temp_uploads")
     temp_dir.mkdir(exist_ok=True)
-    file_path = temp_dir / f"{job_id}_{file.filename}"
+    file_path = temp_dir / f"{upload_id}_{file.filename}"
 
     content = await file.read()
     with open(file_path, "wb") as f:
         f.write(content)
+
+    # Store upload info
+    upload_info = {
+        "upload_id": upload_id,
+        "filename": file.filename,
+        "file_size": len(content),
+        "file_path": str(file_path),
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    uploads_store[upload_id] = upload_info
+
+    return UploadResponse(
+        upload_id=upload_id,
+        filename=file.filename,
+        file_size=len(content),
+        message="File uploaded successfully",
+    )
+
+
+@app.post("/api/transcribe", response_model=JobResponse)
+async def start_transcription(
+    background_tasks: BackgroundTasks,
+    request: StartJobRequest,
+):
+    """
+    Start transcription job for a previously uploaded file
+    Returns a job ID for tracking progress
+    """
+    # Check if upload exists
+    if request.upload_id not in uploads_store:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    upload_info = uploads_store[request.upload_id]
+
+    # Generate job ID
+    job_id = str(uuid.uuid4())
 
     # Create job entry
     job = {
@@ -103,18 +148,21 @@ async def transcribe_audio(
         "result_url": None,
         "error": None,
         "metadata": {
-            "filename": file.filename,
-            "file_size": len(content),
-            "file_path": str(file_path),
+            "filename": upload_info["filename"],
+            "file_size": upload_info["file_size"],
+            "file_path": upload_info["file_path"],
+            "upload_id": request.upload_id,
         },
     }
     jobs_store[job_id] = job
 
     # Add background task for processing
-    background_tasks.add_task(process_audio_task, job_id, str(file_path))
+    background_tasks.add_task(process_audio_task, job_id, upload_info["file_path"])
 
     return JobResponse(
-        job_id=job_id, message="Job created successfully", status_url=f"/api/jobs/{job_id}"
+        job_id=job_id,
+        message="Transcription started successfully",
+        status_url=f"/api/jobs/{job_id}",
     )
 
 
@@ -177,7 +225,7 @@ async def process_audio_task(job_id: str, file_path: str):
         jobs_store[job_id]["progress"] = 10
 
         # Import processing modules (lazy loading for better startup time)
-        from app.transcriber import DrumTranscriber
+        from src.app.transcriber import DrumTranscriber
 
         # Initialize transcriber
         transcriber = DrumTranscriber()

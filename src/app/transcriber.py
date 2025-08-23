@@ -150,7 +150,7 @@ class DrumTranscriber:
             return None
 
         try:
-            from app.tf2_magenta_model import create_drum_model, load_tf1_checkpoint_to_tf2
+            from src.app.tf2_magenta_model import create_drum_model, load_tf1_checkpoint_to_tf2
 
             # Create the TF2 model
             model = create_drum_model()
