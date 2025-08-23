@@ -15,7 +15,14 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-app = FastAPI(title="Drum Transcription API", version="1.0.0")
+app = FastAPI(
+    title="Drum Transcription API",
+    version="1.0.0",
+    description="API for drum transcription. Swagger UI available at /api/docs",
+    docs_url="/api/docs",
+    openapi_url="/api/openapi.json",
+    redoc_url=None,
+)
 
 # CORS configuration for Cloudflare Workers
 app.add_middleware(
