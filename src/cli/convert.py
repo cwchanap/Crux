@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-Convert TensorFlow 1 checkpoint to TensorFlow 2 format
+CLI to convert a TensorFlow 1 checkpoint to TensorFlow 2 weights.
 """
 
 import logging
 import os
 from pathlib import Path
 
+import click
 import tensorflow as tf
 
 from src.app.tf2_magenta_model import create_drum_model
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+DEFAULT_CHECKPOINT_PATH = os.path.expanduser("~/.cache/drum_transcription/models/model.ckpt-569400")
+DEFAULT_OUTPUT_PATH = "models/e-gmd/tf2_model.weights.h5"
 
 
 def convert_tf1_checkpoint_to_tf2(checkpoint_path: str, output_path: str):
@@ -57,7 +61,7 @@ def convert_tf1_checkpoint_to_tf2(checkpoint_path: str, output_path: str):
             weights_dict[var_name] = tensor
             weights_loaded += 1
 
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-except
             logger.warning(f"Could not load {var_name}: {e}")
 
     logger.info(f"Successfully loaded {weights_loaded}/{len(var_to_shape_map)} weights")
@@ -100,7 +104,7 @@ def convert_tf1_checkpoint_to_tf2(checkpoint_path: str, output_path: str):
                                 layer.bias.assign(tensor)
                                 logger.info(f"Assigned weights to {layer_name} bias")
 
-    except Exception as e:
+    except Exception as e:  # pylint: disable=broad-except
         logger.error(f"Error assigning weights: {e}")
         # Continue anyway - partial weights are better than none
 
@@ -114,37 +118,61 @@ def convert_tf1_checkpoint_to_tf2(checkpoint_path: str, output_path: str):
     return model
 
 
-def main():
-    # Path to the TF1 checkpoint
-    checkpoint_path = os.path.expanduser("~/.cache/drum_transcription/models/model.ckpt-569400")
-
-    # Output path for TF2 weights
-    output_path = "models/e-gmd/tf2_model.weights.h5"
+@click.command(context_settings=dict(help_option_names=["-h", "--help"]))
+@click.option(
+    "--checkpoint-path",
+    type=str,
+    default=os.path.expanduser("~/.cache/drum_transcription/models/model.ckpt-569400"),
+    show_default=True,
+    help="Path to TF1 checkpoint (without .data/.index extensions)",
+)
+@click.option(
+    "--output-path",
+    type=str,
+    default="models/e-gmd/tf2_model.weights.h5",
+    show_default=True,
+    help="Path to save TF2 weights (.h5)",
+)
+@click.option(
+    "--test/--no-test",
+    default=True,
+    show_default=True,
+    help="Run a quick inference test after conversion",
+)
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Enable verbose logging",
+)
+def main(checkpoint_path: str, output_path: str, test: bool, verbose: bool):
+    """Convert a TF1 checkpoint to TF2 weights using the drum model."""
+    if verbose:
+        logger.setLevel(logging.DEBUG)
 
     # Check if checkpoint exists
     if not os.path.exists(checkpoint_path + ".index"):
         logger.error(f"Checkpoint not found: {checkpoint_path}")
-        return
+        raise SystemExit(1)
 
-    # Convert the checkpoint
     logger.info("Starting TF1 to TF2 checkpoint conversion...")
     model = convert_tf1_checkpoint_to_tf2(checkpoint_path, output_path)
 
     logger.info("✅ Conversion complete!")
     logger.info(f"TF2 weights saved to: {output_path}")
 
-    # Test the converted model
-    logger.info("\nTesting converted model...")
-    # Conv2D expects 4D input: [batch, time, frequency, channels]
-    test_input = tf.random.normal((1, 100, 229, 1))  # Add channel dimension
-
-    try:
-        outputs = model(test_input)
-        logger.info("Model inference successful!")
-        for key, value in outputs.items():
-            logger.info(f"  {key}: shape={value.shape}")
-    except Exception as e:
-        logger.error(f"Model inference failed: {e}")
+    if test:
+        logger.info("Testing converted model...")
+        # Conv2D expects 4D input: [batch, time, frequency, channels]
+        test_input = tf.random.normal((1, 100, 229, 1))  # Add channel dimension
+        try:
+            outputs = model(test_input)
+            logger.info("Model inference successful!")
+            for key, value in outputs.items():
+                logger.info(f"  {key}: shape={value.shape}")
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(f"Model inference failed: {e}")
+            raise SystemExit(2)
 
 
 if __name__ == "__main__":

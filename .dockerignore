@@ -1,0 +1,47 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# VCS
+.git/
+.gitignore
+
+# Envs
+.venv/
+.env
+.env.*
+
+# IDE/editor
+.vscode/
+*.swp
+
+# Python packaging
+*.egg-info/
+.dist/
+build/
+
+# Temporary runtime dirs
+.temp/
+.temp_*/
+temp_uploads/
+temp_downloads/
+
+# Node artifacts (if any UI build present)
+node_modules/
+dist/
+
+# Local data and large assets (uncomment if you don't want these in the image)
+# models/
+# data/
+
+# Cache
+.ruff_cache/
+
+# MacOS
+.DS_Store
+
+# UV / lock files
+uv.lock

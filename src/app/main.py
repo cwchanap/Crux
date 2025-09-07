@@ -12,8 +12,9 @@ from typing import Any, Dict, Optional
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+from src.app.transcriber import DrumTranscriber
 
 app = FastAPI(
     title="Drum Transcription API",
@@ -37,6 +38,16 @@ app.add_middleware(
 jobs_store: Dict[str, Dict[str, Any]] = {}
 midi_store: Dict[str, bytes] = {}
 uploads_store: Dict[str, Dict[str, Any]] = {}
+
+
+@app.on_event("startup")
+async def startup_load_model():
+    """Initialize and cache the transcriber/model at server startup"""
+    try:
+        app.state.transcriber = DrumTranscriber()
+    except Exception:
+        # Do not block server startup; background task will fallback to lazy init
+        app.state.transcriber = None
 
 
 class JobStatus(BaseModel):
@@ -70,19 +81,13 @@ class StartJobRequest(BaseModel):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     """Serve the main UI"""
-    html_path = Path(__file__).parent.parent / "static" / "index.html"
+    html_path = Path(__file__).resolve().parents[2] / "static" / "index.html"
     if not html_path.exists():
         return HTMLResponse(
             content="<h1>Please build the UI first: cd ui && npm install && npm run build</h1>"
         )
     with open(html_path, "r") as f:
         return HTMLResponse(content=f.read())
-
-
-# Mount static files for the SPA (must be after API routes)
-static_path = Path(__file__).parent.parent / "static"
-if static_path.exists():
-    app.mount("/", StaticFiles(directory=str(static_path), html=True), name="static")
 
 
 @app.post("/api/upload", response_model=UploadResponse)
@@ -231,11 +236,11 @@ async def process_audio_task(job_id: str, file_path: str):
         jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
         jobs_store[job_id]["progress"] = 10
 
-        # Import processing modules (lazy loading for better startup time)
-        from src.app.transcriber import DrumTranscriber
-
-        # Initialize transcriber
-        transcriber = DrumTranscriber()
+        # Get preloaded transcriber if available; otherwise create and cache it
+        transcriber = getattr(app.state, "transcriber", None)
+        if transcriber is None:
+            transcriber = DrumTranscriber()
+            app.state.transcriber = transcriber
 
         # Update progress
         jobs_store[job_id]["progress"] = 30

@@ -10,6 +10,6 @@ repos:
     hooks:
       - id: pylint
         name: pylint (errors-only)
-        entry: uv run pylint --errors-only
+        entry: uv run pylint --errors-only --disable=E1120
         language: system
         types: [python]
