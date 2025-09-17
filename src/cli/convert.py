@@ -176,4 +176,5 @@ def main(checkpoint_path: str, output_path: str, test: bool, verbose: bool):
 
 
 if __name__ == "__main__":
+    # pylint: disable=E1120
     main()

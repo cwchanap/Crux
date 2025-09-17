@@ -14,7 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
-from src.app.transcriber import DrumTranscriber
+# NOTE: Avoid importing the heavy transcriber (and TensorFlow) at module import time.
+DrumTranscriber = None  # will be lazily imported when needed
 
 app = FastAPI(
     title="Drum Transcription API",
@@ -42,12 +43,22 @@ uploads_store: Dict[str, Dict[str, Any]] = {}
 
 @app.on_event("startup")
 async def startup_load_model():
-    """Initialize and cache the transcriber/model at server startup"""
-    try:
-        app.state.transcriber = DrumTranscriber()
-    except Exception:
-        # Do not block server startup; background task will fallback to lazy init
-        app.state.transcriber = None
+    """Initialize and cache the transcriber/model at server startup.
+
+    To keep tests and lightweight environments fast, we do not import TensorFlow or load
+    the model unless explicitly requested by setting PRELOAD_MODEL=1.
+    """
+    preload = os.getenv("PRELOAD_MODEL") == "1"
+    app.state.transcriber = None
+    if preload:
+        try:
+            # Lazy import only if preloading is requested
+            from src.app.transcriber import DrumTranscriber as _DrumTranscriber  # type: ignore
+
+            app.state.transcriber = _DrumTranscriber()
+        except Exception:
+            # Do not block server startup; background task will fallback to lazy init
+            app.state.transcriber = None
 
 
 class JobStatus(BaseModel):
@@ -239,7 +250,10 @@ async def process_audio_task(job_id: str, file_path: str):
         # Get preloaded transcriber if available; otherwise create and cache it
         transcriber = getattr(app.state, "transcriber", None)
         if transcriber is None:
-            transcriber = DrumTranscriber()
+            # Lazy import to avoid importing TensorFlow during app/module import
+            from src.app.transcriber import DrumTranscriber as _DrumTranscriber  # type: ignore
+
+            transcriber = _DrumTranscriber()
             app.state.transcriber = transcriber
 
         # Update progress
