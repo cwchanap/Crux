@@ -81,7 +81,7 @@ class DrumTranscriber:
                 tf2_weights_path = "models/e-gmd/tf2_model.weights.h5"
                 if os.path.exists(tf2_weights_path):
                     self.model_path = tf2_weights_path
-                    logger.info(f"Found converted TF2 weights at {tf2_weights_path}")
+                    logger.info("Found converted TF2 weights at %s", tf2_weights_path)
                 else:
                     # Download E-GMD model if not provided
                     self.model_path = self._download_model()
@@ -89,8 +89,8 @@ class DrumTranscriber:
             # Build model
             try:
                 self.model = self._build_model()
-            except Exception as e:
-                logger.warning(f"Could not load model: {e}. Using fallback method.")
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning("Could not load model: %s. Using fallback method.", e)
                 self.model = None
         else:
             # Skip model initialization entirely (used for tests)
@@ -138,8 +138,8 @@ class DrumTranscriber:
                 logger.info("E-GMD model downloaded successfully")
                 return str(checkpoint_path)
 
-            except Exception as e:
-                logger.warning(f"Failed with URL {model_url}: {e}")
+            except (requests.RequestException, zipfile.BadZipFile, OSError) as e:
+                logger.warning("Failed with URL %s: %s", model_url, e)
                 continue
 
         logger.error("Failed to download model from any source")
@@ -165,7 +165,7 @@ class DrumTranscriber:
             tf2_weights_path = "models/e-gmd/tf2_model.weights.h5"
             if os.path.exists(tf2_weights_path):
                 model.load_weights(tf2_weights_path)
-                logging.info(f"Loaded converted TF2 weights from {tf2_weights_path}")
+                logger.info("Loaded converted TF2 weights from %s", tf2_weights_path)
                 return model
 
             # Try to load weights if checkpoint exists
@@ -173,19 +173,19 @@ class DrumTranscriber:
                 if self.model_path.endswith(".weights.h5"):
                     # Load TF2 weights directly
                     model.load_weights(self.model_path)
-                    logging.info(f"Loaded TF2 weights from {self.model_path}")
+                    logging.info("Loaded TF2 weights from %s", self.model_path)
                 else:
                     # Try to load and convert TF1 checkpoint
                     model = load_tf1_checkpoint_to_tf2(self.model_path, model)
-                    logging.info(f"Loaded and converted TF1 checkpoint from {self.model_path}")
+                    logging.info("Loaded and converted TF1 checkpoint from %s", self.model_path)
             else:
                 logging.warning("No model path available, using fallback method")
                 return None
 
             return model
 
-        except Exception as e:
-            logging.error(f"Failed to build TF2 model: {e}")
+        except Exception as e:  # pylint: disable=broad-except
+            logging.error("Failed to build TF2 model: %s", e)
             return None
 
     def _load_model(self, checkpoint_path: str) -> bool:
@@ -197,8 +197,8 @@ class DrumTranscriber:
             self.model = create_drum_model(checkpoint_path)
             logger.info("Successfully loaded TF2-compatible model")
             return True
-        except Exception as e:
-            logger.error(f"Failed to load model: {e}")
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error("Failed to load model: %s", e)
             logger.warning("Using fallback onset detection method")
             return False
 
@@ -384,7 +384,7 @@ class DrumTranscriber:
             jobs_store[job_id]["progress"] = 40
 
             # Load and preprocess audio
-            logger.info(f"Loading audio file: {audio_path}")
+            logger.info("Loading audio file: %s", audio_path)
             audio, _ = librosa.load(audio_path, sr=self.sample_rate, mono=True)
 
             # Update progress
@@ -433,8 +433,8 @@ class DrumTranscriber:
 
             return midi_data
 
-        except Exception as e:
-            logger.error(f"Transcription failed: {str(e)}")
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error("Transcription failed: %s", str(e))
             raise
 
     def _run_tf2_model_inference(self, audio: np.ndarray, sr: int) -> Dict:
@@ -455,8 +455,8 @@ class DrumTranscriber:
             drum_events = self._process_tf2_model_outputs(outputs, sr)
 
             return drum_events
-        except Exception as e:
-            logger.error(f"TF2 model inference failed: {e}")
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error("TF2 model inference failed: %s", e)
             logger.warning("Falling back to onset detection")
             return self._detect_onsets_from_audio(audio)
 
