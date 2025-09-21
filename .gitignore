@@ -6,3 +6,4 @@ temp_downloads/
 
 models/
 static/assets/
+.coverage

@@ -12,9 +12,9 @@ import librosa
 import numpy as np
 import pretty_midi
 import requests
-import tensorflow as tf
 
-from .tf2_magenta_model import create_drum_model
+# Heavy dependencies (TensorFlow, TF2 model utilities) are intentionally NOT imported at
+# module import time to keep tests and lightweight environments fast.
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -42,7 +42,9 @@ class DrumTranscriber:
     # Magenta E-GMD drum model checkpoint URL
     MODEL_URL = "https://storage.googleapis.com/magentadata/models/onsets_frames_transcription/e-gmd_checkpoint.zip"
 
-    def __init__(self, model_path: Optional[str] = None, sample_rate: int = 44100):
+    def __init__(
+        self, model_path: Optional[str] = None, sample_rate: int = 44100, load_model: bool = True
+    ):
         """
         Initialize drum transcriber
 
@@ -73,21 +75,25 @@ class DrumTranscriber:
             50: "Tom High",
         }
 
-        if model_path is None:
-            # Check for converted TF2 weights first
-            tf2_weights_path = "models/e-gmd/tf2_model.weights.h5"
-            if os.path.exists(tf2_weights_path):
-                self.model_path = tf2_weights_path
-                logger.info(f"Found converted TF2 weights at {tf2_weights_path}")
-            else:
-                # Download E-GMD model if not provided
-                self.model_path = self._download_model()
+        if load_model:
+            if model_path is None:
+                # Check for converted TF2 weights first
+                tf2_weights_path = "models/e-gmd/tf2_model.weights.h5"
+                if os.path.exists(tf2_weights_path):
+                    self.model_path = tf2_weights_path
+                    logger.info(f"Found converted TF2 weights at {tf2_weights_path}")
+                else:
+                    # Download E-GMD model if not provided
+                    self.model_path = self._download_model()
 
-        # Build model
-        try:
-            self.model = self._build_model()
-        except Exception as e:
-            logger.warning(f"Could not load model: {e}. Using fallback method.")
+            # Build model
+            try:
+                self.model = self._build_model()
+            except Exception as e:
+                logger.warning(f"Could not load model: {e}. Using fallback method.")
+                self.model = None
+        else:
+            # Skip model initialization entirely (used for tests)
             self.model = None
 
     def _download_model(self) -> str:
@@ -186,6 +192,8 @@ class DrumTranscriber:
         """Load the Magenta model from checkpoint"""
         try:
             # Create and load TF2-compatible model
+            from src.app.tf2_magenta_model import create_drum_model  # Lazy import
+
             self.model = create_drum_model(checkpoint_path)
             logger.info("Successfully loaded TF2-compatible model")
             return True
@@ -199,6 +207,8 @@ class DrumTranscriber:
         Build the E-GMD model architecture
         Based on the Onsets and Frames architecture for drums
         """
+        import tensorflow as tf  # Lazy import to avoid heavy dependency at module import time
+
         # Input: Mel spectrogram
         inputs = tf.keras.Input(shape=(None, self.n_mels), name="mel_input")
 
