@@ -46,7 +46,7 @@ def test_upload_transcribe_download_flow(client: TestClient, monkeypatch):
 
     # 1) Upload a small dummy wav file
     files = {
-        "file": ("test.wav", b"\x00\x00\x00\x00", "audio/wav"),
+        "file": ("test.wav", b"RIFF\x00\x00\x00\x00WAVE", "audio/wav"),
     }
     r = client.post("/api/upload", files=files)
     assert r.status_code == 200, r.text
@@ -76,3 +76,78 @@ def test_upload_transcribe_download_flow(client: TestClient, monkeypatch):
     assert r4.headers["content-type"].startswith("audio/midi")
     content = r4.content
     assert content[:4] == b"MThd"
+
+
+def test_cors_rejects_unknown_origin(client: TestClient):
+    resp = client.get("/api/jobs", headers={"Origin": "https://evil.com"})
+    # Unknown origins should not receive the CORS allow-origin header
+    assert "access-control-allow-origin" not in resp.headers
+
+
+def test_cors_allows_known_origin(client: TestClient):
+    resp = client.get("/api/jobs", headers={"Origin": "http://localhost:4330"})
+    assert resp.headers.get("access-control-allow-origin") == "http://localhost:4330"
+
+
+def test_upload_rejects_oversized_file(client: TestClient):
+    big_content = b"\x00" * (51 * 1024 * 1024)  # 51 MB
+    files = {"file": ("big.wav", big_content, "audio/wav")}
+    resp = client.post("/api/upload", files=files)
+    assert resp.status_code == 413
+
+
+def test_upload_rejects_wrong_extension(client: TestClient):
+    files = {"file": ("malware.exe", b"\x00\x01", "application/octet-stream")}
+    resp = client.post("/api/upload", files=files)
+    assert resp.status_code == 400
+
+
+def test_upload_rejects_disguised_file(client: TestClient):
+    # .wav extension but PE magic bytes
+    pe_magic = b"MZ\x90\x00" + b"\x00" * 8
+    files = {"file": ("fake.wav", pe_magic, "audio/wav")}
+    resp = client.post("/api/upload", files=files)
+    assert resp.status_code == 400
+
+
+def test_upload_rejects_disguised_m4a(client: TestClient):
+    # File with .m4a extension but non-audio content (no ftyp box at offset 4)
+    bad_content = b"\x00\x00\x00\xfe" + b"\x00" * 8
+    files = {"file": ("fake.m4a", bad_content, "audio/mp4")}
+    resp = client.post("/api/upload", files=files)
+    assert resp.status_code == 400
+
+
+def test_upload_rejects_missing_filename(client: TestClient):
+    # UploadFile.filename can be None/empty; the server must reject with a 4xx.
+    # An empty filename causes the multipart parser to strip the filename field,
+    # so FastAPI may return 422 (form validation) or our handler returns 400.
+    files = {"file": ("", b"RIFF\x00\x00\x00\x00WAVE", "audio/wav")}
+    resp = client.post("/api/upload", files=files)
+    assert resp.status_code in (400, 422)
+
+
+def test_upload_rejects_m4a_with_generic_isom_brand(client: TestClient):
+    # Build a minimal ftyp box with major_brand=b"isom" (generic MP4, not audio-only).
+    # isom was removed from M4A_AUDIO_BRANDS so this should now be rejected.
+    ftyp_size = (16).to_bytes(4, "big")  # 16-byte ftyp box
+    ftyp_tag = b"ftyp"
+    major_brand = b"isom"
+    minor_version = b"\x00" * 4
+    content = ftyp_size + ftyp_tag + major_brand + minor_version
+    files = {"file": ("video.m4a", content, "audio/mp4")}
+    resp = client.post("/api/upload", files=files)
+    assert resp.status_code == 400
+
+
+def test_upload_accepts_m4a_with_audio_brand(client: TestClient):
+    # Build a minimal ftyp box with major_brand=b"M4A " (audio-specific brand).
+    ftyp_size = (16).to_bytes(4, "big")
+    ftyp_tag = b"ftyp"
+    major_brand = b"M4A "
+    minor_version = b"\x00" * 4
+    content = ftyp_size + ftyp_tag + major_brand + minor_version
+    files = {"file": ("audio.m4a", content, "audio/mp4")}
+    resp = client.post("/api/upload", files=files)
+    # M4A with audio brand should pass format validation (status 200)
+    assert resp.status_code == 200, resp.text

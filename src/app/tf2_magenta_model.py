@@ -50,7 +50,9 @@ class ConvStack(tf.keras.Model):
             if freq_pool_size > 1:
                 self.pool_layers.append(
                     layers.MaxPool2D(
-                        (1, freq_pool_size), strides=(1, freq_pool_size), name=f"pool_{i}"
+                        (1, freq_pool_size),
+                        strides=(1, freq_pool_size),
+                        name=f"pool_{i}",
                     )
                 )
             else:
@@ -75,7 +77,12 @@ class ConvStack(tf.keras.Model):
 
         # Apply convolutional layers
         for i, (conv, bn, pool, dropout) in enumerate(
-            zip(self.conv_layers, self.batch_norms, self.pool_layers, self.dropout_layers)
+            zip(
+                self.conv_layers,
+                self.batch_norms,
+                self.pool_layers,
+                self.dropout_layers,
+            )
         ):
             net = conv(net)
             net = bn(net, training=training)

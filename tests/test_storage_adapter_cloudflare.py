@@ -7,7 +7,10 @@ from src.app.storage import StorageAdapter
 
 class FakeResponse:
     def __init__(
-        self, status_code: int, json_data: Any | None = None, content: bytes | None = None
+        self,
+        status_code: int,
+        json_data: Any | None = None,
+        content: bytes | None = None,
     ):
         self.status_code = status_code
         self._json_data = json_data

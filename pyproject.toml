@@ -2,7 +2,7 @@
 name = "drum-transcription-api"
 version = "0.1.0"
 description = "FastAPI server for drum audio transcription using Magenta"
-requires-python = "==3.13.*"
+requires-python = "==3.12.*"
 dependencies = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
@@ -28,9 +28,11 @@ dev = [
     "pytest>=7.4.3",
     "pytest-asyncio>=0.21.1",
     "pytest-cov>=4.1.0",
+    "black>=24.8.0",
     "ruff>=0.1.6",
     "pylint>=3.2.0",
     "pre-commit>=3.7.0",
+    "tensorflowjs>=4.21.0",
 ]
 
 [project.scripts]
@@ -48,13 +50,15 @@ dev-dependencies = [
     "pytest>=7.4.3",
     "pytest-asyncio>=0.21.1",
     "pytest-cov>=4.1.0",
+    "black>=24.8.0",
     "ruff>=0.1.6",
     "pylint>=3.2.0",
     "pre-commit>=3.7.0",
+    "tensorflowjs>=4.21.0",
 ]
 
 [tool.pylint.main]
-py-version = "3.13"
+py-version = "3.12"
 jobs = 0
 ignore = [".venv", "temp_downloads", "temp_uploads"]
 ignored-modules = ["tensorflow", "tensorflow.keras", "js"]
@@ -78,7 +82,7 @@ generated-members = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py313"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]

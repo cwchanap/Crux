@@ -71,7 +71,7 @@ def test_list_jobs_pagination(client: TestClient, monkeypatch):
 
     # Create three jobs via upload + transcribe
     for i in range(3):
-        files = {"file": (f"t{i}.wav", b"\x00\x00\x00\x00", "audio/wav")}
+        files = {"file": (f"t{i}.wav", b"RIFF\x00\x00\x00\x00WAVEfmt ", "audio/wav")}
         r_up = client.post("/api/upload", files=files)
         assert r_up.status_code == 200
         upload_id = r_up.json()["upload_id"]
