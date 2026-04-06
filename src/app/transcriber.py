@@ -43,7 +43,10 @@ class DrumTranscriber:
     MODEL_URL = "https://storage.googleapis.com/magentadata/models/onsets_frames_transcription/e-gmd_checkpoint.zip"
 
     def __init__(
-        self, model_path: Optional[str] = None, sample_rate: int = 44100, load_model: bool = True
+        self,
+        model_path: Optional[str] = None,
+        sample_rate: int = 44100,
+        load_model: bool = True,
     ):
         """
         Initialize drum transcriber
@@ -156,7 +159,10 @@ class DrumTranscriber:
             return None
 
         try:
-            from src.app.tf2_magenta_model import create_drum_model, load_tf1_checkpoint_to_tf2
+            from src.app.tf2_magenta_model import (
+                create_drum_model,
+                load_tf1_checkpoint_to_tf2,
+            )
 
             # Create the TF2 model
             model = create_drum_model()
@@ -495,7 +501,13 @@ class DrumTranscriber:
 
         # Find peaks (onsets)
         peaks = librosa.util.peak_pick(
-            onset_envelope, pre_max=3, post_max=3, pre_avg=3, post_avg=5, delta=0.5, wait=10
+            onset_envelope,
+            pre_max=3,
+            post_max=3,
+            pre_avg=3,
+            post_avg=5,
+            delta=0.5,
+            wait=10,
         )
 
         # Convert frame indices to time
