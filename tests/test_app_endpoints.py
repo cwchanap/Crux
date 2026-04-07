@@ -1,6 +1,8 @@
 import asyncio
+import builtins
 import os
 import struct
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -85,14 +87,67 @@ def test_cors_rejects_unknown_origin(client: TestClient):
 
 
 def test_cors_allows_known_origin(client: TestClient):
-    resp = client.get("/api/jobs", headers={"Origin": "http://localhost:4330"})
-    assert resp.headers.get("access-control-allow-origin") == "http://localhost:4330"
+    from src.app import main as app_main
+
+    origin = (
+        os.getenv("CORS_ALLOWED_ORIGINS", ",".join(app_main.ALLOWED_ORIGINS)).split(",")[0].strip()
+    )
+    if not origin:
+        origin = "http://localhost:4330"
+
+    resp = client.get("/api/jobs", headers={"Origin": origin})
+    assert resp.headers.get("access-control-allow-origin") == origin
 
 
 def test_upload_rejects_oversized_file(client: TestClient):
     big_content = b"\x00" * (51 * 1024 * 1024)  # 51 MB
     files = {"file": ("big.wav", big_content, "audio/wav")}
     resp = client.post("/api/upload", files=files)
+    assert resp.status_code == 413
+
+
+def test_upload_rejects_oversized_file_after_closing_temp_file(client: TestClient, monkeypatch):
+    from src.app import main as app_main
+
+    monkeypatch.setattr(app_main, "MAX_UPLOAD_BYTES", 8, raising=True)
+
+    real_open = builtins.open
+    real_unlink = Path.unlink
+    temp_file_closed = {"value": False}
+
+    class TrackingWriter:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        def __enter__(self):
+            self._wrapped.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            try:
+                return self._wrapped.__exit__(exc_type, exc, tb)
+            finally:
+                temp_file_closed["value"] = True
+
+        def __getattr__(self, name):
+            return getattr(self._wrapped, name)
+
+    def tracking_open(file, mode="r", *args, **kwargs):
+        wrapped = real_open(file, mode, *args, **kwargs)
+        if "temp_uploads" in str(file) and mode == "wb":
+            return TrackingWriter(wrapped)
+        return wrapped
+
+    def guarded_unlink(self, *args, **kwargs):
+        assert temp_file_closed["value"], "temp file must be closed before unlink"
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", tracking_open)
+    monkeypatch.setattr(Path, "unlink", guarded_unlink)
+
+    files = {"file": ("big.wav", b"012345678", "audio/wav")}
+    resp = client.post("/api/upload", files=files)
+
     assert resp.status_code == 413
 
 
@@ -116,6 +171,13 @@ def test_upload_rejects_disguised_m4a(client: TestClient):
     files = {"file": ("fake.m4a", bad_content, "audio/mp4")}
     resp = client.post("/api/upload", files=files)
     assert resp.status_code == 400
+
+
+def test_upload_accepts_mpeg25_mp3(client: TestClient):
+    mp3_header = b"\xff\xe3\x18\xc4" + b"\x00" * 8
+    files = {"file": ("voice.mp3", mp3_header, "audio/mpeg")}
+    resp = client.post("/api/upload", files=files)
+    assert resp.status_code == 200, resp.text
 
 
 def test_upload_rejects_missing_filename(client: TestClient):
@@ -151,3 +213,42 @@ def test_upload_accepts_m4a_with_audio_brand(client: TestClient):
     resp = client.post("/api/upload", files=files)
     # M4A with audio brand should pass format validation (status 200)
     assert resp.status_code == 200, resp.text
+
+
+def test_upload_accepts_m4a_with_audio_compat_brand_when_ftyp_extends_to_eof(
+    client: TestClient,
+):
+    content = b"\x00\x00\x00\x00ftypisom\x00\x00\x00\x00M4A "
+    files = {"file": ("audio.m4a", content, "audio/mp4")}
+    resp = client.post("/api/upload", files=files)
+    assert resp.status_code == 200, resp.text
+
+
+def test_upload_accepts_m4a_with_audio_compat_brand_in_extended_ftyp_box(
+    client: TestClient,
+):
+    content = (
+        (1).to_bytes(4, "big") + b"ftyp" + (28).to_bytes(8, "big") + b"isom" + b"\x00" * 4 + b"M4A "
+    )
+    files = {"file": ("audio.m4a", content, "audio/mp4")}
+    resp = client.post("/api/upload", files=files)
+    assert resp.status_code == 200, resp.text
+
+
+def test_upload_closes_upload_file(client: TestClient, monkeypatch):
+    from starlette.datastructures import UploadFile
+
+    close_called = {"value": False}
+    original_close = UploadFile.close
+
+    async def tracking_close(self):
+        close_called["value"] = True
+        return await original_close(self)
+
+    monkeypatch.setattr(UploadFile, "close", tracking_close)
+
+    files = {"file": ("test.wav", b"RIFF\x00\x00\x00\x00WAVE", "audio/wav")}
+    resp = client.post("/api/upload", files=files)
+
+    assert resp.status_code == 200, resp.text
+    assert close_called["value"]

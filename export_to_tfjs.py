@@ -71,28 +71,34 @@ def build_functional_model(weights_path: str | None) -> tf.keras.Model:
     return func_model
 
 
-def export_to_tfjs(weights_path: str | None, output_dir: Path) -> None:
+def export_to_tfjs(
+    weights_path: str | None,
+    output_dir: Path,
+    save_keras_h5: Path | None = None,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model = build_functional_model(weights_path)
 
-    # Try the Python API first
-    try:
-        import tensorflowjs as tfjs  # type: ignore
+    if save_keras_h5 is None:
+        # Try the Python API first
+        try:
+            import tensorflowjs as tfjs  # type: ignore
 
-        logger.info("Exporting Keras model to TFJS (Layers format): %s", output_dir)
-        tfjs.converters.save_keras_model(model, str(output_dir))
-        logger.info("✅ Exported TFJS model to: %s", output_dir)
-        return
-    except Exception as e:
-        logger.warning(
-            "tensorflowjs Python package not available or failed (%s).\n"
-            "Falling back to saving Keras H5 for CLI conversion.",
-            e,
-        )
+            logger.info("Exporting Keras model to TFJS (Layers format): %s", output_dir)
+            tfjs.converters.save_keras_model(model, str(output_dir))
+            logger.info("✅ Exported TFJS model to: %s", output_dir)
+            return
+        except Exception as e:
+            logger.warning(
+                "tensorflowjs Python package not available or failed (%s).\n"
+                "Falling back to saving Keras H5 for CLI conversion.",
+                e,
+            )
 
     # Fallback: save to H5 and instruct user to run CLI
-    h5_path = output_dir / "keras_model.h5"
+    h5_path = save_keras_h5 or output_dir / "keras_model.h5"
+    h5_path.parent.mkdir(parents=True, exist_ok=True)
     logger.info("Saving Keras H5 to: %s", h5_path)
     model.save(str(h5_path), include_optimizer=False)
 
@@ -103,7 +109,7 @@ def export_to_tfjs(weights_path: str | None, output_dir: Path) -> None:
     )
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Export TF2 drum model to TFJS format")
     parser.add_argument(
         "--weights",
@@ -117,16 +123,28 @@ def main() -> None:
         default="web_model",
         help="Output directory for TFJS model (model.json + shards)",
     )
+    parser.add_argument(
+        "--save-keras-h5",
+        action="store",
+        dest="save_keras_h5",
+        help="path to write Keras H5 model",
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     weights_path = args.weights
     output_dir = Path(args.output_dir)
+    save_keras_h5 = Path(args.save_keras_h5) if args.save_keras_h5 else None
 
     if weights_path and not Path(weights_path).exists():
         logger.warning("Weights not found at %s. Proceeding without loading weights.", weights_path)
         weights_path = None
 
-    export_to_tfjs(weights_path, output_dir)
+    export_to_tfjs(weights_path, output_dir, save_keras_h5=save_keras_h5)
 
 
 if __name__ == "__main__":

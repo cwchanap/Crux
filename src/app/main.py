@@ -59,6 +59,7 @@ CHUNK_SIZE = 64 * 1024  # 64 KB read chunks
 # Generic container brands (b"isom", b"mp42") are intentionally excluded because
 # they are shared by video MP4 files and would weaken the audio-only guard.
 M4A_AUDIO_BRANDS: frozenset[bytes] = frozenset([b"M4A ", b"M4B ", b"M4P ", b"aac ", b"f4a "])
+MAX_FTYP_COMPAT_SCAN_BYTES = 4096
 
 # Magic bytes for allowed audio formats
 AUDIO_MAGIC: list[tuple[bytes, str]] = [
@@ -68,8 +69,57 @@ AUDIO_MAGIC: list[tuple[bytes, str]] = [
     (b"\xff\xfa", "mp3"),  # MPEG-1 Layer 3, with CRC
     (b"\xff\xf3", "mp3"),  # MPEG-2 Layer 3, no CRC
     (b"\xff\xf2", "mp3"),  # MPEG-2 Layer 3, with CRC
+    (b"\xff\xe3", "mp3"),  # MPEG-2.5 Layer 3, no CRC
+    (b"\xff\xe2", "mp3"),  # MPEG-2.5 Layer 3, with CRC
     (b"fLaC", "flac"),  # FLAC
 ]
+
+
+def _read_m4a_brands(file_path: Path, total_bytes: int) -> tuple[bytes, set[bytes]]:
+    with open(file_path, "rb") as f:
+        ftyp_size_bytes = f.read(4)
+        box_type = f.read(4)
+        if len(ftyp_size_bytes) != 4 or box_type != b"ftyp":
+            raise ValueError("Invalid ftyp box header")
+
+        ftyp_size = int.from_bytes(ftyp_size_bytes, "big")
+        compat_offset = 16
+        if ftyp_size == 0:
+            ftyp_size = total_bytes
+        elif ftyp_size == 1:
+            large_size_bytes = f.read(8)
+            if len(large_size_bytes) != 8:
+                raise ValueError("Incomplete extended ftyp size")
+            ftyp_size = int.from_bytes(large_size_bytes, "big")
+            compat_offset = 24
+
+        if not compat_offset <= ftyp_size <= total_bytes:
+            raise ValueError("Invalid ftyp size")
+
+        major_brand = f.read(4)
+        minor_version = f.read(4)
+        if len(major_brand) != 4 or len(minor_version) != 4:
+            raise ValueError("Incomplete ftyp box body")
+
+        compat_bytes = ftyp_size - compat_offset
+        compat_scan_bytes = min(compat_bytes, MAX_FTYP_COMPAT_SCAN_BYTES)
+        compat_brands: set[bytes] = set()
+
+        while compat_scan_bytes >= 4:
+            brand = f.read(4)
+            if len(brand) != 4:
+                raise ValueError("Incomplete compatible brand entry")
+            compat_brands.add(brand)
+            compat_scan_bytes -= 4
+
+        if compat_bytes > MAX_FTYP_COMPAT_SCAN_BYTES:
+            logger.debug(
+                "Truncated compatible brand scan from %s to %s bytes",
+                compat_bytes,
+                MAX_FTYP_COMPAT_SCAN_BYTES,
+            )
+
+        return major_brand, compat_brands
 
 
 @app.on_event("startup")
@@ -162,6 +212,7 @@ async def upload_audio(file: UploadFile = File(...)):
 
     total_bytes = 0
     header = b""
+    file_too_large = False
     with open(temp_file_path, "wb") as f:
         while True:
             chunk = await file.read(CHUNK_SIZE)
@@ -169,15 +220,18 @@ async def upload_audio(file: UploadFile = File(...)):
                 break
             total_bytes += len(chunk)
             if total_bytes > MAX_UPLOAD_BYTES:
-                # Clean up temp file before raising
-                temp_file_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"File too large. Maximum size is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB",
-                )
+                file_too_large = True
+                break
             f.write(chunk)
             if len(header) < 12:
                 header += chunk[: 12 - len(header)]
+
+    if file_too_large:
+        temp_file_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum size is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB",
+        )
 
     # Validate magic bytes (need at least 4 bytes)
     if total_bytes < 4:
@@ -196,25 +250,12 @@ async def upload_audio(file: UploadFile = File(...)):
         is_valid_audio = False
     # M4A: 'ftyp' at offset 4 – only accept known audio-specific brands
     if len(header) >= 12 and header[4:8] == b"ftyp":
-        major_brand = header[8:12]
-        with open(temp_file_path, "rb") as f:
-            ftyp_size_bytes = f.read(4)
-            if len(ftyp_size_bytes) >= 4:
-                try:
-                    ftyp_size = int.from_bytes(ftyp_size_bytes, "big")
-                    if ftyp_size >= 16 and ftyp_size <= total_bytes:
-                        f.seek(16)
-                        compat_area = f.read(ftyp_size - 16)
-                        compat_brands = {
-                            compat_area[i : i + 4] for i in range(0, len(compat_area) - 3, 4)
-                        }
-                    else:
-                        compat_brands = set()
-                except Exception as exc:
-                    logger.warning("Could not parse ftyp box compat brands: %s", exc)
-                    compat_brands = set()
-            else:
-                compat_brands = set()
+        major_brand = b""
+        compat_brands = set()
+        try:
+            major_brand, compat_brands = _read_m4a_brands(temp_file_path, total_bytes)
+        except (OSError, ValueError) as exc:
+            logger.debug("Could not parse ftyp box compat brands: %s", exc, exc_info=True)
         is_valid_audio = (major_brand in M4A_AUDIO_BRANDS) or bool(compat_brands & M4A_AUDIO_BRANDS)
 
     if not is_valid_audio:
