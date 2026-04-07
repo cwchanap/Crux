@@ -93,7 +93,7 @@ def test_list_jobs_pagination(client: TestClient, monkeypatch):
 @pytest.mark.usefixtures("client")
 def test_process_audio_task_error_flow(tmp_path, client: TestClient):  # noqa: ARG001
     """Ensure process_audio_task sets job to failed and cleans up file on exception."""
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     from src.app import main as app_main
 
@@ -105,8 +105,8 @@ def test_process_audio_task_error_flow(tmp_path, client: TestClient):  # noqa: A
     app_main.jobs_store[job_id] = {
         "job_id": job_id,
         "status": "pending",
-        "created_at": datetime.utcnow().isoformat(),
-        "updated_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
         "progress": 0,
         "result_url": None,
         "error": None,
