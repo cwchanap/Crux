@@ -52,13 +52,19 @@ def build_functional_model(weights_path: str | None) -> tf.keras.Model:
     # Use batch_shape to ensure batch_input_shape is present in the config for TFJS importer
     inputs = tf.keras.Input(batch_shape=(None, None, 229, 1), name="inputs", dtype="float32")
     outputs = base(inputs, training=False)
-    # Ensure list outputs with stable ordering for TFJS Layers export
+    # Ensure list outputs with stable ordering and distinct output names
+    # for TFJS Layers export.  A subclassed model called in a functional
+    # context attributes every output tensor to the parent call layer, so
+    # without explicit wrapping model.output_names collapses to duplicates
+    # like ["onsets_frames_model", "onsets_frames_model_1", ...].
     if isinstance(outputs, dict):
         outputs = [
-            outputs["onset_probs"],
-            outputs["offset_probs"],
-            outputs["velocity_values"],
-            outputs["frame_probs"],
+            tf.keras.layers.Activation("linear", name="onset_probs")(outputs["onset_probs"]),
+            tf.keras.layers.Activation("linear", name="offset_probs")(outputs["offset_probs"]),
+            tf.keras.layers.Activation("linear", name="velocity_values")(
+                outputs["velocity_values"]
+            ),
+            tf.keras.layers.Activation("linear", name="frame_probs")(outputs["frame_probs"]),
         ]
     func_model = tf.keras.Model(inputs=inputs, outputs=outputs, name="drums_onsets_frames")
 
