@@ -14,11 +14,89 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
 # NOTE: Avoid importing the heavy transcriber (and TensorFlow) at module import time.
 DrumTranscriber = None  # will be lazily imported when needed
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+CHUNK_SIZE = 64 * 1024  # 64 KB read chunks
+
+# Allowlist of MP4 major/compatible brands that represent audio-only containers.
+# Generic container brands (b"isom", b"mp42") are intentionally excluded because
+# they are shared by video MP4 files and would weaken the audio-only guard.
+M4A_AUDIO_BRANDS: frozenset[bytes] = frozenset([b"M4A ", b"M4B ", b"M4P ", b"aac ", b"f4a "])
+MAX_FTYP_COMPAT_SCAN_BYTES = 4096
+
+# Magic bytes for allowed audio formats
+AUDIO_MAGIC: list[tuple[bytes, str]] = [
+    (b"RIFF", "wav"),  # WAV
+    (b"ID3", "mp3"),  # MP3 with ID3 tag
+    (b"\xff\xfb", "mp3"),  # MPEG-1 Layer 3, no CRC
+    (b"\xff\xfa", "mp3"),  # MPEG-1 Layer 3, with CRC
+    (b"\xff\xf3", "mp3"),  # MPEG-2 Layer 3, no CRC
+    (b"\xff\xf2", "mp3"),  # MPEG-2 Layer 3, with CRC
+    (b"\xff\xe3", "mp3"),  # MPEG-2.5 Layer 3, no CRC
+    (b"\xff\xe2", "mp3"),  # MPEG-2.5 Layer 3, with CRC
+    (b"fLaC", "flac"),  # FLAC
+]
+
+
+# ---------------------------------------------------------------------------
+# Middleware
+# ---------------------------------------------------------------------------
+
+
+class UploadSizeLimitMiddleware:
+    """Reject uploads whose Content-Length exceeds the limit *before* the
+    multipart body is parsed by Starlette.  Without this guard the server
+    fully receives and spools a huge file only to reject it after the fact."""
+
+    def __init__(self, app: ASGIApp, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope.get("method") in ("POST", "PUT", "PATCH"):
+            for name, value in scope.get("headers", []):
+                if name == b"content-length":
+                    try:
+                        content_length = int(value)
+                    except (ValueError, TypeError):
+                        break
+                    if content_length > self.max_bytes:
+                        await send(
+                            {
+                                "type": "http.response.start",
+                                "status": 413,
+                                "headers": [
+                                    (b"content-type", b"application/json"),
+                                ],
+                            }
+                        )
+                        await send(
+                            {
+                                "type": "http.response.body",
+                                "body": (
+                                    '{"detail":"File too large. Maximum size is'
+                                    f" {self.max_bytes // (1024 * 1024)} MB"
+                                    '"}'
+                                ).encode(),
+                            }
+                        )
+                        return
+                    break
+        await self.app(scope, receive, send)
+
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
 
 app = FastAPI(
     title="Drum Transcription API",
@@ -47,32 +125,14 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
+# NOTE: add_middleware prepends (runs first).  We want the size-limit check
+# to execute *before* CORS and *before* Starlette starts parsing the body.
+app.add_middleware(UploadSizeLimitMiddleware, max_bytes=MAX_UPLOAD_BYTES)
+
 # In-memory storage for demo (will be replaced with Cloudflare KV/D1)
 jobs_store: Dict[str, Dict[str, Any]] = {}
 midi_store: Dict[str, bytes] = {}
 uploads_store: Dict[str, Dict[str, Any]] = {}
-
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
-CHUNK_SIZE = 64 * 1024  # 64 KB read chunks
-
-# Allowlist of MP4 major/compatible brands that represent audio-only containers.
-# Generic container brands (b"isom", b"mp42") are intentionally excluded because
-# they are shared by video MP4 files and would weaken the audio-only guard.
-M4A_AUDIO_BRANDS: frozenset[bytes] = frozenset([b"M4A ", b"M4B ", b"M4P ", b"aac ", b"f4a "])
-MAX_FTYP_COMPAT_SCAN_BYTES = 4096
-
-# Magic bytes for allowed audio formats
-AUDIO_MAGIC: list[tuple[bytes, str]] = [
-    (b"RIFF", "wav"),  # WAV
-    (b"ID3", "mp3"),  # MP3 with ID3 tag
-    (b"\xff\xfb", "mp3"),  # MPEG-1 Layer 3, no CRC
-    (b"\xff\xfa", "mp3"),  # MPEG-1 Layer 3, with CRC
-    (b"\xff\xf3", "mp3"),  # MPEG-2 Layer 3, no CRC
-    (b"\xff\xf2", "mp3"),  # MPEG-2 Layer 3, with CRC
-    (b"\xff\xe3", "mp3"),  # MPEG-2.5 Layer 3, no CRC
-    (b"\xff\xe2", "mp3"),  # MPEG-2.5 Layer 3, with CRC
-    (b"fLaC", "flac"),  # FLAC
-]
 
 
 def _read_m4a_brands(file_path: Path, total_bytes: int) -> tuple[bytes, set[bytes]]:
