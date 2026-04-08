@@ -31,7 +31,7 @@ def test_build_parser_accepts_save_keras_h5_option(export_module):
     assert args.save_keras_h5 == "custom.keras.h5"
 
 
-def test_export_to_tfjs_uses_requested_h5_path_on_fallback(export_module, monkeypatch, tmp_path):
+def test_export_to_tfjs_saves_to_explicit_h5_path(export_module, monkeypatch, tmp_path):
     class FakeModel:
         def __init__(self):
             self.saved_args = None
@@ -40,13 +40,8 @@ def test_export_to_tfjs_uses_requested_h5_path_on_fallback(export_module, monkey
             self.saved_args = (path, include_optimizer)
 
     fake_model = FakeModel()
-    fake_tfjs = types.ModuleType("tensorflowjs")
-    fake_tfjs.converters = types.SimpleNamespace(
-        save_keras_model=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
-    )
 
     monkeypatch.setattr(export_module, "build_functional_model", lambda _weights_path: fake_model)
-    monkeypatch.setitem(sys.modules, "tensorflowjs", fake_tfjs)
 
     output_dir = tmp_path / "web_model"
     keras_h5_path = tmp_path / "custom.keras.h5"

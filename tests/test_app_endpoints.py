@@ -82,6 +82,7 @@ def test_upload_transcribe_download_flow(client: TestClient, monkeypatch):
 
 def test_cors_rejects_unknown_origin(client: TestClient):
     resp = client.get("/api/jobs", headers={"Origin": "https://evil.com"})
+    assert resp.status_code == 200
     # Unknown origins should not receive the CORS allow-origin header
     assert "access-control-allow-origin" not in resp.headers
 
@@ -96,12 +97,16 @@ def test_cors_allows_known_origin(client: TestClient):
         origin = "http://localhost:4330"
 
     resp = client.get("/api/jobs", headers={"Origin": origin})
+    assert resp.status_code == 200
     assert resp.headers.get("access-control-allow-origin") == origin
 
 
-def test_upload_rejects_oversized_file(client: TestClient):
-    big_content = b"\x00" * (51 * 1024 * 1024)  # 51 MB
-    files = {"file": ("big.wav", big_content, "audio/wav")}
+def test_upload_rejects_oversized_file(client: TestClient, monkeypatch):
+    from src.app import main as app_main
+
+    monkeypatch.setattr(app_main, "MAX_UPLOAD_BYTES", 10, raising=True)
+
+    files = {"file": ("big.wav", b"01234567890", "audio/wav")}
     resp = client.post("/api/upload", files=files)
     assert resp.status_code == 413
 
