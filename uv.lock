@@ -412,6 +412,8 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "ruff" },
+]
+tfjs = [
     { name = "tensorflowjs" },
 ]
 
@@ -424,7 +426,6 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "ruff" },
-    { name = "tensorflowjs" },
 ]
 
 [package.metadata]
@@ -451,11 +452,11 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.11.0" },
     { name = "soundfile", specifier = ">=0.12.1" },
     { name = "tensorflow", specifier = ">=2.13.0" },
-    { name = "tensorflowjs", marker = "extra == 'dev'", specifier = ">=4.21.0" },
+    { name = "tensorflowjs", marker = "extra == 'tfjs'", specifier = ">=4.21.0" },
     { name = "uuid6", specifier = ">=2024.1.12" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.23.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["dev", "tfjs"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -466,7 +467,6 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=0.21.1" },
     { name = "pytest-cov", specifier = ">=4.1.0" },
     { name = "ruff", specifier = ">=0.1.6" },
-    { name = "tensorflowjs", specifier = ">=4.21.0" },
 ]
 
 [[package]]

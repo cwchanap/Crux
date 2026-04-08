@@ -8,7 +8,27 @@ import pytest
 @pytest.fixture()
 def export_module(monkeypatch):
     fake_tf = types.ModuleType("tensorflow")
-    fake_tf.keras = types.SimpleNamespace(Model=object)
+
+    # Minimal fake Keras surface used by export_to_tfjs
+    class _FakeActivation:
+        """Record ``(name)`` so tests can assert the wrapper passes names."""
+
+        def __init__(self, activation, name=None):
+            self.name = name
+
+        def __call__(self, tensor):
+            return tensor
+
+    class _FakeInput:
+        pass
+
+    _fake_layers = types.SimpleNamespace(Activation=_FakeActivation, Input=_FakeInput)
+    _fake_keras = types.SimpleNamespace(
+        Model=object,
+        Input=lambda *a, **kw: None,
+        layers=_fake_layers,
+    )
+    fake_tf.keras = _fake_keras
 
     fake_magenta_model = types.ModuleType("src.app.tf2_magenta_model")
     fake_magenta_model.create_drum_model = lambda checkpoint_path=None: None
