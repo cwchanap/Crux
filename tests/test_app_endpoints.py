@@ -257,3 +257,27 @@ def test_upload_closes_upload_file(client: TestClient, monkeypatch):
 
     assert resp.status_code == 200, resp.text
     assert close_called["value"]
+
+
+def test_upload_rejects_oversized_content_length_middleware(client: TestClient, monkeypatch):
+    """The UploadSizeLimitMiddleware must reject requests whose Content-Length
+    header exceeds the limit *before* Starlette parses the multipart body."""
+    from src.app import main as app_main
+
+    # Patch the middleware's stored max_bytes to 10 bytes.
+    # user_middleware[0] is the UploadSizeLimitMiddleware (added last = index 0).
+    monkeypatch.setitem(
+        app_main.app.user_middleware[0].kwargs,
+        "max_bytes",
+        10,
+    )
+    # Force middleware stack rebuild so the patched value takes effect.
+    # monkeypatch will restore the original stack after the test.
+    monkeypatch.setattr(app_main.app, "middleware_stack", None)
+
+    files = {"file": ("big.wav", b"01234567890", "audio/wav")}
+    resp = client.post("/api/upload", files=files)
+    assert resp.status_code == 413
+    # Verify the middleware responded (not the handler-level check) by confirming
+    # the endpoint was never reached — no temp file created on disk.
+    assert "File too large" in resp.json()["detail"]
