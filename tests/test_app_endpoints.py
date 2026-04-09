@@ -266,11 +266,17 @@ def test_upload_rejects_oversized_content_length_middleware(client: TestClient, 
 
     # Patch the middleware's stored max_bytes to 10 bytes.
     # user_middleware[0] is the UploadSizeLimitMiddleware (added last = index 0).
+    # Defensive check: fail fast if middleware registration order changes.
+    assert (
+        app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware
+    ), "Expected first middleware to be UploadSizeLimitMiddleware"
     monkeypatch.setitem(
         app_main.app.user_middleware[0].kwargs,
         "max_bytes",
         10,
     )
+    # Also zero out the multipart overhead buffer so the threshold is exactly 10.
+    monkeypatch.setattr(app_main, "MULTIPART_OVERHEAD_BYTES", 0, raising=True)
     # Force middleware stack rebuild so the patched value takes effect.
     # monkeypatch will restore the original stack after the test.
     monkeypatch.setattr(app_main.app, "middleware_stack", None)
@@ -281,3 +287,83 @@ def test_upload_rejects_oversized_content_length_middleware(client: TestClient, 
     # Verify the middleware responded (not the handler-level check) by confirming
     # the endpoint was never reached — no temp file created on disk.
     assert "File too large" in resp.json()["detail"]
+
+
+def test_middleware_allows_file_at_limit_with_multipart_overhead(client: TestClient, monkeypatch):
+    """A file whose raw bytes are exactly at the limit should NOT be rejected
+    by the middleware, because Content-Length includes multipart framing that
+    pushes it slightly above the file-size limit."""
+    from src.app import main as app_main
+
+    # Set a very small limit so we can construct a payload that is right at
+    # the boundary.
+    # Defensive check: fail fast if middleware registration order changes.
+    assert (
+        app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware
+    ), "Expected first middleware to be UploadSizeLimitMiddleware"
+    limit = 100
+    monkeypatch.setitem(
+        app_main.app.user_middleware[0].kwargs,
+        "max_bytes",
+        limit,
+    )
+    monkeypatch.setattr(app_main, "MULTIPART_OVERHEAD_BYTES", 2048, raising=True)
+    monkeypatch.setattr(app_main, "MAX_UPLOAD_BYTES", limit, raising=True)
+    monkeypatch.setattr(app_main.app, "middleware_stack", None)
+
+    # A small valid WAV that is well under both limits — the middleware should
+    # let it through; the handler-level check uses MAX_UPLOAD_BYTES for the
+    # actual file bytes, so we keep the payload under that too.
+    files = {"file": ("tiny.wav", b"RIFF\x00\x00\x00\x00WAVE", "audio/wav")}
+    resp = client.post("/api/upload", files=files)
+    # Should succeed (200) because Content-Length (with multipart overhead)
+    # is still under limit + MULTIPART_OVERHEAD_BYTES.
+    assert resp.status_code == 200, resp.text
+
+
+def test_middleware_413_includes_cors_headers_for_allowed_origin(client: TestClient, monkeypatch):
+    """When the middleware rejects an oversized upload from an allowed origin,
+    the 413 response must include CORS headers so the browser can read it."""
+    from src.app import main as app_main
+
+    # Defensive check: fail fast if middleware registration order changes.
+    assert (
+        app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware
+    ), "Expected first middleware to be UploadSizeLimitMiddleware"
+    monkeypatch.setitem(
+        app_main.app.user_middleware[0].kwargs,
+        "max_bytes",
+        10,
+    )
+    monkeypatch.setattr(app_main, "MULTIPART_OVERHEAD_BYTES", 0, raising=True)
+    monkeypatch.setattr(app_main.app, "middleware_stack", None)
+
+    origin = app_main.ALLOWED_ORIGINS[0]  # e.g. "http://localhost:4330"
+    files = {"file": ("big.wav", b"01234567890", "audio/wav")}
+    resp = client.post("/api/upload", files=files, headers={"Origin": origin})
+    assert resp.status_code == 413
+    assert resp.headers.get("access-control-allow-origin") == origin
+    assert "File too large" in resp.json()["detail"]
+
+
+def test_middleware_413_no_cors_headers_for_unknown_origin(client: TestClient, monkeypatch):
+    """When the middleware rejects an oversized upload from a disallowed origin,
+    the 413 response must NOT include CORS headers."""
+    from src.app import main as app_main
+
+    # Defensive check: fail fast if middleware registration order changes.
+    assert (
+        app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware
+    ), "Expected first middleware to be UploadSizeLimitMiddleware"
+    monkeypatch.setitem(
+        app_main.app.user_middleware[0].kwargs,
+        "max_bytes",
+        10,
+    )
+    monkeypatch.setattr(app_main, "MULTIPART_OVERHEAD_BYTES", 0, raising=True)
+    monkeypatch.setattr(app_main.app, "middleware_stack", None)
+
+    files = {"file": ("big.wav", b"01234567890", "audio/wav")}
+    resp = client.post("/api/upload", files=files, headers={"Origin": "https://evil.com"})
+    assert resp.status_code == 413
+    assert "access-control-allow-origin" not in resp.headers

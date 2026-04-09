@@ -68,3 +68,33 @@ def test_export_to_tfjs_saves_to_explicit_h5_path(export_module, monkeypatch, tm
     export_module.export_to_tfjs(None, output_dir, keras_h5_path)
 
     assert fake_model.saved_args == (str(keras_h5_path), False)
+
+
+def test_main_fails_fast_for_missing_weights_path(export_module, monkeypatch, caplog, tmp_path):
+    missing_weights = tmp_path / "does_not_exist.weights.h5"
+    output_dir = tmp_path / "web_model"
+    export_called = False
+
+    def _fake_export(*_args, **_kwargs):
+        nonlocal export_called
+        export_called = True
+
+    monkeypatch.setattr(export_module, "export_to_tfjs", _fake_export)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "export_to_tfjs.py",
+            "--weights",
+            str(missing_weights),
+            "--output-dir",
+            str(output_dir),
+        ],
+    )
+
+    with caplog.at_level("ERROR", logger="export_to_tfjs"):
+        with pytest.raises(FileNotFoundError, match=str(missing_weights)):
+            export_module.main()
+
+    assert not export_called
+    assert str(missing_weights) in caplog.text

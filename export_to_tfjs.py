@@ -18,7 +18,7 @@ Usage examples:
   tensorflowjs_converter --input_format=keras --output_format=tfjs_layers_model keras_model.h5 web_model
 
 Requirements:
-  pip install tensorflow tensorflowjs
+  pip install 'tensorflow>=2.16.1' tensorflowjs
 
 Notes:
 - Input shape is [batch, time, 229 mel bins, 1 channel]. Time is variable-length (None).
@@ -121,7 +121,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--weights",
         type=str,
         default="models/e-gmd/tf2_model.weights.h5",
-        help="Path to TF2 weights (.h5). If missing, the model exports with randomly initialized weights.",
+        help=(
+            "Path to TF2 weights (.h5). This path must exist; "
+            "the script exits with an error when it is missing."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -147,8 +150,8 @@ def main() -> None:
     save_keras_h5 = Path(args.save_keras_h5) if args.save_keras_h5 else None
 
     if weights_path and not Path(weights_path).exists():
-        logger.warning("Weights not found at %s. Proceeding without loading weights.", weights_path)
-        weights_path = None
+        logger.error("Weights path does not exist: %s", weights_path)
+        raise FileNotFoundError(f"Weights path does not exist: {weights_path}")
 
     export_to_tfjs(weights_path, output_dir, save_keras_h5=save_keras_h5)
 
