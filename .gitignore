@@ -8,3 +8,4 @@ models/
 static/assets/
 .coverage
 web_model*/
+.claude/settings.local.json
