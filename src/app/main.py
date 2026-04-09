@@ -25,6 +25,10 @@ DrumTranscriber = None  # will be lazily imported when needed
 # Constants
 # ---------------------------------------------------------------------------
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+# Multipart requests add ~1-2 KB of overhead (boundaries + headers).  The
+# middleware uses this buffer so that a file exactly at the limit is not
+# rejected simply because Content-Length includes transport framing.
+MULTIPART_OVERHEAD_BYTES = 2 * 1024 * 1024  # 2 MB generous buffer
 CHUNK_SIZE = 64 * 1024  # 64 KB read chunks
 
 # Allowlist of MP4 major/compatible brands that represent audio-only containers.
@@ -55,7 +59,17 @@ AUDIO_MAGIC: list[tuple[bytes, str]] = [
 class UploadSizeLimitMiddleware:
     """Reject uploads whose Content-Length exceeds the limit *before* the
     multipart body is parsed by Starlette.  Without this guard the server
-    fully receives and spools a huge file only to reject it after the fact."""
+    fully receives and spools a huge file only to reject it after the fact.
+
+    The middleware uses *max_bytes + MULTIPART_OVERHEAD_BYTES* as its ceiling
+    so that files right at the documented limit are not falsely rejected due
+    to multipart boundaries and headers inflating the Content-Length header.
+
+    Because this middleware sits outside CORSMiddleware, it injects the
+    appropriate CORS headers into its 413 response so that cross-origin
+    browser clients receive a readable error instead of a generic CORS
+    failure.
+    """
 
     def __init__(self, app: ASGIApp, max_bytes: int) -> None:
         self.app = app
@@ -63,34 +77,47 @@ class UploadSizeLimitMiddleware:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http" and scope.get("method") in ("POST", "PUT", "PATCH"):
+            origin: Optional[bytes] = None
+            content_length: Optional[int] = None
             for name, value in scope.get("headers", []):
-                if name == b"content-length":
+                if name == b"origin":
+                    origin = value
+                elif name == b"content-length":
                     try:
                         content_length = int(value)
                     except (ValueError, TypeError):
                         break
-                    if content_length > self.max_bytes:
-                        await send(
-                            {
-                                "type": "http.response.start",
-                                "status": 413,
-                                "headers": [
-                                    (b"content-type", b"application/json"),
-                                ],
-                            }
-                        )
-                        await send(
-                            {
-                                "type": "http.response.body",
-                                "body": (
-                                    '{"detail":"File too large. Maximum size is'
-                                    f" {self.max_bytes // (1024 * 1024)} MB"
-                                    '"}'
-                                ).encode(),
-                            }
-                        )
-                        return
-                    break
+            if (
+                content_length is not None
+                and content_length > self.max_bytes + MULTIPART_OVERHEAD_BYTES
+            ):
+                # Build response headers: always include content-type
+                # and, when an Origin is present that matches an
+                # allowed origin, include the CORS allow-origin header.
+                resp_headers: list[tuple[bytes, bytes]] = [
+                    (b"content-type", b"application/json"),
+                ]
+                if origin and origin.decode("latin-1") in ALLOWED_ORIGINS:
+                    resp_headers.append((b"access-control-allow-origin", origin))
+                    resp_headers.append((b"vary", b"Origin"))
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 413,
+                        "headers": resp_headers,
+                    }
+                )
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": (
+                            '{"detail":"File too large. Maximum size is'
+                            f" {self.max_bytes // (1024 * 1024)} MB"
+                            '"}'
+                        ).encode(),
+                    }
+                )
+                return
         await self.app(scope, receive, send)
 
 

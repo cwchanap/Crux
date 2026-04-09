@@ -232,22 +232,20 @@ class OnsetsFramesModel(tf.keras.Model):
 
 
 def load_tf1_checkpoint_to_tf2(model, checkpoint_path):
-    """Load TF1 checkpoint weights into TF2 model"""
-    # This is a simplified version - actual implementation would need
-    # proper variable mapping from TF1 to TF2
-    try:
-        # Try to load as TF2 checkpoint first
-        if checkpoint_path.endswith(".h5") or checkpoint_path.endswith(".weights.h5"):
+    """Load TF1 checkpoint weights into TF2 model.
+
+    Raises RuntimeError if weight loading fails so callers (e.g. the TFJS
+    exporter) can fail fast instead of silently using random weights.
+    """
+    if checkpoint_path.endswith(".h5") or checkpoint_path.endswith(".weights.h5"):
+        try:
             model.load_weights(checkpoint_path)
-        else:
-            # For TF1 checkpoints, we'd need manual conversion
-            print("Note: TF1 checkpoint loading not fully implemented")
-        return model
-    except Exception as e:
-        # If that fails, we'd need to manually map TF1 variables
-        # This requires knowing the exact variable names in the checkpoint
-        print(f"Note: Could not load checkpoint: {e}")
-        return model
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load weights from {checkpoint_path}: {exc}") from exc
+    else:
+        # For TF1 checkpoints, we'd need manual conversion
+        raise RuntimeError(f"Non-H5 checkpoint loading not implemented: {checkpoint_path}")
+    return model
 
 
 def create_drum_model(checkpoint_path=None):
