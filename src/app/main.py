@@ -25,10 +25,12 @@ DrumTranscriber = None  # will be lazily imported when needed
 # Constants
 # ---------------------------------------------------------------------------
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
-# Multipart requests add ~1-2 KB of overhead (boundaries + headers).  The
-# middleware uses this buffer so that a file exactly at the limit is not
-# rejected simply because Content-Length includes transport framing.
-MULTIPART_OVERHEAD_BYTES = 2 * 1024 * 1024  # 2 MB generous buffer
+# 2 MB buffer above MAX_UPLOAD_BYTES so that clients whose Content-Length
+# slightly overshoots the limit (e.g. due to multipart framing or metadata)
+# are not spuriously rejected.  The buffer is intentionally large relative
+# to actual multipart overhead (~1-2 KB) to avoid false negatives at the
+# boundary.
+MULTIPART_OVERHEAD_BYTES = 2 * 1024 * 1024  # 2 MB
 CHUNK_SIZE = 64 * 1024  # 64 KB read chunks
 
 # Allowlist of MP4 major/compatible brands that represent audio-only containers.
@@ -152,8 +154,10 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
-# NOTE: add_middleware prepends (runs first).  We want the size-limit check
-# to execute *before* CORS and *before* Starlette starts parsing the body.
+# NOTE: add_middleware wraps the entire existing stack, so the *last* call
+# becomes the outermost middleware and runs *first* on inbound requests.
+# Adding UploadSizeLimitMiddleware after CORSMiddleware means the size check
+# executes before CORS and before Starlette starts parsing the body.
 app.add_middleware(UploadSizeLimitMiddleware, max_bytes=MAX_UPLOAD_BYTES)
 
 # In-memory storage for demo (will be replaced with Cloudflare KV/D1)
