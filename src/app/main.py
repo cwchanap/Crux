@@ -341,13 +341,14 @@ async def upload_audio(file: UploadFile = File(...)):
         is_valid_audio = False
     # M4A: 'ftyp' at offset 4 – only accept known audio-specific brands
     if len(header) >= 12 and header[4:8] == b"ftyp":
-        major_brand = b""
-        compat_brands = set()
         try:
             major_brand, compat_brands = _read_m4a_brands(temp_file_path, total_bytes)
+            is_valid_audio = (major_brand in M4A_AUDIO_BRANDS) or bool(
+                compat_brands & M4A_AUDIO_BRANDS
+            )
         except (OSError, ValueError) as exc:
-            logger.debug("Could not parse ftyp box compat brands: %s", exc, exc_info=True)
-        is_valid_audio = (major_brand in M4A_AUDIO_BRANDS) or bool(compat_brands & M4A_AUDIO_BRANDS)
+            logger.warning("Could not parse ftyp box: %s — rejecting upload", exc, exc_info=True)
+            is_valid_audio = False
 
     if not is_valid_audio:
         temp_file_path.unlink(missing_ok=True)
