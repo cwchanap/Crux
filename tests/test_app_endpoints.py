@@ -267,9 +267,9 @@ def test_upload_rejects_oversized_content_length_middleware(client: TestClient, 
     # Patch the middleware's stored max_bytes to 10 bytes.
     # user_middleware[0] is the UploadSizeLimitMiddleware (added last = index 0).
     # Defensive check: fail fast if middleware registration order changes.
-    assert app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware, (
-        "Expected first middleware to be UploadSizeLimitMiddleware"
-    )
+    assert (
+        app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware
+    ), "Expected first middleware to be UploadSizeLimitMiddleware"
     monkeypatch.setitem(
         app_main.app.user_middleware[0].kwargs,
         "max_bytes",
@@ -298,9 +298,9 @@ def test_middleware_allows_file_at_limit_with_multipart_overhead(client: TestCli
     # Set a very small limit so we can construct a payload that is right at
     # the boundary.
     # Defensive check: fail fast if middleware registration order changes.
-    assert app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware, (
-        "Expected first middleware to be UploadSizeLimitMiddleware"
-    )
+    assert (
+        app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware
+    ), "Expected first middleware to be UploadSizeLimitMiddleware"
     limit = 100
     monkeypatch.setitem(
         app_main.app.user_middleware[0].kwargs,
@@ -327,9 +327,9 @@ def test_middleware_413_includes_cors_headers_for_allowed_origin(client: TestCli
     from src.app import main as app_main
 
     # Defensive check: fail fast if middleware registration order changes.
-    assert app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware, (
-        "Expected first middleware to be UploadSizeLimitMiddleware"
-    )
+    assert (
+        app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware
+    ), "Expected first middleware to be UploadSizeLimitMiddleware"
     monkeypatch.setitem(
         app_main.app.user_middleware[0].kwargs,
         "max_bytes",
@@ -352,9 +352,9 @@ def test_middleware_413_no_cors_headers_for_unknown_origin(client: TestClient, m
     from src.app import main as app_main
 
     # Defensive check: fail fast if middleware registration order changes.
-    assert app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware, (
-        "Expected first middleware to be UploadSizeLimitMiddleware"
-    )
+    assert (
+        app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware
+    ), "Expected first middleware to be UploadSizeLimitMiddleware"
     monkeypatch.setitem(
         app_main.app.user_middleware[0].kwargs,
         "max_bytes",
@@ -367,3 +367,38 @@ def test_middleware_413_no_cors_headers_for_unknown_origin(client: TestClient, m
     resp = client.post("/api/upload", files=files, headers={"Origin": "https://evil.com"})
     assert resp.status_code == 413
     assert "access-control-allow-origin" not in resp.headers
+
+
+def test_upload_strips_directory_traversal_from_filename(client: TestClient):
+    # A filename like "../../etc/evil.wav" must be sanitized to "evil.wav"
+    # (Path.name strips all path components).
+    files = {"file": ("../../etc/evil.wav", b"RIFF\x00\x00\x00\x00WAVE", "audio/wav")}
+    resp = client.post("/api/upload", files=files)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["filename"] == "evil.wav"
+
+
+def test_upload_rejects_path_only_filename(client: TestClient):
+    # A filename that resolves to an empty base name (e.g. "../") must be rejected.
+    files = {"file": ("../", b"RIFF\x00\x00\x00\x00WAVE", "audio/wav")}
+    resp = client.post("/api/upload", files=files)
+    assert resp.status_code in (400, 422)
+
+
+def test_upload_rejects_riff_non_wav(client: TestClient):
+    # RIFF container with non-WAVE FOURCC (e.g. "AVI ") must be rejected even
+    # though the first 4 bytes are b"RIFF".
+    content = b"RIFF\x00\x00\x00\x00AVI " + b"\x00" * 4
+    files = {"file": ("fake.wav", content, "audio/wav")}
+    resp = client.post("/api/upload", files=files)
+    assert resp.status_code == 400
+
+
+def test_upload_rejects_m4a_with_malformed_ftyp_box(client: TestClient):
+    # A file whose first 8 bytes look like an ftyp size but whose box type
+    # is not b"ftyp" should be rejected (brand parse fails → is_valid_audio=False).
+    # Bytes: size=16 (big-endian), box_type="moov", then 8 zero bytes.
+    content = (16).to_bytes(4, "big") + b"moov" + b"\x00" * 8
+    files = {"file": ("bad.m4a", content, "audio/mp4")}
+    resp = client.post("/api/upload", files=files)
+    assert resp.status_code == 400
