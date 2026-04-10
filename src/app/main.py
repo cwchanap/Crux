@@ -304,18 +304,23 @@ async def upload_audio(file: UploadFile = File(...)):
     total_bytes = 0
     header = b""
     file_too_large = False
-    with open(temp_file_path, "wb") as f:
-        while True:
-            chunk = await file.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            total_bytes += len(chunk)
-            if total_bytes > MAX_UPLOAD_BYTES:
-                file_too_large = True
-                break
-            f.write(chunk)
-            if len(header) < 12:
-                header += chunk[: 12 - len(header)]
+    try:
+        with open(temp_file_path, "wb") as f:
+            while True:
+                chunk = await file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    file_too_large = True
+                    break
+                f.write(chunk)
+                if len(header) < 12:
+                    header += chunk[: 12 - len(header)]
+    except BaseException:
+        temp_file_path.unlink(missing_ok=True)
+        logger.error("Upload write failed for %s — temp file cleaned up", upload_id, exc_info=True)
+        raise
 
     if file_too_large:
         temp_file_path.unlink(missing_ok=True)
