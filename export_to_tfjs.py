@@ -87,20 +87,18 @@ def export_to_tfjs(
     model = build_functional_model(weights_path)
 
     if save_keras_h5 is None:
-        # Try the Python API first
+        # Try the Python API first; fall back to H5 only if the package is absent.
         try:
             import tensorflowjs as tfjs  # type: ignore
-
+        except ModuleNotFoundError:
+            logger.warning(
+                "tensorflowjs is not installed. Falling back to saving Keras H5 for CLI conversion."
+            )
+        else:
             logger.info("Exporting Keras model to TFJS (Layers format): %s", output_dir)
             tfjs.converters.save_keras_model(model, str(output_dir))
-            logger.info("✅ Exported TFJS model to: %s", output_dir)
+            logger.info("Exported TFJS model to: %s", output_dir)
             return
-        except Exception as e:
-            logger.warning(
-                "tensorflowjs Python package not available or failed (%s).\n"
-                "Falling back to saving Keras H5 for CLI conversion.",
-                e,
-            )
 
     # Fallback: save to H5 and instruct user to run CLI
     h5_path = save_keras_h5 or output_dir / "keras_model.h5"
