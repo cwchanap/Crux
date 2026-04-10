@@ -22,11 +22,11 @@ uv run pytest tests/test_app_endpoints.py::test_name
 
 # Linting and formatting checks
 uv run ruff check src tests
-uv run black --check src tests
+uv run ruff format --check src tests
 uv run pylint src/app src/cli
 
 # Format code before committing
-uv run black src tests
+uv run ruff format src tests
 ```
 
 ## Architecture
