@@ -512,7 +512,12 @@ async def process_audio_task(job_id: str, file_path: str):
         jobs_store[job_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
 
         # Clean up temp file
-        os.remove(file_path)
+        try:
+            Path(file_path).unlink(missing_ok=True)
+        except OSError:
+            logger.warning(
+                "Could not remove input file %s — manual cleanup may be required", file_path
+            )
 
     except Exception as e:
         logger.exception("Transcription job %s failed: %s", job_id, e)
@@ -520,8 +525,12 @@ async def process_audio_task(job_id: str, file_path: str):
         jobs_store[job_id]["error"] = str(e)
         jobs_store[job_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        try:
+            Path(file_path).unlink(missing_ok=True)
+        except OSError:
+            logger.warning(
+                "Could not remove input file %s — manual cleanup may be required", file_path
+            )
 
 
 if __name__ == "__main__":
