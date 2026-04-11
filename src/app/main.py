@@ -101,6 +101,7 @@ class UploadSizeLimitMiddleware:
                 ]
                 if origin and origin.decode("latin-1") in ALLOWED_ORIGINS:
                     resp_headers.append((b"access-control-allow-origin", origin))
+                    resp_headers.append((b"access-control-allow-credentials", b"true"))
                     resp_headers.append((b"vary", b"Origin"))
                 await send(
                     {
