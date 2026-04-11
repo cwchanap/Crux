@@ -99,10 +99,14 @@ class UploadSizeLimitMiddleware:
                 resp_headers: list[tuple[bytes, bytes]] = [
                     (b"content-type", b"application/json"),
                 ]
-                if origin and origin.decode("latin-1") in ALLOWED_ORIGINS:
-                    resp_headers.append((b"access-control-allow-origin", origin))
-                    resp_headers.append((b"access-control-allow-credentials", b"true"))
-                    resp_headers.append((b"vary", b"Origin"))
+                if origin:
+                    origin_str = origin.decode("latin-1")
+                    if "*" in ALLOWED_ORIGINS:
+                        resp_headers.append((b"access-control-allow-origin", b"*"))
+                    elif origin_str in ALLOWED_ORIGINS:
+                        resp_headers.append((b"access-control-allow-origin", origin))
+                        resp_headers.append((b"access-control-allow-credentials", b"true"))
+                        resp_headers.append((b"vary", b"Origin"))
                 await send(
                     {
                         "type": "http.response.start",
