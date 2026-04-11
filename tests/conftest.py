@@ -7,6 +7,10 @@ from fastapi.testclient import TestClient
 # Ensure the heavy model is not preloaded during tests
 os.environ.setdefault("PRELOAD_MODEL", "0")
 
+# Use a restrictive CORS allowlist in tests so that rejection behaviour can be
+# verified.  The production default is ["*"] (wildcard) for backward compat.
+os.environ.setdefault("CORS_ALLOWED_ORIGINS", "http://localhost:4330,http://localhost:8788")
+
 
 @pytest.fixture()
 def client() -> Generator[TestClient, None, None]:

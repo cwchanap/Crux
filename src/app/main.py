@@ -138,14 +138,18 @@ app = FastAPI(
 )
 
 # CORS configuration for Cloudflare Workers
-ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in os.getenv(
-        "CORS_ALLOWED_ORIGINS",
-        "http://localhost:4330,http://localhost:8788",
-    ).split(",")
-    if origin.strip()
-]
+# Default to wildcard to avoid breaking existing deployments that relied on
+# the previous allow_origins=["*"] behaviour.  Operators should set
+# CORS_ALLOWED_ORIGINS explicitly in production to lock down allowed origins.
+_CORS_RAW = os.getenv("CORS_ALLOWED_ORIGINS")
+if _CORS_RAW is not None:
+    ALLOWED_ORIGINS = [o.strip() for o in _CORS_RAW.split(",") if o.strip()]
+else:
+    logger.warning(
+        "CORS_ALLOWED_ORIGINS is unset – defaulting to wildcard. "
+        "Set CORS_ALLOWED_ORIGINS explicitly in production."
+    )
+    ALLOWED_ORIGINS = ["*"]
 
 app.add_middleware(
     CORSMiddleware,
