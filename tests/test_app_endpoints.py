@@ -343,6 +343,7 @@ def test_middleware_413_includes_cors_headers_for_allowed_origin(client: TestCli
     resp = client.post("/api/upload", files=files, headers={"Origin": origin})
     assert resp.status_code == 413
     assert resp.headers.get("access-control-allow-origin") == origin
+    assert resp.headers.get("access-control-allow-credentials") == "true"
     assert "File too large" in resp.json()["detail"]
 
 
