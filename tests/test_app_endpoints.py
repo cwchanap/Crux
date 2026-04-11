@@ -394,6 +394,40 @@ def test_middleware_413_no_cors_headers_for_unknown_origin(client: TestClient, m
     assert "access-control-allow-origin" not in resp.headers
 
 
+def test_middleware_413_includes_cors_wildcard_for_any_origin(monkeypatch):
+    """When ALLOWED_ORIGINS is ['*'] (default), a 413 from the size-limit middleware
+    must include Access-Control-Allow-Origin: * so browsers can read the error body."""
+    import importlib
+
+    monkeypatch.delenv("CORS_ALLOWED_ORIGINS", raising=False)
+    from src.app import main as app_main
+
+    importlib.reload(app_main)
+    try:
+        assert app_main.ALLOWED_ORIGINS == ["*"], "Expected wildcard default after env delete"
+        monkeypatch.setitem(
+            app_main.app.user_middleware[0].kwargs,
+            "max_bytes",
+            10,
+        )
+        monkeypatch.setattr(app_main, "MULTIPART_OVERHEAD_BYTES", 0, raising=True)
+        monkeypatch.setattr(app_main.app, "middleware_stack", None)
+
+        with TestClient(app_main.app) as client:
+            files = {"file": ("big.wav", b"01234567890", "audio/wav")}
+            resp = client.post(
+                "/api/upload",
+                files=files,
+                headers={"Origin": "https://arbitrary.example.com"},
+            )
+            assert resp.status_code == 413
+            assert resp.headers.get("access-control-allow-origin") == "*"
+            assert "File too large" in resp.json()["detail"]
+    finally:
+        monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "http://localhost:4330,http://localhost:8788")
+        importlib.reload(app_main)
+
+
 def test_upload_strips_directory_traversal_from_filename(client: TestClient):
     # A filename like "../../etc/evil.wav" must be sanitized to "evil.wav"
     # (Path.name strips all path components).
