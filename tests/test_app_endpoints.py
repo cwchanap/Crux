@@ -291,9 +291,9 @@ def test_upload_rejects_oversized_content_length_middleware(client: TestClient, 
     # Patch the middleware's stored max_bytes to 10 bytes.
     # user_middleware[0] is the UploadSizeLimitMiddleware (added last = index 0).
     # Defensive check: fail fast if middleware registration order changes.
-    assert (
-        app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware
-    ), "Expected first middleware to be UploadSizeLimitMiddleware"
+    assert app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware, (
+        "Expected first middleware to be UploadSizeLimitMiddleware"
+    )
     monkeypatch.setitem(
         app_main.app.user_middleware[0].kwargs,
         "max_bytes",
@@ -322,9 +322,9 @@ def test_middleware_allows_file_at_limit_with_multipart_overhead(client: TestCli
     # Set a very small limit so we can construct a payload that is right at
     # the boundary.
     # Defensive check: fail fast if middleware registration order changes.
-    assert (
-        app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware
-    ), "Expected first middleware to be UploadSizeLimitMiddleware"
+    assert app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware, (
+        "Expected first middleware to be UploadSizeLimitMiddleware"
+    )
     limit = 100
     monkeypatch.setitem(
         app_main.app.user_middleware[0].kwargs,
@@ -351,9 +351,9 @@ def test_middleware_413_includes_cors_headers_for_allowed_origin(client: TestCli
     from src.app import main as app_main
 
     # Defensive check: fail fast if middleware registration order changes.
-    assert (
-        app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware
-    ), "Expected first middleware to be UploadSizeLimitMiddleware"
+    assert app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware, (
+        "Expected first middleware to be UploadSizeLimitMiddleware"
+    )
     monkeypatch.setitem(
         app_main.app.user_middleware[0].kwargs,
         "max_bytes",
@@ -377,9 +377,9 @@ def test_middleware_413_no_cors_headers_for_unknown_origin(client: TestClient, m
     from src.app import main as app_main
 
     # Defensive check: fail fast if middleware registration order changes.
-    assert (
-        app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware
-    ), "Expected first middleware to be UploadSizeLimitMiddleware"
+    assert app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware, (
+        "Expected first middleware to be UploadSizeLimitMiddleware"
+    )
     monkeypatch.setitem(
         app_main.app.user_middleware[0].kwargs,
         "max_bytes",
