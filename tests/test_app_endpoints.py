@@ -101,6 +101,30 @@ def test_cors_allows_known_origin(client: TestClient):
     assert resp.headers.get("access-control-allow-origin") == origin
 
 
+def test_cors_wildcard_default_allows_any_origin(monkeypatch):
+    """When CORS_ALLOWED_ORIGINS is unset, the wildcard default should allow
+    any origin (backward compat with the previous allow_origins=["*"] behaviour)."""
+    import importlib
+
+    monkeypatch.delenv("CORS_ALLOWED_ORIGINS", raising=False)
+    from src.app import main as app_main
+
+    importlib.reload(app_main)
+    try:
+        with TestClient(app_main.app) as client:
+            resp = client.get("/api/jobs", headers={"Origin": "https://arbitrary.example.com"})
+            assert resp.status_code == 200
+            # With wildcard default, Starlette returns literal "*" as the
+            # allow-origin header.  (Note: browsers reject "*" combined with
+            # credentials, but the backward-compat goal is to avoid 403-style
+            # CORS failures for non-credentialed requests.)
+            assert resp.headers.get("access-control-allow-origin") == "*"
+    finally:
+        # Reload again to restore the test-environment CORS settings
+        monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "http://localhost:4330,http://localhost:8788")
+        importlib.reload(app_main)
+
+
 def test_upload_rejects_oversized_file(client: TestClient, monkeypatch):
     from src.app import main as app_main
 
