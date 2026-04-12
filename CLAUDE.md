@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 uv pip install -e .
 
 # Run development server
-uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uv run uvicorn src.app.main:app --reload --host 0.0.0.0 --port 8000
 
 # Run all tests
 uv run pytest

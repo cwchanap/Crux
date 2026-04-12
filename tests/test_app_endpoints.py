@@ -496,3 +496,68 @@ def test_upload_rejects_m4a_with_malformed_ftyp_box(client: TestClient):
     files = {"file": ("bad.m4a", content, "audio/mp4")}
     resp = client.post("/api/upload", files=files)
     assert resp.status_code == 400
+
+
+def test_middleware_rejects_malformed_content_length(client: TestClient, monkeypatch):
+    """The UploadSizeLimitMiddleware must reject requests with a malformed
+    Content-Length header (e.g. non-numeric) with a 400 instead of silently
+    passing them through."""
+    from src.app import main as app_main
+
+    # Patch to a small limit so any oversized request would normally be caught.
+    monkeypatch.setitem(
+        app_main.app.user_middleware[0].kwargs,
+        "max_bytes",
+        10,
+    )
+    monkeypatch.setattr(app_main, "MULTIPART_OVERHEAD_BYTES", 0, raising=True)
+    monkeypatch.setattr(app_main.app, "middleware_stack", None)
+
+    # Send a request with a deliberately invalid Content-Length.
+    # We use the raw test client transport to inject the bad header.
+    resp = client.post(
+        "/api/upload",
+        content=b"anything",
+        headers={
+            "Content-Type": "multipart/form-data",
+            "Content-Length": "not-a-number",
+        },
+    )
+    assert resp.status_code == 400
+    assert "Invalid Content-Length" in resp.json()["detail"]
+
+
+def test_middleware_cors_echoes_origin_with_wildcard_config(client: TestClient, monkeypatch):
+    """When ALLOWED_ORIGINS contains '*', the middleware should echo the
+    request origin (not return '*') to remain compatible with credentialed
+    requests, matching CORSMiddleware semantics."""
+    import importlib
+
+    from src.app import main as app_main
+
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "*")
+    importlib.reload(app_main)
+    try:
+        monkeypatch.setitem(
+            app_main.app.user_middleware[0].kwargs,
+            "max_bytes",
+            10,
+        )
+        monkeypatch.setattr(app_main, "MULTIPART_OVERHEAD_BYTES", 0, raising=True)
+        monkeypatch.setattr(app_main.app, "middleware_stack", None)
+
+        with TestClient(app_main.app) as tc:
+            origin = "http://example.com"
+            resp = tc.post(
+                "/api/upload",
+                files={"file": ("big.wav", b"01234567890", "audio/wav")},
+                headers={"Origin": origin},
+            )
+            assert resp.status_code == 413
+            # Must echo the specific origin, NOT "*"
+            assert resp.headers.get("access-control-allow-origin") == origin
+            assert resp.headers.get("access-control-allow-credentials") == "true"
+            assert resp.headers.get("vary") == "Origin"
+    finally:
+        monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "http://localhost:4330,http://localhost:8788")
+        importlib.reload(app_main)

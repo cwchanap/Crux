@@ -81,6 +81,7 @@ class UploadSizeLimitMiddleware:
         if scope["type"] == "http" and scope.get("method") in ("POST", "PUT", "PATCH"):
             origin: Optional[bytes] = None
             content_length: Optional[int] = None
+            invalid_content_length = False
             for name, value in scope.get("headers", []):
                 if name == b"origin":
                     origin = value
@@ -88,7 +89,28 @@ class UploadSizeLimitMiddleware:
                     try:
                         content_length = int(value)
                     except (ValueError, TypeError):
-                        break
+                        invalid_content_length = True
+            if invalid_content_length:
+                # A malformed Content-Length is always invalid — reject
+                # immediately rather than silently passing the request
+                # through and relying solely on the handler-level check.
+                resp_headers: list[tuple[bytes, bytes]] = [
+                    (b"content-type", b"application/json"),
+                ]
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 400,
+                        "headers": resp_headers,
+                    }
+                )
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": b'{"detail":"Invalid Content-Length header"}',
+                    }
+                )
+                return
             if (
                 content_length is not None
                 and content_length > self.max_bytes + MULTIPART_OVERHEAD_BYTES
@@ -101,9 +123,11 @@ class UploadSizeLimitMiddleware:
                 ]
                 if origin:
                     origin_str = origin.decode("latin-1")
-                    if "*" in ALLOWED_ORIGINS:
-                        resp_headers.append((b"access-control-allow-origin", b"*"))
-                    elif origin_str in ALLOWED_ORIGINS:
+                    if "*" in ALLOWED_ORIGINS or origin_str in ALLOWED_ORIGINS:
+                        # Always echo the specific origin (never use the "*"
+                        # wildcard) so that the response is compatible with
+                        # credentialed requests and matches CORSMiddleware
+                        # semantics.
                         resp_headers.append((b"access-control-allow-origin", origin))
                         resp_headers.append((b"access-control-allow-credentials", b"true"))
                         resp_headers.append((b"vary", b"Origin"))
