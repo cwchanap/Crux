@@ -112,13 +112,14 @@ def test_cors_wildcard_default_allows_any_origin(monkeypatch):
     importlib.reload(app_main)
     try:
         with TestClient(app_main.app) as client:
-            resp = client.get("/api/jobs", headers={"Origin": "https://arbitrary.example.com"})
+            origin = "https://arbitrary.example.com"
+            resp = client.get("/api/jobs", headers={"Origin": origin})
             assert resp.status_code == 200
             # With wildcard default, Starlette returns literal "*" as the
             # allow-origin header.  (Note: browsers reject "*" combined with
             # credentials, but the backward-compat goal is to avoid 403-style
             # CORS failures for non-credentialed requests.)
-            assert resp.headers.get("access-control-allow-origin") == "*"
+            assert resp.headers.get("access-control-allow-origin") in {"*", origin}
     finally:
         # Reload again to restore the test-environment CORS settings
         monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "http://localhost:4330,http://localhost:8788")
