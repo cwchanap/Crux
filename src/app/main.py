@@ -123,11 +123,7 @@ class UploadSizeLimitMiddleware:
                 ]
                 if origin:
                     origin_str = origin.decode("latin-1")
-                    if "*" in ALLOWED_ORIGINS or origin_str in ALLOWED_ORIGINS:
-                        # Always echo the specific origin (never use the "*"
-                        # wildcard) so that the response is compatible with
-                        # credentialed requests and matches CORSMiddleware
-                        # semantics.
+                    if origin_str in ALLOWED_ORIGINS:
                         resp_headers.append((b"access-control-allow-origin", origin))
                         resp_headers.append((b"access-control-allow-credentials", b"true"))
                         resp_headers.append((b"vary", b"Origin"))
@@ -178,6 +174,13 @@ else:
         "Set CORS_ALLOWED_ORIGINS explicitly in production."
     )
     ALLOWED_ORIGINS = ["http://localhost:4330", "http://localhost:8788"]
+
+if "*" in ALLOWED_ORIGINS:
+    raise ValueError(
+        "CORS_ALLOWED_ORIGINS must not contain '*' when credentials are enabled. "
+        "Browsers reject 'Access-Control-Allow-Origin: *' combined with "
+        "'Access-Control-Allow-Credentials: true'.  List explicit origins instead."
+    )
 
 app.add_middleware(
     CORSMiddleware,
