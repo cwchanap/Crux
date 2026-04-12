@@ -4,6 +4,7 @@ import os
 import struct
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 
@@ -527,37 +528,18 @@ def test_middleware_rejects_malformed_content_length(client: TestClient, monkeyp
     assert "Invalid Content-Length" in resp.json()["detail"]
 
 
-def test_middleware_cors_echoes_origin_with_wildcard_config(client: TestClient, monkeypatch):
-    """When ALLOWED_ORIGINS contains '*', the middleware should echo the
-    request origin (not return '*') to remain compatible with credentialed
-    requests, matching CORSMiddleware semantics."""
+def test_wildcard_cors_origin_rejected_at_startup(monkeypatch):
+    """Setting CORS_ALLOWED_ORIGINS='*' must raise ValueError because
+    browsers reject 'Access-Control-Allow-Origin: *' combined with
+    'Access-Control-Allow-Credentials: true'."""
     import importlib
 
     from src.app import main as app_main
 
     monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "*")
-    importlib.reload(app_main)
-    try:
-        monkeypatch.setitem(
-            app_main.app.user_middleware[0].kwargs,
-            "max_bytes",
-            10,
-        )
-        monkeypatch.setattr(app_main, "MULTIPART_OVERHEAD_BYTES", 0, raising=True)
-        monkeypatch.setattr(app_main.app, "middleware_stack", None)
-
-        with TestClient(app_main.app) as tc:
-            origin = "http://example.com"
-            resp = tc.post(
-                "/api/upload",
-                files={"file": ("big.wav", b"01234567890", "audio/wav")},
-                headers={"Origin": origin},
-            )
-            assert resp.status_code == 413
-            # Must echo the specific origin, NOT "*"
-            assert resp.headers.get("access-control-allow-origin") == origin
-            assert resp.headers.get("access-control-allow-credentials") == "true"
-            assert resp.headers.get("vary") == "Origin"
-    finally:
-        monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "http://localhost:4330,http://localhost:8788")
+    with pytest.raises(ValueError, match="must not contain '\\*'"):
         importlib.reload(app_main)
+
+    # Restore valid CORS config so subsequent tests aren't affected.
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "http://localhost:4330,http://localhost:8788")
+    importlib.reload(app_main)
