@@ -1,4 +1,5 @@
 import importlib
+import re
 import sys
 import types
 
@@ -93,7 +94,7 @@ def test_main_fails_fast_for_missing_weights_path(export_module, monkeypatch, ca
     )
 
     with caplog.at_level("ERROR", logger="export_to_tfjs"):
-        with pytest.raises(FileNotFoundError, match=str(missing_weights)):
+        with pytest.raises(FileNotFoundError, match=re.escape(str(missing_weights))):
             export_module.main()
 
     assert not export_called

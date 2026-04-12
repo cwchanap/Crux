@@ -101,9 +101,9 @@ def test_cors_allows_known_origin(client: TestClient):
     assert resp.headers.get("access-control-allow-origin") == origin
 
 
-def test_cors_wildcard_default_allows_any_origin(monkeypatch):
-    """When CORS_ALLOWED_ORIGINS is unset, the wildcard default should allow
-    any origin (backward compat with the previous allow_origins=["*"] behaviour)."""
+def test_cors_localhost_default_applies_when_env_unset(monkeypatch):
+    """When CORS_ALLOWED_ORIGINS is unset, the app should fall back to the
+    localhost allowlist instead of a wildcard."""
     import importlib
 
     monkeypatch.delenv("CORS_ALLOWED_ORIGINS", raising=False)
@@ -112,14 +112,18 @@ def test_cors_wildcard_default_allows_any_origin(monkeypatch):
     importlib.reload(app_main)
     try:
         with TestClient(app_main.app) as client:
-            origin = "https://arbitrary.example.com"
-            resp = client.get("/api/jobs", headers={"Origin": origin})
-            assert resp.status_code == 200
-            # With wildcard default, Starlette returns literal "*" as the
-            # allow-origin header.  (Note: browsers reject "*" combined with
-            # credentials, but the backward-compat goal is to avoid 403-style
-            # CORS failures for non-credentialed requests.)
-            assert resp.headers.get("access-control-allow-origin") in {"*", origin}
+            assert app_main.ALLOWED_ORIGINS == [
+                "http://localhost:4330",
+                "http://localhost:8788",
+            ]
+
+            allowed = client.get("/api/jobs", headers={"Origin": "http://localhost:4330"})
+            blocked = client.get("/api/jobs", headers={"Origin": "https://arbitrary.example.com"})
+
+            assert allowed.status_code == 200
+            assert allowed.headers.get("access-control-allow-origin") == "http://localhost:4330"
+            assert blocked.status_code == 200
+            assert "access-control-allow-origin" not in blocked.headers
     finally:
         # Reload again to restore the test-environment CORS settings
         monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "http://localhost:4330,http://localhost:8788")
@@ -265,6 +269,29 @@ def test_upload_accepts_m4a_with_audio_compat_brand_in_extended_ftyp_box(
     assert resp.status_code == 200, resp.text
 
 
+def test_upload_rejects_mp3_content_with_wav_extension(client: TestClient):
+    temp_uploads = Path("temp_uploads")
+    before = {path.name for path in temp_uploads.iterdir()} if temp_uploads.exists() else set()
+
+    mp3_header = b"\xff\xe3\x18\xc4" + b"\x00" * 8
+    files = {"file": ("voice.wav", mp3_header, "audio/wav")}
+    resp = client.post("/api/upload", files=files)
+
+    after = {path.name for path in temp_uploads.iterdir()} if temp_uploads.exists() else set()
+    assert resp.status_code == 400
+    assert "does not match detected audio format" in resp.json()["detail"]
+    assert after == before
+
+
+def test_upload_rejects_m4a_content_with_mp3_extension(client: TestClient):
+    content = (16).to_bytes(4, "big") + b"ftyp" + b"M4A " + b"\x00" * 4
+    files = {"file": ("audio.mp3", content, "audio/mpeg")}
+    resp = client.post("/api/upload", files=files)
+
+    assert resp.status_code == 400
+    assert "does not match detected audio format" in resp.json()["detail"]
+
+
 def test_upload_closes_upload_file(client: TestClient, monkeypatch):
     from starlette.datastructures import UploadFile
 
@@ -292,9 +319,10 @@ def test_upload_rejects_oversized_content_length_middleware(client: TestClient, 
     # Patch the middleware's stored max_bytes to 10 bytes.
     # user_middleware[0] is the UploadSizeLimitMiddleware (added last = index 0).
     # Defensive check: fail fast if middleware registration order changes.
-    assert app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware, (
-        "Expected first middleware to be UploadSizeLimitMiddleware"
+    is_size_limit_middleware = (
+        app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware
     )
+    assert is_size_limit_middleware, "Expected first middleware to be UploadSizeLimitMiddleware"
     monkeypatch.setitem(
         app_main.app.user_middleware[0].kwargs,
         "max_bytes",
@@ -323,9 +351,10 @@ def test_middleware_allows_file_at_limit_with_multipart_overhead(client: TestCli
     # Set a very small limit so we can construct a payload that is right at
     # the boundary.
     # Defensive check: fail fast if middleware registration order changes.
-    assert app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware, (
-        "Expected first middleware to be UploadSizeLimitMiddleware"
+    is_size_limit_middleware = (
+        app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware
     )
+    assert is_size_limit_middleware, "Expected first middleware to be UploadSizeLimitMiddleware"
     limit = 100
     monkeypatch.setitem(
         app_main.app.user_middleware[0].kwargs,
@@ -352,9 +381,10 @@ def test_middleware_413_includes_cors_headers_for_allowed_origin(client: TestCli
     from src.app import main as app_main
 
     # Defensive check: fail fast if middleware registration order changes.
-    assert app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware, (
-        "Expected first middleware to be UploadSizeLimitMiddleware"
+    is_size_limit_middleware = (
+        app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware
     )
+    assert is_size_limit_middleware, "Expected first middleware to be UploadSizeLimitMiddleware"
     monkeypatch.setitem(
         app_main.app.user_middleware[0].kwargs,
         "max_bytes",
@@ -378,9 +408,10 @@ def test_middleware_413_no_cors_headers_for_unknown_origin(client: TestClient, m
     from src.app import main as app_main
 
     # Defensive check: fail fast if middleware registration order changes.
-    assert app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware, (
-        "Expected first middleware to be UploadSizeLimitMiddleware"
+    is_size_limit_middleware = (
+        app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware
     )
+    assert is_size_limit_middleware, "Expected first middleware to be UploadSizeLimitMiddleware"
     monkeypatch.setitem(
         app_main.app.user_middleware[0].kwargs,
         "max_bytes",
@@ -395,9 +426,9 @@ def test_middleware_413_no_cors_headers_for_unknown_origin(client: TestClient, m
     assert "access-control-allow-origin" not in resp.headers
 
 
-def test_middleware_413_includes_cors_wildcard_for_any_origin(monkeypatch):
-    """When ALLOWED_ORIGINS is ['*'] (default), a 413 from the size-limit middleware
-    must include Access-Control-Allow-Origin: * so browsers can read the error body."""
+def test_middleware_413_uses_default_localhost_allowlist_when_env_unset(monkeypatch):
+    """When CORS_ALLOWED_ORIGINS is unset, the middleware should still apply the
+    localhost default allowlist to its 413 response."""
     import importlib
 
     monkeypatch.delenv("CORS_ALLOWED_ORIGINS", raising=False)
@@ -405,7 +436,10 @@ def test_middleware_413_includes_cors_wildcard_for_any_origin(monkeypatch):
 
     importlib.reload(app_main)
     try:
-        assert app_main.ALLOWED_ORIGINS == ["*"], "Expected wildcard default after env delete"
+        assert app_main.ALLOWED_ORIGINS == [
+            "http://localhost:4330",
+            "http://localhost:8788",
+        ]
         monkeypatch.setitem(
             app_main.app.user_middleware[0].kwargs,
             "max_bytes",
@@ -419,10 +453,10 @@ def test_middleware_413_includes_cors_wildcard_for_any_origin(monkeypatch):
             resp = client.post(
                 "/api/upload",
                 files=files,
-                headers={"Origin": "https://arbitrary.example.com"},
+                headers={"Origin": "http://localhost:4330"},
             )
             assert resp.status_code == 413
-            assert resp.headers.get("access-control-allow-origin") == "*"
+            assert resp.headers.get("access-control-allow-origin") == "http://localhost:4330"
             assert "File too large" in resp.json()["detail"]
     finally:
         monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "http://localhost:4330,http://localhost:8788")
