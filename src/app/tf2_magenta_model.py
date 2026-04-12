@@ -231,7 +231,7 @@ class OnsetsFramesModel(tf.keras.Model):
         }
 
 
-def load_tf1_checkpoint_to_tf2(model, checkpoint_path):
+def load_tf1_checkpoint_to_tf2(checkpoint_path, model):
     """Load TF1 checkpoint weights into TF2 model.
 
     Raises RuntimeError if weight loading fails so callers (e.g. the TFJS
@@ -277,7 +277,7 @@ def create_drum_model(checkpoint_path=None):
     _ = model(dummy_input, training=False)
     # Load checkpoint if provided
     if checkpoint_path:
-        model = load_tf1_checkpoint_to_tf2(model, checkpoint_path)
+        model = load_tf1_checkpoint_to_tf2(checkpoint_path, model)
 
     return model
 

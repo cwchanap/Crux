@@ -142,18 +142,18 @@ app = FastAPI(
 )
 
 # CORS configuration for Cloudflare Workers
-# Default to wildcard to avoid breaking existing deployments that relied on
-# the previous allow_origins=["*"] behaviour.  Operators should set
-# CORS_ALLOWED_ORIGINS explicitly in production to lock down allowed origins.
+# Default to the local development allowlist when CORS_ALLOWED_ORIGINS is not
+# set. Operators should set CORS_ALLOWED_ORIGINS explicitly in production to
+# lock down allowed origins.
 _CORS_RAW = os.getenv("CORS_ALLOWED_ORIGINS")
 if _CORS_RAW is not None:
     ALLOWED_ORIGINS = [o.strip() for o in _CORS_RAW.split(",") if o.strip()]
 else:
     logger.warning(
-        "CORS_ALLOWED_ORIGINS is unset – defaulting to wildcard. "
+        "CORS_ALLOWED_ORIGINS is unset – defaulting to the localhost allowlist. "
         "Set CORS_ALLOWED_ORIGINS explicitly in production."
     )
-    ALLOWED_ORIGINS = ["*"]
+    ALLOWED_ORIGINS = ["http://localhost:4330", "http://localhost:8788"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -220,6 +220,29 @@ def _read_m4a_brands(file_path: Path, total_bytes: int) -> tuple[bytes, set[byte
             )
 
         return major_brand, compat_brands
+
+
+def _detect_audio_format(header: bytes, file_path: Path, total_bytes: int) -> Optional[str]:
+    detected_format = next(
+        (audio_format for magic, audio_format in AUDIO_MAGIC if header.startswith(magic)),
+        None,
+    )
+
+    if header[:4] == b"RIFF":
+        return "wav" if header[8:12] == b"WAVE" else None
+
+    if len(header) >= 12 and header[4:8] == b"ftyp":
+        try:
+            major_brand, compat_brands = _read_m4a_brands(file_path, total_bytes)
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not parse ftyp box: %s — rejecting upload", exc, exc_info=True)
+            return None
+
+        if (major_brand in M4A_AUDIO_BRANDS) or bool(compat_brands & M4A_AUDIO_BRANDS):
+            return "m4a"
+        return None
+
+    return detected_format
 
 
 @app.on_event("startup")
@@ -349,26 +372,20 @@ async def upload_audio(file: UploadFile = File(...)):
         with open(temp_file_path, "rb") as f:
             header = f.read(12)
 
-    is_valid_audio = any(header.startswith(magic) for magic, _ in AUDIO_MAGIC)
-    # WAV special case: RIFF....WAVE
-    if header[:4] == b"RIFF" and header[8:12] != b"WAVE":
-        is_valid_audio = False
-    # M4A: 'ftyp' at offset 4 – only accept known audio-specific brands
-    if len(header) >= 12 and header[4:8] == b"ftyp":
-        try:
-            major_brand, compat_brands = _read_m4a_brands(temp_file_path, total_bytes)
-            is_valid_audio = (major_brand in M4A_AUDIO_BRANDS) or bool(
-                compat_brands & M4A_AUDIO_BRANDS
-            )
-        except (OSError, ValueError) as exc:
-            logger.warning("Could not parse ftyp box: %s — rejecting upload", exc, exc_info=True)
-            is_valid_audio = False
-
-    if not is_valid_audio:
+    detected_format = _detect_audio_format(header, temp_file_path, total_bytes)
+    if detected_format is None:
         temp_file_path.unlink(missing_ok=True)
         raise HTTPException(
             status_code=400,
             detail="File content does not match a supported audio format",
+        )
+
+    expected_format = safe_name.rsplit(".", maxsplit=1)[-1].lower()
+    if expected_format != detected_format:
+        temp_file_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail="File extension does not match detected audio format",
         )
 
     # Rename temp file to final name
