@@ -14,7 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +33,12 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 MULTIPART_OVERHEAD_BYTES = 2 * 1024 * 1024  # 2 MB
 CHUNK_SIZE = 64 * 1024  # 64 KB read chunks
 
-# Allowlist of MP4 major/compatible brands that represent audio-only containers.
-# Generic container brands (b"isom", b"mp42") are intentionally excluded because
-# they are shared by video MP4 files and would weaken the audio-only guard.
+# Allowlist of MP4 major/compatible brands recognized for supported M4A uploads.
+# Generic container brands (b"isom", b"mp42") are included because they are
+# also commonly emitted by encoder-produced audio-only MP4/M4A files.
 M4A_AUDIO_BRANDS: frozenset[bytes] = frozenset([b"M4A ", b"M4B ", b"M4P ", b"aac ", b"f4a "])
+M4A_GENERIC_BRANDS: frozenset[bytes] = frozenset([b"isom", b"mp42"])
+M4A_RECOGNIZED_BRANDS: frozenset[bytes] = M4A_AUDIO_BRANDS | M4A_GENERIC_BRANDS
 MAX_FTYP_COMPAT_SCAN_BYTES = 4096
 
 # Magic bytes for allowed audio formats
@@ -58,6 +60,10 @@ AUDIO_MAGIC: list[tuple[bytes, str]] = [
 # ---------------------------------------------------------------------------
 
 
+class _RequestBodyTooLarge(Exception):
+    pass
+
+
 class UploadSizeLimitMiddleware:
     """Reject uploads whose Content-Length exceeds the limit *before* the
     multipart body is parsed by Starlette.  Without this guard the server
@@ -77,11 +83,45 @@ class UploadSizeLimitMiddleware:
         self.app = app
         self.max_bytes = max_bytes
 
+    def _response_headers(self, origin: Optional[bytes]) -> list[tuple[bytes, bytes]]:
+        resp_headers: list[tuple[bytes, bytes]] = [
+            (b"content-type", b"application/json"),
+        ]
+        if origin:
+            origin_str = origin.decode("latin-1")
+            if origin_str in ALLOWED_ORIGINS:
+                resp_headers.append((b"access-control-allow-origin", origin))
+                resp_headers.append((b"access-control-allow-credentials", b"true"))
+                resp_headers.append((b"vary", b"Origin"))
+        return resp_headers
+
+    async def _send_json_error(
+        self,
+        send: Send,
+        status_code: int,
+        detail: str,
+        origin: Optional[bytes],
+    ) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status_code,
+                "headers": self._response_headers(origin),
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": f'{{"detail":"{detail}"}}'.encode(),
+            }
+        )
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http" and scope.get("method") in ("POST", "PUT", "PATCH"):
             origin: Optional[bytes] = None
             content_length: Optional[int] = None
             invalid_content_length = False
+            request_bytes_limit = self.max_bytes + MULTIPART_OVERHEAD_BYTES
             for name, value in scope.get("headers", []):
                 if name == b"origin":
                     origin = value
@@ -91,60 +131,51 @@ class UploadSizeLimitMiddleware:
                     except (ValueError, TypeError):
                         invalid_content_length = True
             if invalid_content_length:
-                # A malformed Content-Length is always invalid — reject
-                # immediately rather than silently passing the request
-                # through and relying solely on the handler-level check.
-                resp_headers: list[tuple[bytes, bytes]] = [
-                    (b"content-type", b"application/json"),
-                ]
-                await send(
-                    {
-                        "type": "http.response.start",
-                        "status": 400,
-                        "headers": resp_headers,
-                    }
-                )
-                await send(
-                    {
-                        "type": "http.response.body",
-                        "body": b'{"detail":"Invalid Content-Length header"}',
-                    }
+                await self._send_json_error(
+                    send,
+                    400,
+                    "Invalid Content-Length header",
+                    origin,
                 )
                 return
-            if (
-                content_length is not None
-                and content_length > self.max_bytes + MULTIPART_OVERHEAD_BYTES
-            ):
-                # Build response headers: always include content-type
-                # and, when an Origin is present that matches an
-                # allowed origin, include the CORS allow-origin header.
-                resp_headers: list[tuple[bytes, bytes]] = [
-                    (b"content-type", b"application/json"),
-                ]
-                if origin:
-                    origin_str = origin.decode("latin-1")
-                    if origin_str in ALLOWED_ORIGINS:
-                        resp_headers.append((b"access-control-allow-origin", origin))
-                        resp_headers.append((b"access-control-allow-credentials", b"true"))
-                        resp_headers.append((b"vary", b"Origin"))
-                await send(
-                    {
-                        "type": "http.response.start",
-                        "status": 413,
-                        "headers": resp_headers,
-                    }
-                )
-                await send(
-                    {
-                        "type": "http.response.body",
-                        "body": (
-                            '{"detail":"File too large. Maximum size is'
-                            f" {self.max_bytes // (1024 * 1024)} MB"
-                            '"}'
-                        ).encode(),
-                    }
-                )
+            size_error_detail = (
+                f"File too large. Maximum size is {self.max_bytes // (1024 * 1024)} MB"
+            )
+            if content_length is not None and content_length > request_bytes_limit:
+                await self._send_json_error(send, 413, size_error_detail, origin)
                 return
+
+            response_started = False
+            received_bytes = 0
+            request_too_large = False
+
+            async def tracked_send(message: Message) -> None:
+                nonlocal response_started
+                if request_too_large:
+                    return
+                if message["type"] == "http.response.start":
+                    response_started = True
+                await send(message)
+
+            async def limited_receive() -> Message:
+                nonlocal received_bytes, request_too_large
+                if request_too_large:
+                    return {"type": "http.request", "body": b"", "more_body": False}
+
+                message = await receive()
+                if message["type"] != "http.request":
+                    return message
+
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > request_bytes_limit:
+                    request_too_large = True
+                    return {"type": "http.request", "body": b"", "more_body": False}
+                return message
+
+            await self.app(scope, limited_receive, tracked_send)
+            if request_too_large and not response_started:
+                await self._send_json_error(send, 413, size_error_detail, origin)
+            return
         await self.app(scope, receive, send)
 
 
@@ -265,7 +296,7 @@ def _detect_audio_format(header: bytes, file_path: Path, total_bytes: int) -> Op
             logger.warning("Could not parse ftyp box: %s — rejecting upload", exc, exc_info=True)
             return None
 
-        if (major_brand in M4A_AUDIO_BRANDS) or bool(compat_brands & M4A_AUDIO_BRANDS):
+        if (major_brand in M4A_RECOGNIZED_BRANDS) or (compat_brands & M4A_RECOGNIZED_BRANDS):
             return "m4a"
         return None
 
