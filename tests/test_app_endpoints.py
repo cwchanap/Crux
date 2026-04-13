@@ -224,17 +224,27 @@ def test_upload_rejects_missing_filename(client: TestClient):
     assert resp.status_code in (400, 422)
 
 
-def test_upload_rejects_m4a_with_generic_isom_brand(client: TestClient):
-    # Build a minimal ftyp box with major_brand=b"isom" (generic MP4, not audio-only).
-    # isom was removed from M4A_AUDIO_BRANDS so this should now be rejected.
+def test_upload_accepts_m4a_with_generic_isom_brand(client: TestClient):
+    # Build a minimal ftyp box with major_brand=b"isom" (generic MP4 brand).
     ftyp_size = (16).to_bytes(4, "big")  # 16-byte ftyp box
     ftyp_tag = b"ftyp"
     major_brand = b"isom"
     minor_version = b"\x00" * 4
     content = ftyp_size + ftyp_tag + major_brand + minor_version
-    files = {"file": ("video.m4a", content, "audio/mp4")}
+    files = {"file": ("audio.m4a", content, "audio/mp4")}
     resp = client.post("/api/upload", files=files)
-    assert resp.status_code == 400
+    assert resp.status_code == 200, resp.text
+
+
+def test_upload_accepts_m4a_with_generic_mp42_brand(client: TestClient):
+    ftyp_size = (16).to_bytes(4, "big")
+    ftyp_tag = b"ftyp"
+    major_brand = b"mp42"
+    minor_version = b"\x00" * 4
+    content = ftyp_size + ftyp_tag + major_brand + minor_version
+    files = {"file": ("audio.m4a", content, "audio/mp4")}
+    resp = client.post("/api/upload", files=files)
+    assert resp.status_code == 200, resp.text
 
 
 def test_upload_accepts_m4a_with_audio_brand(client: TestClient):
@@ -329,10 +339,7 @@ def test_upload_rejects_oversized_content_length_middleware(client: TestClient, 
         "max_bytes",
         10,
     )
-    # Also zero out the multipart overhead buffer so the threshold is exactly 10.
     monkeypatch.setattr(app_main, "MULTIPART_OVERHEAD_BYTES", 0, raising=True)
-    # Force middleware stack rebuild so the patched value takes effect.
-    # monkeypatch will restore the original stack after the test.
     monkeypatch.setattr(app_main.app, "middleware_stack", None)
 
     files = {"file": ("big.wav", b"01234567890", "audio/wav")}
@@ -343,6 +350,89 @@ def test_upload_rejects_oversized_content_length_middleware(client: TestClient, 
     assert "File too large" in resp.json()["detail"]
 
 
+def test_middleware_rejects_streamed_upload_without_content_length(monkeypatch):
+    from src.app import main as app_main
+
+    app_main.jobs_store.clear()
+    app_main.midi_store.clear()
+    app_main.uploads_store.clear()
+
+    boundary = "chunked-boundary"
+    chunk1 = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="big.wav"\r\n'
+        "Content-Type: audio/wav\r\n\r\n"
+    ).encode() + b"RIFF"
+    chunk2 = b"0123456789"
+    chunk3 = f"\r\n--{boundary}--\r\n".encode()
+    limit = len(chunk1) + 4
+
+    monkeypatch.setitem(
+        app_main.app.user_middleware[0].kwargs,
+        "max_bytes",
+        limit,
+    )
+    monkeypatch.setattr(app_main, "MULTIPART_OVERHEAD_BYTES", 0, raising=True)
+    monkeypatch.setattr(app_main.app, "middleware_stack", None)
+
+    temp_uploads = Path("temp_uploads")
+    before = {path.name for path in temp_uploads.iterdir()} if temp_uploads.exists() else set()
+
+    messages = [
+        {"type": "http.request", "body": chunk1, "more_body": True},
+        {"type": "http.request", "body": chunk2, "more_body": True},
+        {"type": "http.request", "body": chunk3, "more_body": False},
+    ]
+    receive_state = {"index": 0}
+    sent = []
+
+    async def receive():
+        index = receive_state["index"]
+        receive_state["index"] += 1
+        if index < len(messages):
+            return messages[index]
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/upload",
+        "raw_path": b"/api/upload",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"testserver"),
+            (b"content-type", f"multipart/form-data; boundary={boundary}".encode()),
+        ],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+        "state": {},
+        "app": app_main.app,
+    }
+
+    asyncio.run(app_main.app(scope, receive, send))
+
+    after = {path.name for path in temp_uploads.iterdir()} if temp_uploads.exists() else set()
+    start_message = next(
+        (message for message in sent if message["type"] == "http.response.start"),
+        None,
+    )
+    body = b"".join(
+        (message.get("body", b"") for message in sent if message["type"] == "http.response.body")
+    )
+
+    assert start_message["status"] == 413
+    assert b"File too large" in body
+    assert receive_state["index"] == 2
+    assert after == before
+
+
 def test_middleware_allows_file_at_limit_with_multipart_overhead(client: TestClient, monkeypatch):
     """A file whose raw bytes are exactly at the limit should NOT be rejected
     by the middleware, because Content-Length includes multipart framing that
@@ -351,7 +441,6 @@ def test_middleware_allows_file_at_limit_with_multipart_overhead(client: TestCli
 
     # Set a very small limit so we can construct a payload that is right at
     # the boundary.
-    # Defensive check: fail fast if middleware registration order changes.
     is_size_limit_middleware = (
         app_main.app.user_middleware[0].cls is app_main.UploadSizeLimitMiddleware
     )
