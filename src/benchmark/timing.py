@@ -77,6 +77,11 @@ def _tempo_points(
     previous_bpm = points[0][1]
     for beat, bpm in points:
         if resolved and math.isclose(beat, resolved[-1][0], abs_tol=1e-9):
+            if math.isclose(beat, 0.0, abs_tol=1e-9):
+                resolved[-1] = (beat, current_time, bpm)
+                previous_beat = beat
+                previous_bpm = bpm
+                continue
             raise ValueError(f"duplicate tempo events at beat {beat}")
         if beat > previous_beat:
             current_time += (beat - previous_beat) * 60.0 / previous_bpm
