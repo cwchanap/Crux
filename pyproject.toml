@@ -39,6 +39,7 @@ tfjs = [
 
 [project.scripts]
 convert-checkpoint = "src.cli.convert:main"
+crux = "src.cli.main:main"
 
 [build-system]
 requires = ["hatchling"]

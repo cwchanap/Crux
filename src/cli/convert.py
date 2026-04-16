@@ -8,9 +8,6 @@ import os
 from pathlib import Path
 
 import click
-import tensorflow as tf
-
-from src.app.tf2_magenta_model import create_drum_model
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,6 +25,10 @@ def convert_tf1_checkpoint_to_tf2(checkpoint_path: str, output_path: str):
         output_path: Path to save TF2 weights (.h5 file)
     """
     logger.info(f"Loading TF1 checkpoint from: {checkpoint_path}")
+
+    import tensorflow as tf
+
+    from src.app.tf2_magenta_model import create_drum_model
 
     # Create the TF2 model
     model = create_drum_model()
@@ -147,6 +148,8 @@ def convert_tf1_checkpoint_to_tf2(checkpoint_path: str, output_path: str):
 )
 def main(checkpoint_path: str, output_path: str, test: bool, verbose: bool):
     """Convert a TF1 checkpoint to TF2 weights using the drum model."""
+    import tensorflow as tf
+
     if verbose:
         logger.setLevel(logging.DEBUG)
 
