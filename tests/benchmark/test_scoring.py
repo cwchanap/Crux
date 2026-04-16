@@ -85,3 +85,13 @@ def test_alignment_recovers_offsets_beyond_previous_search_window():
     assert result.raw.summary.true_positives == 0
     assert result.aligned.summary.true_positives == 2
     assert round(result.aligned.summary.offset_sec, 3) == -0.3
+
+
+def test_alignment_chooses_stable_offset_for_symmetric_tie():
+    ground_truth = [event(1.0, "kick", "ground_truth"), event(2.0, "kick", "ground_truth")]
+    predictions = [event(0.9, "kick", "prediction_a"), event(2.1, "kick", "prediction_b")]
+
+    result = score_events_with_alignment(ground_truth, predictions, tolerance_sec=0.05)
+
+    assert result.aligned.summary.true_positives == 1
+    assert round(result.aligned.summary.offset_sec, 3) == -0.1

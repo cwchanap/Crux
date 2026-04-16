@@ -133,13 +133,14 @@ def _choose_global_offset(
 
     best_offset = 0.0
     best_score = (-1, float("-inf"), float("-inf"))
-    for offset in candidates:
+    for offset in sorted(candidates):
         result = score_events(ground_truth, predictions, tolerance_sec, offset_sec=offset)
         median_error = result.summary.median_abs_error_sec
+        offset_magnitude = round(abs(offset), 12)
         score = (
             result.summary.true_positives,
             -median_error if median_error is not None else 0.0,
-            -abs(offset),
+            -offset_magnitude,
         )
         if score > best_score:
             best_score = score
