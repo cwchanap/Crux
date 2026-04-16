@@ -38,12 +38,39 @@ def test_parse_bpm_table_and_bpm_channels():
     ]
 
 
+def test_parse_bpm_table_reference_defined_later():
+    text = "\n".join(
+        [
+            "#BPM: 120",
+            "#00008: 0100",
+            "#BPM01: 180",
+        ]
+    )
+
+    chart = parse_dtx_text(text, chart_id="tempo-late")
+
+    assert chart.bpm_table == {"01": 180.0}
+    assert [(event.measure, event.position, event.bpm) for event in chart.bpm_events] == [
+        (0, 0.0, 180.0),
+    ]
+    assert chart.warnings == []
+
+
 def test_parse_measure_length_carries_forward_metadata():
     text = "#BPM: 120\n#00102: 0.5\n#00302: 1.5\n#00111: 0100\n"
 
     chart = parse_dtx_text(text, chart_id="length")
 
     assert chart.measure_lengths == {1: 0.5, 3: 1.5}
+
+
+def test_parse_text_strips_utf8_bom_from_first_header():
+    text = "\ufeff#TITLE: Song\n#BPM: 120\n"
+
+    chart = parse_dtx_text(text, chart_id="bom")
+
+    assert chart.title == "Song"
+    assert chart.base_bpm == 120.0
 
 
 def test_parse_file_tries_shift_jis(tmp_path: Path):
