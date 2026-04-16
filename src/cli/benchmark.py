@@ -5,7 +5,7 @@ from pathlib import Path
 import click
 
 from src.benchmark.corpus import validate_score_midi_corpus
-from src.benchmark.runner import run_score_midi
+from src.benchmark.runner import export_reference_midis, run_score_midi
 from src.cli.options import (
     charts_dir_option,
     output_dir_option,
@@ -71,9 +71,12 @@ def inspect_dtx(dtx_path: Path) -> None:
 
 
 @benchmark.command("export-reference-midi")
-def export_reference_midi() -> None:
+@charts_dir_option
+@output_dir_option
+def export_reference_midi(charts_dir: Path, output_dir: Path) -> None:
     """Export benchmark-owned reference MIDI artifacts."""
-    raise click.ClickException("export-reference-midi is planned but not implemented yet")
+    count = export_reference_midis(charts_dir, output_dir)
+    click.echo(f"Wrote {count} reference MIDI file(s)")
 
 
 @benchmark.command("transcribe-and-score")
