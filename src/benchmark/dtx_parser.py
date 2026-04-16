@@ -46,6 +46,7 @@ def parse_dtx_file(path: Path, chart_id: str | None = None) -> ParsedDtxChart:
 
 
 def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
+    text = text.removeprefix("\ufeff")
     title = ""
     artist = ""
     base_bpm = 120.0
@@ -53,6 +54,7 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
     measure_lengths: dict[int, float] = {}
     events: list[DtxEvent] = []
     bpm_events: list[DtxBpmEvent] = []
+    pending_table_bpm_events: list[tuple[int, str]] = []
     warnings: list[str] = []
 
     for raw_line in text.splitlines():
@@ -71,7 +73,7 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
             elif channel == "03":
                 bpm_events.extend(_parse_direct_bpm_events(measure, value))
             elif channel == "08":
-                bpm_events.extend(_parse_table_bpm_events(measure, value, bpm_table, warnings))
+                pending_table_bpm_events.append((measure, value))
             else:
                 events.extend(_parse_note_events(chart_id, measure, channel, value))
             continue
@@ -89,6 +91,9 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
             base_bpm = _parse_positive_float(value, "base BPM")
         elif key.startswith("BPM") and len(key) == 5:
             bpm_table[key[3:].upper()] = _parse_positive_float(value, key)
+
+    for measure, value in pending_table_bpm_events:
+        bpm_events.extend(_parse_table_bpm_events(measure, value, bpm_table, warnings))
 
     return ParsedDtxChart(
         chart_id=chart_id,
