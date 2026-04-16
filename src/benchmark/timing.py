@@ -75,12 +75,14 @@ def _tempo_points(
     current_time = 0.0
     previous_beat = points[0][0]
     previous_bpm = points[0][1]
+    beat_zero_overridden = False
     for beat, bpm in points:
         if resolved and math.isclose(beat, resolved[-1][0], abs_tol=1e-9):
-            if math.isclose(beat, 0.0, abs_tol=1e-9):
+            if math.isclose(beat, 0.0, abs_tol=1e-9) and not beat_zero_overridden:
                 resolved[-1] = (beat, current_time, bpm)
                 previous_beat = beat
                 previous_bpm = bpm
+                beat_zero_overridden = True
                 continue
             raise ValueError(f"duplicate tempo events at beat {beat}")
         if beat > previous_beat:

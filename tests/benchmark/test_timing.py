@@ -44,3 +44,13 @@ def test_beat_zero_bpm_event_overrides_seeded_base_tempo():
     timed = dtx_events_to_timed_events(chart)
 
     assert timed[0].time_sec == 4.0
+
+
+def test_multiple_beat_zero_bpm_events_raise_error():
+    chart = parse_dtx_text(
+        "#BPM: 120\n#BPM01: 60\n#00003: 01\n#00008: 01\n#00111: 01\n",
+        "song",
+    )
+
+    with pytest.raises(ValueError, match="duplicate tempo events at beat 0.0"):
+        dtx_events_to_timed_events(chart)
