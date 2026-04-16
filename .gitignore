@@ -3,6 +3,7 @@ audio/
 temp_uploads/
 temp_downloads/
 .venv/
+.worktrees/
 
 models/
 static/assets/
