@@ -61,7 +61,7 @@ def map_dtx_events(
     events: list[BenchmarkEvent],
     lane_map: dict[str, DtxClassMapping] | None = None,
 ) -> tuple[list[BenchmarkEvent], MappingDiagnostics]:
-    lane_map = lane_map or DEFAULT_DTX_LANE_MAP
+    lane_map = DEFAULT_DTX_LANE_MAP if lane_map is None else lane_map
     mapped: list[BenchmarkEvent] = []
     unmapped: dict[str, int] = {}
     for event in events:
@@ -89,7 +89,7 @@ def map_midi_events(
     events: list[BenchmarkEvent],
     note_map: dict[int, str] | None = None,
 ) -> tuple[list[BenchmarkEvent], MappingDiagnostics]:
-    note_map = note_map or DEFAULT_MIDI_NOTE_MAP
+    note_map = DEFAULT_MIDI_NOTE_MAP if note_map is None else note_map
     mapped: list[BenchmarkEvent] = []
     unmapped: dict[str, int] = {}
     for event in events:
