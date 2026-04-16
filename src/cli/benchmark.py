@@ -6,8 +6,9 @@ import click
 
 from src.benchmark.corpus import validate_score_midi_corpus
 from src.benchmark.dtx_parser import parse_dtx_file
-from src.benchmark.runner import export_reference_midis, run_score_midi
+from src.benchmark.runner import export_reference_midis, run_score_midi, run_transcribe_and_score
 from src.cli.options import (
+    audio_dir_option,
     charts_dir_option,
     output_dir_option,
     predictions_dir_option,
@@ -89,6 +90,18 @@ def export_reference_midi(charts_dir: Path, output_dir: Path) -> None:
 
 
 @benchmark.command("transcribe-and-score")
-def transcribe_and_score() -> None:
+@charts_dir_option
+@audio_dir_option
+@output_dir_option
+@tolerance_option
+def transcribe_and_score(
+    charts_dir: Path,
+    audio_dir: Path,
+    output_dir: Path,
+    tolerance_ms: tuple[int, ...],
+) -> None:
     """Run transcription and score generated MIDI."""
-    raise click.ClickException("transcribe-and-score is planned but not implemented yet")
+    reports = run_transcribe_and_score(charts_dir, audio_dir, output_dir, list(tolerance_ms))
+    click.echo(
+        f"Wrote benchmark reports for {len({report.chart_id for report in reports})} chart(s)"
+    )
