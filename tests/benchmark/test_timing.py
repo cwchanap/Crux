@@ -1,3 +1,5 @@
+import pytest
+
 from src.benchmark.dtx_parser import parse_dtx_text
 from src.benchmark.timing import dtx_events_to_timed_events
 
@@ -24,3 +26,13 @@ def test_bpm_change_affects_following_segments():
     timed = dtx_events_to_timed_events(chart)
 
     assert timed[0].time_sec == 6.0
+
+
+def test_same_beat_bpm_events_raise_error():
+    chart = parse_dtx_text(
+        "#BPM: 120\n#BPM01: 150\n#00103: 0100\n#00108: 0100\n#00211: 0100\n",
+        "song",
+    )
+
+    with pytest.raises(ValueError, match="duplicate tempo events at beat 4.0"):
+        dtx_events_to_timed_events(chart)
