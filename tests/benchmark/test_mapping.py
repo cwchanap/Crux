@@ -37,6 +37,15 @@ def test_map_dtx_events_respects_explicit_empty_lane_map():
     assert diagnostics.unmapped == {"13": 1}
 
 
+def test_map_midi_events_maps_known_note_and_preserves_event_structure():
+    event = BenchmarkEvent("song", 1.25, "unknown", "prediction", {"midi_note": 36})
+
+    mapped, diagnostics = map_midi_events([event])
+
+    assert mapped == [BenchmarkEvent("song", 1.25, "kick", "prediction", {"midi_note": 36})]
+    assert diagnostics.unmapped == {}
+
+
 def test_map_midi_events_respects_explicit_empty_note_map():
     event = BenchmarkEvent("song", 0.0, "unknown", "prediction", {"midi_note": 36})
 
