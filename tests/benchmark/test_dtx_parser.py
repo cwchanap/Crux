@@ -4,19 +4,25 @@ from src.benchmark.dtx_parser import parse_dtx_file, parse_dtx_text
 
 
 def test_parse_notes_with_lf_or_crlf():
-    text = "#TITLE: Song\n#BPM: 120\n#00011: 01000002\n#00012: 00010000\n"
+    for newline in ("\n", "\r\n"):
+        text = (
+            f"#TITLE: Song{newline}"
+            f"#BPM: 120{newline}"
+            f"#00011: 01000002{newline}"
+            f"#00012: 00010000{newline}"
+        )
 
-    chart = parse_dtx_text(text, chart_id="song")
+        chart = parse_dtx_text(text, chart_id="song")
 
-    assert chart.title == "Song"
-    assert chart.base_bpm == 120.0
-    assert [
-        (event.measure, event.position, event.lane_id, event.note_id) for event in chart.events
-    ] == [
-        (0, 0.0, "11", "01"),
-        (0, 0.25, "12", "01"),
-        (0, 0.75, "11", "02"),
-    ]
+        assert chart.title == "Song"
+        assert chart.base_bpm == 120.0
+        assert [
+            (event.measure, event.position, event.lane_id, event.note_id) for event in chart.events
+        ] == [
+            (0, 0.0, "11", "01"),
+            (0, 0.25, "12", "01"),
+            (0, 0.75, "11", "02"),
+        ]
 
 
 def test_parse_bpm_table_and_bpm_channels():
