@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pretty_midi
 
-from src.benchmark.runner import run_score_midi
+from src.benchmark.runner import run_score_midi, run_transcribe_and_score
 
 
 def write_prediction(path: Path):
@@ -25,3 +25,23 @@ def test_run_score_midi_writes_summary(tmp_path: Path):
     run_score_midi(charts, predictions, output, tolerance_ms=[50], align=True)
 
     assert (output / "summary.json").exists()
+
+
+def test_transcribe_and_score_uses_injected_transcriber(tmp_path: Path):
+    charts = tmp_path / "charts"
+    audio = tmp_path / "audio"
+    output = tmp_path / "out"
+    charts.mkdir()
+    audio.mkdir()
+    (charts / "foo.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+    (audio / "foo.wav").write_bytes(b"fake wav")
+
+    def fake_transcribe(audio_path: Path) -> bytes:
+        midi_path = tmp_path / "prediction.mid"
+        write_prediction(midi_path)
+        return midi_path.read_bytes()
+
+    reports = run_transcribe_and_score(charts, audio, output, [50], transcribe=fake_transcribe)
+
+    assert reports[0].chart_id == "foo"
+    assert (output / "predictions" / "foo.mid").exists()
