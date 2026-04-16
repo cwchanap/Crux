@@ -99,3 +99,51 @@ def _percentile(values: list[float], percentile: float) -> float:
         raise ValueError("values must not be empty")
     index = min(len(values) - 1, ceil((len(values) - 1) * percentile))
     return values[index]
+
+
+@dataclass(frozen=True)
+class AlignedScoreResult:
+    raw: ScoreResult
+    aligned: ScoreResult
+
+
+def score_events_with_alignment(
+    ground_truth: list[BenchmarkEvent],
+    predictions: list[BenchmarkEvent],
+    tolerance_sec: float,
+) -> AlignedScoreResult:
+    raw = score_events(ground_truth, predictions, tolerance_sec)
+    offset = _choose_global_offset(ground_truth, predictions, tolerance_sec)
+    aligned = score_events(ground_truth, predictions, tolerance_sec, offset_sec=offset)
+    return AlignedScoreResult(raw=raw, aligned=aligned)
+
+
+def _choose_global_offset(
+    ground_truth: list[BenchmarkEvent],
+    predictions: list[BenchmarkEvent],
+    tolerance_sec: float,
+) -> float:
+    candidates = {0.0}
+    search_window = max(tolerance_sec * 4, 0.25)
+    for gt_event in ground_truth:
+        for prediction in predictions:
+            if gt_event.canonical_class != prediction.canonical_class:
+                continue
+            offset = gt_event.time_sec - prediction.time_sec
+            if abs(offset) <= search_window:
+                candidates.add(offset)
+
+    best_offset = 0.0
+    best_score = (-1, float("-inf"), float("-inf"))
+    for offset in candidates:
+        result = score_events(ground_truth, predictions, tolerance_sec, offset_sec=offset)
+        median_error = result.summary.median_abs_error_sec
+        score = (
+            result.summary.true_positives,
+            -median_error if median_error is not None else 0.0,
+            -abs(offset),
+        )
+        if score > best_score:
+            best_score = score
+            best_offset = offset
+    return best_offset

@@ -1,7 +1,7 @@
 import pytest
 
 from src.benchmark.models import BenchmarkEvent
-from src.benchmark.scoring import score_events
+from src.benchmark.scoring import score_events, score_events_with_alignment
 
 
 def event(time_sec: float, canonical_class: str, source: str) -> BenchmarkEvent:
@@ -63,3 +63,14 @@ def test_equal_distance_candidates_choose_lowest_sorted_index():
 
     assert result.matches[0].prediction.source == "prediction_a"
     assert [prediction.source for prediction in result.unmatched_predictions] == ["prediction_b"]
+
+
+def test_alignment_applies_single_global_offset():
+    ground_truth = [event(1.0, "kick", "ground_truth"), event(2.0, "snare", "ground_truth")]
+    predictions = [event(1.1, "kick", "prediction"), event(2.1, "snare", "prediction")]
+
+    result = score_events_with_alignment(ground_truth, predictions, tolerance_sec=0.05)
+
+    assert result.raw.summary.true_positives == 0
+    assert result.aligned.summary.true_positives == 2
+    assert round(result.aligned.summary.offset_sec, 3) == -0.1
