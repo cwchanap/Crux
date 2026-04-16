@@ -124,14 +124,12 @@ def _choose_global_offset(
     tolerance_sec: float,
 ) -> float:
     candidates = {0.0}
-    search_window = max(tolerance_sec * 4, 0.25)
     for gt_event in ground_truth:
         for prediction in predictions:
             if gt_event.canonical_class != prediction.canonical_class:
                 continue
             offset = gt_event.time_sec - prediction.time_sec
-            if abs(offset) <= search_window:
-                candidates.add(offset)
+            candidates.add(offset)
 
     best_offset = 0.0
     best_score = (-1, float("-inf"), float("-inf"))
