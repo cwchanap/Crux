@@ -2,6 +2,7 @@ from src.benchmark.mapping import (
     DEFAULT_DTX_LANE_MAP,
     DEFAULT_MIDI_NOTE_MAP,
     map_dtx_events,
+    map_midi_events,
 )
 from src.benchmark.models import BenchmarkEvent
 
@@ -25,3 +26,21 @@ def test_map_dtx_event_replaces_lane_class_and_preserves_native_metadata():
     assert mapped[0].canonical_class == "kick"
     assert mapped[0].metadata["native_class"] == "kick"
     assert diagnostics.unmapped == {}
+
+
+def test_map_dtx_events_respects_explicit_empty_lane_map():
+    event = BenchmarkEvent("song", 0.0, "13", "ground_truth", {"lane_id": "13"})
+
+    mapped, diagnostics = map_dtx_events([event], lane_map={})
+
+    assert mapped == []
+    assert diagnostics.unmapped == {"13": 1}
+
+
+def test_map_midi_events_respects_explicit_empty_note_map():
+    event = BenchmarkEvent("song", 0.0, "unknown", "prediction", {"midi_note": 36})
+
+    mapped, diagnostics = map_midi_events([event], note_map={})
+
+    assert mapped == []
+    assert diagnostics.unmapped == {"36": 1}
