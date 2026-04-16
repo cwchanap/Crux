@@ -21,12 +21,23 @@ class CorpusValidationResult:
         return not self.errors
 
 
-def _by_stem(directory: Path, suffixes: set[str]) -> dict[str, Path]:
+def _by_stem(directory: Path, suffixes: set[str]) -> tuple[dict[str, Path], list[str]]:
     paths: dict[str, Path] = {}
+    errors: list[str] = []
+    duplicate_stems: set[str] = set()
     for path in sorted(directory.iterdir()):
         if path.is_file() and path.suffix.lower() in suffixes:
-            paths[path.stem] = path
-    return paths
+            stem = path.stem
+            if stem in paths:
+                duplicate_stems.add(stem)
+                errors.append(f"duplicate files for chart_id {stem}")
+                continue
+            paths[stem] = path
+
+    for stem in duplicate_stems:
+        paths.pop(stem, None)
+
+    return paths, errors
 
 
 def discover_score_midi_items(charts_dir: Path, predictions_dir: Path) -> list[ScoreMidiItem]:
@@ -37,8 +48,10 @@ def validate_score_midi_corpus(charts_dir: Path, predictions_dir: Path) -> Corpu
     errors: list[str] = []
     valid_items: list[ScoreMidiItem] = []
 
-    chart_paths = _by_stem(charts_dir, {".dtx", ".txt"})
-    prediction_paths = _by_stem(predictions_dir, {".mid", ".midi"})
+    chart_paths, chart_errors = _by_stem(charts_dir, {".dtx", ".txt"})
+    prediction_paths, prediction_errors = _by_stem(predictions_dir, {".mid", ".midi"})
+    errors.extend(chart_errors)
+    errors.extend(prediction_errors)
 
     for chart_id, dtx_path in chart_paths.items():
         prediction_path = prediction_paths.get(chart_id)
