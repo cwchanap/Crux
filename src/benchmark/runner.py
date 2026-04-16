@@ -46,3 +46,14 @@ def run_score_midi(
 
     write_reports(reports, output_dir)
     return reports
+
+
+def export_reference_midis(charts_dir: Path, output_dir: Path) -> int:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for dtx_path in sorted(charts_dir.glob("*.dtx")):
+        chart = parse_dtx_file(dtx_path, chart_id=dtx_path.stem)
+        ground_truth, _ = map_dtx_events(dtx_events_to_timed_events(chart))
+        write_reference_midi(ground_truth, output_dir / f"{dtx_path.stem}.mid")
+        count += 1
+    return count

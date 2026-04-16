@@ -64,3 +64,25 @@ def test_validate_corpus_reports_missing_prediction(tmp_path: Path):
 
     assert result.exit_code == 1
     assert "missing prediction MIDI" in result.output
+
+
+def test_export_reference_midi_command_writes_files(tmp_path: Path):
+    charts = tmp_path / "charts"
+    output = tmp_path / "out"
+    charts.mkdir()
+    (charts / "foo.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "export-reference-midi",
+            "--charts-dir",
+            str(charts),
+            "--output-dir",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert (output / "foo.mid").exists()
