@@ -86,3 +86,15 @@ def test_export_reference_midi_command_writes_files(tmp_path: Path):
 
     assert result.exit_code == 0
     assert (output / "foo.mid").exists()
+
+
+def test_inspect_dtx_outputs_counts(tmp_path: Path):
+    chart = tmp_path / "foo.dtx"
+    chart.write_text("#BPM: 120\n#BPM01: 180\n#00008: 0100\n#00013: 0100\n", encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["benchmark", "inspect-dtx", str(chart)])
+
+    assert result.exit_code == 0
+    assert "chart_id: foo" in result.output
+    assert "events: 1" in result.output
+    assert "bpm_events: 1" in result.output
