@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import ceil
 from statistics import median
 
 from src.benchmark.models import BenchmarkEvent, MatchResult, ScoreSummary
@@ -76,11 +77,11 @@ def _match_class(
     for gt_event in ground_truth:
         best_index = None
         best_error = None
-        for pred_index in list(available_predictions):
+        for pred_index in sorted(available_predictions):
             error = predictions[pred_index].time_sec - gt_event.time_sec
             if abs(error) > tolerance_sec:
                 continue
-            if best_error is None or abs(error) < abs(best_error):
+            if best_error is None or (abs(error), pred_index) < (abs(best_error), best_index):
                 best_index = pred_index
                 best_error = error
         if best_index is None or best_error is None:
@@ -96,5 +97,5 @@ def _match_class(
 def _percentile(values: list[float], percentile: float) -> float:
     if not values:
         raise ValueError("values must not be empty")
-    index = min(len(values) - 1, round((len(values) - 1) * percentile))
+    index = min(len(values) - 1, ceil((len(values) - 1) * percentile))
     return values[index]
