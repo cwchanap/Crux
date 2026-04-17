@@ -41,6 +41,31 @@ def test_prepare_corpus_command_writes_parsed_files(tmp_path: Path):
     assert (output / "manifest.json").exists()
 
 
+def test_prepare_corpus_defaults_output_dir_from_raw_dir_name(tmp_path: Path, monkeypatch):
+    raw = tmp_path / "Test DTX"
+    song = raw / "Soukyuu e no shouka"
+    expected_output = tmp_path / "artifacts" / "benchmark" / "Test DTX"
+    monkeypatch.chdir(tmp_path)
+    song.mkdir(parents=True)
+    (song / "mas.dtx").write_text("#BPM: 120\n", encoding="utf-8")
+    (song / "drum.mp3").write_bytes(b"drums")
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "prepare-corpus",
+            "--raw-dir",
+            str(raw),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert (expected_output / "charts" / "Soukyuu e no shouka.dtx").exists()
+    assert (expected_output / "audio" / "Soukyuu e no shouka.mp3").exists()
+    assert (expected_output / "manifest.json").exists()
+
+
 def test_score_midi_command_runs(tmp_path: Path):
     charts = tmp_path / "charts"
     predictions = tmp_path / "predictions"
@@ -68,6 +93,36 @@ def test_score_midi_command_runs(tmp_path: Path):
 
     assert result.exit_code == 0
     assert (output / "summary.json").exists()
+
+
+def test_score_midi_defaults_output_dir_from_run_name(tmp_path: Path, monkeypatch):
+    charts = tmp_path / "parsed" / "charts"
+    predictions = tmp_path / "parsed" / "predictions"
+    expected_output = tmp_path / "artifacts" / "benchmark" / "soukyuu-stem-test"
+    monkeypatch.chdir(tmp_path)
+    charts.mkdir(parents=True)
+    predictions.mkdir(parents=True)
+    (charts / "foo.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+    write_prediction(predictions / "foo.mid")
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "score-midi",
+            "--charts-dir",
+            str(charts),
+            "--predictions-dir",
+            str(predictions),
+            "--run-name",
+            "soukyuu-stem-test",
+            "--tolerance-ms",
+            "50",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert (expected_output / "summary.json").exists()
 
 
 def test_validate_corpus_reports_missing_prediction(tmp_path: Path):
