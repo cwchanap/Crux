@@ -42,6 +42,8 @@ class DrumTranscriber:
 
     # Magenta E-GMD drum model checkpoint URL
     MODEL_URL = "https://storage.googleapis.com/magentadata/models/onsets_frames_transcription/e-gmd_checkpoint.zip"
+    TF2_WEIGHTS_RELATIVE_PATH = Path("models/e-gmd/tf2_model.weights.h5")
+    CHECKPOINT_RELATIVE_PATH = Path("models/e-gmd/train/model.ckpt-10000")
 
     def __init__(
         self,
@@ -81,11 +83,10 @@ class DrumTranscriber:
 
         if load_model:
             if model_path is None:
-                # Check for converted TF2 weights first
-                tf2_weights_path = "models/e-gmd/tf2_model.weights.h5"
-                if os.path.exists(tf2_weights_path):
-                    self.model_path = tf2_weights_path
-                    logger.info("Found converted TF2 weights at %s", tf2_weights_path)
+                existing_weights_path = self._resolve_existing_path(self.TF2_WEIGHTS_RELATIVE_PATH)
+                if existing_weights_path is not None:
+                    self.model_path = str(existing_weights_path)
+                    logger.info("Found converted TF2 weights at %s", existing_weights_path)
                 else:
                     # Download E-GMD model if not provided
                     self.model_path = self._download_model()
@@ -100,10 +101,47 @@ class DrumTranscriber:
             # Skip model initialization entirely (used for tests)
             self.model = None
 
-    def _download_model(self) -> str:
+    @classmethod
+    def _resolve_existing_path(cls, relative_path: Path) -> Path | None:
+        """Resolve project assets from the current repo or the shared workspace root."""
+        repo_root = Path(__file__).resolve().parents[2]
+        search_anchors = [Path.cwd().resolve(), repo_root]
+        checked: set[Path] = set()
+
+        for anchor in search_anchors:
+            for candidate_root in [anchor, *anchor.parents]:
+                if candidate_root in checked:
+                    continue
+                checked.add(candidate_root)
+
+                candidate_path = candidate_root / relative_path
+                if candidate_path.exists():
+                    return candidate_path
+
+                if candidate_root.name == ".worktrees":
+                    shared_root_path = candidate_root.parent / relative_path
+                    if shared_root_path.exists():
+                        return shared_root_path
+
+        return None
+
+    @classmethod
+    def _shared_models_dir(cls) -> Path:
+        """Store models in the shared workspace root when running from a worktree."""
+        repo_root = Path(__file__).resolve().parents[2]
+        current_dir = Path.cwd().resolve()
+
+        for anchor in (current_dir, repo_root):
+            for candidate_root in [anchor, *anchor.parents]:
+                if candidate_root.name == ".worktrees":
+                    return candidate_root.parent / "models" / "e-gmd"
+
+        return repo_root / "models" / "e-gmd"
+
+    def _download_model(self) -> str | None:
         """Download the E-GMD model checkpoint if not already present"""
-        model_dir = Path("models/e-gmd")
-        checkpoint_path = model_dir / "train/model.ckpt-10000"
+        model_dir = self._shared_models_dir()
+        checkpoint_path = model_dir / "train" / "model.ckpt-10000"
 
         if checkpoint_path.with_suffix(".index").exists():
             logger.info("E-GMD model already downloaded")
@@ -165,10 +203,9 @@ class DrumTranscriber:
             # Create the TF2 model
             model = create_drum_model()
 
-            # Check for converted TF2 weights first
-            tf2_weights_path = "models/e-gmd/tf2_model.weights.h5"
-            if os.path.exists(tf2_weights_path):
-                model.load_weights(tf2_weights_path)
+            tf2_weights_path = self._resolve_existing_path(self.TF2_WEIGHTS_RELATIVE_PATH)
+            if tf2_weights_path is not None:
+                model.load_weights(str(tf2_weights_path))
                 logger.info("Loaded converted TF2 weights from %s", tf2_weights_path)
                 return model
 
