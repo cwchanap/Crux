@@ -5,6 +5,7 @@ Directly loads the checkpoint without requiring full Magenta installation
 
 import logging
 import os
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -128,9 +129,6 @@ class DrumTranscriber:
                 with open(zip_path, "wb") as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
-
-                # Extract the checkpoint
-                import zipfile
 
                 with zipfile.ZipFile(zip_path, "r") as zip_ref:
                     zip_ref.extractall(model_dir)
