@@ -95,3 +95,13 @@ def test_alignment_chooses_stable_offset_for_symmetric_tie():
 
     assert result.aligned.summary.true_positives == 1
     assert round(result.aligned.summary.offset_sec, 3) == -0.1
+
+
+def test_alignment_refines_offset_beyond_histogram_bin():
+    ground_truth = [event(1.0, "kick", "ground_truth"), event(2.0, "snare", "ground_truth")]
+    predictions = [event(1.123, "kick", "prediction"), event(2.123, "snare", "prediction")]
+
+    result = score_events_with_alignment(ground_truth, predictions, tolerance_sec=0.05)
+
+    assert result.aligned.summary.true_positives == 2
+    assert round(result.aligned.summary.offset_sec, 3) == -0.123
