@@ -6,12 +6,14 @@ import click
 
 from src.benchmark.corpus import validate_score_midi_corpus
 from src.benchmark.dtx_parser import parse_dtx_file
+from src.benchmark.prepare import prepare_corpus
 from src.benchmark.runner import export_reference_midis, run_score_midi, run_transcribe_and_score
 from src.cli.options import (
     audio_dir_option,
     charts_dir_option,
     output_dir_option,
     predictions_dir_option,
+    raw_dir_option,
     tolerance_option,
 )
 
@@ -19,6 +21,18 @@ from src.cli.options import (
 @click.group()
 def benchmark() -> None:
     """Benchmark drum transcription against DTX ground truth."""
+
+
+@benchmark.command("prepare-corpus")
+@raw_dir_option
+@output_dir_option
+def prepare_benchmark_corpus(raw_dir: Path, output_dir: Path) -> None:
+    """Convert raw song folders into the parsed benchmark corpus format."""
+    result = prepare_corpus(raw_dir, output_dir)
+    click.echo(
+        f"Prepared {len(result.valid_items)} benchmark item(s); "
+        f"skipped {len(result.invalid_items)} invalid folder(s)"
+    )
 
 
 @benchmark.command("score-midi")
