@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import requests
 import soundfile as sf
 
 from src.app.transcriber import DrumTranscriber
@@ -34,6 +35,24 @@ async def test_transcribe_fallback_uses_onset_detection(monkeypatch, tmp_path):
     assert midi_bytes[:4] == b"MThd"
     # Progress should have advanced
     assert jobs_store[job_id]["progress"] >= 70
+
+
+def test_init_falls_back_when_model_download_fails(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+
+    class FailingResponse:
+        def raise_for_status(self):
+            raise requests.HTTPError("404 Client Error")
+
+    def fake_get(*args, **kwargs):
+        return FailingResponse()
+
+    monkeypatch.setattr("src.app.transcriber.requests.get", fake_get)
+
+    transcriber = DrumTranscriber(load_model=True)
+
+    assert transcriber.model_path is None
+    assert transcriber.model is None
 
 
 def test_compute_spectrogram_shape():
