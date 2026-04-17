@@ -2,6 +2,7 @@ __pycache__
 audio/
 temp_uploads/
 temp_downloads/
+artifacts/
 .venv/
 .worktrees/
 
