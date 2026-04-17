@@ -14,6 +14,33 @@ def write_prediction(path: Path):
     midi.write(str(path))
 
 
+def test_prepare_corpus_command_writes_parsed_files(tmp_path: Path):
+    raw = tmp_path / "raw"
+    song = raw / "Soukyuu e no shouka"
+    output = tmp_path / "parsed"
+    song.mkdir(parents=True)
+    (song / "adv.dtx").write_text("#BPM: 120\n", encoding="utf-8")
+    (song / "mas.dtx").write_text("#BPM: 120\n", encoding="utf-8")
+    (song / "2 Drums.mp3").write_bytes(b"drums")
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "prepare-corpus",
+            "--raw-dir",
+            str(raw),
+            "--output-dir",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert (output / "charts" / "Soukyuu e no shouka.dtx").exists()
+    assert (output / "audio" / "Soukyuu e no shouka.mp3").exists()
+    assert (output / "manifest.json").exists()
+
+
 def test_score_midi_command_runs(tmp_path: Path):
     charts = tmp_path / "charts"
     predictions = tmp_path / "predictions"

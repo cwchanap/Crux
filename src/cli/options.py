@@ -13,6 +13,10 @@ def charts_dir_option(function: F) -> F:
     return click.option("--charts-dir", type=click.Path(path_type=Path), required=True)(function)
 
 
+def raw_dir_option(function: F) -> F:
+    return click.option("--raw-dir", type=click.Path(path_type=Path), required=True)(function)
+
+
 def audio_dir_option(function: F) -> F:
     return click.option("--audio-dir", type=click.Path(path_type=Path), required=True)(function)
 
