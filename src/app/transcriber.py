@@ -44,6 +44,9 @@ class DrumTranscriber:
     MODEL_URL = "https://storage.googleapis.com/magentadata/models/onsets_frames_transcription/e-gmd_checkpoint.zip"
     TF2_WEIGHTS_RELATIVE_PATH = Path("models/e-gmd/tf2_model.weights.h5")
     CHECKPOINT_RELATIVE_PATH = Path("models/e-gmd/train/model.ckpt-10000")
+    MODEL_SAMPLE_RATE = 16000
+    MODEL_ONSET_THRESHOLD = 0.7
+    MODEL_ONSET_MIN_GAP_FRAMES = 5
 
     def __init__(
         self,
@@ -493,7 +496,7 @@ class DrumTranscriber:
             outputs = self.model(spec_input, training=False)
 
             # Process outputs to drum events
-            drum_events = self._process_tf2_model_outputs(outputs, sr)
+            drum_events = self._process_tf2_model_outputs(outputs, self.MODEL_SAMPLE_RATE)
 
             return drum_events
         except Exception as e:  # pylint: disable=broad-except
@@ -660,9 +663,9 @@ class DrumTranscriber:
     def _compute_spectrogram_for_model(self, audio: np.ndarray, sr: int) -> np.ndarray:
         """Compute mel spectrogram for TF2 model input"""
         # Resample to 16kHz if needed (standard for Magenta models)
-        if sr != 16000:
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
-            sr = 16000
+        if sr != self.MODEL_SAMPLE_RATE:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=self.MODEL_SAMPLE_RATE)
+            sr = self.MODEL_SAMPLE_RATE
 
         # Compute mel spectrogram
         mel_spec = librosa.feature.melspectrogram(
@@ -719,7 +722,11 @@ class DrumTranscriber:
                 pitch_velocities = velocity_values[:, pitch]
 
                 # Find onset peaks with threshold
-                onset_indices = self._find_onset_peaks(pitch_onsets, threshold=0.3)
+                onset_indices = self._find_onset_peaks(
+                    pitch_onsets,
+                    threshold=self.MODEL_ONSET_THRESHOLD,
+                    min_gap_frames=self.MODEL_ONSET_MIN_GAP_FRAMES,
+                )
 
                 # Get velocities for detected onsets
                 if len(onset_indices) > 0:
@@ -733,21 +740,25 @@ class DrumTranscriber:
 
         return drum_events
 
-    def _find_onset_peaks(self, signal: np.ndarray, threshold: float = 0.3) -> np.ndarray:
+    def _find_onset_peaks(
+        self,
+        signal: np.ndarray,
+        threshold: float = 0.3,
+        min_gap_frames: int = 1,
+    ) -> np.ndarray:
         """Find peaks in a signal above threshold"""
-        above_threshold = signal > threshold
-
-        # Find where signal crosses threshold
-        diff = np.diff(np.concatenate(([False], above_threshold, [False])).astype(int))
-        starts = np.where(diff == 1)[0]
-        ends = np.where(diff == -1)[0]
-
-        # Find peaks within each above-threshold region
         peaks = []
-        for start, end in zip(starts, ends):
-            segment = signal[start:end]
-            if len(segment) > 0:
-                peak_idx = start + np.argmax(segment)
-                peaks.append(peak_idx)
+        last_peak = -(10**9)
+        for idx in range(1, len(signal) - 1):
+            if signal[idx] < threshold:
+                continue
+            if signal[idx] <= signal[idx - 1]:
+                continue
+            if signal[idx] < signal[idx + 1]:
+                continue
+            if idx - last_peak < min_gap_frames:
+                continue
+            peaks.append(idx)
+            last_peak = idx
 
         return np.array(peaks)
