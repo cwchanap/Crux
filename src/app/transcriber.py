@@ -738,26 +738,16 @@ class DrumTranscriber:
         above_threshold = signal > threshold
 
         # Find where signal crosses threshold
-        diff = np.diff(np.concatenate(([False], above_threshold, [False])))
+        diff = np.diff(np.concatenate(([False], above_threshold, [False])).astype(int))
         starts = np.where(diff == 1)[0]
         ends = np.where(diff == -1)[0]
 
         # Find peaks within each above-threshold region
         peaks = []
         for start, end in zip(starts, ends):
-            # Extend search window slightly
-            start = max(0, start - 1)
-            end = min(len(signal), end + 1)
-
-            # Find local maxima
-            while end < len(signal) and signal[end] > signal[end - 1]:
-                end += 1
-
-            # Only find peak if we have a valid range
-            if end > start and end - start > 0:
-                segment = signal[start:end]
-                if len(segment) > 0:
-                    peak_idx = start + np.argmax(segment)
-                    peaks.append(peak_idx)
+            segment = signal[start:end]
+            if len(segment) > 0:
+                peak_idx = start + np.argmax(segment)
+                peaks.append(peak_idx)
 
         return np.array(peaks)

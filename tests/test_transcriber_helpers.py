@@ -7,9 +7,8 @@ def test_find_onset_peaks_simple():
     dt = DrumTranscriber(load_model=False)
     signal = np.array([0.1, 0.2, 0.6, 0.4, 0.1, 0.7, 0.6, 0.5, 0.1])
     peaks = dt._find_onset_peaks(signal, threshold=0.3)
-    # Validate return type and that indices (if any) are non-negative
     assert isinstance(peaks, np.ndarray)
-    assert (peaks >= 0).all()
+    assert peaks.tolist() == [2, 5]
 
 
 def test_find_onset_frames_simple():
