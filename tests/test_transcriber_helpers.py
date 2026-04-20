@@ -61,3 +61,49 @@ def test_run_tf2_model_inference_uses_model_sample_rate(monkeypatch):
     dt._run_tf2_model_inference(np.zeros(44100, dtype=np.float32), 44100)
 
     assert captured["sr"] == 16000
+
+
+def test_process_tf2_model_outputs_uses_calibrated_bin_mapping():
+    dt = DrumTranscriber(load_model=False)
+    onset_probs = np.zeros((1, 3, 88), dtype=np.float32)
+    velocity_values = np.zeros((1, 3, 88), dtype=np.float32)
+
+    calibrated_bins = {
+        78: 36,  # kick
+        63: 38,  # snare
+        7: 42,  # closed hihat
+        32: 46,  # open hihat
+        35: 49,  # crash
+        15: 51,  # ride
+        72: 41,  # low tom
+        57: 47,  # provisional mid tom
+        66: 50,  # high tom
+    }
+    ignored_bin = 44  # was previously used by the overlapping mapping
+
+    for model_bin in list(calibrated_bins) + [ignored_bin]:
+        onset_probs[0, 1, model_bin] = 0.9
+        velocity_values[0, 1, model_bin] = 0.5
+
+    class FakeTensor:
+        def __init__(self, value):
+            self._value = value
+
+        def numpy(self):
+            return self._value
+
+    outputs = {
+        "onset_probs": FakeTensor(onset_probs),
+        "velocity_values": FakeTensor(velocity_values),
+    }
+
+    drum_events = dt._process_tf2_model_outputs(outputs, sr=16000)
+
+    for midi_note in dt.drum_mapping:
+        expected_count = 1 if midi_note in calibrated_bins.values() else 0
+        assert len(drum_events[midi_note]) == expected_count
+
+    assert drum_events[36][0]["time"] == 512 / 16000
+    assert drum_events[36][0]["velocity"] == 63
+    assert len(drum_events[42]) == 1
+    assert len(drum_events[46]) == 1
