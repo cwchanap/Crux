@@ -47,6 +47,19 @@ class DrumTranscriber:
     MODEL_SAMPLE_RATE = 16000
     MODEL_ONSET_THRESHOLD = 0.7
     MODEL_ONSET_MIN_GAP_FRAMES = 5
+    # Empirically calibrated against the prepared benchmark corpus.
+    # Mid tom remains provisional until we calibrate against charts that contain it.
+    TF2_OUTPUT_BIN_TO_DRUM_MIDI = {
+        7: 42,
+        15: 51,
+        32: 46,
+        35: 49,
+        57: 47,
+        63: 38,
+        66: 50,
+        72: 41,
+        78: 36,
+    }
 
     def __init__(
         self,
@@ -694,49 +707,26 @@ class DrumTranscriber:
         onset_probs = outputs["onset_probs"].numpy()[0]
         velocity_values = outputs["velocity_values"].numpy()[0]
 
-        # Map piano keys to drum types (simplified mapping for E-GMD)
-        drum_key_ranges = {
-            36: range(35, 37),  # Kick drum
-            38: range(37, 41),  # Snare
-            42: range(41, 45),  # Hi-hat closed
-            46: range(44, 46),  # Hi-hat open
-            49: range(45, 52),  # Crash cymbal
-            51: range(50, 53),  # Ride
-            41: range(52, 55),  # Tom low
-            47: range(55, 58),  # Tom mid
-            50: range(58, 60),  # Tom high
-        }
-
-        # Process onsets for each drum type
         hop_length = 512
-        for drum_midi, key_range in drum_key_ranges.items():
+        for pitch, drum_midi in self.TF2_OUTPUT_BIN_TO_DRUM_MIDI.items():
             if drum_midi not in self.drum_mapping:
                 continue
+            if pitch >= onset_probs.shape[1]:
+                continue
 
-            for pitch in key_range:
-                if pitch >= onset_probs.shape[1]:
-                    continue
+            pitch_onsets = onset_probs[:, pitch]
+            pitch_velocities = velocity_values[:, pitch]
 
-                # Get onset probabilities for this pitch
-                pitch_onsets = onset_probs[:, pitch]
-                pitch_velocities = velocity_values[:, pitch]
+            onset_indices = self._find_onset_peaks(
+                pitch_onsets,
+                threshold=self.MODEL_ONSET_THRESHOLD,
+                min_gap_frames=self.MODEL_ONSET_MIN_GAP_FRAMES,
+            )
 
-                # Find onset peaks with threshold
-                onset_indices = self._find_onset_peaks(
-                    pitch_onsets,
-                    threshold=self.MODEL_ONSET_THRESHOLD,
-                    min_gap_frames=self.MODEL_ONSET_MIN_GAP_FRAMES,
-                )
-
-                # Get velocities for detected onsets
-                if len(onset_indices) > 0:
-                    for idx in onset_indices:
-                        onset_time = idx * hop_length / sr
-
-                        # Get velocity at onset frame
-                        velocity = int(np.clip(pitch_velocities[idx] * 127, 1, 127))
-
-                        drum_events[drum_midi].append({"time": onset_time, "velocity": velocity})
+            for idx in onset_indices:
+                onset_time = idx * hop_length / sr
+                velocity = int(np.clip(pitch_velocities[idx] * 127, 1, 127))
+                drum_events[drum_midi].append({"time": onset_time, "velocity": velocity})
 
         return drum_events
 
