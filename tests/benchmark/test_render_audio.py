@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import numpy as np
@@ -36,7 +37,17 @@ def test_plan_render_corpus_uses_highest_level_chart_rule_without_drum_stem(
     song.mkdir(parents=True)
     (song / "bas.dtx").write_text("#BPM: 120\n", encoding="utf-8")
     (song / "ext.dtx").write_text("#BPM: 120\n", encoding="utf-8")
-    (song / "mas.dtx").write_text("#BPM: 120\n", encoding="utf-8")
+    (song / "mas.dtx").write_text(
+        "\n".join(
+            [
+                "#BPM: 120",
+                "#WAV01: kick.wav",
+                "#00111: 01",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _write_sample(song / "kick.wav", [1.0, 0.0, 0.0, 0.0])
 
     result = plan_render_corpus(raw)
 
@@ -448,3 +459,44 @@ def test_render_plan_item_preserves_stereo_samples(tmp_path: Path):
     assert np.isclose(audio[8000, 1], 0.0)
     assert np.isclose(audio[8001, 0], 0.0)
     assert np.isclose(audio[8001, 1], 1.0)
+
+
+def test_render_audio_corpus_writes_render_artifacts_and_reports(tmp_path: Path):
+    raw = tmp_path / "raw"
+    song = raw / "Rendered Song"
+    output = tmp_path / "rendered"
+    song.mkdir(parents=True)
+    (song / "mas.dtx").write_text(
+        "\n".join(
+            [
+                "#BPM: 120",
+                "#WAV01: kick.wav",
+                "#00111: 01",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _write_sample(song / "kick.wav", [1.0, 0.0, 0.0, 0.0])
+
+    result = render_audio.render_audio_corpus(raw, output)
+
+    assert len(result.valid_items) == 1
+    assert result.invalid_items == []
+    assert (output / "audio" / "Rendered Song.wav").exists()
+    assert (output / "renders" / "Rendered Song.wav").exists()
+
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest == {
+        "items": [
+            {
+                "audio_path": str(output / "audio" / "Rendered Song.wav"),
+                "raw_folder": str(song),
+                "render_path": str(output / "renders" / "Rendered Song.wav"),
+                "selected_chart": "mas.dtx",
+                "selected_chart_level": "mas",
+                "song_id": "Rendered Song",
+            }
+        ]
+    }
+    invalid = json.loads((output / "invalid.json").read_text(encoding="utf-8"))
+    assert invalid == {"items": []}

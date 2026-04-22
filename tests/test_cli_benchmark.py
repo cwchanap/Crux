@@ -103,6 +103,9 @@ def test_render_audio_command_writes_one_song_from_song_dir(tmp_path: Path):
 
     assert result.exit_code == 0
     assert (output / "audio" / "Song Render.wav").exists()
+    assert (output / "renders" / "Song Render.wav").exists()
+    assert (output / "manifest.json").exists()
+    assert (output / "invalid.json").exists()
 
 
 def test_render_audio_command_writes_batch_from_raw_dir(tmp_path: Path):
@@ -126,6 +129,10 @@ def test_render_audio_command_writes_batch_from_raw_dir(tmp_path: Path):
     assert result.exit_code == 0
     assert (output / "audio" / "Song A.wav").exists()
     assert (output / "audio" / "Song B.wav").exists()
+    assert (output / "renders" / "Song A.wav").exists()
+    assert (output / "renders" / "Song B.wav").exists()
+    assert (output / "manifest.json").exists()
+    assert (output / "invalid.json").exists()
 
 
 def test_render_audio_defaults_output_dir_from_input_dir_name(tmp_path: Path, monkeypatch):

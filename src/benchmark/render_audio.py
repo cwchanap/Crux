@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -42,6 +44,36 @@ class InvalidRenderPlanItem:
 class RenderPlanResult:
     valid_items: list[RenderPlanItem]
     invalid_items: list[InvalidRenderPlanItem]
+
+
+@dataclass(frozen=True)
+class RenderedAudioItem:
+    song_id: str
+    raw_folder: Path
+    selected_chart: Path
+    selected_chart_level: str
+    audio_path: Path
+    render_path: Path
+
+
+@dataclass(frozen=True)
+class RenderAudioResult:
+    valid_items: list[RenderedAudioItem]
+    invalid_items: list[InvalidRenderPlanItem]
+    manifest_path: Path
+    invalid_report_path: Path
+
+
+def render_audio_corpus(raw_dir: Path, output_dir: Path) -> RenderAudioResult:
+    plan_result = plan_render_corpus(raw_dir)
+    return _render_plans(plan_result.valid_items, plan_result.invalid_items, output_dir)
+
+
+def render_audio_song(song_dir: Path, output_dir: Path) -> RenderAudioResult:
+    plan, invalid = plan_render_song(song_dir)
+    valid_plans = [plan] if plan is not None else []
+    invalid_items = [invalid] if invalid is not None else []
+    return _render_plans(valid_plans, invalid_items, output_dir)
 
 
 def plan_render_corpus(raw_dir: Path) -> RenderPlanResult:
@@ -134,6 +166,12 @@ def _plan_render_selection(
                 "missing_event_metadata": missing_event_metadata,
             },
         )
+    if not placements:
+        return None, InvalidRenderPlanItem(
+            raw_folder=song_dir,
+            reason="no renderable note events",
+            details={},
+        )
 
     return (
         RenderPlanItem(
@@ -199,6 +237,94 @@ def _resolve_sample_path(song_dir: Path, sample_name: str) -> Path | None:
     except (OSError, RuntimeError, ValueError, sf.LibsndfileError):
         return None
     return sample_path
+
+
+def _render_plans(
+    valid_plans: list[RenderPlanItem],
+    invalid_items: list[InvalidRenderPlanItem],
+    output_dir: Path,
+) -> RenderAudioResult:
+    rendered_items: list[RenderedAudioItem] = []
+    final_invalid_items = list(invalid_items)
+
+    for plan in valid_plans:
+        try:
+            rendered_items.append(_render_outputs_for_plan(plan, output_dir))
+        except (OSError, RuntimeError, ValueError) as exc:
+            final_invalid_items.append(
+                InvalidRenderPlanItem(
+                    raw_folder=plan.raw_folder,
+                    reason="failed to render audio",
+                    details={
+                        "exception_class": exc.__class__.__name__,
+                        "message": str(exc),
+                    },
+                )
+            )
+
+    manifest_path, invalid_report_path = _write_render_reports(
+        rendered_items, final_invalid_items, output_dir
+    )
+    return RenderAudioResult(
+        valid_items=rendered_items,
+        invalid_items=final_invalid_items,
+        manifest_path=manifest_path,
+        invalid_report_path=invalid_report_path,
+    )
+
+
+def _render_outputs_for_plan(plan_item: RenderPlanItem, output_dir: Path) -> RenderedAudioItem:
+    audio_path = output_dir / "audio" / f"{plan_item.song_id}.wav"
+    render_path = output_dir / "renders" / f"{plan_item.song_id}.wav"
+    render_plan_item(plan_item, audio_path)
+    render_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(audio_path, render_path)
+    return RenderedAudioItem(
+        song_id=plan_item.song_id,
+        raw_folder=plan_item.raw_folder,
+        selected_chart=plan_item.selected_chart,
+        selected_chart_level=plan_item.selected_chart_level,
+        audio_path=audio_path,
+        render_path=render_path,
+    )
+
+
+def _write_render_reports(
+    valid_items: list[RenderedAudioItem],
+    invalid_items: list[InvalidRenderPlanItem],
+    output_dir: Path,
+) -> tuple[Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_dir / "manifest.json"
+    invalid_report_path = output_dir / "invalid.json"
+    manifest_entries = [
+        {
+            "audio_path": str(item.audio_path),
+            "raw_folder": str(item.raw_folder),
+            "render_path": str(item.render_path),
+            "selected_chart": item.selected_chart.name,
+            "selected_chart_level": item.selected_chart_level,
+            "song_id": item.song_id,
+        }
+        for item in valid_items
+    ]
+    invalid_entries = [
+        {
+            "details": item.details,
+            "raw_folder": str(item.raw_folder),
+            "reason": item.reason,
+        }
+        for item in invalid_items
+    ]
+    manifest_path.write_text(
+        json.dumps({"items": manifest_entries}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    invalid_report_path.write_text(
+        json.dumps({"items": invalid_entries}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return manifest_path, invalid_report_path
 
 
 def _render_placements(placements: list[ScheduledSamplePlacement]) -> tuple[np.ndarray, int]:
