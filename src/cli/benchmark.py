@@ -7,7 +7,7 @@ import click
 from src.benchmark.corpus import validate_score_midi_corpus
 from src.benchmark.dtx_parser import parse_dtx_file
 from src.benchmark.prepare import prepare_corpus
-from src.benchmark.render_audio import plan_render_corpus, plan_render_song, render_plan_item
+from src.benchmark.render_audio import render_audio_corpus, render_audio_song
 from src.benchmark.runner import export_reference_midis, run_score_midi, run_transcribe_and_score
 from src.cli.options import (
     audio_dir_option,
@@ -132,23 +132,21 @@ def render_audio(
     source_dir = song_dir or raw_dir
     assert source_dir is not None
     resolved_output_dir = resolve_benchmark_output_dir(output_dir, run_name, source_dir)
-    audio_dir = resolved_output_dir / "audio"
 
     if song_dir is not None:
-        plan, invalid = plan_render_song(song_dir)
-        if invalid is not None:
-            raise click.ClickException(f"{invalid.reason}: {invalid.details}")
-        assert plan is not None
-        render_plan_item(plan, audio_dir / f"{plan.song_id}.wav")
-        click.echo(f"Rendered 1 song to {audio_dir}")
+        result = render_audio_song(song_dir, resolved_output_dir)
+        if result.invalid_items and not result.valid_items:
+            invalid = result.invalid_items[0]
+            raise click.ClickException(
+                f"{invalid.reason}: {invalid.details} (see {result.invalid_report_path})"
+            )
+        click.echo(f"Rendered {len(result.valid_items)} song(s) to {resolved_output_dir / 'audio'}")
         return
 
-    result = plan_render_corpus(raw_dir)
-    for plan in result.valid_items:
-        render_plan_item(plan, audio_dir / f"{plan.song_id}.wav")
+    result = render_audio_corpus(raw_dir, resolved_output_dir)
     if result.invalid_items:
         click.echo(f"Skipped {len(result.invalid_items)} invalid song folder(s)", err=True)
-    click.echo(f"Rendered {len(result.valid_items)} song(s) to {audio_dir}")
+    click.echo(f"Rendered {len(result.valid_items)} song(s) to {resolved_output_dir / 'audio'}")
 
 
 @benchmark.command("transcribe-and-score")
