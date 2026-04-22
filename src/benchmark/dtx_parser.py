@@ -26,6 +26,9 @@ class ParsedDtxChart:
     artist: str = ""
     base_bpm: float = 120.0
     bpm_table: dict[str, float] = field(default_factory=dict)
+    wav_table: dict[str, str] = field(default_factory=dict)
+    volume_table: dict[str, float] = field(default_factory=dict)
+    position_table: dict[str, float] = field(default_factory=dict)
     measure_lengths: dict[int, float] = field(default_factory=dict)
     events: list[DtxEvent] = field(default_factory=list)
     bpm_events: list[DtxBpmEvent] = field(default_factory=list)
@@ -51,6 +54,9 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
     artist = ""
     base_bpm = 120.0
     bpm_table: dict[str, float] = {}
+    wav_table: dict[str, str] = {}
+    volume_table: dict[str, float] = {}
+    position_table: dict[str, float] = {}
     measure_lengths: dict[int, float] = {}
     events: list[DtxEvent] = []
     bpm_events: list[DtxBpmEvent] = []
@@ -91,6 +97,12 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
             base_bpm = _parse_positive_float(value, "base BPM")
         elif key.startswith("BPM") and len(key) == 5:
             bpm_table[key[3:].upper()] = _parse_positive_float(value, key)
+        elif key.startswith("WAV") and len(key) == 5:
+            wav_table[key[3:].upper()] = value
+        elif key.startswith("VOLUME") and len(key) == 8:
+            volume_table[key[6:].upper()] = float(value)
+        elif key.startswith("POSITION") and len(key) == 10:
+            position_table[key[8:].upper()] = float(value)
 
     for measure, value in pending_table_bpm_events:
         bpm_events.extend(_parse_table_bpm_events(measure, value, bpm_table, warnings))
@@ -101,6 +113,9 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
         artist=artist,
         base_bpm=base_bpm,
         bpm_table=bpm_table,
+        wav_table=wav_table,
+        volume_table=volume_table,
+        position_table=position_table,
         measure_lengths=measure_lengths,
         events=sorted(events, key=lambda event: (event.measure, event.position, event.lane_id)),
         bpm_events=sorted(bpm_events, key=lambda event: (event.measure, event.position)),

@@ -25,6 +25,23 @@ def test_parse_notes_with_lf_or_crlf():
         ]
 
 
+def test_parse_render_chip_metadata_headers():
+    text = "\n".join(
+        [
+            "#WAV01: kick.wav",
+            "#VOLUME01: 90",
+            "#POSITION01: 0.25",
+            "#BPM: 120",
+        ]
+    )
+
+    chart = parse_dtx_text(text, chart_id="render-metadata")
+
+    assert chart.wav_table == {"01": "kick.wav"}
+    assert chart.volume_table == {"01": 90.0}
+    assert chart.position_table == {"01": 0.25}
+
+
 def test_parse_bpm_table_and_bpm_channels():
     text = "\n".join(
         [
