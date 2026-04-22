@@ -18,6 +18,10 @@ def raw_dir_option(function: F) -> F:
     return click.option("--raw-dir", type=click.Path(path_type=Path), required=True)(function)
 
 
+def song_dir_option(function: F) -> F:
+    return click.option("--song-dir", type=click.Path(path_type=Path), required=False)(function)
+
+
 def audio_dir_option(function: F) -> F:
     return click.option("--audio-dir", type=click.Path(path_type=Path), required=True)(function)
 

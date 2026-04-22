@@ -7,6 +7,7 @@ import click
 from src.benchmark.corpus import validate_score_midi_corpus
 from src.benchmark.dtx_parser import parse_dtx_file
 from src.benchmark.prepare import prepare_corpus
+from src.benchmark.render_audio import plan_render_corpus, plan_render_song, render_plan_item
 from src.benchmark.runner import export_reference_midis, run_score_midi, run_transcribe_and_score
 from src.cli.options import (
     audio_dir_option,
@@ -16,6 +17,7 @@ from src.cli.options import (
     raw_dir_option,
     resolve_benchmark_output_dir,
     run_name_option,
+    song_dir_option,
     tolerance_option,
 )
 
@@ -110,6 +112,43 @@ def export_reference_midi(charts_dir: Path, run_name: str | None, output_dir: Pa
         charts_dir, resolve_benchmark_output_dir(output_dir, run_name, charts_dir)
     )
     click.echo(f"Wrote {count} reference MIDI file(s)")
+
+
+@benchmark.command("render-audio")
+@song_dir_option
+@click.option("--raw-dir", type=click.Path(path_type=Path), required=False)
+@run_name_option
+@output_dir_option
+def render_audio(
+    song_dir: Path | None,
+    raw_dir: Path | None,
+    run_name: str | None,
+    output_dir: Path | None,
+) -> None:
+    """Render drum-only audio from a song folder or raw corpus."""
+    if (song_dir is None) == (raw_dir is None):
+        raise click.UsageError("Provide exactly one of --song-dir or --raw-dir")
+
+    source_dir = song_dir or raw_dir
+    assert source_dir is not None
+    resolved_output_dir = resolve_benchmark_output_dir(output_dir, run_name, source_dir)
+    audio_dir = resolved_output_dir / "audio"
+
+    if song_dir is not None:
+        plan, invalid = plan_render_song(song_dir)
+        if invalid is not None:
+            raise click.ClickException(f"{invalid.reason}: {invalid.details}")
+        assert plan is not None
+        render_plan_item(plan, audio_dir / f"{plan.song_id}.wav")
+        click.echo(f"Rendered 1 song to {audio_dir}")
+        return
+
+    result = plan_render_corpus(raw_dir)
+    for plan in result.valid_items:
+        render_plan_item(plan, audio_dir / f"{plan.song_id}.wav")
+    if result.invalid_items:
+        click.echo(f"Skipped {len(result.invalid_items)} invalid song folder(s)", err=True)
+    click.echo(f"Rendered {len(result.valid_items)} song(s) to {audio_dir}")
 
 
 @benchmark.command("transcribe-and-score")
