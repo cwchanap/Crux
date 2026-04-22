@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
+import soundfile as sf
+
 from src.benchmark.dtx_parser import parse_dtx_file
 from src.benchmark.models import BenchmarkEvent
 from src.benchmark.prepare import _select_chart
@@ -16,6 +19,7 @@ class ScheduledSamplePlacement:
     sample_path: Path
     lane_id: str
     note_id: str
+    volume_scale: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -71,6 +75,17 @@ def plan_render_song(song_dir: Path) -> tuple[RenderPlanItem | None, InvalidRend
     )
 
 
+def render_plan_item(plan_item: RenderPlanItem, output_path: Path) -> Path:
+    if not plan_item.placements:
+        sample_rate = 44100
+        rendered_audio = np.zeros(1, dtype=np.float32)
+    else:
+        rendered_audio, sample_rate = _render_placements(plan_item.placements)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(output_path, rendered_audio, sample_rate, format="WAV", subtype="FLOAT")
+    return output_path
+
+
 def _plan_render_selection(
     song_dir: Path,
     selected_chart: Path,
@@ -95,7 +110,7 @@ def _plan_render_selection(
 
     for event in timed_events:
         placement, missing_note_id, missing_sample_name, missing_metadata = _plan_sample_placement(
-            song_dir, chart.wav_table, event
+            song_dir, chart.wav_table, chart.volume_table, event
         )
         if missing_metadata is not None:
             _append_unique(missing_event_metadata, missing_metadata)
@@ -133,7 +148,7 @@ def _plan_render_selection(
 
 
 def _plan_sample_placement(
-    song_dir: Path, wav_table: dict[str, str], event: BenchmarkEvent
+    song_dir: Path, wav_table: dict[str, str], volume_table: dict[str, float], event: BenchmarkEvent
 ) -> tuple[ScheduledSamplePlacement | None, str | None, str | None, str | None]:
     note_id_value = event.metadata.get("note_id")
     if note_id_value is None:
@@ -148,6 +163,8 @@ def _plan_sample_placement(
     if sample_path is None:
         return None, None, sample_name, None
 
+    volume_scale = volume_table.get(note_id, 100.0) / 100.0
+
     return (
         ScheduledSamplePlacement(
             time_sec=event.time_sec,
@@ -155,6 +172,7 @@ def _plan_sample_placement(
             sample_path=sample_path,
             lane_id=str(event.metadata.get("lane_id", "")).upper(),
             note_id=note_id,
+            volume_scale=volume_scale,
         ),
         None,
         None,
@@ -176,4 +194,56 @@ def _resolve_sample_path(song_dir: Path, sample_name: str) -> Path | None:
         return None
     if not sample_path.is_file():
         return None
+    try:
+        sf.info(sample_path)
+    except (OSError, RuntimeError, ValueError, sf.LibsndfileError):
+        return None
     return sample_path
+
+
+def _render_placements(placements: list[ScheduledSamplePlacement]) -> tuple[np.ndarray, int]:
+    sample_rate: int | None = None
+    cached_samples: dict[Path, np.ndarray] = {}
+    max_frame = 0
+    output_channels = 1
+
+    for placement in placements:
+        sample, placement_sample_rate = _load_sample(placement.sample_path)
+        cached_samples[placement.sample_path] = sample
+        if sample_rate is None:
+            sample_rate = placement_sample_rate
+        elif sample_rate != placement_sample_rate:
+            raise ValueError("sample rate mismatch across rendered placements")
+
+        output_channels = max(output_channels, sample.shape[1])
+
+        start_frame = max(0, int(round(placement.time_sec * sample_rate)))
+        max_frame = max(max_frame, start_frame + sample.shape[0])
+
+    assert sample_rate is not None
+    if output_channels == 1:
+        rendered_audio = np.zeros(max(1, max_frame), dtype=np.float32)
+    else:
+        rendered_audio = np.zeros((max(1, max_frame), output_channels), dtype=np.float32)
+
+    for placement in placements:
+        sample = cached_samples[placement.sample_path]
+        start_frame = max(0, int(round(placement.time_sec * sample_rate)))
+        end_frame = start_frame + sample.shape[0]
+        if output_channels == 1:
+            rendered_audio[start_frame:end_frame] += sample[:, 0] * placement.volume_scale
+            continue
+        if sample.shape[1] == 1:
+            sample_to_mix = np.repeat(sample, output_channels, axis=1)
+        elif sample.shape[1] == output_channels:
+            sample_to_mix = sample
+        else:
+            raise ValueError("sample channel count mismatch across rendered placements")
+        rendered_audio[start_frame:end_frame, :] += sample_to_mix * placement.volume_scale
+
+    return rendered_audio, sample_rate
+
+
+def _load_sample(sample_path: Path) -> tuple[np.ndarray, int]:
+    audio, sample_rate = sf.read(sample_path, always_2d=True, dtype="float32")
+    return np.asarray(audio, dtype=np.float32), sample_rate
