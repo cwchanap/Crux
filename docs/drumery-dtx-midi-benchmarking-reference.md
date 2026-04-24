@@ -459,3 +459,232 @@ For benchmarking a drum transcription model, the useful ground truth is the pars
 plus a lane normalization layer that you define explicitly. The built-in DTX-to-MIDI and
 MIDI-to-DTX conversions are helpful utilities, but they should not be treated as a lossless or
 canonical interchange layer.
+
+## Reproducible Benchmark Workflow
+
+This section documents the benchmark workflow implemented in this repository so results can be
+reproduced consistently.
+
+### Recommended workflow
+
+The recommended path is:
+
+```text
+raw song folders -> prepare-corpus -> parsed charts/audio -> transcribe-and-score or score-midi
+```
+
+Use this path when a song folder already contains a usable drum stem such as `2 Drums.mp3` or
+`drum.mp3`.
+
+In this workflow:
+
+- raw DTX chip/sample assets such as `bass.xa` or `snare.ogg` are not needed for scoring
+- the parsed corpus becomes the stable working directory for future benchmark runs
+- the DTX chart remains the scoring authority
+
+### Benchmark inputs
+
+The benchmark uses these inputs:
+
+- ground truth chart: parsed from `.dtx`
+- model input audio: one drum-only audio file per chart
+- prediction: model-generated MIDI or precomputed MIDI
+
+The benchmark does not require raw DTX chip assets unless you are using the optional
+`render-audio` fallback described later in this document.
+
+### Raw corpus assumptions for `prepare-corpus`
+
+`crux benchmark prepare-corpus` scans a raw song-folder corpus and selects one benchmark item per
+song folder.
+
+Selection rules:
+
+- chart priority is `mas > ext > adv > bas`
+- exactly one selected chart file must exist at the winning level
+- the drum audio filename must be one of:
+  - `2 Drums.mp3`
+  - `drum.mp3`
+
+If a song folder does not meet those rules, it is excluded from the parsed corpus and recorded in
+`invalid.json`.
+
+### Step 1: Prepare a parsed corpus
+
+Run:
+
+```bash
+uv run crux benchmark prepare-corpus \
+  --raw-dir /path/to/raw-dtx-corpus \
+  --run-name my-benchmark-corpus
+```
+
+If `--output-dir` is omitted, outputs default to:
+
+```text
+artifacts/benchmark/<run-name-or-input-dir-name>/
+```
+
+Example output layout:
+
+```text
+artifacts/benchmark/my-benchmark-corpus/
+  charts/
+    Song A.dtx
+  audio/
+    Song A.mp3
+  manifest.json
+  invalid.json
+```
+
+`manifest.json` records the selected chart and copied audio for each valid song. `invalid.json`
+records every rejected raw folder and the reason it was excluded.
+
+After this step, future benchmark work should use the parsed corpus rather than the original raw
+folder structure.
+
+### Step 2: Inspect or validate the parsed corpus
+
+Optional checks:
+
+Inspect one parsed chart:
+
+```bash
+uv run crux benchmark inspect-dtx \
+  artifacts/benchmark/my-benchmark-corpus/charts/Song\ A.dtx
+```
+
+Validate a parsed chart directory against precomputed prediction MIDI files:
+
+```bash
+uv run crux benchmark validate-corpus \
+  --charts-dir artifacts/benchmark/my-benchmark-corpus/charts \
+  --predictions-dir /path/to/predictions
+```
+
+### Step 3A: Run end-to-end transcription and scoring
+
+Use this when you want the benchmark to run the model and score its generated MIDI:
+
+```bash
+uv run crux benchmark transcribe-and-score \
+  --charts-dir artifacts/benchmark/my-benchmark-corpus/charts \
+  --audio-dir artifacts/benchmark/my-benchmark-corpus/audio \
+  --run-name my-transcription-run \
+  --tolerance-ms 30 \
+  --tolerance-ms 50 \
+  --tolerance-ms 100
+```
+
+Outputs:
+
+```text
+artifacts/benchmark/my-transcription-run/
+  predictions/
+    Song A.mid
+  summary.json
+  per_chart.csv
+  summary.md
+```
+
+The current transcriber expects the benchmark model weights to be available at:
+
+```text
+models/e-gmd/tf2_model.weights.h5
+```
+
+### Step 3B: Score precomputed MIDI only
+
+Use this when model MIDI has already been generated elsewhere:
+
+```bash
+uv run crux benchmark score-midi \
+  --charts-dir artifacts/benchmark/my-benchmark-corpus/charts \
+  --predictions-dir /path/to/predictions \
+  --run-name my-score-run \
+  --tolerance-ms 30 \
+  --tolerance-ms 50 \
+  --tolerance-ms 100
+```
+
+Optional flags:
+
+- `--align/--no-align` controls whether global offset alignment is reported
+- `--export-reference-midi` writes benchmark-owned reference MIDI artifacts alongside the reports
+
+### Optional: Export benchmark-owned reference MIDI
+
+If you want a benchmark-owned MIDI representation of the parsed DTX charts for debugging or manual
+inspection, export it explicitly:
+
+```bash
+uv run crux benchmark export-reference-midi \
+  --charts-dir artifacts/benchmark/my-benchmark-corpus/charts \
+  --run-name my-reference-midi
+```
+
+This is useful for inspection, but parsed DTX remains the scoring source of truth.
+
+## Optional Fallback: `render-audio`
+
+`render-audio` is not part of the core benchmark path when a usable drum stem already exists.
+
+It exists for the fallback case where:
+
+- a raw song folder has a usable chart
+- but there is no benchmark-ready drum audio file to feed into `prepare-corpus`
+
+In that case, `render-audio` can synthesize a drum-only `.wav` from the raw DTX chart and its
+referenced sample chips.
+
+Single-song mode:
+
+```bash
+uv run crux benchmark render-audio \
+  --song-dir /path/to/raw-song-folder \
+  --run-name my-render
+```
+
+Batch mode:
+
+```bash
+uv run crux benchmark render-audio \
+  --raw-dir /path/to/raw-dtx-corpus \
+  --run-name my-render-batch
+```
+
+Outputs:
+
+```text
+artifacts/benchmark/my-render/
+  audio/
+    Song A.wav
+  renders/
+    Song A.wav
+  manifest.json
+  invalid.json
+```
+
+Use `render-audio` only when you need to manufacture a drum stem. If a song already has
+`2 Drums.mp3` or `drum.mp3`, prefer `prepare-corpus` directly.
+
+## Reproducibility Notes
+
+For reproducible runs:
+
+- keep the parsed corpus fixed once prepared
+- record the benchmark command, `--run-name`, and tolerance windows
+- keep the model weights file fixed across comparisons
+- compare runs using the emitted `summary.json` and `per_chart.csv`
+
+If you add more songs later, rerun `prepare-corpus` to create a new parsed corpus artifact rather
+than mutating old results in place without tracking the change.
+
+## Known Limitations
+
+- `prepare-corpus` currently only recognizes `2 Drums.mp3` and `drum.mp3` as allowed raw drum
+  stem filenames
+- one raw song folder yields at most one benchmark chart, selected by `mas > ext > adv > bas`
+- `render-audio` is optional and may fail on raw sample formats that the current Python audio
+  stack cannot decode reliably
+- in the current environment, `.xa` raw sample files are a known example of that limitation
