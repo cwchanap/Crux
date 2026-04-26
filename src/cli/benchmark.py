@@ -61,14 +61,17 @@ def score_midi(
 ) -> None:
     """Score precomputed prediction MIDI files."""
     resolved_output_dir = resolve_benchmark_output_dir(output_dir, run_name, charts_dir)
-    reports = run_score_midi(
-        charts_dir=charts_dir,
-        predictions_dir=predictions_dir,
-        output_dir=resolved_output_dir,
-        tolerance_ms=list(tolerance_ms),
-        align=align,
-        export_reference_midi=export_reference_midi,
-    )
+    try:
+        reports = run_score_midi(
+            charts_dir=charts_dir,
+            predictions_dir=predictions_dir,
+            output_dir=resolved_output_dir,
+            tolerance_ms=list(tolerance_ms),
+            align=align,
+            export_reference_midi=export_reference_midi,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     click.echo(
         f"Wrote benchmark reports for {len({report.chart_id for report in reports})} chart(s)"
     )

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 
-from src.benchmark.corpus import discover_score_midi_items
+from src.benchmark.corpus import validate_score_midi_corpus
 from src.benchmark.dtx_parser import parse_dtx_file
 from src.benchmark.mapping import map_dtx_events, map_midi_events
 from src.benchmark.midi_io import parse_prediction_midi, write_reference_midi
@@ -12,6 +14,8 @@ from src.benchmark.prepare import CHART_SUFFIXES
 from src.benchmark.reports import ChartReport, write_reports
 from src.benchmark.scoring import score_events, score_events_with_alignment
 from src.benchmark.timing import dtx_events_to_timed_events
+
+logger = logging.getLogger(__name__)
 
 
 def run_score_midi(
@@ -22,8 +26,13 @@ def run_score_midi(
     align: bool = True,
     export_reference_midi: bool = False,
 ) -> list[ChartReport]:
+    validation = validate_score_midi_corpus(charts_dir, predictions_dir)
+    if validation.errors:
+        error_list = "; ".join(validation.errors)
+        raise ValueError(f"corpus validation failed: {error_list}")
+
     reports: list[ChartReport] = []
-    for item in discover_score_midi_items(charts_dir, predictions_dir):
+    for item in validation.valid_items:
         chart = parse_dtx_file(item.dtx_path, chart_id=item.chart_id)
         ground_truth, _ = map_dtx_events(dtx_events_to_timed_events(chart))
         predictions, _ = map_midi_events(
@@ -78,14 +87,29 @@ def run_transcribe_and_score(
     predictions_dir = output_dir / "predictions"
     predictions_dir.mkdir(parents=True, exist_ok=True)
 
+    missing_audio: list[str] = []
+    matched_charts_dir = output_dir / "_matched_charts"
+    matched_charts_dir.mkdir(parents=True, exist_ok=True)
     for dtx_path in sorted(
         p for p in charts_dir.iterdir() if p.is_file() and p.suffix.lower() in CHART_SUFFIXES
     ):
-        audio_path = _find_audio(audio_dir, dtx_path.stem)
+        try:
+            audio_path = _find_audio(audio_dir, dtx_path.stem)
+        except FileNotFoundError:
+            missing_audio.append(dtx_path.stem)
+            continue
         midi_bytes = transcribe(audio_path)
         (predictions_dir / f"{dtx_path.stem}.mid").write_bytes(midi_bytes)
+        shutil.copy2(dtx_path, matched_charts_dir / dtx_path.name)
 
-    return run_score_midi(charts_dir, predictions_dir, output_dir, tolerance_ms, align=True)
+    if missing_audio:
+        logger.warning(
+            "Skipping %d chart(s) with missing audio: %s",
+            len(missing_audio),
+            ", ".join(missing_audio),
+        )
+
+    return run_score_midi(matched_charts_dir, predictions_dir, output_dir, tolerance_ms, align=True)
 
 
 def _find_audio(audio_dir: Path, chart_id: str) -> Path:

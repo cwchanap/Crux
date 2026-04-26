@@ -15,6 +15,7 @@ from src.app.transcriber import DrumTranscriber
 from src.benchmark.dtx_parser import parse_dtx_file
 from src.benchmark.mapping import DEFAULT_MIDI_NOTE_MAP, map_dtx_events
 from src.benchmark.models import BenchmarkEvent, ScoreSummary
+from src.benchmark.prepare import CHART_SUFFIXES
 from src.benchmark.scoring import score_events_with_alignment
 from src.benchmark.timing import dtx_events_to_timed_events
 
@@ -201,7 +202,9 @@ def load_prepared_corpus(
     min_gap_frames: int,
 ) -> list[ChartCalibrationData]:
     chart_items: list[ChartCalibrationData] = []
-    for dtx_path in sorted(charts_dir.glob("*.dtx")):
+    for dtx_path in sorted(
+        p for p in charts_dir.iterdir() if p.is_file() and p.suffix.lower() in CHART_SUFFIXES
+    ):
         audio_path = find_audio(audio_dir, dtx_path.stem)
         ground_truth = load_ground_truth(dtx_path)
         predictions_by_bin = extract_predictions_by_bin(
@@ -225,7 +228,9 @@ def load_prepared_corpus(
             flush=True,
         )
     if not chart_items:
-        raise FileNotFoundError(f"no .dtx charts found under {charts_dir}")
+        raise FileNotFoundError(
+            f"no chart files ({', '.join(sorted(CHART_SUFFIXES))}) found under {charts_dir}"
+        )
     return chart_items
 
 

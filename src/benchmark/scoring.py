@@ -192,7 +192,13 @@ def _alignment_bin_size(tolerance_sec: float) -> float:
 
 
 def _alignment_histogram(times: list[float], num_bins: int, bin_size: float) -> np.ndarray:
-    bins = np.rint(np.asarray(times) / bin_size).astype(np.int64)
+    times_arr = np.asarray(times)
+    if times_arr.size > 0 and np.any(times_arr < 0):
+        raise ValueError(
+            f"_alignment_histogram received negative times (min={times_arr.min():.6f}). "
+            "All event times must be non-negative."
+        )
+    bins = np.rint(times_arr / bin_size).astype(np.int64)
     bins = np.clip(bins, 0, num_bins - 1)
     return np.bincount(bins, minlength=num_bins).astype(np.float64)
 
