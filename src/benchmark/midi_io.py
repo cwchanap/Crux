@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pretty_midi
 
 from src.benchmark.models import BenchmarkEvent
+
+logger = logging.getLogger(__name__)
 
 REFERENCE_CLASS_TO_MIDI = {
     "kick": 36,
@@ -45,6 +48,10 @@ def write_reference_midi(events: list[BenchmarkEvent], path: Path) -> None:
     for event in sorted(events):
         midi_note = REFERENCE_CLASS_TO_MIDI.get(event.canonical_class)
         if midi_note is None:
+            logger.warning(
+                "Skipping unmapped canonical class %r in write_reference_midi",
+                event.canonical_class,
+            )
             continue
         start = max(0.0, event.time_sec)
         drums.notes.append(

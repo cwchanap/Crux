@@ -8,6 +8,7 @@ from src.benchmark.corpus import discover_score_midi_items
 from src.benchmark.dtx_parser import parse_dtx_file
 from src.benchmark.mapping import map_dtx_events, map_midi_events
 from src.benchmark.midi_io import parse_prediction_midi, write_reference_midi
+from src.benchmark.prepare import CHART_SUFFIXES
 from src.benchmark.reports import ChartReport, write_reports
 from src.benchmark.scoring import score_events, score_events_with_alignment
 from src.benchmark.timing import dtx_events_to_timed_events
@@ -53,7 +54,9 @@ def run_score_midi(
 def export_reference_midis(charts_dir: Path, output_dir: Path) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     count = 0
-    for dtx_path in sorted(charts_dir.glob("*.dtx")):
+    for dtx_path in sorted(
+        p for p in charts_dir.iterdir() if p.is_file() and p.suffix.lower() in CHART_SUFFIXES
+    ):
         chart = parse_dtx_file(dtx_path, chart_id=dtx_path.stem)
         ground_truth, _ = map_dtx_events(dtx_events_to_timed_events(chart))
         write_reference_midi(ground_truth, output_dir / f"{dtx_path.stem}.mid")
@@ -69,12 +72,15 @@ def run_transcribe_and_score(
     transcribe: Callable[[Path], bytes] | None = None,
 ) -> list[ChartReport]:
     if transcribe is None:
-        transcribe = _default_transcribe_audio
+        transcriber = _create_shared_transcriber()
+        transcribe = _make_transcribe_fn(transcriber)
 
     predictions_dir = output_dir / "predictions"
     predictions_dir.mkdir(parents=True, exist_ok=True)
 
-    for dtx_path in sorted(charts_dir.glob("*.dtx")):
+    for dtx_path in sorted(
+        p for p in charts_dir.iterdir() if p.is_file() and p.suffix.lower() in CHART_SUFFIXES
+    ):
         audio_path = _find_audio(audio_dir, dtx_path.stem)
         midi_bytes = transcribe(audio_path)
         (predictions_dir / f"{dtx_path.stem}.mid").write_bytes(midi_bytes)
@@ -90,10 +96,19 @@ def _find_audio(audio_dir: Path, chart_id: str) -> Path:
     raise FileNotFoundError(f"missing audio for chart_id {chart_id}")
 
 
-def _default_transcribe_audio(audio_path: Path) -> bytes:
+def _create_shared_transcriber():
+    """Construct a single DrumTranscriber instance to reuse across all charts."""
     from src.app.transcriber import DrumTranscriber
 
-    job_id = audio_path.stem
-    jobs_store = {job_id: {"progress": 0}}
-    transcriber = DrumTranscriber()
-    return asyncio.run(transcriber.transcribe(str(audio_path), job_id, jobs_store))
+    return DrumTranscriber()
+
+
+def _make_transcribe_fn(transcriber):
+    """Return a callable that reuses *transcriber* with a fresh jobs_store per call."""
+
+    def _transcribe(audio_path: Path) -> bytes:
+        job_id = audio_path.stem
+        jobs_store = {job_id: {"progress": 0}}
+        return asyncio.run(transcriber.transcribe(str(audio_path), job_id, jobs_store))
+
+    return _transcribe

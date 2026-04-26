@@ -47,3 +47,31 @@ def test_validation_reports_duplicate_stems(tmp_path: Path):
     assert result.valid_items == []
     assert result.errors == ["duplicate files for chart_id foo"]
     assert result.is_valid is False
+
+
+def test_case_insensitive_stem_matching(tmp_path: Path):
+    charts = tmp_path / "charts"
+    predictions = tmp_path / "predictions"
+    charts.mkdir()
+    predictions.mkdir()
+    (charts / "Song1.dtx").write_text("#BPM: 120\n", encoding="utf-8")
+    (predictions / "song1.mid").write_bytes(b"MThd")
+
+    items = discover_score_midi_items(charts, predictions)
+
+    assert len(items) == 1
+    assert items[0].chart_id == "song1"
+    assert items[0].dtx_path == charts / "Song1.dtx"
+    assert items[0].prediction_midi_path == predictions / "song1.mid"
+
+
+def test_missing_directory_returns_error(tmp_path: Path):
+    predictions = tmp_path / "predictions"
+    predictions.mkdir()
+    missing_charts = tmp_path / "nonexistent"
+
+    result = validate_score_midi_corpus(missing_charts, predictions)
+
+    assert result.valid_items == []
+    assert result.errors == [f"directory not found: {missing_charts}"]
+    assert result.is_valid is False

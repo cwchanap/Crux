@@ -33,3 +33,22 @@ def test_write_reference_midi_handles_simultaneous_hits(tmp_path: Path):
     parsed = pretty_midi.PrettyMIDI(str(path))
     notes = sorted(note.pitch for note in parsed.instruments[0].notes)
     assert notes == [36, 38]
+
+
+def test_write_reference_midi_skips_unmapped_classes_with_warning(tmp_path: Path, caplog):
+    import logging
+
+    path = tmp_path / "reference.mid"
+    events = [
+        BenchmarkEvent("song", 0.0, "kick", "ground_truth"),
+        BenchmarkEvent("song", 1.0, "unknown_class", "ground_truth"),
+    ]
+
+    with caplog.at_level(logging.WARNING, logger="src.benchmark.midi_io"):
+        write_reference_midi(events, path)
+
+    assert "unmapped canonical class 'unknown_class'" in caplog.text
+
+    parsed = pretty_midi.PrettyMIDI(str(path))
+    notes = [note.pitch for note in parsed.instruments[0].notes]
+    assert notes == [36]
