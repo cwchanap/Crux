@@ -25,7 +25,7 @@ class BenchmarkEvent:
     time_sec: float
     canonical_class: str
     source: str
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict, hash=False)
 
     def __lt__(self, other: object) -> bool:
         if not isinstance(other, BenchmarkEvent):
@@ -54,18 +54,20 @@ class ScoreSummary:
     offset_sec: float = 0.0
 
     @property
-    def precision(self) -> float:
+    def precision(self) -> float | None:
         denominator = self.true_positives + self.false_positives
-        return self.true_positives / denominator if denominator else 0.0
+        return self.true_positives / denominator if denominator else None
 
     @property
-    def recall(self) -> float:
+    def recall(self) -> float | None:
         denominator = self.true_positives + self.false_negatives
-        return self.true_positives / denominator if denominator else 0.0
+        return self.true_positives / denominator if denominator else None
 
     @property
-    def f1(self) -> float:
+    def f1(self) -> float | None:
         precision = self.precision
         recall = self.recall
+        if precision is None or recall is None:
+            return None
         denominator = precision + recall
-        return 2 * precision * recall / denominator if denominator else 0.0
+        return 2 * precision * recall / denominator if denominator else None

@@ -103,3 +103,40 @@ def test_parse_file_tries_shift_jis(tmp_path: Path):
     chart = parse_dtx_file(path, chart_id="sjis")
 
     assert chart.title == "テスト"
+
+
+def test_parse_preserves_semicolons_in_string_value_headers():
+    text = "\n".join(
+        [
+            "#TITLE: Song; Part II",
+            "#ARTIST: Band; feat. Singer",
+            "#WAV01: kick;snare.wav",
+            "#BPM: 120",
+        ]
+    )
+
+    chart = parse_dtx_text(text, chart_id="semicolons")
+
+    assert chart.title == "Song; Part II"
+    assert chart.artist == "Band; feat. Singer"
+    assert chart.wav_table == {"01": "kick;snare.wav"}
+
+
+def test_parse_strips_semicolon_comments_from_data_lines():
+    text = "\n".join(
+        [
+            "#BPM: 120",
+            "#00011: 01000002; note data comment",
+            "#00103: 3C00; bpm comment",
+        ]
+    )
+
+    chart = parse_dtx_text(text, chart_id="data-comments")
+
+    assert len(chart.events) == 2
+    assert [(ev.measure, ev.position, ev.lane_id, ev.note_id) for ev in chart.events] == [
+        (0, 0.0, "11", "01"),
+        (0, 0.75, "11", "02"),
+    ]
+    assert len(chart.bpm_events) == 1
+    assert chart.bpm_events[0].bpm == 120.0

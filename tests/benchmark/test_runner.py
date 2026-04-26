@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import patch
 
 import pretty_midi
 
@@ -45,3 +46,46 @@ def test_transcribe_and_score_uses_injected_transcriber(tmp_path: Path):
 
     assert reports[0].chart_id == "foo"
     assert (output / "predictions" / "foo.mid").exists()
+
+
+def test_default_transcribe_creates_single_transcriber(tmp_path: Path):
+    """When no transcribe callback is provided, DrumTranscriber is constructed once."""
+    charts = tmp_path / "charts"
+    audio = tmp_path / "audio"
+    output = tmp_path / "out"
+    charts.mkdir()
+    audio.mkdir()
+    (charts / "a.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+    (charts / "b.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+    (audio / "a.wav").write_bytes(b"fake")
+    (audio / "b.wav").write_bytes(b"fake")
+
+    with patch("src.benchmark.runner._create_shared_transcriber") as mock_create:
+        mock_transcriber = mock_create.return_value
+        midi_bytes = write_prediction_bytes()
+        mock_transcriber.transcribe.side_effect = lambda *a, **kw: _async_return(midi_bytes)
+        reports = run_transcribe_and_score(charts, audio, output, [50])
+
+    mock_create.assert_called_once()
+    assert mock_transcriber.transcribe.call_count == 2
+    assert len(reports) == 4  # 2 charts × 2 report types (raw + aligned)
+
+
+def write_prediction_bytes() -> bytes:
+    """Return a minimal prediction MIDI as raw bytes."""
+    midi = pretty_midi.PrettyMIDI()
+    drums = pretty_midi.Instrument(program=0, is_drum=True)
+    drums.notes.append(pretty_midi.Note(velocity=100, pitch=36, start=0.0, end=0.1))
+    midi.instruments.append(drums)
+
+    import io
+
+    buf = io.BytesIO()
+    midi.write(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+async def _async_return(value):
+    """Helper to make a coroutine that returns *value*."""
+    return value

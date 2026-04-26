@@ -22,17 +22,20 @@ class CorpusValidationResult:
 
 
 def _by_stem(directory: Path, suffixes: set[str]) -> tuple[dict[str, Path], list[str]]:
+    if not directory.exists() or not directory.is_dir():
+        return {}, [f"directory not found: {directory}"]
+
     paths: dict[str, Path] = {}
     errors: list[str] = []
     duplicate_stems: set[str] = set()
     for path in sorted(directory.iterdir()):
         if path.is_file() and path.suffix.lower() in suffixes:
-            stem = path.stem
-            if stem in paths:
-                duplicate_stems.add(stem)
-                errors.append(f"duplicate files for chart_id {stem}")
+            stem_lower = path.stem.lower()
+            if stem_lower in paths:
+                duplicate_stems.add(stem_lower)
+                errors.append(f"duplicate files for chart_id {stem_lower}")
                 continue
-            paths[stem] = path
+            paths[stem_lower] = path
 
     for stem in duplicate_stems:
         paths.pop(stem, None)

@@ -9,6 +9,7 @@ from src.benchmark.models import DtxEvent
 LINE_RE = re.compile(r"^[#*](?P<measure>\d{3})(?P<channel>[0-9A-Za-z]{2})\s*:\s*(?P<value>.*)$")
 HEADER_RE = re.compile(r"^#(?P<key>[A-Za-z0-9_]+)\s*:?\s*(?P<value>.*)$")
 ENCODINGS = ("shift-jis", "utf-8", "utf-16le", "utf-16be")
+_STRING_VALUE_HEADER_KEYS = frozenset({"TITLE", "ARTIST"})
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,11 @@ def parse_dtx_file(path: Path, chart_id: str | None = None) -> ParsedDtxChart:
     raise ValueError(f"could not decode DTX file: {path}")
 
 
+def _is_string_value_header_key(key: str) -> bool:
+    """Return True if the header key stores a free-form string that may contain semicolons."""
+    return key in _STRING_VALUE_HEADER_KEYS or (key.startswith("WAV") and len(key) == 5)
+
+
 def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
     text = text.removeprefix("\ufeff")
     title = ""
@@ -67,7 +73,15 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
         line = raw_line.strip()
         if not line or line.startswith(";"):
             continue
-        value_without_comment = line.split(";", 1)[0].strip()
+        # Preserve semicolons in header lines with free-form string values
+        # (TITLE, ARTIST, WAVxx) since they can legitimately appear in
+        # titles, artist names and filenames.  For everything else (data
+        # lines, numeric headers) semicolons are comment delimiters.
+        header_peek = HEADER_RE.match(line)
+        if header_peek and _is_string_value_header_key(header_peek.group("key").upper()):
+            value_without_comment = line
+        else:
+            value_without_comment = line.split(";", 1)[0].strip()
 
         match = LINE_RE.match(value_without_comment)
         if match:

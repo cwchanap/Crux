@@ -65,8 +65,11 @@ def _write_summary_markdown(reports: list[ChartReport], path: Path) -> None:
     lines = ["# DTX MIDI Benchmark Summary", ""]
     for report in reports:
         row = _report_row(report)
+        f1_str = f"{row['f1']:.3f}" if row["f1"] is not None else "N/A"
+        p_str = f"{row['precision']:.3f}" if row["precision"] is not None else "N/A"
+        r_str = f"{row['recall']:.3f}" if row["recall"] is not None else "N/A"
         lines.append(
             f"- `{report.chart_id}` {report.mode} @{report.tolerance_ms}ms: "
-            f"F1={row['f1']:.3f}, P={row['precision']:.3f}, R={row['recall']:.3f}"
+            f"F1={f1_str}, P={p_str}, R={r_str}"
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

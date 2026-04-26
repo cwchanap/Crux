@@ -64,7 +64,7 @@ def prepare_corpus(raw_dir: Path, output_dir: Path) -> PrepareCorpusResult:
 
     manifest_entries: list[dict[str, object]] = []
     for item in scan_result.valid_items:
-        parsed_chart_path = charts_dir / f"{item.song_id}.dtx"
+        parsed_chart_path = charts_dir / f"{item.song_id}{item.selected_chart.suffix.lower()}"
         parsed_audio_path = audio_dir / f"{item.song_id}{item.selected_audio.suffix.lower()}"
         shutil.copy2(item.selected_chart, parsed_chart_path)
         shutil.copy2(item.selected_audio, parsed_audio_path)

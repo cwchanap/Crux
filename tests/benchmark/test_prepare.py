@@ -76,3 +76,23 @@ def test_prepare_corpus_writes_parsed_dirs_and_reports(tmp_path: Path):
     assert manifest["items"][0]["song_id"] == "Good Song"
     assert manifest["items"][0]["selected_chart_level"] == "ext"
     assert invalid["items"][0]["raw_folder"].endswith("Bad Song")
+
+
+def test_prepare_corpus_preserves_txt_chart_suffix(tmp_path: Path):
+    raw = tmp_path / "raw"
+    song = raw / "TxtSong"
+    song.mkdir(parents=True)
+    (song / "ext.txt").write_text("#BPM: 120\n", encoding="utf-8")
+    (song / "drum.mp3").write_bytes(b"drums")
+    output = tmp_path / "parsed"
+
+    result = prepare_corpus(raw, output)
+
+    assert len(result.valid_items) == 1
+    assert len(result.invalid_items) == 0
+    assert (output / "charts" / "TxtSong.txt").exists()
+    assert not (output / "charts" / "TxtSong.dtx").exists()
+    manifest = json.loads((output / "manifest.json").read_text())
+    entry = manifest["items"][0]
+    assert entry["selected_chart"] == "ext.txt"
+    assert entry["parsed_chart_path"].endswith("TxtSong.txt")
