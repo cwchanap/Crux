@@ -63,4 +63,9 @@ def validate_score_midi_corpus(charts_dir: Path, predictions_dir: Path) -> Corpu
             continue
         valid_items.append(ScoreMidiItem(chart_id, dtx_path, prediction_path))
 
+    chart_stems = set(chart_paths.keys())
+    for prediction_id in prediction_paths:
+        if prediction_id not in chart_stems:
+            errors.append(f"stray prediction MIDI with no matching chart: {prediction_id}")
+
     return CorpusValidationResult(valid_items=valid_items, errors=errors)

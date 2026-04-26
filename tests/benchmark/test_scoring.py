@@ -1,7 +1,12 @@
+import numpy as np
 import pytest
 
 from src.benchmark.models import BenchmarkEvent
-from src.benchmark.scoring import score_events, score_events_with_alignment
+from src.benchmark.scoring import (
+    _alignment_histogram,
+    score_events,
+    score_events_with_alignment,
+)
 
 
 def event(time_sec: float, canonical_class: str, source: str) -> BenchmarkEvent:
@@ -105,3 +110,20 @@ def test_alignment_refines_offset_beyond_histogram_bin():
 
     assert result.aligned.summary.true_positives == 2
     assert round(result.aligned.summary.offset_sec, 3) == -0.123
+
+
+def test_alignment_histogram_rejects_negative_times():
+    with pytest.raises(ValueError, match="negative times"):
+        _alignment_histogram([1.0, -0.5, 2.0], num_bins=10, bin_size=0.01)
+
+
+def test_alignment_histogram_accepts_non_negative_times():
+    result = _alignment_histogram([0.0, 0.01, 0.02], num_bins=10, bin_size=0.01)
+    assert isinstance(result, np.ndarray)
+    assert result.sum() == 3
+
+
+def test_alignment_histogram_accepts_empty_input():
+    result = _alignment_histogram([], num_bins=10, bin_size=0.01)
+    assert isinstance(result, np.ndarray)
+    assert result.sum() == 0

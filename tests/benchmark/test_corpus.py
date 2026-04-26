@@ -45,7 +45,8 @@ def test_validation_reports_duplicate_stems(tmp_path: Path):
     result = validate_score_midi_corpus(charts, predictions)
 
     assert result.valid_items == []
-    assert result.errors == ["duplicate files for chart_id foo"]
+    assert "duplicate files for chart_id foo" in result.errors
+    assert "stray prediction MIDI with no matching chart: foo" in result.errors
     assert result.is_valid is False
 
 
@@ -74,4 +75,20 @@ def test_missing_directory_returns_error(tmp_path: Path):
 
     assert result.valid_items == []
     assert result.errors == [f"directory not found: {missing_charts}"]
+    assert result.is_valid is False
+
+
+def test_validation_reports_stray_prediction(tmp_path: Path):
+    charts = tmp_path / "charts"
+    predictions = tmp_path / "predictions"
+    charts.mkdir()
+    predictions.mkdir()
+    (charts / "foo.dtx").write_text("#BPM: 120\n", encoding="utf-8")
+    (predictions / "foo.mid").write_bytes(b"MThd")
+    (predictions / "stray.mid").write_bytes(b"MThd")
+
+    result = validate_score_midi_corpus(charts, predictions)
+
+    assert len(result.valid_items) == 1
+    assert "stray prediction MIDI with no matching chart: stray" in result.errors
     assert result.is_valid is False

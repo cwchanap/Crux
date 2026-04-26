@@ -215,6 +215,37 @@ def test_score_midi_defaults_output_dir_from_run_name(tmp_path: Path, monkeypatc
     assert (expected_output / "summary.json").exists()
 
 
+def test_score_midi_fails_on_missing_prediction(tmp_path: Path):
+    charts = tmp_path / "charts"
+    predictions = tmp_path / "predictions"
+    output = tmp_path / "out"
+    charts.mkdir()
+    predictions.mkdir()
+    (charts / "foo.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+    (charts / "bar.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+    write_prediction(predictions / "foo.mid")
+    # bar.mid is missing
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "score-midi",
+            "--charts-dir",
+            str(charts),
+            "--predictions-dir",
+            str(predictions),
+            "--output-dir",
+            str(output),
+            "--tolerance-ms",
+            "50",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "corpus validation failed" in result.output
+
+
 def test_validate_corpus_reports_missing_prediction(tmp_path: Path):
     charts = tmp_path / "charts"
     predictions = tmp_path / "predictions"
