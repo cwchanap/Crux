@@ -60,7 +60,7 @@ def score_midi(
     export_reference_midi: bool,
 ) -> None:
     """Score precomputed prediction MIDI files."""
-    resolved_output_dir = resolve_benchmark_output_dir(output_dir, run_name, charts_dir)
+    resolved_output_dir = resolve_benchmark_output_dir(output_dir, run_name, charts_dir.parent)
     try:
         reports = run_score_midi(
             charts_dir=charts_dir,
@@ -112,7 +112,7 @@ def inspect_dtx(dtx_path: Path) -> None:
 def export_reference_midi(charts_dir: Path, run_name: str | None, output_dir: Path | None) -> None:
     """Export benchmark-owned reference MIDI artifacts."""
     count = export_reference_midis(
-        charts_dir, resolve_benchmark_output_dir(output_dir, run_name, charts_dir)
+        charts_dir, resolve_benchmark_output_dir(output_dir, run_name, charts_dir.parent)
     )
     click.echo(f"Wrote {count} reference MIDI file(s)")
 
@@ -169,7 +169,7 @@ def transcribe_and_score(
     reports = run_transcribe_and_score(
         charts_dir,
         audio_dir,
-        resolve_benchmark_output_dir(output_dir, run_name, charts_dir),
+        resolve_benchmark_output_dir(output_dir, run_name, charts_dir.parent),
         list(tolerance_ms),
     )
     click.echo(

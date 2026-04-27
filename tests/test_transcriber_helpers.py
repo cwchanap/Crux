@@ -3,6 +3,19 @@ import numpy as np
 from src.app.transcriber import DrumTranscriber
 
 
+def test_onset_min_gap_allows_sixteenth_notes_at_120bpm():
+    """MODEL_ONSET_MIN_GAP_FRAMES must be small enough to allow 16th notes at 120 BPM.
+
+    At 120 BPM, 16th notes are 125 ms apart. With 16 kHz / 512-sample hop,
+    each frame is ~32 ms so 2 frames = ~64 ms, well under 125 ms.
+    """
+    dt = DrumTranscriber(load_model=False)
+    frame_duration_ms = dt.hop_length / dt.MODEL_SAMPLE_RATE * 1000
+    gap_ms = dt.MODEL_ONSET_MIN_GAP_FRAMES * frame_duration_ms
+    # Gap must be shorter than a 16th note at 120 BPM (125 ms)
+    assert gap_ms < 125.0
+
+
 def test_find_onset_peaks_simple():
     dt = DrumTranscriber(load_model=False)
     signal = np.array([0.1, 0.2, 0.6, 0.4, 0.1, 0.7, 0.6, 0.5, 0.1])

@@ -85,11 +85,18 @@ def run_transcribe_and_score(
         transcribe = _make_transcribe_fn(transcriber)
 
     predictions_dir = output_dir / "predictions"
+    matched_charts_dir = output_dir / "_matched_charts"
+
+    # Clear stale artefacts from previous runs so that removed or skipped
+    # charts don't silently contaminate the new results.
+    if predictions_dir.exists():
+        shutil.rmtree(predictions_dir)
+    if matched_charts_dir.exists():
+        shutil.rmtree(matched_charts_dir)
     predictions_dir.mkdir(parents=True, exist_ok=True)
+    matched_charts_dir.mkdir(parents=True, exist_ok=True)
 
     missing_audio: list[str] = []
-    matched_charts_dir = output_dir / "_matched_charts"
-    matched_charts_dir.mkdir(parents=True, exist_ok=True)
     for dtx_path in sorted(
         p for p in charts_dir.iterdir() if p.is_file() and p.suffix.lower() in CHART_SUFFIXES
     ):

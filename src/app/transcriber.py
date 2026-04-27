@@ -46,7 +46,7 @@ class DrumTranscriber:
     CHECKPOINT_RELATIVE_PATH = Path("models/e-gmd/train/model.ckpt-10000")
     MODEL_SAMPLE_RATE = 16000
     MODEL_ONSET_THRESHOLD = 0.7
-    MODEL_ONSET_MIN_GAP_FRAMES = 5
+    MODEL_ONSET_MIN_GAP_FRAMES = 2  # ~64 ms at 16 kHz / 512-sample hop
     # Empirically calibrated against the prepared benchmark corpus.
     # Mid tom remains provisional until we calibrate against charts that contain it.
     TF2_OUTPUT_BIN_TO_DRUM_MIDI = {

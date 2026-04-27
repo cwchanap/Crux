@@ -55,9 +55,30 @@ def test_parse_bpm_table_and_bpm_channels():
     chart = parse_dtx_text(text, chart_id="tempo")
 
     assert chart.bpm_table == {"01": 180.0}
+    # Channel 03 "3C" is hexadecimal = 60 BPM (not base-36 = 120)
     assert [(event.measure, event.position, event.bpm) for event in chart.bpm_events] == [
         (0, 0.0, 180.0),
-        (1, 0.0, 120.0),
+        (1, 0.0, 60.0),
+    ]
+
+
+def test_parse_direct_bpm_channel_03_hex_values():
+    """Channel 03 BPM values are 2-digit hexadecimal (base 16)."""
+    text = "\n".join(
+        [
+            "#BPM: 100",
+            "#00003: 7F00",  # 0x7F = 127
+            "#00103: FF00",  # 0xFF = 255
+            "#00203: 5000",  # 0x50 = 80
+        ]
+    )
+
+    chart = parse_dtx_text(text, chart_id="hex-bpm")
+
+    assert [(ev.measure, ev.bpm) for ev in chart.bpm_events] == [
+        (0, 127.0),
+        (1, 255.0),
+        (2, 80.0),
     ]
 
 
@@ -139,4 +160,5 @@ def test_parse_strips_semicolon_comments_from_data_lines():
         (0, 0.75, "11", "02"),
     ]
     assert len(chart.bpm_events) == 1
-    assert chart.bpm_events[0].bpm == 120.0
+    # Channel 03 "3C" is hexadecimal = 60 BPM
+    assert chart.bpm_events[0].bpm == 60.0
