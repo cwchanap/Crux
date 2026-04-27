@@ -89,6 +89,37 @@ def test_transcribe_and_score_skips_missing_audio(tmp_path: Path):
     assert any(r.chart_id == "found" for r in reports)
 
 
+def test_transcribe_and_score_clears_stale_predictions_on_rerun(tmp_path: Path):
+    """Rerunning transcribe-and-score into the same output_dir clears stale artefacts."""
+    charts = tmp_path / "charts"
+    audio = tmp_path / "audio"
+    output = tmp_path / "out"
+    charts.mkdir()
+    audio.mkdir()
+
+    # First run: two charts with audio
+    (charts / "alpha.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+    (charts / "bravo.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+    (audio / "alpha.wav").write_bytes(b"fake wav")
+    (audio / "bravo.wav").write_bytes(b"fake wav")
+
+    def fake_transcribe(audio_path: Path) -> bytes:
+        return write_prediction_bytes()
+
+    run_transcribe_and_score(charts, audio, output, [50], transcribe=fake_transcribe)
+    assert (output / "predictions" / "alpha.mid").exists()
+    assert (output / "predictions" / "bravo.mid").exists()
+
+    # Remove bravo's audio to simulate a chart being skipped on rerun
+    (audio / "bravo.wav").unlink()
+
+    run_transcribe_and_score(charts, audio, output, [50], transcribe=fake_transcribe)
+
+    # Stale bravo prediction should be gone; only alpha remains
+    assert (output / "predictions" / "alpha.mid").exists()
+    assert not (output / "predictions" / "bravo.mid").exists()
+
+
 def test_default_transcribe_creates_single_transcriber(tmp_path: Path):
     """When no transcribe callback is provided, DrumTranscriber is constructed once."""
     charts = tmp_path / "charts"

@@ -162,9 +162,10 @@ def _parse_note_events(chart_id: str, measure: int, channel: str, value: str) ->
 
 
 def _parse_direct_bpm_events(measure: int, value: str) -> list[DtxBpmEvent]:
+    """Parse DTX channel 03 direct BPM events (2-digit hexadecimal values)."""
     chunks = _chunks(value)
     return [
-        DtxBpmEvent(measure, index / len(chunks), float(int(note_id, 36)), "03")
+        DtxBpmEvent(measure, index / len(chunks), float(int(note_id, 16)), "03")
         for index, note_id in enumerate(chunks)
         if note_id != "00"
     ]
