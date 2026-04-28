@@ -91,3 +91,32 @@ def test_compute_spectrogram_shape():
     # 229 mel bins expected per implementation
     assert spec.shape[1] == 229
     assert np.isfinite(spec).all()
+
+
+def test_build_model_returns_none_on_import_error(monkeypatch, tmp_path):
+    """If tensorflow is not installed, _build_model should return None (fallback), not raise."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        DrumTranscriber,
+        "_resolve_existing_path",
+        classmethod(lambda cls, relative_path: tmp_path / "fake.weights.h5"),
+        raising=True,
+    )
+    # Make the weights file exist so _build_model tries to import the model module.
+    (tmp_path / "fake.weights.h5").write_bytes(b"fake")
+
+    # Patch the import to raise ImportError as if tensorflow is missing.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "src.app.tf2_magenta_model":
+            raise ImportError("no module named 'tensorflow'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    transcriber = DrumTranscriber(load_model=True)
+
+    assert transcriber.model is None
