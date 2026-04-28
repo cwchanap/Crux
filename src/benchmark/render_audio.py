@@ -176,6 +176,15 @@ def _plan_render_selection(
             details={},
         )
 
+    # Validate sample rate consistency
+    sample_rate_check = _validate_placement_sample_rates(placements)
+    if sample_rate_check is not None:
+        return None, InvalidRenderPlanItem(
+            raw_folder=song_dir,
+            reason=sample_rate_check["reason"],
+            details=sample_rate_check["details"],
+        )
+
     return (
         RenderPlanItem(
             song_id=song_dir.name,
@@ -219,6 +228,38 @@ def _plan_sample_placement(
         None,
         None,
     )
+
+
+def _validate_placement_sample_rates(
+    placements: list[ScheduledSamplePlacement],
+) -> dict[str, object] | None:
+    if not placements:
+        return None
+
+    sample_rate: int | None = None
+    for placement in placements:
+        try:
+            info = sf.info(placement.sample_path)
+            placement_sample_rate = info.samplerate
+        except Exception as exc:
+            return {
+                "reason": "sample rate validation failed",
+                "details": {
+                    "message": f"could not read sample rate from {placement.sample_path.name}: {exc}",
+                },
+            }
+
+        if sample_rate is None:
+            sample_rate = placement_sample_rate
+        elif sample_rate != placement_sample_rate:
+            return {
+                "reason": "sample rate mismatch",
+                "details": {
+                    "message": f"sample rate mismatch: expected {sample_rate} Hz but "
+                    f"{placement.sample_path.name} has {placement_sample_rate} Hz",
+                },
+            }
+    return None
 
 
 def _append_unique(items: list[str], value: str) -> None:

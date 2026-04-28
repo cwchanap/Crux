@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from src.benchmark.dtx_parser import parse_dtx_file, parse_dtx_text
 
 
@@ -162,3 +164,8 @@ def test_parse_strips_semicolon_comments_from_data_lines():
     assert len(chart.bpm_events) == 1
     # Channel 03 "3C" is hexadecimal = 60 BPM
     assert chart.bpm_events[0].bpm == 60.0
+
+
+def test_parse_dtx_raises_on_odd_length_pattern():
+    with pytest.raises(ValueError, match="odd length"):
+        parse_dtx_text("#BPM: 120\n#00011: 010\n", chart_id="test")
