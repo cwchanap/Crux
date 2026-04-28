@@ -47,6 +47,9 @@ def _report_row(report: ChartReport) -> dict[str, object]:
     }
 
 
+_REPORT_FIELDNAMES = list(_report_row(ChartReport("", 0, "", ScoreSummary(0, 0, 0))))
+
+
 def _write_summary_json(reports: list[ChartReport], path: Path) -> None:
     payload = {"charts": [_report_row(report) for report in reports]}
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -54,9 +57,8 @@ def _write_summary_json(reports: list[ChartReport], path: Path) -> None:
 
 def _write_per_chart_csv(reports: list[ChartReport], path: Path) -> None:
     rows = [_report_row(report) for report in reports]
-    fieldnames = list(rows[0]) if rows else ["chart_id", "tolerance_ms", "mode"]
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=_REPORT_FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
 

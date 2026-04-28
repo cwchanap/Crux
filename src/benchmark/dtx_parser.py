@@ -114,9 +114,15 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
         elif key.startswith("WAV") and len(key) == 5:
             wav_table[key[3:].upper()] = value
         elif key.startswith("VOLUME") and len(key) == 8:
-            volume_table[key[6:].upper()] = float(value)
+            try:
+                volume_table[key[6:].upper()] = float(value)
+            except ValueError:
+                warnings.append(f"ignoring non-numeric VOLUME value for {key}: {value!r}")
         elif key.startswith("POSITION") and len(key) == 10:
-            position_table[key[8:].upper()] = float(value)
+            try:
+                position_table[key[8:].upper()] = float(value)
+            except ValueError:
+                warnings.append(f"ignoring non-numeric POSITION value for {key}: {value!r}")
 
     for measure, value in pending_table_bpm_events:
         bpm_events.extend(_parse_table_bpm_events(measure, value, bpm_table, warnings))

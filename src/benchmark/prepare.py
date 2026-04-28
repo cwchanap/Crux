@@ -66,8 +66,18 @@ def prepare_corpus(raw_dir: Path, output_dir: Path) -> PrepareCorpusResult:
     for item in scan_result.valid_items:
         parsed_chart_path = charts_dir / f"{item.song_id}{item.selected_chart.suffix.lower()}"
         parsed_audio_path = audio_dir / f"{item.song_id}{item.selected_audio.suffix.lower()}"
-        shutil.copy2(item.selected_chart, parsed_chart_path)
-        shutil.copy2(item.selected_audio, parsed_audio_path)
+        try:
+            shutil.copy2(item.selected_chart, parsed_chart_path)
+            shutil.copy2(item.selected_audio, parsed_audio_path)
+        except OSError as exc:
+            scan_result.invalid_items.append(
+                InvalidPreparedCorpusItem(
+                    raw_folder=item.raw_folder,
+                    reason="failed to copy corpus files",
+                    details={"exception": str(exc)},
+                )
+            )
+            continue
         manifest_entries.append(
             {
                 "song_id": item.song_id,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from math import ceil
 from statistics import median
@@ -29,12 +30,10 @@ def score_events(
     offset_sec: float = 0.0,
 ) -> ScoreResult:
     adjusted_predictions = [
-        BenchmarkEvent(
-            event.chart_id,
-            event.time_sec + offset_sec,
-            event.canonical_class,
-            event.source,
-            event.metadata,
+        dataclasses.replace(
+            event,
+            time_sec=event.time_sec + offset_sec,
+            metadata=dict(event.metadata),
         )
         for event in predictions
     ]

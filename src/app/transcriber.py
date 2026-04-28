@@ -108,11 +108,7 @@ class DrumTranscriber:
                     self.model_path = self._download_model()
 
             # Build model
-            try:
-                self.model = self._build_model()
-            except Exception as e:  # pylint: disable=broad-except
-                logger.warning("Could not load model: %s. Using fallback method.", e)
-                self.model = None
+            self.model = self._build_model()
         else:
             # Skip model initialization entirely (used for tests)
             self.model = None
@@ -198,8 +194,6 @@ class DrumTranscriber:
                 continue
 
         logger.error("Failed to download model from any source")
-        # For testing, create a dummy model
-        logger.warning("Creating dummy model for testing purposes")
         return None
 
     def _build_model(self):
@@ -241,7 +235,8 @@ class DrumTranscriber:
 
             return model
 
-        except Exception as e:  # pylint: disable=broad-except
+        # Unexpected TF errors propagate intentionally — silent fallback hides broken model state.
+        except (OSError, ValueError) as e:
             logging.error("Failed to build TF2 model: %s", e)
             return None
 
@@ -498,24 +493,12 @@ class DrumTranscriber:
         """
         Run TF2 model inference on audio
         """
-        try:
-            # Compute spectrogram for model input
-            spec = self._compute_spectrogram_for_model(audio, sr)
-
-            # Add batch and channel dimensions [batch, time, freq, channels]
-            spec_input = spec[np.newaxis, :, :, np.newaxis]
-
-            # Run inference
-            outputs = self.model(spec_input, training=False)
-
-            # Process outputs to drum events
-            drum_events = self._process_tf2_model_outputs(outputs, self.MODEL_SAMPLE_RATE)
-
-            return drum_events
-        except Exception as e:  # pylint: disable=broad-except
-            logger.error("TF2 model inference failed: %s", e)
-            logger.warning("Falling back to onset detection")
-            return self._detect_onsets_from_audio(audio)
+        # Exceptions propagate intentionally — the caller skips the chart rather than silently
+        # producing heuristic output disguised as ML transcription.
+        spec = self._compute_spectrogram_for_model(audio, sr)
+        spec_input = spec[np.newaxis, :, :, np.newaxis]
+        outputs = self.model(spec_input, training=False)
+        return self._process_tf2_model_outputs(outputs, self.MODEL_SAMPLE_RATE)
 
     def _extract_features(self, audio: np.ndarray) -> np.ndarray:
         """Extract mel-spectrogram features from audio"""
@@ -534,7 +517,13 @@ class DrumTranscriber:
         log_mel = librosa.power_to_db(mel_spec, ref=np.max)
 
         # Normalize
-        log_mel = (log_mel - log_mel.mean()) / log_mel.std()
+        std = log_mel.std()
+        if std < 1e-8:
+            raise ValueError(
+                f"audio spectrogram has near-zero standard deviation ({std:.2e}); "
+                "input may be silent or corrupt"
+            )
+        log_mel = (log_mel - log_mel.mean()) / std
 
         # Transpose for model input (time, features)
         return log_mel.T
