@@ -301,3 +301,33 @@ def test_inspect_dtx_outputs_counts(tmp_path: Path):
     assert "chart_id: foo" in result.output
     assert "events: 1" in result.output
     assert "bpm_events: 1" in result.output
+
+
+def test_transcribe_and_score_cli_runs_and_reports_chart_count(tmp_path: Path, monkeypatch):
+    from src.benchmark.models import ScoreSummary
+    from src.benchmark.reports import ChartReport
+
+    fake_reports = [ChartReport("foo", 50, "raw", ScoreSummary(1, 0, 0))]
+    monkeypatch.setattr(
+        "src.cli.benchmark.run_transcribe_and_score",
+        lambda *args, **kwargs: fake_reports,
+    )
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "transcribe-and-score",
+            "--charts-dir",
+            str(tmp_path),
+            "--audio-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--tolerance-ms",
+            "50",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "1 chart" in result.output

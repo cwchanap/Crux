@@ -499,3 +499,23 @@ def test_render_audio_corpus_writes_render_artifacts_and_reports(tmp_path: Path)
     }
     invalid = json.loads((output / "invalid.json").read_text(encoding="utf-8"))
     assert invalid == {"items": []}
+
+
+def test_render_plan_item_reports_sample_rate_mismatch_as_invalid(tmp_path: Path):
+    song = tmp_path / "Song"
+    song.mkdir()
+    (song / "mas.dtx").write_text(
+        "\n".join(
+            ["#BPM: 120", "#WAV01: kick.wav", "#WAV02: snare.wav", "#00111: 01", "#00112: 02"]
+        ),
+        encoding="utf-8",
+    )
+    _write_sample(song / "kick.wav", [1.0, 0.0], sample_rate=8000)
+    _write_sample(song / "snare.wav", [0.5, 0.0], sample_rate=44100)
+
+    result = plan_render_corpus(tmp_path)
+
+    assert not result.valid_items
+    assert len(result.invalid_items) == 1
+    invalid = result.invalid_items[0]
+    assert "sample rate mismatch" in invalid.details.get("message", "")

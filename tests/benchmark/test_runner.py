@@ -161,3 +161,19 @@ def write_prediction_bytes() -> bytes:
 async def _async_return(value):
     """Helper to make a coroutine that returns *value*."""
     return value
+
+
+def test_run_score_midi_no_align_emits_only_raw_reports(tmp_path: Path):
+    charts = tmp_path / "charts"
+    predictions = tmp_path / "predictions"
+    output = tmp_path / "out"
+    charts.mkdir()
+    predictions.mkdir()
+    (charts / "foo.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+    write_prediction(predictions / "foo.mid")
+
+    reports = run_score_midi(charts, predictions, output, tolerance_ms=[50], align=False)
+
+    modes = {report.mode for report in reports}
+    assert modes == {"raw"}, f"expected only 'raw' mode, got {modes}"
+    assert len(reports) == 1

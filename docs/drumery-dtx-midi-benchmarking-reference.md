@@ -45,137 +45,37 @@ The safest benchmarking strategy is:
 - `../drumery/packages/common/src/lib/game/scenes/BaseGame.ts`
 - `../drumery/packages/common/src/lib/game/scenes/Preview.ts`
 
-## Supported DTX Subset in the Parser
+## DTX Parsing in the Benchmark Pipeline
 
-### File decoding
+### Python `dtx_parser.py` (used for scoring)
 
-When a DTX file is loaded from `File`, the parser tries these encodings in order:
+The benchmark uses `src/benchmark/dtx_parser.py` exclusively for all DTX parsing. It handles:
 
-- `shift-jis`
-- `utf-8`
-- `utf-16le`
-- `utf-16be`
+**File encoding:** Attempts UTF-8 first; falls back to Shift-JIS (common for Japanese DTX files). Line splitting uses Python's `str.splitlines()`, which correctly handles LF (`\n`), CRLF (`\r\n`), and CR (`\r`) files.
 
-The fallback encoding is `shift-jis`.
+**Line prefixes:** Both `#` and `*` are accepted as line-directive prefixes.
 
-Validation is shallow. The file is treated as DTX-like if the decoded text contains one of:
+**Header fields parsed:**
+- `#TITLE` — song title (string; semicolons preserved)
+- `#ARTIST` — artist name (string; semicolons preserved)
+- `#BPM` — base tempo in BPM (positive float)
+- `#BPMxx` — BPM lookup table entry (positive float; hex key)
+- `#WAVxx` — sample filename (string; hex key)
+- `#VOLUMExx` — per-sample volume scalar (float; non-numeric values produce a warning and are skipped)
+- `#POSITIONxx` — per-sample pan position (float; non-numeric values produce a warning and are skipped)
 
-- `#TITLE:`
-- `#ARTIST:`
-- `#BPM:`
-- `#WAV`
+**Tempo events:**
+- Channel `02` — measure-length multiplier (modifies how many beats a measure spans)
+- Channel `03` — inline BPM, encoded as a two-digit hex integer (e.g. `78` hex = 120 BPM)
+- Channel `08` — BPM lookup index into the `#BPMxx` table
 
-### Line splitting
+**Note chips:** Any channel not handled above is treated as a note event (lane = channel id, note_id = chip value).
 
-`parseFromText()` splits only on `\r\n`.
+**Duplicate tempo events:** If two BPM chips resolve to the same beat position, the later value wins and a warning is added to `chart.warnings`.
 
-Implication:
+### Background: Drumery TypeScript Parser (not used for scoring)
 
-- CRLF files are handled as expected.
-- LF-only files may not be parsed correctly as multi-line DTX files.
-
-### Header fields actually parsed
-
-The parser reads these directives:
-
-- `#TITLE`
-- `#ARTIST`
-- `#DLEVEL`
-- `#BPM`
-- `#PREIMAGE`
-- `#PREVIEW`
-
-It does not parse `#COMMENT` from source DTX, even though export can write `#COMMENT`.
-
-### Sound chip directives actually parsed
-
-The parser reads:
-
-- `#WAVxx`
-- `#VOLUMExx`
-- `#POSITIONxx`
-
-Where `xx` is a 2-character base-36 chip id.
-
-Examples:
-
-- `#WAV01: kick.wav`
-- `#WAVA1: hihat.wav`
-- `#VOLUME01: 80`
-- `#POSITION02: 50`
-
-Important implementation detail:
-
-- sound-chip parsing expects `": "` with a trailing space after the colon
-- `#WAV01:kick.wav` is not handled consistently by the sound-chip parser
-
-### BPM change directives
-
-The parser can extract `#BPMxx` directives into a lookup table, including:
-
-- `#BPM: 120`
-- `#BPM01: 140.5`
-
-But the DTX-to-MIDI exporter does not apply BPM changes during MIDI generation. Only the base
-`this.bpm` value is used.
-
-### Note line grammar implemented by the parser
-
-The parser expects note lines in this form:
-
-```text
-#mmmll: pattern
-```
-
-Where:
-
-- `mmm` is a 3-digit measure number
-- `ll` is a 2-character lane id
-- `pattern` is an even-length string of 2-character note ids
-- `00` means "empty slot"
-
-Example:
-
-```text
-#00011: 01020000
-```
-
-The parser:
-
-- splits the pattern into 2-character chunks
-- assigns each chunk a fractional position within the measure
-- filters out `00`
-
-Example:
-
-```text
-#00011: 01020000
-```
-
-becomes:
-
-- note `01` at position `0`
-- note `02` at position `0.25`
-
-### Supported subdivisions
-
-Subdivision support is implicit through pattern length. Tests cover:
-
-- 16th-note-like grids
-- 24th-note grids
-- 32nd-note grids
-- 48th-note grids
-- 64th-note grids
-
-Positions are represented as fractions of the measure and normalized for precision.
-
-### Important parser limitations
-
-- note lines must start with `#`
-- note parsing expects `": "` with a trailing space
-- measure-length changes are not handled here
-- extended DTX channel semantics are not interpreted
-- note ids are treated as opaque 2-character values until later conversion
+The Drumery web application uses a separate TypeScript parser (`dtx.ts`, `note.ts`) for chart rendering. This parser is **not** used anywhere in the benchmark pipeline. Its behavior may differ from `dtx_parser.py` in edge cases (whitespace handling, comment stripping, supported channels). The sections below describe the TypeScript parser for reference only.
 
 ## Lane Id Conventions: The Biggest Benchmarking Trap
 
@@ -609,7 +509,14 @@ uv run crux benchmark score-midi \
 
 Optional flags:
 
-- `--align/--no-align` controls whether global offset alignment is reported
+`--align` / `--no-align` controls whether a global time-offset correction is computed and applied before scoring. With `--align` (the default), the pipeline:
+
+1. Computes a cross-correlation histogram across shared drum classes to find the best global offset
+2. Applies that offset to all predictions
+3. Emits two report rows per chart per tolerance window: `raw` (unshifted) and `aligned` (offset-corrected)
+
+With `--no-align`, only `raw` report rows are emitted and no offset is computed.
+
 - `--export-reference-midi` writes benchmark-owned reference MIDI artifacts alongside the reports
 
 ### Optional: Export benchmark-owned reference MIDI

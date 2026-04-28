@@ -127,3 +127,22 @@ def test_alignment_histogram_accepts_empty_input():
     result = _alignment_histogram([], num_bins=10, bin_size=0.01)
     assert isinstance(result, np.ndarray)
     assert result.sum() == 0
+
+
+def test_alignment_empty_ground_truth_returns_zero_offset():
+    pred = [event(1.0, "kick", "prediction")]
+    result = score_events_with_alignment([], pred, 0.05)
+
+    assert result.raw.summary.offset_sec == 0.0
+    assert result.aligned.summary.offset_sec == 0.0
+    assert result.raw.summary.true_positives == 0
+    assert result.raw.summary.false_positives == 1
+
+
+def test_alignment_no_shared_classes_returns_zero_offset():
+    gt = [event(1.0, "kick", "ground_truth")]
+    pred = [event(1.0, "snare", "prediction")]
+    result = score_events_with_alignment(gt, pred, 0.05)
+
+    assert result.raw.summary.offset_sec == 0.0
+    assert result.aligned.summary.offset_sec == 0.0
