@@ -32,30 +32,39 @@ def run_score_midi(
         raise ValueError(f"corpus validation failed: {error_list}")
 
     reports: list[ChartReport] = []
+    failed_charts: list[str] = []
     for item in validation.valid_items:
-        chart = parse_dtx_file(item.dtx_path, chart_id=item.chart_id)
-        ground_truth, _ = map_dtx_events(dtx_events_to_timed_events(chart))
-        predictions, _ = map_midi_events(
-            parse_prediction_midi(item.prediction_midi_path, item.chart_id)
-        )
-
-        if export_reference_midi:
-            write_reference_midi(
-                ground_truth, output_dir / "reference_midi" / f"{item.chart_id}.mid"
+        try:
+            chart = parse_dtx_file(item.dtx_path, chart_id=item.chart_id)
+            ground_truth, _ = map_dtx_events(dtx_events_to_timed_events(chart))
+            predictions, _ = map_midi_events(
+                parse_prediction_midi(item.prediction_midi_path, item.chart_id)
             )
 
-        for tolerance in tolerance_ms:
-            tolerance_sec = tolerance / 1000
-            if align:
-                result = score_events_with_alignment(ground_truth, predictions, tolerance_sec)
-                reports.append(ChartReport(item.chart_id, tolerance, "raw", result.raw.summary))
-                reports.append(
-                    ChartReport(item.chart_id, tolerance, "aligned", result.aligned.summary)
+            if export_reference_midi:
+                write_reference_midi(
+                    ground_truth, output_dir / "reference_midi" / f"{item.chart_id}.mid"
                 )
-            else:
-                result = score_events(ground_truth, predictions, tolerance_sec)
-                reports.append(ChartReport(item.chart_id, tolerance, "raw", result.summary))
 
+            for tolerance in tolerance_ms:
+                tolerance_sec = tolerance / 1000
+                if align:
+                    result = score_events_with_alignment(ground_truth, predictions, tolerance_sec)
+                    reports.append(ChartReport(item.chart_id, tolerance, "raw", result.raw.summary))
+                    reports.append(
+                        ChartReport(item.chart_id, tolerance, "aligned", result.aligned.summary)
+                    )
+                else:
+                    result = score_events(ground_truth, predictions, tolerance_sec)
+                    reports.append(ChartReport(item.chart_id, tolerance, "raw", result.summary))
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Failed to score chart %r; skipping", item.chart_id)
+            failed_charts.append(item.chart_id)
+
+    if failed_charts:
+        logger.warning(
+            "Scoring failed for %d chart(s): %s", len(failed_charts), ", ".join(failed_charts)
+        )
     write_reports(reports, output_dir)
     return reports
 
@@ -63,13 +72,21 @@ def run_score_midi(
 def export_reference_midis(charts_dir: Path, output_dir: Path) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     count = 0
+    failed = 0
     for dtx_path in sorted(
         p for p in charts_dir.iterdir() if p.is_file() and p.suffix.lower() in CHART_SUFFIXES
     ):
-        chart = parse_dtx_file(dtx_path, chart_id=dtx_path.stem)
-        ground_truth, _ = map_dtx_events(dtx_events_to_timed_events(chart))
-        write_reference_midi(ground_truth, output_dir / f"{dtx_path.stem}.mid")
-        count += 1
+        try:
+            chart = parse_dtx_file(dtx_path, chart_id=dtx_path.stem)
+            ground_truth, _ = map_dtx_events(dtx_events_to_timed_events(chart))
+            write_reference_midi(ground_truth, output_dir / f"{dtx_path.stem}.mid")
+            count += 1
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Failed to export reference MIDI for %s; skipping", dtx_path.name)
+            failed += 1
+
+    if failed:
+        logger.warning("Export failed for %d chart(s)", failed)
     return count
 
 
@@ -97,6 +114,7 @@ def run_transcribe_and_score(
     matched_charts_dir.mkdir(parents=True, exist_ok=True)
 
     missing_audio: list[str] = []
+    failed_charts: list[str] = []
     for dtx_path in sorted(
         p for p in charts_dir.iterdir() if p.is_file() and p.suffix.lower() in CHART_SUFFIXES
     ):
@@ -105,7 +123,12 @@ def run_transcribe_and_score(
         except FileNotFoundError:
             missing_audio.append(dtx_path.stem)
             continue
-        midi_bytes = transcribe(audio_path)
+        try:
+            midi_bytes = transcribe(audio_path)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Transcription failed for chart %r; skipping", dtx_path.stem)
+            failed_charts.append(dtx_path.stem)
+            continue
         (predictions_dir / f"{dtx_path.stem}.mid").write_bytes(midi_bytes)
         shutil.copy2(dtx_path, matched_charts_dir / dtx_path.name)
 
@@ -114,6 +137,12 @@ def run_transcribe_and_score(
             "Skipping %d chart(s) with missing audio: %s",
             len(missing_audio),
             ", ".join(missing_audio),
+        )
+    if failed_charts:
+        logger.warning(
+            "Transcription failed for %d chart(s): %s",
+            len(failed_charts),
+            ", ".join(failed_charts),
         )
 
     return run_score_midi(matched_charts_dir, predictions_dir, output_dir, tolerance_ms, align=True)

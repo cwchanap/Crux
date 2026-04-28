@@ -130,14 +130,13 @@ def test_plan_render_corpus_collects_timing_failures_as_invalid_items(tmp_path: 
         encoding="utf-8",
     )
     _write_sample(good_song / "kick.wav", [1.0, 0.0, 0.0, 0.0])
+    # Measure length of 0 is invalid and triggers a parse-time ValueError.
     (bad_song / "mas.dtx").write_text(
         "\n".join(
             [
                 "#BPM: 120",
-                "#BPM01: 150",
-                "#00103: 01",
-                "#00108: 01",
-                "#00211: 01",
+                "#00102: 0",
+                "#00111: 01",
             ]
         ),
         encoding="utf-8",

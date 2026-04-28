@@ -46,7 +46,12 @@ def prepare_benchmark_corpus(raw_dir: Path, run_name: str | None, output_dir: Pa
 @run_name_option
 @output_dir_option
 @tolerance_option
-@click.option("--align/--no-align", default=True, show_default=True)
+@click.option(
+    "--align/--no-align",
+    default=True,
+    show_default=True,
+    help="Compute and apply a global time-offset correction. Emits both raw and aligned report rows when enabled.",
+)
 @click.option(
     "--export-reference-midi/--no-export-reference-midi", default=False, show_default=True
 )
@@ -81,7 +86,7 @@ def score_midi(
 @charts_dir_option
 @predictions_dir_option
 def validate_corpus(charts_dir: Path, predictions_dir: Path) -> None:
-    """Validate benchmark corpus folder matching."""
+    """Check DTX charts and prediction MIDIs for missing files, stray files, and duplicate stems."""
     result = validate_score_midi_corpus(charts_dir, predictions_dir)
     for error in result.errors:
         click.echo(error, err=True)
@@ -93,7 +98,7 @@ def validate_corpus(charts_dir: Path, predictions_dir: Path) -> None:
 @benchmark.command("inspect-dtx")
 @click.argument("dtx_path", type=click.Path(exists=True, path_type=Path))
 def inspect_dtx(dtx_path: Path) -> None:
-    """Inspect parsed DTX timing and lane statistics."""
+    """Print parsed DTX chart metadata: event count, BPM, measure changes, and lane list."""
     chart = parse_dtx_file(dtx_path, chart_id=dtx_path.stem)
     lanes = sorted({event.lane_id for event in chart.events})
     click.echo(f"chart_id: {chart.chart_id}")
@@ -110,7 +115,7 @@ def inspect_dtx(dtx_path: Path) -> None:
 @run_name_option
 @output_dir_option
 def export_reference_midi(charts_dir: Path, run_name: str | None, output_dir: Path | None) -> None:
-    """Export benchmark-owned reference MIDI artifacts."""
+    """Export MIDI files derived from DTX charts for manual inspection (not used for scoring)."""
     count = export_reference_midis(
         charts_dir, resolve_benchmark_output_dir(output_dir, run_name, charts_dir.parent)
     )

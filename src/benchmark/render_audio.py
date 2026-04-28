@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +13,8 @@ from src.benchmark.dtx_parser import parse_dtx_file
 from src.benchmark.models import BenchmarkEvent
 from src.benchmark.prepare import _select_chart
 from src.benchmark.timing import dtx_events_to_timed_events
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -229,12 +232,22 @@ def _resolve_sample_path(song_dir: Path, sample_name: str) -> Path | None:
     try:
         sample_path.relative_to(song_dir_resolved)
     except ValueError:
+        logger.warning(
+            "Sample path escapes song directory (song_dir=%s, sample=%s); skipping",
+            song_dir_resolved,
+            sample_path,
+        )
         return None
     if not sample_path.is_file():
         return None
     try:
         sf.info(sample_path)
-    except (OSError, RuntimeError, ValueError, sf.LibsndfileError):
+    except (OSError, RuntimeError, ValueError, sf.LibsndfileError) as exc:
+        logger.debug(
+            "Sample file exists but is unreadable (path=%s): %s",
+            sample_path,
+            exc,
+        )
         return None
     return sample_path
 
@@ -334,14 +347,19 @@ def _render_placements(placements: list[ScheduledSamplePlacement]) -> tuple[np.n
     output_channels = 1
 
     for placement in placements:
-        sample, placement_sample_rate = _load_sample(placement.sample_path)
-        cached_samples[placement.sample_path] = sample
-        if sample_rate is None:
-            sample_rate = placement_sample_rate
-        elif sample_rate != placement_sample_rate:
-            raise ValueError("sample rate mismatch across rendered placements")
-
-        output_channels = max(output_channels, sample.shape[1])
+        if placement.sample_path not in cached_samples:
+            sample, placement_sample_rate = _load_sample(placement.sample_path)
+            cached_samples[placement.sample_path] = sample
+            if sample_rate is None:
+                sample_rate = placement_sample_rate
+            elif sample_rate != placement_sample_rate:
+                raise ValueError(
+                    f"sample rate mismatch: expected {sample_rate} Hz but "
+                    f"{placement.sample_path.name} has {placement_sample_rate} Hz"
+                )
+            output_channels = max(output_channels, sample.shape[1])
+        else:
+            sample = cached_samples[placement.sample_path]
 
         start_frame = max(0, int(round(placement.time_sec * sample_rate)))
         max_frame = max(max_frame, start_frame + sample.shape[0])

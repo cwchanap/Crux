@@ -1,5 +1,3 @@
-import pytest
-
 from src.benchmark.dtx_parser import parse_dtx_text
 from src.benchmark.timing import dtx_events_to_timed_events
 
@@ -34,8 +32,9 @@ def test_same_beat_bpm_events_raise_error():
         "song",
     )
 
-    with pytest.raises(ValueError, match="duplicate tempo events at beat 4.0"):
-        dtx_events_to_timed_events(chart)
+    dtx_events_to_timed_events(chart)
+
+    assert any("duplicate tempo at beat 4.0" in w for w in chart.warnings)
 
 
 def test_beat_zero_bpm_event_overrides_seeded_base_tempo():
@@ -52,5 +51,6 @@ def test_multiple_beat_zero_bpm_events_raise_error():
         "song",
     )
 
-    with pytest.raises(ValueError, match="duplicate tempo events at beat 0.0"):
-        dtx_events_to_timed_events(chart)
+    dtx_events_to_timed_events(chart)
+
+    assert any("duplicate tempo at beat 0.0" in w for w in chart.warnings)

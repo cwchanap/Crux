@@ -38,6 +38,15 @@ def parse_prediction_midi(path: Path, chart_id: str) -> list[BenchmarkEvent]:
                     metadata={"midi_note": int(note.pitch), "velocity": int(note.velocity)},
                 )
             )
+    if not events and midi.instruments:
+        non_drum = [i.name for i in midi.instruments if not i.is_drum]
+        logger.warning(
+            "parse_prediction_midi: no drum track found in %s (chart_id=%r); "
+            "non-drum instruments: %s",
+            path,
+            chart_id,
+            non_drum or "<none>",
+        )
     return sorted(events)
 
 
