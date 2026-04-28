@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 from src.benchmark.prepare import (
@@ -96,3 +97,40 @@ def test_prepare_corpus_preserves_txt_chart_suffix(tmp_path: Path):
     entry = manifest["items"][0]
     assert entry["selected_chart"] == "ext.txt"
     assert entry["parsed_chart_path"].endswith("TxtSong.txt")
+
+
+def test_prepare_corpus_removes_stale_files_on_rerun(tmp_path: Path):
+    """Re-running prepare_corpus into the same output dir must not leave stale files."""
+    raw = tmp_path / "raw"
+    output = tmp_path / "parsed"
+
+    # First run: two songs
+    song_a = raw / "SongA"
+    song_a.mkdir(parents=True)
+    (song_a / "ext.dtx").write_text("#BPM: 120\n", encoding="utf-8")
+    (song_a / "drum.mp3").write_bytes(b"drums-a")
+
+    song_b = raw / "SongB"
+    song_b.mkdir(parents=True)
+    (song_b / "ext.dtx").write_text("#BPM: 120\n", encoding="utf-8")
+    (song_b / "drum.mp3").write_bytes(b"drums-b")
+
+    prepare_corpus(raw, output)
+    assert (output / "charts" / "SongA.dtx").exists()
+    assert (output / "charts" / "SongB.dtx").exists()
+    assert (output / "audio" / "SongA.mp3").exists()
+    assert (output / "audio" / "SongB.mp3").exists()
+
+    # Remove SongB from raw dir, re-run with only SongA
+    shutil.rmtree(song_b)
+
+    prepare_corpus(raw, output)
+
+    # SongA still present; SongB must be gone
+    assert (output / "charts" / "SongA.dtx").exists()
+    assert (output / "audio" / "SongA.mp3").exists()
+    assert not (output / "charts" / "SongB.dtx").exists()
+    assert not (output / "audio" / "SongB.mp3").exists()
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert len(manifest["items"]) == 1
+    assert manifest["items"][0]["song_id"] == "SongA"

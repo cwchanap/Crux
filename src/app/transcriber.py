@@ -235,8 +235,11 @@ class DrumTranscriber:
 
             return model
 
-        # Unexpected TF errors propagate intentionally — silent fallback hides broken model state.
-        except (OSError, ValueError) as e:
+        # ImportError/ModuleNotFoundError: TF not installed — fall back to onset detection.
+        # OSError/ValueError: corrupt weights or bad checkpoint — fall back gracefully.
+        # Unexpected TF runtime errors (RuntimeError etc.) propagate intentionally so that
+        # broken model state is not silently hidden behind heuristic output.
+        except (ImportError, ModuleNotFoundError, OSError, ValueError) as e:
             logging.error("Failed to build TF2 model: %s", e)
             return None
 

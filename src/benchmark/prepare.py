@@ -59,6 +59,13 @@ def prepare_corpus(raw_dir: Path, output_dir: Path) -> PrepareCorpusResult:
     scan_result = scan_raw_corpus(raw_dir)
     charts_dir = output_dir / "charts"
     audio_dir = output_dir / "audio"
+    # Clear stale files from previous runs so removed/invalid songs don't
+    # leak into downstream commands that discover inputs by scanning these
+    # directories rather than reading manifest.json.
+    if charts_dir.exists():
+        shutil.rmtree(charts_dir)
+    if audio_dir.exists():
+        shutil.rmtree(audio_dir)
     charts_dir.mkdir(parents=True, exist_ok=True)
     audio_dir.mkdir(parents=True, exist_ok=True)
 
