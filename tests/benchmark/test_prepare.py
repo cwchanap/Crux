@@ -1,6 +1,7 @@
 import json
 import shutil
 from pathlib import Path
+from unittest.mock import patch
 
 from src.benchmark.prepare import (
     DRUM_AUDIO_FILENAMES,
@@ -131,6 +132,45 @@ def test_prepare_corpus_removes_stale_files_on_rerun(tmp_path: Path):
     assert (output / "audio" / "SongA.mp3").exists()
     assert not (output / "charts" / "SongB.dtx").exists()
     assert not (output / "audio" / "SongB.mp3").exists()
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert len(manifest["items"]) == 1
+    assert manifest["items"][0]["song_id"] == "SongA"
+
+
+def test_prepare_corpus_excludes_copy_failures_from_valid_items(tmp_path: Path):
+    """Items that fail during file copy must not appear in valid_items or manifest."""
+    raw = tmp_path / "raw"
+    output = tmp_path / "parsed"
+
+    song_a = raw / "SongA"
+    song_a.mkdir(parents=True)
+    (song_a / "ext.dtx").write_text("#BPM: 120\n", encoding="utf-8")
+    (song_a / "drum.mp3").write_bytes(b"drums-a")
+
+    song_b = raw / "SongB"
+    song_b.mkdir(parents=True)
+    (song_b / "ext.dtx").write_text("#BPM: 120\n", encoding="utf-8")
+    (song_b / "drum.mp3").write_bytes(b"drums-b")
+
+    original_copy2 = shutil.copy2
+    call_count = 0
+
+    def failing_copy2(src, dst, *, follow_symlinks=True):
+        nonlocal call_count
+        call_count += 1
+        if "SongB" in str(src):
+            raise OSError("disk full")
+        return original_copy2(src, dst, follow_symlinks=follow_symlinks)
+
+    with patch("src.benchmark.prepare.shutil.copy2", side_effect=failing_copy2):
+        result = prepare_corpus(raw, output)
+
+    assert len(result.valid_items) == 1
+    assert result.valid_items[0].song_id == "SongA"
+    assert len(result.invalid_items) == 1
+    assert result.invalid_items[0].reason == "failed to copy corpus files"
+    assert (output / "charts" / "SongA.dtx").exists()
+    assert not (output / "charts" / "SongB.dtx").exists()
     manifest = json.loads((output / "manifest.json").read_text())
     assert len(manifest["items"]) == 1
     assert manifest["items"][0]["song_id"] == "SongA"
