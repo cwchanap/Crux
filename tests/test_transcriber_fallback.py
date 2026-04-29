@@ -1,6 +1,6 @@
+import httpx
 import numpy as np
 import pytest
-import requests
 import soundfile as sf
 
 from src.app.transcriber import DrumTranscriber
@@ -46,14 +46,14 @@ def test_init_falls_back_when_model_download_fails(monkeypatch, tmp_path):
         raising=True,
     )
 
-    class FailingResponse:
-        def raise_for_status(self):
-            raise requests.HTTPError("404 Client Error")
+    def fake_stream(*args, **kwargs):
+        raise httpx.HTTPStatusError(
+            "404 Client Error",
+            request=httpx.Request("GET", "http://fake"),
+            response=httpx.Response(404),
+        )
 
-    def fake_get(*args, **kwargs):
-        return FailingResponse()
-
-    monkeypatch.setattr("src.app.transcriber.requests.get", fake_get)
+    monkeypatch.setattr("src.app.transcriber.httpx.stream", fake_stream)
 
     transcriber = DrumTranscriber(load_model=True)
 

@@ -9,10 +9,10 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import httpx
 import librosa
 import numpy as np
 import pretty_midi
-import requests
 
 # Heavy dependencies (TensorFlow, TF2 model utilities) are intentionally NOT imported at
 # module import time to keep tests and lightweight environments fast.
@@ -169,16 +169,14 @@ class DrumTranscriber:
 
         for model_url in model_urls:
             try:
-                response = requests.get(model_url, stream=True, timeout=10)
-                response.raise_for_status()
-
-                # Save the zip file
                 model_dir.mkdir(parents=True, exist_ok=True)
                 zip_path = model_dir / "checkpoint.zip"
 
-                with open(zip_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
+                with httpx.stream("GET", model_url, timeout=10, follow_redirects=True) as response:
+                    response.raise_for_status()
+                    with open(zip_path, "wb") as f:
+                        for chunk in response.iter_bytes(chunk_size=8192):
+                            f.write(chunk)
 
                 with zipfile.ZipFile(zip_path, "r") as zip_ref:
                     zip_ref.extractall(model_dir)
@@ -189,7 +187,7 @@ class DrumTranscriber:
                 logger.info("E-GMD model downloaded successfully")
                 return str(checkpoint_path)
 
-            except (requests.RequestException, zipfile.BadZipFile, OSError) as e:
+            except (httpx.HTTPError, zipfile.BadZipFile, OSError) as e:
                 logger.warning("Failed with URL %s: %s", model_url, e)
                 continue
 

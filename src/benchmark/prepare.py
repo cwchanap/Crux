@@ -70,6 +70,7 @@ def prepare_corpus(raw_dir: Path, output_dir: Path) -> PrepareCorpusResult:
     audio_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_entries: list[dict[str, object]] = []
+    prepared_items: list[PreparedCorpusSelection] = []
     for item in scan_result.valid_items:
         parsed_chart_path = charts_dir / f"{item.song_id}{item.selected_chart.suffix.lower()}"
         parsed_audio_path = audio_dir / f"{item.song_id}{item.selected_audio.suffix.lower()}"
@@ -85,6 +86,7 @@ def prepare_corpus(raw_dir: Path, output_dir: Path) -> PrepareCorpusResult:
                 )
             )
             continue
+        prepared_items.append(item)
         manifest_entries.append(
             {
                 "song_id": item.song_id,
@@ -118,7 +120,7 @@ def prepare_corpus(raw_dir: Path, output_dir: Path) -> PrepareCorpusResult:
     )
 
     return PrepareCorpusResult(
-        valid_items=scan_result.valid_items,
+        valid_items=prepared_items,
         invalid_items=scan_result.invalid_items,
         manifest_path=manifest_path,
         invalid_report_path=invalid_report_path,
