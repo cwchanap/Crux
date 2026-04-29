@@ -154,8 +154,9 @@ class DrumTranscriber:
         """Download the E-GMD model checkpoint if not already present"""
         model_dir = self._shared_models_dir()
         checkpoint_path = model_dir / "train" / "model.ckpt-10000"
+        checkpoint_index_path = checkpoint_path.with_name(f"{checkpoint_path.name}.index")
 
-        if checkpoint_path.with_suffix(".index").exists():
+        if checkpoint_index_path.exists():
             logger.info("E-GMD model already downloaded")
             return str(checkpoint_path)
 
@@ -225,7 +226,11 @@ class DrumTranscriber:
                     logging.info("Loaded TF2 weights from %s", self.model_path)
                 else:
                     # Try to load and convert TF1 checkpoint
-                    model = load_tf1_checkpoint_to_tf2(self.model_path, model)
+                    try:
+                        model = load_tf1_checkpoint_to_tf2(self.model_path, model)
+                    except RuntimeError as e:
+                        logging.error("Failed to convert TF1 checkpoint %s: %s", self.model_path, e)
+                        return None
                     logging.info("Loaded and converted TF1 checkpoint from %s", self.model_path)
             else:
                 logging.warning("No model path available, using fallback method")

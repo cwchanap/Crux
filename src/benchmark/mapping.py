@@ -17,18 +17,6 @@ class MappingDiagnostics:
 
 
 DEFAULT_DTX_LANE_MAP: dict[str, DtxClassMapping] = {
-    "01": DtxClassMapping("kick", "kick"),
-    "02": DtxClassMapping("snare", "snare"),
-    "03": DtxClassMapping("closed_hihat", "closed_hihat"),
-    "04": DtxClassMapping("open_hihat", "open_hihat"),
-    "05": DtxClassMapping("crash", "crash"),
-    "06": DtxClassMapping("ride", "ride"),
-    "07": DtxClassMapping("low_tom", "low_tom"),
-    "08": DtxClassMapping("mid_tom", "mid_tom"),
-    "09": DtxClassMapping("high_tom", "high_tom"),
-    "0A": DtxClassMapping("closed_hihat", "pedal_hihat"),
-    "0B": DtxClassMapping("crash", "crash_2"),
-    "0C": DtxClassMapping("ride", "ride_2"),
     "11": DtxClassMapping("closed_hihat", "closed_hihat"),
     "12": DtxClassMapping("snare", "snare"),
     "13": DtxClassMapping("kick", "kick"),

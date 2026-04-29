@@ -70,6 +70,18 @@ def test_equal_distance_candidates_choose_lowest_sorted_index():
     assert [prediction.source for prediction in result.unmatched_predictions] == ["prediction_b"]
 
 
+def test_matching_maximizes_true_positives_for_dense_hits():
+    result = score_events(
+        [event(0.1, "kick", "ground_truth_a"), event(0.2, "kick", "ground_truth_b")],
+        [event(0.0, "kick", "prediction_a"), event(0.1, "kick", "prediction_b")],
+        0.11,
+    )
+
+    assert result.summary.true_positives == 2
+    assert result.summary.false_positives == 0
+    assert result.summary.false_negatives == 0
+
+
 def test_alignment_applies_single_global_offset():
     ground_truth = [event(1.0, "kick", "ground_truth"), event(2.0, "snare", "ground_truth")]
     predictions = [event(1.1, "kick", "prediction"), event(2.1, "snare", "prediction")]

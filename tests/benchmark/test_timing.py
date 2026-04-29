@@ -11,11 +11,14 @@ def test_constant_bpm_timing():
 
 
 def test_measure_length_changes_timing():
-    chart = parse_dtx_text("#BPM: 120\n#00102: 0.5\n#00111: 0100\n#00211: 0100\n", "song")
+    chart = parse_dtx_text(
+        "#BPM: 120\n#00102: 0.5\n#00111: 0100\n#00211: 0100\n#00311: 0100\n",
+        "song",
+    )
 
     timed = dtx_events_to_timed_events(chart)
 
-    assert [event.time_sec for event in timed] == [2.0, 3.0]
+    assert [event.time_sec for event in timed] == [2.0, 3.0, 5.0]
 
 
 def test_bpm_change_affects_following_segments():

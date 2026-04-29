@@ -112,6 +112,32 @@ def test_plan_render_song_marks_missing_chip_or_sample_references_invalid(tmp_pa
     assert invalid.details["missing_sample_names"] == ["missing_sample.wav"]
 
 
+def test_plan_render_song_ignores_non_drum_lanes_when_rendering_stem(tmp_path: Path):
+    song = tmp_path / "Song Three B"
+    song.mkdir()
+    (song / "mas.dtx").write_text(
+        "\n".join(
+            [
+                "#BPM: 120",
+                "#WAV01: kick.wav",
+                "#WAV02: missing_autoplay.wav",
+                "#00101: 02",
+                "#00111: 01",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _write_sample(song / "kick.wav", [1.0, 0.0, 0.0, 0.0])
+
+    plan, invalid = plan_render_song(song)
+
+    assert invalid is None
+    assert plan is not None
+    assert [(placement.lane_id, placement.note_id) for placement in plan.placements] == [
+        ("11", "01")
+    ]
+
+
 def test_plan_render_corpus_collects_timing_failures_as_invalid_items(tmp_path: Path):
     raw = tmp_path / "raw"
     good_song = raw / "Good Song"

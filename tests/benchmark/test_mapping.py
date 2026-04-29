@@ -37,6 +37,15 @@ def test_map_dtx_events_respects_explicit_empty_lane_map():
     assert diagnostics.unmapped == {"13": 1}
 
 
+def test_default_dtx_mapping_ignores_converter_style_non_drum_lanes():
+    event = BenchmarkEvent("song", 0.0, "01", "ground_truth", {"lane_id": "01"})
+
+    mapped, diagnostics = map_dtx_events([event])
+
+    assert mapped == []
+    assert diagnostics.unmapped == {"01": 1}
+
+
 def test_map_midi_events_maps_known_note_and_preserves_event_structure():
     event = BenchmarkEvent("song", 1.25, "unknown", "prediction", {"midi_note": 36})
 
