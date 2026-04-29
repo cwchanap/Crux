@@ -76,27 +76,32 @@ def _match_class(
     predictions: list[BenchmarkEvent],
     tolerance_sec: float,
 ) -> tuple[list[MatchResult], list[BenchmarkEvent], list[BenchmarkEvent]]:
-    available_predictions = set(range(len(predictions)))
     matches: list[MatchResult] = []
     unmatched_ground_truth: list[BenchmarkEvent] = []
+    unmatched_predictions: list[BenchmarkEvent] = []
+    gt_index = 0
+    pred_index = 0
 
-    for gt_event in ground_truth:
-        best_index = None
-        best_error = None
-        for pred_index in sorted(available_predictions):
-            error = predictions[pred_index].time_sec - gt_event.time_sec
-            if abs(error) > tolerance_sec:
-                continue
-            if best_error is None or (abs(error), pred_index) < (abs(best_error), best_index):
-                best_index = pred_index
-                best_error = error
-        if best_index is None or best_error is None:
-            unmatched_ground_truth.append(gt_event)
+    while gt_index < len(ground_truth) and pred_index < len(predictions):
+        gt_event = ground_truth[gt_index]
+        pred_event = predictions[pred_index]
+        error = pred_event.time_sec - gt_event.time_sec
+
+        if error < -tolerance_sec:
+            unmatched_predictions.append(pred_event)
+            pred_index += 1
             continue
-        available_predictions.remove(best_index)
-        matches.append(MatchResult(gt_event, predictions[best_index], best_error))
+        if error > tolerance_sec:
+            unmatched_ground_truth.append(gt_event)
+            gt_index += 1
+            continue
 
-    unmatched_predictions = [predictions[index] for index in sorted(available_predictions)]
+        matches.append(MatchResult(gt_event, pred_event, error))
+        gt_index += 1
+        pred_index += 1
+
+    unmatched_ground_truth.extend(ground_truth[gt_index:])
+    unmatched_predictions.extend(predictions[pred_index:])
     return matches, unmatched_ground_truth, unmatched_predictions
 
 

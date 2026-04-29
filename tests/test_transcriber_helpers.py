@@ -120,3 +120,21 @@ def test_process_tf2_model_outputs_uses_calibrated_bin_mapping():
     assert drum_events[36][0]["velocity"] == 63
     assert len(drum_events[42]) == 1
     assert len(drum_events[46]) == 1
+
+
+def test_download_model_uses_cached_tf1_checkpoint_with_full_filename(monkeypatch, tmp_path):
+    checkpoint = tmp_path / "train" / "model.ckpt-10000"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.with_name(f"{checkpoint.name}.index").write_text("index", encoding="utf-8")
+
+    monkeypatch.setattr(
+        DrumTranscriber, "_shared_models_dir", classmethod(lambda cls: tmp_path), raising=True
+    )
+    monkeypatch.setattr(
+        "src.app.transcriber.httpx.stream",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected download")),
+    )
+
+    transcriber = DrumTranscriber(load_model=False)
+
+    assert transcriber._download_model() == str(checkpoint)

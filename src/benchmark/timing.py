@@ -37,10 +37,9 @@ def _max_measure(chart: ParsedDtxChart) -> int:
 
 
 def _measure_lengths_by_measure(chart: ParsedDtxChart) -> list[float]:
-    current = 1.0
     lengths: list[float] = []
     for measure in range(_max_measure(chart) + 2):
-        current = chart.measure_lengths.get(measure, current)
+        current = chart.measure_lengths.get(measure, 1.0)
         if current <= 0:
             raise ValueError(f"measure {measure} has non-positive length")
         lengths.append(current)
@@ -57,9 +56,7 @@ def _measure_start_beats(chart: ParsedDtxChart) -> list[float]:
 def _event_beat(
     event: DtxEvent | DtxBpmEvent, measure_lengths: dict[int, float], starts: list[float]
 ) -> float:
-    current_length = 1.0
-    for measure in range(event.measure + 1):
-        current_length = measure_lengths.get(measure, current_length)
+    current_length = measure_lengths.get(event.measure, 1.0)
     return starts[event.measure] + event.position * current_length * BEATS_PER_MEASURE
 
 

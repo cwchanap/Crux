@@ -1,3 +1,6 @@
+import sys
+from types import ModuleType
+
 import httpx
 import numpy as np
 import pytest
@@ -119,4 +122,38 @@ def test_build_model_returns_none_on_import_error(monkeypatch, tmp_path):
 
     transcriber = DrumTranscriber(load_model=True)
 
+    assert transcriber.model is None
+
+
+def test_init_falls_back_when_tf1_checkpoint_conversion_raises(monkeypatch, tmp_path):
+    checkpoint = tmp_path / "model.ckpt-10000"
+    checkpoint.write_text("checkpoint", encoding="utf-8")
+
+    monkeypatch.setattr(
+        DrumTranscriber,
+        "_resolve_existing_path",
+        classmethod(lambda cls, relative_path: None),
+        raising=True,
+    )
+    monkeypatch.setattr(
+        DrumTranscriber, "_download_model", lambda self: str(checkpoint), raising=True
+    )
+
+    fake_module = ModuleType("src.app.tf2_magenta_model")
+
+    class FakeModel:
+        def load_weights(self, path):  # noqa: ANN001
+            raise AssertionError(f"unexpected TF2 weight load: {path}")
+
+    fake_module.create_drum_model = lambda: FakeModel()
+
+    def raise_conversion_error(checkpoint_path, model):  # noqa: ANN001
+        raise RuntimeError(f"Non-H5 checkpoint loading not implemented: {checkpoint_path}")
+
+    fake_module.load_tf1_checkpoint_to_tf2 = raise_conversion_error
+    monkeypatch.setitem(sys.modules, "src.app.tf2_magenta_model", fake_module)
+
+    transcriber = DrumTranscriber(load_model=True)
+
+    assert transcriber.model_path == str(checkpoint)
     assert transcriber.model is None
