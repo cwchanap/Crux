@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -545,3 +546,41 @@ def test_render_plan_item_reports_sample_rate_mismatch_as_invalid(tmp_path: Path
     assert len(result.invalid_items) == 1
     invalid = result.invalid_items[0]
     assert "sample rate mismatch" in invalid.details.get("message", "")
+
+
+def test_render_audio_corpus_clears_stale_files_from_previous_run(tmp_path: Path):
+    """Re-running render-audio must remove old audio/renders that are no longer
+    in the current manifest so downstream steps don't process stale outputs."""
+
+    raw = tmp_path / "raw"
+    output = tmp_path / "rendered"
+
+    # First run: two songs
+    for name in ("Song A", "Song B"):
+        song = raw / name
+        song.mkdir(parents=True)
+        (song / "mas.dtx").write_text(
+            "\n".join(["#BPM: 120", "#WAV01: kick.wav", "#00111: 01"]),
+            encoding="utf-8",
+        )
+        _write_sample(song / "kick.wav", [1.0, 0.0, 0.0, 0.0])
+
+    render_audio.render_audio_corpus(raw, output)
+    assert (output / "audio" / "Song A.wav").exists()
+    assert (output / "audio" / "Song B.wav").exists()
+    assert (output / "renders" / "Song A.wav").exists()
+    assert (output / "renders" / "Song B.wav").exists()
+
+    # Second run: remove Song B from raw, only Song A remains
+    shutil.rmtree(raw / "Song B")
+    render_audio.render_audio_corpus(raw, output)
+
+    # Song A files must survive, Song B files must be gone
+    assert (output / "audio" / "Song A.wav").exists()
+    assert not (output / "audio" / "Song B.wav").exists()
+    assert (output / "renders" / "Song A.wav").exists()
+    assert not (output / "renders" / "Song B.wav").exists()
+
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert len(manifest["items"]) == 1
+    assert manifest["items"][0]["song_id"] == "Song A"
