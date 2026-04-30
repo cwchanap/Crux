@@ -1,3 +1,4 @@
+import httpx
 import numpy as np
 
 from src.app.transcriber import DrumTranscriber
@@ -138,3 +139,42 @@ def test_download_model_uses_cached_tf1_checkpoint_with_full_filename(monkeypatc
     transcriber = DrumTranscriber(load_model=False)
 
     assert transcriber._download_model() == str(checkpoint)
+
+
+def test_download_model_tries_model_url_first(monkeypatch, tmp_path):
+    """The known-good MODEL_URL must be the first URL attempted so that a clean
+    checkout succeeds even when alternative mirrors are offline."""
+
+    captured_urls: list[str] = []
+
+    class FakeStreamContext:
+        def __init__(self, url):
+            captured_urls.append(url)
+
+        def raise_for_status(self):
+            raise httpx.HTTPStatusError(
+                "404", request=httpx.Request("GET", "http://x"), response=httpx.Response(404)
+            )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def iter_bytes(self, **kwargs):
+            return iter([])
+
+    def fake_stream(method, url, **kwargs):
+        return FakeStreamContext(url)
+
+    model_dir = tmp_path / "models" / "e-gmd"
+    monkeypatch.setattr(
+        DrumTranscriber, "_shared_models_dir", classmethod(lambda cls: model_dir), raising=True
+    )
+    monkeypatch.setattr("src.app.transcriber.httpx.stream", fake_stream)
+
+    transcriber = DrumTranscriber(load_model=False)
+    transcriber._download_model()
+
+    assert captured_urls[0] == DrumTranscriber.MODEL_URL

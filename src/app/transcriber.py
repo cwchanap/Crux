@@ -160,8 +160,9 @@ class DrumTranscriber:
             logger.info("E-GMD model already downloaded")
             return str(checkpoint_path)
 
-        # Try alternative download URLs
+        # Try the known-good checkpoint URL first, then fallback alternatives.
         model_urls = [
+            self.MODEL_URL,
             "https://storage.googleapis.com/magentadata/models/onsets_frames_transcription/e-gmd/model.ckpt-10000.zip",
             "https://storage.googleapis.com/magentadata/models/onsets_frames_transcription/e_gmd_checkpoint.zip",
         ]

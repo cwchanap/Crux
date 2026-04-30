@@ -305,6 +305,14 @@ def _render_plans(
     rendered_items: list[RenderedAudioItem] = []
     final_invalid_items = list(invalid_items)
 
+    # Clear stale audio and renders from previous runs so removed/invalid
+    # songs don't leak into downstream commands that discover inputs by
+    # scanning these directories rather than reading manifest.json.
+    for subdir in ("audio", "renders"):
+        stale_dir = output_dir / subdir
+        if stale_dir.exists():
+            shutil.rmtree(stale_dir)
+
     for plan in valid_plans:
         try:
             rendered_items.append(_render_outputs_for_plan(plan, output_dir))
