@@ -9,6 +9,7 @@ from src.benchmark.models import DtxEvent
 LINE_RE = re.compile(r"^[#*](?P<measure>\d{3})(?P<channel>[0-9A-Za-z]{2})\s*:\s*(?P<value>.*)$")
 HEADER_RE = re.compile(r"^#(?P<key>[A-Za-z0-9_]+)\s*:?\s*(?P<value>.*)$")
 ENCODINGS = ("shift-jis", "utf-8", "utf-16le", "utf-16be")
+_DTX_LINE_RE = re.compile(r"^[#*]\s*[0-9A-Za-z]")
 _STRING_VALUE_HEADER_KEYS = frozenset({"TITLE", "ARTIST"})
 
 
@@ -41,9 +42,16 @@ def parse_dtx_file(path: Path, chart_id: str | None = None) -> ParsedDtxChart:
     last_error: UnicodeDecodeError | None = None
     for encoding in ENCODINGS:
         try:
-            return parse_dtx_text(raw.decode(encoding), chart_id=chart_id or path.stem)
+            text = raw.decode(encoding)
         except UnicodeDecodeError as exc:
             last_error = exc
+            continue
+        # Some encodings (notably shift-jis) decode UTF-16 byte sequences
+        # without raising, producing gibberish that parses as an empty chart.
+        # Reject decodes that contain no recognisable DTX lines so that the
+        # next encoding in the list gets a chance.
+        if any(_DTX_LINE_RE.match(line.strip()) for line in text.splitlines()):
+            return parse_dtx_text(text, chart_id=chart_id or path.stem)
     if last_error is not None:
         raise last_error
     raise ValueError(f"could not decode DTX file: {path}")

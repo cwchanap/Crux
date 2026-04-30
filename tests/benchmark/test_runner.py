@@ -177,3 +177,52 @@ def test_run_score_midi_no_align_emits_only_raw_reports(tmp_path: Path):
     modes = {report.mode for report in reports}
     assert modes == {"raw"}, f"expected only 'raw' mode, got {modes}"
     assert len(reports) == 1
+
+
+def test_run_score_midi_raises_on_scoring_failure(tmp_path: Path):
+    """When a validated chart fails during scoring, the run must raise
+    instead of silently producing partial results."""
+    charts = tmp_path / "charts"
+    predictions = tmp_path / "predictions"
+    output = tmp_path / "out"
+    charts.mkdir()
+    predictions.mkdir()
+    (charts / "bad.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+    # Write an invalid MIDI file so parsing fails during scoring.
+    (predictions / "bad.mid").write_bytes(b"not a midi file")
+
+    with pytest.raises(RuntimeError, match="Scoring failed"):
+        run_score_midi(charts, predictions, output, tolerance_ms=[50], align=True)
+
+
+def test_transcribe_and_score_raises_when_all_audio_missing(tmp_path: Path):
+    """If every chart is missing audio, the run must raise instead of
+    producing an empty summary with exit 0."""
+    charts = tmp_path / "charts"
+    audio = tmp_path / "audio"
+    output = tmp_path / "out"
+    charts.mkdir()
+    audio.mkdir()
+    (charts / "song.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+    # No audio file created for "song"
+
+    with pytest.raises(RuntimeError, match="No charts available for scoring"):
+        run_transcribe_and_score(charts, audio, output, [50])
+
+
+def test_transcribe_and_score_raises_when_all_transcriptions_fail(tmp_path: Path):
+    """If every transcription raises, the run must raise instead of
+    producing an empty summary."""
+    charts = tmp_path / "charts"
+    audio = tmp_path / "audio"
+    output = tmp_path / "out"
+    charts.mkdir()
+    audio.mkdir()
+    (charts / "song.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+    (audio / "song.wav").write_bytes(b"fake wav")
+
+    def failing_transcribe(audio_path: Path) -> bytes:
+        raise RuntimeError("transcription engine broken")
+
+    with pytest.raises(RuntimeError, match="No charts available for scoring"):
+        run_transcribe_and_score(charts, audio, output, [50], transcribe=failing_transcribe)

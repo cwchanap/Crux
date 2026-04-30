@@ -169,3 +169,31 @@ def test_parse_strips_semicolon_comments_from_data_lines():
 def test_parse_dtx_raises_on_odd_length_pattern():
     with pytest.raises(ValueError, match="odd length"):
         parse_dtx_text("#BPM: 120\n#00011: 010\n", chart_id="test")
+
+
+def test_parse_file_rejects_gibberish_shift_jis_decode(tmp_path: Path):
+    """A UTF-16LE file should not be silently decoded as shift-JIS gibberish.
+
+    Without post-decode validation, shift-JIS would accept the raw bytes and
+    return an empty chart (default BPM, zero events) instead of trying the
+    later UTF-16 encodings in the list.
+    """
+    content = "#TITLE: UTF16 Song\r\n#BPM: 140\r\n#00011: 0100\r\n"
+    path = tmp_path / "utf16.dtx"
+    path.write_bytes(content.encode("utf-16le"))
+
+    chart = parse_dtx_file(path, chart_id="utf16")
+
+    assert chart.title == "UTF16 Song"
+    assert chart.base_bpm == 140.0
+    assert len(chart.events) == 1
+
+
+def test_parse_file_raises_when_no_encoding_produces_valid_dtx(tmp_path: Path):
+    """Random binary content that decodes under multiple encodings but contains
+    no DTX lines should still raise."""
+    path = tmp_path / "garbage.dtx"
+    path.write_bytes(bytes(range(256)))
+
+    with pytest.raises((UnicodeDecodeError, ValueError)):
+        parse_dtx_file(path, chart_id="garbage")

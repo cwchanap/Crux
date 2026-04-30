@@ -62,8 +62,8 @@ def run_score_midi(
             failed_charts.append(item.chart_id)
 
     if failed_charts:
-        logger.warning(
-            "Scoring failed for %d chart(s): %s", len(failed_charts), ", ".join(failed_charts)
+        raise RuntimeError(
+            f"Scoring failed for {len(failed_charts)} chart(s): {', '.join(failed_charts)}"
         )
     write_reports(reports, output_dir)
     return reports
@@ -144,6 +144,14 @@ def run_transcribe_and_score(
             len(failed_charts),
             ", ".join(failed_charts),
         )
+
+    if not any(matched_charts_dir.iterdir()):
+        reasons: list[str] = []
+        if missing_audio:
+            reasons.append(f"{len(missing_audio)} chart(s) with missing audio")
+        if failed_charts:
+            reasons.append(f"{len(failed_charts)} chart(s) failed transcription")
+        raise RuntimeError(f"No charts available for scoring ({'; '.join(reasons)})")
 
     return run_score_midi(matched_charts_dir, predictions_dir, output_dir, tolerance_ms, align=True)
 
