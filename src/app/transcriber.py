@@ -213,13 +213,9 @@ class DrumTranscriber:
             # Create the TF2 model
             model = create_drum_model()
 
-            tf2_weights_path = self._resolve_existing_path(self.TF2_WEIGHTS_RELATIVE_PATH)
-            if tf2_weights_path is not None:
-                model.load_weights(str(tf2_weights_path))
-                logger.info("Loaded converted TF2 weights from %s", tf2_weights_path)
-                return model
-
-            # Try to load weights if checkpoint exists
+            # Load weights from the resolved model_path (set by __init__).
+            # __init__ already handles the shared-weights search, so
+            # _build_model must honour whatever path was chosen.
             if self.model_path and os.path.exists(self.model_path):
                 if self.model_path.endswith(".weights.h5"):
                     # Load TF2 weights directly
