@@ -584,3 +584,37 @@ def test_render_audio_corpus_clears_stale_files_from_previous_run(tmp_path: Path
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     assert len(manifest["items"]) == 1
     assert manifest["items"][0]["song_id"] == "Song A"
+
+
+def test_render_audio_corpus_cleans_up_audio_when_renders_copy_fails(tmp_path: Path):
+    """When the copy to renders/ fails, the audio file must be removed so it
+    doesn't leak into downstream directory-scanning."""
+    from unittest.mock import patch
+
+    raw = tmp_path / "raw"
+    output = tmp_path / "rendered"
+
+    song = raw / "FailSong"
+    song.mkdir(parents=True)
+    (song / "mas.dtx").write_text(
+        "\n".join(["#BPM: 120", "#WAV01: kick.wav", "#00111: 01"]),
+        encoding="utf-8",
+    )
+    _write_sample(song / "kick.wav", [1.0, 0.0, 0.0, 0.0])
+
+    original_copy2 = shutil.copy2
+
+    def fail_on_renders_copy(src, dst, *, follow_symlinks=True):
+        if "renders" in str(dst):
+            raise OSError("disk full")
+        return original_copy2(src, dst, follow_symlinks=follow_symlinks)
+
+    with patch("src.benchmark.render_audio.shutil.copy2", side_effect=fail_on_renders_copy):
+        result = render_audio.render_audio_corpus(raw, output)
+
+    assert len(result.valid_items) == 0
+    assert len(result.invalid_items) == 1
+    assert result.invalid_items[0].reason == "failed to render audio"
+    # Both the audio file and renders file must be absent.
+    assert not (output / "audio" / "FailSong.wav").exists()
+    assert not (output / "renders" / "FailSong.wav").exists()

@@ -52,3 +52,42 @@ def test_write_reference_midi_skips_unmapped_classes_with_warning(tmp_path: Path
     parsed = pretty_midi.PrettyMIDI(str(path))
     notes = [note.pitch for note in parsed.instruments[0].notes]
     assert notes == [36]
+
+
+def test_parse_prediction_midi_uses_only_drum_instruments_when_present(tmp_path: Path):
+    """When drum-flagged instruments exist, non-drum instruments are ignored."""
+    path = tmp_path / "prediction.mid"
+    midi = pretty_midi.PrettyMIDI()
+    drums = pretty_midi.Instrument(program=0, is_drum=True, name="drums")
+    drums.notes.append(pretty_midi.Note(velocity=100, pitch=36, start=0.5, end=0.6))
+    melody = pretty_midi.Instrument(program=0, is_drum=False, name="melody")
+    melody.notes.append(pretty_midi.Note(velocity=80, pitch=60, start=0.0, end=0.1))
+    midi.instruments.extend([drums, melody])
+    midi.write(str(path))
+
+    events = parse_prediction_midi(path, chart_id="song")
+
+    assert len(events) == 1
+    assert events[0].metadata["midi_note"] == 36
+
+
+def test_parse_prediction_midi_falls_back_to_all_instruments_when_no_drum_flag(
+    tmp_path: Path, caplog
+):
+    """When no instrument has is_drum=True, all instruments are used."""
+    import logging
+
+    path = tmp_path / "prediction.mid"
+    midi = pretty_midi.PrettyMIDI()
+    piano = pretty_midi.Instrument(program=0, is_drum=False, name="piano")
+    piano.notes.append(pretty_midi.Note(velocity=90, pitch=38, start=1.0, end=1.1))
+    midi.instruments.append(piano)
+    midi.write(str(path))
+
+    with caplog.at_level(logging.WARNING, logger="src.benchmark.midi_io"):
+        events = parse_prediction_midi(path, chart_id="song")
+
+    assert len(events) == 1
+    assert events[0].metadata["midi_note"] == 38
+    assert "no drum-flagged track" in caplog.text
+    assert "falling back to all instruments" in caplog.text

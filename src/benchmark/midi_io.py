@@ -25,9 +25,22 @@ REFERENCE_CLASS_TO_MIDI = {
 def parse_prediction_midi(path: Path, chart_id: str) -> list[BenchmarkEvent]:
     midi = pretty_midi.PrettyMIDI(str(path))
     events: list[BenchmarkEvent] = []
-    for instrument in midi.instruments:
-        if not instrument.is_drum:
-            continue
+
+    # Prefer drum-flagged instruments (MIDI channel 10).  Fall back to all
+    # instruments when none carry the drum flag so that external transcribers
+    # which write drum notes on a normal channel are still scored correctly.
+    drum_instruments = [i for i in midi.instruments if i.is_drum]
+    instruments = drum_instruments if drum_instruments else midi.instruments
+
+    if not drum_instruments and midi.instruments:
+        logger.warning(
+            "parse_prediction_midi: no drum-flagged track in %s (chart_id=%r); "
+            "falling back to all instruments",
+            path,
+            chart_id,
+        )
+
+    for instrument in instruments:
         for note in instrument.notes:
             events.append(
                 BenchmarkEvent(
@@ -39,13 +52,10 @@ def parse_prediction_midi(path: Path, chart_id: str) -> list[BenchmarkEvent]:
                 )
             )
     if not events and midi.instruments:
-        non_drum = [i.name for i in midi.instruments if not i.is_drum]
         logger.warning(
-            "parse_prediction_midi: no drum track found in %s (chart_id=%r); "
-            "non-drum instruments: %s",
+            "parse_prediction_midi: no notes extracted from %s (chart_id=%r)",
             path,
             chart_id,
-            non_drum or "<none>",
         )
     return sorted(events)
 
