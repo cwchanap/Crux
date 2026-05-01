@@ -174,3 +174,33 @@ def test_prepare_corpus_excludes_copy_failures_from_valid_items(tmp_path: Path):
     manifest = json.loads((output / "manifest.json").read_text())
     assert len(manifest["items"]) == 1
     assert manifest["items"][0]["song_id"] == "SongA"
+
+
+def test_prepare_corpus_cleans_up_partial_chart_on_audio_copy_failure(tmp_path: Path):
+    """When chart copy succeeds but audio copy fails, the chart must be removed."""
+    raw = tmp_path / "raw"
+    output = tmp_path / "parsed"
+
+    song = raw / "PartialSong"
+    song.mkdir(parents=True)
+    (song / "ext.dtx").write_text("#BPM: 120\n", encoding="utf-8")
+    (song / "drum.mp3").write_bytes(b"drums")
+
+    original_copy2 = shutil.copy2
+
+    def copy2_chart_ok_audio_fail(src, dst, *, follow_symlinks=True):
+        # Allow chart copy to succeed, fail audio copy.
+        if src.suffix.lower() == ".mp3":
+            raise OSError("unreadable audio")
+        return original_copy2(src, dst, follow_symlinks=follow_symlinks)
+
+    with patch("src.benchmark.prepare.shutil.copy2", side_effect=copy2_chart_ok_audio_fail):
+        result = prepare_corpus(raw, output)
+
+    assert len(result.valid_items) == 0
+    assert len(result.invalid_items) == 1
+    assert result.invalid_items[0].reason == "failed to copy corpus files"
+    # The partially copied chart must be cleaned up.
+    assert not (output / "charts" / "PartialSong.dtx").exists()
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert len(manifest["items"]) == 0

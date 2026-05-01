@@ -343,8 +343,14 @@ def _render_outputs_for_plan(plan_item: RenderPlanItem, output_dir: Path) -> Ren
     audio_path = output_dir / "audio" / f"{plan_item.song_id}.wav"
     render_path = output_dir / "renders" / f"{plan_item.song_id}.wav"
     render_plan_item(plan_item, audio_path)
-    render_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(audio_path, render_path)
+    try:
+        render_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(audio_path, render_path)
+    except BaseException:
+        # Remove the rendered audio so it doesn't leak into downstream
+        # directory-scanning when the copy to renders/ fails.
+        audio_path.unlink(missing_ok=True)
+        raise
     return RenderedAudioItem(
         song_id=plan_item.song_id,
         raw_folder=plan_item.raw_folder,

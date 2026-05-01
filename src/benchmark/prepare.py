@@ -78,6 +78,10 @@ def prepare_corpus(raw_dir: Path, output_dir: Path) -> PrepareCorpusResult:
             shutil.copy2(item.selected_chart, parsed_chart_path)
             shutil.copy2(item.selected_audio, parsed_audio_path)
         except OSError as exc:
+            # Remove partially copied chart so it doesn't surface as an
+            # orphan with missing audio in downstream directory-scanning.
+            if parsed_chart_path.exists():
+                parsed_chart_path.unlink(missing_ok=True)
             scan_result.invalid_items.append(
                 InvalidPreparedCorpusItem(
                     raw_folder=item.raw_folder,
