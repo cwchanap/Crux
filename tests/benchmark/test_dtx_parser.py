@@ -64,6 +64,52 @@ def test_parse_bpm_table_and_bpm_channels():
     ]
 
 
+def test_parse_bpm_source_order_channel03_after_channel08():
+    """When channel 08 appears before channel 03 at the same beat, the later
+    channel 03 line (60 BPM) must sort after the table event (180 BPM) so
+    that downstream consumers use the correct last-written tempo."""
+    text = "\n".join(
+        [
+            "#BPM: 120",
+            "#BPM01: 180",
+            "#00008: 0100",  # table BPM → 180, source_order=0
+            "#00003: 3C00",  # direct BPM → 60,  source_order=1 (later in file)
+        ]
+    )
+
+    chart = parse_dtx_text(text, chart_id="source-order")
+
+    assert len(chart.bpm_events) == 2
+    # Both at measure 0, position 0.0.  Source order preserves file order,
+    # so the direct BPM (60) must come last and win when downstream code
+    # picks the last event at a given position.
+    assert [(ev.bpm, ev.source_channel) for ev in chart.bpm_events] == [
+        (180.0, "08"),
+        (60.0, "03"),
+    ]
+
+
+def test_parse_bpm_source_order_channel08_after_channel03():
+    """When channel 03 appears before channel 08 at the same beat, the later
+    channel 08 line must sort after the direct BPM event."""
+    text = "\n".join(
+        [
+            "#BPM: 120",
+            "#BPM01: 180",
+            "#00003: 3C00",  # direct BPM → 60,  source_order=0
+            "#00008: 0100",  # table BPM → 180, source_order=1 (later in file)
+        ]
+    )
+
+    chart = parse_dtx_text(text, chart_id="source-order-reverse")
+
+    assert len(chart.bpm_events) == 2
+    assert [(ev.bpm, ev.source_channel) for ev in chart.bpm_events] == [
+        (60.0, "03"),
+        (180.0, "08"),
+    ]
+
+
 def test_parse_direct_bpm_channel_03_hex_values():
     """Channel 03 BPM values are 2-digit hexadecimal (base 16)."""
     text = "\n".join(

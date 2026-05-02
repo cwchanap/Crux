@@ -141,6 +141,34 @@ def test_download_model_uses_cached_tf1_checkpoint_with_full_filename(monkeypatc
     assert transcriber._download_model() == str(checkpoint)
 
 
+def test_find_checkpoint_discovers_extracted_ckpt569400(tmp_path):
+    """_find_checkpoint_in_dir must find checkpoints regardless of step number
+    or sub-directory layout."""
+    # Simulate the actual e-gmd_checkpoint.zip layout: root-level ckpt
+    index_file = tmp_path / "model.ckpt-569400.index"
+    index_file.write_text("index", encoding="utf-8")
+
+    result = DrumTranscriber._find_checkpoint_in_dir(tmp_path)
+    assert result is not None
+    assert result.name == "model.ckpt-569400"
+
+
+def test_find_checkpoint_discovers_nested_checkpoint(tmp_path):
+    """Some zip variants extract into a train/ subdirectory."""
+    sub = tmp_path / "train"
+    sub.mkdir()
+    (sub / "model.ckpt-10000.index").write_text("index", encoding="utf-8")
+
+    result = DrumTranscriber._find_checkpoint_in_dir(tmp_path)
+    assert result is not None
+    assert result.name == "model.ckpt-10000"
+
+
+def test_find_checkpoint_returns_none_when_no_index(tmp_path):
+    result = DrumTranscriber._find_checkpoint_in_dir(tmp_path)
+    assert result is None
+
+
 def test_download_model_tries_model_url_first(monkeypatch, tmp_path):
     """The known-good MODEL_URL must be the first URL attempted so that a clean
     checkout succeeds even when alternative mirrors are offline."""

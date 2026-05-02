@@ -19,6 +19,7 @@ class DtxBpmEvent:
     position: float
     bpm: float
     source_channel: str
+    source_order: int = 0
 
 
 @dataclass(frozen=True)
@@ -74,8 +75,9 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
     measure_lengths: dict[int, float] = {}
     events: list[DtxEvent] = []
     bpm_events: list[DtxBpmEvent] = []
-    pending_table_bpm_events: list[tuple[int, str]] = []
+    pending_table_bpm_events: list[tuple[int, str, int]] = []
     warnings: list[str] = []
+    source_counter = 0
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -99,9 +101,11 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
             if channel == "02":
                 measure_lengths[measure] = _parse_positive_float(value, f"measure length {measure}")
             elif channel == "03":
-                bpm_events.extend(_parse_direct_bpm_events(measure, value))
+                bpm_events.extend(_parse_direct_bpm_events(measure, value, source_counter))
+                source_counter += 1
             elif channel == "08":
-                pending_table_bpm_events.append((measure, value))
+                pending_table_bpm_events.append((measure, value, source_counter))
+                source_counter += 1
             else:
                 events.extend(_parse_note_events(chart_id, measure, channel, value))
             continue
@@ -132,8 +136,8 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
             except ValueError:
                 warnings.append(f"ignoring non-numeric POSITION value for {key}: {value!r}")
 
-    for measure, value in pending_table_bpm_events:
-        bpm_events.extend(_parse_table_bpm_events(measure, value, bpm_table, warnings))
+    for measure, value, order in pending_table_bpm_events:
+        bpm_events.extend(_parse_table_bpm_events(measure, value, bpm_table, warnings, order))
 
     return ParsedDtxChart(
         chart_id=chart_id,
@@ -146,7 +150,9 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
         position_table=position_table,
         measure_lengths=measure_lengths,
         events=sorted(events, key=lambda event: (event.measure, event.position, event.lane_id)),
-        bpm_events=sorted(bpm_events, key=lambda event: (event.measure, event.position)),
+        bpm_events=sorted(
+            bpm_events, key=lambda event: (event.measure, event.position, event.source_order)
+        ),
         warnings=warnings,
     )
 
@@ -175,11 +181,11 @@ def _parse_note_events(chart_id: str, measure: int, channel: str, value: str) ->
     ]
 
 
-def _parse_direct_bpm_events(measure: int, value: str) -> list[DtxBpmEvent]:
+def _parse_direct_bpm_events(measure: int, value: str, source_order: int = 0) -> list[DtxBpmEvent]:
     """Parse DTX channel 03 direct BPM events (2-digit hexadecimal values)."""
     chunks = _chunks(value)
     return [
-        DtxBpmEvent(measure, index / len(chunks), float(int(note_id, 16)), "03")
+        DtxBpmEvent(measure, index / len(chunks), float(int(note_id, 16)), "03", source_order)
         for index, note_id in enumerate(chunks)
         if note_id != "00"
     ]
@@ -190,6 +196,7 @@ def _parse_table_bpm_events(
     value: str,
     bpm_table: dict[str, float],
     warnings: list[str],
+    source_order: int = 0,
 ) -> list[DtxBpmEvent]:
     chunks = _chunks(value)
     events: list[DtxBpmEvent] = []
@@ -200,5 +207,5 @@ def _parse_table_bpm_events(
         if bpm is None:
             warnings.append(f"BPM event references unknown #BPM{note_id}")
             continue
-        events.append(DtxBpmEvent(measure, index / len(chunks), bpm, "08"))
+        events.append(DtxBpmEvent(measure, index / len(chunks), bpm, "08", source_order))
     return events

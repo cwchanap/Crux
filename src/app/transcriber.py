@@ -43,7 +43,9 @@ class DrumTranscriber:
     # Magenta E-GMD drum model checkpoint URL
     MODEL_URL = "https://storage.googleapis.com/magentadata/models/onsets_frames_transcription/e-gmd_checkpoint.zip"
     TF2_WEIGHTS_RELATIVE_PATH = Path("models/e-gmd/tf2_model.weights.h5")
-    CHECKPOINT_RELATIVE_PATH = Path("models/e-gmd/train/model.ckpt-10000")
+    # The checkpoint filename inside the zip varies by source URL
+    # (e.g. model.ckpt-569400, model.ckpt-10000).  _download_model()
+    # discovers the actual name dynamically after extraction.
     MODEL_SAMPLE_RATE = 16000
     MODEL_ONSET_THRESHOLD = 0.7
     MODEL_ONSET_MIN_GAP_FRAMES = 2  # ~64 ms at 16 kHz / 512-sample hop
@@ -150,15 +152,30 @@ class DrumTranscriber:
 
         return repo_root / "models" / "e-gmd"
 
+    @staticmethod
+    def _find_checkpoint_in_dir(model_dir: Path) -> Path | None:
+        """Find the first TF1 checkpoint (.index file) under *model_dir*.
+
+        The downloaded zip may extract ``model.ckpt-569400`` at the root or
+        ``train/model.ckpt-10000`` in a sub-directory — the exact name depends
+        on the source URL.  Scanning for ``.index`` avoids hard-coding a name
+        that may not match the archive contents.
+        """
+        for index_file in sorted(model_dir.rglob("*.index")):
+            name = index_file.name
+            if name.startswith("model.ckpt") and name.endswith(".index"):
+                # Strip the ".index" suffix to give the checkpoint base path.
+                return index_file.with_suffix("")
+        return None
+
     def _download_model(self) -> str | None:
         """Download the E-GMD model checkpoint if not already present"""
         model_dir = self._shared_models_dir()
-        checkpoint_path = model_dir / "train" / "model.ckpt-10000"
-        checkpoint_index_path = checkpoint_path.with_name(f"{checkpoint_path.name}.index")
 
-        if checkpoint_index_path.exists():
-            logger.info("E-GMD model already downloaded")
-            return str(checkpoint_path)
+        existing = self._find_checkpoint_in_dir(model_dir)
+        if existing is not None:
+            logger.info("E-GMD model already downloaded at %s", existing)
+            return str(existing)
 
         # Try the known-good checkpoint URL first, then fallback alternatives.
         model_urls = [
@@ -186,8 +203,13 @@ class DrumTranscriber:
                 # Clean up zip file
                 zip_path.unlink()
 
-                logger.info("E-GMD model downloaded successfully")
-                return str(checkpoint_path)
+                discovered = self._find_checkpoint_in_dir(model_dir)
+                if discovered is None:
+                    logger.warning("Zip from %s did not contain a recognised checkpoint", model_url)
+                    continue
+
+                logger.info("E-GMD model downloaded successfully at %s", discovered)
+                return str(discovered)
 
             except (httpx.HTTPError, zipfile.BadZipFile, OSError) as e:
                 logger.warning("Failed with URL %s: %s", model_url, e)
