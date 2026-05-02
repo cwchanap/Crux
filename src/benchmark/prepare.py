@@ -71,6 +71,7 @@ def prepare_corpus(raw_dir: Path, output_dir: Path) -> PrepareCorpusResult:
 
     manifest_entries: list[dict[str, object]] = []
     prepared_items: list[PreparedCorpusSelection] = []
+    copy_failures: list[InvalidPreparedCorpusItem] = []
     for item in scan_result.valid_items:
         parsed_chart_path = charts_dir / f"{item.song_id}{item.selected_chart.suffix.lower()}"
         parsed_audio_path = audio_dir / f"{item.song_id}{item.selected_audio.suffix.lower()}"
@@ -82,7 +83,7 @@ def prepare_corpus(raw_dir: Path, output_dir: Path) -> PrepareCorpusResult:
             # orphan with missing audio in downstream directory-scanning.
             if parsed_chart_path.exists():
                 parsed_chart_path.unlink(missing_ok=True)
-            scan_result.invalid_items.append(
+            copy_failures.append(
                 InvalidPreparedCorpusItem(
                     raw_folder=item.raw_folder,
                     reason="failed to copy corpus files",
@@ -103,13 +104,14 @@ def prepare_corpus(raw_dir: Path, output_dir: Path) -> PrepareCorpusResult:
             }
         )
 
+    all_invalid_items = list(scan_result.invalid_items) + copy_failures
     invalid_entries = [
         {
             "raw_folder": str(item.raw_folder),
             "reason": item.reason,
             "details": item.details,
         }
-        for item in scan_result.invalid_items
+        for item in all_invalid_items
     ]
 
     manifest_path = output_dir / "manifest.json"
@@ -125,7 +127,7 @@ def prepare_corpus(raw_dir: Path, output_dir: Path) -> PrepareCorpusResult:
 
     return PrepareCorpusResult(
         valid_items=prepared_items,
-        invalid_items=scan_result.invalid_items,
+        invalid_items=all_invalid_items,
         manifest_path=manifest_path,
         invalid_report_path=invalid_report_path,
     )

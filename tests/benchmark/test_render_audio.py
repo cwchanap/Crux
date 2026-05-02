@@ -1,6 +1,7 @@
 import json
 import shutil
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -618,6 +619,41 @@ def test_render_audio_corpus_cleans_up_audio_when_renders_copy_fails(tmp_path: P
     # Both the audio file and renders file must be absent.
     assert not (output / "audio" / "FailSong.wav").exists()
     assert not (output / "renders" / "FailSong.wav").exists()
+
+
+def test_validate_placement_sample_rates_caches_sf_info_calls(tmp_path: Path):
+    """When the same sample appears in multiple placements, sf.info should be
+    called only once per unique sample path."""
+    sample = tmp_path / "kick.wav"
+    _write_sample(sample, [1.0, 0.0, 0.0, 0.0])
+
+    placements = [
+        render_audio.ScheduledSamplePlacement(
+            time_sec=float(i),
+            sample_name="kick.wav",
+            sample_path=sample,
+            lane_id="11",
+            note_id="01",
+            volume_scale=1.0,
+        )
+        for i in range(5)
+    ]
+
+    original_sf_info = sf.info
+    call_count = 0
+
+    def counting_sf_info(path):
+        nonlocal call_count
+        call_count += 1
+        return original_sf_info(path)
+
+    with patch("src.benchmark.render_audio.sf.info", side_effect=counting_sf_info):
+        result = render_audio._validate_placement_sample_rates(placements)
+
+    assert result is None
+    assert call_count == 1, (
+        f"Expected 1 sf.info call for 5 placements of same sample, got {call_count}"
+    )
 
 
 def test_plan_render_song_resolves_windows_backslash_sample_paths(tmp_path: Path):
