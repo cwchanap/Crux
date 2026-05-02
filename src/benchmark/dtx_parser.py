@@ -7,7 +7,7 @@ from pathlib import Path
 from src.benchmark.models import DtxEvent
 
 LINE_RE = re.compile(r"^[#*](?P<measure>\d{3})(?P<channel>[0-9A-Za-z]{2})\s*:\s*(?P<value>.*)$")
-HEADER_RE = re.compile(r"^#(?P<key>[A-Za-z0-9_]+)\s*:?\s*(?P<value>.*)$")
+HEADER_RE = re.compile(r"^[#*](?P<key>[A-Za-z0-9_]+)\s*:?\s*(?P<value>.*)$")
 ENCODINGS = ("utf-8", "shift-jis", "utf-16le", "utf-16be")
 _DTX_LINE_RE = re.compile(r"^[#*]\s*[0-9A-Za-z]")
 _STRING_VALUE_HEADER_KEYS = frozenset({"TITLE", "ARTIST"})

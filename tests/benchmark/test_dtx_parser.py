@@ -212,3 +212,32 @@ def test_parse_file_prefers_utf8_over_shift_jis(tmp_path: Path):
     assert chart.title == "café"
     assert chart.base_bpm == 120.0
     assert len(chart.events) == 1
+
+
+def test_parse_star_prefixed_headers():
+    """DTX charts may use * instead of # as the directive prefix."""
+    text = "\n".join(
+        [
+            "*TITLE: Star Song",
+            "*ARTIST: Star Artist",
+            "*BPM: 180",
+            "*BPM01: 200",
+            "*WAV01: kick.wav",
+            "*VOLUME01: 80",
+            "*POSITION01: 0.5",
+            "*00011: 0100",
+        ]
+    )
+
+    chart = parse_dtx_text(text, chart_id="star-headers")
+
+    assert chart.title == "Star Song"
+    assert chart.artist == "Star Artist"
+    assert chart.base_bpm == 180.0
+    assert chart.bpm_table == {"01": 200.0}
+    assert chart.wav_table == {"01": "kick.wav"}
+    assert chart.volume_table == {"01": 80.0}
+    assert chart.position_table == {"01": 0.5}
+    assert len(chart.events) == 1
+    assert chart.events[0].lane_id == "11"
+    assert chart.events[0].note_id == "01"
