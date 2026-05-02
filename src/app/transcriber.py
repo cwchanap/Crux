@@ -216,7 +216,10 @@ class DrumTranscriber:
             # Load weights from the resolved model_path (set by __init__).
             # __init__ already handles the shared-weights search, so
             # _build_model must honour whatever path was chosen.
-            if self.model_path and os.path.exists(self.model_path):
+            model_available = self.model_path and (
+                os.path.exists(self.model_path) or os.path.exists(self.model_path + ".index")
+            )
+            if model_available:
                 if self.model_path.endswith(".weights.h5"):
                     # Load TF2 weights directly
                     model.load_weights(self.model_path)

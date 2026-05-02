@@ -127,7 +127,8 @@ def test_build_model_returns_none_on_import_error(monkeypatch, tmp_path):
 
 def test_init_falls_back_when_tf1_checkpoint_conversion_raises(monkeypatch, tmp_path):
     checkpoint = tmp_path / "model.ckpt-10000"
-    checkpoint.write_text("checkpoint", encoding="utf-8")
+    # TF1 checkpoints store data as .index + .data-* shards — no base file.
+    checkpoint.with_name(f"{checkpoint.name}.index").write_text("index", encoding="utf-8")
 
     monkeypatch.setattr(
         DrumTranscriber,
@@ -157,3 +158,33 @@ def test_init_falls_back_when_tf1_checkpoint_conversion_raises(monkeypatch, tmp_
 
     assert transcriber.model_path == str(checkpoint)
     assert transcriber.model is None
+
+
+def test_build_model_loads_cached_tf1_checkpoint_without_base_file(monkeypatch, tmp_path):
+    """Regression test: cached TF1 checkpoints only have .index/.data-* shards.
+    _build_model must recognise the checkpoint even when no literal base file exists."""
+    checkpoint = tmp_path / "model.ckpt-10000"
+    checkpoint.with_name(f"{checkpoint.name}.index").write_text("index", encoding="utf-8")
+
+    monkeypatch.setattr(
+        DrumTranscriber,
+        "_resolve_existing_path",
+        classmethod(lambda cls, relative_path: None),
+        raising=True,
+    )
+    monkeypatch.setattr(
+        DrumTranscriber, "_download_model", lambda self: str(checkpoint), raising=True
+    )
+
+    fake_module = ModuleType("src.app.tf2_magenta_model")
+
+    class FakeModel:
+        pass
+
+    fake_module.create_drum_model = lambda: FakeModel()
+    fake_module.load_tf1_checkpoint_to_tf2 = lambda path, model: model
+    monkeypatch.setitem(sys.modules, "src.app.tf2_magenta_model", fake_module)
+
+    transcriber = DrumTranscriber(load_model=True)
+
+    assert transcriber.model is not None
