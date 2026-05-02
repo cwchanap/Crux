@@ -38,7 +38,7 @@ DEFAULT_MIDI_NOTE_MAP: dict[int, str] = {
     42: "closed_hihat",
     45: "low_tom",
     46: "open_hihat",
-    47: "mid_tom",
+    47: "low_tom",
     49: "crash",
     50: "high_tom",
     51: "ride",

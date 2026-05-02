@@ -618,3 +618,29 @@ def test_render_audio_corpus_cleans_up_audio_when_renders_copy_fails(tmp_path: P
     # Both the audio file and renders file must be absent.
     assert not (output / "audio" / "FailSong.wav").exists()
     assert not (output / "renders" / "FailSong.wav").exists()
+
+
+def test_plan_render_song_resolves_windows_backslash_sample_paths(tmp_path: Path):
+    """DTX charts authored on Windows store paths like 'chips\\snare.wav'.
+    On POSIX the backslash must be normalized so the file is found."""
+    song = tmp_path / "WinSong"
+    chips = song / "chips"
+    chips.mkdir(parents=True)
+    (song / "mas.dtx").write_text(
+        "\n".join(
+            [
+                "#BPM: 120",
+                "#WAV01: chips\\snare.wav",
+                "#00111: 01",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _write_sample(chips / "snare.wav", [1.0, 0.0, 0.0, 0.0])
+
+    plan, invalid = plan_render_song(song)
+
+    assert invalid is None
+    assert plan is not None
+    assert len(plan.placements) == 1
+    assert plan.placements[0].sample_path.name == "snare.wav"

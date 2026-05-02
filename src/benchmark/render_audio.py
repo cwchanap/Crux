@@ -273,7 +273,11 @@ def _append_unique(items: list[str], value: str) -> None:
 
 def _resolve_sample_path(song_dir: Path, sample_name: str) -> Path | None:
     song_dir_resolved = song_dir.resolve()
-    sample_path = (song_dir / sample_name).resolve(strict=False)
+    # DTX charts authored on Windows use backslash separators.  On POSIX,
+    # Path treats backslashes as literal characters, so "chips\snare.wav"
+    # would never resolve.  Normalize before joining.
+    normalized = sample_name.replace("\\", "/")
+    sample_path = (song_dir / normalized).resolve(strict=False)
     try:
         sample_path.relative_to(song_dir_resolved)
     except ValueError:
