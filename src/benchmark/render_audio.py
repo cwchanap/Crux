@@ -241,17 +241,22 @@ def _validate_placement_sample_rates(
         return None
 
     sample_rate: int | None = None
+    sample_rate_cache: dict[Path, int] = {}
     for placement in placements:
-        try:
-            info = sf.info(placement.sample_path)
-            placement_sample_rate = info.samplerate
-        except Exception as exc:
-            return {
-                "reason": "sample rate validation failed",
-                "details": {
-                    "message": f"could not read sample rate from {placement.sample_path.name}: {exc}",
-                },
-            }
+        if placement.sample_path in sample_rate_cache:
+            placement_sample_rate = sample_rate_cache[placement.sample_path]
+        else:
+            try:
+                info = sf.info(placement.sample_path)
+                placement_sample_rate = info.samplerate
+            except Exception as exc:
+                return {
+                    "reason": "sample rate validation failed",
+                    "details": {
+                        "message": f"could not read sample rate from {placement.sample_path.name}: {exc}",
+                    },
+                }
+            sample_rate_cache[placement.sample_path] = placement_sample_rate
 
         if sample_rate is None:
             sample_rate = placement_sample_rate

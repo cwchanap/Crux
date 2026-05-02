@@ -1,10 +1,11 @@
+import logging
 from pathlib import Path
 from unittest.mock import patch
 
 import pretty_midi
 import pytest
 
-from src.benchmark.runner import run_score_midi, run_transcribe_and_score
+from src.benchmark.runner import export_reference_midis, run_score_midi, run_transcribe_and_score
 
 
 def write_prediction(path: Path):
@@ -158,6 +159,39 @@ def write_prediction_bytes() -> bytes:
     return buf.read()
 
 
+def test_transcribe_and_score_skips_chart_when_file_write_fails(tmp_path: Path):
+    """If writing the prediction MIDI or copying the chart fails, that chart is
+    skipped but the batch continues."""
+    charts = tmp_path / "charts"
+    audio = tmp_path / "audio"
+    output = tmp_path / "out"
+    charts.mkdir()
+    audio.mkdir()
+
+    (charts / "ok.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+    (charts / "bad.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+    (audio / "ok.wav").write_bytes(b"fake wav")
+    (audio / "bad.wav").write_bytes(b"fake wav")
+
+    def fake_transcribe(audio_path: Path) -> bytes:
+        return write_prediction_bytes()
+
+    original_write_bytes = Path.write_bytes
+
+    def failing_write_bytes(self, data):
+        if "bad.mid" in str(self):
+            raise OSError("disk full")
+        return original_write_bytes(self, data)
+
+    with patch.object(Path, "write_bytes", failing_write_bytes):
+        reports = run_transcribe_and_score(charts, audio, output, [50], transcribe=fake_transcribe)
+
+    # "ok" should succeed; "bad" should be skipped due to write failure
+    assert (output / "predictions" / "ok.mid").exists()
+    assert not (output / "predictions" / "bad.mid").exists()
+    assert any(r.chart_id == "ok" for r in reports)
+
+
 async def _async_return(value):
     """Helper to make a coroutine that returns *value*."""
     return value
@@ -226,3 +260,73 @@ def test_transcribe_and_score_raises_when_all_transcriptions_fail(tmp_path: Path
 
     with pytest.raises(RuntimeError, match="No charts available for scoring"):
         run_transcribe_and_score(charts, audio, output, [50], transcribe=failing_transcribe)
+
+
+def _write_prediction_with_note(path: Path, pitch: int):
+    """Write a prediction MIDI with a single note at the given pitch."""
+    midi = pretty_midi.PrettyMIDI()
+    drums = pretty_midi.Instrument(program=0, is_drum=True)
+    drums.notes.append(pretty_midi.Note(velocity=100, pitch=pitch, start=0.0, end=0.1))
+    midi.instruments.append(drums)
+    midi.write(str(path))
+
+
+def test_run_score_midi_warns_on_unmapped_prediction_events(tmp_path: Path, caplog):
+    """Unmapped prediction MIDI notes should produce a warning so that the
+    user knows some predictions were excluded from scoring."""
+    charts = tmp_path / "charts"
+    predictions = tmp_path / "predictions"
+    output = tmp_path / "out"
+    charts.mkdir()
+    predictions.mkdir()
+    # Chart with a single kick (lane 13 → MIDI 36)
+    (charts / "foo.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+    # Prediction with MIDI note 44 (pedal hi-hat) — not in DEFAULT_MIDI_NOTE_MAP
+    _write_prediction_with_note(predictions / "foo.mid", pitch=44)
+
+    with caplog.at_level(logging.WARNING, logger="src.benchmark.runner"):
+        reports = run_score_midi(charts, predictions, output, tolerance_ms=[50], align=False)
+
+    assert any("unmapped prediction events" in msg for msg in caplog.messages), (
+        f"Expected unmapped prediction warning, got: {caplog.messages}"
+    )
+    # Scoring should still complete (the unmapped prediction is dropped, ground truth is present)
+    assert len(reports) == 1
+
+
+def test_run_score_midi_warns_on_unmapped_ground_truth_events(tmp_path: Path, caplog):
+    """Unmapped DTX lanes should produce a warning so that the user knows
+    some ground-truth hits were excluded from scoring."""
+    charts = tmp_path / "charts"
+    predictions = tmp_path / "predictions"
+    output = tmp_path / "out"
+    charts.mkdir()
+    predictions.mkdir()
+    # Channel "01" is a BGM lane — not in DEFAULT_DTX_LANE_MAP
+    (charts / "bar.dtx").write_text("#BPM: 120\n#00001: 0100\n", encoding="utf-8")
+    write_prediction(predictions / "bar.mid")
+
+    with caplog.at_level(logging.WARNING, logger="src.benchmark.runner"):
+        reports = run_score_midi(charts, predictions, output, tolerance_ms=[50], align=False)
+
+    assert any("unmapped ground-truth events" in msg for msg in caplog.messages), (
+        f"Expected unmapped ground-truth warning, got: {caplog.messages}"
+    )
+    assert len(reports) == 1
+
+
+def test_export_reference_midis_warns_on_unmapped_events(tmp_path: Path, caplog):
+    """export_reference_midis should warn when a chart has unmapped lanes."""
+    charts = tmp_path / "charts"
+    output = tmp_path / "out"
+    charts.mkdir()
+    # Channel "01" is not in DEFAULT_DTX_LANE_MAP
+    (charts / "bgm.dtx").write_text("#BPM: 120\n#00001: 0100\n", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="src.benchmark.runner"):
+        count = export_reference_midis(charts, output)
+
+    assert count == 1
+    assert any("unmapped ground-truth events" in msg for msg in caplog.messages), (
+        f"Expected unmapped ground-truth warning, got: {caplog.messages}"
+    )

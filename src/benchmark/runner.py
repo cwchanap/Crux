@@ -36,10 +36,25 @@ def run_score_midi(
     for item in validation.valid_items:
         try:
             chart = parse_dtx_file(item.dtx_path, chart_id=item.chart_id)
-            ground_truth, _ = map_dtx_events(dtx_events_to_timed_events(chart))
-            predictions, _ = map_midi_events(
+            ground_truth, gt_diag = map_dtx_events(dtx_events_to_timed_events(chart))
+            predictions, pred_diag = map_midi_events(
                 parse_prediction_midi(item.prediction_midi_path, item.chart_id)
             )
+
+            if gt_diag.unmapped:
+                logger.warning(
+                    "chart %r has %d unmapped ground-truth events: %s",
+                    item.chart_id,
+                    sum(gt_diag.unmapped.values()),
+                    gt_diag.unmapped,
+                )
+            if pred_diag.unmapped:
+                logger.warning(
+                    "chart %r has %d unmapped prediction events: %s",
+                    item.chart_id,
+                    sum(pred_diag.unmapped.values()),
+                    pred_diag.unmapped,
+                )
 
             if export_reference_midi:
                 write_reference_midi(
@@ -78,7 +93,14 @@ def export_reference_midis(charts_dir: Path, output_dir: Path) -> int:
     ):
         try:
             chart = parse_dtx_file(dtx_path, chart_id=dtx_path.stem)
-            ground_truth, _ = map_dtx_events(dtx_events_to_timed_events(chart))
+            ground_truth, gt_diag = map_dtx_events(dtx_events_to_timed_events(chart))
+            if gt_diag.unmapped:
+                logger.warning(
+                    "chart %r has %d unmapped ground-truth events: %s",
+                    dtx_path.stem,
+                    sum(gt_diag.unmapped.values()),
+                    gt_diag.unmapped,
+                )
             write_reference_midi(ground_truth, output_dir / f"{dtx_path.stem}.mid")
             count += 1
         except Exception:  # pylint: disable=broad-except
@@ -129,8 +151,12 @@ def run_transcribe_and_score(
             logger.exception("Transcription failed for chart %r; skipping", dtx_path.stem)
             failed_charts.append(dtx_path.stem)
             continue
-        (predictions_dir / f"{dtx_path.stem}.mid").write_bytes(midi_bytes)
-        shutil.copy2(dtx_path, matched_charts_dir / dtx_path.name)
+        try:
+            (predictions_dir / f"{dtx_path.stem}.mid").write_bytes(midi_bytes)
+            shutil.copy2(dtx_path, matched_charts_dir / dtx_path.name)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Failed to write output for chart %r; skipping", dtx_path.stem)
+            failed_charts.append(dtx_path.stem)
 
     if missing_audio:
         logger.warning(

@@ -554,9 +554,9 @@ def score_summary_dict(summary: ScoreSummary) -> dict[str, Any]:
         "true_positives": summary.true_positives,
         "false_positives": summary.false_positives,
         "false_negatives": summary.false_negatives,
-        "precision": summary.precision,
-        "recall": summary.recall,
-        "f1": summary.f1,
+        "precision": summary.precision or 0.0,
+        "recall": summary.recall or 0.0,
+        "f1": summary.f1 or 0.0,
         "offset_sec": summary.offset_sec,
     }
 
