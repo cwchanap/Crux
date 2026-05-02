@@ -18,6 +18,14 @@ def test_default_midi_mapping_supports_current_transcriber_notes():
     assert DEFAULT_MIDI_NOTE_MAP[38] == "snare"
 
 
+def test_default_midi_note_47_maps_to_existing_dtx_tom_class():
+    """MIDI note 47 must map to a collapsed class that DEFAULT_DTX_LANE_MAP
+    can produce, otherwise mid-tom predictions are guaranteed false-positives."""
+    collapsed = DEFAULT_MIDI_NOTE_MAP[47]
+    dtx_classes = {m.collapsed_class for m in DEFAULT_DTX_LANE_MAP.values()}
+    assert collapsed in dtx_classes, f"{collapsed!r} not in DTX collapsed classes {dtx_classes}"
+
+
 def test_map_dtx_event_replaces_lane_class_and_preserves_native_metadata():
     event = BenchmarkEvent("song", 0.0, "13", "ground_truth", {"lane_id": "13"})
 

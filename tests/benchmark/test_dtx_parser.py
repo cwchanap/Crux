@@ -197,3 +197,18 @@ def test_parse_file_raises_when_no_encoding_produces_valid_dtx(tmp_path: Path):
 
     with pytest.raises((UnicodeDecodeError, ValueError)):
         parse_dtx_file(path, chart_id="garbage")
+
+
+def test_parse_file_prefers_utf8_over_shift_jis(tmp_path: Path):
+    """A UTF-8 encoded chart with non-ASCII text must not be garbled by a
+    Shift-JIS decode.  UTF-8 is tried first, so the correct title survives."""
+    # " café " in UTF-8 is valid but decodes to garbled text under Shift-JIS.
+    content = "#TITLE: café\n#BPM: 120\n#00011: 0100\n"
+    path = tmp_path / "utf8.dtx"
+    path.write_bytes(content.encode("utf-8"))
+
+    chart = parse_dtx_file(path, chart_id="utf8")
+
+    assert chart.title == "café"
+    assert chart.base_bpm == 120.0
+    assert len(chart.events) == 1
