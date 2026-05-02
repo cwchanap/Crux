@@ -41,14 +41,28 @@ def test_score_summary_computes_metrics_with_nonzero_counts():
     assert summary.f1 == pytest.approx(0.8)
 
 
-def test_score_summary_f1_none_when_only_false_positives():
+def test_score_summary_f1_zero_when_only_false_positives():
     summary = ScoreSummary(true_positives=0, false_positives=5, false_negatives=0)
     assert summary.precision == 0.0
     assert summary.recall is None
-    assert summary.f1 is None
+    assert summary.f1 == 0.0
     result = MatchResult(
         ground_truth=BenchmarkEvent("song", 0.5, "kick", "ground_truth"),
         prediction=BenchmarkEvent("song", 0.45, "kick", "prediction"),
         timing_error_sec=-0.05,
     )
     assert result.absolute_error_sec == 0.05
+
+
+def test_score_summary_f1_zero_when_only_false_negatives():
+    summary = ScoreSummary(true_positives=0, false_positives=0, false_negatives=5)
+    assert summary.precision is None
+    assert summary.recall == 0.0
+    assert summary.f1 == 0.0
+
+
+def test_score_summary_f1_zero_when_no_matches():
+    summary = ScoreSummary(true_positives=0, false_positives=3, false_negatives=4)
+    assert summary.precision == 0.0
+    assert summary.recall == 0.0
+    assert summary.f1 == 0.0

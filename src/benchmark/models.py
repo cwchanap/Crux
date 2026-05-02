@@ -67,7 +67,9 @@ class ScoreSummary:
     def f1(self) -> float | None:
         precision = self.precision
         recall = self.recall
-        if precision is None or recall is None:
+        if precision is None and recall is None:
             return None
-        denominator = precision + recall
-        return 2 * precision * recall / denominator if denominator else None
+        p = precision if precision is not None else 0.0
+        r = recall if recall is not None else 0.0
+        denominator = p + r
+        return 2 * p * r / denominator if denominator else 0.0
