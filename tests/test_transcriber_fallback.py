@@ -48,6 +48,12 @@ def test_init_falls_back_when_model_download_fails(monkeypatch, tmp_path):
         classmethod(lambda cls, relative_path: None),
         raising=True,
     )
+    monkeypatch.setattr(
+        DrumTranscriber,
+        "_shared_models_dir",
+        classmethod(lambda cls: tmp_path / "models" / "e-gmd"),
+        raising=True,
+    )
 
     def fake_stream(*args, **kwargs):
         raise httpx.HTTPStatusError(
