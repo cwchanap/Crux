@@ -151,10 +151,15 @@ def run_transcribe_and_score(
             logger.exception("Transcription failed for chart %r; skipping", dtx_path.stem)
             failed_charts.append(dtx_path.stem)
             continue
+        prediction_path = predictions_dir / f"{dtx_path.stem}.mid"
         try:
-            (predictions_dir / f"{dtx_path.stem}.mid").write_bytes(midi_bytes)
+            prediction_path.write_bytes(midi_bytes)
             shutil.copy2(dtx_path, matched_charts_dir / dtx_path.name)
         except Exception:  # pylint: disable=broad-except
+            # Remove partially-written prediction so it doesn't become a stray
+            # file that triggers corpus validation failure later.
+            if prediction_path.exists():
+                prediction_path.unlink(missing_ok=True)
             logger.exception("Failed to write output for chart %r; skipping", dtx_path.stem)
             failed_charts.append(dtx_path.stem)
 
