@@ -1,4 +1,5 @@
 import logging
+import shutil
 from pathlib import Path
 from unittest.mock import patch
 
@@ -187,6 +188,39 @@ def test_transcribe_and_score_skips_chart_when_file_write_fails(tmp_path: Path):
         reports = run_transcribe_and_score(charts, audio, output, [50], transcribe=fake_transcribe)
 
     # "ok" should succeed; "bad" should be skipped due to write failure
+    assert (output / "predictions" / "ok.mid").exists()
+    assert not (output / "predictions" / "bad.mid").exists()
+    assert any(r.chart_id == "ok" for r in reports)
+
+
+def test_transcribe_and_score_cleans_up_prediction_when_chart_copy_fails(tmp_path: Path):
+    """If write_bytes succeeds but shutil.copy2 fails, the prediction MIDI must
+    be removed so corpus validation does not see a stray file."""
+    charts = tmp_path / "charts"
+    audio = tmp_path / "audio"
+    output = tmp_path / "out"
+    charts.mkdir()
+    audio.mkdir()
+
+    (charts / "ok.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+    (charts / "bad.dtx").write_text("#BPM: 120\n#00013: 0100\n", encoding="utf-8")
+    (audio / "ok.wav").write_bytes(b"fake wav")
+    (audio / "bad.wav").write_bytes(b"fake wav")
+
+    def fake_transcribe(audio_path: Path) -> bytes:
+        return write_prediction_bytes()
+
+    original_copy2 = shutil.copy2
+
+    def failing_copy2(src, dst, *, follow_symlinks=True):
+        if "bad.dtx" in str(src):
+            raise OSError("permission denied")
+        return original_copy2(src, dst, follow_symlinks=follow_symlinks)
+
+    with patch("src.benchmark.runner.shutil.copy2", failing_copy2):
+        reports = run_transcribe_and_score(charts, audio, output, [50], transcribe=fake_transcribe)
+
+    # "ok" should succeed; "bad" prediction must be cleaned up
     assert (output / "predictions" / "ok.mid").exists()
     assert not (output / "predictions" / "bad.mid").exists()
     assert any(r.chart_id == "ok" for r in reports)

@@ -51,7 +51,7 @@ The safest benchmarking strategy is:
 
 The benchmark uses `src/benchmark/dtx_parser.py` exclusively for all DTX parsing. It handles:
 
-**File encoding:** Attempts Shift-JIS first, then UTF-8, UTF-16LE, and UTF-16BE. Line splitting uses Python's `str.splitlines()`, which correctly handles LF (`\n`), CRLF (`\r\n`), and CR (`\r`) files.
+**File encoding:** Attempts UTF-8 first, then Shift-JIS, UTF-16LE, and UTF-16BE. Line splitting uses Python's `str.splitlines()`, which correctly handles LF (`\n`), CRLF (`\r\n`), and CR (`\r`) files.
 
 **Line prefixes:** Both `#` and `*` are accepted as line-directive prefixes.
 
