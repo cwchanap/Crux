@@ -331,6 +331,7 @@ def test_get_waits_for_a_checkpoint_to_be_durable_before_exposing_it(
     store = CacheIndexStore.load(tmp_path)
     replacement_started = Event()
     allow_replacement = Event()
+    reader_started = Event()
     get_finished = Event()
     observed: list[CacheIndexEntry | None] = []
     real_replace = cache.os.replace
@@ -346,11 +347,13 @@ def test_get_waits_for_a_checkpoint_to_be_durable_before_exposing_it(
     assert replacement_started.wait(1)
 
     def read_entry() -> None:
+        reader_started.set()
         observed.append(store.get("a" * 64, "simfile-dtx", "42/pending.dtx"))
         get_finished.set()
 
     reader_thread = Thread(target=read_entry)
     reader_thread.start()
+    assert reader_started.wait(1)
     assert not get_finished.wait(0.05)
     allow_replacement.set()
     checkpoint_thread.join()
@@ -433,6 +436,7 @@ def test_writer_lock_sanitizes_unexpected_open_and_flock_failures(
 
     import src.benchmark.corpus_cache as cache
 
+    real_os_open = cache.os.open
     monkeypatch.setattr(
         cache.os,
         "open",
@@ -444,7 +448,7 @@ def test_writer_lock_sanitizes_unexpected_open_and_flock_failures(
     assert str(caught.value) == "cache_lock_failed"
     assert "private" not in str(caught.value)
 
-    monkeypatch.setattr(cache.os, "open", os.open)
+    monkeypatch.setattr(cache.os, "open", real_os_open)
     monkeypatch.setattr(
         fcntl,
         "flock",
@@ -453,6 +457,25 @@ def test_writer_lock_sanitizes_unexpected_open_and_flock_failures(
     with pytest.raises(RuntimeError) as caught:
         with cache_writer_lock(tmp_path):
             raise AssertionError("failed flock must not enter")
+    assert str(caught.value) == "cache_lock_failed"
+    assert "private" not in str(caught.value)
+
+
+@pytest.mark.parametrize("error_number", [errno.EAGAIN, errno.EWOULDBLOCK])
+def test_writer_lock_does_not_treat_busy_open_as_a_live_writer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error_number: int
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    monkeypatch.setattr(
+        cache.os,
+        "open",
+        lambda *_: (_ for _ in ()).throw(OSError(error_number, "private lock path")),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        with cache_writer_lock(tmp_path):
+            raise AssertionError("failed lock open must not enter")
     assert str(caught.value) == "cache_lock_failed"
     assert "private" not in str(caught.value)
 

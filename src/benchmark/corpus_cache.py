@@ -295,17 +295,23 @@ def _open_lock_file(lock_path: Path):
             0o600,
         )
     except OSError as exc:
-        raise RuntimeError(_lock_error_message(exc)) from exc
+        raise RuntimeError(_lock_open_error_message(exc)) from exc
     try:
         return os.fdopen(descriptor, "a+b")
     except OSError as exc:
         os.close(descriptor)
-        raise RuntimeError(_lock_error_message(exc)) from exc
+        raise RuntimeError(_lock_open_error_message(exc)) from exc
 
 
 def _lock_error_message(exc: OSError) -> str:
     if exc.errno in {EAGAIN, EWOULDBLOCK}:
         return "cache_locked"
+    if exc.errno in _UNSUPPORTED_LOCK_ERRNOS:
+        return "unsupported_platform"
+    return "cache_lock_failed"
+
+
+def _lock_open_error_message(exc: OSError) -> str:
     if exc.errno in _UNSUPPORTED_LOCK_ERRNOS:
         return "unsupported_platform"
     return "cache_lock_failed"
