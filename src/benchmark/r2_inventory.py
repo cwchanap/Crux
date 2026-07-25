@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -87,6 +87,7 @@ def build_inventory(
     include_ids: frozenset[int],
     exclude_ids: frozenset[int],
     head_concurrency: int,
+    item_progress: Callable[[int, int, int], None] | None = None,
 ) -> InventoryResult:
     listed = store.list_objects()
     groups, malformed_keys, ambiguous_prefixes = _classify_root(listed)
@@ -110,9 +111,28 @@ def build_inventory(
         (simfile_id, f"{simfile_id}/", [])
         for simfile_id in sorted(include_ids - exclude_ids - discovered_ids - ambiguous_ids)
     )
+    ordered_selected = sorted(selected, key=lambda row: (row[0], row[1]))
+    total_heads = sum(len(objects) for _, _, objects in ordered_selected)
+    completed_heads = 0
+    completed_bytes = 0
+
+    def record_head(size: int) -> None:
+        nonlocal completed_heads, completed_bytes
+        completed_heads += 1
+        completed_bytes += size
+        if item_progress is not None:
+            item_progress(completed_heads, total_heads, completed_bytes)
+
     simfiles = tuple(
-        _build_simfile_inventory(store, simfile_id, prefix, objects, head_concurrency)
-        for simfile_id, prefix, objects in sorted(selected, key=lambda row: (row[0], row[1]))
+        _build_simfile_inventory(
+            store,
+            simfile_id,
+            prefix,
+            objects,
+            head_concurrency,
+            record_head,
+        )
+        for simfile_id, prefix, objects in ordered_selected
     )
     return InventoryResult(
         simfiles=simfiles,
@@ -160,9 +180,10 @@ def _build_simfile_inventory(
     object_prefix: str,
     listed: list[ListedObject],
     head_concurrency: int,
+    item_progress: Callable[[int], None],
 ) -> SimfileInventory:
     ordered_listed = sorted(listed, key=lambda item: item.key)
-    metadata = _head_metadata(store, ordered_listed, head_concurrency)
+    metadata = _head_metadata(store, ordered_listed, head_concurrency, item_progress)
     objects: list[RemoteObject] = []
     row_errors: list[SyncError] = []
 
@@ -209,12 +230,22 @@ def _head_metadata(
     store: R2ObjectStore,
     listed: list[ListedObject],
     head_concurrency: int,
+    item_progress: Callable[[int], None],
 ) -> list[HeadMetadata | R2StoreError]:
     if not listed:
         return []
     with ThreadPoolExecutor(max_workers=head_concurrency) as executor:
-        futures = [executor.submit(_head_one, store, item.key) for item in listed]
-        return [future.result() for future in futures]
+        futures = {
+            executor.submit(_head_one, store, item.key): (index, item.size)
+            for index, item in enumerate(listed)
+        }
+        results: list[HeadMetadata | R2StoreError | None] = [None] * len(listed)
+        for future in as_completed(futures):
+            index, size = futures[future]
+            results[index] = future.result()
+            item_progress(size)
+    assert all(result is not None for result in results)
+    return [result for result in results if result is not None]
 
 
 def _head_one(store: R2ObjectStore, key: str) -> HeadMetadata | R2StoreError:

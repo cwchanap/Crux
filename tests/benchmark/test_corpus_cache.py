@@ -786,6 +786,69 @@ def test_dry_run_selects_only_setdef_dtx_and_txt_without_mutating_cache(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_download_progress_callback_runs_while_another_download_is_still_blocked(
+    tmp_path: Path,
+) -> None:
+    class PartiallyBlockingStore(FakeStore):
+        def __init__(self):
+            super().__init__()
+            self.blocked_started = Event()
+            self.release_blocked = Event()
+
+        @contextmanager
+        def open_object(self, key: str, if_match: str | None) -> Iterator[ObjectDownload]:
+            self.open_calls.append(OpenCall(key, if_match))
+            if key == "42/blocked.dtx":
+                self.blocked_started.set()
+                assert self.release_blocked.wait(timeout=5)
+            yield ObjectDownload(
+                body=BytesIO(b"chart"),
+                size=5,
+                etag="etag",
+                etag_is_weak=False,
+                last_modified=FIXED_MTIME,
+            )
+
+    store = PartiallyBlockingStore()
+    progress: list[tuple[int, int, int]] = []
+    progress_seen = Event()
+    errors: list[Exception] = []
+
+    def run_cache_sync():
+        try:
+            sync_cache(
+                (
+                    simfile(
+                        remote_object("42/blocked.dtx"),
+                        remote_object("42/fast.dtx"),
+                    ),
+                ),
+                store,
+                empty_index(tmp_path),
+                config(download_concurrency=2),
+                False,
+                item_progress=lambda completed, total, completed_bytes: (
+                    progress.append((completed, total, completed_bytes)),
+                    progress_seen.set(),
+                ),
+            )
+        except Exception as error:
+            errors.append(error)
+
+    thread = Thread(target=run_cache_sync, daemon=True)
+    thread.start()
+    try:
+        assert store.blocked_started.wait(timeout=2)
+        assert progress_seen.wait(timeout=2)
+        assert thread.is_alive()
+    finally:
+        store.release_blocked.set()
+        thread.join(timeout=5)
+
+    assert errors == []
+    assert progress == [(1, 2, 5), (2, 2, 10)]
+
+
 def test_verified_hit_reads_no_remote_body(tmp_path: Path) -> None:
     body = b"chart"
     digest = sha256(body).hexdigest()

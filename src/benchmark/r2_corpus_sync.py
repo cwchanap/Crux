@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import errno
 import os
 import stat
 import time
 from collections.abc import Callable, Mapping
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -116,6 +117,7 @@ _CACHE_MISS_REASONS = (
     "size_mismatch",
     "sha256_mismatch",
 )
+_OUTPUT_LOCK_FILENAME = ".r2-corpus-publication.lock"
 _publication_lock = Lock()
 
 
@@ -126,6 +128,12 @@ class _SyncFailure(Exception):
 
 
 class _ReportWriteFailure(Exception):
+    def __init__(self, primary_error: SyncError | None = None) -> None:
+        super().__init__("report publication failed")
+        self.primary_error = primary_error
+
+
+class _InvalidPathFailure(Exception):
     pass
 
 
@@ -139,54 +147,65 @@ class _RunState:
     immutable_manifest: PublishedManifest | None = None
 
 
+@dataclass(frozen=True)
+class _PointerSnapshots:
+    latest_manifest: bytes | None
+    latest_report: bytes | None
+
+
 class _Progress:
     def __init__(self, callback: ProgressCallback, monotonic: MonotonicClock) -> None:
         self._callback = callback
         self._monotonic = monotonic
         self._entered: set[str] = set()
+        self._last_item_event_at: dict[str, float] = {}
+        self._lock = Lock()
 
     def enter(self, phase: str, total: int | None = None) -> None:
-        if phase in self._entered:
-            return
-        self._entered.add(phase)
-        self._callback(ProgressEvent(phase, 0, total, f"{phase} phase started."))
+        with self._lock:
+            if phase in self._entered:
+                return
+            self._entered.add(phase)
+            self._callback(ProgressEvent(phase, 0, total, f"{phase} phase started."))
 
-    def items(
+    def begin_items(self, phase: str) -> None:
+        with self._lock:
+            self._last_item_event_at[phase] = self._monotonic()
+
+    def item(
         self,
         phase: str,
-        totals: tuple[int, ...],
+        completed: int,
+        total: int,
+        completed_bytes: int,
         *,
         unit: str,
     ) -> None:
-        total = len(totals)
-        if total == 0:
-            return
-        last_event_at = self._monotonic()
-        accumulated = 0
-        for completed, amount in enumerate(totals, start=1):
-            accumulated += amount
+        with self._lock:
             now = self._monotonic()
+            last_event_at = self._last_item_event_at.setdefault(phase, now)
             if completed % 100 == 0 or completed == total or now - last_event_at >= 5:
                 self._callback(
                     ProgressEvent(
                         phase,
                         completed,
                         total,
-                        f"{phase}: {completed}/{total} {unit}, {accumulated} bytes.",
+                        (f"{phase}: {completed}/{total} {unit}, {completed_bytes} bytes."),
                     )
                 )
-                last_event_at = now
+                self._last_item_event_at[phase] = now
 
     def finish(self, status: OverallStatus) -> None:
-        self._callback(ProgressEvent(status, 1, 1, f"{status} synchronization outcome."))
+        with self._lock:
+            self._callback(ProgressEvent(status, 1, 1, f"{status} synchronization outcome."))
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return _trusted_utc_now()
 
 
 def new_run_id() -> str:
-    return str(uuid4())
+    return _trusted_run_id()
 
 
 def ignore_progress(_event: ProgressEvent) -> None:
@@ -213,17 +232,19 @@ def sync_r2_corpus(
 ) -> SyncOutcome:
     try:
         started_at = clock()
+        _validate_aware_datetime(started_at)
         run_id = run_id_factory()
+        _validate_run_id(run_id)
     except Exception:
-        started_at = utc_now()
-        run_id = new_run_id()
+        started_at = _trusted_utc_now()
+        run_id = _trusted_run_id()
         tracker = _Progress(progress, monotonic)
         tracker.enter("configuration")
         return _fatal_outcome(
             request=request,
             run_id=run_id,
             started_at=started_at,
-            clock=clock,
+            clock=_trusted_utc_now,
             tracker=tracker,
             state=_RunState(),
             error=_safe_error("internal_error"),
@@ -258,10 +279,11 @@ def _run_sync(
     tracker.enter("configuration")
     try:
         dependency_check()
-        _validate_aware_datetime(started_at)
-        _validate_run_id(run_id)
         state.config = R2Config.from_environ(environ)
-        _validate_request_paths(request)
+        try:
+            _validate_request_paths(request)
+        except ValueError:
+            raise _InvalidPathFailure from None
         try:
             state.provenance = load_provenance(request.provenance_file)
         except ValueError:
@@ -272,6 +294,8 @@ def _run_sync(
         )
     except _SyncFailure as failure:
         return _fatal_outcome(request, run_id, started_at, clock, tracker, state, failure.error)
+    except _InvalidPathFailure:
+        return _fatal_without_report(tracker, _safe_error("invalid_config"))
     except ValueError:
         return _fatal_outcome(
             request, run_id, started_at, clock, tracker, state, _safe_error("invalid_config")
@@ -295,8 +319,8 @@ def _run_sync(
                     tracker=tracker,
                     state=state,
                 )
-            except _ReportWriteFailure:
-                return _report_fallback_outcome(tracker)
+            except _ReportWriteFailure as failure:
+                return _report_fallback_outcome(tracker, failure.primary_error)
             except R2StoreError as error:
                 return _fatal_outcome(
                     request, run_id, started_at, clock, tracker, state, _adapter_error(error)
@@ -359,29 +383,36 @@ def _run_transaction(
     tracker.enter("inventory")
     store.validate_bucket()
     tracker.enter("metadata")
+    tracker.begin_items("metadata")
     state.inventory = build_inventory(
         store,
         request.include_simfile_ids,
         request.exclude_simfile_ids,
         state.config.head_concurrency,
+        item_progress=lambda completed, total, completed_bytes: tracker.item(
+            "metadata",
+            completed,
+            total,
+            completed_bytes,
+            unit="objects",
+        ),
     )
-    metadata_sizes = tuple(
-        remote.size for simfile in state.inventory.simfiles for remote in simfile.objects
-    )
-    tracker.items("metadata", metadata_sizes, unit="objects")
 
     tracker.enter("cache")
+    tracker.begin_items("cache")
     state.cache_result = sync_cache(
         state.inventory.simfiles,
         store,
         index,
         state.config,
         request.dry_run,
-    )
-    tracker.items(
-        "cache",
-        tuple(action.bytes for action in state.cache_result.actions),
-        unit="objects",
+        item_progress=lambda completed, total, completed_bytes: tracker.item(
+            "cache",
+            completed,
+            total,
+            completed_bytes,
+            unit="objects",
+        ),
     )
     state.counters = _build_counters(state.inventory, state.cache_result)
     is_partial = _is_partial(state.inventory, state.cache_result)
@@ -393,6 +424,7 @@ def _run_transaction(
     exit_code = 1 if is_partial else 0
 
     tracker.enter("manifest")
+    rendered_manifest: bytes | None = None
     if not request.dry_run:
         rows = build_manifest_rows(
             state.cache_result.simfiles,
@@ -400,24 +432,55 @@ def _run_transaction(
             state.config.source_endpoint_sha256,
             state.config.bucket,
         )
-        state.immutable_manifest = publish_manifest(request.output_dir, render_manifest(rows))
+        rendered_manifest = render_manifest(rows)
 
     tracker.enter("report")
-    completed_at = clock()
-    _validate_aware_datetime(completed_at)
     top_level_errors = state.inventory.root_errors
-    report = _build_report(
-        request=request,
-        run_id=run_id,
-        started_at=started_at,
-        completed_at=completed_at,
-        overall_status=overall_status,
-        exit_code=exit_code,
-        state=state,
-        top_level_errors=top_level_errors,
-        manifest=state.immutable_manifest,
-    )
-    with _publication_lock:
+    with _output_publication_lock(request.output_dir):
+        try:
+            snapshots = _snapshot_pointers(request.output_dir)
+        except Exception:
+            raise _ReportWriteFailure from None
+
+        if rendered_manifest is not None:
+            try:
+                state.immutable_manifest = publish_manifest(
+                    request.output_dir,
+                    rendered_manifest,
+                )
+            except ManifestPublicationError as error:
+                _restore_pointers_or_report_failure(
+                    request.output_dir,
+                    snapshots,
+                    error.error,
+                )
+                raise
+            except Exception:
+                _restore_pointers_or_report_failure(request.output_dir, snapshots)
+                raise _ReportWriteFailure from None
+
+        try:
+            completed_at = clock()
+            _validate_aware_datetime(completed_at)
+            report = _build_report(
+                request=request,
+                run_id=run_id,
+                started_at=started_at,
+                completed_at=completed_at,
+                overall_status=overall_status,
+                exit_code=exit_code,
+                state=state,
+                top_level_errors=top_level_errors,
+                manifest=state.immutable_manifest,
+            )
+        except Exception:
+            _restore_pointers_or_report_failure(
+                request.output_dir,
+                snapshots,
+                _safe_error("internal_error"),
+            )
+            raise
+
         try:
             report_path, relative_report_path, report_sha256 = _publish_report_file(
                 request.output_dir,
@@ -425,25 +488,13 @@ def _run_transaction(
                 run_id,
                 report,
             )
-        except Exception:
-            raise _ReportWriteFailure from None
-        previous_latest = None
-        if state.immutable_manifest is not None:
-            previous_latest = _snapshot_latest_manifest(request.output_dir)
-            try:
+            if state.immutable_manifest is not None:
                 publish_latest_manifest(
                     request.output_dir,
                     state.immutable_manifest,
                     overall_status,
                     completed_at,
                 )
-            except Exception:
-                try:
-                    _restore_latest_manifest(request.output_dir, previous_latest)
-                except Exception:
-                    raise _ReportWriteFailure from None
-                raise
-        try:
             _publish_latest_report(
                 request.output_dir,
                 relative_report_path,
@@ -458,8 +509,7 @@ def _run_transaction(
                 completed_at,
             )
         except Exception:
-            if state.immutable_manifest is not None:
-                _restore_latest_manifest(request.output_dir, previous_latest)
+            _restore_pointers_or_report_failure(request.output_dir, snapshots)
             raise _ReportWriteFailure from None
 
     tracker.finish(overall_status)
@@ -484,8 +534,7 @@ def _fatal_outcome(
 ) -> SyncOutcome:
     tracker.enter("report")
     try:
-        completed_at = clock()
-        _validate_aware_datetime(completed_at)
+        completed_at = _safe_clock_value(clock)
         report = _build_report(
             request=request,
             run_id=run_id,
@@ -497,34 +546,48 @@ def _fatal_outcome(
             top_level_errors=(error,),
             manifest=None,
         )
-        with _publication_lock:
-            report_path, relative_report_path, report_sha256 = _publish_report_file(
-                request.output_dir,
-                started_at,
-                run_id,
-                report,
-            )
-            _publish_latest_report(
-                request.output_dir,
-                relative_report_path,
-                "failed",
-                2,
-                None,
-                report_sha256,
-                completed_at,
-            )
+        with _output_publication_lock(request.output_dir):
+            snapshots = _snapshot_pointers(request.output_dir)
+            try:
+                report_path, relative_report_path, report_sha256 = _publish_report_file(
+                    request.output_dir,
+                    started_at,
+                    run_id,
+                    report,
+                )
+                _publish_latest_report(
+                    request.output_dir,
+                    relative_report_path,
+                    "failed",
+                    2,
+                    None,
+                    report_sha256,
+                    completed_at,
+                )
+            except Exception:
+                _restore_pointers_or_report_failure(request.output_dir, snapshots)
+                raise
     except Exception:
-        return _report_fallback_outcome(tracker)
+        return _report_fallback_outcome(tracker, error)
     tracker.finish("failed")
     return SyncOutcome("failed", 2, report_path, None, (error,), state.counters)
 
 
-def _report_fallback_outcome(tracker: _Progress) -> SyncOutcome:
-    error = SyncError(
+def _report_fallback_outcome(
+    tracker: _Progress,
+    primary_error: SyncError | None = None,
+) -> SyncOutcome:
+    artifact_error = SyncError(
         "artifact",
         "artifact_write_failed",
         "A required synchronization report write failed.",
     )
+    tracker.finish("failed")
+    errors = (artifact_error,) if primary_error is None else (primary_error, artifact_error)
+    return SyncOutcome("failed", 2, None, None, errors, SyncCounters())
+
+
+def _fatal_without_report(tracker: _Progress, error: SyncError) -> SyncOutcome:
     tracker.finish("failed")
     return SyncOutcome("failed", 2, None, None, (error,), SyncCounters())
 
@@ -713,27 +776,144 @@ def _publish_latest_report(
     _atomic_replace_bytes(output_dir / "latest-report.json", canonical_json_line(payload))
 
 
-def _snapshot_latest_manifest(output_dir: Path) -> bytes | None:
-    path = output_dir / "latest.json"
+@contextmanager
+def _output_publication_lock(output_dir: Path):
+    with _publication_lock:
+        _ensure_durable_directory(output_dir)
+        descriptor, flock, unlock_operation = _acquire_output_lock(output_dir)
+        try:
+            yield
+        finally:
+            try:
+                flock(descriptor, unlock_operation)
+            except OSError:
+                pass
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _acquire_output_lock(output_dir: Path):
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise _SyncFailure(_safe_error("unsupported_platform"))
+    try:
+        import fcntl
+    except ImportError:
+        raise _SyncFailure(_safe_error("unsupported_platform")) from None
+
+    lock_path = output_dir / _OUTPUT_LOCK_FILENAME
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | no_follow,
+            0o600,
+        )
+        descriptor_metadata = os.fstat(descriptor)
+        path_metadata = lock_path.lstat()
+        if (
+            not stat.S_ISREG(descriptor_metadata.st_mode)
+            or not stat.S_ISREG(path_metadata.st_mode)
+            or descriptor_metadata.st_dev != path_metadata.st_dev
+            or descriptor_metadata.st_ino != path_metadata.st_ino
+        ):
+            raise OSError("publication lock is unavailable")
+        _fsync_directory(output_dir)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        except OSError as error:
+            unsupported = {
+                getattr(errno, "ENOSYS", -1),
+                getattr(errno, "ENOTSUP", -1),
+                getattr(errno, "EOPNOTSUPP", -1),
+            }
+            if error.errno in unsupported:
+                raise _SyncFailure(_safe_error("unsupported_platform")) from None
+            raise
+    except _SyncFailure:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise _SyncFailure(_safe_error("artifact_write_failed")) from None
+    return descriptor, fcntl.flock, fcntl.LOCK_UN
+
+
+def _snapshot_pointers(output_dir: Path) -> _PointerSnapshots:
+    return _PointerSnapshots(
+        latest_manifest=_snapshot_pointer(output_dir / "latest.json"),
+        latest_report=_snapshot_pointer(output_dir / "latest-report.json"),
+    )
+
+
+def _snapshot_pointer(path: Path) -> bytes | None:
     try:
         metadata = path.lstat()
     except FileNotFoundError:
         return None
-    if not stat.S_ISREG(metadata.st_mode):
-        raise OSError("manifest pointer is unavailable")
-    return path.read_bytes()
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None or not stat.S_ISREG(metadata.st_mode):
+        raise OSError("artifact pointer is unavailable")
+    descriptor = os.open(path, os.O_RDONLY | no_follow)
+    try:
+        descriptor_metadata = os.fstat(descriptor)
+        current_metadata = path.lstat()
+        if (
+            not stat.S_ISREG(descriptor_metadata.st_mode)
+            or not stat.S_ISREG(current_metadata.st_mode)
+            or descriptor_metadata.st_dev != current_metadata.st_dev
+            or descriptor_metadata.st_ino != current_metadata.st_ino
+        ):
+            raise OSError("artifact pointer is unavailable")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 64 * 1024):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
 
 
-def _restore_latest_manifest(output_dir: Path, previous_content: bytes | None) -> None:
-    path = output_dir / "latest.json"
+def _restore_pointers(output_dir: Path, snapshots: _PointerSnapshots) -> None:
+    failures: list[Exception] = []
+    for path, content in (
+        (output_dir / "latest.json", snapshots.latest_manifest),
+        (output_dir / "latest-report.json", snapshots.latest_report),
+    ):
+        try:
+            _restore_pointer(path, content)
+        except Exception as error:
+            failures.append(error)
+    if failures:
+        raise OSError("artifact pointer rollback failed")
+
+
+def _restore_pointers_or_report_failure(
+    output_dir: Path,
+    snapshots: _PointerSnapshots,
+    primary_error: SyncError | None = None,
+) -> None:
+    try:
+        _restore_pointers(output_dir, snapshots)
+    except Exception:
+        raise _ReportWriteFailure(primary_error) from None
+
+
+def _restore_pointer(path: Path, previous_content: bytes | None) -> None:
     if previous_content is not None:
         _atomic_replace_bytes(path, previous_content)
         return
     try:
-        path.unlink()
+        metadata = path.lstat()
     except FileNotFoundError:
         return
-    _fsync_directory(output_dir)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OSError("artifact pointer is unavailable")
+    path.unlink()
+    _fsync_directory(path.parent)
 
 
 def _atomic_replace_bytes(path: Path, content: bytes) -> None:
@@ -780,7 +960,12 @@ def _ensure_durable_directory(path: Path) -> None:
             raise OSError("artifact directory path is unavailable")
         break
     for directory in reversed(missing):
-        directory.mkdir()
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            metadata = directory.lstat()
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise OSError("artifact directory path is unavailable") from None
         _fsync_directory(directory.parent)
 
 
@@ -842,10 +1027,26 @@ def _validate_request_paths(request: SyncRequest) -> None:
     for path in (request.output_dir, request.cache_dir):
         if not isinstance(path, Path):
             raise ValueError("artifact paths must be pathlib paths")
-        if path.exists() and (path.is_symlink() or not path.is_dir()):
-            raise ValueError("artifact path is unavailable")
+        _validate_directory_components(path)
     if request.provenance_file is not None and not isinstance(request.provenance_file, Path):
         raise ValueError("provenance path must be a pathlib path")
+
+
+def _validate_directory_components(path: Path) -> None:
+    if ".." in path.parts:
+        raise ValueError("artifact path may not contain parent traversal")
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise ValueError("artifact path is unavailable") from None
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("artifact path is unavailable")
 
 
 def _validate_run_id(run_id: str) -> None:
@@ -862,3 +1063,20 @@ def _validate_run_id(run_id: str) -> None:
 def _validate_aware_datetime(value: datetime) -> None:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("clock values must be timezone-aware")
+
+
+def _safe_clock_value(clock: Clock) -> datetime:
+    try:
+        value = clock()
+        _validate_aware_datetime(value)
+    except Exception:
+        return _trusted_utc_now()
+    return value
+
+
+def _trusted_utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _trusted_run_id() -> str:
+    return str(uuid4())

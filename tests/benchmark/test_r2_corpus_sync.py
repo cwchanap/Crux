@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import stat
 from collections.abc import Iterator
@@ -102,6 +103,20 @@ class FakeStore:
             etag_is_weak=metadata.etag_is_weak,
             last_modified=metadata.last_modified,
         )
+
+
+class ManualMonotonic:
+    def __init__(self) -> None:
+        self.value = 0.0
+        self._lock = Lock()
+
+    def __call__(self) -> float:
+        with self._lock:
+            return self.value
+
+    def set(self, value: float) -> None:
+        with self._lock:
+            self.value = value
 
 
 def listed_object(key: str, body: bytes, *, etag: str | None = None) -> ListedObject:
@@ -328,6 +343,111 @@ def test_invalid_bucket_configuration_fails_before_network(tmp_path):
     assert read_report(outcome.report_path)["errors"][0]["code"] == "invalid_config"
 
 
+def test_symlinked_cache_ancestor_is_invalid_before_network_or_local_writes(tmp_path):
+    external = tmp_path / "external"
+    external.mkdir()
+    cache_link = tmp_path / "cache-link"
+    cache_link.symlink_to(external, target_is_directory=True)
+    output_dir = tmp_path / "output"
+    store = complete_store()
+
+    outcome, _ = invoke_sync(
+        tmp_path,
+        store,
+        output_dir=output_dir,
+        cache_dir=cache_link / "cache",
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.errors[0].code == "invalid_config"
+    assert outcome.report_path is None
+    assert store.calls == []
+    assert not output_dir.exists()
+    assert list(external.iterdir()) == []
+
+
+def test_broken_cache_symlink_is_invalid_without_writing_a_fatal_report(tmp_path):
+    cache_dir = tmp_path / "cache"
+    cache_dir.symlink_to(tmp_path / "missing-cache", target_is_directory=True)
+    output_dir = tmp_path / "output"
+    store = complete_store()
+
+    outcome, _ = invoke_sync(
+        tmp_path,
+        store,
+        output_dir=output_dir,
+        cache_dir=cache_dir,
+    )
+
+    assert outcome.errors[0].code == "invalid_config"
+    assert outcome.report_path is None
+    assert store.calls == []
+    assert cache_dir.is_symlink()
+    assert not output_dir.exists()
+
+
+def test_nondirectory_cache_ancestor_is_invalid_before_any_output_write(tmp_path):
+    ancestor = tmp_path / "not-a-directory"
+    ancestor.write_text("sentinel", encoding="utf-8")
+    output_dir = tmp_path / "output"
+    store = complete_store()
+
+    outcome, _ = invoke_sync(
+        tmp_path,
+        store,
+        output_dir=output_dir,
+        cache_dir=ancestor / "cache",
+    )
+
+    assert outcome.errors[0].code == "invalid_config"
+    assert outcome.report_path is None
+    assert store.calls == []
+    assert ancestor.read_text(encoding="utf-8") == "sentinel"
+    assert not output_dir.exists()
+
+
+def test_symlinked_output_ancestor_is_invalid_before_cache_or_network_mutation(tmp_path):
+    external = tmp_path / "external-output"
+    external.mkdir()
+    output_link = tmp_path / "output-link"
+    output_link.symlink_to(external, target_is_directory=True)
+    cache_dir = tmp_path / "cache"
+    store = complete_store()
+
+    outcome, _ = invoke_sync(
+        tmp_path,
+        store,
+        output_dir=output_link / "output",
+        cache_dir=cache_dir,
+    )
+
+    assert outcome.errors[0].code == "invalid_config"
+    assert outcome.report_path is None
+    assert store.calls == []
+    assert not cache_dir.exists()
+    assert list(external.iterdir()) == []
+
+
+def test_existing_output_file_remains_invalid_config_without_cache_mutation(tmp_path):
+    output_dir = tmp_path / "output"
+    output_dir.write_text("sentinel", encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    store = complete_store()
+
+    outcome, _ = invoke_sync(
+        tmp_path,
+        store,
+        output_dir=output_dir,
+        cache_dir=cache_dir,
+    )
+
+    assert outcome.errors[0].code == "invalid_config"
+    assert outcome.report_path is None
+    assert store.calls == []
+    assert output_dir.read_text(encoding="utf-8") == "sentinel"
+    assert not cache_dir.exists()
+
+
 def test_missing_credentials_from_store_factory_preserves_allowlisted_code(tmp_path):
     request = SyncRequest(tmp_path / "output", tmp_path / "cache", None)
 
@@ -488,14 +608,17 @@ def test_latest_report_failure_restores_previous_latest_manifest_pointer(tmp_pat
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     previous_latest = b'{"previous":"manifest"}\n'
+    previous_latest_report = b'{"previous":"report"}\n'
     (output_dir / "latest.json").write_bytes(previous_latest)
+    (output_dir / "latest-report.json").write_bytes(previous_latest_report)
     store = complete_store()
+    real_publish_latest_report = r2_corpus_sync._publish_latest_report
 
-    monkeypatch.setattr(
-        r2_corpus_sync,
-        "_publish_latest_report",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unsafe pointer detail")),
-    )
+    def fail_after_replacement(*args, **kwargs):
+        real_publish_latest_report(*args, **kwargs)
+        raise OSError("unsafe pointer detail")
+
+    monkeypatch.setattr(r2_corpus_sync, "_publish_latest_report", fail_after_replacement)
 
     outcome, _ = invoke_sync(tmp_path, store)
 
@@ -503,6 +626,7 @@ def test_latest_report_failure_restores_previous_latest_manifest_pointer(tmp_pat
     assert outcome.manifest is None
     assert outcome.report_path is None
     assert (output_dir / "latest.json").read_bytes() == previous_latest
+    assert (output_dir / "latest-report.json").read_bytes() == previous_latest_report
 
 
 def test_latest_manifest_failure_restores_previous_pointer_before_fatal_report(
@@ -511,11 +635,14 @@ def test_latest_manifest_failure_restores_previous_pointer_before_fatal_report(
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     previous_latest = b'{"previous":"manifest"}\n'
+    previous_latest_report = b'{"previous":"report"}\n'
     (output_dir / "latest.json").write_bytes(previous_latest)
+    (output_dir / "latest-report.json").write_bytes(previous_latest_report)
     store = complete_store()
+    real_publish_latest_manifest = r2_corpus_sync.publish_latest_manifest
 
-    def fail_after_replacement(output, *_args, **_kwargs):
-        (output / "latest.json").write_text('{"failed":"replacement"}\n', encoding="utf-8")
+    def fail_after_replacement(*args, **kwargs):
+        real_publish_latest_manifest(*args, **kwargs)
         raise ManifestPublicationError(
             r2_corpus_sync.SyncError(
                 "artifact",
@@ -530,9 +657,47 @@ def test_latest_manifest_failure_restores_previous_pointer_before_fatal_report(
 
     assert outcome.exit_code == 2
     assert outcome.manifest is None
-    assert outcome.report_path is not None
+    assert outcome.report_path is None
     assert (output_dir / "latest.json").read_bytes() == previous_latest
-    assert read_report(outcome.report_path)["errors"][0]["code"] == "artifact_write_failed"
+    assert (output_dir / "latest-report.json").read_bytes() == previous_latest_report
+
+
+def test_latest_report_directory_fsync_failure_restores_both_prior_pointers(tmp_path, monkeypatch):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    previous_latest = b'{"previous":"manifest"}\n'
+    previous_latest_report = b'{"previous":"report"}\n'
+    (output_dir / "latest.json").write_bytes(previous_latest)
+    (output_dir / "latest-report.json").write_bytes(previous_latest_report)
+    real_replace = r2_corpus_sync.os.replace
+    real_fsync_directory = r2_corpus_sync._fsync_directory
+    latest_report_replaced = False
+    failed_once = False
+
+    def record_replace(source, destination):
+        nonlocal latest_report_replaced
+        real_replace(source, destination)
+        if Path(destination).name == "latest-report.json":
+            latest_report_replaced = True
+
+    def fail_after_latest_report_replace(path):
+        nonlocal failed_once
+        if latest_report_replaced and not failed_once:
+            failed_once = True
+            raise OSError("unsafe directory fsync detail")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(r2_corpus_sync.os, "replace", record_replace)
+    monkeypatch.setattr(r2_corpus_sync, "_fsync_directory", fail_after_latest_report_replace)
+
+    outcome, _ = invoke_sync(tmp_path, complete_store())
+
+    assert failed_once
+    assert outcome.exit_code == 2
+    assert outcome.report_path is None
+    assert outcome.manifest is None
+    assert (output_dir / "latest.json").read_bytes() == previous_latest
+    assert (output_dir / "latest-report.json").read_bytes() == previous_latest_report
 
 
 def test_report_names_include_fixed_microseconds_and_canonical_uuid4():
@@ -689,6 +854,72 @@ def test_progress_emits_item_update_after_five_monotonic_seconds(tmp_path):
     assert metadata_completed == [2, 3]
 
 
+def test_metadata_progress_is_emitted_live_before_a_blocked_head_returns(tmp_path):
+    monotonic = ManualMonotonic()
+    blocked_started = Event()
+    release_blocked = Event()
+    progress_seen = Event()
+    base = store_from_bodies(
+        {
+            "2/blocked.dtx": b"chart",
+            "2/fast.dtx": b"chart",
+        }
+    )
+
+    class LiveProgressStore(FakeStore):
+        def head_object(self, key: str) -> HeadMetadata:
+            self._record("head", key)
+            if key == "2/blocked.dtx":
+                blocked_started.set()
+                assert release_blocked.wait(timeout=5)
+            else:
+                monotonic.set(6.0)
+            return self.heads[key]
+
+    store = LiveProgressStore(base.listed, base.heads, base.bodies)
+    events = []
+    outcome_holder = []
+    request = SyncRequest(tmp_path / "output", tmp_path / "cache", None, dry_run=True)
+    times = iter((STARTED_AT, COMPLETED_AT))
+
+    def capture_progress(event):
+        events.append(event)
+        if event.phase == "metadata" and event.completed == 1:
+            progress_seen.set()
+
+    thread = Thread(
+        target=lambda: outcome_holder.append(
+            sync_r2_corpus(
+                request,
+                environ=DEFAULT_ENVIRON,
+                dependency_check=lambda: None,
+                store_factory=lambda _config: store,
+                clock=lambda: next(times, COMPLETED_AT),
+                monotonic=monotonic,
+                run_id_factory=lambda: RUN_ID,
+                progress=capture_progress,
+            )
+        ),
+        daemon=True,
+    )
+    thread.start()
+    try:
+        assert blocked_started.wait(timeout=2)
+        assert progress_seen.wait(timeout=2)
+        assert thread.is_alive()
+    finally:
+        release_blocked.set()
+        thread.join(timeout=5)
+
+    assert outcome_holder[0].exit_code == 0
+    metadata = [
+        (event.completed, event.total)
+        for event in events
+        if event.phase == "metadata" and event.completed > 0
+    ]
+    assert metadata == [(1, 2), (2, 2)]
+
+
 def test_real_writer_lock_is_held_through_latest_report_publication(tmp_path, monkeypatch):
     store = complete_store()
     observed_conflict = False
@@ -709,6 +940,53 @@ def test_real_writer_lock_is_held_through_latest_report_publication(tmp_path, mo
 
     assert outcome.exit_code == 0
     assert observed_conflict
+
+
+def test_output_publication_lock_rejects_symlink_without_touching_target(tmp_path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    external_target = tmp_path / "external-lock-target"
+    external_target.write_bytes(b"sentinel")
+    (output_dir / ".r2-corpus-publication.lock").symlink_to(external_target)
+
+    outcome, _ = invoke_sync(tmp_path, complete_store())
+
+    assert outcome.exit_code == 2
+    assert outcome.report_path is None
+    assert external_target.read_bytes() == b"sentinel"
+    assert not (output_dir / "latest.json").exists()
+    assert not (output_dir / "latest-report.json").exists()
+    assert {error.code for error in outcome.errors} == {"artifact_write_failed"}
+
+
+def test_output_publication_lock_reports_unsupported_platform_without_raw_detail(
+    tmp_path, monkeypatch
+):
+    def unsupported_lock(_output_dir):
+        raise r2_corpus_sync._SyncFailure(r2_corpus_sync._safe_error("unsupported_platform"))
+
+    monkeypatch.setattr(r2_corpus_sync, "_acquire_output_lock", unsupported_lock)
+
+    outcome, _ = invoke_sync(tmp_path, complete_store(), dry_run=True)
+
+    assert outcome.exit_code == 2
+    assert outcome.report_path is None
+    assert [error.code for error in outcome.errors] == [
+        "unsupported_platform",
+        "artifact_write_failed",
+    ]
+    assert all("O_NOFOLLOW" not in error.message for error in outcome.errors)
+
+
+def test_output_lock_requires_no_follow_support(tmp_path, monkeypatch):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    monkeypatch.delattr(r2_corpus_sync.os, "O_NOFOLLOW")
+
+    with pytest.raises(r2_corpus_sync._SyncFailure) as raised:
+        r2_corpus_sync._acquire_output_lock(output_dir)
+
+    assert raised.value.error.code == "unsupported_platform"
 
 
 def test_fixed_input_rerun_reuses_byte_identical_immutable_manifest(tmp_path):
@@ -786,6 +1064,116 @@ def test_unexpected_failure_is_sanitized_as_internal_error(tmp_path):
 def test_report_filename_rejects_noncanonical_or_non_uuid4_ids(run_id):
     with pytest.raises(ValueError, match="canonical UUID4"):
         report_filename(STARTED_AT, run_id)
+
+
+def test_invalid_injected_run_id_uses_trusted_fallback_and_reports_internal_error(tmp_path):
+    invalid_run_id = "not-a-uuid"
+    store = complete_store()
+
+    outcome, _ = invoke_sync(tmp_path, store, run_id=invalid_run_id)
+
+    assert outcome.exit_code == 2
+    assert outcome.errors[0].code == "internal_error"
+    report = read_report(outcome.report_path)
+    assert report["errors"][0]["code"] == "internal_error"
+    assert report["run_id"] != invalid_run_id
+    assert invalid_run_id not in outcome.report_path.name
+    assert store.calls == []
+
+
+def test_naive_injected_start_clock_uses_trusted_fallback_for_fatal_report(tmp_path):
+    request = SyncRequest(tmp_path / "output", tmp_path / "cache", None)
+    naive = STARTED_AT.replace(tzinfo=None)
+    store = complete_store()
+
+    outcome = sync_r2_corpus(
+        request,
+        environ=DEFAULT_ENVIRON,
+        dependency_check=lambda: None,
+        store_factory=lambda _config: store,
+        clock=lambda: naive,
+        run_id_factory=lambda: RUN_ID,
+    )
+
+    assert outcome.errors[0].code == "internal_error"
+    report = read_report(outcome.report_path)
+    assert report["errors"][0]["code"] == "internal_error"
+    assert report["started_at"] != "2026-07-25T01:02:03.12Z"
+    assert report["started_at"].endswith("Z")
+    assert store.calls == []
+
+
+def test_raising_clock_factory_retains_internal_error_when_report_fallback_is_needed(tmp_path):
+    request = SyncRequest(tmp_path / "output", tmp_path / "cache", None)
+
+    outcome = sync_r2_corpus(
+        request,
+        environ=DEFAULT_ENVIRON,
+        dependency_check=lambda: None,
+        store_factory=lambda _config: complete_store(),
+        clock=lambda: (_ for _ in ()).throw(RuntimeError("unsafe clock detail")),
+        run_id_factory=lambda: RUN_ID,
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.errors[0].code == "internal_error"
+    report = read_report(outcome.report_path)
+    assert report["errors"][0]["code"] == "internal_error"
+    assert "unsafe clock detail" not in repr(outcome)
+    assert "unsafe clock detail" not in json.dumps(report)
+
+
+def test_raising_run_id_factory_uses_trusted_fallback_without_reusing_factory(tmp_path):
+    request = SyncRequest(tmp_path / "output", tmp_path / "cache", None)
+    calls = 0
+
+    def raise_run_id():
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("unsafe run ID detail")
+
+    outcome = sync_r2_corpus(
+        request,
+        environ=DEFAULT_ENVIRON,
+        dependency_check=lambda: None,
+        store_factory=lambda _config: complete_store(),
+        clock=lambda: STARTED_AT,
+        run_id_factory=raise_run_id,
+    )
+
+    assert calls == 1
+    assert outcome.errors[0].code == "internal_error"
+    report = read_report(outcome.report_path)
+    assert report["run_id"] != RUN_ID
+    assert report["errors"][0]["code"] == "internal_error"
+    assert "unsafe run ID detail" not in json.dumps(report)
+
+
+def test_later_clock_failure_uses_trusted_completion_time_and_keeps_internal_error(tmp_path):
+    values = iter((STARTED_AT,))
+
+    def clock():
+        try:
+            return next(values)
+        except StopIteration:
+            raise RuntimeError("unsafe completion clock detail") from None
+
+    request = SyncRequest(tmp_path / "output", tmp_path / "cache", None)
+    outcome = sync_r2_corpus(
+        request,
+        environ=DEFAULT_ENVIRON,
+        dependency_check=lambda: None,
+        store_factory=lambda _config: complete_store(),
+        clock=clock,
+        run_id_factory=lambda: RUN_ID,
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.errors[0].code == "internal_error"
+    report = read_report(outcome.report_path)
+    assert report["errors"][0]["code"] == "internal_error"
+    assert report["completed_at"].endswith("Z")
+    assert "unsafe completion clock detail" not in json.dumps(report)
 
 
 def test_report_and_latest_report_hashes_match_durable_canonical_bytes(tmp_path):
@@ -874,6 +1262,194 @@ def threaded_sync(
         clock=lambda: next(times, completed_at),
         run_id_factory=lambda: run_id,
     )
+
+
+def process_sync_worker(
+    output_dir: Path,
+    cache_dir: Path,
+    body: bytes,
+    run_id: str,
+    dry_run: bool,
+    block_before_latest_report: bool,
+    reached_publication,
+    release_publication,
+    started,
+    done,
+    results,
+) -> None:
+    started.set()
+    if block_before_latest_report:
+        real_publish_latest_report = r2_corpus_sync._publish_latest_report
+
+        def block_then_publish(*args, **kwargs):
+            reached_publication.set()
+            assert release_publication.wait(timeout=10)
+            return real_publish_latest_report(*args, **kwargs)
+
+        r2_corpus_sync._publish_latest_report = block_then_publish
+    try:
+        outcome = threaded_sync(
+            output_dir=output_dir,
+            cache_dir=cache_dir,
+            store=store_from_bodies({"2/chart.dtx": body}),
+            run_id=run_id,
+            started_at=STARTED_AT,
+            completed_at=COMPLETED_AT,
+            dry_run=dry_run,
+        )
+        results.put(
+            {
+                "run_id": run_id,
+                "status": outcome.overall_status,
+                "manifest_sha256": (
+                    outcome.manifest.manifest_sha256 if outcome.manifest is not None else None
+                ),
+            }
+        )
+    except BaseException as error:
+        results.put({"run_id": run_id, "error": type(error).__name__})
+    finally:
+        done.set()
+
+
+def test_two_process_real_runs_publish_as_one_serialized_unit(tmp_path):
+    context = multiprocessing.get_context("fork")
+    output_dir = tmp_path / "output"
+    reached_publication = context.Event()
+    release_publication = context.Event()
+    first_started = context.Event()
+    first_done = context.Event()
+    second_started = context.Event()
+    second_done = context.Event()
+    results = context.Queue()
+    first = context.Process(
+        target=process_sync_worker,
+        args=(
+            output_dir,
+            tmp_path / "cache-first",
+            b"first",
+            RUN_ID,
+            False,
+            True,
+            reached_publication,
+            release_publication,
+            first_started,
+            first_done,
+            results,
+        ),
+    )
+    second = context.Process(
+        target=process_sync_worker,
+        args=(
+            output_dir,
+            tmp_path / "cache-second",
+            b"second",
+            SECOND_RUN_ID,
+            False,
+            False,
+            context.Event(),
+            context.Event(),
+            second_started,
+            second_done,
+            results,
+        ),
+    )
+
+    first.start()
+    try:
+        assert first_started.wait(timeout=5)
+        assert reached_publication.wait(timeout=10)
+        second.start()
+        assert second_started.wait(timeout=5)
+        assert not second_done.wait(timeout=0.5)
+    finally:
+        release_publication.set()
+        first.join(timeout=10)
+        if second.pid is not None:
+            second.join(timeout=10)
+
+    assert first.exitcode == 0
+    assert second.exitcode == 0
+    outcomes = {result["run_id"]: result for result in (results.get(), results.get())}
+    assert "error" not in outcomes[RUN_ID]
+    assert "error" not in outcomes[SECOND_RUN_ID]
+    assert (
+        read_json(output_dir / "latest.json")["manifest_sha256"]
+        == outcomes[SECOND_RUN_ID]["manifest_sha256"]
+    )
+    assert read_json(output_dir / "latest-report.json")["report_path"].endswith(
+        f"{SECOND_RUN_ID}.json"
+    )
+
+
+def test_two_process_dry_run_waits_for_real_publication_then_moves_only_report(tmp_path):
+    context = multiprocessing.get_context("fork")
+    output_dir = tmp_path / "output"
+    reached_publication = context.Event()
+    release_publication = context.Event()
+    real_started = context.Event()
+    real_done = context.Event()
+    dry_started = context.Event()
+    dry_done = context.Event()
+    results = context.Queue()
+    real_process = context.Process(
+        target=process_sync_worker,
+        args=(
+            output_dir,
+            tmp_path / "cache-real",
+            b"real",
+            RUN_ID,
+            False,
+            True,
+            reached_publication,
+            release_publication,
+            real_started,
+            real_done,
+            results,
+        ),
+    )
+    dry_process = context.Process(
+        target=process_sync_worker,
+        args=(
+            output_dir,
+            tmp_path / "cache-dry",
+            b"dry",
+            SECOND_RUN_ID,
+            True,
+            False,
+            context.Event(),
+            context.Event(),
+            dry_started,
+            dry_done,
+            results,
+        ),
+    )
+
+    real_process.start()
+    try:
+        assert real_started.wait(timeout=5)
+        assert reached_publication.wait(timeout=10)
+        dry_process.start()
+        assert dry_started.wait(timeout=5)
+        assert not dry_done.wait(timeout=0.5)
+    finally:
+        release_publication.set()
+        real_process.join(timeout=10)
+        if dry_process.pid is not None:
+            dry_process.join(timeout=10)
+
+    assert real_process.exitcode == 0
+    assert dry_process.exitcode == 0
+    outcomes = {result["run_id"]: result for result in (results.get(), results.get())}
+    assert "error" not in outcomes[RUN_ID]
+    assert "error" not in outcomes[SECOND_RUN_ID]
+    assert (
+        read_json(output_dir / "latest.json")["manifest_sha256"]
+        == outcomes[RUN_ID]["manifest_sha256"]
+    )
+    latest_report = read_json(output_dir / "latest-report.json")
+    assert latest_report["report_path"].endswith(f"{SECOND_RUN_ID}.json")
+    assert latest_report["overall_status"] == "dry_run_complete"
 
 
 def test_reverse_start_order_real_writers_leave_latest_on_last_completion(tmp_path):

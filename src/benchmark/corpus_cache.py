@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import os
 import stat
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -243,10 +244,27 @@ def sync_cache(
     index: CacheIndexStore,
     config: R2Config,
     dry_run: bool,
+    item_progress: Callable[[int, int, int], None] | None = None,
 ) -> CacheSyncResult:
     object_results: dict[tuple[int, int], RemoteObject] = {}
     actions: dict[tuple[int, int], CacheAction] = {}
     misses: list[tuple[int, int, RemoteObject, CacheValidation]] = []
+    total_selected = sum(
+        is_selected(remote.key) for simfile in simfiles for remote in simfile.objects
+    )
+    completed_selected = 0
+    completed_bytes = 0
+    progressed: set[tuple[int, int]] = set()
+
+    def record_progress(identity: tuple[int, int], byte_count: int) -> None:
+        nonlocal completed_selected, completed_bytes
+        if identity in progressed:
+            return
+        progressed.add(identity)
+        completed_selected += 1
+        completed_bytes += byte_count
+        if item_progress is not None:
+            item_progress(completed_selected, total_selected, completed_bytes)
 
     for simfile_index, simfile in enumerate(simfiles):
         for object_index, remote in enumerate(simfile.objects):
@@ -263,6 +281,7 @@ def sync_cache(
                     0,
                     errors=remote.errors,
                 )
+                record_progress(identity, 0)
                 continue
 
             entry = index.get(config.source_endpoint_sha256, config.bucket, remote.key)
@@ -278,6 +297,7 @@ def sync_cache(
                 )
                 object_results[identity] = verified
                 actions[identity] = CacheAction(remote.key, "cache_hit", 0)
+                record_progress(identity, 0)
                 continue
             if dry_run:
                 object_results[identity] = remote
@@ -287,6 +307,7 @@ def sync_cache(
                     remote.size,
                     validation.state,
                 )
+                record_progress(identity, remote.size)
                 continue
             misses.append((simfile_index, object_index, remote, validation))
 
@@ -295,26 +316,27 @@ def sync_cache(
         try:
             with _open_content_directories(index.cache_dir) as directories:
                 with ThreadPoolExecutor(max_workers=config.download_concurrency) as executor:
-                    futures = [
-                        (
-                            (simfile_index, object_index),
-                            executor.submit(
-                                _prepare_download,
-                                store,
-                                directories,
-                                remote,
-                                validation,
-                            ),
-                        )
+                    futures = {
+                        executor.submit(
+                            _prepare_download,
+                            store,
+                            directories,
+                            remote,
+                            validation,
+                        ): (simfile_index, object_index)
                         for simfile_index, object_index, remote, validation in misses
-                    ]
-                    for identity, future in futures:
+                    }
+                    for future in as_completed(futures):
+                        identity = futures[future]
                         result = future.result()
                         if isinstance(result, _PreparedDownload):
                             prepared.append((identity, result))
+                            record_progress(identity, result.size)
                         else:
                             object_results[identity] = result.object
                             actions[identity] = result.action
+                            record_progress(identity, result.action.bytes)
+                prepared.sort(key=lambda item: item[0])
                 for identity, result in _install_prepared_downloads(
                     prepared,
                     directories,
@@ -336,6 +358,7 @@ def sync_cache(
                 )
                 object_results[identity] = result.object
                 actions[identity] = result.action
+                record_progress(identity, result.action.bytes)
         finally:
             for _, download in prepared:
                 download.temporary.close()
