@@ -28,6 +28,49 @@ RUN_IDS = (
     "10000000-0000-4000-8000-000000000005",
     "10000000-0000-4000-8000-000000000006",
 )
+EXPECTED_SELECTED_FIXTURE = {
+    "1/set.def": (
+        b"set-definition",
+        14,
+        "14e9b6a8adecf03c85c74d46bc38230bd9cde66cc9d95099d9bb355aa16a47d5",
+    ),
+    "1/main.DTX": (
+        b"main-chart",
+        10,
+        "46829163852a40de1473ca08982687285211684ad6b69c49026394761e56f8c2",
+    ),
+    "1/音源/readme.TXT": (
+        b"\xe8\xaa\xac\xe6\x98\x8e",
+        6,
+        "9683551a843c71d8b84ba930126021ef40831ee11bd5e69b06a3ea589148bba6",
+    ),
+    "2/chart.dtx": (
+        b"chart-v1",
+        8,
+        "0bdc777f11e9ed6f56d418040e9716d177d16ec2ec45ab7468b6350a1a01379a",
+    ),
+}
+EXPECTED_CHANGED_CHART = (
+    b"chart-v2-updated",
+    16,
+    "0b97e9e3214d72b38920ef3138b376e5158acab0eef2b16290eb1501d8fa0adc",
+)
+EXPECTED_ROW_OBJECTS = {
+    1: (
+        ("1/assets/", 0, "not_selected"),
+        ("1/assets/音源/", 0, "not_selected"),
+        ("1/audio/song.ogg", 18, "not_selected"),
+        ("1/main.DTX", 10, "verified"),
+        ("1/set.def", 14, "verified"),
+        ("1/音源/readme.TXT", 6, "verified"),
+    ),
+    2: (("2/chart.dtx", 8, "verified"),),
+    3: (
+        ("3/", 0, "not_selected"),
+        ("3/nested/", 0, "not_selected"),
+    ),
+}
+EXPECTED_ROW_STATUSES = {1: "complete", 2: "complete", 3: "empty"}
 
 
 @dataclass(frozen=True)
@@ -233,6 +276,40 @@ def assert_canonical_index(cache_dir: Path) -> dict[str, object]:
     return document
 
 
+def assert_selected_fixture_contract(
+    rows_by_id: dict[int, dict[str, object]],
+    cache_dir: Path,
+    index: dict[str, object],
+) -> None:
+    manifest_objects = {
+        item["key"]: item
+        for row in rows_by_id.values()
+        for item in row["objects"]
+        if item["cache_status"] == "verified"
+    }
+    index_entries = {entry["key"]: entry for entry in index["entries"]}
+    assert set(manifest_objects) == set(EXPECTED_SELECTED_FIXTURE)
+    assert set(index_entries) == set(EXPECTED_SELECTED_FIXTURE)
+
+    for key, (expected_body, expected_size, expected_sha256) in EXPECTED_SELECTED_FIXTURE.items():
+        expected_cache_path = f"sha256/{expected_sha256[:2]}/{expected_sha256}"
+        manifest_object = manifest_objects[key]
+        assert manifest_object["size"] == expected_size
+        assert manifest_object["sha256"] == expected_sha256
+        assert manifest_object["cache_path"] == expected_cache_path
+        assert manifest_object["cache_status"] == "verified"
+
+        index_entry = index_entries[key]
+        assert index_entry["size"] == expected_size
+        assert index_entry["sha256"] == expected_sha256
+        assert index_entry["cache_path"] == expected_cache_path
+
+        cache_body = (cache_dir / expected_cache_path).read_bytes()
+        assert cache_body == expected_body
+        assert len(cache_body) == expected_size
+        assert sha256(cache_body).hexdigest() == expected_sha256
+
+
 def test_sync_is_repeatable_and_preserves_changed_history(tmp_path: Path):
     pages = fixture_pages()
     first_store = PaginatedMemoryStore(pages)
@@ -266,36 +343,33 @@ def test_sync_is_repeatable_and_preserves_changed_history(tmp_path: Path):
 
     second_rows = read_manifest(second.manifest.path)
     rows_by_id = {row["simfile_id"]: row for row in second_rows}
-    assert rows_by_id[3]["sync_status"] == "empty"
-    assert [item["key"] for item in rows_by_id[3]["objects"]] == ["3/", "3/nested/"]
-    assert "1/音源/readme.TXT" in {item["key"] for item in rows_by_id[1]["objects"]}
     assert {row["simfile_id"] for row in second_rows} == {1, 2, 3}
-
-    old_chart = next(item for item in rows_by_id[2]["objects"] if item["key"] == "2/chart.dtx")
-    old_chart_path = tmp_path / "cache" / old_chart["cache_path"]
-    assert old_chart_path.read_bytes() == b"chart-v1"
-    for row in second_rows:
+    assert {
+        simfile_id: row["sync_status"] for simfile_id, row in rows_by_id.items()
+    } == EXPECTED_ROW_STATUSES
+    assert {
+        simfile_id: tuple(
+            (item["key"], item["size"], item["cache_status"]) for item in row["objects"]
+        )
+        for simfile_id, row in rows_by_id.items()
+    } == EXPECTED_ROW_OBJECTS
+    for row in rows_by_id.values():
         for item in row["objects"]:
-            cache_path = item["cache_path"]
-            if cache_path is None:
-                continue
-            relative = Path(cache_path)
-            assert relative.suffix == ""
-            assert relative.name == item["sha256"]
-            assert (
-                sha256((tmp_path / "cache" / relative).read_bytes()).hexdigest() == item["sha256"]
-            )
+            if item["cache_status"] == "not_selected":
+                assert item["sha256"] is None
+                assert item["cache_path"] is None
 
-    audio = next(item for item in rows_by_id[1]["objects"] if item["key"] == "1/audio/song.ogg")
-    assert audio["cache_status"] == "not_selected"
-    assert audio["sha256"] is None
-    assert audio["cache_path"] is None
+    index = assert_canonical_index(tmp_path / "cache")
+    assert_selected_fixture_contract(rows_by_id, tmp_path / "cache", index)
+    old_chart_body, old_chart_size, old_chart_sha256 = EXPECTED_SELECTED_FIXTURE["2/chart.dtx"]
+    old_chart_path = tmp_path / "cache" / f"sha256/{old_chart_sha256[:2]}/{old_chart_sha256}"
+    assert old_chart_path.read_bytes() == old_chart_body
+    assert old_chart_path.stat().st_size == old_chart_size
     independently_verify_manifest(
         second.manifest.path,
         second.manifest.corpus_version,
         second.manifest.manifest_sha256,
     )
-    assert len(assert_canonical_index(tmp_path / "cache")["entries"]) == 4
 
     third_store = PaginatedMemoryStore(with_changed_chart(pages))
     third = run_sync(tmp_path, third_store, RUN_IDS[2])
@@ -306,7 +380,16 @@ def test_sync_is_repeatable_and_preserves_changed_history(tmp_path: Path):
     assert third.manifest.path != second.manifest.path
     assert third_store.get_calls == [("2/chart.dtx", "chart-v2")]
     assert second.manifest.path.read_bytes() == second_manifest_bytes
-    assert old_chart_path.read_bytes() == b"chart-v1"
+    assert old_chart_path.read_bytes() == old_chart_body
+    third_rows = {row["simfile_id"]: row for row in read_manifest(third.manifest.path)}
+    changed_chart = third_rows[2]["objects"][0]
+    changed_body, changed_size, changed_sha256 = EXPECTED_CHANGED_CHART
+    changed_cache_path = f"sha256/{changed_sha256[:2]}/{changed_sha256}"
+    assert changed_chart["key"] == "2/chart.dtx"
+    assert changed_chart["size"] == changed_size
+    assert changed_chart["sha256"] == changed_sha256
+    assert changed_chart["cache_path"] == changed_cache_path
+    assert (tmp_path / "cache" / changed_cache_path).read_bytes() == changed_body
     latest = read_json(tmp_path / "output" / "latest.json")
     assert latest["corpus_version"] == third.manifest.corpus_version
     assert latest["manifest_sha256"] == third.manifest.manifest_sha256
