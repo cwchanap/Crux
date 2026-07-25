@@ -17,6 +17,8 @@ ALLOWED_FIELDS = {
     "redistribution_allowed",
     "provenance_notes",
 }
+_ROOT_FIELDS = {"schema_version", "simfiles"}
+_MAX_SIMFILE_ID_TEXT = str(MAX_SIMFILE_ID)
 
 _NULLABLE_STRING_FIELDS = (
     "source_origin",
@@ -26,21 +28,34 @@ _NULLABLE_STRING_FIELDS = (
 )
 
 
+class _JSONObject(list[tuple[str, object]]):
+    """Preserves JSON object member order and duplicates during validation."""
+
+
 def load_provenance(path: Path | None) -> dict[int, ProvenanceRecord]:
     if path is None:
         return {}
 
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_JSONObject)
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise ValueError("invalid provenance JSON") from None
 
-    if not isinstance(payload, dict) or payload.get("schema_version") != PROVENANCE_SCHEMA:
+    document = _parse_object(
+        payload,
+        invalid_message="unsupported provenance schema_version",
+        duplicate_message="duplicate provenance document field",
+    )
+    if document.keys() - _ROOT_FIELDS:
+        raise ValueError("provenance document contains unsupported field")
+    if document.get("schema_version") != PROVENANCE_SCHEMA:
         raise ValueError("unsupported provenance schema_version")
 
-    raw_simfiles = payload.get("simfiles")
-    if not isinstance(raw_simfiles, dict):
-        raise ValueError("provenance simfiles must be an object")
+    raw_simfiles = _parse_object(
+        document.get("simfiles"),
+        invalid_message="provenance simfiles must be an object",
+        duplicate_message="duplicate simfile ID after numeric normalization",
+    )
 
     records: dict[int, ProvenanceRecord] = {}
     for raw_id, raw_record in raw_simfiles.items():
@@ -62,36 +77,58 @@ def _parse_id(raw_id: object) -> int:
     if not isinstance(raw_id, str) or not raw_id.isascii() or not raw_id.isdecimal():
         raise ValueError("simfile ID must be a decimal integer in supported range")
 
-    simfile_id = int(raw_id)
-    if not 0 <= simfile_id <= MAX_SIMFILE_ID:
+    normalized_id = raw_id.lstrip("0") or "0"
+    if len(normalized_id) > len(_MAX_SIMFILE_ID_TEXT) or (
+        len(normalized_id) == len(_MAX_SIMFILE_ID_TEXT) and normalized_id > _MAX_SIMFILE_ID_TEXT
+    ):
         raise ValueError("simfile ID must be a decimal integer in supported range")
-    return simfile_id
+    return int(normalized_id)
 
 
 def _parse_record(raw_record: object) -> ProvenanceRecord:
-    if not isinstance(raw_record, dict):
-        raise ValueError("provenance record must be an object")
-    if raw_record.keys() - ALLOWED_FIELDS:
+    record = _parse_object(
+        raw_record,
+        invalid_message="provenance record must be an object",
+        duplicate_message="duplicate provenance record field",
+    )
+    if record.keys() - ALLOWED_FIELDS:
         raise ValueError("provenance record contains unsupported field")
 
     for field in _NULLABLE_STRING_FIELDS:
-        value = raw_record.get(field)
+        value = record.get(field)
         if value is not None and not isinstance(value, str):
             raise ValueError("provenance string fields must be strings or null")
 
-    rights_status = raw_record.get("rights_status", "unknown")
+    rights_status = record.get("rights_status", "unknown")
     if not isinstance(rights_status, str) or not rights_status:
         raise ValueError("rights_status must be a non-empty string")
 
-    redistribution_allowed = raw_record.get("redistribution_allowed")
+    redistribution_allowed = record.get("redistribution_allowed")
     if redistribution_allowed is not None and type(redistribution_allowed) is not bool:
         raise ValueError("redistribution_allowed must be a boolean or null")
 
     return ProvenanceRecord(
-        source_origin=raw_record.get("source_origin"),
-        source_author_or_pack=raw_record.get("source_author_or_pack"),
-        source_reference=raw_record.get("source_reference"),
+        source_origin=record.get("source_origin"),
+        source_author_or_pack=record.get("source_author_or_pack"),
+        source_reference=record.get("source_reference"),
         rights_status=rights_status,
         redistribution_allowed=redistribution_allowed,
-        provenance_notes=raw_record.get("provenance_notes"),
+        provenance_notes=record.get("provenance_notes"),
     )
+
+
+def _parse_object(
+    value: object,
+    *,
+    invalid_message: str,
+    duplicate_message: str,
+) -> dict[str, object]:
+    if not isinstance(value, _JSONObject):
+        raise ValueError(invalid_message)
+
+    parsed: dict[str, object] = {}
+    for key, member_value in value:
+        if key in parsed:
+            raise ValueError(duplicate_message)
+        parsed[key] = member_value
+    return parsed
