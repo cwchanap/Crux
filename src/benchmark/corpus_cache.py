@@ -324,7 +324,7 @@ def sync_cache(
                     object_results[identity] = result.object
                     actions[identity] = result.action
         except (OSError, ValueError):
-            error = _download_error("artifact_write_failed", "")
+            error = _download_error("artifact_write_failed", None)
             for simfile_index, object_index, remote, validation in misses:
                 identity = (simfile_index, object_index)
                 if identity in object_results:
@@ -731,7 +731,7 @@ def _failed_download(
     )
 
 
-def _download_error(code: ErrorCode, key: str) -> SyncError:
+def _download_error(code: ErrorCode, key: str | None) -> SyncError:
     return SyncError(
         "cache" if code in {"artifact_write_failed", "cache_corrupt"} else "object",
         code,

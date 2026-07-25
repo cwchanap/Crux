@@ -53,6 +53,10 @@ class SyncError:
     message: str
     object_key: str | None = None
 
+    def __post_init__(self) -> None:
+        if self.object_key == "":
+            raise ValueError("object_key must be non-empty or None")
+
 
 @dataclass(frozen=True)
 class R2Config:

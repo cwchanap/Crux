@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
@@ -454,6 +455,35 @@ def test_publish_manifest_rejects_conflicting_existing_version(tmp_path: Path) -
     assert str(version_path) not in str(raised.value)
 
 
+def test_publish_manifest_rejects_a_matching_symlink_destination(tmp_path: Path) -> None:
+    rendered = render_fixture()
+    manifests_dir = tmp_path / "manifests"
+    manifests_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.jsonl"
+    outside.write_bytes(rendered.content)
+    version_path = manifests_dir / f"{rendered.manifest_sha256}.jsonl"
+    version_path.symlink_to(outside)
+
+    with pytest.raises(ManifestPublicationError) as raised:
+        publish_manifest(tmp_path, rendered)
+
+    assert raised.value.error.code == "artifact_write_failed"
+    assert version_path.is_symlink()
+    assert outside.read_bytes() == rendered.content
+
+
+def test_publish_manifest_rejects_a_non_regular_destination(tmp_path: Path) -> None:
+    rendered = render_fixture()
+    version_path = tmp_path / "manifests" / f"{rendered.manifest_sha256}.jsonl"
+    version_path.mkdir(parents=True)
+
+    with pytest.raises(ManifestPublicationError) as raised:
+        publish_manifest(tmp_path, rendered)
+
+    assert raised.value.error.code == "artifact_write_failed"
+    assert version_path.is_dir()
+
+
 def test_publish_manifest_rejects_content_that_does_not_match_rendered_hash(
     tmp_path: Path,
 ) -> None:
@@ -500,6 +530,29 @@ def test_publish_manifest_accepts_an_identical_concurrent_winner(
     monkeypatch.setattr(corpus_manifest.os, "link", real_link)
 
 
+def test_publish_manifest_rejects_a_concurrent_matching_symlink_winner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    rendered = render_fixture()
+    outside = tmp_path / "outside.jsonl"
+    outside.write_bytes(rendered.content)
+
+    def concurrent_link(source: Path, destination: Path) -> None:
+        del source
+        destination.symlink_to(outside)
+        raise FileExistsError
+
+    monkeypatch.setattr(corpus_manifest.os, "link", concurrent_link)
+
+    with pytest.raises(ManifestPublicationError) as raised:
+        publish_manifest(tmp_path, rendered)
+
+    assert raised.value.error.code == "artifact_write_failed"
+    assert outside.read_bytes() == rendered.content
+    assert not list((tmp_path / "manifests").glob(".*.tmp"))
+
+
 def test_publish_manifest_rejects_a_conflicting_concurrent_winner(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -519,6 +572,76 @@ def test_publish_manifest_rejects_a_conflicting_concurrent_winner(
     manifests_dir = tmp_path / "manifests"
     assert not list(manifests_dir.glob(".*.tmp"))
     assert list(manifests_dir.glob("*.jsonl"))[0].read_bytes() == b"conflict\n"
+
+
+def test_concurrent_identical_winner_is_fsynced_before_its_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    rendered = render_fixture()
+    version_path = tmp_path / "manifests" / f"{rendered.manifest_sha256}.jsonl"
+    events: list[str] = []
+    real_fsync = os.fsync
+
+    def concurrent_link(source: Path, destination: Path) -> None:
+        del source
+        destination.write_bytes(rendered.content)
+        events.append("winner_visible")
+        raise FileExistsError
+
+    def tracked_fsync(descriptor: int) -> None:
+        descriptor_stat = os.fstat(descriptor)
+        if version_path.exists():
+            winner_stat = os.stat(version_path, follow_symlinks=False)
+            if (descriptor_stat.st_dev, descriptor_stat.st_ino) == (
+                winner_stat.st_dev,
+                winner_stat.st_ino,
+            ):
+                events.append("winner_fsync")
+        if stat.S_ISDIR(descriptor_stat.st_mode) and version_path.parent.exists():
+            directory_stat = os.stat(version_path.parent, follow_symlinks=False)
+            if (descriptor_stat.st_dev, descriptor_stat.st_ino) == (
+                directory_stat.st_dev,
+                directory_stat.st_ino,
+            ):
+                events.append("manifests_fsync")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(corpus_manifest.os, "link", concurrent_link)
+    monkeypatch.setattr(corpus_manifest.os, "fsync", tracked_fsync)
+
+    publish_manifest(tmp_path, rendered)
+
+    visible = events.index("winner_visible")
+    winner_fsync = events.index("winner_fsync")
+    following_directory_fsync = events.index("manifests_fsync", winner_fsync)
+    assert visible < winner_fsync < following_directory_fsync
+
+
+def test_fresh_multilevel_output_tree_fsyncs_every_created_child_attachment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "level-one" / "level-two" / "output"
+    fsynced: list[Path] = []
+    real_fsync_directory = corpus_manifest._fsync_directory
+
+    def tracked_fsync_directory(path: Path) -> None:
+        fsynced.append(path)
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(corpus_manifest, "_fsync_directory", tracked_fsync_directory)
+
+    publish_manifest(output_dir, render_fixture())
+
+    assert fsynced == [
+        tmp_path,
+        tmp_path / "level-one",
+        tmp_path / "level-one" / "level-two",
+        output_dir,
+        output_dir / "manifests",
+        output_dir / "manifests",
+    ]
 
 
 def test_latest_pointer_replacement_happens_after_manifest_directory_is_durable(
@@ -549,6 +672,157 @@ def test_latest_pointer_replacement_happens_after_manifest_directory_is_durable(
     assert events[latest_parent_fsync] == ("fsync", tmp_path)
 
 
+def test_publish_manifest_sanitizes_uuid_generation_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    unsafe = "unsafe raw endpoint https://account-id.example"
+
+    def failed_uuid() -> object:
+        raise RuntimeError(unsafe)
+
+    monkeypatch.setattr(corpus_manifest, "uuid4", failed_uuid)
+
+    with pytest.raises(ManifestPublicationError) as raised:
+        publish_manifest(tmp_path, render_fixture())
+
+    assert str(raised.value) == "artifact_write_failed"
+    assert unsafe not in str(raised.value)
+
+
+def test_publish_latest_sanitizes_uuid_generation_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    published = publish_manifest(tmp_path, render_fixture())
+    unsafe = "unsafe signed query X-Amz-Signature=secret"
+
+    def failed_uuid() -> object:
+        raise RuntimeError(unsafe)
+
+    monkeypatch.setattr(corpus_manifest, "uuid4", failed_uuid)
+
+    with pytest.raises(ManifestPublicationError) as raised:
+        publish_latest_manifest(tmp_path, published, "complete", FIXED_TIME)
+
+    assert str(raised.value) == "artifact_write_failed"
+    assert unsafe not in str(raised.value)
+
+
+def test_publish_latest_sanitizes_non_utf8_pointer_fields(tmp_path: Path) -> None:
+    published = publish_manifest(tmp_path, render_fixture())
+    unsafe = replace(published, relative_path="\ud800")
+
+    with pytest.raises(ManifestPublicationError) as raised:
+        publish_latest_manifest(tmp_path, unsafe, "complete", FIXED_TIME)
+
+    assert str(raised.value) == "artifact_write_failed"
+    assert not (tmp_path / "latest.json").exists()
+
+
+def test_publish_latest_sanitizes_canonical_serialization_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    published = publish_manifest(tmp_path, render_fixture())
+    unsafe = "unsafe credential AKIA-not-a-real-key"
+
+    def failed_dumps(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        raise RuntimeError(unsafe)
+
+    monkeypatch.setattr(corpus_manifest.json, "dumps", failed_dumps)
+
+    with pytest.raises(ManifestPublicationError) as raised:
+        publish_latest_manifest(tmp_path, published, "complete", FIXED_TIME)
+
+    assert str(raised.value) == "artifact_write_failed"
+    assert unsafe not in str(raised.value)
+
+
+def test_publish_manifest_sanitizes_unexpected_path_operation_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    unsafe = "unsafe header Authorization=secret"
+
+    def failed_link(source: Path, destination: Path) -> None:
+        del source, destination
+        raise RuntimeError(unsafe)
+
+    monkeypatch.setattr(corpus_manifest.os, "link", failed_link)
+
+    with pytest.raises(ManifestPublicationError) as raised:
+        publish_manifest(tmp_path, render_fixture())
+
+    assert str(raised.value) == "artifact_write_failed"
+    assert unsafe not in str(raised.value)
+    assert not list((tmp_path / "manifests").glob(".*.tmp"))
+
+
+def test_publish_manifest_sanitizes_cleanup_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    unsafe = "unsafe cleanup endpoint https://account-id.example"
+
+    def failed_link(source: Path, destination: Path) -> None:
+        del source, destination
+        raise OSError("install failed")
+
+    def failed_unlink(
+        path: Path,
+        missing_ok: bool = False,
+    ) -> None:
+        del path, missing_ok
+        raise RuntimeError(unsafe)
+
+    monkeypatch.setattr(corpus_manifest.os, "link", failed_link)
+    monkeypatch.setattr(Path, "unlink", failed_unlink)
+
+    with pytest.raises(ManifestPublicationError) as raised:
+        publish_manifest(tmp_path, render_fixture())
+
+    assert str(raised.value) == "artifact_write_failed"
+    assert unsafe not in str(raised.value)
+
+
+def test_publish_latest_rejects_naive_publication_time_without_moving_pointer(
+    tmp_path: Path,
+) -> None:
+    published = publish_manifest(tmp_path, render_fixture())
+    latest_path = tmp_path / "latest.json"
+    latest_path.write_bytes(b'{"existing":true}\n')
+
+    with pytest.raises(ValueError, match="published_at must be timezone-aware"):
+        publish_latest_manifest(
+            tmp_path,
+            published,
+            "complete",
+            datetime(2026, 7, 25, 1, 2, 3),
+        )
+
+    assert latest_path.read_bytes() == b'{"existing":true}\n'
+
+
+def test_publish_latest_normalizes_aware_publication_time_to_utc(tmp_path: Path) -> None:
+    published = publish_manifest(tmp_path, render_fixture())
+    pacific_time = datetime(
+        2026,
+        7,
+        24,
+        18,
+        2,
+        3,
+        tzinfo=timezone(timedelta(hours=-7)),
+    )
+
+    publish_latest_manifest(tmp_path, published, "complete", pacific_time)
+
+    latest = json.loads((tmp_path / "latest.json").read_text(encoding="utf-8"))
+    assert latest["published_at"] == "2026-07-25T01:02:03Z"
+
+
 def test_failed_latest_replace_cleans_temporary_file_and_keeps_old_pointer(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -570,3 +844,18 @@ def test_failed_latest_replace_cleans_temporary_file_and_keeps_old_pointer(
     assert "unsafe raw endpoint" not in str(raised.value)
     assert latest_path.read_bytes() == b'{"existing":true}\n'
     assert not list(tmp_path.glob(".latest.json.*.tmp"))
+
+
+def test_reversed_equivalent_error_inputs_render_byte_identically() -> None:
+    errors = (
+        SyncError("object", "object_get_failed", "Object body read failed.", "2/a.dtx"),
+        SyncError("object", "object_get_failed", "Object body read failed.", None),
+    )
+    first = replace(make_simfile(), sync_status="partial", sync_errors=errors)
+    second = replace(make_simfile(), sync_status="partial", sync_errors=tuple(reversed(errors)))
+
+    first_rendered = render_manifest(build_manifest_rows((first,), {}, "a" * 64, "bucket"))
+    second_rendered = render_manifest(build_manifest_rows((second,), {}, "a" * 64, "bucket"))
+
+    assert first_rendered.content == second_rendered.content
+    assert first_rendered.corpus_version == second_rendered.corpus_version
