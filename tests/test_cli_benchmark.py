@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -7,6 +10,7 @@ import pytest
 import soundfile as sf
 from click.testing import CliRunner
 
+import src.benchmark.r2_corpus_sync as r2_corpus_sync
 from src.benchmark.r2_corpus_models import (
     MAX_SIMFILE_ID,
     OverallStatus,
@@ -324,7 +328,7 @@ def test_transcribe_and_score_cli_runs_and_reports_chart_count(tmp_path: Path, m
 
     fake_reports = [ChartReport("foo", 50, "raw", ScoreSummary(1, 0, 0))]
     monkeypatch.setattr(
-        "src.cli.benchmark.run_transcribe_and_score",
+        "src.benchmark.runner.run_transcribe_and_score",
         lambda *args, **kwargs: fake_reports,
     )
 
@@ -599,6 +603,77 @@ def test_sync_r2_corpus_fatal_report_failure_uses_one_sanitized_stderr_line(monk
     assert endpoint not in result.stderr
     assert credential not in result.stdout
     assert credential not in result.stderr
+
+
+def test_sync_r2_corpus_real_report_write_failure_keeps_one_final_stderr_line(
+    monkeypatch, tmp_path
+):
+    class EmptyStore:
+        def validate_bucket(self) -> None:
+            return None
+
+        def list_objects(self) -> tuple:
+            return ()
+
+    def real_sync(request: SyncRequest, *, progress):
+        return r2_corpus_sync.sync_r2_corpus(
+            request,
+            environ={
+                "CRUX_R2_ENDPOINT_URL": "https://account.example.invalid",
+                "AWS_ACCESS_KEY_ID": "test-access-key",
+                "AWS_SECRET_ACCESS_KEY": "test-secret-key",
+            },
+            dependency_check=lambda: None,
+            store_factory=lambda _config: EmptyStore(),
+            progress=progress,
+        )
+
+    def fail_report_write(*args, **kwargs):
+        raise OSError("report write failed")
+
+    monkeypatch.setattr(benchmark_cli, "sync_r2_corpus", real_sync)
+    monkeypatch.setattr(r2_corpus_sync, "_publish_report_file", fail_report_write)
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "sync-r2-corpus",
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--output-dir",
+            str(tmp_path / "output"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert result.stderr.count("failed synchronization outcome.\n") == 1
+    assert "R2 synchronization failed before a report could be written." not in result.stderr
+    assert json.loads(result.stdout)["report_path"] is None
+
+
+def test_installed_sync_r2_corpus_help_is_silent_and_avoids_optional_imports(tmp_path):
+    import_spies = tmp_path / "import_spies"
+    import_spies.mkdir()
+    for module_name in ("pretty_midi", "boto3"):
+        (import_spies / f"{module_name}.py").write_text(
+            f'raise RuntimeError("{module_name} must not be imported for sync help")\n',
+            encoding="utf-8",
+        )
+
+    command = Path(sys.executable).with_name("crux")
+    result = subprocess.run(
+        [str(command), "benchmark", "sync-r2-corpus", "--help"],
+        capture_output=True,
+        check=False,
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(import_spies)},
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert "sync-r2-corpus" in result.stdout
 
 
 def test_sync_r2_corpus_dry_run_summary_states_no_manifest_was_published(monkeypatch, tmp_path):

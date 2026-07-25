@@ -21,6 +21,11 @@
   R2 authority, defaults, filtering, cache/resume behavior, dry-run mutation limits, artifacts and
   pointers, status/exit contract, provenance identity, HPA-322 scope, and the credentialed smoke
   acceptance requirement.
+- Tracks the orchestrator's terminal `failed` progress event so a real fatal report-write outcome
+  keeps its single sanitized final stderr line; mocked/custom failed outcomes with no such event
+  still receive the CLI fallback.
+- Moved legacy benchmark imports into their owning subcommands. The R2 command's installed help
+  path now avoids `runner`, `midi_io`, `pretty_midi`, and optional `boto3` imports.
 
 ## TDD Evidence
 
@@ -28,6 +33,10 @@
   directly monkeypatchable orchestrator import did not exist.
 - The minimal command registration, request mapping, JSON summary, stderr progress, and explicit
   exits made the same focused suite pass without touching orchestration or R2 adapter code.
+- Fix round 1 RED tests showed a real report-write fallback emitted both the orchestration's final
+  `failed` progress message and the CLI fallback, while an installed help subprocess imported the
+  `pretty_midi` spy and exited nonzero. The scoped progress wrapper and command-local imports make
+  both regressions pass.
 
 ## Verification
 
@@ -40,12 +49,22 @@
   docs/drumery-dtx-midi-benchmarking-reference.md` — required documentation boundaries present.
 - `rtk git diff --check` — passed.
 - `rtk uv run --extra r2 pytest -q` — 522 passed.
+- Fix round 1 targeted report-write/help/lazy-import checks — 3 passed.
+- Fix round 1 `rtk uv run --extra r2 pytest tests/test_cli_benchmark.py
+  tests/benchmark/test_runner.py tests/benchmark/test_midi_io.py
+  tests/benchmark/test_render_audio.py tests/benchmark/test_prepare.py -q` — 76 passed.
+- Fix round 1 Ruff and Black checks on `src/cli/benchmark.py` and
+  `tests/test_cli_benchmark.py` — passed.
+- Fix round 1 `rtk uv run --extra r2 pytest -q` — 524 passed.
 
 ## Notes
 
 - No live credentialed R2 smoke run was performed. The approved design reserves it for acceptance;
   this task uses injected fake outcomes and the existing fake-backed synchronization suite.
+- The installed-entrypoint regression uses subprocess import sentinels for `pretty_midi` and
+  `boto3`; it does not suppress warnings and proves those modules are not imported for R2 help.
 
 ## Commit
 
-- Planned conventional commit: `feat: expose R2 corpus sync command`.
+- Initial conventional commit: `feat: expose R2 corpus sync command`.
+- Fix round 1 planned conventional commit: `fix: silence R2 sync CLI help`.
