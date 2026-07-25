@@ -53,9 +53,10 @@
   Fatal reports use trusted stdlib UTC/UUID4 fallbacks, and retain the primary internal
   error if fallback report publication also fails.
 - Added a mutation-free platform preflight for `O_NOFOLLOW`, `O_DIRECTORY`, and the
-  required `fcntl` locking interface. Unsupported platforms fail before store
-  creation, network activity, output/cache creation, or fatal-report publication.
-  Layered fatal fallbacks deduplicate identical artifact error codes.
+  required `fcntl` locking interface: `flock`, `LOCK_EX`, `LOCK_NB`, and `LOCK_UN`.
+  Unsupported platforms fail before store creation, network activity, output/cache
+  creation, or fatal-report publication. Layered fatal fallbacks deduplicate identical
+  artifact error codes.
 - Added a reusable boto3-free fake store with exact list/HEAD/body state, configured
   operation failures, recorded calls, and fixed-size streamed body chunks.
 
@@ -102,6 +103,11 @@
   work, an incompatible `fcntl` surface being ignored, and duplicate
   `artifact_write_failed` outcomes. Preflight and same-code fallback deduplication
   now contain those cases.
+- The round-3 partial-`fcntl` RED test supplied working `flock`, `LOCK_EX`, and
+  `LOCK_UN` primitives without `LOCK_NB`; preflight initially allowed a complete dry
+  run and created artifacts. Auditing both real locks confirmed `LOCK_NB` is the only
+  additional primitive used by the cache writer, and adding it to preflight makes the
+  same attempt fail mutation-free as one `unsupported_platform` error.
 - The final R2-focused run covers 188 inventory, cache, and orchestration behaviors;
   the subsequent publication subset covers eight dual-pointer, process-lock,
   no-follow, and unsupported-platform behaviors.
@@ -126,6 +132,13 @@
   `tests/benchmark/test_r2_corpus_sync.py` — passed.
 - Round-2 `rtk git diff --check` — passed before the full-suite gate.
 - Round-2 `rtk uv run --extra r2 pytest -q` — 510 passed.
+- Round-3 targeted POSIX/`fcntl` preflight selection — 5 passed.
+- Round-3 `rtk uv run pytest tests/benchmark/test_r2_corpus_sync.py -q` —
+  62 passed.
+- Round-3 Ruff, Black, and `rtk git diff --check` gates — passed.
+- The full repository suite was not repeated in round 3: the production diff is one
+  additional `fcntl` capability predicate, its direct mutation-free regression and
+  complete orchestration module pass, and the round-2 full suite remains 510 passed.
 
 ## Notes
 
@@ -140,4 +153,4 @@
 
 ## Commit
 
-- Planned conventional commit: `fix: contain R2 sync failure paths`.
+- Planned conventional commit: `fix: require nonblocking R2 lock support`.
