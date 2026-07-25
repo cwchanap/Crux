@@ -1,11 +1,26 @@
+import json
 from pathlib import Path
 
 import numpy as np
 import pretty_midi
+import pytest
 import soundfile as sf
 from click.testing import CliRunner
 
+from src.benchmark.r2_corpus_models import (
+    MAX_SIMFILE_ID,
+    OverallStatus,
+    PublishedManifest,
+    SyncCounters,
+    SyncError,
+    SyncOutcome,
+    SyncRequest,
+)
+from src.benchmark.r2_corpus_sync import ProgressEvent
+from src.cli import benchmark as benchmark_cli
 from src.cli.main import main
+
+runner = CliRunner()
 
 
 def write_prediction(path: Path):
@@ -331,3 +346,271 @@ def test_transcribe_and_score_cli_runs_and_reports_chart_count(tmp_path: Path, m
 
     assert result.exit_code == 0, result.output
     assert "1 chart" in result.output
+
+
+def make_sync_outcome(
+    status: OverallStatus,
+    tmp_path: Path,
+    *,
+    report: bool = True,
+    counters: SyncCounters | None = None,
+    errors: tuple[SyncError, ...] = (),
+) -> SyncOutcome:
+    exit_code = {
+        "complete": 0,
+        "partial": 1,
+        "failed": 2,
+        "dry_run_complete": 0,
+        "dry_run_partial": 1,
+    }[status]
+    report_path = tmp_path / "report.json" if report else None
+    if report_path is not None:
+        report_path.write_text("{}\n", encoding="utf-8")
+    manifest = None
+    if status in {"complete", "partial"}:
+        manifest_path = tmp_path / "manifest.jsonl"
+        manifest_path.write_text("{}\n", encoding="utf-8")
+        manifest = PublishedManifest(
+            corpus_version=f"sha256:{'a' * 64}",
+            manifest_sha256="b" * 64,
+            relative_path="manifests/test.jsonl",
+            path=manifest_path,
+            latest_path=tmp_path / "latest.json",
+        )
+    return SyncOutcome(
+        status,
+        exit_code,
+        report_path,
+        manifest,
+        errors,
+        SyncCounters() if counters is None else counters,
+    )
+
+
+def test_sync_r2_corpus_help_lists_local_options_without_endpoint_flag():
+    result = runner.invoke(main, ["benchmark", "sync-r2-corpus", "--help"])
+
+    assert result.exit_code == 0
+    assert "--cache-dir" in result.output
+    assert "--output-dir" in result.output
+    assert "--include-simfile-id" in result.output
+    assert "--exclude-simfile-id" in result.output
+    assert "--provenance-file" in result.output
+    assert "--dry-run" in result.output
+    assert "--profile" not in result.output
+    assert "--endpoint" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("outcome_status", "expected_exit", "exception_type"),
+    [("complete", 0, None), ("partial", 1, SystemExit), ("failed", 2, SystemExit)],
+)
+def test_sync_r2_corpus_maps_outcome_to_explicit_exit(
+    monkeypatch, tmp_path, outcome_status, expected_exit, exception_type
+):
+    monkeypatch.setattr(
+        benchmark_cli,
+        "sync_r2_corpus",
+        lambda request, *, progress: make_sync_outcome(outcome_status, tmp_path),
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "sync-r2-corpus",
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--output-dir",
+            str(tmp_path / "output"),
+        ],
+    )
+
+    assert result.exit_code == expected_exit
+    if exception_type is None:
+        assert result.exception is None
+    else:
+        assert type(result.exception) is exception_type
+
+
+def test_sync_r2_corpus_builds_request_from_local_options(monkeypatch, tmp_path):
+    captured: list[SyncRequest] = []
+
+    def fake_sync(request: SyncRequest, *, progress):
+        captured.append(request)
+        return make_sync_outcome("dry_run_complete", tmp_path)
+
+    monkeypatch.setattr(benchmark_cli, "sync_r2_corpus", fake_sync)
+    explicit_provenance = tmp_path / "provenance.json"
+    explicit_cache = tmp_path / "cache"
+    explicit_output = tmp_path / "output"
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "sync-r2-corpus",
+            "--cache-dir",
+            str(explicit_cache),
+            "--output-dir",
+            str(explicit_output),
+            "--provenance-file",
+            str(explicit_provenance),
+            "--include-simfile-id",
+            "0",
+            "--include-simfile-id",
+            str(MAX_SIMFILE_ID),
+            "--exclude-simfile-id",
+            "0",
+            "--exclude-simfile-id",
+            "23",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured == [
+        SyncRequest(
+            cache_dir=explicit_cache,
+            output_dir=explicit_output,
+            include_simfile_ids=frozenset({0, MAX_SIMFILE_ID}),
+            exclude_simfile_ids=frozenset({0, 23}),
+            provenance_file=explicit_provenance,
+            dry_run=True,
+        )
+    ]
+
+
+def test_sync_r2_corpus_uses_local_default_paths_and_no_provenance(monkeypatch, tmp_path):
+    captured: list[SyncRequest] = []
+
+    def fake_sync(request: SyncRequest, *, progress):
+        captured.append(request)
+        return make_sync_outcome("complete", tmp_path)
+
+    monkeypatch.setattr(benchmark_cli, "sync_r2_corpus", fake_sync)
+
+    result = runner.invoke(main, ["benchmark", "sync-r2-corpus"])
+
+    assert result.exit_code == 0
+    assert captured == [
+        SyncRequest(
+            cache_dir=Path("artifacts/benchmark/r2-corpus/cache"),
+            output_dir=Path("artifacts/benchmark/r2-corpus"),
+            provenance_file=None,
+        )
+    ]
+
+
+@pytest.mark.parametrize("invalid_id", ["-1", str(MAX_SIMFILE_ID + 1)])
+def test_sync_r2_corpus_rejects_out_of_range_filters_before_sync(monkeypatch, invalid_id):
+    def unexpected_sync(request: SyncRequest, *, progress):
+        raise AssertionError("Click should reject invalid filter values before synchronization")
+
+    monkeypatch.setattr(benchmark_cli, "sync_r2_corpus", unexpected_sync)
+
+    result = runner.invoke(
+        main,
+        ["benchmark", "sync-r2-corpus", "--include-simfile-id", invalid_id],
+    )
+
+    assert result.exit_code == 2
+    assert "Invalid value" in result.output
+
+
+def test_sync_r2_corpus_emits_sanitized_progress_and_machine_summary(monkeypatch, tmp_path):
+    endpoint = "https://account-secret.r2.cloudflarestorage.com"
+    credential = "credential-secret"
+    counters = SyncCounters(
+        simfiles_discovered=3,
+        simfiles_included=2,
+        simfiles_excluded_by_filter=1,
+        objects_listed=5,
+        objects_selected=3,
+        cache_hits=1,
+        downloads_planned=2,
+        downloads_completed=2,
+        download_bytes_completed=99,
+    )
+
+    def fake_sync(request: SyncRequest, *, progress):
+        progress(ProgressEvent("inventory", 1, 3, "inventory: 1/3 simfiles, 0 bytes."))
+        return make_sync_outcome("complete", tmp_path, counters=counters)
+
+    monkeypatch.setattr(benchmark_cli, "sync_r2_corpus", fake_sync)
+    monkeypatch.setenv("CRUX_R2_ENDPOINT_URL", endpoint)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", credential)
+
+    result = runner.invoke(main, ["benchmark", "sync-r2-corpus"])
+
+    assert result.exit_code == 0
+    assert result.stderr == "inventory: 1/3 simfiles, 0 bytes.\n"
+    summary = json.loads(result.stdout)
+    assert summary == {
+        "corpus_version": f"sha256:{'a' * 64}",
+        "counts": {
+            "cache_hits": 1,
+            "download_bytes_completed": 99,
+            "download_bytes_planned": 0,
+            "downloads_completed": 2,
+            "downloads_failed": 0,
+            "downloads_planned": 2,
+            "objects_listed": 5,
+            "objects_selected": 3,
+            "simfiles_discovered": 3,
+            "simfiles_empty": 0,
+            "simfiles_excluded_by_filter": 1,
+            "simfiles_included": 2,
+        },
+        "exit_code": 0,
+        "manifest_published": True,
+        "report_path": str(tmp_path / "report.json"),
+        "status": "complete",
+    }
+    assert endpoint not in result.stdout
+    assert endpoint not in result.stderr
+    assert credential not in result.stdout
+    assert credential not in result.stderr
+
+
+def test_sync_r2_corpus_fatal_report_failure_uses_one_sanitized_stderr_line(monkeypatch, tmp_path):
+    endpoint = "https://account-secret.r2.cloudflarestorage.com"
+    credential = "credential-secret"
+    failure = SyncError(
+        "artifact", "artifact_write_failed", f"failed at {endpoint} with {credential}"
+    )
+
+    monkeypatch.setattr(
+        benchmark_cli,
+        "sync_r2_corpus",
+        lambda request, *, progress: make_sync_outcome(
+            "failed", tmp_path, report=False, errors=(failure,)
+        ),
+    )
+
+    result = runner.invoke(main, ["benchmark", "sync-r2-corpus"])
+
+    assert result.exit_code == 2
+    assert result.stderr == "R2 synchronization failed before a report could be written.\n"
+    summary = json.loads(result.stdout)
+    assert summary["status"] == "failed"
+    assert summary["report_path"] is None
+    assert endpoint not in result.stdout
+    assert endpoint not in result.stderr
+    assert credential not in result.stdout
+    assert credential not in result.stderr
+
+
+def test_sync_r2_corpus_dry_run_summary_states_no_manifest_was_published(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        benchmark_cli,
+        "sync_r2_corpus",
+        lambda request, *, progress: make_sync_outcome("dry_run_partial", tmp_path),
+    )
+
+    result = runner.invoke(main, ["benchmark", "sync-r2-corpus", "--dry-run"])
+
+    assert result.exit_code == 1
+    summary = json.loads(result.stdout)
+    assert summary["status"] == "dry_run_partial"
+    assert summary["manifest_published"] is False
