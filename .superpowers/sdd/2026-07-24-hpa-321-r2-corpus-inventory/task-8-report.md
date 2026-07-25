@@ -32,10 +32,19 @@
   together after replacement or directory-fsync failures, so a failed outcome cannot
   leave a success pointer behind. Successful real and dry processes retain
   last-completed-writer pointer semantics.
+- If either pointer publication fails after the timestamped success or partial report
+  is durable, both pointers are restored first and that same attempt report is
+  atomically rewritten as canonical `failed`/exit-2 output with the sanitized
+  publication error. A failed rewrite durably removes the stale success report and
+  never moves `latest-report.json`.
 - Added bounded callback-only progress at deterministic phase boundaries and every
   100 items, final item, or five monotonic seconds. Inventory HEAD and cache-download
   hooks now feed the thread-safe tracker as futures complete instead of replaying
   progress after work. Messages contain only phases, counts, and byte totals.
+- Progress callbacks are non-authoritative observability. The tracker catches a
+  callback exception at phase, live-item, or final-outcome delivery, permanently
+  disables further callbacks for that attempt, and preserves the synchronization's
+  real result without exposing callback details.
 - Added lexical no-follow validation for existing output and cache path components
   before store creation, bucket validation, network access, cache mutation, or report
   publication. Broken symlinks, symlinked ancestors, non-directory components, and
@@ -43,6 +52,10 @@
 - Contained invalid or raising wall-clock and run-ID factories as `internal_error`.
   Fatal reports use trusted stdlib UTC/UUID4 fallbacks, and retain the primary internal
   error if fallback report publication also fails.
+- Added a mutation-free platform preflight for `O_NOFOLLOW`, `O_DIRECTORY`, and the
+  required `fcntl` locking interface. Unsupported platforms fail before store
+  creation, network activity, output/cache creation, or fatal-report publication.
+  Layered fatal fallbacks deduplicate identical artifact error codes.
 - Added a reusable boto3-free fake store with exact list/HEAD/body state, configured
   operation failures, recorded calls, and fixed-size streamed body chunks.
 
@@ -78,6 +91,17 @@
   work finished. The inventory and cache hooks now report each completed future live.
 - Path/factory RED tests covered symlinked and broken cache/output components,
   non-directory leaves, invalid/raising clocks, and invalid/raising run-ID factories.
+- Round-2 RED tests found four stale-report outcomes after pointer
+  replacement/durability failures. The fix restores both pointers and replaces the
+  only timestamped attempt report with failed/exit-2 content, or removes it when the
+  fatal rewrite fails.
+- Three callback RED tests showed phase exceptions escaping, live-item exceptions
+  changing a dry success into failure, and fatal-path exceptions replacing the
+  primary error. A fourth isolated RED test covered the final `failed` event.
+- Platform RED tests showed missing POSIX flags becoming internal errors after local
+  work, an incompatible `fcntl` surface being ignored, and duplicate
+  `artifact_write_failed` outcomes. Preflight and same-code fallback deduplication
+  now contain those cases.
 - The final R2-focused run covers 188 inventory, cache, and orchestration behaviors;
   the subsequent publication subset covers eight dual-pointer, process-lock,
   no-follow, and unsupported-platform behaviors.
@@ -95,6 +119,13 @@
 - `rtk uv run black --check` on all six modified source/test files — passed.
 - `rtk git diff --check` — passed before the full-suite gate.
 - `rtk uv run --extra r2 pytest -q` — 504 passed.
+- Round-2 `rtk uv run pytest tests/benchmark/test_r2_corpus_sync.py -q` —
+  61 passed.
+- Round-2 `rtk uv run ruff check` and `rtk uv run black --check` on
+  `src/benchmark/r2_corpus_sync.py` and
+  `tests/benchmark/test_r2_corpus_sync.py` — passed.
+- Round-2 `rtk git diff --check` — passed before the full-suite gate.
+- Round-2 `rtk uv run --extra r2 pytest -q` — 510 passed.
 
 ## Notes
 
@@ -109,4 +140,4 @@
 
 ## Commit
 
-- Planned conventional commit: `fix: harden R2 sync publication`.
+- Planned conventional commit: `fix: contain R2 sync failure paths`.
