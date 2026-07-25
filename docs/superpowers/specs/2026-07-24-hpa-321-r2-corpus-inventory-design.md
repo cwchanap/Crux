@@ -25,7 +25,7 @@ merged anonymously.
 
 - Inventory every object under each valid simfile prefix, including nested keys.
 - Preserve exact R2 keys and collect size, ETag or version signal, modification time,
-  content type, and available remote checksums.
+  and content type where available.
 - Cache only bodies needed by the current stage. The initial profile caches
   case-insensitive `set.def`, `.dtx`, and `.txt` files.
 - Verify cached bodies with locally computed SHA-256 digests.
@@ -70,9 +70,11 @@ The command accepts:
 - optional `--provenance-file PATH`;
 - `--dry-run` for list-only planning.
 
-An ID present in both filters is excluded. Invalid or negative IDs are rejected before
+An ID present in both filters is excluded. IDs must be in the JSON-number-safe range
+`0..9007199254740991` (`2^53 - 1`); invalid or out-of-range IDs are rejected before
 network access. An explicitly included ID whose prefix has no objects receives an
-`empty` manifest row in a real sync and an empty-prefix entry in a dry-run report.
+`empty` manifest row with `objects: []` in a real sync and an empty-prefix entry in a
+dry-run report. Any empty row makes the attempt partial and produces exit `1`.
 
 The HPA-321 selection profile is the fixed identifier `setdef_dtx_txt_v1`. There is no
 `--cache-profile` option in v1. The identifier is recorded in manifests and reports so
@@ -101,7 +103,10 @@ Crux accepts an HTTPS origin with no user information, query, or fragment. It
 lowercases the scheme and hostname, removes the default port and trailing slash, and
 computes `source_endpoint_sha256` from the normalized ASCII origin. The hash
 distinguishes same-named buckets in different R2 accounts without storing or logging
-the account-bearing endpoint itself.
+the account-bearing endpoint itself. Changing between account, jurisdiction-specific,
+or custom endpoint origins intentionally creates a different source identity and
+invalidates index hits even if the endpoint currently exposes the same object bytes;
+content-addressed files deduplicate again only after verification.
 
 Command exit codes are:
 
@@ -112,6 +117,12 @@ Command exit codes are:
 The report's `overall_status` remains the machine-readable result; the exit code is its
 coarse process-level projection.
 
+The Click callback receives `click.Context` and terminates domain outcomes explicitly
+with `ctx.exit(1)` or `ctx.exit(2)`. HPA-321 fatal paths must not escape as a bare
+`click.ClickException`, whose default exit code is `1` and would be indistinguishable
+from a published partial result. Click's own argument and option parsing errors may
+retain its standard usage exit `2`.
+
 The default artifact layout is:
 
 ```text
@@ -119,7 +130,9 @@ artifacts/benchmark/r2-corpus/
 ├── cache/
 │   ├── .index-v1.lock
 │   ├── index-v1.json
-│   └── sha256/<first-two-hex>/<full-sha256>
+│   └── sha256/
+│       ├── .incoming/<temporary-id>
+│       └── <first-two-hex>/<full-sha256>
 ├── manifests/<manifest-sha256>.jsonl
 ├── reports/<UTC-YYYYMMDDTHHMMSS.ffffffZ>-<run-id>.json
 ├── latest.json
@@ -128,7 +141,7 @@ artifacts/benchmark/r2-corpus/
 
 ## Architecture
 
-The command coordinates four focused components.
+The command coordinates five focused components.
 
 ### R2 inventory
 
@@ -200,9 +213,16 @@ fatal configuration errors.
 ### Corpus manifest
 
 `src/benchmark/corpus_manifest.py` converts domain records to canonical JSONL,
-computes deterministic identities, publishes immutable manifests, writes sync reports,
-and atomically updates the convenience pointer. `src/cli/benchmark.py` owns only
-command wiring and presentation.
+computes deterministic identities, publishes immutable manifests, and atomically
+updates the manifest convenience pointer.
+
+### Synchronization orchestration
+
+`src/benchmark/r2_corpus_sync.py` owns transactional flow across inventory, cache,
+provenance, and manifest components. It derives row and overall statuses, assembles
+machine-readable reports, and returns an explicit complete, partial, dry-run, or fatal
+outcome. `src/cli/benchmark.py` owns only command wiring, sanitized presentation, and
+mapping that outcome to the documented Click exit code.
 
 Existing `prepare-corpus` behavior remains unchanged. HPA-322 may later consume the
 new manifest and cache, but no chart selection or DTX parsing belongs in these
@@ -223,13 +243,16 @@ the top-level segment `42` identifies simfile `42`, and the exact object prefix 
 
 Rules:
 
-1. A valid simfile prefix has a non-negative, digit-only first segment followed by `/`.
+1. A valid simfile prefix has a digit-only first segment followed by `/` whose numeric
+   value is in `0..9007199254740991`. An out-of-range remote segment is reported as
+   `malformed_root_key`; an out-of-range CLI filter is `invalid_config`.
 2. The manifest stores `simfile_id` as an integer and `object_prefix` as the exact
    source string.
-3. A zero-byte folder marker whose key equals the prefix is inventory metadata but is
-   not selected for caching. A prefix containing only that marker is `empty`, retains
-   the marker as a `not_selected` object, makes the overall attempt `partial`, and
-   produces exit `1`.
+3. A folder marker is any zero-byte object whose key ends in `/`, including nested
+   markers such as `42/assets/`. Folder markers remain inventory metadata with
+   `cache_status: "not_selected"` but are not content. A discovered prefix is `empty`
+   when every object under it is a folder marker. It retains all markers in the row,
+   makes the overall attempt `partial`, and produces exit `1`.
 4. If distinct prefixes normalize to the same integer, such as `1/` and `01/`, both
    are quarantined as an ambiguous prefix rather than silently merged. Quarantine wins
    even when the operator explicitly passes `--include-simfile-id 1`; the report uses
@@ -243,16 +266,24 @@ Rules:
 
 Listing initially supplies `key`, `size`, `etag`, and `last_modified`. A successful
 `HeadObject` response becomes authoritative for `size`, `etag`, and `last_modified`
-when those fields are present, and supplements them with `content_type`, checksum
-values, and checksum type. The normalized post-HEAD-merge values are the only values
-used by both the cache index and manifest. If HEAD omits one of the identity fields,
-the listing value is retained. Listing metadata is retained when `HeadObject` fails;
-the affected object receives `object_head_failed`, cannot be selected for download,
-and its simfile status becomes `partial`.
+when those fields are present, and supplements them with `content_type`. The normalized
+post-HEAD-merge values are the only values used by both the cache index and manifest.
+If HEAD omits one of the identity fields, the listing value is retained. Listing
+metadata is retained when `HeadObject` fails; the affected object receives
+`object_head_failed`, cannot be selected for download, and its simfile status becomes
+`partial`.
 
-HEAD fan-out is intentional for this corpus scale: root listing alone does not return
-the content type or checksum values required by the manifest. The bounded concurrency
-and explicit timeouts cap its operational cost.
+HEAD fan-out is intentional because root listing does not return the content type
+required for every manifest object. At roughly 400 songs with tens of objects per
+song, operators should expect thousands to tens of thousands of HEAD requests and a
+minutes-scale metadata phase. Bounded concurrency and explicit timeouts cap its
+operational cost.
+
+Provider checksum algorithms, checksum type, and remote checksum values are excluded
+from the v1 manifest and cache index. They are capability-dependent observations,
+whereas selected bodies already receive a locally verified SHA-256. The adapter does
+not request `ChecksumMode`; adding remote checksum metadata later requires a new
+manifest schema whose identity rules define it explicitly.
 
 ## Cache Identity and Synchronization
 
@@ -290,45 +321,73 @@ The index is intentionally profile-independent: it proves an exact remote object
 is present at a content-addressed path. The active cache profile is instead recorded
 in the manifest and sync report, where selection policy affects corpus identity.
 
-A real sync holds an exclusive advisory lock on `<cache-dir>/.index-v1.lock` while
-reading and publishing index state. Index publication serializes the complete new
-document to a uniquely named sibling temporary file, flushes and `fsync`s the file,
-uses `os.replace` to install `index-v1.json`, and `fsync`s the cache directory where
-the platform supports directory synchronization. Dry runs read the index without
-rewriting it. The operating-system lock is released automatically when the process
-exits; the lock file itself may remain harmlessly. A live lock conflict fails fast
-with a sanitized `cache_locked` error. Invalid JSON or an unsupported cache-index
-schema version is fatal rather than being treated as a cache miss.
+A real sync acquires an exclusive advisory lock on `<cache-dir>/.index-v1.lock` before
+reading the index and holds it for the entire transaction through cache checkpoints,
+manifest/report publication, and convenience-pointer updates. The implementation
+opens the lock file exactly once, retains that file descriptor until transaction
+cleanup, and never reopens or closes another descriptor for the lock path while the
+lock is held. A live lock conflict fails fast with a sanitized `cache_locked` error.
 
-The lock implementation is a non-blocking POSIX `fcntl` exclusive lock and supports
-the macOS and Linux environments targeted by this CLI. A platform without compatible
-`fcntl` locking fails before cache mutation with `unsupported_platform`; it must not
-continue with an unlocked index.
+The inter-process lock uses non-blocking POSIX `fcntl.flock` and supports the macOS
+and Linux environments targeted by this CLI. A separate in-process `threading.Lock`
+guards the mutable index snapshot plus each checkpoint so download worker threads
+cannot publish overlapping versions; the file lock alone does not serialize threads
+within one process. A platform without compatible `fcntl` locking fails before cache
+mutation with `unsupported_platform` and must not continue unlocked.
+
+Index publication serializes the complete new document to a uniquely named sibling
+temporary file, flushes and `fsync`s the file, uses `os.replace` to install
+`index-v1.json`, and `fsync`s the cache directory. Dry runs read one atomically
+published index snapshot without rewriting it or taking the real-sync writer lock.
+Invalid JSON or an unsupported cache-index schema version is fatal rather than being
+treated as a cache miss.
+
+Cache validation classifies an indexed entry as:
+
+- `missing` when its content path does not exist;
+- `size_mismatch` when the local byte count differs;
+- `sha256_mismatch` when its streamed digest differs;
+- `verified` only when path, byte count, and digest all match.
+
+In a real sync, the first three states are repairable cache misses: the report records
+the miss reason and Crux attempts a fresh download. A successful repair remains a
+complete object and emits no `cache_corrupt` error. If the repair fails, the object is
+failed and receives `cache_corrupt` plus the applicable download or local-write error.
+In a dry run, the first three states become planned downloads with their miss reasons;
+they do not alone make planning partial because no repair was attempted.
 
 For each selected object:
 
 1. Compare key, ETag, size, and modification time with the index.
 2. If they match, stream-hash the referenced local file.
 3. Reuse the entry only when the computed SHA-256 and byte count match the index.
-4. For a strong ETag, download to a temporary file with `If-Match` using the exact
-   quoted entity tag reconstructed from `etag`.
-5. For a weak ETag, do not send `If-Match`, because HTTP preconditions use strong
-   comparison for that header. Perform an unconditional GET and require its normalized
-   ETag, content length, and last-modified response metadata to equal the post-HEAD
-   inventory identity. Missing comparison metadata produces `weak_etag_unverifiable`;
-   changed metadata produces `source_changed_during_sync`.
-6. Stream-compute SHA-256 and byte count during either download path.
-7. Reject a byte-count mismatch, strong conditional-request failure, or weak-path
+4. Ensure `<cache-dir>/sha256/.incoming/` exists, synchronizing each newly created
+   directory's parent.
+5. For a strong ETag, download to a uniquely named cache-local temporary file under
+   `<cache-dir>/sha256/.incoming/` with `If-Match` using the exact quoted entity tag
+   reconstructed from `etag`.
+6. For a weak ETag, do not send `If-Match`, because HTTP preconditions use strong
+   comparison for that header. Download to the same cache-local incoming directory
+   with an unconditional GET and require its normalized ETag, content length, and
+   last-modified response metadata to equal the post-HEAD inventory identity. Missing
+   comparison metadata produces `weak_etag_unverifiable`; changed metadata produces
+   `source_changed_during_sync`.
+7. Stream-compute SHA-256 and byte count during either download path.
+8. Reject a byte-count mismatch, strong conditional-request failure, or weak-path
    response-metadata mismatch.
-8. Atomically move valid content to:
+9. Create the content-addressed shard directory, synchronizing each newly created
+   directory's parent. Incoming and final paths must resolve to the same filesystem;
+   Crux never stages bodies in the process-wide `TMPDIR`.
+10. Flush and `fsync` the body temporary file, then atomically move valid content to:
 
    ```text
    sha256/<first-two-hex>/<full-sha256>
    ```
 
-9. Atomically checkpoint the cache index after each successfully installed selected
-   body and only after the content file is durable. Concurrent download workers
-   serialize these short index-publication sections.
+11. `fsync` the shard directory after `os.replace`, then atomically checkpoint the
+    cache index after each successfully installed selected body. The in-process lock
+    serializes the index mutation and publication section, and index publication
+    occurs only after the content path is durable.
 
 The cache is content-addressed and extensionless. Manifest metadata retains the source
 key and media type, so the cache filename does not need to reproduce a potentially
@@ -390,7 +449,7 @@ credentials, signed URLs, or source file bodies.
 The manifest is UTF-8 JSONL with one record per simfile. A representative record is:
 
 ```json
-{"schema_version":"crux.r2-corpus-manifest/v1","corpus_version":"sha256:…","cache_profile":"setdef_dtx_txt_v1","simfile_id":42,"object_prefix":"42/","source_endpoint_sha256":"…","source_bucket":"simfile-dtx","source_discovery_method":"r2_list_objects_v2","objects":[{"key":"42/SET.DEF","size":1234,"etag":"…","etag_is_weak":false,"version":null,"last_modified":"2026-07-24T12:34:56Z","content_type":"text/plain","checksum_algorithms":["sha256"],"checksum_type":"full_object","remote_checksums":{"sha256":"base64-value"},"cache_status":"verified","sha256":"…","cache_path":"sha256/ab/ab…"}],"sync_status":"complete","sync_errors":[],"source_origin":null,"source_author_or_pack":null,"source_reference":null,"rights_status":"unknown","redistribution_allowed":null,"provenance_notes":null}
+{"schema_version":"crux.r2-corpus-manifest/v1","corpus_version":"sha256:…","cache_profile":"setdef_dtx_txt_v1","simfile_id":42,"object_prefix":"42/","source_endpoint_sha256":"…","source_bucket":"simfile-dtx","source_discovery_method":"r2_list_objects_v2","objects":[{"key":"42/SET.DEF","size":1234,"etag":"…","etag_is_weak":false,"version":null,"last_modified":"2026-07-24T12:34:56Z","content_type":"text/plain","cache_status":"verified","sha256":"…","cache_path":"sha256/ab/ab…"}],"sync_status":"complete","sync_errors":[],"source_origin":null,"source_author_or_pack":null,"source_reference":null,"rights_status":"unknown","redistribution_allowed":null,"provenance_notes":null}
 ```
 
 Each row includes `source_endpoint_sha256` and `source_bucket` so its remote source is
@@ -410,29 +469,15 @@ Each object contains:
   this v1 field;
 - `last_modified` as UTC ISO 8601;
 - `content_type`, nullable;
-- `checksum_algorithms`, a sorted list of algorithms advertised by `ListObjectsV2` or
-  inferred from checksum values returned by `HeadObject`;
-- `checksum_type`, normalized to `full_object`, `composite`, or `null`;
-- `remote_checksums`, an object containing only checksum values actually returned by
-  `HeadObject`;
 - `cache_status`;
 - `sha256`, nullable for bodies not cached or not successfully downloaded;
 - `cache_path`, nullable and relative to the configured cache root.
 
-Checksum algorithm names use the closed lowercase set `crc32`, `crc32c`, `crc64nvme`,
-`sha1`, and `sha256`. Remote checksum values remain in the base64 representation
-returned by the SDK. The adapter maps `ChecksumCRC32`, `ChecksumCRC32C`,
-`ChecksumCRC64NVME`, `ChecksumSHA1`, and `ChecksumSHA256` to those keys and never
-places ETag values in `remote_checksums`. `checksum_type` uses the HEAD value when
-present and otherwise the listing value; contradictory non-null values are an object
-metadata error.
-
-Before launching concurrent HEAD requests, the adapter probes one selected listed
-object with `ChecksumMode="ENABLED"`. If R2 explicitly reports that checksum mode is
-unsupported, the adapter retries that object without checksum mode, disables
-checksum-value retrieval for the remainder of the run, and adds one non-fatal
-capability note to the sync report. Other probe failures follow normal per-object
-failure semantics.
+Remote provider checksum fields are intentionally absent from v1 rows. Their
+availability is not an R2 object-content property, so including them would allow a
+capability change to alter the corpus or manifest identity for an unchanged bucket.
+Locally computed `sha256` remains the verification and content-addressing authority for
+selected bodies.
 
 The cache path is a logical content-addressed path such as
 `sha256/ab/<full-sha256>`. It is independent of the operator's absolute output and
@@ -496,14 +541,11 @@ Serialized diagnostics use this closed code set:
 | `object_metadata_invalid` | Required object metadata is malformed or contradictory |
 | `ambiguous_simfile_prefix` | Multiple exact prefixes normalize to one numeric ID |
 | `malformed_root_key` | A root key cannot be assigned to a valid simfile prefix |
-| `empty_prefix` | A requested prefix has no objects or a discovered prefix has only its folder marker |
+| `empty_prefix` | A requested prefix has no objects or a discovered prefix has only folder markers |
 | `internal_error` | An unforeseen failure was caught at the command boundary |
-| `checksum_mode_unsupported` | Non-fatal report note: R2 rejected checksum-mode retrieval |
 
-`checksum_mode_unsupported` appears only in the report's `notes` array and does not by
-itself make a run partial. Every other code appears in `errors` when its condition is
-surfaced. Unexpected exceptions map to the sanitized `internal_error`; SDK exception
-names, bodies, and raw strings are never serialized as substitute codes or messages.
+Unexpected exceptions map to the sanitized `internal_error`; SDK exception names,
+bodies, and raw strings are never serialized as substitute codes or messages.
 
 ## Canonicalization and Immutability
 
@@ -511,6 +553,8 @@ Canonicalization rules are:
 
 - simfile records sorted by numeric `simfile_id`, then exact `object_prefix`;
 - objects sorted by exact key using Python's deterministic Unicode code-point order;
+- `sync_errors` sorted by scope, code, nullable object key treated as an empty string,
+  and deterministic message;
 - mapping keys serialized in sorted order;
 - UTF-8 output with `ensure_ascii=False`;
 - compact JSON separators;
@@ -537,9 +581,15 @@ remain self-identifying when streamed, extracted, or sharded without introducing
 special header-record shape that every consumer must branch around. At the expected
 corpus size, the duplicated value is negligible.
 
-Provenance is part of the normalized corpus payload. Editing any provenance or rights
-field therefore creates a new corpus version and manifest identity even when the R2
-inventory is unchanged; provenance edits are not metadata-only mutations of an
+Every manifest field except `corpus_version`, including `sync_status` and
+`sync_errors`, is part of the normalized corpus payload. A rerun that clears a
+transient object error therefore creates a different corpus and manifest identity from
+the earlier partial run; a complete unchanged rerun remains byte-identical only when
+its normalized source observations, cache content state, and provenance are unchanged.
+
+Provenance is consequently part of the normalized corpus payload. Editing any
+provenance or rights field creates a new corpus version and manifest identity even when
+the R2 inventory is unchanged; provenance edits are not metadata-only mutations of an
 existing manifest.
 
 The final manifest is published as:
@@ -579,9 +629,10 @@ identity. It contains:
 - effective concurrency, timeout, and retry settings;
 - simfile and object counts, including `simfiles_excluded_by_filter`;
 - cache hits, planned downloads, completed downloads, failed downloads, and bytes;
+- `cache_misses_by_reason` with fixed keys `remote_changed`, `missing`,
+  `size_mismatch`, and `sha256_mismatch`;
 - malformed root keys and ambiguous prefixes;
 - sanitized errors;
-- non-fatal capability notes;
 - overall status: `complete`, `partial`, `failed`, `dry_run_complete`, or
   `dry_run_partial`;
 - manifest corpus version, hash, and relative path when published.
@@ -593,9 +644,17 @@ reports/<UTC-YYYYMMDDTHHMMSS.ffffffZ>-<run-id>.json
 ```
 
 The high-resolution timestamp and random run ID prevent collisions across rapid or
-concurrent invocations. The report includes the run ID, and `latest-report.json`
-points to the latest attempt. Reports do not contain credentials, signed URLs, request
-headers, or audio bodies.
+concurrent invocations. Report filenames always retain exactly six fractional digits;
+unlike canonical manifest timestamps, their fractional zeroes are not trimmed, so
+lexicographic filename order remains chronological at equal date and second. The
+report includes the run ID.
+
+`latest-report.json` is atomically updated by every attempt, including dry runs, and is
+defined as the most recently completed writer rather than the attempt with the newest
+start timestamp. `latest.json` is atomically updated only by successful manifest
+publication. Pointer updates are intentionally last-completed-writer-wins; neither
+pointer is an immutable-input or concurrency-ordering primitive. Reports do not
+contain credentials, signed URLs, request headers, or audio bodies.
 
 ### Operator progress
 
@@ -653,7 +712,10 @@ Malformed root keys and ambiguous aliases have no trustworthy simfile row and th
 live in the sync report. Their presence makes the attempt `partial` and produces a
 `1` exit after publishing the valid rows. Explicitly included empty prefixes
 receive an `empty` simfile row with the canonical requested prefix `<id>/` in a real
-manifest.
+manifest and `objects: []`. Every `empty` row—including discovered marker-only
+prefixes and explicitly included absent prefixes—makes a real sync `partial` with exit
+`1`. The corresponding dry-run condition makes the result `dry_run_partial` with exit
+`1`.
 
 Downstream benchmark stages should reject any row whose status is not `complete`
 unless they explicitly implement an audit-only mode. That enforcement belongs to the
@@ -676,6 +738,10 @@ not weaken synchronization status or silently omit empty prefixes.
 - Never accept secrets in command-line flags.
 - Never log the configured endpoint URL because it contains the Cloudflare account
   identifier and may be embedded in SDK error context.
+- Set the `boto3`, `botocore`, and `urllib3` logger levels to at least `WARNING`
+  before constructing the SDK client, regardless of the root logger level, and never
+  call `boto3.set_stream_logger`; SDK debug logs can expose full request endpoints and
+  signed headers.
 - Convert SDK failures to allowlisted error codes and safe messages.
 - Do not serialize SDK request or response metadata wholesale.
 - Store logical cache paths relative to the configured cache root; never store
@@ -694,8 +760,9 @@ Unit and CLI tests use fake R2 clients and temporary directories. They cover:
 - non-ASCII, space-containing, and special-character keys;
 - exact-key preservation and deterministic ordering;
 - folder markers;
-- marker-only prefixes becoming `empty`;
+- root and nested marker-only prefixes becoming `empty`;
 - malformed root objects;
+- JSON-number-safe simfile ID bounds for remote prefixes and CLI filters;
 - ambiguous numeric prefixes;
 - explicit includes not overriding ambiguous-prefix quarantine;
 - explicitly included empty prefixes;
@@ -707,21 +774,28 @@ Unit and CLI tests use fake R2 clients and temporary directories. They cover:
 - strong ETag conditional serialization;
 - weak ETag unconditional GETs with exact response-metadata verification;
 - weak ETag GETs with missing comparison metadata failing closed;
-- remote checksum preservation without treating ETags as checksums;
-- checksum key normalization and unsupported checksum-mode fallback;
+- provider checksum metadata and `ChecksumMode` remaining absent from v1;
 - configured concurrency, connection-pool, timeout, retry, and exhausted-retry
   behavior;
 - initial downloads;
 - verified cache hits causing no body request;
 - identical manifest bytes after the first run changes from a download action to a
   cache-hit action;
-- locally corrupted cache entries being redownloaded;
+- missing, size-mismatched, and SHA-mismatched cache entries becoming reported repair
+  downloads in real runs and planned downloads in dry runs;
+- successful cache repair remaining complete and failed repair emitting
+  `cache_corrupt`;
 - byte-count mismatches;
 - `If-Match` failures when remote content changes after listing;
 - temporary-file cleanup after failed downloads;
-- atomic cache-index publication, POSIX lock conflicts, unsupported-platform failure,
-  and restart cache hits after an interrupted run;
+- cache-local incoming files, same-filesystem atomic body installation, shard-directory
+  durability, and cleanup after interruption;
+- atomic cache-index publication, whole-real-sync POSIX lock lifetime, single lock-file
+  descriptor discipline, in-process checkpoint serialization, lock conflicts,
+  unsupported-platform failure, and restart cache hits after interruption;
 - unchanged reruns producing identical corpus and manifest identities;
+- transient `sync_errors` changing partial-run identity and clean reruns remaining
+  stable;
 - object changes producing new identities while preserving old manifests and cache
   files;
 - provenance changes producing new identities;
@@ -730,14 +804,20 @@ Unit and CLI tests use fake R2 clients and temporary directories. They cover:
 - unsupported provenance schema versions failing before network access;
 - partial failures remaining visible per simfile;
 - `latest.json` carrying complete or partial status;
+- last-completed-writer-wins pointer behavior across concurrent real and dry runs;
 - collision-resistant report filenames;
+- fixed six-digit report filename timestamps preserving lexical chronology;
 - sanitized periodic progress on stderr;
 - dry runs issuing no body reads and changing neither cache nor manifests;
 - atomic, idempotent manifest publication;
 - secret, signed-query, endpoint, and header redaction;
+- botocore, boto3, and urllib3 debug logging suppression under a DEBUG root logger;
 - importability without `boto3`, the missing-extra installation hint, and lazy adapter
   loading;
-- command defaults, help text, summary output, and exact `0`/`1`/`2` exit codes.
+- fatal-path report publication, invalid-config and missing-extra exit `2`, partial
+  exit `1`, and complete exit `0`;
+- report-write failure producing only the sanitized stderr fallback and exit `2`;
+- command defaults, help text, and summary output.
 
 The credential-gated production smoke test is a manual acceptance gate, not a routine
 CI job:
@@ -758,6 +838,18 @@ The current development shell has no R2 credentials configured. Deterministic te
 can run without them, but the production smoke test is required before HPA-321 can be
 considered fully accepted.
 
+## Implementation Planning Gate
+
+No implementation plan written before final approval of this revision is
+authoritative. In particular, the previously committed
+`docs/superpowers/plans/2026-07-24-hpa-321-r2-corpus-inventory.md` is superseded and
+must not be executed: it installs `boto3` in the base runtime, exposes the endpoint as
+a CLI flag, uses bare `ClickException` failures, and omits later cache-profile,
+weak-ETag, locking, durability, and report contracts.
+
+After this design is approved, the replacement plan must be regenerated from the
+current document rather than patched task-by-task from the superseded plan.
+
 ## Dependencies
 
 - Add an `r2` optional dependency extra containing `boto3>=1.42,<2`; do not add
@@ -774,13 +866,18 @@ considered fully accepted.
 ## Reference Behavior
 
 - [Cloudflare R2 S3 compatibility](https://developers.cloudflare.com/r2/api/s3/api/)
-  defines supported listing, HEAD, GET, conditional, and checksum-type behavior.
+  defines supported listing, HEAD, GET, and conditional behavior.
 - [Cloudflare R2 upload behavior](https://developers.cloudflare.com/r2/objects/upload-objects/)
   documents multipart ETag construction.
 - [Botocore client configuration](https://docs.aws.amazon.com/botocore/latest/reference/config.html)
   defines timeout, connection-pool, and retry settings.
 - [Boto3 `HeadObject`](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/head_object.html)
-  defines checksum-mode request and response fields.
+  defines object metadata response fields.
+- [Click exception handling](https://click.palletsprojects.com/en/stable/exceptions/)
+  defines the default exception and usage exit codes that the HPA-321 callback must
+  map explicitly.
+- [Python `fcntl`](https://docs.python.org/3/library/fcntl.html) defines the POSIX
+  advisory file-lock primitive used by supported platforms.
 - [RFC 9110 `If-Match`](https://www.rfc-editor.org/rfc/rfc9110.html#name-if-match)
   requires strong entity-tag comparison and therefore motivates the separate
   metadata-verified weak-ETag download path.
