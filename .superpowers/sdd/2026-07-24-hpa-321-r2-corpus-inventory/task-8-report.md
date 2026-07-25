@@ -11,6 +11,10 @@
   immutable manifest, durable report, and both pointer publications. Dry runs use a
   read-only index snapshot without taking the writer lock, reading bodies, or mutating
   cache or manifest state.
+- Added a durable POSIX output-publication lock shared by real and dry runs. It uses
+  no-follow descriptor validation and serializes the immutable real manifest, report,
+  `latest.json`, and `latest-report.json` as one process-safe publication unit while
+  the real-run cache writer lock remains held.
 - Added deterministic complete, partial, failed, `dry_run_complete`, and
   `dry_run_partial` status/exit mapping. Empty, malformed, ambiguous, row-failure, and
   operation-failure conditions remain visible and produce partial artifacts where
@@ -24,19 +28,32 @@
   atomic sibling-temporary replacement, file and directory `fsync`, and an atomic
   `latest-report.json` pointer containing the report digest.
 - Kept `latest.json` deferred until the immutable manifest and report are durable.
-  Fatal report or manifest-pointer failures restore the previous pointer bytes, while
-  successful real and dry writers retain last-completed-writer pointer semantics.
+  Both pointers are snapshotted with no-follow descriptor reads and durably restored
+  together after replacement or directory-fsync failures, so a failed outcome cannot
+  leave a success pointer behind. Successful real and dry processes retain
+  last-completed-writer pointer semantics.
 - Added bounded callback-only progress at deterministic phase boundaries and every
-  100 items, final item, or five monotonic seconds. Messages contain only phases,
-  counts, and byte totals.
+  100 items, final item, or five monotonic seconds. Inventory HEAD and cache-download
+  hooks now feed the thread-safe tracker as futures complete instead of replaying
+  progress after work. Messages contain only phases, counts, and byte totals.
+- Added lexical no-follow validation for existing output and cache path components
+  before store creation, bucket validation, network access, cache mutation, or report
+  publication. Broken symlinks, symlinked ancestors, non-directory components, and
+  invalid leaves fail as `invalid_config` with zero local writes.
+- Contained invalid or raising wall-clock and run-ID factories as `internal_error`.
+  Fatal reports use trusted stdlib UTC/UUID4 fallbacks, and retain the primary internal
+  error if fallback report publication also fails.
 - Added a reusable boto3-free fake store with exact list/HEAD/body state, configured
   operation failures, recorded calls, and fixed-size streamed body chunks.
 
 ## Files
 
-- Added `src/benchmark/r2_corpus_sync.py`.
-- Added `tests/benchmark/test_r2_corpus_sync.py`.
-- Added this Task 8 report.
+- Updated `src/benchmark/r2_corpus_sync.py`,
+  `src/benchmark/r2_inventory.py`, and `src/benchmark/corpus_cache.py`.
+- Updated `tests/benchmark/test_r2_corpus_sync.py`,
+  `tests/benchmark/test_r2_inventory.py`, and
+  `tests/benchmark/test_corpus_cache.py`.
+- Updated this Task 8 report.
 
 ## TDD Evidence
 
@@ -53,20 +70,31 @@
 - A second fatal publication regression failed after a simulated
   `publish_latest_manifest` replacement-then-error; the fix restores the prior pointer
   before publishing the fatal report.
-- The final focused suite covers 38 complete, partial, fatal, dry-run, validation,
-  pagination, locking, counters, cache-miss, report naming, durability, redaction,
-  progress, concurrent-writer, pointer-rollback, and repeatability behaviors.
+- Review-fix RED runs demonstrated three dual-pointer rollback failures, including a
+  replacement followed by directory-fsync failure, and two independent processes
+  publishing concurrently without serialization.
+- Live-progress RED tests held one HEAD or download future blocked after another
+  completed; the callbacks were initially absent or replayed only after the blocked
+  work finished. The inventory and cache hooks now report each completed future live.
+- Path/factory RED tests covered symlinked and broken cache/output components,
+  non-directory leaves, invalid/raising clocks, and invalid/raising run-ID factories.
+- The final R2-focused run covers 188 inventory, cache, and orchestration behaviors;
+  the subsequent publication subset covers eight dual-pointer, process-lock,
+  no-follow, and unsupported-platform behaviors.
 
 ## Verification
 
-- `rtk uv run --extra r2 pytest tests/benchmark/test_r2_corpus_sync.py -q` —
-  38 passed.
-- `rtk uv run ruff check src/benchmark/r2_corpus_sync.py
-  tests/benchmark/test_r2_corpus_sync.py` — passed.
-- `rtk uv run black --check src/benchmark/r2_corpus_sync.py
-  tests/benchmark/test_r2_corpus_sync.py` — passed; both files unchanged.
-- `rtk uv run --extra r2 pytest -q` — 485 passed.
+- `rtk uv run pytest tests/benchmark/test_r2_inventory.py
+  tests/benchmark/test_corpus_cache.py tests/benchmark/test_r2_corpus_sync.py -q`
+  — 188 passed.
+- `rtk uv run pytest tests/benchmark/test_r2_corpus_sync.py -k
+  'output_publication_lock or output_lock_requires or two_process_ or
+  latest_report_failure_restores or latest_manifest_failure_restores or
+  latest_report_directory_fsync_failure' -q` — 8 passed.
+- `rtk uv run ruff check` on all six modified source/test files — passed.
+- `rtk uv run black --check` on all six modified source/test files — passed.
 - `rtk git diff --check` — passed before the full-suite gate.
+- `rtk uv run --extra r2 pytest -q` — 504 passed.
 
 ## Notes
 
@@ -76,7 +104,9 @@
 - Immutable manifest content installed before a later report failure is deliberately
   retained as an unreferenced reusable artifact and omitted from `SyncOutcome`, while
   `latest.json` remains unchanged.
+- The output lock file is a persistent regular file named
+  `.r2-corpus-publication.lock`; persistent identity avoids rename/unlink lock races.
 
 ## Commit
 
-- Planned conventional commit: `feat: orchestrate R2 corpus synchronization`.
+- Planned conventional commit: `fix: harden R2 sync publication`.

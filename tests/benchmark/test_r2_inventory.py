@@ -690,3 +690,51 @@ def test_head_requests_respect_the_configured_concurrency_bound():
     assert not thread.is_alive()
     assert result
     assert store.max_active <= 2
+
+
+def test_head_progress_callback_runs_while_another_head_is_still_blocked():
+    class PartiallyBlockingStore(FakeStore):
+        def __init__(self):
+            super().__init__([listed("42/blocked.dtx"), listed("42/fast.dtx")])
+            self.blocked_started = Event()
+            self.release_blocked = Event()
+
+        def head_object(self, key: str) -> HeadMetadata:
+            self.head_calls.append(key)
+            if key == "42/blocked.dtx":
+                self.blocked_started.set()
+                assert self.release_blocked.wait(timeout=5)
+            return HeadMetadata(None, None, None, None, None)
+
+    store = PartiallyBlockingStore()
+    progress: list[tuple[int, int, int]] = []
+    progress_seen = Event()
+    errors: list[Exception] = []
+
+    def run_inventory():
+        try:
+            build_inventory(
+                store,
+                frozenset(),
+                frozenset(),
+                2,
+                item_progress=lambda completed, total, completed_bytes: (
+                    progress.append((completed, total, completed_bytes)),
+                    progress_seen.set(),
+                ),
+            )
+        except Exception as error:
+            errors.append(error)
+
+    thread = Thread(target=run_inventory, daemon=True)
+    thread.start()
+    try:
+        assert store.blocked_started.wait(timeout=2)
+        assert progress_seen.wait(timeout=2)
+        assert thread.is_alive()
+    finally:
+        store.release_blocked.set()
+        thread.join(timeout=5)
+
+    assert errors == []
+    assert progress == [(1, 2, 5), (2, 2, 10)]
