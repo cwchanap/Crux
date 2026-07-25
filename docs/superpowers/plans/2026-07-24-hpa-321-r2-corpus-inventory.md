@@ -4,25 +4,39 @@
 
 **Goal:** Build a secure, resumable R2 inventory command that selectively caches chart-definition files and publishes deterministic, immutable benchmark manifests.
 
-**Architecture:** A `boto3` adapter exposes a narrow object-store protocol. Separate inventory, provenance, cache, and manifest modules operate on typed domain records, while one orchestration module owns transactional flow and machine-readable reports. A Click command provides the operator interface without accepting credential values.
+**Architecture:** A lazy `boto3` adapter implements a narrow object-store protocol without making AWS packages part of the base runtime. Focused inventory, provenance, cache, manifest, and orchestration modules exchange immutable domain records; the Click command only maps options, progress, summaries, and explicit `0`/`1`/`2` outcomes.
 
-**Tech Stack:** Python 3.12, Click, boto3/botocore, dataclasses, SHA-256, JSONL, pytest
+**Tech Stack:** Python 3.12, Click 8, optional boto3/botocore, dataclasses, SHA-256, canonical JSON/JSONL, POSIX `fcntl.flock`, `ThreadPoolExecutor`, pytest
 
 ## Global Constraints
 
-- R2 object contents are authoritative; do not use D1 or GraphQL to determine corpus truth.
-- Enumerate the complete bucket root with `ListObjectsV2` and no delimiter so nested keys remain visible.
-- Preserve exact Unicode object keys; do not URL-decode, case-fold, or normalize stored keys.
-- The initial cache profile selects case-insensitive `set.def`, `.dtx`, and `.txt` files only.
-- Treat ETags as remote change signals, never as universal content hashes.
-- Verify every reused or downloaded cache body with locally computed SHA-256 and byte count.
+- R2 object contents are authoritative; D1 and GraphQL must not determine chart truth.
+- Enumerate the complete bucket root with `ListObjectsV2` and no delimiter.
+- Preserve exact Unicode object keys without URL decoding, case folding, or normalization.
+- Accept simfile IDs only in `0..9007199254740991`.
+- Quarantine ambiguous numeric aliases such as `1/` and `01/`, even for explicit includes.
+- Treat every zero-byte key ending in `/` as a folder marker; a prefix containing only markers is `empty`.
+- The fixed cache profile is `setdef_dtx_txt_v1`; there is no profile option in v1.
+- Select case-insensitive `set.def`, `.dtx`, and `.txt` objects only.
+- Treat ETags as remote change signals, never universal content hashes.
+- Store ETag weakness separately and use `If-Match` only for strong ETags.
+- Verify weak-ETag downloads against response ETag, content length, and last-modified metadata.
+- Omit provider checksum fields and `ChecksumMode` from the v1 adapter and manifest.
+- Verify every reused or downloaded selected body with local SHA-256 and byte count.
 - Store cache bodies at `sha256/<first-two-hex>/<full-sha256>` relative to the cache root.
-- Never store or log credentials, signed URLs, request headers, raw endpoint URLs, or raw SDK exceptions.
-- Real manifests are canonical UTF-8 JSONL and immutable at `manifests/<manifest-sha256>.jsonl`.
-- `latest.json` is a convenience pointer only; benchmark consumers must use the concrete hash path.
-- Dry-run may write reports but must not call `GetObject` or mutate cache, cache index, manifests, or `latest.json`.
-- Partial object or simfile failures remain visible, publish a partial manifest, and return a nonzero result.
-- Published reports and manifests contain no source audio bodies.
+- Stage bodies only under `<cache-dir>/sha256/.incoming/`, never process-wide `TMPDIR`.
+- Hold one non-blocking POSIX writer lock for the whole real transaction.
+- Use an in-process `threading.Lock` around index mutation and checkpoint publication.
+- Publish cache indexes, bodies, manifests, reports, and pointers with durable atomic replacement.
+- Real manifests are canonical UTF-8 JSONL and immutable at `manifests/<sha256>.jsonl`.
+- Every manifest field except `corpus_version`, including status and errors, participates in corpus identity.
+- `latest.json` and `latest-report.json` are convenience pointers with last-completed-writer-wins semantics.
+- Dry-run may write reports but must not GET bodies or mutate cache, index, manifests, or `latest.json`.
+- Exit `0` for complete, `1` for partial, and `2` for fatal/no-manifest outcomes.
+- Do not let an HPA-321 domain failure escape as a bare `click.ClickException`.
+- Never store or log credentials, signed URLs, signed headers, raw endpoint URLs, or raw SDK exceptions.
+- Pin `boto3`, `botocore`, and `urllib3` loggers to at least `WARNING`.
+- Keep chart selection, DTX parsing, audio selection, inference, and scoring out of HPA-321.
 - Keep Python lines at or below the repository's 100-character formatting limit.
 
 ---
@@ -31,54 +45,71 @@
 
 ### New source files
 
-- `src/benchmark/r2_corpus_models.py` — immutable domain records, endpoint identity, ETag and timestamp normalization.
-- `src/benchmark/r2_store.py` — narrow R2 protocol, safe SDK errors, and lazy `boto3` adapter.
-- `src/benchmark/r2_inventory.py` — root-key classification, include/exclude filtering, bounded HEAD enrichment.
-- `src/benchmark/corpus_provenance.py` — strict optional provenance mapping loader.
-- `src/benchmark/corpus_cache.py` — cache selection, index, SHA-256 verification, conditional download, atomic install.
-- `src/benchmark/corpus_manifest.py` — canonical JSONL, corpus identity, immutable publication, latest pointer.
-- `src/benchmark/r2_corpus_sync.py` — end-to-end orchestration, reports, partial/fatal outcomes.
-- `src/cli/r2_corpus.py` — `sync-r2-corpus` Click command.
+- `src/benchmark/r2_corpus_models.py` — shared constants, immutable records, endpoint/ETag/timestamp normalization, and diagnostic vocabulary.
+- `src/benchmark/r2_inventory.py` — lazy boto3 adapter, object-store protocol, root classification, filtering, and bounded HEAD enrichment.
+- `src/benchmark/corpus_provenance.py` — strict optional provenance loader and unknown defaults.
+- `src/benchmark/corpus_cache.py` — selection policy, index model, whole-run lock, local validation, concurrent downloads, durability, and checkpoints.
+- `src/benchmark/corpus_manifest.py` — canonical row construction, two-pass identity, immutable manifest publication, and `latest.json`.
+- `src/benchmark/r2_corpus_sync.py` — transaction orchestration, progress, report assembly/publication, fatal containment, and outcome mapping.
 
 ### New configuration and tests
 
 - `config/corpus-provenance.json` — version-controlled empty v1 provenance mapping.
 - `tests/benchmark/test_r2_corpus_models.py`
-- `tests/benchmark/test_r2_store.py`
 - `tests/benchmark/test_r2_inventory.py`
 - `tests/benchmark/test_corpus_provenance.py`
 - `tests/benchmark/test_corpus_cache.py`
 - `tests/benchmark/test_corpus_manifest.py`
 - `tests/benchmark/test_r2_corpus_sync.py`
+- `tests/benchmark/test_r2_corpus_acceptance.py`
 
 ### Modified files
 
-- `pyproject.toml` — add the `boto3` runtime dependency.
-- `uv.lock` — lock the resolved boto3/botocore dependency graph.
-- `src/cli/benchmark.py` — register the new command.
-- `tests/test_cli_benchmark.py` — CLI configuration, filtering, dry-run, output, and failure tests.
-- `docs/drumery-dtx-midi-benchmarking-reference.md` — document R2 inventory workflow and artifact contract.
+- `pyproject.toml` — add only the `r2` optional extra.
+- `uv.lock` — lock boto3, botocore, jmespath, s3transfer, and urllib3.
+- `src/cli/benchmark.py` — register `sync-r2-corpus` and map explicit outcomes through `ctx.exit`.
+- `tests/test_cli_benchmark.py` — command help, options, output, redaction, and exit-code tests.
+- `docs/drumery-dtx-midi-benchmarking-reference.md` — document the R2 inventory stage and artifact contract.
+
+### Cross-task interfaces
+
+Later tasks must use the exact public names defined below:
+
+- Models: `MAX_SIMFILE_ID`, `CACHE_PROFILE`, `ErrorCode`, `SyncError`, `R2Config`,
+  `ListedObject`, `HeadMetadata`, `RemoteObject`, `SimfileInventory`,
+  `InventoryResult`, `ProvenanceRecord`, `CacheAction`, `CacheSyncResult`,
+  `RenderedManifest`, `PublishedManifest`, `SyncCounters`, `SyncRequest`,
+  `SyncOutcome`,
+  `parse_etag`, `format_manifest_timestamp`, and
+  `format_report_filename_timestamp`.
+- Inventory: `R2ObjectStore`, `R2StoreError`, `ensure_r2_dependency`,
+  `create_boto3_store`, and `build_inventory`.
+- Provenance: `load_provenance` and `provenance_for`.
+- Cache: `CacheIndexStore`, `cache_writer_lock`, and `sync_cache`.
+- Manifest: `canonical_json_line`, `build_manifest_rows`, `render_manifest`,
+  `publish_manifest`, and `publish_latest_manifest`.
+- Orchestration: `ProgressEvent` and `sync_r2_corpus`.
+
+Each task defines the complete signature and record fields before a later task consumes
+the interface.
 
 ---
 
-### Task 1: Add the dependency, configuration model, and canonical primitives
+### Task 1: Add the optional dependency and shared domain primitives
 
 **Files:**
 - Create: `src/benchmark/r2_corpus_models.py`
 - Create: `tests/benchmark/test_r2_corpus_models.py`
-- Modify: `pyproject.toml`
+- Modify: `pyproject.toml:22-38`
 - Modify: `uv.lock`
 
 **Interfaces:**
-- Produces: `R2Config.from_values(endpoint_url: str, bucket: str) -> R2Config`
-- Produces: `normalize_etag(value: str | None) -> str | None`
-- Produces: `format_r2_datetime(value: datetime) -> str`
-- Produces: `SyncError`, `ListedObject`, `HeadMetadata`, `RemoteObject`, and `SimfileInventory`
-- Consumes: no HPA-321 source interfaces
+- Consumes: environment mappings and SDK-returned datetime/ETag values.
+- Produces: all immutable records and constants listed in the file map.
 
-- [ ] **Step 1: Add failing canonicalization tests**
+- [ ] **Step 1: Write failing normalization and configuration tests**
 
-Create `tests/benchmark/test_r2_corpus_models.py`:
+Create `tests/benchmark/test_r2_corpus_models.py` with focused tests:
 
 ```python
 from datetime import datetime, timezone
@@ -86,45 +117,69 @@ from hashlib import sha256
 
 import pytest
 
-from src.benchmark.r2_corpus_models import R2Config, format_r2_datetime, normalize_etag
+from src.benchmark.r2_corpus_models import (
+    CACHE_PROFILE,
+    MAX_SIMFILE_ID,
+    R2Config,
+    format_manifest_timestamp,
+    format_report_filename_timestamp,
+    parse_etag,
+)
 
 
-def test_r2_config_normalizes_endpoint_and_hashes_source_identity():
-    config = R2Config.from_values(
-        "HTTPS://ABC123.r2.cloudflarestorage.com/",
-        "simfile-dtx",
+def test_config_normalizes_endpoint_and_hashes_only_normalized_origin():
+    config = R2Config.from_environ(
+        {
+            "CRUX_R2_ENDPOINT_URL": "HTTPS://ABC123.r2.cloudflarestorage.com/",
+            "CRUX_R2_BUCKET": "simfile-dtx",
+        }
     )
-
     normalized = "https://abc123.r2.cloudflarestorage.com"
     assert config.endpoint_url == normalized
     assert config.source_endpoint_sha256 == sha256(normalized.encode("ascii")).hexdigest()
     assert config.bucket == "simfile-dtx"
+    assert config.head_concurrency == 8
+    assert config.download_concurrency == 4
+    assert config.connect_timeout_seconds == 10
+    assert config.read_timeout_seconds == 60
+    assert config.max_attempts == 5
 
 
 @pytest.mark.parametrize(
     "endpoint",
     [
-        "http://abc123.r2.cloudflarestorage.com",
+        "http://abc.r2.cloudflarestorage.com",
         "https://user@example.com",
         "https://example.com/path",
-        "https://example.com?token=secret",
+        "https://example.com?token=value",
         "https://example.com#fragment",
     ],
 )
-def test_r2_config_rejects_non_origin_or_non_https_endpoint(endpoint):
+def test_config_rejects_non_https_origin(endpoint):
     with pytest.raises(ValueError, match="HTTPS origin"):
-        R2Config.from_values(endpoint, "simfile-dtx")
+        R2Config.from_environ({"CRUX_R2_ENDPOINT_URL": endpoint})
 
 
-def test_etag_and_datetime_normalization():
-    assert normalize_etag('"abc-2"') == "abc-2"
-    assert normalize_etag(None) is None
-    assert format_r2_datetime(
-        datetime(2026, 7, 24, 12, 34, 56, 120000, tzinfo=timezone.utc)
-    ) == "2026-07-24T12:34:56.12Z"
+def test_etag_and_timestamp_normalization_are_canonical():
+    assert parse_etag('"abc-2"') == ("abc-2", False)
+    assert parse_etag('W/"weak-value"') == ("weak-value", True)
+    with pytest.raises(ValueError, match="entity tag"):
+        parse_etag("not-quoted")
+    value = datetime(2026, 7, 25, 1, 2, 3, 120000, tzinfo=timezone.utc)
+    assert format_manifest_timestamp(value) == "2026-07-25T01:02:03.12Z"
+    assert format_report_filename_timestamp(value) == "20260725T010203.120000Z"
+
+
+def test_fixed_contract_constants_are_stable():
+    assert CACHE_PROFILE == "setdef_dtx_txt_v1"
+    assert MAX_SIMFILE_ID == 9_007_199_254_740_991
 ```
 
-- [ ] **Step 2: Run the new tests and verify the missing module failure**
+Add parameterized cases for a missing endpoint, empty/invalid bucket, concurrency
+outside `1..32` or `1..16`, and nonpositive timeout/attempt values. Assert messages
+name only the relevant environment variable and never echo the supplied value.
+
+- [ ] **Step 2: Run the tests and verify the missing-module failure**
 
 Run:
 
@@ -134,20 +189,29 @@ rtk uv run pytest tests/benchmark/test_r2_corpus_models.py -q
 
 Expected: collection fails with `ModuleNotFoundError: src.benchmark.r2_corpus_models`.
 
-- [ ] **Step 3: Add boto3 through uv**
+- [ ] **Step 3: Add boto3 only to the optional `r2` extra**
 
 Run:
 
 ```bash
-rtk uv add "boto3>=1.35.37"
+rtk uv add --optional r2 "boto3>=1.42,<2"
 ```
 
-Expected: `pyproject.toml` adds boto3 and `uv.lock` records boto3, botocore, jmespath,
-s3transfer, and their resolved transitive dependencies.
+Verify `pyproject.toml` contains:
 
-- [ ] **Step 4: Implement the typed model module**
+```toml
+[project.optional-dependencies]
+r2 = [
+    "boto3>=1.42,<2",
+]
+```
 
-Create `src/benchmark/r2_corpus_models.py` with these public definitions:
+Do not add boto3 to `[project.dependencies]`. Confirm `uv.lock` contains the resolved
+boto3/botocore graph.
+
+- [ ] **Step 4: Implement the shared records and canonical primitives**
+
+Create `src/benchmark/r2_corpus_models.py` with:
 
 ```python
 from __future__ import annotations
@@ -155,23 +219,75 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
-from typing import Literal
+from pathlib import Path
+from typing import Literal, Mapping
 from urllib.parse import urlsplit
 
-ErrorScope = Literal["root", "simfile", "object", "cache", "configuration"]
+MAX_SIMFILE_ID = (1 << 53) - 1
+CACHE_PROFILE = "setdef_dtx_txt_v1"
+CACHE_INDEX_SCHEMA = "crux.r2-cache-index/v1"
+MANIFEST_SCHEMA = "crux.r2-corpus-manifest/v1"
+PROVENANCE_SCHEMA = "crux.corpus-provenance/v1"
+REPORT_SCHEMA = "crux.r2-corpus-sync-report/v1"
+
+ErrorScope = Literal["configuration", "root", "simfile", "object", "cache", "artifact"]
+ErrorCode = Literal[
+    "invalid_config",
+    "missing_optional_dependency",
+    "missing_credentials",
+    "auth_failed",
+    "bucket_inaccessible",
+    "root_list_failed",
+    "cache_locked",
+    "cache_index_invalid",
+    "unsupported_platform",
+    "provenance_invalid",
+    "artifact_write_failed",
+    "object_head_failed",
+    "object_get_failed",
+    "source_changed_during_sync",
+    "weak_etag_unverifiable",
+    "byte_count_mismatch",
+    "cache_corrupt",
+    "object_metadata_invalid",
+    "ambiguous_simfile_prefix",
+    "malformed_root_key",
+    "empty_prefix",
+    "internal_error",
+]
+CacheStatus = Literal["not_selected", "verified", "failed"]
 SimfileStatus = Literal["complete", "partial", "failed", "empty"]
+OverallStatus = Literal[
+    "complete", "partial", "failed", "dry_run_complete", "dry_run_partial"
+]
+CacheActionName = Literal["planned", "cache_hit", "downloaded", "failed"]
+CacheMissReason = Literal["remote_changed", "missing", "size_mismatch", "sha256_mismatch"]
+
+
+@dataclass(frozen=True)
+class SyncError:
+    scope: ErrorScope
+    code: ErrorCode
+    message: str
+    object_key: str | None = None
 
 
 @dataclass(frozen=True)
 class R2Config:
     endpoint_url: str
-    bucket: str
     source_endpoint_sha256: str
+    bucket: str
+    head_concurrency: int = 8
+    download_concurrency: int = 4
+    connect_timeout_seconds: int = 10
+    read_timeout_seconds: int = 60
+    max_attempts: int = 5
     region_name: str = "auto"
 
     @classmethod
-    def from_values(cls, endpoint_url: str, bucket: str) -> "R2Config":
-        parts = urlsplit(endpoint_url)
+    def from_environ(cls, environ: Mapping[str, str]) -> "R2Config":
+        raw_endpoint = environ.get("CRUX_R2_ENDPOINT_URL", "")
+        parts = urlsplit(raw_endpoint)
         invalid = (
             parts.scheme.lower() != "https"
             or not parts.hostname
@@ -182,60 +298,94 @@ class R2Config:
             or bool(parts.fragment)
         )
         if invalid:
-            raise ValueError("R2 endpoint must be an HTTPS origin without credentials or a path")
-        if not bucket or "/" in bucket:
-            raise ValueError("R2 bucket must be a non-empty bucket name")
-        hostname = parts.hostname.lower()
-        port = f":{parts.port}" if parts.port not in (None, 443) else ""
+            raise ValueError("R2 endpoint must be an HTTPS origin")
+        hostname = parts.hostname.encode("idna").decode("ascii").lower()
+        port = "" if parts.port in (None, 443) else f":{parts.port}"
         normalized = f"https://{hostname}{port}"
-        source_hash = sha256(normalized.encode("ascii")).hexdigest()
-        return cls(normalized, bucket, source_hash)
+        bucket = environ.get("CRUX_R2_BUCKET", "simfile-dtx")
+        if not bucket or "/" in bucket:
+            raise ValueError("CRUX_R2_BUCKET must be a non-empty bucket name")
+        return cls(
+            endpoint_url=normalized,
+            source_endpoint_sha256=sha256(normalized.encode("ascii")).hexdigest(),
+            bucket=bucket,
+            head_concurrency=_bounded_int(environ, "CRUX_R2_HEAD_CONCURRENCY", 8, 1, 32),
+            download_concurrency=_bounded_int(
+                environ, "CRUX_R2_DOWNLOAD_CONCURRENCY", 4, 1, 16
+            ),
+            connect_timeout_seconds=_positive_int(
+                environ, "CRUX_R2_CONNECT_TIMEOUT_SECONDS", 10
+            ),
+            read_timeout_seconds=_positive_int(
+                environ, "CRUX_R2_READ_TIMEOUT_SECONDS", 60
+            ),
+            max_attempts=_positive_int(environ, "CRUX_R2_MAX_ATTEMPTS", 5),
+        )
+```
+
+Add these integer helpers:
+
+```python
+def _positive_int(environ: Mapping[str, str], name: str, default: int) -> int:
+    raw = environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
 
 
-def normalize_etag(value: str | None) -> str | None:
-    if value is None:
-        return None
-    return value[1:-1] if len(value) >= 2 and value.startswith('"') and value.endswith('"') else value
+def _bounded_int(
+    environ: Mapping[str, str],
+    name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = _positive_int(environ, name, default)
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be in {minimum}..{maximum}")
+    return value
+```
 
+Wrap URL parsing, IDNA encoding, and port extraction so malformed input becomes the
+same deterministic HTTPS-origin error without echoing the value. Add these immutable
+records:
 
-def format_r2_datetime(value: datetime) -> str:
-    utc_value = value.astimezone(timezone.utc)
-    text = utc_value.strftime("%Y-%m-%dT%H:%M:%S.%f").rstrip("0").rstrip(".")
-    return f"{text}Z"
-
-
-@dataclass(frozen=True)
-class SyncError:
-    scope: ErrorScope
-    code: str
-    message: str
-    object_key: str | None = None
-
-
+```python
 @dataclass(frozen=True)
 class ListedObject:
     key: str
     size: int
-    etag: str | None
+    etag: str
+    etag_is_weak: bool
     last_modified: datetime
 
 
 @dataclass(frozen=True)
 class HeadMetadata:
+    size: int | None
+    etag: str | None
+    etag_is_weak: bool | None
+    last_modified: datetime | None
     content_type: str | None
-    version: str | None
-    remote_checksums: dict[str, str]
 
 
 @dataclass(frozen=True)
 class RemoteObject:
     key: str
     size: int
-    etag: str | None
+    etag: str
+    etag_is_weak: bool
     last_modified: datetime
-    content_type: str | None = None
-    version: str | None = None
-    remote_checksums: dict[str, str] = field(default_factory=dict)
+    content_type: str | None
+    cache_status: CacheStatus = "not_selected"
+    sha256: str | None = None
+    cache_path: str | None = None
     errors: tuple[SyncError, ...] = ()
 
 
@@ -244,701 +394,19 @@ class SimfileInventory:
     simfile_id: int
     object_prefix: str
     objects: tuple[RemoteObject, ...]
-    status: SimfileStatus
-    errors: tuple[SyncError, ...] = ()
-```
+    sync_status: SimfileStatus
+    sync_errors: tuple[SyncError, ...] = ()
 
-- [ ] **Step 5: Run model tests and formatting**
 
-Run:
-
-```bash
-rtk uv run pytest tests/benchmark/test_r2_corpus_models.py -q
-rtk uv run black src/benchmark/r2_corpus_models.py tests/benchmark/test_r2_corpus_models.py
-rtk uv run ruff check src/benchmark/r2_corpus_models.py tests/benchmark/test_r2_corpus_models.py
-```
-
-Expected: all model tests pass and Ruff reports no errors.
-
-- [ ] **Step 6: Commit the foundation**
-
-Run:
-
-```bash
-rtk git add pyproject.toml uv.lock src/benchmark/r2_corpus_models.py \
-  tests/benchmark/test_r2_corpus_models.py
-rtk git commit -m "feat: add R2 corpus configuration models"
-```
-
----
-
-### Task 2: Implement the safe boto3 object-store adapter
-
-**Files:**
-- Create: `src/benchmark/r2_store.py`
-- Create: `tests/benchmark/test_r2_store.py`
-
-**Interfaces:**
-- Consumes: `R2Config`, `ListedObject`, `HeadMetadata`, and `normalize_etag`
-- Produces: `R2ObjectStore` protocol
-- Produces: `Boto3R2Store.from_config(config: R2Config) -> Boto3R2Store`
-- Produces: `validate_bucket`, `list_objects`, `head_object`, and `get_object`
-- Produces: `R2OperationError` with allowlisted `code`, `operation`, `status`, and `object_key`
-
-- [ ] **Step 1: Write failing adapter tests**
-
-Create `tests/benchmark/test_r2_store.py` with fake paginator/client objects and these
-assertions:
-
-```python
-from datetime import datetime, timezone
-from io import BytesIO
-
-import pytest
-
-from src.benchmark.r2_corpus_models import R2Config
-from src.benchmark.r2_store import Boto3R2Store, R2OperationError
-
-
-class FakePaginator:
-    def paginate(self, **kwargs):
-        assert kwargs == {"Bucket": "simfile-dtx"}
-        return [
-            {
-                "Contents": [
-                    {
-                        "Key": "42/曲/SET.DEF",
-                        "Size": 12,
-                        "ETag": '"etag-2"',
-                        "LastModified": datetime(2026, 7, 24, tzinfo=timezone.utc),
-                    }
-                ]
-            },
-            {"Contents": []},
-        ]
-
-
-class FakeBody(BytesIO):
-    closed_by_adapter = False
-
-    def close(self):
-        self.closed_by_adapter = True
-        super().close()
-
-
-class FakeClient:
-    def __init__(self):
-        self.get_calls = []
-        self.body = FakeBody(b"chart")
-
-    def head_bucket(self, **kwargs):
-        assert kwargs == {"Bucket": "simfile-dtx"}
-
-    def get_paginator(self, name):
-        assert name == "list_objects_v2"
-        return FakePaginator()
-
-    def head_object(self, **kwargs):
-        assert kwargs == {
-            "Bucket": "simfile-dtx",
-            "Key": "42/曲/SET.DEF",
-            "ChecksumMode": "ENABLED",
-        }
-        return {
-            "ContentType": "text/plain",
-            "VersionId": "version-1",
-            "ChecksumSHA256": "base64-value",
-        }
-
-    def get_object(self, **kwargs):
-        self.get_calls.append(kwargs)
-        return {"Body": self.body, "ContentLength": 5}
-
-
-def test_store_paginates_heads_and_conditionally_gets_exact_key():
-    client = FakeClient()
-    store = Boto3R2Store(client)
-
-    listed = store.list_objects("simfile-dtx")
-    metadata = store.head_object("simfile-dtx", listed[0].key)
-    response = store.get_object("simfile-dtx", listed[0].key, "etag-2")
-
-    assert listed[0].key == "42/曲/SET.DEF"
-    assert listed[0].etag == "etag-2"
-    assert metadata.remote_checksums == {"sha256": "base64-value"}
-    assert response.content_length == 5
-    assert client.get_calls == [
-        {
-            "Bucket": "simfile-dtx",
-            "Key": "42/曲/SET.DEF",
-            "IfMatch": '"etag-2"',
-        }
-    ]
-    response.close()
-    assert client.body.closed_by_adapter is True
-
-
-def test_operation_error_does_not_include_raw_sdk_message():
-    error = R2OperationError("access_denied", "list", 403)
-    assert str(error) == "R2 list failed with access_denied (HTTP 403)"
-    assert "credential" not in str(error).lower()
-```
-
-- [ ] **Step 2: Run the adapter tests and verify failure**
-
-Run:
-
-```bash
-rtk uv run pytest tests/benchmark/test_r2_store.py -q
-```
-
-Expected: collection fails because `src.benchmark.r2_store` does not exist.
-
-- [ ] **Step 3: Implement the protocol and download response**
-
-Create `src/benchmark/r2_store.py` with:
-
-```python
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import BinaryIO, Protocol
-
-import boto3
-from botocore.exceptions import BotoCoreError, ClientError
-
-from src.benchmark.r2_corpus_models import HeadMetadata, ListedObject, R2Config, normalize_etag
-
-CHECKSUM_FIELDS = {
-    "ChecksumCRC32": "crc32",
-    "ChecksumCRC32C": "crc32c",
-    "ChecksumSHA1": "sha1",
-    "ChecksumSHA256": "sha256",
-    "ChecksumCRC64NVME": "crc64nvme",
-}
-
-
-class R2OperationError(RuntimeError):
-    def __init__(
-        self,
-        code: str,
-        operation: str,
-        status: int | None = None,
-        object_key: str | None = None,
-    ) -> None:
-        self.code = code
-        self.operation = operation
-        self.status = status
-        self.object_key = object_key
-        suffix = f" (HTTP {status})" if status is not None else ""
-        super().__init__(f"R2 {operation} failed with {code}{suffix}")
-
-
-@dataclass
-class ObjectDownload:
-    body: BinaryIO
-    content_length: int | None
-
-    def close(self) -> None:
-        self.body.close()
-
-
-class R2ObjectStore(Protocol):
-    def validate_bucket(self, bucket: str) -> None: ...
-    def list_objects(self, bucket: str) -> list[ListedObject]: ...
-    def head_object(self, bucket: str, key: str) -> HeadMetadata: ...
-    def get_object(self, bucket: str, key: str, etag: str | None) -> ObjectDownload: ...
-```
-
-Implement `Boto3R2Store` so:
-
-- `from_config` calls `boto3.client("s3", endpoint_url=config.endpoint_url,
-  region_name=config.region_name)` without explicit credential values;
-- `validate_bucket` uses `head_bucket(Bucket=bucket)`;
-- `list_objects` uses `client.get_paginator("list_objects_v2").paginate(Bucket=bucket)`;
-- missing `Contents` is treated as an empty list;
-- `head_object` requests `ChecksumMode="ENABLED"` and allowlists the five checksum fields;
-- when checksum mode alone returns SDK code `NotImplemented`, `InvalidArgument`, or
-  `InvalidRequest`, retry that HEAD once without checksum mode so content type remains
-  available; do not retry authentication, authorization, or other failures;
-- `get_object` adds `IfMatch=f'"{etag}"'` only when ETag is present;
-- every SDK exception is converted by a private `_operation_error` that reads only
-  `Error.Code` and `ResponseMetadata.HTTPStatusCode`;
-- raw `str(exc)`, request IDs, response headers, endpoint URLs, and request dictionaries
-  never enter the raised message.
-
-Normalize SDK codes through an allowlist:
-
-```python
-SAFE_ERROR_CODES = {
-    "AccessDenied": "access_denied",
-    "InvalidAccessKeyId": "invalid_access_key",
-    "SignatureDoesNotMatch": "signature_mismatch",
-    "NoSuchBucket": "bucket_not_found",
-    "NoSuchKey": "object_not_found",
-    "PreconditionFailed": "precondition_failed",
-    "SlowDown": "rate_limited",
-    "NotImplemented": "checksum_mode_unsupported",
-    "InvalidArgument": "invalid_request",
-    "InvalidRequest": "invalid_request",
-}
-
-
-def _operation_error(error: Exception, operation: str, key: str | None = None):
-    if isinstance(error, ClientError):
-        response = error.response if isinstance(error.response, dict) else {}
-        error_data = response.get("Error", {})
-        metadata = response.get("ResponseMetadata", {})
-        raw_code = error_data.get("Code") if isinstance(error_data, dict) else None
-        status = metadata.get("HTTPStatusCode") if isinstance(metadata, dict) else None
-        safe_code = SAFE_ERROR_CODES.get(raw_code, "r2_request_failed")
-        return R2OperationError(safe_code, operation, status, key)
-    if isinstance(error, BotoCoreError):
-        return R2OperationError("r2_client_error", operation, object_key=key)
-    return R2OperationError("r2_request_failed", operation, object_key=key)
-```
-
-Call this helper with `raise _operation_error(error, operation, key) from None` so
-tracebacks presented by Click cannot reveal the SDK exception chain.
-
-Add a test whose first `head_object` call raises `NotImplemented`, whose second call
-without `ChecksumMode` returns `ContentType`, and assert exactly two calls occur with
-no checksum values. Add a separate `AccessDenied` HEAD test and assert it is not
-retried.
-
-- [ ] **Step 4: Add SDK-error redaction cases**
-
-Extend `tests/benchmark/test_r2_store.py` with a `ClientError` whose raw message contains
-an endpoint and signature:
-
-```python
-from botocore.exceptions import ClientError
-
-
-def test_client_error_is_reduced_to_allowlisted_fields():
-    client = FakeClient()
-
-    def fail(**_kwargs):
-        raise ClientError(
-            {
-                "Error": {
-                    "Code": "AccessDenied",
-                    "Message": "signed request https://account.r2.example?X-Amz-Signature=secret",
-                },
-                "ResponseMetadata": {"HTTPStatusCode": 403, "RequestId": "private-request-id"},
-            },
-            "HeadBucket",
-        )
-
-    client.head_bucket = fail
-    store = Boto3R2Store(client)
-
-    with pytest.raises(R2OperationError) as raised:
-        store.validate_bucket("simfile-dtx")
-
-    assert raised.value.code == "access_denied"
-    assert "http" not in str(raised.value).lower()
-    assert "signature" not in str(raised.value).lower()
-    assert "request-id" not in str(raised.value).lower()
-```
-
-- [ ] **Step 5: Run adapter tests and checks**
-
-Run:
-
-```bash
-rtk uv run pytest tests/benchmark/test_r2_store.py -q
-rtk uv run black src/benchmark/r2_store.py tests/benchmark/test_r2_store.py
-rtk uv run ruff check src/benchmark/r2_store.py tests/benchmark/test_r2_store.py
-```
-
-Expected: all adapter tests pass and formatting checks succeed.
-
-- [ ] **Step 6: Commit the adapter**
-
-Run:
-
-```bash
-rtk git add src/benchmark/r2_store.py tests/benchmark/test_r2_store.py
-rtk git commit -m "feat: add safe R2 object store adapter"
-```
-
----
-
-### Task 3: Build complete inventory and prefix classification
-
-**Files:**
-- Create: `src/benchmark/r2_inventory.py`
-- Create: `tests/benchmark/test_r2_inventory.py`
-
-**Interfaces:**
-- Consumes: `R2ObjectStore`, `R2Config`, `ListedObject`, `RemoteObject`, `SimfileInventory`
-- Produces: `InventorySnapshot`
-- Produces: `inventory_r2_corpus(store, config, include_ids, exclude_ids, head_workers=8)`
-- Guarantees: deterministic simfile/object order and complete root discovery
-
-- [ ] **Step 1: Write failing root-classification tests**
-
-Create `tests/benchmark/test_r2_inventory.py` with a fake store returning:
-
-```python
-listed = [
-    ListedObject("42/", 0, "folder", NOW),
-    ListedObject("42/SET.DEF", 10, "set", NOW),
-    ListedObject("42/assets/曲 snare.ogg", 20, "audio", NOW),
-    ListedObject("7/mas.dtx", 30, "chart", NOW),
-    ListedObject("01/chart.dtx", 40, "alias-a", NOW),
-    ListedObject("1/chart.dtx", 50, "alias-b", NOW),
-    ListedObject("derived/report.json", 60, "derived", NOW),
-    ListedObject("root-object", 70, "root", NOW),
-]
-```
-
-Add assertions that:
-
-- simfiles are ordered `7`, then `42`;
-- `42/assets/曲 snare.ogg` remains exact and nested;
-- the `42/` marker is retained in inventory;
-- `1/` and `01/` produce one `ambiguous_simfile_prefix` root error and no simfile row;
-- `derived/report.json` and `root-object` produce `malformed_root_key` errors;
-- include `{42, 99}` yields rows `42` and empty `99/`;
-- exclude `{42}` removes 42 even when included;
-- HEAD failure on one object preserves listing metadata and marks simfile 42 `partial`.
-
-Use this fake protocol:
-
-```python
-class FakeStore:
-    def __init__(self, listed, head_errors=None):
-        self.listed = listed
-        self.head_errors = head_errors or {}
-
-    def validate_bucket(self, bucket):
-        assert bucket == "simfile-dtx"
-
-    def list_objects(self, bucket):
-        assert bucket == "simfile-dtx"
-        return self.listed
-
-    def head_object(self, bucket, key):
-        if key in self.head_errors:
-            raise self.head_errors[key]
-        return HeadMetadata("application/octet-stream", None, {})
-```
-
-- [ ] **Step 2: Run inventory tests and verify failure**
-
-Run:
-
-```bash
-rtk uv run pytest tests/benchmark/test_r2_inventory.py -q
-```
-
-Expected: collection fails because `src.benchmark.r2_inventory` is missing.
-
-- [ ] **Step 3: Implement the inventory result and root classifier**
-
-Create `src/benchmark/r2_inventory.py` with:
-
-```python
 @dataclass(frozen=True)
-class InventorySnapshot:
+class InventoryResult:
     simfiles: tuple[SimfileInventory, ...]
+    malformed_root_keys: tuple[str, ...]
+    ambiguous_prefixes: dict[int, tuple[str, ...]]
     root_errors: tuple[SyncError, ...]
-    source_discovery_method: str = "r2_list_objects_v2"
-
-    @property
-    def is_partial(self) -> bool:
-        return bool(self.root_errors) or any(item.status != "complete" for item in self.simfiles)
-
-
-def inventory_r2_corpus(
-    store: R2ObjectStore,
-    config: R2Config,
-    include_ids: frozenset[int] = frozenset(),
-    exclude_ids: frozenset[int] = frozenset(),
-    head_workers: int = 8,
-) -> InventorySnapshot:
-    store.validate_bucket(config.bucket)
-    listed_objects = store.list_objects(config.bucket)
-    grouped, root_errors = _classify_root_objects(listed_objects)
-    selected = _filter_and_add_empty_prefixes(grouped, include_ids, exclude_ids)
-    simfiles = _head_enrich_simfiles(
-        store,
-        config.bucket,
-        selected,
-        max_workers=head_workers,
-    )
-    return InventorySnapshot(
-        simfiles=tuple(sorted(simfiles, key=lambda item: (item.simfile_id, item.object_prefix))),
-        root_errors=tuple(root_errors),
-    )
-```
-
-Implementation rules:
-
-- call `validate_bucket` before listing;
-- list the root once with no prefix or delimiter;
-- classify the first path segment only when a slash exists and the segment is digits;
-- map digit segments to `int` and quarantine all prefixes involved in duplicate numeric IDs;
-- apply include and exclude after classification, with exclude winning;
-- synthesize `<id>/` only for explicitly included missing IDs;
-- sort simfiles by `(simfile_id, object_prefix)` and objects by exact key;
-- enrich selected objects with `ThreadPoolExecutor(max_workers=head_workers)`;
-- convert `R2OperationError` to `SyncError(scope="object", code=error.code,
-  message=safe_message, object_key=key)`;
-- do not use raw exception messages.
-
-Define the private helpers used above with these exact signatures:
-
-```python
-def _classify_root_objects(
-    objects: list[ListedObject],
-) -> tuple[dict[int, tuple[str, list[ListedObject]]], list[SyncError]]:
-    candidates: dict[int, dict[str, list[ListedObject]]] = {}
-    errors: list[SyncError] = []
-    for item in objects:
-        segment, separator, _remainder = item.key.partition("/")
-        if not separator or not segment.isdigit():
-            errors.append(
-                SyncError("root", "malformed_root_key", "Object has no numeric prefix", item.key)
-            )
-            continue
-        candidates.setdefault(int(segment), {}).setdefault(f"{segment}/", []).append(item)
-
-    grouped: dict[int, tuple[str, list[ListedObject]]] = {}
-    for simfile_id, prefixes in candidates.items():
-        if len(prefixes) != 1:
-            errors.append(
-                SyncError(
-                    "root",
-                    "ambiguous_simfile_prefix",
-                    f"Numeric simfile ID maps to prefixes {sorted(prefixes)}",
-                )
-            )
-            continue
-        prefix, prefix_objects = next(iter(prefixes.items()))
-        grouped[simfile_id] = (prefix, sorted(prefix_objects, key=lambda item: item.key))
-    return grouped, errors
-
-
-def _filter_and_add_empty_prefixes(
-    grouped: dict[int, tuple[str, list[ListedObject]]],
-    include_ids: frozenset[int],
-    exclude_ids: frozenset[int],
-) -> dict[int, tuple[str, list[ListedObject]]]:
-    selected_ids = set(include_ids) if include_ids else set(grouped)
-    selected_ids.difference_update(exclude_ids)
-    return {
-        simfile_id: grouped.get(simfile_id, (f"{simfile_id}/", []))
-        for simfile_id in sorted(selected_ids)
-    }
-
-
-def _head_enrich_simfiles(
-    store: R2ObjectStore,
-    bucket: str,
-    grouped: dict[int, tuple[str, list[ListedObject]]],
-    max_workers: int,
-) -> list[SimfileInventory]:
-    enriched_by_key: dict[str, RemoteObject] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(store.head_object, bucket, item.key): item
-            for _prefix, items in grouped.values()
-            for item in items
-        }
-        for future, item in futures.items():
-            try:
-                head = future.result()
-                enriched_by_key[item.key] = RemoteObject(
-                    item.key,
-                    item.size,
-                    item.etag,
-                    item.last_modified,
-                    head.content_type,
-                    head.version,
-                    head.remote_checksums,
-                )
-            except R2OperationError as error:
-                sync_error = SyncError(
-                    "object",
-                    error.code,
-                    str(error),
-                    item.key,
-                )
-                enriched_by_key[item.key] = RemoteObject(
-                    item.key,
-                    item.size,
-                    item.etag,
-                    item.last_modified,
-                    errors=(sync_error,),
-                )
-
-    simfiles: list[SimfileInventory] = []
-    for simfile_id, (prefix, listed) in grouped.items():
-        objects = tuple(enriched_by_key[item.key] for item in listed)
-        errors = tuple(error for item in objects for error in item.errors)
-        only_marker = not objects or all(
-            item.key == prefix and item.size == 0 for item in objects
-        )
-        status: SimfileStatus = "empty" if only_marker else "partial" if errors else "complete"
-        simfiles.append(SimfileInventory(simfile_id, prefix, objects, status, errors))
-    return simfiles
-```
-
-The helpers are private implementation units, not future extension points. A prefix
-with no object beyond its exact zero-byte folder marker has status `empty`; a prefix
-with objects and no errors has status `complete`.
-
-- [ ] **Step 4: Add a deterministic >1,000-object fixture**
-
-Add a test that gives the inventory service 1,005 objects already returned by the
-adapter, with nested Unicode keys, and asserts all objects survive sorted under the
-single simfile. Pagination itself remains covered by Task 2; this test proves the
-inventory does not truncate adapter output.
-
-- [ ] **Step 5: Run inventory tests and checks**
-
-Run:
-
-```bash
-rtk uv run pytest tests/benchmark/test_r2_inventory.py -q
-rtk uv run black src/benchmark/r2_inventory.py tests/benchmark/test_r2_inventory.py
-rtk uv run ruff check src/benchmark/r2_inventory.py tests/benchmark/test_r2_inventory.py
-```
-
-Expected: all inventory tests pass.
-
-- [ ] **Step 6: Commit inventory behavior**
-
-Run:
-
-```bash
-rtk git add src/benchmark/r2_inventory.py tests/benchmark/test_r2_inventory.py
-rtk git commit -m "feat: inventory R2 simfile prefixes"
-```
-
----
-
-### Task 4: Add strict provenance and rights metadata
-
-**Files:**
-- Create: `src/benchmark/corpus_provenance.py`
-- Create: `tests/benchmark/test_corpus_provenance.py`
-- Create: `config/corpus-provenance.json`
-
-**Interfaces:**
-- Produces: `ProvenanceRecord`
-- Produces: `load_provenance(path: Path | None) -> dict[int, ProvenanceRecord]`
-- Produces: `unknown_provenance() -> ProvenanceRecord`
-- Consumes: no network or R2 interfaces
-
-- [ ] **Step 1: Write failing provenance tests**
-
-Create `tests/benchmark/test_corpus_provenance.py`:
-
-```python
-import json
-
-import pytest
-
-from src.benchmark.corpus_provenance import load_provenance, unknown_provenance
-
-
-def test_missing_mapping_entry_uses_explicit_unknown_values():
-    assert unknown_provenance().to_dict() == {
-        "source_origin": None,
-        "source_author_or_pack": None,
-        "source_reference": None,
-        "rights_status": "unknown",
-        "redistribution_allowed": None,
-        "provenance_notes": None,
-    }
-
-
-def test_loads_versioned_mapping(tmp_path):
-    path = tmp_path / "provenance.json"
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": "crux.corpus-provenance/v1",
-                "simfiles": {
-                    "42": {
-                        "source_origin": "personal",
-                        "source_author_or_pack": "Example Pack",
-                        "source_reference": "private archive",
-                        "rights_status": "privately_authorized",
-                        "redistribution_allowed": False,
-                        "provenance_notes": "Local benchmark use.",
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    records = load_provenance(path)
-
-    assert records[42].rights_status == "privately_authorized"
-    assert records[42].redistribution_allowed is False
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {"schema_version": "wrong", "simfiles": {}},
-        {"schema_version": "crux.corpus-provenance/v1", "simfiles": {"01": {}, "1": {}}},
-        {
-            "schema_version": "crux.corpus-provenance/v1",
-            "simfiles": {"42": {"redistribution_allowed": "no"}},
-        },
-    ],
-)
-def test_rejects_invalid_schema_aliases_and_field_types(tmp_path, payload):
-    path = tmp_path / "provenance.json"
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-    with pytest.raises(ValueError):
-        load_provenance(path)
-```
-
-- [ ] **Step 2: Run provenance tests and verify failure**
-
-Run:
-
-```bash
-rtk uv run pytest tests/benchmark/test_corpus_provenance.py -q
-```
-
-Expected: collection fails because `src.benchmark.corpus_provenance` is missing.
-
-- [ ] **Step 3: Implement strict parsing**
-
-Create `src/benchmark/corpus_provenance.py` with a frozen `ProvenanceRecord` containing
-the six approved fields and `to_dict()`. `load_provenance` must:
-
-- return `{}` for `None`;
-- require schema `crux.corpus-provenance/v1`;
-- require a JSON object named `simfiles`;
-- require canonical decimal keys (`str(int(key)) == key`, non-negative);
-- reject numeric aliases and unknown provenance field names;
-- accept nullable string fields;
-- require a non-empty string for an explicitly provided `rights_status`;
-- accept only `bool` or `null` for `redistribution_allowed`;
-- raise `ValueError` with a safe local validation message.
-
-Use this record and parsing structure:
-
-```python
-PROVENANCE_FIELDS = {
-    "source_origin",
-    "source_author_or_pack",
-    "source_reference",
-    "rights_status",
-    "redistribution_allowed",
-    "provenance_notes",
-}
+    simfiles_discovered: int
+    simfiles_excluded_by_filter: int
+    objects_listed: int
 
 
 @dataclass(frozen=True)
@@ -950,74 +418,708 @@ class ProvenanceRecord:
     redistribution_allowed: bool | None = None
     provenance_notes: str | None = None
 
-    def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+
+@dataclass(frozen=True)
+class CacheAction:
+    object_key: str
+    action: CacheActionName
+    bytes: int
+    miss_reason: CacheMissReason | None = None
+    errors: tuple[SyncError, ...] = ()
 
 
-def unknown_provenance() -> ProvenanceRecord:
-    return ProvenanceRecord()
+@dataclass(frozen=True)
+class CacheSyncResult:
+    simfiles: tuple[SimfileInventory, ...]
+    actions: tuple[CacheAction, ...]
+
+
+@dataclass(frozen=True)
+class RenderedManifest:
+    rows: tuple[dict[str, object], ...]
+    corpus_version: str
+    manifest_sha256: str
+    content: bytes
+
+
+@dataclass(frozen=True)
+class PublishedManifest:
+    corpus_version: str
+    manifest_sha256: str
+    relative_path: str
+    path: Path
+    latest_path: Path
+
+
+@dataclass(frozen=True)
+class SyncCounters:
+    simfiles_discovered: int = 0
+    simfiles_included: int = 0
+    simfiles_excluded_by_filter: int = 0
+    simfiles_empty: int = 0
+    objects_listed: int = 0
+    objects_selected: int = 0
+    cache_hits: int = 0
+    downloads_planned: int = 0
+    downloads_completed: int = 0
+    downloads_failed: int = 0
+    download_bytes_planned: int = 0
+    download_bytes_completed: int = 0
+
+
+@dataclass(frozen=True)
+class SyncRequest:
+    output_dir: Path
+    cache_dir: Path
+    provenance_file: Path | None
+    include_simfile_ids: frozenset[int] = field(default_factory=frozenset)
+    exclude_simfile_ids: frozenset[int] = field(default_factory=frozenset)
+    dry_run: bool = False
+
+
+@dataclass(frozen=True)
+class SyncOutcome:
+    overall_status: OverallStatus
+    exit_code: Literal[0, 1, 2]
+    report_path: Path | None
+    manifest: PublishedManifest | None
+    errors: tuple[SyncError, ...] = ()
+    counters: SyncCounters = field(default_factory=SyncCounters)
+```
+
+Implement `parse_etag` as a strict quoted HTTP entity-tag parser that retains the
+`W/` bit separately. Implement timestamps with UTC conversion, manifest fractional
+zero trimming, and fixed six-digit report filename precision.
+
+- [ ] **Step 5: Run focused tests and import-without-extra checks**
+
+Run:
+
+```bash
+rtk uv run pytest tests/benchmark/test_r2_corpus_models.py -q
+rtk uv run python -c "import src.benchmark.r2_corpus_models"
+rtk uv run ruff check src/benchmark/r2_corpus_models.py tests/benchmark/test_r2_corpus_models.py
+rtk uv run black --check src/benchmark/r2_corpus_models.py tests/benchmark/test_r2_corpus_models.py
+```
+
+Expected: all tests pass, the base import succeeds without importing boto3, and both
+formatters report clean files.
+
+- [ ] **Step 6: Commit the foundation**
+
+```bash
+rtk git add pyproject.toml uv.lock src/benchmark/r2_corpus_models.py \
+  tests/benchmark/test_r2_corpus_models.py
+rtk git commit -m "feat: add R2 corpus domain primitives"
+```
+
+---
+
+### Task 2: Implement the lazy, sanitized R2 object-store adapter
+
+**Files:**
+- Create: `src/benchmark/r2_inventory.py`
+- Create: `tests/benchmark/test_r2_inventory.py`
+
+**Interfaces:**
+- Consumes: `R2Config`, `ListedObject`, `HeadMetadata`, `parse_etag`.
+- Produces: `R2ObjectStore`, `R2StoreError`, `ObjectDownload`, `ensure_r2_dependency`, and `create_boto3_store`.
+
+- [ ] **Step 1: Write failing adapter tests with fake paginator and client objects**
+
+Start `tests/benchmark/test_r2_inventory.py` with:
+
+```python
+from datetime import datetime, timezone
+from io import BytesIO
+import logging
+
+import pytest
+
+from src.benchmark.r2_corpus_models import R2Config
+from src.benchmark.r2_inventory import (
+    Boto3R2Store,
+    R2StoreError,
+    create_boto3_store,
+)
+
+
+class FakePaginator:
+    def paginate(self, **kwargs):
+        assert kwargs == {"Bucket": "simfile-dtx"}
+        return [
+            {
+                "Contents": [
+                    {
+                        "Key": "42/曲/SET.DEF",
+                        "Size": 5,
+                        "ETag": '"etag-2"',
+                        "LastModified": datetime(2026, 7, 25, tzinfo=timezone.utc),
+                    }
+                ]
+            },
+            {"Contents": []},
+        ]
+
+
+class FakeClient:
+    def __init__(self):
+        self.get_calls = []
+
+    def head_bucket(self, **kwargs):
+        assert kwargs == {"Bucket": "simfile-dtx"}
+
+    def get_paginator(self, name):
+        assert name == "list_objects_v2"
+        return FakePaginator()
+
+    def head_object(self, **kwargs):
+        assert "ChecksumMode" not in kwargs
+        return {
+            "ContentLength": 5,
+            "ETag": '"etag-2"',
+            "LastModified": datetime(2026, 7, 25, tzinfo=timezone.utc),
+            "ContentType": "text/plain",
+        }
+
+    def get_object(self, **kwargs):
+        self.get_calls.append(kwargs)
+        return {
+            "Body": BytesIO(b"chart"),
+            "ContentLength": 5,
+            "ETag": '"etag-2"',
+            "LastModified": datetime(2026, 7, 25, tzinfo=timezone.utc),
+        }
+
+
+def test_adapter_lists_heads_and_opens_strong_and_weak_downloads():
+    store = Boto3R2Store(FakeClient(), "simfile-dtx")
+    listed = store.list_objects()
+    assert listed[0].key == "42/曲/SET.DEF"
+    assert store.head_object(listed[0].key).content_type == "text/plain"
+
+    with store.open_object(listed[0].key, if_match='"etag-2"') as response:
+        assert response.body.read() == b"chart"
+    with store.open_object(listed[0].key, if_match=None):
+        pass
+
+    assert store.client.get_calls[0]["IfMatch"] == '"etag-2"'
+    assert "IfMatch" not in store.client.get_calls[1]
+
+
+def test_adapter_never_requests_provider_checksum_mode():
+    store = Boto3R2Store(FakeClient(), "simfile-dtx")
+    store.head_object("42/SET.DEF")
+
+
+def test_sdk_logger_namespaces_are_pinned_to_warning():
+    for name in ("boto3", "botocore", "urllib3"):
+        logging.getLogger(name).setLevel(logging.DEBUG)
+    Boto3R2Store(FakeClient(), "simfile-dtx")
+    assert all(
+        logging.getLogger(name).getEffectiveLevel() >= logging.WARNING
+        for name in ("boto3", "botocore", "urllib3")
+    )
+```
+
+Add tests that construct fake `ClientError`, `NoCredentialsError`, and timeout
+exceptions and assert only closed codes and deterministic messages are exposed.
+Include a test that monkeypatches the lazy import helper to raise `ImportError` and
+asserts `missing_optional_dependency` plus the exact install hint
+`uv pip install -e '.[r2]'`.
+
+- [ ] **Step 2: Run the adapter tests and verify failure**
+
+Run:
+
+```bash
+rtk uv run --extra r2 pytest tests/benchmark/test_r2_inventory.py -q
+```
+
+Expected: import fails because `src.benchmark.r2_inventory` does not exist.
+
+- [ ] **Step 3: Define the protocol and download response without eager SDK imports**
+
+Implement these public definitions in `src/benchmark/r2_inventory.py`:
+
+```python
+from __future__ import annotations
+
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime
+from logging import WARNING, getLogger
+from typing import BinaryIO, ContextManager, Protocol
+
+from src.benchmark.r2_corpus_models import (
+    ErrorCode,
+    HeadMetadata,
+    ListedObject,
+    R2Config,
+    parse_etag,
+)
+
+
+@dataclass(frozen=True)
+class ObjectDownload:
+    body: BinaryIO
+    size: int | None
+    etag: str | None
+    etag_is_weak: bool | None
+    last_modified: datetime | None
+
+
+class R2ObjectStore(Protocol):
+    def validate_bucket(self) -> None:
+        raise NotImplementedError
+
+    def list_objects(self) -> tuple[ListedObject, ...]:
+        raise NotImplementedError
+
+    def head_object(self, key: str) -> HeadMetadata:
+        raise NotImplementedError
+
+    def open_object(
+        self, key: str, if_match: str | None
+    ) -> ContextManager[ObjectDownload]:
+        raise NotImplementedError
+
+
+class R2StoreError(RuntimeError):
+    def __init__(self, code: ErrorCode, message: str, object_key: str | None = None):
+        super().__init__(message)
+        self.code = code
+        self.object_key = object_key
+```
+
+`ensure_r2_dependency()` must import `boto3`, `botocore.config.Config`, and botocore
+exceptions inside the function. It raises `R2StoreError` with
+`missing_optional_dependency` when imports fail. Module import itself must succeed in
+the base environment. `Boto3R2Store.__init__` calls a small SDK-logger suppression
+helper so direct adapter construction is protected as well as factory construction.
+
+- [ ] **Step 4: Implement boto3 configuration and safe operation mapping**
+
+`create_boto3_store(config)` must:
+
+1. call `ensure_r2_dependency`;
+2. set `boto3`, `botocore`, and `urllib3` logger levels to `WARNING`;
+3. build `botocore.config.Config` with:
+
+```python
+Config(
+    connect_timeout=config.connect_timeout_seconds,
+    read_timeout=config.read_timeout_seconds,
+    tcp_keepalive=True,
+    retries={"mode": "standard", "total_max_attempts": config.max_attempts},
+    max_pool_connections=max(
+        16,
+        config.head_concurrency + config.download_concurrency,
+    ),
+)
+```
+
+4. create an S3 client using the normalized endpoint, region `auto`, and the standard
+credential provider chain, without passing access-key, secret-key, or session-token
+arguments;
+5. return `Boto3R2Store(client, config.bucket)`.
+
+Implement paginated listing with no delimiter, strict required metadata validation,
+post-HEAD response parsing, and a context-managed GET response that always closes the
+SDK body. Listing identity fields are required. GET response ETag, content length, and
+last-modified fields remain nullable in `ObjectDownload` so the weak-ETag verifier can
+emit the specific `weak_etag_unverifiable` code instead of accepting incomplete
+comparison metadata.
+
+Add adapter assertions for all configured timeout/retry/pool values, a paginator with
+more than 1,000 exact keys, and exhausted-retry errors. Confirm the adapter relies on
+botocore's configured standard retries and has no outer general retry loop.
+
+Map SDK outcomes to only:
+
+| Operation | Stable codes |
+| --- | --- |
+| credential resolution | `missing_credentials` |
+| auth rejection | `auth_failed` |
+| bucket validation | `bucket_inaccessible` |
+| root pagination | `root_list_failed` |
+| object HEAD | `object_head_failed` |
+| object GET | `object_get_failed` |
+| conditional 412 | `source_changed_during_sync` |
+| malformed SDK metadata | `object_metadata_invalid` |
+
+Never include raw exception text, request IDs, response bodies, endpoint URLs, headers,
+or SDK exception class names in `R2StoreError`.
+
+- [ ] **Step 5: Run adapter tests, logging test, and base-import test**
+
+Run:
+
+```bash
+rtk uv run --extra r2 pytest tests/benchmark/test_r2_inventory.py -q
+rtk uv run python -c "import src.benchmark.r2_inventory"
+rtk uv run ruff check src/benchmark/r2_inventory.py tests/benchmark/test_r2_inventory.py
+rtk uv run black --check src/benchmark/r2_inventory.py tests/benchmark/test_r2_inventory.py
+```
+
+Expected: all adapter tests pass and the import succeeds without enabling the extra.
+
+- [ ] **Step 6: Commit the adapter**
+
+```bash
+rtk git add src/benchmark/r2_inventory.py tests/benchmark/test_r2_inventory.py
+rtk git commit -m "feat: add safe R2 object store adapter"
+```
+
+---
+
+### Task 3: Implement complete root discovery and bounded metadata enrichment
+
+**Files:**
+- Modify: `src/benchmark/r2_inventory.py`
+- Modify: `tests/benchmark/test_r2_inventory.py`
+
+**Interfaces:**
+- Consumes: `R2ObjectStore`, include/exclude sets, `MAX_SIMFILE_ID`, and configured HEAD concurrency.
+- Produces: `build_inventory(store, include_ids, exclude_ids, head_concurrency) -> InventoryResult`.
+
+- [ ] **Step 1: Add failing prefix, filter, and enrichment tests**
+
+Append tests using a protocol fake that records every list and HEAD call:
+
+```python
+def listed(key: str, size: int = 5) -> ListedObject:
+    return ListedObject(
+        key=key,
+        size=size,
+        etag="listed-etag",
+        etag_is_weak=False,
+        last_modified=datetime(2026, 7, 25, tzinfo=timezone.utc),
+    )
+
+
+class FakeStore:
+    def __init__(
+        self,
+        listed: list[ListedObject],
+        heads: dict[str, HeadMetadata | R2StoreError] | None = None,
+    ):
+        self.listed = tuple(listed)
+        self.heads = heads or {}
+        self.list_calls = 0
+        self.head_calls: list[str] = []
+
+    def list_objects(self) -> tuple[ListedObject, ...]:
+        self.list_calls += 1
+        return self.listed
+
+    def head_object(self, key: str) -> HeadMetadata:
+        self.head_calls.append(key)
+        result = self.heads.get(
+            key,
+            HeadMetadata(None, None, None, None, None),
+        )
+        if isinstance(result, R2StoreError):
+            raise result
+        return result
+
+
+def test_inventory_discovers_before_filtering_and_preserves_exact_keys():
+    store = FakeStore(
+        listed=[
+            listed("42/SET.DEF"),
+            listed("42/assets/曲 name.ogg"),
+            listed("99/chart.dtx"),
+            listed("README"),
+            listed("other/file.txt"),
+        ]
+    )
+    result = build_inventory(
+        store,
+        include_ids=frozenset({42}),
+        exclude_ids=frozenset(),
+        head_concurrency=2,
+    )
+    assert store.list_calls == 1
+    assert [item.simfile_id for item in result.simfiles] == [42]
+    assert result.simfiles_discovered == 2
+    assert result.simfiles_excluded_by_filter == 1
+    assert result.objects_listed == 5
+    assert result.malformed_root_keys == ("README", "other/file.txt")
+    assert result.simfiles[0].objects[1].key == "42/assets/曲 name.ogg"
+    assert sorted(store.head_calls) == ["42/SET.DEF", "42/assets/曲 name.ogg"]
+
+
+def test_ambiguous_aliases_are_quarantined_even_when_included():
+    store = FakeStore(listed=[listed("1/chart.dtx"), listed("01/chart.dtx")])
+    result = build_inventory(store, frozenset({1}), frozenset(), 2)
+    assert result.simfiles == ()
+    assert result.ambiguous_prefixes == {1: ("01/", "1/")}
+    assert result.root_errors[0].code == "ambiguous_simfile_prefix"
+
+
+def test_nested_marker_only_prefix_is_empty_and_retains_markers():
+    store = FakeStore(
+        listed=[
+            listed("42/", size=0),
+            listed("42/assets/", size=0),
+        ]
+    )
+    result = build_inventory(store, frozenset(), frozenset(), 2)
+    row = result.simfiles[0]
+    assert row.sync_status == "empty"
+    assert [item.key for item in row.objects] == ["42/", "42/assets/"]
+    assert all(item.cache_status == "not_selected" for item in row.objects)
+    assert row.sync_errors[0].code == "empty_prefix"
+
+
+def test_explicit_missing_id_creates_empty_row_with_no_objects():
+    result = build_inventory(FakeStore(listed=[]), frozenset({42}), frozenset(), 2)
+    assert result.simfiles[0].simfile_id == 42
+    assert result.simfiles[0].objects == ()
+    assert result.simfiles[0].sync_errors[0].code == "empty_prefix"
+```
+
+Also add tests for:
+
+- include/exclude overlap where exclude wins;
+- IDs `0` and `MAX_SIMFILE_ID`;
+- `MAX_SIMFILE_ID + 1` becoming `malformed_root_key`;
+- a zero-byte non-slash key counting as content, not a folder marker;
+- a HEAD failure retaining listing metadata and making only that simfile partial;
+- malformed HEAD metadata retaining valid listing identity and emitting
+  `object_metadata_invalid`;
+- HEAD values overriding listing size, ETag, mtime, and content type;
+- no provider checksum fields in the resulting object;
+- exact preservation of keys containing spaces, `+`, `%2F`, `#`, `?`, and
+  non-ASCII code points without URL decoding;
+- deterministic numeric/prefix/object ordering;
+- a synchronization barrier fake proving active HEAD calls never exceed the supplied bound.
+
+- [ ] **Step 2: Run the new inventory tests and verify failure**
+
+Run:
+
+```bash
+rtk uv run --extra r2 pytest tests/benchmark/test_r2_inventory.py -q
+```
+
+Expected: tests fail because `build_inventory` and inventory helpers do not exist.
+
+- [ ] **Step 3: Implement root classification before filtering**
+
+Implement `_classify_root(listed: tuple[ListedObject, ...])` returning
+`tuple[dict[str, list[ListedObject]], tuple[str, ...], dict[int, tuple[str, ...]]]`.
+The three values are exact-prefix groups, malformed keys, and quarantined numeric
+aliases.
+
+Classification rules:
+
+1. Require a slash and a digit-only first segment.
+2. Parse the segment and require `0 <= value <= MAX_SIMFILE_ID`.
+3. Preserve the exact segment plus `/` as `object_prefix`.
+4. Collect every exact prefix before detecting numeric aliases.
+5. Sort malformed keys by Unicode code point.
+6. Sort conflicting prefixes by exact string.
+7. Apply include/exclude only after classification and ambiguity detection.
+8. Count valid, non-quarantined discovered simfiles removed by filters.
+9. Record total root objects and valid, non-quarantined discovered simfiles before
+   filters.
+10. Add requested-but-absent IDs as canonical `<id>/` empty rows.
+
+- [ ] **Step 4: Implement bounded HEAD merge and row statuses**
+
+Use `ThreadPoolExecutor(max_workers=head_concurrency)` only for filtered,
+non-quarantined objects. Submit exact keys and reassemble results in deterministic key
+order, independent of completion order.
+
+For successful HEAD:
+
+- overwrite listing size, ETag/weakness, and last-modified when returned;
+- add nullable content type;
+- never request or store checksum fields.
+
+For failed HEAD:
+
+- retain the listing identity and `content_type=None`;
+- append the adapter's allowlisted `object_head_failed` or
+  `object_metadata_invalid` error to object and row errors;
+- set the row `partial`;
+- continue unrelated objects and simfiles.
+
+A discovered row is `empty` only when every object satisfies
+`size == 0 and key.endswith("/")`; add one deterministic `empty_prefix` row error
+while retaining every marker. Any other row with no errors is `complete`. Each
+ambiguous-root error names the numeric ID and its sorted conflicting prefixes without
+allowing an explicit include to restore a row.
+
+- [ ] **Step 5: Run focused tests and format checks**
+
+Run:
+
+```bash
+rtk uv run --extra r2 pytest tests/benchmark/test_r2_inventory.py -q
+rtk uv run ruff check src/benchmark/r2_inventory.py tests/benchmark/test_r2_inventory.py
+rtk uv run black --check src/benchmark/r2_inventory.py tests/benchmark/test_r2_inventory.py
+```
+
+Expected: all inventory and adapter tests pass.
+
+- [ ] **Step 6: Commit root inventory**
+
+```bash
+rtk git add src/benchmark/r2_inventory.py tests/benchmark/test_r2_inventory.py
+rtk git commit -m "feat: inventory R2 simfile prefixes"
+```
+
+---
+
+### Task 4: Implement strict provenance loading
+
+**Files:**
+- Create: `src/benchmark/corpus_provenance.py`
+- Create: `tests/benchmark/test_corpus_provenance.py`
+- Create: `config/corpus-provenance.json`
+
+**Interfaces:**
+- Consumes: optional provenance path, `MAX_SIMFILE_ID`, `PROVENANCE_SCHEMA`.
+- Produces: `load_provenance(path) -> dict[int, ProvenanceRecord]` and `provenance_for(mapping, simfile_id) -> ProvenanceRecord`.
+
+- [ ] **Step 1: Write failing provenance validation tests**
+
+Create `tests/benchmark/test_corpus_provenance.py`:
+
+```python
+import json
+from pathlib import Path
+
+import pytest
+
+from src.benchmark.corpus_provenance import load_provenance, provenance_for
+
+
+def write_mapping(path: Path, simfiles: dict[str, object], schema: str = "crux.corpus-provenance/v1"):
+    path.write_text(
+        json.dumps({"schema_version": schema, "simfiles": simfiles}),
+        encoding="utf-8",
+    )
+
+
+def test_loads_known_record_and_supplies_explicit_unknown_default(tmp_path: Path):
+    path = tmp_path / "provenance.json"
+    write_mapping(
+        path,
+        {
+            "42": {
+                "source_origin": "personal",
+                "source_author_or_pack": "Example Pack",
+                "source_reference": "private archive",
+                "rights_status": "privately_authorized",
+                "redistribution_allowed": False,
+                "provenance_notes": "Local benchmark use.",
+            }
+        },
+    )
+    records = load_provenance(path)
+    assert records[42].rights_status == "privately_authorized"
+    assert records[42].redistribution_allowed is False
+    assert provenance_for(records, 99).rights_status == "unknown"
+    assert provenance_for(records, 99).redistribution_allowed is None
+
+
+@pytest.mark.parametrize(
+    "schema",
+    ["", "crux.corpus-provenance/v2", "other"],
+)
+def test_rejects_unknown_schema(schema, tmp_path: Path):
+    path = tmp_path / "provenance.json"
+    write_mapping(path, {}, schema=schema)
+    with pytest.raises(ValueError, match="schema_version"):
+        load_provenance(path)
+
+
+def test_rejects_duplicate_ids_after_numeric_normalization(tmp_path: Path):
+    path = tmp_path / "provenance.json"
+    write_mapping(path, {"1": {}, "01": {}})
+    with pytest.raises(ValueError, match="duplicate simfile ID"):
+        load_provenance(path)
+```
+
+Add cases for malformed JSON, non-object `simfiles`, negative and above-safe-range
+keys, unknown record fields, wrong string types, and non-boolean
+`redistribution_allowed`. Assert error messages never echo field values.
+
+- [ ] **Step 2: Run tests and verify the missing-module failure**
+
+Run:
+
+```bash
+rtk uv run pytest tests/benchmark/test_corpus_provenance.py -q
+```
+
+Expected: collection fails because `src.benchmark.corpus_provenance` does not exist.
+
+- [ ] **Step 3: Implement the strict loader and unknown default**
+
+Implement:
+
+```python
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from src.benchmark.r2_corpus_models import (
+    MAX_SIMFILE_ID,
+    PROVENANCE_SCHEMA,
+    ProvenanceRecord,
+)
+
+ALLOWED_FIELDS = {
+    "source_origin",
+    "source_author_or_pack",
+    "source_reference",
+    "rights_status",
+    "redistribution_allowed",
+    "provenance_notes",
+}
 
 
 def load_provenance(path: Path | None) -> dict[int, ProvenanceRecord]:
     if path is None:
         return {}
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("Corpus provenance root must be an object")
-    if payload.get("schema_version") != "crux.corpus-provenance/v1":
-        raise ValueError("Unsupported corpus provenance schema")
-    simfiles = payload.get("simfiles")
-    if not isinstance(simfiles, dict):
-        raise ValueError("Corpus provenance simfiles must be an object")
+    if not isinstance(payload, dict) or payload.get("schema_version") != PROVENANCE_SCHEMA:
+        raise ValueError("unsupported provenance schema_version")
+    raw_simfiles = payload.get("simfiles")
+    if not isinstance(raw_simfiles, dict):
+        raise ValueError("provenance simfiles must be an object")
 
     records: dict[int, ProvenanceRecord] = {}
-    for raw_id, raw_record in simfiles.items():
-        if not isinstance(raw_id, str) or not raw_id.isdigit() or str(int(raw_id)) != raw_id:
-            raise ValueError("Corpus provenance IDs must be canonical non-negative decimals")
-        simfile_id = int(raw_id)
+    for raw_id, raw_record in raw_simfiles.items():
+        simfile_id = _parse_id(raw_id)
         if simfile_id in records:
-            raise ValueError("Corpus provenance contains a duplicate simfile ID")
-        if not isinstance(raw_record, dict) or set(raw_record) - PROVENANCE_FIELDS:
-            raise ValueError(f"Corpus provenance record {raw_id} has unsupported fields")
-        records[simfile_id] = _parse_record(raw_id, raw_record)
+            raise ValueError("duplicate simfile ID after numeric normalization")
+        records[simfile_id] = _parse_record(raw_record)
     return records
 
 
-def _parse_record(raw_id: str, values: dict[str, object]) -> ProvenanceRecord:
-    string_fields = (
-        "source_origin",
-        "source_author_or_pack",
-        "source_reference",
-        "provenance_notes",
-    )
-    for field_name in string_fields:
-        value = values.get(field_name)
-        if value is not None and not isinstance(value, str):
-            raise ValueError(f"Corpus provenance {raw_id}.{field_name} must be text or null")
-
-    rights_status = values.get("rights_status", "unknown")
-    if not isinstance(rights_status, str) or not rights_status:
-        raise ValueError(f"Corpus provenance {raw_id}.rights_status must be non-empty text")
-    redistribution = values.get("redistribution_allowed")
-    if redistribution is not None and not isinstance(redistribution, bool):
-        raise ValueError(
-            f"Corpus provenance {raw_id}.redistribution_allowed must be boolean or null"
-        )
-    return ProvenanceRecord(
-        source_origin=values.get("source_origin"),
-        source_author_or_pack=values.get("source_author_or_pack"),
-        source_reference=values.get("source_reference"),
-        rights_status=rights_status,
-        redistribution_allowed=redistribution,
-        provenance_notes=values.get("provenance_notes"),
-    )
+def provenance_for(
+    mapping: dict[int, ProvenanceRecord],
+    simfile_id: int,
+) -> ProvenanceRecord:
+    return mapping.get(simfile_id, ProvenanceRecord())
 ```
 
-Do not coerce strings, integers, or truthy values.
+`_parse_record` must reject unknown keys, require nullable string fields to be string
+or null, require `rights_status` to be a non-empty string when present, and require
+`redistribution_allowed` to be exactly bool or null. Free-text rights values remain
+allowed; downstream publication is permitted only for an exact `True`.
 
-- [ ] **Step 4: Add the version-controlled empty mapping**
+- [ ] **Step 4: Add the checked-in empty mapping**
 
-Create `config/corpus-provenance.json`:
+Create `config/corpus-provenance.json` with exact bytes:
 
 ```json
 {
@@ -1026,23 +1128,19 @@ Create `config/corpus-provenance.json`:
 }
 ```
 
-- [ ] **Step 5: Run provenance tests and checks**
+- [ ] **Step 5: Run tests and style checks**
 
 Run:
 
 ```bash
 rtk uv run pytest tests/benchmark/test_corpus_provenance.py -q
-rtk uv run black src/benchmark/corpus_provenance.py \
-  tests/benchmark/test_corpus_provenance.py
-rtk uv run ruff check src/benchmark/corpus_provenance.py \
-  tests/benchmark/test_corpus_provenance.py
+rtk uv run ruff check src/benchmark/corpus_provenance.py tests/benchmark/test_corpus_provenance.py
+rtk uv run black --check src/benchmark/corpus_provenance.py tests/benchmark/test_corpus_provenance.py
 ```
 
 Expected: all provenance tests pass.
 
 - [ ] **Step 6: Commit provenance support**
-
-Run:
 
 ```bash
 rtk git add config/corpus-provenance.json src/benchmark/corpus_provenance.py \
@@ -1052,78 +1150,91 @@ rtk git commit -m "feat: add corpus provenance mapping"
 
 ---
 
-### Task 5: Implement content-addressed cache synchronization
+### Task 5: Implement the canonical cache index and whole-run writer lock
 
 **Files:**
 - Create: `src/benchmark/corpus_cache.py`
 - Create: `tests/benchmark/test_corpus_cache.py`
 
 **Interfaces:**
-- Consumes: `R2ObjectStore`, `R2Config`, and `RemoteObject`
-- Produces: `is_chart_definition_key(key: str) -> bool`
-- Produces: `CacheIdentity`, `CacheIndexEntry`, `CacheObjectResult`, and `CacheSyncResult`
-- Produces: `sync_corpus_cache(store, config, objects, cache_root, dry_run=False)`
-- Guarantees: no body read or cache/index mutation in dry-run
+- Consumes: `R2Config`, `RemoteObject`, exact cache root.
+- Produces: `CacheIndexEntry`, `CacheValidation`, `CacheIndexStore`, and `cache_writer_lock`.
 
-- [ ] **Step 1: Write failing selection and first-download tests**
+- [ ] **Step 1: Write failing cache-index round-trip and validation tests**
 
 Create `tests/benchmark/test_corpus_cache.py` with:
 
 ```python
-from datetime import datetime, timezone
-from io import BytesIO
+import json
+from pathlib import Path
 
-from src.benchmark.corpus_cache import is_chart_definition_key, sync_corpus_cache
-from src.benchmark.r2_corpus_models import R2Config, RemoteObject
-from src.benchmark.r2_store import ObjectDownload
+import pytest
 
-NOW = datetime(2026, 7, 24, tzinfo=timezone.utc)
-
-
-class FakeStore:
-    def __init__(self, bodies):
-        self.bodies = bodies
-        self.get_calls = []
-
-    def get_object(self, bucket, key, etag):
-        self.get_calls.append((bucket, key, etag))
-        body = self.bodies[key]
-        return ObjectDownload(BytesIO(body), len(body))
+from src.benchmark.corpus_cache import (
+    CacheIndexEntry,
+    CacheIndexStore,
+    cache_writer_lock,
+)
 
 
-def object_for(key, body, etag="etag-1"):
-    return RemoteObject(key, len(body), etag, NOW, "text/plain")
-
-
-def test_initial_profile_is_case_insensitive_and_excludes_audio():
-    assert is_chart_definition_key("42/SET.DEF")
-    assert is_chart_definition_key("42/MAS.DTX")
-    assert is_chart_definition_key("42/readme.Txt")
-    assert not is_chart_definition_key("42/bgm.ogg")
-    assert not is_chart_definition_key("42/assets/snare.wav")
-
-
-def test_downloads_selected_body_and_installs_by_sha256(tmp_path):
-    body = b"#TITLE: chart\n"
-    remote = object_for("42/SET.DEF", body)
-    store = FakeStore({remote.key: body})
-    config = R2Config.from_values(
-        "https://abc.r2.cloudflarestorage.com",
-        "simfile-dtx",
+def entry(key: str = "42/SET.DEF") -> CacheIndexEntry:
+    return CacheIndexEntry(
+        source_endpoint_sha256="a" * 64,
+        bucket="simfile-dtx",
+        key=key,
+        etag="etag",
+        etag_is_weak=False,
+        size=5,
+        last_modified="2026-07-25T00:00:00Z",
+        sha256="b" * 64,
+        cache_path=f"sha256/bb/{'b' * 64}",
     )
 
-    result = sync_corpus_cache(store, config, [remote], tmp_path)
 
-    item = result.objects[remote.key]
-    assert item.cache_status == "verified"
-    assert item.action == "downloaded"
-    assert item.sha256 is not None
-    assert item.cache_path == f"sha256/{item.sha256[:2]}/{item.sha256}"
-    assert (tmp_path / item.cache_path).read_bytes() == body
-    assert store.get_calls == [("simfile-dtx", remote.key, "etag-1")]
+def test_index_checkpoint_is_canonical_and_restart_readable(tmp_path: Path):
+    store = CacheIndexStore.load(tmp_path)
+    store.checkpoint(entry("42/z.dtx"))
+    store.checkpoint(entry("42/a.dtx"))
+
+    payload = json.loads((tmp_path / "index-v1.json").read_text(encoding="utf-8"))
+    assert payload["schema_version"] == "crux.r2-cache-index/v1"
+    assert [item["key"] for item in payload["entries"]] == ["42/a.dtx", "42/z.dtx"]
+    restarted = CacheIndexStore.load(tmp_path)
+    assert restarted.get("a" * 64, "simfile-dtx", "42/a.dtx") is not None
+
+
+def test_invalid_index_json_and_schema_fail_closed(tmp_path: Path):
+    (tmp_path / "index-v1.json").write_text("{", encoding="utf-8")
+    with pytest.raises(ValueError, match="cache index"):
+        CacheIndexStore.load(tmp_path)
+    (tmp_path / "index-v1.json").write_text(
+        '{"schema_version":"crux.r2-cache-index/v2","entries":[]}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="schema"):
+        CacheIndexStore.load(tmp_path)
+
+
+def test_live_writer_lock_fails_fast(tmp_path: Path):
+    with cache_writer_lock(tmp_path):
+        with pytest.raises(RuntimeError, match="cache_locked"):
+            with cache_writer_lock(tmp_path):
+                raise AssertionError("second writer must not enter")
 ```
 
-- [ ] **Step 2: Run cache tests and verify failure**
+Add tests that:
+
+- reject absolute cache paths and any path containing `..`;
+- reject duplicate `(endpoint_hash, bucket, key)` entries;
+- sort entries by endpoint hash, bucket, and exact key;
+- contain no cache-profile or provider-checksum fields;
+- monkeypatch `os.replace`, file `flush`, `os.fsync`, and directory opens to assert
+  file-before-directory durability ordering;
+- retain one lock-file object for the full context lifetime;
+- replace `fcntl` import with failure and assert `unsupported_platform`;
+- start two threads calling `checkpoint` and prove writes never overlap.
+
+- [ ] **Step 2: Run tests and verify the missing-module failure**
 
 Run:
 
@@ -1131,28 +1242,34 @@ Run:
 rtk uv run pytest tests/benchmark/test_corpus_cache.py -q
 ```
 
-Expected: collection fails because `src.benchmark.corpus_cache` is missing.
+Expected: collection fails because `src.benchmark.corpus_cache` does not exist.
 
-- [ ] **Step 3: Implement cache records and strict index loading**
+- [ ] **Step 3: Implement cache index records and strict loading**
 
 Create `src/benchmark/corpus_cache.py` with:
 
 ```python
-CacheStatus = Literal["not_selected", "planned", "verified", "failed"]
-CacheAction = Literal["none", "planned", "cache_hit", "downloaded", "failed"]
+from __future__ import annotations
 
+import json
+import os
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from pathlib import Path, PurePosixPath
+from threading import Lock
+from typing import Iterator
+from uuid import uuid4
 
-@dataclass(frozen=True)
-class CacheIdentity:
-    source_endpoint_sha256: str
-    bucket: str
-    key: str
+from src.benchmark.r2_corpus_models import CACHE_INDEX_SCHEMA
 
 
 @dataclass(frozen=True)
 class CacheIndexEntry:
-    identity: CacheIdentity
-    etag: str | None
+    source_endpoint_sha256: str
+    bucket: str
+    key: str
+    etag: str
+    etag_is_weak: bool
     size: int
     last_modified: str
     sha256: str
@@ -1160,660 +1277,1139 @@ class CacheIndexEntry:
 
 
 @dataclass(frozen=True)
-class CacheObjectResult:
-    cache_status: CacheStatus
-    action: CacheAction
-    sha256: str | None = None
-    cache_path: str | None = None
-    error: SyncError | None = None
+class CacheValidation:
+    state: str
+    entry: CacheIndexEntry | None
 
 
-@dataclass(frozen=True)
-class CacheSyncResult:
-    objects: dict[str, CacheObjectResult]
-    index_entries: tuple[CacheIndexEntry, ...]
-    bytes_planned: int
-    bytes_downloaded: int
+class CacheIndexStore:
+    def __init__(self, cache_dir: Path, entries: dict[tuple[str, str, str], CacheIndexEntry]):
+        self.cache_dir = cache_dir
+        self._entries = entries
+        self._checkpoint_lock = Lock()
+
+    def get(self, endpoint_hash: str, bucket: str, key: str) -> CacheIndexEntry | None:
+        return self._entries.get((endpoint_hash, bucket, key))
+
+    def checkpoint(self, entry: CacheIndexEntry) -> None:
+        with self._checkpoint_lock:
+            self._entries[(entry.source_endpoint_sha256, entry.bucket, entry.key)] = entry
+            self._publish_locked()
 ```
 
-Use an index document shaped as:
+Add the classmethod
+`load(cls, cache_dir: Path) -> CacheIndexStore` with this concrete JSON validation:
 
-```json
-{
-  "schema_version": "crux.r2-cache-index/v1",
-  "entries": [
-    {
-      "source_endpoint_sha256": "…",
-      "bucket": "simfile-dtx",
-      "key": "42/SET.DEF",
-      "etag": "etag-1",
-      "size": 14,
-      "last_modified": "2026-07-24T00:00:00Z",
-      "sha256": "…",
-      "cache_path": "sha256/ab/ab…"
-    }
-  ]
-}
-```
+1. return an empty store if `index-v1.json` is absent;
+2. parse UTF-8 JSON;
+3. require only schema `crux.r2-cache-index/v1`;
+4. require `entries` as a list;
+5. construct every dataclass with exact field types;
+6. reject booleans where integers are required, require `etag_is_weak` to be a
+   boolean, require a nonnegative size, and require canonical UTC `last_modified`;
+7. validate lower-case 64-hex SHA fields;
+8. inspect raw slash-separated path parts before constructing `PurePosixPath`, and
+   reject roots, empty parts, `.`, or `..`;
+9. require `cache_path == f"sha256/{sha256[:2]}/{sha256}"`;
+10. reject duplicate composite identities.
 
-Reject duplicate identities, absolute cache paths, and paths containing `..`.
-
-- [ ] **Step 4: Implement verification, conditional download, and atomic writes**
-
-`sync_corpus_cache` must:
-
-- return `not_selected`/`none` without touching bodies for unselected keys;
-- compare endpoint hash, bucket, exact key, ETag, size, and normalized modification time;
-- hash and count a matching local cache body before returning `verified`/`cache_hit`;
-- download mismatches through `store.get_object(bucket, key, etag)`;
-- read in 1 MiB chunks, hash while writing to `<cache-root>/tmp/`;
-- close the body in `finally`;
-- verify both listed size and response content length when present;
-- use `os.replace` for index publication;
-- install the content path atomically and never overwrite different bytes;
-- remove temporary files after every failure;
-- convert 412/precondition errors to `source_changed_during_sync`;
-- use only safe `R2OperationError` fields in `SyncError`.
-
-For `dry_run=True`, it may hash an existing candidate cache file but must return
-`planned` for misses without creating directories, temp files, bodies, or the index.
-
-Use this streaming core; the surrounding function converts its raised safe errors to
-`CacheObjectResult`:
+`_publish_locked` must encode:
 
 ```python
-def _download_and_install(
-    store: R2ObjectStore,
-    config: R2Config,
-    remote: RemoteObject,
-    cache_root: Path,
-) -> tuple[str, str, int]:
-    temp_dir = cache_root / "tmp"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    temp_path: Path | None = None
-    response: ObjectDownload | None = None
-    try:
-        with tempfile.NamedTemporaryFile(dir=temp_dir, delete=False) as temp_file:
-            temp_path = Path(temp_file.name)
-            digest = hashlib.sha256()
-            byte_count = 0
-            response = store.get_object(config.bucket, remote.key, remote.etag)
-            while chunk := response.body.read(1024 * 1024):
-                digest.update(chunk)
-                temp_file.write(chunk)
-                byte_count += len(chunk)
-            temp_file.flush()
-            os.fsync(temp_file.fileno())
-
-        if byte_count != remote.size:
-            raise CacheVerificationError("Downloaded byte count differs from inventory")
-        if response.content_length is not None and byte_count != response.content_length:
-            raise CacheVerificationError("Downloaded byte count differs from response metadata")
-
-        sha256_hex = digest.hexdigest()
-        relative_path = Path("sha256") / sha256_hex[:2] / sha256_hex
-        destination = cache_root / relative_path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        _install_content_once(temp_path, destination, sha256_hex)
-        temp_path = None
-        return sha256_hex, relative_path.as_posix(), byte_count
-    finally:
-        if response is not None:
-            response.close()
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
-
-
-def _install_content_once(temp_path: Path, destination: Path, expected_sha256: str) -> None:
-    if destination.exists():
-        if _sha256_file(destination) != expected_sha256:
-            raise CacheVerificationError("Existing content-addressed cache file is corrupt")
-        temp_path.unlink()
-        return
-    try:
-        os.link(temp_path, destination)
-    except FileExistsError:
-        if _sha256_file(destination) != expected_sha256:
-            raise CacheVerificationError("Concurrent cache publication produced different bytes")
-    finally:
-        temp_path.unlink(missing_ok=True)
+payload = {
+    "schema_version": CACHE_INDEX_SCHEMA,
+    "entries": [
+        asdict(entry)
+        for entry in sorted(
+            self._entries.values(),
+            key=lambda item: (
+                item.source_endpoint_sha256,
+                item.bucket,
+                item.key,
+            ),
+        )
+    ],
+}
+content = json.dumps(
+    payload,
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+).encode("utf-8")
 ```
 
-Define `_sha256_file(path: Path) -> str` using the same 1 MiB chunk size. Write the
-cache index through a temporary sibling, `flush`, `os.fsync`, and `os.replace`.
+Write `content` to a unique sibling of `index-v1.json`, flush, `fsync`, replace, and
+`fsync` the cache directory. Clean the temporary file if publication fails.
 
-- [ ] **Step 5: Add cache-hit, corruption, mismatch, and dry-run tests**
+- [ ] **Step 4: Implement the POSIX lock with one descriptor**
 
-Add exact tests asserting:
+Implement:
 
-- an unchanged rerun returns `verified`/`cache_hit` and makes zero new `get_object` calls;
-- replacing cached bytes with `b"corrupt"` causes a new download and repairs the file;
-- a response content length or final byte count mismatch returns `failed` and leaves no
-  temp file or index entry;
-- an `R2OperationError("precondition_failed", "get", 412, key)` becomes
-  `source_changed_during_sync`;
-- dry-run returns `planned`, reports bytes, performs zero GETs, and leaves the cache root
-  absent;
-- two keys with the same body share one SHA-256 content file but retain separate index
-  entries.
+```python
+@contextmanager
+def cache_writer_lock(cache_dir: Path) -> Iterator[None]:
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise RuntimeError("unsupported_platform") from exc
 
-- [ ] **Step 6: Run cache tests and checks**
+    _ensure_durable_directory(cache_dir)
+    lock_path = cache_dir / ".index-v1.lock"
+    handle = lock_path.open("a+b")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("cache_locked") from exc
+        yield
+    finally:
+        handle.close()
+```
+
+Do not open the lock path anywhere else. The orchestration task will hold this context
+across inventory, cache, manifest, report, and pointer publication.
+`_ensure_durable_directory` creates each missing directory component and `fsync`s its
+parent before continuing, and does nothing when the complete path already exists.
+
+- [ ] **Step 5: Run cache-index and lock tests**
 
 Run:
 
 ```bash
 rtk uv run pytest tests/benchmark/test_corpus_cache.py -q
-rtk uv run black src/benchmark/corpus_cache.py tests/benchmark/test_corpus_cache.py
 rtk uv run ruff check src/benchmark/corpus_cache.py tests/benchmark/test_corpus_cache.py
+rtk uv run black --check src/benchmark/corpus_cache.py tests/benchmark/test_corpus_cache.py
 ```
 
-Expected: all cache tests pass.
+Expected: canonical index, lock, durability, and thread-serialization tests pass.
 
-- [ ] **Step 7: Commit cache synchronization**
-
-Run:
+- [ ] **Step 6: Commit the cache-index foundation**
 
 ```bash
 rtk git add src/benchmark/corpus_cache.py tests/benchmark/test_corpus_cache.py
-rtk git commit -m "feat: add verified R2 corpus cache"
+rtk git commit -m "feat: add durable R2 cache index"
 ```
 
 ---
 
-### Task 6: Canonicalize and publish immutable JSONL manifests
+### Task 6: Implement selective cache validation, repair, and download
+
+**Files:**
+- Modify: `src/benchmark/corpus_cache.py`
+- Modify: `tests/benchmark/test_corpus_cache.py`
+
+**Interfaces:**
+- Consumes: enriched `SimfileInventory`, `R2ObjectStore`, `CacheIndexStore`, `R2Config`, and dry-run flag.
+- Produces: `sync_cache(...) -> CacheSyncResult` with reproducible rows and invocation-only actions.
+
+- [ ] **Step 1: Add failing selection, hit, miss, and download tests**
+
+Append cache-local constructors rather than importing test helpers across modules:
+
+```python
+FIXED_MTIME = datetime(2026, 7, 25, tzinfo=timezone.utc)
+
+
+def remote_object(
+    key: str = "42/chart.dtx",
+    *,
+    size: int = 5,
+    etag: str = "etag",
+    etag_is_weak: bool = False,
+) -> RemoteObject:
+    return RemoteObject(
+        key=key,
+        size=size,
+        etag=etag,
+        etag_is_weak=etag_is_weak,
+        last_modified=FIXED_MTIME,
+        content_type="text/plain",
+    )
+
+
+def simfile(*objects: RemoteObject) -> SimfileInventory:
+    return SimfileInventory(42, "42/", tuple(objects), "complete")
+
+
+def config() -> R2Config:
+    return R2Config("https://example.invalid", "a" * 64, "simfile-dtx")
+
+
+def empty_index(cache_dir: Path) -> CacheIndexStore:
+    return CacheIndexStore.load(cache_dir)
+```
+
+Define a `FakeStore` implementing `open_object` with recorded `OpenCall` values and
+an `ObjectDownload` backed by `BytesIO`; let each test inject the response ETag,
+size, mtime, bytes, or `R2StoreError`. Define `seeded_index` by computing the local
+file SHA-256 and checkpointing the exact remote identity. Define
+`index_with_local_state` by starting from `seeded_index` and then deleting,
+truncating, or replacing the local body for the named state.
+
+Append tests that build one complete simfile with these keys:
+
+```python
+(
+    remote_object("42/SET.DEF"),
+    remote_object("42/charts/MAS.DTX"),
+    remote_object("42/notes.TxT"),
+    remote_object("42/audio/song.ogg"),
+    remote_object("42/assets/", size=0),
+)
+```
+
+Assert only the first three are selected. Add:
+
+```python
+def test_verified_hit_reads_no_remote_body(tmp_path: Path):
+    cache_path = tmp_path / "sha256" / "2c" / sha256(b"chart").hexdigest()
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_bytes(b"chart")
+    index = seeded_index(tmp_path, remote_object(), cache_path)
+    store = FakeStore()
+
+    result = sync_cache(
+        simfiles=(simfile(remote_object()),),
+        store=store,
+        index=index,
+        config=config(),
+        dry_run=False,
+    )
+
+    assert store.open_calls == []
+    assert result.simfiles[0].objects[0].cache_status == "verified"
+    assert result.actions[0].action == "cache_hit"
+
+
+@pytest.mark.parametrize("local_state", ["missing", "size_mismatch", "sha256_mismatch"])
+def test_dry_run_reports_repair_as_planned_without_get(tmp_path: Path, local_state: str):
+    index = index_with_local_state(tmp_path, local_state)
+    store = FakeStore()
+    result = sync_cache((simfile(remote_object()),), store, index, config(), dry_run=True)
+    assert store.open_calls == []
+    assert result.actions[0].action == "planned"
+    assert result.actions[0].miss_reason == local_state
+
+
+def test_strong_etag_uses_if_match_and_weak_etag_does_not(tmp_path: Path):
+    strong_store = FakeStore(body=b"strong")
+    sync_cache(
+        (simfile(remote_object(etag_is_weak=False)),),
+        strong_store,
+        empty_index(tmp_path),
+        config(),
+        False,
+    )
+    assert strong_store.open_calls[0].if_match == '"etag"'
+
+    weak_store = FakeStore(body=b"weak", response_etag='W/"etag"')
+    sync_cache(
+        (simfile(remote_object(etag_is_weak=True)),),
+        weak_store,
+        empty_index(tmp_path),
+        config(),
+        False,
+    )
+    assert weak_store.open_calls[0].if_match is None
+```
+
+Add cases for:
+
+- remote identity mismatch producing `remote_changed`;
+- weak response missing ETag/size/mtime producing `weak_etag_unverifiable`;
+- weak response metadata drift producing `source_changed_during_sync`;
+- strong 412 producing `source_changed_during_sync` with no SDK details;
+- streamed byte-count mismatch;
+- failed GET and failed local write;
+- successful repair producing no `cache_corrupt`;
+- failed repair of a locally missing, size-mismatched, or SHA-mismatched entry
+  producing `cache_corrupt` plus the operational error;
+- a failed `remote_changed` download producing only its operational error;
+- body temp paths always under `sha256/.incoming`;
+- incoming/final `st_dev` mismatch failing before replace;
+- file `fsync`, `os.replace`, shard-directory `fsync`, then index checkpoint order;
+- deduplication when a final SHA path already contains identical bytes;
+- rejection when an existing final SHA path contains mismatched bytes;
+- failed temporary-file cleanup;
+- independent download workers never exceeding `download_concurrency`;
+- restart after checkpoint becoming a verified hit.
+
+- [ ] **Step 2: Run the expanded cache tests and verify failure**
+
+Run:
+
+```bash
+rtk uv run --extra r2 pytest tests/benchmark/test_corpus_cache.py -q
+```
+
+Expected: new tests fail because cache selection and synchronization are absent.
+
+- [ ] **Step 3: Implement cache selection and local validation**
+
+Add:
+
+```python
+def is_selected(key: str) -> bool:
+    basename = key.rsplit("/", 1)[-1].lower()
+    lowered = key.lower()
+    return basename == "set.def" or lowered.endswith((".dtx", ".txt"))
+
+
+def validate_cached_body(
+    cache_dir: Path,
+    entry: CacheIndexEntry | None,
+) -> CacheValidation:
+    if entry is None:
+        return CacheValidation("remote_changed", None)
+    path = cache_dir / PurePosixPath(entry.cache_path)
+    if not path.is_file():
+        return CacheValidation("missing", entry)
+    digest, size = _hash_file(path)
+    if size != entry.size:
+        return CacheValidation("size_mismatch", entry)
+    if digest != entry.sha256:
+        return CacheValidation("sha256_mismatch", entry)
+    return CacheValidation("verified", entry)
+```
+
+Call this only after exact endpoint, bucket, key, ETag/weakness, remote size, and
+canonical mtime comparison. A mismatched remote identity is `remote_changed`, not
+local corruption.
+
+- [ ] **Step 4: Implement concurrent real and dry-run synchronization**
+
+Implement
+`sync_cache(simfiles: tuple[SimfileInventory, ...], store: R2ObjectStore,
+index: CacheIndexStore, config: R2Config, dry_run: bool) -> CacheSyncResult`
+with this concrete flow:
+
+1. Leave folder markers and non-profile objects `not_selected`.
+2. Mark HEAD-failed selected objects `failed` without attempting GET.
+3. Compare remote identity with the index, then hash matching local entries.
+4. Emit `cache_hit` and `verified` only for byte-count and SHA matches.
+5. In dry-run, emit `planned` for every miss and do not mutate rows, cache, or index.
+6. In real mode, submit misses to `ThreadPoolExecutor(config.download_concurrency)`.
+7. Rebuild objects and rows by original indices rather than future completion order.
+8. Set a row `failed` only when all selected objects fail; otherwise any failed
+   selected object makes it `partial`; preserve `empty` and never erase prior
+   inventory/HEAD errors.
+
+Implement `_download_one` to:
+
+- create and durability-sync `<cache-dir>/sha256/.incoming`;
+- reconstruct strong `If-Match` as a quoted ETag;
+- omit it for weak ETags and verify response identity before accepting bytes;
+- stream in fixed-size chunks to a unique incoming file while hashing/counting;
+- flush and `fsync` the incoming file;
+- create and sync the two-hex shard directory;
+- require incoming and shard directories to share `st_dev`;
+- verify an existing final path has the expected bytes, otherwise `os.replace` into
+  the extensionless final path while serializing same-digest installations;
+- `fsync` the shard directory;
+- call `index.checkpoint` only afterward;
+- delete the invocation's incoming file on every failure path.
+
+Use one module-local `_body_install_lock = Lock()` only around the existing-final
+verification, `os.replace`, and shard-directory `fsync`. Do not hold it during
+network reads or hashing. The separate `CacheIndexStore` checkpoint lock continues to
+serialize index mutation/publication.
+
+- [ ] **Step 5: Run cache tests and restart/idempotence coverage**
+
+Run:
+
+```bash
+rtk uv run --extra r2 pytest tests/benchmark/test_corpus_cache.py -q
+rtk uv run ruff check src/benchmark/corpus_cache.py tests/benchmark/test_corpus_cache.py
+rtk uv run black --check src/benchmark/corpus_cache.py tests/benchmark/test_corpus_cache.py
+```
+
+Expected: all cache selection, durability, repair, concurrency, and restart tests pass.
+
+- [ ] **Step 6: Commit cache synchronization**
+
+```bash
+rtk git add src/benchmark/corpus_cache.py tests/benchmark/test_corpus_cache.py
+rtk git commit -m "feat: synchronize selected R2 corpus files"
+```
+
+---
+
+### Task 7: Build deterministic manifests and publish immutable versions
 
 **Files:**
 - Create: `src/benchmark/corpus_manifest.py`
 - Create: `tests/benchmark/test_corpus_manifest.py`
 
 **Interfaces:**
-- Consumes: `InventorySnapshot`, cache results, provenance records, `R2Config`
-- Produces: `build_manifest_rows(snapshot: InventorySnapshot, cache: CacheSyncResult,
-  provenance: Mapping[int, ProvenanceRecord], config: R2Config) ->
-  list[dict[str, object]]`
-- Produces: `seal_manifest(rows, output_dir, published_at) -> ManifestPublication`
-- Produces: `verify_manifest_cache(manifest_path: Path, cache_root: Path) ->
-  list[SyncError]`
-- Produces: `ManifestPublication(corpus_version, manifest_sha256, manifest_path)`
+- Consumes: `CacheSyncResult`, provenance records, source endpoint identity, bucket, and a
+  caller-supplied publication timestamp.
+- Produces: canonical rows, `RenderedManifest`, immutable manifest bytes, and a
+  separately replaceable `latest.json` pointer that orchestration can defer until
+  the attempt's report is durable.
 
-- [ ] **Step 1: Write failing determinism and immutability tests**
+- [ ] **Step 1: Write failing canonical-row and identity tests**
 
-Create `tests/benchmark/test_corpus_manifest.py` with fixtures for one complete simfile
-and assert:
+Create `tests/benchmark/test_corpus_manifest.py`. Add compact constructors for
+`RemoteObject`, `SimfileInventory`, and `CacheSyncResult` at the top of the file so
+every test builds complete records without mocks hidden in another suite.
 
 ```python
-from datetime import datetime, timezone
-
-PUBLISHED_AT = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
-LATER_PUBLISHED_AT = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
+FIXED_TIME = datetime(2026, 7, 25, 1, 2, 3, tzinfo=timezone.utc)
 
 
-def make_rows(etag="etag-1"):
-    return [
-        {
-            "schema_version": "crux.r2-corpus-manifest/v1",
-            "simfile_id": 42,
-            "object_prefix": "42/",
-            "source_endpoint_sha256": "a" * 64,
-            "source_bucket": "simfile-dtx",
-            "source_discovery_method": "r2_list_objects_v2",
-            "objects": [
-                {
-                    "key": "42/SET.DEF",
-                    "size": 3,
-                    "etag": etag,
-                    "version": None,
-                    "last_modified": "2026-07-24T00:00:00Z",
-                    "content_type": "text/plain",
-                    "remote_checksums": {},
-                    "cache_status": "verified",
-                    "sha256": "b" * 64,
-                    "cache_path": f"sha256/bb/{'b' * 64}",
-                }
-            ],
-            "sync_status": "complete",
-            "sync_errors": [],
-            "source_origin": None,
-            "source_author_or_pack": None,
-            "source_reference": None,
-            "rights_status": "unknown",
-            "redistribution_allowed": None,
-            "provenance_notes": None,
-        }
-    ]
+def make_simfile(
+    simfile_id: int = 2,
+    *,
+    key: str | None = None,
+    status: SimfileStatus = "complete",
+    error_code: ErrorCode | None = None,
+) -> SimfileInventory:
+    object_key = key or f"{simfile_id}/chart.dtx"
+    errors = (
+        ()
+        if error_code is None
+        else (SyncError("object", error_code, "Safe deterministic message.", object_key),)
+    )
+    remote = RemoteObject(
+        key=object_key,
+        size=5,
+        etag="etag",
+        etag_is_weak=False,
+        last_modified=FIXED_TIME,
+        content_type="text/plain",
+        cache_status="verified",
+        sha256="c" * 64,
+        cache_path=f"sha256/cc/{'c' * 64}",
+        errors=errors,
+    )
+    return SimfileInventory(
+        simfile_id=simfile_id,
+        object_prefix=f"{simfile_id}/",
+        objects=(remote,),
+        sync_status=status,
+        sync_errors=errors,
+    )
 
 
-def test_manifest_is_identical_for_unchanged_rows_across_publication_times(tmp_path):
-    rows = make_rows()
+def render_fixture(
+    *,
+    key: str = "2/chart.dtx",
+    status: SimfileStatus = "complete",
+    error_code: ErrorCode | None = None,
+    source_reference: str | None = None,
+) -> RenderedManifest:
+    provenance = {2: ProvenanceRecord(source_reference=source_reference)}
+    rows = build_manifest_rows(
+        (make_simfile(2, key=key, status=status, error_code=error_code),),
+        provenance,
+        "a" * 64,
+        "simfile-dtx",
+    )
+    return render_manifest(rows)
 
-    first = seal_manifest(rows, tmp_path, PUBLISHED_AT)
-    second = seal_manifest(rows, tmp_path, LATER_PUBLISHED_AT)
+
+def render_for_action(action: CacheActionName) -> RenderedManifest:
+    simfiles = (make_simfile(),)
+    cache_result = CacheSyncResult(
+        simfiles,
+        (CacheAction("2/chart.dtx", action, 5),),
+    )
+    rows = build_manifest_rows(
+        cache_result.simfiles,
+        {},
+        "a" * 64,
+        "simfile-dtx",
+    )
+    return render_manifest(rows)
+```
+
+Cover these cases:
+
+```python
+def test_render_manifest_is_order_independent_for_inputs():
+    first = render_manifest(
+        build_manifest_rows(
+            simfiles=(make_simfile(10), make_simfile(2)),
+            provenance={},
+            source_endpoint_sha256="a" * 64,
+            bucket="bucket",
+        )
+    )
+    second = render_manifest(
+        build_manifest_rows(
+            simfiles=(make_simfile(2), make_simfile(10)),
+            provenance={},
+            source_endpoint_sha256="a" * 64,
+            bucket="bucket",
+        )
+    )
 
     assert first.corpus_version == second.corpus_version
-    assert first.manifest_sha256 == second.manifest_sha256
-    assert first.manifest_path.read_bytes() == second.manifest_path.read_bytes()
+    assert first.content == second.content
+    assert first.content.endswith(b"\n")
+    assert [row["simfile_id"] for row in first.rows] == [2, 10]
 
 
-def test_changed_object_metadata_creates_new_manifest_without_overwriting_old(tmp_path):
-    first = seal_manifest(make_rows(etag="etag-1"), tmp_path, PUBLISHED_AT)
-    second = seal_manifest(make_rows(etag="etag-2"), tmp_path, LATER_PUBLISHED_AT)
+def test_render_manifest_hashes_the_self_reference_free_bytes():
+    rendered = render_manifest(
+        build_manifest_rows(
+            simfiles=(make_simfile(2),),
+            provenance={},
+            source_endpoint_sha256="b" * 64,
+            bucket="bucket",
+        )
+    )
+    identity_bytes = b"".join(
+        canonical_json_line(
+            {key: value for key, value in row.items() if key != "corpus_version"}
+        )
+        for row in rendered.rows
+    )
 
-    assert first.manifest_sha256 != second.manifest_sha256
-    assert first.manifest_path.exists()
-    assert second.manifest_path.exists()
+    assert rendered.corpus_version == f"sha256:{sha256(identity_bytes).hexdigest()}"
+    assert all(row["corpus_version"] == rendered.corpus_version for row in rendered.rows)
+
+
+def test_cache_hit_and_downloaded_actions_have_identical_manifest_identity():
+    downloaded = render_for_action("downloaded")
+    cache_hit = render_for_action("cache_hit")
+
+    assert downloaded.content == cache_hit.content
+    assert downloaded.corpus_version == cache_hit.corpus_version
+
+
+def test_status_error_and_provenance_changes_rekey_the_manifest():
+    baseline = render_fixture()
+
+    assert render_fixture(status="partial").corpus_version != baseline.corpus_version
+    assert (
+        render_fixture(error_code="object_head_failed").corpus_version
+        != baseline.corpus_version
+    )
+    assert (
+        render_fixture(source_reference="private archive").corpus_version
+        != baseline.corpus_version
+    )
+
+
+def test_manifest_preserves_non_ascii_keys_without_ascii_escaping():
+    rendered = render_fixture(key="7/音楽/譜面.DTX")
+
+    assert "音楽".encode() in rendered.content
+    assert b"\\u97f3" not in rendered.content
 ```
 
 Also assert:
 
-- `build_manifest_rows` returns identical rows when two otherwise identical
-  `CacheSyncResult` fixtures differ only by `CacheObjectResult.action` values
-  `downloaded` and `cache_hit`, and serialized bytes contain no `cache_action`;
-- simfiles sort numerically and objects sort by exact Unicode key;
-- JSON is compact, `ensure_ascii=False`, and ends with one newline per row;
-- absolute cache roots and invocation timestamps are absent;
-- changing provenance changes corpus and manifest identities;
-- a pre-existing mismatched file at the computed hash raises `ManifestCollisionError`;
-- `latest.json` contains the concrete relative hash path and updates atomically.
-- `verify_manifest_cache` returns no errors for valid references, returns stable errors
-  for missing/size/SHA mismatches, and rejects absolute or `..` cache paths without
-  reading outside the cache root.
+- objects sort by exact key and errors sort by
+  `(scope, code, object_key or "", message)`;
+- each object contains the complete manifest contract and no cache action, miss
+  reason, invocation ID, report path, provider checksum, or publication time;
+- the reserved object `version` field is always `None`;
+- each row includes `cache_profile="setdef_dtx_txt_v1"` and
+  `source_discovery_method="r2_list_objects_v2"`;
+- source identity is the normalized endpoint SHA-256, never the raw endpoint;
+- manifest timestamps are UTC whole-second `Z` strings;
+- empty and failed rows still have stable shapes;
+- changing only object enumeration order does not change bytes;
+- changing remote metadata or locally verified SHA-256 does change bytes.
+- normalized payload rows omit `corpus_version`; only final rendered rows contain it.
 
-- [ ] **Step 2: Run manifest tests and verify failure**
-
-Run:
+Run the new tests once and confirm they fail because the module does not exist:
 
 ```bash
 rtk uv run pytest tests/benchmark/test_corpus_manifest.py -q
 ```
 
-Expected: collection fails because `src.benchmark.corpus_manifest` is missing.
+- [ ] **Step 2: Implement canonical JSONL and the two-pass corpus identity**
 
-- [ ] **Step 3: Implement row construction**
+Implement these exact public functions:
 
-Implement `build_manifest_rows` so every row contains the exact v1 fields approved in
-the design:
+```python
+def canonical_json_line(value: dict[str, object]) -> bytes:
+    text = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return text.encode("utf-8") + b"\n"
+
+
+def build_manifest_rows(
+    simfiles: tuple[SimfileInventory, ...],
+    provenance: Mapping[int, ProvenanceRecord],
+    source_endpoint_sha256: str,
+    bucket: str,
+) -> tuple[dict[str, object], ...]:
+    return tuple(
+        _build_row(
+            simfile,
+            provenance_for(provenance, simfile.simfile_id),
+            source_endpoint_sha256,
+            bucket,
+        )
+        for simfile in sorted(
+            simfiles,
+            key=lambda item: (item.simfile_id, item.object_prefix),
+        )
+    )
+
+
+def render_manifest(rows: tuple[dict[str, object], ...]) -> RenderedManifest:
+    if any("corpus_version" in row for row in rows):
+        raise ValueError("normalized payload rows must omit corpus_version")
+    identity_bytes = b"".join(canonical_json_line(row) for row in rows)
+    corpus_version = f"sha256:{hashlib.sha256(identity_bytes).hexdigest()}"
+    final_rows = tuple(
+        {"corpus_version": corpus_version, **row} for row in rows
+    )
+    content = b"".join(canonical_json_line(row) for row in final_rows)
+    manifest_sha256 = hashlib.sha256(content).hexdigest()
+    return RenderedManifest(final_rows, corpus_version, manifest_sha256, content)
+```
+
+Use this row contract:
 
 ```python
 {
-    "schema_version": "crux.r2-corpus-manifest/v1",
+    "schema_version": MANIFEST_SCHEMA,
+    "cache_profile": CACHE_PROFILE,
     "simfile_id": simfile.simfile_id,
     "object_prefix": simfile.object_prefix,
-    "source_endpoint_sha256": config.source_endpoint_sha256,
-    "source_bucket": config.bucket,
-    "source_discovery_method": snapshot.source_discovery_method,
-    "objects": object_rows,
-    "sync_status": simfile.status,
-    "sync_errors": error_rows,
-    **provenance.to_dict(),
+    "source_endpoint_sha256": source_endpoint_sha256,
+    "source_bucket": bucket,
+    "source_discovery_method": "r2_list_objects_v2",
+    "objects": object_dicts,
+    "sync_status": simfile.sync_status,
+    "sync_errors": error_dicts,
+    "source_origin": provenance.source_origin,
+    "source_author_or_pack": provenance.source_author_or_pack,
+    "source_reference": provenance.source_reference,
+    "rights_status": provenance.rights_status,
+    "redistribution_allowed": provenance.redistribution_allowed,
+    "provenance_notes": provenance.provenance_notes,
 }
 ```
 
-Object rows use `cache_status` but never `cache_action`. Normalize ETags, timestamps,
-checksum key order, nullable values, safe errors, and logical cache paths here.
-
-- [ ] **Step 4: Implement two-stage identity and atomic publication**
-
-Use:
+Each object dictionary must contain:
 
 ```python
-def canonical_json(value: object) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+{
+    "key": remote.key,
+    "size": remote.size,
+    "etag": remote.etag,
+    "etag_is_weak": remote.etag_is_weak,
+    "version": None,
+    "last_modified": format_manifest_timestamp(remote.last_modified),
+    "content_type": remote.content_type,
+    "cache_status": remote.cache_status,
+    "sha256": remote.sha256,
+    "cache_path": remote.cache_path,
+}
 ```
 
-Then:
+Serialize each `SyncError` exactly as:
 
-1. Sort base rows and their object arrays.
-2. Hash canonical JSONL payload bytes without `corpus_version`.
-3. Insert `corpus_version=f"sha256:{payload_hash}"` into every row.
-4. Serialize final JSONL with one trailing newline per row.
-5. Hash the final bytes.
-6. Write and fsync a temporary file beneath `manifests/`.
-7. If the hash destination exists, compare exact bytes; reuse only when identical.
-8. Atomically install a new destination otherwise.
-9. Atomically write `latest.json` containing corpus version, manifest hash, relative
-   path, and the supplied publication timestamp.
+```python
+{
+    "scope": error.scope,
+    "code": error.code,
+    "object_key": error.object_key,
+    "message": error.message,
+}
+```
 
-Implement `verify_manifest_cache` by reading each JSONL row, considering only objects
-with `cache_status == "verified"`, validating the logical relative path, then comparing
-the local byte count and SHA-256. Return `SyncError(scope="cache", ...)` values instead
-of raising for per-object verification failures.
+Keep `content_type` nullable and `cache_status` limited to durable corpus facts
+(`verified`, `failed`, or `not_selected`). `sync_cache` has already translated both
+download and cache-hit actions to `verified` on the immutable object records.
 
-- [ ] **Step 5: Run manifest tests and checks**
+- [ ] **Step 3: Write failing immutable-publication tests**
+
+Add:
+
+```python
+def test_publish_manifest_creates_version_file_and_latest_pointer(tmp_path):
+    rendered = render_fixture()
+    published_at = datetime(2026, 7, 25, 1, 2, 3, tzinfo=timezone.utc)
+
+    published = publish_manifest(tmp_path, rendered)
+    publish_latest_manifest(tmp_path, published, "complete", published_at)
+
+    version_path = tmp_path / "manifests" / f"{rendered.manifest_sha256}.jsonl"
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert version_path.read_bytes() == rendered.content
+    assert published.path == version_path
+    assert latest == {
+        "corpus_version": rendered.corpus_version,
+        "manifest_sha256": rendered.manifest_sha256,
+        "manifest_path": f"manifests/{rendered.manifest_sha256}.jsonl",
+        "overall_status": "complete",
+        "published_at": "2026-07-25T01:02:03Z",
+    }
+
+
+def test_publish_manifest_reuses_identical_existing_version(tmp_path):
+    rendered = render_fixture()
+    first = publish_manifest(tmp_path, rendered)
+    inode = first.path.stat().st_ino
+
+    second = publish_manifest(tmp_path, rendered)
+
+    assert second.path.stat().st_ino == inode
+
+
+def test_publish_manifest_rejects_conflicting_existing_version(tmp_path):
+    rendered = render_fixture()
+    version_path = tmp_path / "manifests" / f"{rendered.manifest_sha256}.jsonl"
+    version_path.parent.mkdir(parents=True)
+    version_path.write_bytes(b"conflict\n")
+
+    with pytest.raises(ManifestPublicationError) as raised:
+        publish_manifest(tmp_path, rendered)
+
+    assert raised.value.error.code == "artifact_write_failed"
+```
+
+Monkeypatch `os.replace` and directory `fsync` helpers to assert that
+`latest.json` is replaced only after the immutable manifest is durable.
+
+- [ ] **Step 4: Implement durable immutable publication**
+
+Implement:
+
+```python
+def publish_manifest(
+    output_dir: Path,
+    rendered: RenderedManifest,
+) -> PublishedManifest:
+    manifests_dir = output_dir / "manifests"
+    manifests_dir.mkdir(parents=True, exist_ok=True)
+    _fsync_directory(manifests_dir.parent)
+    _fsync_directory(manifests_dir)
+    manifest_path = manifests_dir / f"{rendered.manifest_sha256}.jsonl"
+    _publish_immutable(manifest_path, rendered.content, rendered.manifest_sha256)
+    return PublishedManifest(
+        corpus_version=rendered.corpus_version,
+        manifest_sha256=rendered.manifest_sha256,
+        relative_path=f"manifests/{rendered.manifest_sha256}.jsonl",
+        path=manifest_path,
+        latest_path=output_dir / "latest.json",
+    )
+
+
+def publish_latest_manifest(
+    output_dir: Path,
+    published: PublishedManifest,
+    overall_status: Literal["complete", "partial"],
+    published_at: datetime,
+) -> None:
+    latest = {
+        "corpus_version": published.corpus_version,
+        "manifest_sha256": published.manifest_sha256,
+        "manifest_path": published.relative_path,
+        "overall_status": overall_status,
+        "published_at": format_manifest_timestamp(published_at),
+    }
+    _atomic_replace_json(output_dir / "latest.json", latest)
+```
+
+Define `ManifestPublicationError` with one sanitized `SyncError` field.
+`_publish_immutable(path, content, expected_sha256)` must:
+
+1. recompute the content hash and reject a mismatch before publication;
+2. compare exact bytes when the final path already exists;
+3. return without rewriting when they match;
+4. raise sanitized `artifact_write_failed` when they differ;
+5. otherwise write a unique sibling temporary file, flush and `fsync` it;
+6. install without overwriting an existing path, handling a concurrent winner by
+   comparing its exact bytes;
+7. `fsync` the manifest directory after installation;
+8. unlink the temporary file on every failure path.
+
+`_atomic_replace_json` must write canonical UTF-8 JSON plus one newline, flush and
+`fsync` the temporary file, `os.replace` it, and `fsync` its parent directory.
+Test explicitly that `publish_manifest` alone leaves an existing `latest.json`
+unchanged; only `publish_latest_manifest` may move the convenience pointer.
+
+- [ ] **Step 5: Run manifest tests and deterministic-byte checks**
 
 Run:
 
 ```bash
 rtk uv run pytest tests/benchmark/test_corpus_manifest.py -q
-rtk uv run black src/benchmark/corpus_manifest.py tests/benchmark/test_corpus_manifest.py
 rtk uv run ruff check src/benchmark/corpus_manifest.py tests/benchmark/test_corpus_manifest.py
+rtk uv run black --check src/benchmark/corpus_manifest.py tests/benchmark/test_corpus_manifest.py
 ```
 
-Expected: all manifest tests pass.
+Expected: canonicalization, two-pass identity, immutable publication, pointer
+status, conflict handling, and non-ASCII tests pass.
 
-- [ ] **Step 6: Commit immutable manifest publication**
-
-Run:
+- [ ] **Step 6: Commit deterministic manifest publication**
 
 ```bash
 rtk git add src/benchmark/corpus_manifest.py tests/benchmark/test_corpus_manifest.py
-rtk git commit -m "feat: publish immutable corpus manifests"
+rtk git commit -m "feat: publish versioned corpus manifests"
 ```
 
 ---
 
-### Task 7: Orchestrate sync attempts and machine-readable reports
+### Task 8: Orchestrate the sync transaction, reports, progress, and outcomes
 
 **Files:**
 - Create: `src/benchmark/r2_corpus_sync.py`
 - Create: `tests/benchmark/test_r2_corpus_sync.py`
 
 **Interfaces:**
-- Consumes: every public interface from Tasks 1–6
-- Produces: `SyncOptions`, `SyncSummary`, `SyncOutcome`, and `sync_r2_corpus`
-- Produces: timestamped report and `latest-report.json`
-- Guarantees: partial isolation, fatal handling, and dry-run mutation boundary
+- Consumes: a `SyncRequest`, an optional environment mapping, dependency/store
+  factories, wall/monotonic clocks, a run-ID factory, and a progress callback.
+- Produces: one `SyncOutcome`; all expected domain failures are represented by
+  sanitized outcome/report data.
 
-- [ ] **Step 1: Write failing end-to-end service tests**
+- [ ] **Step 1: Build a reusable fake object store and write failing workflow tests**
 
-Create `tests/benchmark/test_r2_corpus_sync.py` around an injected fake store:
+At the top of `tests/benchmark/test_r2_corpus_sync.py`, define a `FakeStore` that:
 
-```python
-from datetime import datetime, timezone
-from io import BytesIO
+- stores exact `ListedObject`, `HeadMetadata`, and body bytes in dictionaries;
+- records list, HEAD, and GET calls;
+- can raise `R2StoreError` by operation and key;
+- returns fixed-size body chunks from the `open_object` context manager;
+- never imports boto3.
 
-FIXED_NOW = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+Add an `invoke_sync` helper that passes fixed clock/run-ID factories and a
+capturing progress callback into `sync_r2_corpus`.
 
-
-class SuccessfulStore:
-    def __init__(self, bodies):
-        self.bodies = bodies
-        self.get_calls = []
-
-    def validate_bucket(self, bucket):
-        assert bucket == "simfile-dtx"
-
-    def list_objects(self, bucket):
-        return [
-            ListedObject(key, len(body), f"etag-{index}", FIXED_NOW)
-            for index, (key, body) in enumerate(sorted(self.bodies.items()))
-        ]
-
-    def head_object(self, bucket, key):
-        return HeadMetadata("text/plain", None, {})
-
-    def get_object(self, bucket, key, etag):
-        self.get_calls.append((bucket, key, etag))
-        body = self.bodies[key]
-        return ObjectDownload(BytesIO(body), len(body))
-
-
-def successful_store(bodies):
-    return SuccessfulStore(bodies)
-
-
-def make_options(tmp_path, dry_run=False):
-    return SyncOptions(
-        config=R2Config.from_values(
-            "https://abc.r2.cloudflarestorage.com",
-            "simfile-dtx",
-        ),
-        output_dir=tmp_path,
-        cache_dir=tmp_path / "cache",
-        dry_run=dry_run,
-    )
-
-
-def test_real_sync_publishes_manifest_report_and_latest_pointer(tmp_path):
-    store = successful_store({"42/SET.DEF": b"set", "42/mas.dtx": b"chart"})
-    outcome = sync_r2_corpus(make_options(tmp_path), store=store, now=FIXED_NOW)
-
-    assert outcome.success is True
-    assert outcome.partial is False
-    assert outcome.publication is not None
-    assert outcome.publication.manifest_path.exists()
-    assert (tmp_path / "latest.json").exists()
-    report = json.loads(outcome.report_path.read_text(encoding="utf-8"))
-    assert report["overall_status"] == "complete"
-    assert report["downloads"]["completed"] == 2
-    assert "endpoint_url" not in report
-
-
-def test_dry_run_writes_report_only(tmp_path):
-    store = successful_store({"42/SET.DEF": b"set"})
-    outcome = sync_r2_corpus(
-        make_options(tmp_path, dry_run=True),
-        store=store,
-        now=FIXED_NOW,
-    )
-
-    assert outcome.success is True
-    assert outcome.publication is None
-    assert outcome.report_path.exists()
-    assert not (tmp_path / "cache").exists()
-    assert not (tmp_path / "manifests").exists()
-    assert not (tmp_path / "latest.json").exists()
-    assert store.get_calls == []
-```
-
-Add tests proving:
-
-- an object HEAD failure publishes a partial manifest and returns `success=False`;
-- a selected GET failure affects only its simfile and unrelated simfiles complete;
-- malformed root keys produce overall `partial`, appear in the report, and cause a
-  nonzero outcome;
-- invalid provenance fails before `validate_bucket` or list calls;
-- auth/root-list failure writes a fatal report and publishes no manifest;
-- an unwritable report root raises `SyncReportWriteError` with a sanitized message;
-- a second unchanged real run reports cache hits, zero downloaded bytes, and the same
-  manifest hash.
-
-Add this exact cache-reference test for the final verification command:
+Write these tests first:
 
 ```python
-def test_manifest_cache_references_verify(tmp_path):
-    store = successful_store({"42/SET.DEF": b"set", "42/mas.dtx": b"chart"})
-    outcome = sync_r2_corpus(make_options(tmp_path), store=store, now=FIXED_NOW)
-    assert outcome.publication is not None
+def test_complete_real_run_publishes_cache_manifest_report_and_pointers(tmp_path):
+    outcome, events = invoke_sync(tmp_path, complete_store())
 
-    for line in outcome.publication.manifest_path.read_text(encoding="utf-8").splitlines():
-        record = json.loads(line)
-        for item in record["objects"]:
-            if item["cache_status"] != "verified":
-                continue
-            cache_path = tmp_path / "cache" / item["cache_path"]
-            body = cache_path.read_bytes()
-            assert len(body) == item["size"]
-            assert hashlib.sha256(body).hexdigest() == item["sha256"]
+    assert outcome.exit_code == 0
+    assert outcome.overall_status == "complete"
+    assert outcome.manifest is not None
+    assert outcome.manifest.corpus_version.startswith("sha256:")
+    assert outcome.manifest.path.is_file()
+    assert outcome.report_path.is_file()
+    assert (tmp_path / "output" / "latest.json").is_file()
+    assert (tmp_path / "output" / "latest-report.json").is_file()
+    assert events[0].phase == "configuration"
+    assert events[-1].phase == "complete"
+
+
+def test_partial_run_publishes_manifest_and_returns_one(tmp_path):
+    outcome, _ = invoke_sync(tmp_path, store_with_one_get_failure())
+
+    assert outcome.exit_code == 1
+    assert outcome.overall_status == "partial"
+    assert outcome.manifest is not None
+    assert outcome.manifest.path.is_file()
+    assert read_latest(tmp_path)["overall_status"] == "partial"
+
+
+def test_fatal_configuration_error_returns_two_without_network(tmp_path):
+    store = complete_store()
+
+    outcome, _ = invoke_sync(tmp_path, store, endpoint_url="http://insecure.example")
+
+    assert outcome.exit_code == 2
+    assert outcome.overall_status == "failed"
+    assert outcome.manifest is None
+    assert store.calls == []
+    assert read_report(outcome.report_path)["errors"][0]["code"] == "invalid_config"
+
+
+def test_malformed_provenance_fails_before_network(tmp_path):
+    path = tmp_path / "provenance.json"
+    path.write_text("{")
+    store = complete_store()
+
+    outcome, _ = invoke_sync(tmp_path, store, provenance_file=path)
+
+    assert outcome.exit_code == 2
+    assert store.calls == []
+
+
+def test_dry_run_lists_and_heads_but_does_not_get_or_mutate_corpus_state(tmp_path):
+    store = complete_store()
+    outcome, _ = invoke_sync(tmp_path, store, dry_run=True)
+
+    assert outcome.exit_code == 0
+    assert outcome.overall_status == "dry_run_complete"
+    assert outcome.manifest is None
+    assert not any(call[0] == "get" for call in store.calls)
+    assert not (tmp_path / "cache" / "index-v1.json").exists()
+    assert not (tmp_path / "output" / "manifests").exists()
+    assert not (tmp_path / "output" / "latest.json").exists()
+    assert outcome.report_path.is_file()
+    assert (tmp_path / "output" / "latest-report.json").is_file()
 ```
 
-- [ ] **Step 2: Run orchestration tests and verify failure**
+Use the same `store` instance in the dry-run call and GET assertion. Also cover:
 
-Run:
+- missing optional dependency and missing/invalid R2 environment configuration;
+- full-page pagination and HEAD failure aggregation;
+- a non-blocking writer-lock conflict before any network request;
+- empty includes and ambiguity quarantine;
+- report-write failure returning `2` with a sanitized one-line fallback message;
+- manifest-publication failure returning `2` and still attempting a fatal report;
+- report failure after immutable installation leaving `latest.json` unchanged and
+  omitting the unreferenced file from `SyncOutcome.manifest`;
+- identical start timestamps with different UUID4 run IDs producing different report
+  paths, and fixed six-digit timestamp names sorting chronologically;
+- report counts for listed objects, selected objects, included/excluded simfiles,
+  empty prefixes, ambiguous prefixes, cache hits, planned/completed/failed
+  downloads, bytes, and each fixed cache miss reason;
+- no credential, raw endpoint, raw SDK message, signed URL, or authorization header
+  in outcome text, reports, progress events, manifests, or pointers;
+- two real writers using distinct cache roots and one output root that complete in
+  reverse start order leave `latest.json` pointing at the last completion;
+- concurrent real and dry-run writers leave `latest.json` on the real manifest while
+  `latest-report.json` points at whichever attempt completes last;
+- repeated fixed-input runs produce byte-identical immutable manifest files.
 
-```bash
-rtk uv run pytest tests/benchmark/test_r2_corpus_sync.py -q
-```
+- [ ] **Step 2: Define progress, report, and orchestration interfaces**
 
-Expected: collection fails because `src.benchmark.r2_corpus_sync` is missing.
-
-- [ ] **Step 3: Implement options and outcome records**
-
-Create:
+Add these local records:
 
 ```python
 @dataclass(frozen=True)
-class SyncOptions:
-    config: R2Config
-    output_dir: Path
-    cache_dir: Path
-    provenance_file: Path | None = None
-    include_ids: frozenset[int] = frozenset()
-    exclude_ids: frozenset[int] = frozenset()
-    dry_run: bool = False
-    head_workers: int = 8
+class ProgressEvent:
+    phase: str
+    completed: int
+    total: int | None
+    message: str
 
 
-@dataclass(frozen=True)
-class SyncSummary:
-    simfiles: int
-    objects: int
-    planned_downloads: int
-    completed_downloads: int
-    cache_hits: int
-    bytes_planned: int
-    bytes_downloaded: int
-
-
-@dataclass(frozen=True)
-class SyncOutcome:
-    success: bool
-    partial: bool
-    report_path: Path
-    publication: ManifestPublication | None
-    summary: SyncSummary
+ProgressCallback = Callable[[ProgressEvent], None]
+StoreFactory = Callable[[R2Config], R2ObjectStore]
+Clock = Callable[[], datetime]
+MonotonicClock = Callable[[], float]
+RunIdFactory = Callable[[], str]
 ```
 
-Validate non-negative filters and `head_workers >= 1` before provenance parsing or
-network access.
-
-- [ ] **Step 4: Implement transactional orchestration**
-
-`sync_r2_corpus(options, store=None, now=None)` must:
-
-1. validate options;
-2. load provenance;
-3. construct `Boto3R2Store.from_config` only when no store is injected;
-4. inventory and HEAD-enrich the selected simfiles;
-5. flatten objects for cache planning/synchronization;
-6. merge per-object cache failures back into simfile status and errors;
-7. build normalized manifest rows;
-8. skip manifest publication in dry-run;
-9. publish real complete or partial manifests;
-10. compute operational counters from cache actions;
-11. write a timestamped report and atomically update `latest-report.json`;
-12. return `success=False` for partial/fatal results without discarding publication.
-
-Use report schema `crux.r2-corpus-sync-report/v1`. Include the endpoint hash and bucket,
-but not the raw endpoint. Use allowlisted errors throughout.
-
-Use this control-flow shape so fatal results return an outcome after writing their
-report, while only report-write failures raise:
+Implement the public entry point with explicit dependency injection:
 
 ```python
 def sync_r2_corpus(
-    options: SyncOptions,
-    store: R2ObjectStore | None = None,
-    now: datetime | None = None,
+    request: SyncRequest,
+    *,
+    environ: Mapping[str, str] | None = None,
+    dependency_check: Callable[[], None] = ensure_r2_dependency,
+    store_factory: StoreFactory = create_boto3_store,
+    clock: Clock = utc_now,
+    monotonic: MonotonicClock = time.monotonic,
+    run_id_factory: RunIdFactory = new_run_id,
+    progress: ProgressCallback = ignore_progress,
 ) -> SyncOutcome:
-    started_at = now or datetime.now(timezone.utc)
-    try:
-        _validate_options(options)
-        provenance = load_provenance(options.provenance_file)
-        resolved_store = store or Boto3R2Store.from_config(options.config)
-        snapshot = inventory_r2_corpus(
-            resolved_store,
-            options.config,
-            options.include_ids,
-            options.exclude_ids,
-            options.head_workers,
-        )
-        cache = sync_corpus_cache(
-            resolved_store,
-            options.config,
-            [obj for item in snapshot.simfiles for obj in item.objects],
-            options.cache_dir,
-            options.dry_run,
-        )
-        merged_snapshot = _merge_cache_failures(snapshot, cache)
-        rows = build_manifest_rows(merged_snapshot, cache, provenance, options.config)
-        publication = (
-            None
-            if options.dry_run
-            else seal_manifest(rows, options.output_dir, started_at)
-        )
-        partial = merged_snapshot.is_partial
-        report = _build_report(
-            options,
-            merged_snapshot,
-            cache,
-            publication,
-            started_at,
-            "partial" if partial else "complete",
-        )
-    except (ValueError, R2OperationError, OSError) as error:
-        report = _build_fatal_report(options, started_at, _safe_fatal_error(error))
-        report_path = _write_report(options.output_dir, report)
-        return SyncOutcome(False, False, report_path, None, _empty_summary())
-
-    report_path = _write_report(options.output_dir, report)
-    return SyncOutcome(
-        not partial,
-        partial,
-        report_path,
-        publication,
-        _summary_from(merged_snapshot, cache),
+    started_at = clock()
+    run_id = run_id_factory()
+    return _run_sync(
+        request=request,
+        environ=os.environ if environ is None else environ,
+        dependency_check=dependency_check,
+        store_factory=store_factory,
+        clock=clock,
+        run_id=run_id,
+        started_at=started_at,
+        progress=progress,
+        monotonic=monotonic,
     )
 ```
 
-`_merge_cache_failures` uses `dataclasses.replace` to append cache errors and change
-only affected simfiles to `partial` or `failed`. `_safe_fatal_error` maps known local
-and SDK exceptions to stable codes/messages and does not use `repr(error)`.
-`_empty_summary()` returns seven zero values; `_summary_from` derives its values only
-from the inventory and cache action records used for the report.
+The entry point must catch only the documented domain/configuration exceptions,
+convert them to allowlisted `SyncError` records, and attempt a fatal report.
+Unexpected programming errors must not be copied into user-visible text; record
+`internal_error` with no raw exception detail, then return exit `2`.
 
-- [ ] **Step 5: Implement fatal report fallback**
+Use this boundary mapping:
 
-Wrap configuration/provenance/store/inventory failures. When the report directory is
-usable, write a fatal report with no manifest fields. When it is not usable, raise
-`SyncReportWriteError("Unable to write R2 corpus sync report")` without chaining a raw
-filesystem or SDK message into user output.
+| Failure source | Serialized code |
+| --- | --- |
+| `R2Config` or request/path validation | `invalid_config` |
+| optional dependency check | `missing_optional_dependency` |
+| credential, auth, bucket, root-list, HEAD, or GET adapter error | preserve the adapter's allowlisted code |
+| provenance loader validation | `provenance_invalid` |
+| cache-index parse/schema validation | `cache_index_invalid` |
+| writer-lock conflict | `cache_locked` |
+| unavailable POSIX lock/durability support | `unsupported_platform` |
+| cache, manifest, report, or pointer filesystem failure | `artifact_write_failed` |
+| unforeseen exception at the command boundary | `internal_error` |
 
-Implement report writes through:
+Never serialize an exception's string or class name as the message.
+
+- [ ] **Step 3: Implement the real and dry-run phase order**
+
+Use this exact phase order:
+
+1. validate the optional dependency;
+2. build `R2Config` and validate all local paths/options;
+3. load and validate provenance;
+4. for a real run, acquire `cache_writer_lock` before index reading, store creation,
+   or network I/O;
+5. load one `CacheIndexStore` snapshot;
+6. create the store and validate bucket access;
+7. build the complete inventory;
+8. synchronize or plan the cache;
+9. for a real run, build, render, and install the immutable manifest without moving
+   `latest.json`;
+10. assemble and publish the report;
+11. for a real run, publish `latest.json` only after both the manifest and report are
+   durable;
+12. publish `latest-report.json` only after the report is durable;
+13. release the whole-run writer lock;
+14. return the explicit outcome.
+
+Use a `nullcontext()` instead of the writer lock for dry-run. Do not call
+`publish_manifest` during dry-run. The dry-run report must describe planned cache
+actions and set manifest corpus version, hash, and path to `None`.
+If report publication fails after immutable manifest installation, leave that
+content-addressed file as an unreferenced, reusable artifact, do not update
+`latest.json`, and return `failed` with no `PublishedManifest` in the outcome.
+
+Compute overall status as:
+
+- `complete` when a real manifest exists and no row or operation has a nonfatal
+  error;
+- `partial` when a real manifest exists and any row is non-complete, any malformed
+  or ambiguous root entry exists, or any nonfatal operation failed;
+- `failed` when no real manifest was produced;
+- `dry_run_complete` when dry-run planning finds no partial condition;
+- `dry_run_partial` when dry-run planning finds any partial condition.
+
+Every `empty` row is partial. Dry-run repair plans for locally missing or corrupt
+bodies are not partial unless another error occurs. Map `complete` and
+`dry_run_complete` to `0`, `partial` and `dry_run_partial` to `1`, and `failed` to
+`2`.
+
+- [ ] **Step 4: Implement deterministic report content and collision-proof names**
+
+Write reports under `<output-dir>/reports/` with:
 
 ```python
-def _write_report(output_dir: Path, report: dict[str, object]) -> Path:
-    try:
-        reports_dir = output_dir / "reports"
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        report_bytes = canonical_report_json(report)
-        report_path = reports_dir / _report_filename(report["started_at"])
-        _atomic_write(report_path, report_bytes)
-        _atomic_write(
-            output_dir / "latest-report.json",
-            canonical_report_json({"report_path": str(report_path.relative_to(output_dir))}),
-        )
-        return report_path
-    except OSError:
-        raise SyncReportWriteError("Unable to write R2 corpus sync report") from None
+def report_filename(started_at: datetime, run_id: str) -> str:
+    stamp = format_report_filename_timestamp(started_at)
+    return f"{stamp}-{run_id}.json"
 ```
 
-Define `canonical_report_json` as sorted UTF-8 JSON plus one final newline.
-`_report_filename` converts the already normalized `started_at` value to
-`sync-YYYYMMDDTHHMMSSffffffZ.json`. `_atomic_write` writes a temporary sibling,
-flushes and fsyncs it, then calls `os.replace`.
+`format_report_filename_timestamp` supplies exactly six UTC fractional digits.
+`new_run_id` returns `str(uuid.uuid4())`; validate injected IDs by parsing them as a
+UUID, requiring version 4, and requiring the lowercase canonical string before using
+them as a filename component.
 
-- [ ] **Step 6: Run orchestration tests and checks**
+The report must contain:
+
+```python
+{
+    "schema_version": REPORT_SCHEMA,
+    "run_id": run_id,
+    "started_at": format_manifest_timestamp(started_at),
+    "completed_at": format_manifest_timestamp(completed_at),
+    "dry_run": request.dry_run,
+    "overall_status": overall_status,
+    "exit_code": exit_code,
+    "source_endpoint_sha256": (
+        config.source_endpoint_sha256 if config is not None else None
+    ),
+    "source_bucket": config.bucket if config is not None else None,
+    "cache_profile": CACHE_PROFILE,
+    "filters": {
+        "include_simfile_ids": sorted(request.include_simfile_ids),
+        "exclude_simfile_ids": sorted(request.exclude_simfile_ids),
+    },
+    "network": {
+        "head_concurrency": config.head_concurrency if config is not None else None,
+        "download_concurrency": (
+            config.download_concurrency if config is not None else None
+        ),
+        "connect_timeout_seconds": (
+            config.connect_timeout_seconds if config is not None else None
+        ),
+        "read_timeout_seconds": (
+            config.read_timeout_seconds if config is not None else None
+        ),
+        "retry_mode": "standard" if config is not None else None,
+        "max_attempts": config.max_attempts if config is not None else None,
+    },
+    "artifacts": {
+        "corpus_version": corpus_version,
+        "manifest_sha256": manifest_sha256,
+        "manifest_path": relative_manifest_path,
+    },
+    "counters": asdict(counters),
+    "cache_misses_by_reason": {
+        "remote_changed": remote_changed_count,
+        "missing": missing_count,
+        "size_mismatch": size_mismatch_count,
+        "sha256_mismatch": sha256_mismatch_count,
+    },
+    "malformed_root_keys": malformed_root_keys,
+    "ambiguous_prefixes": ambiguous_prefixes,
+    "simfiles": report_rows,
+    "errors": top_level_errors,
+}
+```
+
+Canonicalize reports and pointers with the same JSON settings as manifests. Report
+rows may include cache action and cache miss reason, but never credentials or raw
+SDK exceptions. Sort report rows numerically, object actions by exact key, error
+lists by the manifest error sort key, and counter dictionaries by key through
+canonical JSON.
+
+Use these fixed counter keys: `simfiles_discovered`, `simfiles_included`,
+`simfiles_excluded_by_filter`, `simfiles_empty`, `objects_listed`,
+`objects_selected`, `cache_hits`, `downloads_planned`, `downloads_completed`,
+`downloads_failed`, `download_bytes_planned`, and `download_bytes_completed`.
+`simfiles_discovered` counts valid, non-ambiguous remote prefixes before filters;
+`simfiles_included` counts final rows, including explicitly requested absent rows;
+`objects_listed` counts every root-list object, including malformed and quarantined
+keys; the remaining fields derive from the filtered rows and `CacheAction` records.
+When fatal configuration fails before source identity exists, serialize
+`source_endpoint_sha256` and `source_bucket` as `None`; never substitute the raw
+invalid value.
+
+Publish the report with temp-file write, file `fsync`, `os.replace`, and parent
+directory `fsync`. Then atomically publish `latest-report.json` containing report
+schema, relative report path, overall status, exit code, corpus version, report
+SHA-256, and completion time.
+
+If report publication itself fails, do not expose the raw exception. Return a
+`SyncOutcome` with exit `2`, no report path, and one `artifact_write_failed` error so
+the CLI can print a single sanitized fallback line.
+
+- [ ] **Step 5: Implement bounded operator progress**
+
+Emit progress only through the callback, never directly from domain modules.
+Emit:
+
+- one event on entry to configuration, inventory, metadata, cache, manifest, and
+  report phases;
+- item progress every 100 completed objects, at the final item, or when at
+  least five seconds elapsed since the prior item event;
+- a final `complete`, `partial`, `failed`, `dry_run_complete`, or
+  `dry_run_partial` phase.
+
+Messages may contain phase names, counts, and byte totals only. They must not contain
+simfile IDs, object keys, endpoint URLs, credentials, headers, signed query
+parameters, error details, or raw exception text. Test the item throttle with an
+injected monotonic clock instead of sleeping.
+
+- [ ] **Step 6: Run orchestration tests and lint**
 
 Run:
 
 ```bash
-rtk uv run pytest tests/benchmark/test_r2_corpus_sync.py -q
-rtk uv run black src/benchmark/r2_corpus_sync.py \
-  tests/benchmark/test_r2_corpus_sync.py
-rtk uv run ruff check src/benchmark/r2_corpus_sync.py \
-  tests/benchmark/test_r2_corpus_sync.py
+rtk uv run --extra r2 pytest tests/benchmark/test_r2_corpus_sync.py -q
+rtk uv run ruff check src/benchmark/r2_corpus_sync.py tests/benchmark/test_r2_corpus_sync.py
+rtk uv run black --check src/benchmark/r2_corpus_sync.py tests/benchmark/test_r2_corpus_sync.py
 ```
 
-Expected: all orchestration tests pass.
+Expected: complete, partial, failed, dry-run, locking, reporting, progress,
+redaction, and repeatability tests pass without live credentials.
 
-- [ ] **Step 7: Commit orchestration and reports**
-
-Run:
+- [ ] **Step 7: Commit the transaction orchestrator**
 
 ```bash
 rtk git add src/benchmark/r2_corpus_sync.py tests/benchmark/test_r2_corpus_sync.py
@@ -1822,375 +2418,417 @@ rtk git commit -m "feat: orchestrate R2 corpus synchronization"
 
 ---
 
-### Task 8: Expose the CLI and document the workflow
+### Task 9: Expose the Click command and document the operator contract
 
 **Files:**
-- Create: `src/cli/r2_corpus.py`
 - Modify: `src/cli/benchmark.py`
 - Modify: `tests/test_cli_benchmark.py`
-- Modify: `docs/drumery-dtx-midi-benchmarking-reference.md`
+- Modify: `docs/drumery-dtx-midi-benchmarking-reference.md:365`
 
 **Interfaces:**
-- Consumes: `R2Config`, `SyncOptions`, `sync_r2_corpus`
-- Produces: Click command `sync-r2-corpus`
-- Produces: documented operator commands and artifact layout
+- Consumes: Click options and R2 environment variables.
+- Produces: a `SyncRequest`, sanitized stderr progress, a concise stdout summary,
+  and explicit Click exit codes.
 
-- [ ] **Step 1: Write failing CLI help and validation tests**
+- [ ] **Step 1: Write failing command registration and option tests**
 
-Add to `tests/test_cli_benchmark.py`:
+Append these imports and tests to `tests/test_cli_benchmark.py`:
 
 ```python
-def test_sync_r2_corpus_help_lists_safe_configuration_options():
-    result = CliRunner().invoke(main, ["benchmark", "sync-r2-corpus", "--help"])
+from src.benchmark.r2_corpus_models import (
+    OverallStatus,
+    PublishedManifest,
+    SyncOutcome,
+)
+from src.cli import benchmark as benchmark_cli
+
+
+def test_sync_r2_corpus_help_lists_local_options_without_endpoint_flag():
+    result = runner.invoke(main, ["benchmark", "sync-r2-corpus", "--help"])
 
     assert result.exit_code == 0
+    assert "--cache-dir" in result.output
+    assert "--output-dir" in result.output
     assert "--include-simfile-id" in result.output
     assert "--exclude-simfile-id" in result.output
     assert "--provenance-file" in result.output
     assert "--dry-run" in result.output
-    assert "secret" not in result.output.lower()
-    assert "access-key" not in result.output.lower()
+    assert "--profile" not in result.output
+    assert "--endpoint" not in result.output
 
 
-def test_sync_r2_corpus_requires_endpoint_without_printing_values(monkeypatch):
-    monkeypatch.delenv("CRUX_R2_ENDPOINT_URL", raising=False)
-    result = CliRunner().invoke(main, ["benchmark", "sync-r2-corpus", "--dry-run"])
+def make_outcome(status: OverallStatus, tmp_path: Path) -> SyncOutcome:
+    exit_code = {
+        "complete": 0,
+        "partial": 1,
+        "failed": 2,
+    }[status]
+    report_path = tmp_path / "report.json"
+    report_path.write_text("{}\n", encoding="utf-8")
+    manifest = None
+    if status != "failed":
+        manifest_path = tmp_path / "manifest.jsonl"
+        manifest_path.write_text("{}\n", encoding="utf-8")
+        manifest = PublishedManifest(
+            corpus_version=f"sha256:{'a' * 64}",
+            manifest_sha256="b" * 64,
+            relative_path="manifests/test.jsonl",
+            path=manifest_path,
+            latest_path=tmp_path / "latest.json",
+        )
+    return SyncOutcome(status, exit_code, report_path, manifest)
 
-    assert result.exit_code != 0
-    assert "--endpoint-url" in result.output
-    assert "AWS_SECRET_ACCESS_KEY" not in result.output
+
+@pytest.mark.parametrize(
+    ("outcome_status", "expected_exit", "exception_type"),
+    [("complete", 0, None), ("partial", 1, SystemExit), ("failed", 2, SystemExit)],
+)
+def test_sync_r2_corpus_maps_outcome_to_explicit_exit(
+    monkeypatch, tmp_path, outcome_status, expected_exit, exception_type
+):
+    monkeypatch.setattr(
+        benchmark_cli,
+        "sync_r2_corpus",
+        lambda request, progress: make_outcome(outcome_status, tmp_path),
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "sync-r2-corpus",
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--output-dir",
+            str(tmp_path / "output"),
+        ],
+    )
+
+    assert result.exit_code == expected_exit
+    if exception_type is None:
+        assert result.exception is None
+    else:
+        assert type(result.exception) is exception_type
 ```
 
-Add injected-service CLI tests by monkeypatching
-`src.cli.r2_corpus.sync_r2_corpus` and asserting:
+Also cover:
 
-- repeated include/exclude IDs become `frozenset[int]`;
-- exclude wins in the service result;
-- default output is `artifacts/benchmark/r2-corpus`;
-- default cache is `<output>/cache`;
-- `CRUX_R2_BUCKET` defaults to `simfile-dtx`;
-- complete output exits 0 and prints manifest hash/path;
-- partial output prints the report path and raises `click.ClickException`;
-- dry-run prints planned download/object counts and no manifest claim.
+- repeatable include/exclude filters, exclude precedence, and the inclusive
+  JavaScript-safe integer bounds;
+- default output `artifacts/benchmark/r2-corpus/` and cache
+  `<output-dir>/cache/` resolution;
+- absent and explicit provenance-file handling;
+- dependency/configuration failures exit `2`, not Click's default usage exit;
+- progress uses stderr while the final summary uses stdout;
+- summary includes status, corpus version when present, report path when present,
+  and counts;
+- raw endpoint and credential sentinel strings never appear in either stream;
+- report-write failure prints exactly one sanitized stderr line;
+- dry-run summary states that no manifest was published.
 
-- [ ] **Step 2: Run CLI tests and verify missing command failure**
+- [ ] **Step 2: Add the command with explicit context exits**
 
-Run:
-
-```bash
-rtk uv run pytest tests/test_cli_benchmark.py -q
-```
-
-Expected: the new help test fails with `No such command 'sync-r2-corpus'`.
-
-- [ ] **Step 3: Implement the Click command**
-
-Create `src/cli/r2_corpus.py`:
+Import `sync_r2_corpus` and `ProgressEvent` from `r2_corpus_sync` at module scope.
+That module has no eager boto3/botocore imports, so this keeps the base CLI safe and
+makes the orchestrator directly monkeypatchable in CLI tests. Register:
 
 ```python
-DEFAULT_OUTPUT_DIR = Path("artifacts") / "benchmark" / "r2-corpus"
-
-
-@click.command("sync-r2-corpus")
+@benchmark.command("sync-r2-corpus")
 @click.option(
-    "--endpoint-url",
-    envvar="CRUX_R2_ENDPOINT_URL",
-    required=True,
-    show_envvar=True,
-    help="Cloudflare R2 S3 endpoint; prefer CRUX_R2_ENDPOINT_URL.",
+    "--cache-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Local cache root (default: <output-dir>/cache/).",
 )
 @click.option(
-    "--bucket",
-    envvar="CRUX_R2_BUCKET",
-    default="simfile-dtx",
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=Path("artifacts/benchmark/r2-corpus"),
     show_default=True,
 )
-@click.option("--include-simfile-id", type=click.IntRange(min=0), multiple=True)
-@click.option("--exclude-simfile-id", type=click.IntRange(min=0), multiple=True)
-@click.option("--output-dir", type=click.Path(path_type=Path), default=DEFAULT_OUTPUT_DIR)
-@click.option("--cache-dir", type=click.Path(path_type=Path), required=False)
-@click.option("--provenance-file", type=click.Path(path_type=Path), required=False)
+@click.option(
+    "--include-simfile-id",
+    "include_simfile_ids",
+    type=click.IntRange(0, MAX_SIMFILE_ID),
+    multiple=True,
+)
+@click.option(
+    "--exclude-simfile-id",
+    "exclude_simfile_ids",
+    type=click.IntRange(0, MAX_SIMFILE_ID),
+    multiple=True,
+)
+@click.option(
+    "--provenance-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+)
 @click.option("--dry-run", is_flag=True)
+@click.pass_context
 def sync_r2_corpus_command(
-    endpoint_url: str,
-    bucket: str,
-    include_simfile_id: tuple[int, ...],
-    exclude_simfile_id: tuple[int, ...],
-    output_dir: Path,
+    ctx: click.Context,
     cache_dir: Path | None,
+    output_dir: Path,
+    include_simfile_ids: tuple[int, ...],
+    exclude_simfile_ids: tuple[int, ...],
     provenance_file: Path | None,
     dry_run: bool,
 ) -> None:
-    """Inventory R2 simfiles and publish a verified, immutable base manifest."""
-    try:
-        config = R2Config.from_values(endpoint_url, bucket)
-    except ValueError as error:
-        raise click.ClickException(str(error)) from None
-    resolved_cache_dir = cache_dir or output_dir / "cache"
-    outcome = sync_r2_corpus(
-        SyncOptions(
-            config=config,
-            output_dir=output_dir,
-            cache_dir=resolved_cache_dir,
-            provenance_file=provenance_file,
-            include_ids=frozenset(include_simfile_id),
-            exclude_ids=frozenset(exclude_simfile_id),
-            dry_run=dry_run,
-        )
+    request = SyncRequest(
+        cache_dir=output_dir / "cache" if cache_dir is None else cache_dir,
+        output_dir=output_dir,
+        include_simfile_ids=frozenset(include_simfile_ids),
+        exclude_simfile_ids=frozenset(exclude_simfile_ids),
+        provenance_file=provenance_file,
+        dry_run=dry_run,
     )
-    summary = outcome.summary
-    click.echo(
-        f"Inventoried {summary.simfiles} simfile(s), {summary.objects} object(s); "
-        f"cache hits {summary.cache_hits}, downloads {summary.completed_downloads}, "
-        f"planned {summary.planned_downloads}"
-    )
-    if outcome.publication is not None:
-        click.echo(
-            f"Manifest {outcome.publication.manifest_sha256} "
-            f"at {outcome.publication.manifest_path}"
-        )
-    click.echo(f"Sync report: {outcome.report_path}")
-    if not outcome.success:
-        raise click.ClickException("R2 corpus synchronization completed with errors")
+    outcome = sync_r2_corpus(request, progress=_emit_progress)
+    _emit_sync_summary(outcome)
+    if outcome.exit_code:
+        ctx.exit(outcome.exit_code)
 ```
 
-The endpoint option exists for controlled automation but its value must never be echoed.
-There are no access-key, secret-key, session-token, signed-URL, or credential-file
-options.
+Do not add endpoint, credential, profile, concurrency, timeout, retry, or maximum
+simfile flags.
 
-Construct `R2Config`, derive the default cache directory, invoke the service, print a
-concise safe summary, and raise `click.ClickException` after printing the report path
-when `outcome.success` is false.
+`_emit_progress` uses `click.echo(message, err=True)`. `_emit_sync_summary` uses
+`click.echo` for the concise summary and reads counts only from
+`outcome.counters`; it does not parse the report. Only a missing-report fatal outcome
+emits one sanitized stderr fallback line. Do not raise `click.ClickException`.
 
-Register it in `src/cli/benchmark.py`:
+- [ ] **Step 3: Run CLI tests before editing documentation**
 
-```python
-from src.cli.r2_corpus import sync_r2_corpus_command
-
-benchmark.add_command(sync_r2_corpus_command)
-```
-
-- [ ] **Step 4: Document environment, commands, artifacts, and rights**
-
-Add an "Authoritative R2 corpus inventory" section before the existing local
-`prepare-corpus` workflow in `docs/drumery-dtx-midi-benchmarking-reference.md`. Include:
+Run:
 
 ```bash
-export CRUX_R2_ENDPOINT_URL=https://ACCOUNT_ID.r2.cloudflarestorage.com
-export CRUX_R2_BUCKET=simfile-dtx
-export AWS_ACCESS_KEY_ID=REDACTED
-export AWS_SECRET_ACCESS_KEY=REDACTED
+rtk uv run --extra r2 pytest tests/test_cli_benchmark.py -q
+rtk uv run ruff check src/cli/benchmark.py tests/test_cli_benchmark.py
+rtk uv run black --check src/cli/benchmark.py tests/test_cli_benchmark.py
+```
 
-uv run crux benchmark sync-r2-corpus \
+Expected: existing benchmark commands and new `sync-r2-corpus` tests pass.
+
+- [ ] **Step 4: Document installation, configuration, and artifacts**
+
+Add an “R2 corpus inventory” subsection to
+`docs/drumery-dtx-midi-benchmarking-reference.md`. Include:
+
+```bash
+rtk uv pip install -e '.[r2]'
+
+export CRUX_R2_ENDPOINT_URL="https://<account-id>.r2.cloudflarestorage.com"
+export AWS_ACCESS_KEY_ID="<access-key-id>"
+export AWS_SECRET_ACCESS_KEY="<secret-access-key>"
+# Export AWS_SESSION_TOKEN as well when the credential provider requires it.
+export CRUX_R2_BUCKET="<bucket>"
+
+rtk uv run --extra r2 crux benchmark sync-r2-corpus \
   --provenance-file config/corpus-provenance.json \
   --dry-run
-
-uv run crux benchmark sync-r2-corpus \
+rtk uv run --extra r2 crux benchmark sync-r2-corpus \
   --provenance-file config/corpus-provenance.json
 ```
 
-The documentation must state:
+Document:
 
-- use a bucket-scoped read-only token;
-- shell examples use `REDACTED`, never real values;
-- the initial profile caches chart-definition text only;
-- `latest.json` is not an immutable benchmark input;
-- benchmark runs must record `manifests/<sha256>.jsonl`;
-- unknown rights metadata permits private inventory but not public redistribution;
-- expected artifact layout and sync report locations.
+- R2 is the sole content authority for this stage;
+- environment-only endpoint and credential configuration;
+- the optional extra's boto3, botocore, s3transfer, jmespath, and urllib3
+  installation footprint, which remains outside the base runtime;
+- optional timeout, retry, and concurrency environment variables and their
+  defaults from `R2Config`;
+- exact local default paths;
+- root discovery, ambiguity quarantine, marker-only `empty`, and include/exclude
+  precedence;
+- the fixed `setdef_dtx_txt_v1` profile;
+- SHA-256 cache layout and resume-by-rerun behavior;
+- the cache index as local non-authoritative state;
+- dry-run mutation boundaries;
+- immutable manifest, `latest.json`, timestamped report, and
+  `latest-report.json` roles;
+- the requirement to check `latest.json.overall_status == "complete"` and then pin
+  the immutable manifest path rather than treating the pointer itself as input;
+- exits `0`, `1`, and `2`;
+- provenance edits intentionally re-key the corpus version;
+- `version` is reserved and always null in v1;
+- provider checksums are intentionally absent;
+- chart selection, DTX parsing, audio selection, inference, and scoring remain
+  HPA-322 responsibilities;
+- a real credentialed smoke run is required before acceptance but credentials
+  must never be committed or pasted into reports.
 
-- [ ] **Step 5: Run CLI and documentation checks**
+- [ ] **Step 5: Verify the rendered help and documentation text**
 
 Run:
 
 ```bash
-rtk uv run pytest tests/test_cli_benchmark.py -q
-rtk uv run crux benchmark sync-r2-corpus --help
-rtk uv run black src/cli/r2_corpus.py src/cli/benchmark.py tests/test_cli_benchmark.py
-rtk uv run ruff check src/cli/r2_corpus.py src/cli/benchmark.py tests/test_cli_benchmark.py
+rtk uv run --extra r2 crux benchmark sync-r2-corpus --help
+rtk rg -n "sync-r2-corpus|latest-report|overall_status|setdef_dtx_txt_v1|HPA-322" \
+  docs/drumery-dtx-midi-benchmarking-reference.md
 ```
 
-Expected: CLI tests pass, help contains no credential-valued options, and formatting
-checks succeed.
+Expected: help exposes only the documented local options and the reference
+contains every artifact/status boundary.
 
-- [ ] **Step 6: Commit CLI and documentation**
-
-Run:
+- [ ] **Step 6: Commit the CLI and operator documentation**
 
 ```bash
-rtk git add src/cli/r2_corpus.py src/cli/benchmark.py tests/test_cli_benchmark.py \
+rtk git add src/cli/benchmark.py tests/test_cli_benchmark.py \
   docs/drumery-dtx-midi-benchmarking-reference.md
 rtk git commit -m "feat: expose R2 corpus sync command"
 ```
 
 ---
 
-### Task 9: Verify the full implementation and production R2 behavior
+### Task 10: Prove end-to-end repeatability and run the full quality gate
 
 **Files:**
-- Modify only if a verification failure exposes a scoped HPA-321 defect.
+- Create: `tests/benchmark/test_r2_corpus_acceptance.py`
 
 **Interfaces:**
-- Consumes: complete HPA-321 CLI and artifact contract
-- Produces: verified local test stack and credential-gated production evidence
+- Consumes: only the public `sync_r2_corpus` entry point and an in-memory fake
+  object store.
+- Produces: cross-module acceptance proof and the final local verification record.
 
-- [ ] **Step 1: Run the complete HPA-321 test slice**
+- [ ] **Step 1: Write a cross-module deterministic acceptance test**
+
+Create a fake corpus containing:
+
+- `1/set.def`, `1/main.DTX`, and `1/音源/readme.TXT`;
+- nested zero-byte folder markers;
+- `2/chart.dtx`;
+- `3/` with markers only;
+- ambiguous `4/` and `04/`;
+- a non-selected audio object;
+- paginated listing boundaries.
+
+Run the public orchestrator three times:
+
+1. a cold real run into empty cache/output directories;
+2. a warm real run with the identical remote fixture;
+3. a real run after changing one chart body and matching remote metadata.
+
+Assert:
+
+```python
+assert first.exit_code == 1
+assert second.exit_code == 1
+assert first.manifest is not None
+assert second.manifest is not None
+assert first.manifest.corpus_version == second.manifest.corpus_version
+assert first.manifest.path.read_bytes() == second.manifest.path.read_bytes()
+assert second_report["counters"]["cache_hits"] == 4
+assert third.manifest is not None
+assert third.manifest.corpus_version != second.manifest.corpus_version
+assert third.manifest.path != second.manifest.path
+assert read_latest(output_dir)["corpus_version"] == third.manifest.corpus_version
+```
+
+The fixture is partial because aliases `4/` and `04/` are quarantined. Also assert
+that simfile `3` is `empty`, exact non-ASCII keys survive, bodies are extensionless
+and content-addressed, the index is canonical JSON, provenance and error changes
+alter identity, and neither reports nor manifests contain the secret sentinel or
+raw endpoint. After the third run, assert the second manifest and the prior changed
+object's cache body still exist with their original bytes.
+
+- [ ] **Step 2: Add a base-install import boundary test**
+
+Run this subprocess test without requesting the `r2` extra:
+
+```python
+def test_base_cli_import_does_not_import_boto3():
+    code = (
+        "import sys; import src.cli.main; "
+        "assert 'boto3' not in sys.modules; "
+        "assert 'botocore' not in sys.modules"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+```
+
+This verifies lazy imports even when the developer environment happens to have
+boto3 installed.
+
+- [ ] **Step 3: Run the focused HPA-321 suite**
 
 Run:
 
 ```bash
-rtk uv run pytest \
+rtk uv run --extra r2 pytest \
   tests/benchmark/test_r2_corpus_models.py \
-  tests/benchmark/test_r2_store.py \
   tests/benchmark/test_r2_inventory.py \
   tests/benchmark/test_corpus_provenance.py \
   tests/benchmark/test_corpus_cache.py \
   tests/benchmark/test_corpus_manifest.py \
   tests/benchmark/test_r2_corpus_sync.py \
+  tests/benchmark/test_r2_corpus_acceptance.py \
   tests/test_cli_benchmark.py -q
 ```
 
-Expected: all HPA-321 and benchmark CLI tests pass.
+Expected: the complete local HPA-321 suite passes without network access or live
+credentials.
 
-- [ ] **Step 2: Run the repository verification stack**
+- [ ] **Step 4: Run the repository quality gate**
 
 Run:
 
 ```bash
-rtk uv run pytest
+rtk uv run --extra r2 pytest
 rtk uv run ruff check src tests
 rtk uv run black --check src tests
-rtk uv run pylint src/app src/cli src/benchmark
+rtk uv run --extra r2 pylint src/app src/cli src/benchmark
 ```
 
-Expected: every command exits 0. If Pylint exposes pre-existing unrelated failures,
-record the exact command and baseline evidence; do not broaden HPA-321 into unrelated
-cleanup.
+Fix only HPA-321 regressions. If an unrelated pre-existing failure appears, record
+the exact command and failure in the handoff without broadening this implementation.
 
-- [ ] **Step 3: Inspect the diff for secret and path leaks**
+- [ ] **Step 5: Perform the credentialed acceptance smoke check**
 
-Run:
-
-```bash
-rtk rg -n -P \
-  "AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)=(?!REDACTED(?:$|\\s))|X-Amz-Signature=" \
-  src tests config docs/drumery-dtx-midi-benchmarking-reference.md
-rtk rg -n \
-  "https://[a-f0-9]{32}\\.r2\\.cloudflarestorage\\.com" \
-  src tests config docs/drumery-dtx-midi-benchmarking-reference.md
-rtk git diff --check origin/main...HEAD
-```
-
-Expected: no real credential, signature, or account-bearing endpoint is committed; the
-documentation endpoint uses `ACCOUNT_ID` and credential values use `REDACTED`.
-
-- [ ] **Step 4: Run a credential-gated include dry-run**
-
-With `CRUX_R2_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY` configured
-outside Git, run:
+With operator-provided R2 environment variables present only in the shell, set
+`CRUX_R2_SMOKE_ID` to a numeric simfile ID already known to contain nested and
+non-ASCII keys:
 
 ```bash
-rtk uv run crux benchmark sync-r2-corpus \
+rtk uv run --extra r2 crux benchmark sync-r2-corpus \
+  --include-simfile-id "$CRUX_R2_SMOKE_ID" \
   --provenance-file config/corpus-provenance.json \
-  --include-simfile-id 116 \
   --dry-run
-```
-
-Expected: the report contains exact nested keys or an explicit `empty` result for
-simfile 116, planned chart-definition downloads, zero GET/download counts, and no
-manifest.
-
-- [ ] **Step 5: Run a full production dry-run**
-
-Run:
-
-```bash
-rtk uv run crux benchmark sync-r2-corpus \
+rtk uv run --extra r2 crux benchmark sync-r2-corpus \
+  --include-simfile-id "$CRUX_R2_SMOKE_ID" \
+  --provenance-file config/corpus-provenance.json
+rtk uv run --extra r2 crux benchmark sync-r2-corpus \
+  --include-simfile-id "$CRUX_R2_SMOKE_ID" \
+  --provenance-file config/corpus-provenance.json
+rtk uv run --extra r2 crux benchmark sync-r2-corpus \
   --provenance-file config/corpus-provenance.json \
   --dry-run
 ```
 
-Expected: every valid numeric prefix is inventoried; malformed, ambiguous, inaccessible,
-and empty cases are explicit; nested and non-ASCII keys remain exact; no manifest or
-cache mutation occurs.
+Verify:
 
-- [ ] **Step 6: Perform the first real chart-definition sync**
+- the small dry-run performs listing/HEAD but no GET or corpus-state mutation;
+- the first real run publishes cache, manifest, report, and both pointers;
+- every selected cached body recomputes to its manifest SHA-256 and byte count;
+- the second real run reports cache hits and reuses the exact immutable manifest;
+- exit code and `latest.json.overall_status` agree;
+- no credential or raw endpoint appears in terminal output or published JSON;
+- the final command completes a full-corpus dry-run before the first full production
+  synchronization;
+- the observed real R2 ETag forms are recorded in the acceptance notes, and a real
+  weak-ETag object exercises the metadata-verified path when available.
 
-Run:
+Do not fabricate this result when credentials are unavailable. Report the local
+fake-store proof separately from the pending live smoke requirement.
 
-```bash
-rtk uv run crux benchmark sync-r2-corpus \
-  --provenance-file config/corpus-provenance.json
-```
-
-Expected: selected `set.def`, `.dtx`, and `.txt` bodies are SHA-256 verified; the
-immutable JSONL manifest, cache index, sync report, `latest.json`, and
-`latest-report.json` exist; any partial failure is explicit and returns nonzero.
-
-- [ ] **Step 7: Repeat the real sync to prove idempotence**
-
-Run the same command again:
+- [ ] **Step 6: Commit the acceptance coverage**
 
 ```bash
-rtk uv run crux benchmark sync-r2-corpus \
-  --provenance-file config/corpus-provenance.json
+rtk git add tests/benchmark/test_r2_corpus_acceptance.py
+rtk git commit -m "test: cover R2 corpus sync acceptance"
 ```
-
-Expected: zero body downloads, verified cache hits for every previously synchronized
-selected object, and the same corpus version, manifest SHA-256, and immutable manifest
-bytes as Step 6.
-
-- [ ] **Step 8: Verify every manifest cache reference**
-
-Run the manifest verifier against the produced default artifacts:
-
-```bash
-rtk uv run python -c 'import json; from pathlib import Path; from src.benchmark.corpus_manifest import verify_manifest_cache; root = Path("artifacts/benchmark/r2-corpus"); latest = json.loads((root / "latest.json").read_text(encoding="utf-8")); errors = verify_manifest_cache(root / latest["manifest_path"], root / "cache"); assert not errors, [(error.code, error.object_key) for error in errors]; print("verified manifest cache references")'
-```
-
-Expected: every `cache_status="verified"` row resolves beneath
-`artifacts/benchmark/r2-corpus/cache/`, has the recorded byte count, and hashes to the
-recorded SHA-256.
-
-- [ ] **Step 9: Commit only scoped fixes discovered by final verification**
-
-If Steps 1–8 required an HPA-321 correction, run:
-
-```bash
-rtk git add pyproject.toml uv.lock \
-  src/benchmark/r2_corpus_models.py \
-  src/benchmark/r2_store.py \
-  src/benchmark/r2_inventory.py \
-  src/benchmark/corpus_provenance.py \
-  src/benchmark/corpus_cache.py \
-  src/benchmark/corpus_manifest.py \
-  src/benchmark/r2_corpus_sync.py \
-  src/cli/r2_corpus.py \
-  src/cli/benchmark.py \
-  tests/benchmark/test_r2_corpus_models.py \
-  tests/benchmark/test_r2_store.py \
-  tests/benchmark/test_r2_inventory.py \
-  tests/benchmark/test_corpus_provenance.py \
-  tests/benchmark/test_corpus_cache.py \
-  tests/benchmark/test_corpus_manifest.py \
-  tests/benchmark/test_r2_corpus_sync.py \
-  tests/test_cli_benchmark.py \
-  config/corpus-provenance.json \
-  docs/drumery-dtx-midi-benchmarking-reference.md
-rtk git commit -m "fix: address R2 corpus verification findings"
-```
-
-If no correction was necessary, leave the branch unchanged and record the successful
-commands in the implementation handoff.
-
----
-
-## Reference Documentation
-
-- Cloudflare R2 boto3 setup: <https://developers.cloudflare.com/r2/examples/aws/boto3/>
-- Cloudflare R2 S3 compatibility: <https://developers.cloudflare.com/r2/api/s3/api/>
-- Cloudflare multipart ETag behavior: <https://developers.cloudflare.com/r2/objects/upload-objects/>
-- Boto3 ListObjectsV2 paginator: <https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/paginator/ListObjectsV2.html>
-- Boto3 HeadObject: <https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/head_object.html>
-- Boto3 GetObject and `IfMatch`: <https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/get_object.html>
-- Boto3 credential provider chain: <https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html>
