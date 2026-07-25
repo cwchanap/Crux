@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -9,10 +10,15 @@ from logging import WARNING, getLogger
 from typing import Any, BinaryIO, ContextManager, Protocol
 
 from src.benchmark.r2_corpus_models import (
+    MAX_SIMFILE_ID,
     ErrorCode,
     HeadMetadata,
+    InventoryResult,
     ListedObject,
     R2Config,
+    RemoteObject,
+    SimfileInventory,
+    SyncError,
     parse_etag,
 )
 
@@ -40,6 +46,10 @@ _AUTH_ERROR_CODES = frozenset(
         "TokenRefreshRequired",
     }
 )
+_AMBIGUOUS_PREFIX_MESSAGE = "Multiple exact prefixes normalize to one numeric ID."
+_EMPTY_PREFIX_MESSAGE = "A requested prefix has no objects or only folder markers."
+_MALFORMED_ROOT_KEY_MESSAGE = "A root key cannot be assigned to a valid simfile prefix."
+_HEAD_ERROR_CODES = frozenset({"object_head_failed", "object_metadata_invalid"})
 
 
 @dataclass(frozen=True)
@@ -70,6 +80,186 @@ class R2StoreError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.object_key = object_key
+
+
+def build_inventory(
+    store: R2ObjectStore,
+    include_ids: frozenset[int],
+    exclude_ids: frozenset[int],
+    head_concurrency: int,
+) -> InventoryResult:
+    listed = store.list_objects()
+    groups, malformed_keys, ambiguous_prefixes = _classify_root(listed)
+    ambiguous_ids = frozenset(ambiguous_prefixes)
+    root_errors = _root_errors(malformed_keys, ambiguous_prefixes)
+    selected: list[tuple[int, str, list[ListedObject]]] = []
+    discovered_ids: set[int] = set()
+    excluded_by_filter = 0
+
+    for prefix in sorted(groups):
+        simfile_id = int(prefix[:-1])
+        if simfile_id in ambiguous_ids:
+            continue
+        discovered_ids.add(simfile_id)
+        if simfile_id in exclude_ids or (include_ids and simfile_id not in include_ids):
+            excluded_by_filter += 1
+            continue
+        selected.append((simfile_id, prefix, groups[prefix]))
+
+    selected.extend(
+        (simfile_id, f"{simfile_id}/", [])
+        for simfile_id in sorted(include_ids - exclude_ids - discovered_ids - ambiguous_ids)
+    )
+    simfiles = tuple(
+        _build_simfile_inventory(store, simfile_id, prefix, objects, head_concurrency)
+        for simfile_id, prefix, objects in sorted(selected, key=lambda row: (row[0], row[1]))
+    )
+    return InventoryResult(
+        simfiles=simfiles,
+        malformed_root_keys=malformed_keys,
+        ambiguous_prefixes=ambiguous_prefixes,
+        root_errors=root_errors,
+        simfiles_discovered=len(groups)
+        - sum(len(prefixes) for prefixes in ambiguous_prefixes.values()),
+        simfiles_excluded_by_filter=excluded_by_filter,
+        objects_listed=len(listed),
+    )
+
+
+def _classify_root(
+    listed: tuple[ListedObject, ...],
+) -> tuple[dict[str, list[ListedObject]], tuple[str, ...], dict[int, tuple[str, ...]]]:
+    groups: dict[str, list[ListedObject]] = {}
+    malformed_keys: list[str] = []
+
+    for item in listed:
+        first_segment, separator, _ = item.key.partition("/")
+        if not separator or not first_segment.isascii() or not first_segment.isdigit():
+            malformed_keys.append(item.key)
+            continue
+        simfile_id = int(first_segment)
+        if simfile_id > MAX_SIMFILE_ID:
+            malformed_keys.append(item.key)
+            continue
+        groups.setdefault(f"{first_segment}/", []).append(item)
+
+    prefixes_by_id: dict[int, list[str]] = {}
+    for prefix in groups:
+        prefixes_by_id.setdefault(int(prefix[:-1]), []).append(prefix)
+    ambiguous_prefixes = {
+        simfile_id: tuple(sorted(prefixes))
+        for simfile_id, prefixes in sorted(prefixes_by_id.items())
+        if len(prefixes) > 1
+    }
+    return groups, tuple(sorted(malformed_keys)), ambiguous_prefixes
+
+
+def _build_simfile_inventory(
+    store: R2ObjectStore,
+    simfile_id: int,
+    object_prefix: str,
+    listed: list[ListedObject],
+    head_concurrency: int,
+) -> SimfileInventory:
+    ordered_listed = sorted(listed, key=lambda item: item.key)
+    metadata = _head_metadata(store, ordered_listed, head_concurrency)
+    objects: list[RemoteObject] = []
+    row_errors: list[SyncError] = []
+
+    for item, result in zip(ordered_listed, metadata, strict=True):
+        if isinstance(result, R2StoreError):
+            error = _head_error(item.key, result)
+            objects.append(
+                RemoteObject(
+                    key=item.key,
+                    size=item.size,
+                    etag=item.etag,
+                    etag_is_weak=item.etag_is_weak,
+                    last_modified=item.last_modified,
+                    content_type=None,
+                    errors=(error,),
+                )
+            )
+            row_errors.append(error)
+            continue
+        objects.append(_merge_metadata(item, result))
+
+    if not objects or all(item.size == 0 and item.key.endswith("/") for item in objects):
+        row_errors.append(
+            SyncError("simfile", "empty_prefix", _EMPTY_PREFIX_MESSAGE, object_prefix)
+        )
+        status = "empty"
+    elif row_errors:
+        status = "partial"
+    else:
+        status = "complete"
+    return SimfileInventory(
+        simfile_id=simfile_id,
+        object_prefix=object_prefix,
+        objects=tuple(objects),
+        sync_status=status,
+        sync_errors=tuple(sorted(row_errors, key=_error_sort_key)),
+    )
+
+
+def _head_metadata(
+    store: R2ObjectStore,
+    listed: list[ListedObject],
+    head_concurrency: int,
+) -> list[HeadMetadata | R2StoreError]:
+    if not listed:
+        return []
+    with ThreadPoolExecutor(max_workers=head_concurrency) as executor:
+        futures = [executor.submit(_head_one, store, item.key) for item in listed]
+        return [future.result() for future in futures]
+
+
+def _head_one(store: R2ObjectStore, key: str) -> HeadMetadata | R2StoreError:
+    try:
+        return store.head_object(key)
+    except R2StoreError as error:
+        return error
+
+
+def _merge_metadata(item: ListedObject, metadata: HeadMetadata) -> RemoteObject:
+    return RemoteObject(
+        key=item.key,
+        size=metadata.size if metadata.size is not None else item.size,
+        etag=metadata.etag if metadata.etag is not None else item.etag,
+        etag_is_weak=(
+            metadata.etag_is_weak if metadata.etag_is_weak is not None else item.etag_is_weak
+        ),
+        last_modified=metadata.last_modified or item.last_modified,
+        content_type=metadata.content_type,
+    )
+
+
+def _root_errors(
+    malformed_keys: tuple[str, ...], ambiguous_prefixes: dict[int, tuple[str, ...]]
+) -> tuple[SyncError, ...]:
+    errors = [
+        SyncError("root", "malformed_root_key", _MALFORMED_ROOT_KEY_MESSAGE, key)
+        for key in malformed_keys
+    ]
+    errors.extend(
+        SyncError(
+            "root",
+            "ambiguous_simfile_prefix",
+            f"{_AMBIGUOUS_PREFIX_MESSAGE} ID {simfile_id}: {', '.join(prefixes)}",
+            None,
+        )
+        for simfile_id, prefixes in ambiguous_prefixes.items()
+    )
+    return tuple(sorted(errors, key=_error_sort_key))
+
+
+def _head_error(key: str, error: R2StoreError) -> SyncError:
+    code: ErrorCode = error.code if error.code in _HEAD_ERROR_CODES else "object_head_failed"
+    return SyncError("object", code, _MESSAGES[code], key)
+
+
+def _error_sort_key(error: SyncError) -> tuple[str, str, str, str]:
+    return error.scope, error.code, error.object_key or "", error.message
 
 
 @dataclass(frozen=True)
