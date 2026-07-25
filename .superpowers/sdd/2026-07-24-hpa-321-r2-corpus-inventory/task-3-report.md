@@ -25,3 +25,22 @@
 ## Concerns
 
 - None.
+
+## Fix Round 1
+
+### Implemented
+
+- Normalized SDK HTTP ETags to opaque domain values at the listing, HEAD, and download adapter boundaries, while retaining weakness in `etag_is_weak`.
+- Reconstructed strong `If-Match` headers from the opaque domain value exactly once.
+- Made a failed marker-only HEAD result `partial` while retaining the deterministic `empty_prefix` row error.
+
+### Verification
+
+- `rtk uv run --extra r2 pytest tests/benchmark/test_r2_inventory.py -q` — 28 passed.
+- `rtk uv run ruff check src/benchmark/r2_inventory.py tests/benchmark/test_r2_inventory.py` — passed.
+- `rtk uv run black --check src/benchmark/r2_inventory.py tests/benchmark/test_r2_inventory.py` — passed.
+- `rtk uv run --extra r2 pytest -q` — 255 passed.
+
+### Commit
+
+- `fix: normalize R2 inventory ETags`

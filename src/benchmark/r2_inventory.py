@@ -184,13 +184,16 @@ def _build_simfile_inventory(
             continue
         objects.append(_merge_metadata(item, result))
 
-    if not objects or all(item.size == 0 and item.key.endswith("/") for item in objects):
+    has_object_errors = bool(row_errors)
+    is_empty = not objects or all(item.size == 0 and item.key.endswith("/") for item in objects)
+    if is_empty:
         row_errors.append(
             SyncError("simfile", "empty_prefix", _EMPTY_PREFIX_MESSAGE, object_prefix)
         )
-        status = "empty"
-    elif row_errors:
+    if has_object_errors:
         status = "partial"
+    elif is_empty:
+        status = "empty"
     else:
         status = "complete"
     return SimfileInventory(
@@ -343,7 +346,7 @@ class Boto3R2Store:
     def open_object(self, key: str, if_match: str | None) -> Iterator[ObjectDownload]:
         request = {"Bucket": self.bucket, "Key": key}
         if if_match is not None:
-            request["IfMatch"] = if_match
+            request["IfMatch"] = f'"{if_match}"'
         try:
             response = self.client.get_object(**request)
         except Exception as error:
@@ -380,11 +383,11 @@ class Boto3R2Store:
                 or not isinstance(last_modified, datetime)
             ):
                 raise ValueError
-            _, etag_is_weak = parse_etag(raw_etag)
+            etag, etag_is_weak = parse_etag(raw_etag)
             return ListedObject(
                 key=key,
                 size=size,
-                etag=raw_etag,
+                etag=etag,
                 etag_is_weak=etag_is_weak,
                 last_modified=last_modified,
             )
@@ -522,8 +525,8 @@ def _nullable_etag(value: Any) -> tuple[str | None, bool | None]:
         return None, None
     if not isinstance(value, str):
         raise ValueError
-    _, weak = parse_etag(value)
-    return value, weak
+    etag, weak = parse_etag(value)
+    return etag, weak
 
 
 def _client_error_details(error: Exception) -> tuple[str | None, int | None]:
