@@ -840,15 +840,14 @@ considered fully accepted.
 
 ## Implementation Planning Gate
 
-No implementation plan written before final approval of this revision is
-authoritative. In particular, the previously committed
-`docs/superpowers/plans/2026-07-24-hpa-321-r2-corpus-inventory.md` is superseded and
-must not be executed: it installs `boto3` in the base runtime, exposes the endpoint as
-a CLI flag, uses bare `ClickException` failures, and omits later cache-profile,
-weak-ETag, locking, durability, and report contracts.
+The checked-in `docs/superpowers/plans/2026-07-24-hpa-321-r2-corpus-inventory.md` is
+the authoritative implementation plan for this revision. It has been regenerated from
+the current design and supersedes any earlier draft that installed `boto3` in the base
+runtime, exposed the endpoint as a CLI flag, used bare `ClickException` failures, or
+omitted the cache-profile, weak-ETag, locking, durability, and report contracts.
 
-After this design is approved, the replacement plan must be regenerated from the
-current document rather than patched task-by-task from the superseded plan.
+No earlier plan draft is authoritative. Execute only the checked-in plan above; do not
+patch or rederive it from superseded drafts.
 
 ## Dependencies
 

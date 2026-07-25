@@ -926,7 +926,9 @@ Classification rules:
 8. Count valid, non-quarantined discovered simfiles removed by filters.
 9. Record total root objects and valid, non-quarantined discovered simfiles before
    filters.
-10. Add requested-but-absent IDs as canonical `<id>/` empty rows.
+10. Derive requested-but-absent IDs as `include_ids - exclude_ids - discovered_ids`,
+    preserving exclude precedence over include, and add each as a canonical `<id>/`
+    empty row. Excluded IDs never produce absent rows even when explicitly included.
 
 - [ ] **Step 4: Implement bounded HEAD merge and row statuses**
 
@@ -1361,6 +1363,8 @@ def cache_writer_lock(cache_dir: Path) -> Iterator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError("cache_locked") from exc
+        except OSError as exc:
+            raise RuntimeError("unsupported_platform") from exc
         yield
     finally:
         handle.close()
@@ -1503,14 +1507,16 @@ def test_strong_etag_uses_if_match_and_weak_etag_does_not(tmp_path: Path):
     assert strong_store.open_calls[0].if_match == '"etag"'
 
     weak_store = FakeStore(body=b"weak", response_etag='W/"etag"')
-    sync_cache(
-        (simfile(remote_object(etag_is_weak=True)),),
+    weak_result = sync_cache(
+        (simfile(remote_object(size=4, etag_is_weak=True)),),
         weak_store,
         empty_index(tmp_path),
         config(),
         False,
     )
     assert weak_store.open_calls[0].if_match is None
+    assert weak_result.simfiles[0].objects[0].cache_status == "verified"
+    assert weak_result.actions[0].action == "downloaded"
 ```
 
 Add cases for:
@@ -1652,7 +1658,13 @@ rtk git commit -m "feat: synchronize selected R2 corpus files"
 
 Create `tests/benchmark/test_corpus_manifest.py`. Add compact constructors for
 `RemoteObject`, `SimfileInventory`, and `CacheSyncResult` at the top of the file so
-every test builds complete records without mocks hidden in another suite.
+every test builds complete records without mocks hidden in another suite. The
+`render_for_action` helper routes through `sync_cache`, so also import
+`sync_cache`, `CacheIndexStore`, `CacheIndexEntry`, `R2Config`, and
+`ObjectDownload` from `src.benchmark.corpus_cache` and `r2_corpus_models`, plus
+`contextmanager`, `BytesIO`, `sha256`, and `Path` for the in-file fakes. Define a
+local `OpenCall` record for the fake store's call log rather than importing it
+from another test suite.
 
 ```python
 FIXED_TIME = datetime(2026, 7, 25, 1, 2, 3, tzinfo=timezone.utc)
@@ -1709,12 +1721,28 @@ def render_fixture(
     return render_manifest(rows)
 
 
-def render_for_action(action: CacheActionName) -> RenderedManifest:
-    simfiles = (make_simfile(),)
-    cache_result = CacheSyncResult(
-        simfiles,
-        (CacheAction("2/chart.dtx", action, 5),),
+def render_for_action(action: CacheActionName, tmp_path: Path) -> RenderedManifest:
+    # Route through sync_cache so downloaded and cache_hit actions are translated
+    # into identical durable (verified) state before rendering, rather than
+    # bypassing the cache-synchronization path by handing build_manifest_rows
+    # manually-constructed simfiles that already claim "verified".
+    body = b"chart"
+    store = _ManifestFakeStore(body=body)
+    if action == "cache_hit":
+        index = _seeded_manifest_index(tmp_path, body=body)
+    else:
+        index = CacheIndexStore.load(tmp_path)
+
+    cache_result = sync_cache(
+        (make_simfile(),),
+        store,
+        index,
+        _manifest_config(),
+        False,
     )
+    assert cache_result.simfiles[0].objects[0].cache_status == "verified"
+    assert cache_result.actions[0].action == action
+
     rows = build_manifest_rows(
         cache_result.simfiles,
         {},
@@ -1722,6 +1750,54 @@ def render_for_action(action: CacheActionName) -> RenderedManifest:
         "simfile-dtx",
     )
     return render_manifest(rows)
+
+
+def _manifest_config() -> R2Config:
+    return R2Config("https://example.invalid", "a" * 64, "simfile-dtx")
+
+
+class _ManifestFakeStore:
+    def __init__(self, *, body: bytes = b"chart"):
+        self._body = body
+        self.open_calls: list[OpenCall] = []
+
+    @contextmanager
+    def open_object(self, key: str, if_match: str | None):
+        self.open_calls.append(OpenCall(key, if_match))
+        yield ObjectDownload(
+            body=BytesIO(self._body),
+            size=len(self._body),
+            etag='"etag"',
+            etag_is_weak=False,
+            last_modified=FIXED_TIME,
+        )
+
+
+@dataclass(frozen=True)
+class OpenCall:
+    key: str
+    if_match: str | None
+
+
+def _seeded_manifest_index(cache_dir: Path, *, body: bytes) -> CacheIndexStore:
+    digest = sha256(body).hexdigest()
+    cache_path = f"sha256/{digest[:2]}/{digest}"
+    (cache_dir / cache_path).parent.mkdir(parents=True, exist_ok=True)
+    (cache_dir / cache_path).write_bytes(body)
+    entry = CacheIndexEntry(
+        source_endpoint_sha256="a" * 64,
+        bucket="simfile-dtx",
+        key="2/chart.dtx",
+        etag="etag",
+        etag_is_weak=False,
+        size=len(body),
+        last_modified="2026-07-25T00:00:00Z",
+        sha256=digest,
+        cache_path=cache_path,
+    )
+    store = CacheIndexStore.load(cache_dir)
+    store.checkpoint(entry)
+    return store
 ```
 
 Cover these cases:
@@ -1771,9 +1847,9 @@ def test_render_manifest_hashes_the_self_reference_free_bytes():
     assert all(row["corpus_version"] == rendered.corpus_version for row in rendered.rows)
 
 
-def test_cache_hit_and_downloaded_actions_have_identical_manifest_identity():
-    downloaded = render_for_action("downloaded")
-    cache_hit = render_for_action("cache_hit")
+def test_cache_hit_and_downloaded_actions_have_identical_manifest_identity(tmp_path: Path):
+    downloaded = render_for_action("downloaded", tmp_path)
+    cache_hit = render_for_action("cache_hit", tmp_path)
 
     assert downloaded.content == cache_hit.content
     assert downloaded.corpus_version == cache_hit.corpus_version
@@ -2363,7 +2439,8 @@ Use these fixed counter keys: `simfiles_discovered`, `simfiles_included`,
 `objects_selected`, `cache_hits`, `downloads_planned`, `downloads_completed`,
 `downloads_failed`, `download_bytes_planned`, and `download_bytes_completed`.
 `simfiles_discovered` counts valid, non-ambiguous remote prefixes before filters;
-`simfiles_included` counts final rows, including explicitly requested absent rows;
+`simfiles_included` counts final rows after exclude precedence, including explicitly
+requested absent rows derived from `include_ids - exclude_ids - discovered_ids`;
 `objects_listed` counts every root-list object, including malformed and quarantined
 keys; the remaining fields derive from the filtered rows and `CacheAction` records.
 When fatal configuration fails before source identity exists, serialize
