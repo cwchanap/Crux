@@ -111,8 +111,8 @@ def _positive_int(environ: Mapping[str, str], name: str, default: int) -> int:
         return default
     try:
         value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a positive integer") from exc
+    except ValueError:
+        raise ValueError(f"{name} must be a positive integer") from None
     if value < 1:
         raise ValueError(f"{name} must be a positive integer")
     return value
@@ -269,6 +269,11 @@ class SyncRequest:
     include_simfile_ids: frozenset[int] = field(default_factory=frozenset)
     exclude_simfile_ids: frozenset[int] = field(default_factory=frozenset)
     dry_run: bool = False
+
+    def __post_init__(self) -> None:
+        simfile_ids = self.include_simfile_ids | self.exclude_simfile_ids
+        if any(simfile_id < 0 or simfile_id > MAX_SIMFILE_ID for simfile_id in simfile_ids):
+            raise ValueError(f"simfile IDs must be in 0..{MAX_SIMFILE_ID}")
 
 
 @dataclass(frozen=True)
