@@ -8,6 +8,7 @@ from src.benchmark.r2_corpus_models import (
     CACHE_PROFILE,
     MAX_SIMFILE_ID,
     R2Config,
+    SyncError,
     SyncRequest,
     format_manifest_timestamp,
     format_report_filename_timestamp,
@@ -138,3 +139,8 @@ def test_etag_and_timestamp_normalization_are_canonical():
 def test_fixed_contract_constants_are_stable():
     assert CACHE_PROFILE == "setdef_dtx_txt_v1"
     assert MAX_SIMFILE_ID == 9_007_199_254_740_991
+
+
+def test_sync_error_rejects_an_empty_object_key_at_the_domain_boundary():
+    with pytest.raises(ValueError, match="object_key must be non-empty or None"):
+        SyncError("object", "object_get_failed", "Safe deterministic message.", "")
