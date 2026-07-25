@@ -36,6 +36,9 @@ dev = [
 tfjs = [
     "tensorflowjs>=4.21.0",
 ]
+r2 = [
+    "boto3>=1.42,<2",
+]
 
 [project.scripts]
 convert-checkpoint = "src.cli.convert:main"
