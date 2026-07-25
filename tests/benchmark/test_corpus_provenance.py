@@ -92,6 +92,60 @@ def test_rejects_malformed_json_with_a_sanitized_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "content",
+    [
+        '{"schema_version":"\\ud800","simfiles":{}}',
+        '{"schema_version":"crux.corpus-provenance/v1","simfiles":{"\\ud800":{}}}',
+        (
+            '{"schema_version":"crux.corpus-provenance/v1","simfiles":{"42":'
+            + '{"\\ud800":"value"}}}'
+        ),
+        (
+            '{"schema_version":"crux.corpus-provenance/v1","simfiles":{"42":'
+            '{"source_origin":"\\ud800"}}}'
+        ),
+    ],
+)
+def test_rejects_every_decoded_string_that_is_not_strict_utf8(content: str, tmp_path: Path) -> None:
+    path = tmp_path / "provenance.json"
+    write_raw_mapping(path, content)
+
+    with pytest.raises(ValueError) as error:
+        load_provenance(path)
+
+    assert str(error.value) == "invalid provenance JSON"
+
+
+def test_normalizes_missing_unreadable_and_undecodable_provenance_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing = tmp_path / "SECRET-missing-provenance.json"
+    unreadable = tmp_path / "SECRET-unreadable-provenance.json"
+    unreadable.mkdir()
+    undecodable = tmp_path / "SECRET-undecodable-provenance.json"
+    undecodable.write_bytes(b"\xff")
+
+    for path in (missing, unreadable, undecodable):
+        with pytest.raises(ValueError) as error:
+            load_provenance(path)
+        assert str(error.value) == "invalid provenance JSON"
+        assert "SECRET" not in str(error.value)
+
+    original_read_text = Path.read_text
+
+    def fail_read(path: Path, *args: object, **kwargs: object) -> str:
+        if path.name == "SECRET-read-failure.json":
+            raise OSError("SECRET raw operating-system detail")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_read)
+    with pytest.raises(ValueError) as error:
+        load_provenance(tmp_path / "SECRET-read-failure.json")
+    assert str(error.value) == "invalid provenance JSON"
+    assert "SECRET" not in str(error.value)
+
+
+@pytest.mark.parametrize(
     ("payload", "message"),
     [
         ([], "unsupported provenance schema_version"),

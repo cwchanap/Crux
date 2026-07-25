@@ -319,6 +319,99 @@ def test_invalid_index_json_and_schema_fail_closed(tmp_path: Path) -> None:
         CacheIndexStore.load(tmp_path)
 
 
+def test_absent_index_is_empty_but_broken_index_symlink_is_invalid(tmp_path: Path) -> None:
+    assert CacheIndexStore.load(tmp_path)._entries == {}
+
+    index_path = tmp_path / "index-v1.json"
+    index_path.symlink_to(tmp_path / "SECRET-missing-index.json")
+
+    with pytest.raises(ValueError) as error:
+        CacheIndexStore.load(tmp_path)
+
+    assert str(error.value) == "invalid cache index JSON"
+    assert "SECRET" not in str(error.value)
+
+
+@pytest.mark.parametrize("leaf_kind", ["symlink", "directory", "fifo"])
+def test_index_load_rejects_non_regular_leaf_without_opening_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    leaf_kind: str,
+) -> None:
+    index_path = tmp_path / "index-v1.json"
+    if leaf_kind == "symlink":
+        target = tmp_path / "SECRET-external-index.json"
+        target.write_text(
+            '{"schema_version":"crux.r2-cache-index/v1","entries":[]}',
+            encoding="utf-8",
+        )
+        index_path.symlink_to(target)
+    elif leaf_kind == "directory":
+        index_path.mkdir()
+    else:
+        os.mkfifo(index_path)
+
+    def forbidden_path_read(*_args, **_kwargs):
+        raise AssertionError("non-regular index leaf must not be opened through pathlib")
+
+    monkeypatch.setattr(Path, "read_text", forbidden_path_read)
+
+    with pytest.raises(ValueError) as error:
+        CacheIndexStore.load(tmp_path)
+
+    assert str(error.value) == "invalid cache index JSON"
+    assert "SECRET" not in str(error.value)
+
+
+def test_index_load_uses_nofollow_descriptor_read_and_checks_binding_around_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    index_path = tmp_path / "index-v1.json"
+    index_path.write_text(
+        '{"schema_version":"crux.r2-cache-index/v1","entries":[]}',
+        encoding="utf-8",
+    )
+    real_open = os.open
+    real_read = os.read
+    open_flags: list[int] = []
+    read_calls = 0
+
+    def tracking_open(path, flags, *args, **kwargs):
+        if Path(path) == index_path:
+            open_flags.append(flags)
+        return real_open(path, flags, *args, **kwargs)
+
+    def swapping_read(descriptor: int, size: int) -> bytes:
+        nonlocal read_calls
+        content = real_read(descriptor, size)
+        if read_calls == 0:
+            replacement = tmp_path / "replacement-index.json"
+            replacement.write_text(
+                '{"schema_version":"crux.r2-cache-index/v1","entries":[]}',
+                encoding="utf-8",
+            )
+            os.replace(replacement, index_path)
+        read_calls += 1
+        return content
+
+    def forbidden_path_read(*_args, **_kwargs):
+        raise AssertionError("cache index must be read through its pinned descriptor")
+
+    monkeypatch.setattr(cache.os, "open", tracking_open)
+    monkeypatch.setattr(cache.os, "read", swapping_read)
+    monkeypatch.setattr(Path, "read_text", forbidden_path_read)
+
+    with pytest.raises(ValueError) as error:
+        CacheIndexStore.load(tmp_path)
+
+    assert str(error.value) == "invalid cache index JSON"
+    assert len(open_flags) == 1
+    assert open_flags[0] & os.O_NOFOLLOW
+    assert read_calls >= 1
+
+
 @pytest.mark.parametrize(
     "cache_path",
     [
@@ -1419,6 +1512,119 @@ def test_download_workers_are_bounded_and_results_remain_input_ordered(
     assert store.maximum_active == 2
     assert [action.object_key for action in result.actions] == [remote.key for remote in objects]
     assert all(action.action == "downloaded" for action in result.actions)
+
+
+def test_download_concurrency_bounds_owned_staging_resources_for_large_corpus(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    concurrency = 3
+    objects = tuple(
+        remote_object(
+            f"42/chart-{index:03}.dtx",
+            size=len(f"42/chart-{index:03}.dtx".encode("utf-8")),
+        )
+        for index in range(37)
+    )
+    store = ConcurrentStore()
+    real_create_temporary = cache._create_temporary_file
+    real_close_temporary = cache._OwnedTemporaryFile.close
+    active_descriptors: set[int] = set()
+    peak_staged_descriptors = 0
+    staged_lock = Lock()
+
+    def tracking_create(parent_fd: int, name: str):
+        nonlocal peak_staged_descriptors
+        temporary = real_create_temporary(parent_fd, name)
+        with staged_lock:
+            active_descriptors.add(temporary.descriptor)
+            peak_staged_descriptors = max(
+                peak_staged_descriptors,
+                len(active_descriptors),
+            )
+        return temporary
+
+    def tracking_close(temporary):
+        was_closed = temporary.closed
+        descriptor = temporary.descriptor
+        real_close_temporary(temporary)
+        if not was_closed:
+            with staged_lock:
+                active_descriptors.discard(descriptor)
+
+    monkeypatch.setattr(cache, "_create_temporary_file", tracking_create)
+    monkeypatch.setattr(cache._OwnedTemporaryFile, "close", tracking_close)
+
+    result = sync_cache(
+        (simfile(*objects),),
+        store,
+        empty_index(tmp_path),
+        config(download_concurrency=concurrency),
+        False,
+    )
+
+    assert store.maximum_active == concurrency
+    assert peak_staged_descriptors <= concurrency
+    assert active_descriptors == set()
+    assert list((tmp_path / "sha256" / ".incoming").iterdir()) == []
+    assert [action.object_key for action in result.actions] == [remote.key for remote in objects]
+    assert all(action.action == "downloaded" for action in result.actions)
+
+
+def test_repair_candidate_runs_before_unrelated_misses_across_batches_and_restores_order(
+    tmp_path: Path,
+) -> None:
+    bodies = {
+        "42/unrelated.dtx": b"other",
+        "42/ordinary-same-digest.dtx": b"chart",
+        "42/repair.dtx": b"chart",
+    }
+    unrelated = remote_object("42/unrelated.dtx")
+    ordinary = remote_object("42/ordinary-same-digest.dtx")
+    repair = remote_object("42/repair.dtx")
+    digest = sha256(bodies[repair.key]).hexdigest()
+    final_path = tmp_path / "sha256" / digest[:2] / digest
+    index = seeded_index(tmp_path, repair, final_path, body=bodies[repair.key])
+    final_path.write_bytes(b"wrong")
+    completions: list[str] = []
+
+    class BodyMapStore:
+        @contextmanager
+        def open_object(self, key: str, if_match: str | None) -> Iterator[ObjectDownload]:
+            del if_match
+            body = bodies[key]
+            yield ObjectDownload(
+                body=BytesIO(body),
+                size=len(body),
+                etag="etag",
+                etag_is_weak=False,
+                last_modified=FIXED_MTIME,
+            )
+            completions.append(key)
+
+    result = sync_cache(
+        (simfile(unrelated, ordinary, repair),),
+        BodyMapStore(),
+        index,
+        config(download_concurrency=1),
+        False,
+    )
+
+    assert completions == [repair.key, unrelated.key, ordinary.key]
+    assert [action.object_key for action in result.actions] == [
+        unrelated.key,
+        ordinary.key,
+        repair.key,
+    ]
+    assert [action.action for action in result.actions] == [
+        "downloaded",
+        "downloaded",
+        "downloaded",
+    ]
+    assert result.simfiles[0].sync_status == "complete"
+    assert final_path.read_bytes() == b"chart"
 
 
 def test_restart_after_checkpoint_becomes_verified_hit(tmp_path: Path) -> None:

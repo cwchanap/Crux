@@ -138,8 +138,14 @@ class CacheIndexStore:
     @classmethod
     def load(cls, cache_dir: Path) -> CacheIndexStore:
         index_path = cache_dir / _INDEX_FILENAME
-        if not index_path.exists():
+        try:
+            index_metadata = os.stat(index_path, follow_symlinks=False)
+        except FileNotFoundError:
             return cls(cache_dir, {})
+        except OSError:
+            raise ValueError("invalid cache index JSON") from None
+        if not stat.S_ISREG(index_metadata.st_mode):
+            raise ValueError("invalid cache index JSON")
         document = _load_index_document(index_path)
         entries = _validated_entries(document)
         return cls(cache_dir, entries)
@@ -312,39 +318,55 @@ def sync_cache(
             misses.append((simfile_index, object_index, remote, validation))
 
     if misses:
-        prepared: list[tuple[tuple[int, int], _PreparedDownload]] = []
+        ordered_misses = sorted(
+            misses,
+            key=lambda item: item[3].state not in {"size_mismatch", "sha256_mismatch"},
+        )
         try:
             with _open_content_directories(index.cache_dir) as directories:
                 with ThreadPoolExecutor(max_workers=config.download_concurrency) as executor:
-                    futures = {
-                        executor.submit(
-                            _prepare_download,
-                            store,
-                            directories,
-                            remote,
-                            validation,
-                        ): (simfile_index, object_index)
-                        for simfile_index, object_index, remote, validation in misses
-                    }
-                    for future in as_completed(futures):
-                        identity = futures[future]
-                        result = future.result()
-                        if isinstance(result, _PreparedDownload):
-                            prepared.append((identity, result))
-                            record_progress(identity, result.size)
-                        else:
-                            object_results[identity] = result.object
-                            actions[identity] = result.action
-                            record_progress(identity, result.action.bytes)
-                prepared.sort(key=lambda item: item[0])
-                for identity, result in _install_prepared_downloads(
-                    prepared,
-                    directories,
-                    index,
-                    config,
-                ).items():
-                    object_results[identity] = result.object
-                    actions[identity] = result.action
+                    for batch_start in range(
+                        0,
+                        len(ordered_misses),
+                        config.download_concurrency,
+                    ):
+                        batch = ordered_misses[
+                            batch_start : batch_start + config.download_concurrency
+                        ]
+                        prepared: list[tuple[tuple[int, int], _PreparedDownload]] = []
+                        try:
+                            futures = {
+                                executor.submit(
+                                    _prepare_download,
+                                    store,
+                                    directories,
+                                    remote,
+                                    validation,
+                                ): (simfile_index, object_index)
+                                for simfile_index, object_index, remote, validation in batch
+                            }
+                            for future in as_completed(futures):
+                                identity = futures[future]
+                                result = future.result()
+                                if isinstance(result, _PreparedDownload):
+                                    prepared.append((identity, result))
+                                    record_progress(identity, result.size)
+                                else:
+                                    object_results[identity] = result.object
+                                    actions[identity] = result.action
+                                    record_progress(identity, result.action.bytes)
+                            prepared.sort(key=lambda item: item[0])
+                            for identity, result in _install_prepared_downloads(
+                                prepared,
+                                directories,
+                                index,
+                                config,
+                            ).items():
+                                object_results[identity] = result.object
+                                actions[identity] = result.action
+                        finally:
+                            for _, download in prepared:
+                                download.temporary.close()
         except (OSError, ValueError):
             error = _download_error("artifact_write_failed", None)
             for simfile_index, object_index, remote, validation in misses:
@@ -359,9 +381,6 @@ def sync_cache(
                 object_results[identity] = result.object
                 actions[identity] = result.action
                 record_progress(identity, result.action.bytes)
-        finally:
-            for _, download in prepared:
-                download.temporary.close()
 
     rebuilt_simfiles = tuple(
         _rebuild_simfile(simfile, simfile_index, object_results)
@@ -1041,11 +1060,41 @@ def cache_writer_lock(cache_dir: Path) -> Iterator[None]:
 
 
 def _load_index_document(index_path: Path) -> object:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise ValueError("invalid cache index JSON")
+    descriptor: int | None = None
     try:
-        content = index_path.read_text(encoding="utf-8")
+        descriptor = os.open(
+            index_path,
+            os.O_RDONLY | os.O_NONBLOCK | no_follow,
+        )
+        _verify_index_binding(index_path, descriptor)
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        _verify_index_binding(index_path, descriptor)
+        content = b"".join(chunks).decode("utf-8", errors="strict")
         return json.loads(content, object_pairs_hook=_unique_object)
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
-        raise ValueError("invalid cache index JSON") from exc
+    except (OSError, UnicodeDecodeError, ValueError):
+        raise ValueError("invalid cache index JSON") from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _verify_index_binding(index_path: Path, descriptor: int) -> None:
+    path_metadata = os.stat(index_path, follow_symlinks=False)
+    descriptor_metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(path_metadata.st_mode)
+        or not stat.S_ISREG(descriptor_metadata.st_mode)
+        or not _same_inode(path_metadata, descriptor_metadata)
+    ):
+        raise OSError("cache index binding changed")
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

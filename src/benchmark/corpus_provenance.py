@@ -38,7 +38,8 @@ def load_provenance(path: Path | None) -> dict[int, ProvenanceRecord]:
 
     try:
         payload = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_JSONObject)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+        _validate_utf8_strings(payload)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, UnicodeEncodeError):
         raise ValueError("invalid provenance JSON") from None
 
     document = _parse_object(
@@ -132,3 +133,17 @@ def _parse_object(
             raise ValueError(duplicate_message)
         parsed[key] = member_value
     return parsed
+
+
+def _validate_utf8_strings(value: object) -> None:
+    if isinstance(value, str):
+        value.encode("utf-8", errors="strict")
+        return
+    if isinstance(value, _JSONObject):
+        for key, member_value in value:
+            _validate_utf8_strings(key)
+            _validate_utf8_strings(member_value)
+        return
+    if isinstance(value, list):
+        for member_value in value:
+            _validate_utf8_strings(member_value)

@@ -411,7 +411,7 @@ class Boto3R2Store:
                 or not key
                 or not _is_nonnegative_int(size)
                 or not isinstance(raw_etag, str)
-                or not isinstance(last_modified, datetime)
+                or not _is_aware_datetime(last_modified)
             ):
                 raise ValueError
             etag, etag_is_weak = parse_etag(raw_etag)
@@ -538,9 +538,18 @@ def _nullable_size(value: Any) -> int | None:
 def _nullable_datetime(value: Any) -> datetime | None:
     if value is None:
         return None
-    if not isinstance(value, datetime):
+    if not _is_aware_datetime(value):
         raise ValueError
     return value
+
+
+def _is_aware_datetime(value: Any) -> bool:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return False
+    try:
+        return value.utcoffset() is not None
+    except Exception:
+        return False
 
 
 def _nullable_string(value: Any) -> str | None:

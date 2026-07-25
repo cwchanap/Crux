@@ -192,6 +192,7 @@ def invoke_sync(
     exclude_simfile_ids: frozenset[int] = frozenset(),
     run_id: str = RUN_ID,
     monotonic=lambda: 0.0,
+    store_factory=None,
 ):
     events = []
     times = iter((STARTED_AT, COMPLETED_AT))
@@ -208,7 +209,7 @@ def invoke_sync(
         request,
         environ=environ,
         dependency_check=lambda: None,
-        store_factory=lambda _config: store,
+        store_factory=store_factory or (lambda _config: store),
         clock=lambda: next(times, COMPLETED_AT),
         monotonic=monotonic,
         run_id_factory=lambda: run_id,
@@ -293,6 +294,47 @@ def test_malformed_provenance_fails_before_network(tmp_path):
     assert outcome.exit_code == 2
     assert store.calls == []
     assert read_report(outcome.report_path)["errors"][0]["code"] == "provenance_invalid"
+
+
+@pytest.mark.parametrize("failure", ["surrogate", "missing"])
+def test_invalid_provenance_fails_before_store_creation_or_cache_mutation(tmp_path, failure):
+    path = tmp_path / "SECRET-provenance.json"
+    if failure == "surrogate":
+        path.write_text(
+            '{"schema_version":"crux.corpus-provenance/v1","simfiles":{"42":'
+            '{"source_origin":"\\ud800"}}}',
+            encoding="utf-8",
+        )
+    store = complete_store()
+    factory_calls = 0
+
+    def store_factory(_config):
+        nonlocal factory_calls
+        factory_calls += 1
+        return store
+
+    outcome, _ = invoke_sync(
+        tmp_path,
+        store,
+        provenance_file=path,
+        store_factory=store_factory,
+    )
+
+    assert outcome.exit_code == 2
+    assert factory_calls == 0
+    assert store.calls == []
+    assert not (tmp_path / "cache").exists()
+    assert not (tmp_path / "output" / "manifests").exists()
+    assert not (tmp_path / "output" / "latest.json").exists()
+    report = read_report(outcome.report_path)
+    assert report["errors"] == [
+        {
+            "scope": "configuration",
+            "code": "provenance_invalid",
+            "object_key": None,
+            "message": "The provenance document is malformed or unsupported.",
+        }
+    ]
 
 
 def test_dry_run_lists_and_heads_but_does_not_get_or_mutate_corpus_state(tmp_path):
