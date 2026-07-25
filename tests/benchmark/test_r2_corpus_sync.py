@@ -230,6 +230,21 @@ def read_report(path: Path | None) -> dict[str, object]:
     return read_json(path)
 
 
+def assert_only_failed_attempt_report(output_dir: Path, report_path: Path | None) -> None:
+    assert report_path is not None
+    reports = sorted((output_dir / "reports").glob("*.json"))
+    assert reports == [report_path]
+    report = read_json(report_path)
+    assert report["overall_status"] == "failed"
+    assert report["exit_code"] == 2
+    assert report["artifacts"] == {
+        "corpus_version": None,
+        "manifest_path": None,
+        "manifest_sha256": None,
+    }
+    assert [error["code"] for error in report["errors"]] == ["artifact_write_failed"]
+
+
 def test_complete_real_run_publishes_cache_manifest_report_and_pointers(tmp_path):
     outcome, events = invoke_sync(tmp_path, complete_store())
 
@@ -624,7 +639,7 @@ def test_latest_report_failure_restores_previous_latest_manifest_pointer(tmp_pat
 
     assert outcome.exit_code == 2
     assert outcome.manifest is None
-    assert outcome.report_path is None
+    assert_only_failed_attempt_report(output_dir, outcome.report_path)
     assert (output_dir / "latest.json").read_bytes() == previous_latest
     assert (output_dir / "latest-report.json").read_bytes() == previous_latest_report
 
@@ -657,7 +672,7 @@ def test_latest_manifest_failure_restores_previous_pointer_before_fatal_report(
 
     assert outcome.exit_code == 2
     assert outcome.manifest is None
-    assert outcome.report_path is None
+    assert_only_failed_attempt_report(output_dir, outcome.report_path)
     assert (output_dir / "latest.json").read_bytes() == previous_latest
     assert (output_dir / "latest-report.json").read_bytes() == previous_latest_report
 
@@ -674,9 +689,9 @@ def test_latest_report_directory_fsync_failure_restores_both_prior_pointers(tmp_
     latest_report_replaced = False
     failed_once = False
 
-    def record_replace(source, destination):
+    def record_replace(source, destination, *args, **kwargs):
         nonlocal latest_report_replaced
-        real_replace(source, destination)
+        real_replace(source, destination, *args, **kwargs)
         if Path(destination).name == "latest-report.json":
             latest_report_replaced = True
 
@@ -694,8 +709,42 @@ def test_latest_report_directory_fsync_failure_restores_both_prior_pointers(tmp_
 
     assert failed_once
     assert outcome.exit_code == 2
-    assert outcome.report_path is None
+    assert_only_failed_attempt_report(output_dir, outcome.report_path)
     assert outcome.manifest is None
+    assert (output_dir / "latest.json").read_bytes() == previous_latest
+    assert (output_dir / "latest-report.json").read_bytes() == previous_latest_report
+
+
+def test_failed_fatal_rewrite_removes_stale_success_report_and_restores_pointers(
+    tmp_path, monkeypatch
+):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    previous_latest = b'{"previous":"manifest"}\n'
+    previous_latest_report = b'{"previous":"report"}\n'
+    (output_dir / "latest.json").write_bytes(previous_latest)
+    (output_dir / "latest-report.json").write_bytes(previous_latest_report)
+    real_publish_latest_report = r2_corpus_sync._publish_latest_report
+    real_publish_report_file = r2_corpus_sync._publish_report_file
+
+    def fail_pointer_after_replacement(*args, **kwargs):
+        real_publish_latest_report(*args, **kwargs)
+        raise OSError("unsafe pointer detail")
+
+    def fail_fatal_rewrite(*args, **kwargs):
+        report = args[3]
+        if report["overall_status"] == "failed":
+            raise OSError("unsafe report detail")
+        return real_publish_report_file(*args, **kwargs)
+
+    monkeypatch.setattr(r2_corpus_sync, "_publish_latest_report", fail_pointer_after_replacement)
+    monkeypatch.setattr(r2_corpus_sync, "_publish_report_file", fail_fatal_rewrite)
+
+    outcome, _ = invoke_sync(tmp_path, complete_store())
+
+    assert outcome.exit_code == 2
+    assert outcome.report_path is None
+    assert list((output_dir / "reports").glob("*.json")) == []
     assert (output_dir / "latest.json").read_bytes() == previous_latest
     assert (output_dir / "latest-report.json").read_bytes() == previous_latest_report
 
@@ -920,6 +969,123 @@ def test_metadata_progress_is_emitted_live_before_a_blocked_head_returns(tmp_pat
     assert metadata == [(1, 2), (2, 2)]
 
 
+def test_phase_progress_callback_failure_is_disabled_without_changing_success(tmp_path):
+    secret = "SECRET phase callback detail"
+    callback_phases: list[str] = []
+    request = SyncRequest(tmp_path / "output", tmp_path / "cache", None)
+    times = iter((STARTED_AT, COMPLETED_AT))
+
+    def fail_first_callback(event):
+        callback_phases.append(event.phase)
+        raise RuntimeError(secret)
+
+    outcome = sync_r2_corpus(
+        request,
+        environ=DEFAULT_ENVIRON,
+        dependency_check=lambda: None,
+        store_factory=lambda _config: complete_store(),
+        clock=lambda: next(times, COMPLETED_AT),
+        run_id_factory=lambda: RUN_ID,
+        progress=fail_first_callback,
+    )
+
+    assert outcome.overall_status == "complete"
+    assert outcome.exit_code == 0
+    assert callback_phases == ["configuration"]
+    assert read_report(outcome.report_path)["overall_status"] == "complete"
+    assert secret not in repr(outcome)
+
+
+def test_live_item_progress_callback_failure_does_not_abort_completed_work(tmp_path):
+    callback_events = []
+    request = SyncRequest(tmp_path / "output", tmp_path / "cache", None, dry_run=True)
+    times = iter((STARTED_AT, COMPLETED_AT))
+
+    def fail_on_metadata_item(event):
+        callback_events.append((event.phase, event.completed))
+        if event.phase == "metadata" and event.completed > 0:
+            raise RuntimeError("SECRET live item callback detail")
+
+    outcome = sync_r2_corpus(
+        request,
+        environ=DEFAULT_ENVIRON,
+        dependency_check=lambda: None,
+        store_factory=lambda _config: complete_store(),
+        clock=lambda: next(times, COMPLETED_AT),
+        run_id_factory=lambda: RUN_ID,
+        progress=fail_on_metadata_item,
+    )
+
+    assert outcome.overall_status == "dry_run_complete"
+    assert outcome.exit_code == 0
+    assert callback_events[-1][0] == "metadata"
+    assert callback_events[-1][1] > 0
+    assert read_report(outcome.report_path)["overall_status"] == "dry_run_complete"
+
+
+def test_fatal_path_progress_callback_failure_preserves_primary_failure(tmp_path):
+    secret = "SECRET fatal callback detail"
+    callback_phases: list[str] = []
+    request = SyncRequest(tmp_path / "output", tmp_path / "cache", None)
+    environ = {
+        "CRUX_R2_ENDPOINT_URL": ENDPOINT,
+        "CRUX_R2_BUCKET": "simfile-dtx",
+    }
+
+    def fail_on_report_phase(event):
+        callback_phases.append(event.phase)
+        if event.phase == "report":
+            raise RuntimeError(secret)
+
+    outcome = sync_r2_corpus(
+        request,
+        environ=environ,
+        dependency_check=lambda: None,
+        store_factory=lambda _config: (_ for _ in ()).throw(
+            R2StoreError("missing_credentials", "unsafe credential detail")
+        ),
+        clock=lambda: STARTED_AT,
+        run_id_factory=lambda: RUN_ID,
+        progress=fail_on_report_phase,
+    )
+
+    assert outcome.overall_status == "failed"
+    assert outcome.exit_code == 2
+    assert [error.code for error in outcome.errors] == ["missing_credentials"]
+    assert callback_phases == ["configuration", "report"]
+    report = read_report(outcome.report_path)
+    assert [error["code"] for error in report["errors"]] == ["missing_credentials"]
+    assert secret not in repr(outcome) + json.dumps(report)
+
+
+def test_fatal_finish_progress_callback_failure_does_not_escape(tmp_path):
+    callback_phases: list[str] = []
+    request = SyncRequest(tmp_path / "output", tmp_path / "cache", None)
+
+    def fail_on_fatal_finish(event):
+        callback_phases.append(event.phase)
+        if event.phase == "failed":
+            raise RuntimeError("SECRET fatal finish callback detail")
+
+    outcome = sync_r2_corpus(
+        request,
+        environ=DEFAULT_ENVIRON,
+        dependency_check=lambda: None,
+        store_factory=lambda _config: (_ for _ in ()).throw(
+            R2StoreError("missing_credentials", "unsafe credential detail")
+        ),
+        clock=lambda: STARTED_AT,
+        run_id_factory=lambda: RUN_ID,
+        progress=fail_on_fatal_finish,
+    )
+
+    assert outcome.overall_status == "failed"
+    assert outcome.exit_code == 2
+    assert [error.code for error in outcome.errors] == ["missing_credentials"]
+    assert callback_phases == ["configuration", "report", "failed"]
+    assert read_report(outcome.report_path)["overall_status"] == "failed"
+
+
 def test_real_writer_lock_is_held_through_latest_report_publication(tmp_path, monkeypatch):
     store = complete_store()
     observed_conflict = False
@@ -956,37 +1122,41 @@ def test_output_publication_lock_rejects_symlink_without_touching_target(tmp_pat
     assert external_target.read_bytes() == b"sentinel"
     assert not (output_dir / "latest.json").exists()
     assert not (output_dir / "latest-report.json").exists()
-    assert {error.code for error in outcome.errors} == {"artifact_write_failed"}
+    assert [error.code for error in outcome.errors] == ["artifact_write_failed"]
 
 
-def test_output_publication_lock_reports_unsupported_platform_without_raw_detail(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("missing_flag", ["O_NOFOLLOW", "O_DIRECTORY"])
+def test_missing_posix_flag_fails_preflight_without_network_or_local_mutation(
+    tmp_path, monkeypatch, missing_flag
 ):
-    def unsupported_lock(_output_dir):
-        raise r2_corpus_sync._SyncFailure(r2_corpus_sync._safe_error("unsupported_platform"))
+    store = complete_store()
+    monkeypatch.delattr(r2_corpus_sync.os, missing_flag)
 
-    monkeypatch.setattr(r2_corpus_sync, "_acquire_output_lock", unsupported_lock)
-
-    outcome, _ = invoke_sync(tmp_path, complete_store(), dry_run=True)
+    outcome, _ = invoke_sync(tmp_path, store, dry_run=True)
 
     assert outcome.exit_code == 2
     assert outcome.report_path is None
-    assert [error.code for error in outcome.errors] == [
-        "unsupported_platform",
-        "artifact_write_failed",
-    ]
-    assert all("O_NOFOLLOW" not in error.message for error in outcome.errors)
+    assert [error.code for error in outcome.errors] == ["unsupported_platform"]
+    assert all(missing_flag not in error.message for error in outcome.errors)
+    assert store.calls == []
+    assert not (tmp_path / "output").exists()
+    assert not (tmp_path / "cache").exists()
 
 
-def test_output_lock_requires_no_follow_support(tmp_path, monkeypatch):
-    output_dir = tmp_path / "output"
-    output_dir.mkdir()
-    monkeypatch.delattr(r2_corpus_sync.os, "O_NOFOLLOW")
+def test_incompatible_fcntl_fails_preflight_without_network_or_local_mutation(
+    tmp_path, monkeypatch
+):
+    store = complete_store()
+    monkeypatch.setattr(r2_corpus_sync, "_load_fcntl", lambda: object(), raising=False)
 
-    with pytest.raises(r2_corpus_sync._SyncFailure) as raised:
-        r2_corpus_sync._acquire_output_lock(output_dir)
+    outcome, _ = invoke_sync(tmp_path, store, dry_run=True)
 
-    assert raised.value.error.code == "unsupported_platform"
+    assert outcome.exit_code == 2
+    assert outcome.report_path is None
+    assert [error.code for error in outcome.errors] == ["unsupported_platform"]
+    assert store.calls == []
+    assert not (tmp_path / "output").exists()
+    assert not (tmp_path / "cache").exists()
 
 
 def test_fixed_input_rerun_reuses_byte_identical_immutable_manifest(tmp_path):

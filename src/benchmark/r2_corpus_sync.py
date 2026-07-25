@@ -160,13 +160,22 @@ class _Progress:
         self._entered: set[str] = set()
         self._last_item_event_at: dict[str, float] = {}
         self._lock = Lock()
+        self._callback_enabled = True
+
+    def _emit(self, event: ProgressEvent) -> None:
+        if not self._callback_enabled:
+            return
+        try:
+            self._callback(event)
+        except Exception:
+            self._callback_enabled = False
 
     def enter(self, phase: str, total: int | None = None) -> None:
         with self._lock:
             if phase in self._entered:
                 return
             self._entered.add(phase)
-            self._callback(ProgressEvent(phase, 0, total, f"{phase} phase started."))
+            self._emit(ProgressEvent(phase, 0, total, f"{phase} phase started."))
 
     def begin_items(self, phase: str) -> None:
         with self._lock:
@@ -185,7 +194,7 @@ class _Progress:
             now = self._monotonic()
             last_event_at = self._last_item_event_at.setdefault(phase, now)
             if completed % 100 == 0 or completed == total or now - last_event_at >= 5:
-                self._callback(
+                self._emit(
                     ProgressEvent(
                         phase,
                         completed,
@@ -197,7 +206,7 @@ class _Progress:
 
     def finish(self, status: OverallStatus) -> None:
         with self._lock:
-            self._callback(ProgressEvent(status, 1, 1, f"{status} synchronization outcome."))
+            self._emit(ProgressEvent(status, 1, 1, f"{status} synchronization outcome."))
 
 
 def utc_now() -> datetime:
@@ -278,6 +287,7 @@ def _run_sync(
     tracker = _Progress(progress, monotonic)
     tracker.enter("configuration")
     try:
+        _validate_platform_support()
         dependency_check()
         state.config = R2Config.from_environ(environ)
         try:
@@ -293,6 +303,8 @@ def _run_sync(
             request, run_id, started_at, clock, tracker, state, _adapter_error(error)
         )
     except _SyncFailure as failure:
+        if failure.error.code == "unsupported_platform":
+            return _fatal_without_report(tracker, failure.error)
         return _fatal_outcome(request, run_id, started_at, clock, tracker, state, failure.error)
     except _InvalidPathFailure:
         return _fatal_without_report(tracker, _safe_error("invalid_config"))
@@ -481,6 +493,7 @@ def _run_transaction(
             )
             raise
 
+        report_path: Path | None = None
         try:
             report_path, relative_report_path, report_sha256 = _publish_report_file(
                 request.output_dir,
@@ -508,9 +521,22 @@ def _run_transaction(
                 report_sha256,
                 completed_at,
             )
-        except Exception:
-            _restore_pointers_or_report_failure(request.output_dir, snapshots)
-            raise _ReportWriteFailure from None
+        except Exception as error:
+            publication_error = _publication_error(error)
+            try:
+                _restore_pointers(request.output_dir, snapshots)
+            except Exception:
+                _remove_attempt_report(request.output_dir, started_at, run_id)
+                raise _ReportWriteFailure(publication_error) from None
+            return _rewrite_attempt_as_failed(
+                request=request,
+                run_id=run_id,
+                started_at=started_at,
+                completed_at=completed_at,
+                tracker=tracker,
+                state=state,
+                error=publication_error,
+            )
 
     tracker.finish(overall_status)
     return SyncOutcome(
@@ -521,6 +547,41 @@ def _run_transaction(
         errors=top_level_errors,
         counters=state.counters,
     )
+
+
+def _rewrite_attempt_as_failed(
+    *,
+    request: SyncRequest,
+    run_id: str,
+    started_at: datetime,
+    completed_at: datetime,
+    tracker: _Progress,
+    state: _RunState,
+    error: SyncError,
+) -> SyncOutcome:
+    report = _build_report(
+        request=request,
+        run_id=run_id,
+        started_at=started_at,
+        completed_at=completed_at,
+        overall_status="failed",
+        exit_code=2,
+        state=state,
+        top_level_errors=(error,),
+        manifest=None,
+    )
+    try:
+        report_path, _, _ = _publish_report_file(
+            request.output_dir,
+            started_at,
+            run_id,
+            report,
+        )
+    except Exception:
+        _remove_attempt_report(request.output_dir, started_at, run_id)
+        raise _ReportWriteFailure(error) from None
+    tracker.finish("failed")
+    return SyncOutcome("failed", 2, report_path, None, (error,), state.counters)
 
 
 def _fatal_outcome(
@@ -583,13 +644,22 @@ def _report_fallback_outcome(
         "A required synchronization report write failed.",
     )
     tracker.finish("failed")
-    errors = (artifact_error,) if primary_error is None else (primary_error, artifact_error)
+    if primary_error is None or primary_error.code == artifact_error.code:
+        errors = (artifact_error,)
+    else:
+        errors = (primary_error, artifact_error)
     return SyncOutcome("failed", 2, None, None, errors, SyncCounters())
 
 
 def _fatal_without_report(tracker: _Progress, error: SyncError) -> SyncOutcome:
     tracker.finish("failed")
     return SyncOutcome("failed", 2, None, None, (error,), SyncCounters())
+
+
+def _publication_error(error: Exception) -> SyncError:
+    if isinstance(error, ManifestPublicationError):
+        return error.error
+    return _safe_error("artifact_write_failed")
 
 
 def _build_report(
@@ -794,14 +864,31 @@ def _output_publication_lock(output_dir: Path):
                 pass
 
 
-def _acquire_output_lock(output_dir: Path):
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    if no_follow is None:
+def _load_fcntl():
+    import fcntl
+
+    return fcntl
+
+
+def _validate_platform_support() -> None:
+    if getattr(os, "O_NOFOLLOW", None) is None or getattr(os, "O_DIRECTORY", None) is None:
         raise _SyncFailure(_safe_error("unsupported_platform"))
     try:
-        import fcntl
-    except ImportError:
+        fcntl = _load_fcntl()
+    except (ImportError, AttributeError):
         raise _SyncFailure(_safe_error("unsupported_platform")) from None
+    if (
+        not callable(getattr(fcntl, "flock", None))
+        or getattr(fcntl, "LOCK_EX", None) is None
+        or getattr(fcntl, "LOCK_UN", None) is None
+    ):
+        raise _SyncFailure(_safe_error("unsupported_platform"))
+
+
+def _acquire_output_lock(output_dir: Path):
+    _validate_platform_support()
+    no_follow = os.O_NOFOLLOW
+    fcntl = _load_fcntl()
 
     lock_path = output_dir / _OUTPUT_LOCK_FILENAME
     descriptor = -1
@@ -914,6 +1001,21 @@ def _restore_pointer(path: Path, previous_content: bytes | None) -> None:
         raise OSError("artifact pointer is unavailable")
     path.unlink()
     _fsync_directory(path.parent)
+
+
+def _remove_attempt_report(output_dir: Path, started_at: datetime, run_id: str) -> None:
+    path = output_dir / "reports" / report_filename(started_at, run_id)
+    try:
+        metadata = path.lstat()
+    except (FileNotFoundError, OSError):
+        return
+    if not stat.S_ISREG(metadata.st_mode):
+        return
+    try:
+        path.unlink()
+        _fsync_directory(path.parent)
+    except OSError:
+        return
 
 
 def _atomic_replace_bytes(path: Path, content: bytes) -> None:
