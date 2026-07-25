@@ -1,9 +1,10 @@
 import builtins
+import errno
 import json
 import os
 from dataclasses import replace
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 from time import sleep
 
 import pytest
@@ -157,6 +158,61 @@ def test_load_rejects_noncanonical_or_wrongly_typed_entry_values(
         CacheIndexStore.load(tmp_path)
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "source_endpoint_sha256",
+        "bucket",
+        "key",
+        "etag",
+        "last_modified",
+        "sha256",
+        "cache_path",
+    ],
+)
+def test_load_rejects_non_utf8_serializable_entry_strings(tmp_path: Path, field: str) -> None:
+    raw_entry = entry().__dict__ | {field: "\ud800"}
+    write_index(tmp_path, [raw_entry])
+
+    with pytest.raises(ValueError, match="invalid cache index entry"):
+        CacheIndexStore.load(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "source_endpoint_sha256",
+        "bucket",
+        "key",
+        "etag",
+        "last_modified",
+        "sha256",
+        "cache_path",
+    ],
+)
+def test_checkpoint_rejects_non_utf8_serializable_entry_strings(tmp_path: Path, field: str) -> None:
+    poisoned_entry = replace(entry(), **{field: "\ud800"})
+    store = CacheIndexStore.load(tmp_path)
+
+    with pytest.raises(ValueError, match="invalid cache index entry"):
+        store.checkpoint(poisoned_entry)
+    assert store.get("a" * 64, "simfile-dtx", "42/SET.DEF") is None
+    assert not (tmp_path / "index-v1.json").exists()
+
+
+def test_load_normalizes_huge_json_integer_errors_without_echoing_input(tmp_path: Path) -> None:
+    huge_integer = "9" * 5_000
+    (tmp_path / "index-v1.json").write_text(
+        '{"schema_version":"crux.r2-cache-index/v1","entries":[{"size":' + huge_integer + "}]}",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as caught:
+        CacheIndexStore.load(tmp_path)
+    assert str(caught.value) == "invalid cache index JSON"
+    assert huge_integer not in str(caught.value)
+
+
 def test_checkpoint_flushes_file_before_replacing_and_syncing_directory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -242,6 +298,67 @@ def test_checkpoint_keeps_a_preexisting_temp_sibling_when_creation_fails(
     assert temporary_path.read_bytes() == b"not created by this writer"
 
 
+def test_checkpoint_keeps_last_durable_snapshot_when_publication_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    store = CacheIndexStore.load(tmp_path)
+    durable_entry = entry("42/durable.dtx")
+    failed_entry = entry("42/failed.dtx")
+    store.checkpoint(durable_entry)
+    monkeypatch.setattr(
+        cache.os,
+        "replace",
+        lambda *_: (_ for _ in ()).throw(OSError("private")),
+    )
+
+    with pytest.raises(OSError):
+        store.checkpoint(failed_entry)
+
+    assert store.get("a" * 64, "simfile-dtx", "42/durable.dtx") == durable_entry
+    assert store.get("a" * 64, "simfile-dtx", "42/failed.dtx") is None
+    assert [
+        item["key"] for item in json.loads((tmp_path / "index-v1.json").read_text())["entries"]
+    ] == ["42/durable.dtx"]
+
+
+def test_get_waits_for_a_checkpoint_to_be_durable_before_exposing_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    store = CacheIndexStore.load(tmp_path)
+    replacement_started = Event()
+    allow_replacement = Event()
+    get_finished = Event()
+    observed: list[CacheIndexEntry | None] = []
+    real_replace = cache.os.replace
+
+    def blocking_replace(source, target) -> None:
+        replacement_started.set()
+        assert allow_replacement.wait(1)
+        real_replace(source, target)
+
+    monkeypatch.setattr(cache.os, "replace", blocking_replace)
+    checkpoint_thread = Thread(target=store.checkpoint, args=(entry("42/pending.dtx"),))
+    checkpoint_thread.start()
+    assert replacement_started.wait(1)
+
+    def read_entry() -> None:
+        observed.append(store.get("a" * 64, "simfile-dtx", "42/pending.dtx"))
+        get_finished.set()
+
+    reader_thread = Thread(target=read_entry)
+    reader_thread.start()
+    assert not get_finished.wait(0.05)
+    allow_replacement.set()
+    checkpoint_thread.join()
+    reader_thread.join()
+
+    assert observed == [entry("42/pending.dtx")]
+
+
 def test_live_writer_lock_fails_fast(tmp_path: Path) -> None:
     with cache_writer_lock(tmp_path):
         with pytest.raises(RuntimeError, match="cache_locked"):
@@ -252,22 +369,104 @@ def test_live_writer_lock_fails_fast(tmp_path: Path) -> None:
 def test_writer_lock_retains_one_open_lock_file_for_entire_context(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    real_path_open = Path.open
+    import src.benchmark.corpus_cache as cache
+
+    real_fdopen = os.fdopen
     opened = []
 
-    def path_open(self: Path, *args, **kwargs):
-        handle = real_path_open(self, *args, **kwargs)
-        if self == tmp_path / ".index-v1.lock":
-            opened.append(handle)
+    def fdopen(descriptor: int, *args, **kwargs):
+        handle = real_fdopen(descriptor, *args, **kwargs)
+        opened.append(handle)
         return handle
 
-    monkeypatch.setattr(Path, "open", path_open)
+    monkeypatch.setattr(cache.os, "fdopen", fdopen)
 
     with cache_writer_lock(tmp_path):
         assert len(opened) == 1
         assert not opened[0].closed
     assert len(opened) == 1
     assert opened[0].closed
+
+
+@pytest.mark.parametrize("error_number", [errno.EAGAIN, errno.EWOULDBLOCK])
+def test_writer_lock_maps_busy_flock_errnos_to_cache_locked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error_number: int
+) -> None:
+    import fcntl
+
+    def busy(*_) -> None:
+        raise OSError(error_number, "private lock detail")
+
+    monkeypatch.setattr(fcntl, "flock", busy)
+
+    with pytest.raises(RuntimeError) as caught:
+        with cache_writer_lock(tmp_path):
+            raise AssertionError("busy writer must not enter")
+    assert str(caught.value) == "cache_locked"
+
+
+@pytest.mark.parametrize(
+    "error_number",
+    sorted({errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}),
+)
+def test_writer_lock_maps_unsupported_flock_errnos_to_unsupported_platform(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error_number: int
+) -> None:
+    import fcntl
+
+    monkeypatch.setattr(
+        fcntl,
+        "flock",
+        lambda *_: (_ for _ in ()).throw(OSError(error_number, "private lock detail")),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        with cache_writer_lock(tmp_path):
+            raise AssertionError("unsupported platform must not enter")
+    assert str(caught.value) == "unsupported_platform"
+
+
+def test_writer_lock_sanitizes_unexpected_open_and_flock_failures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import fcntl
+
+    import src.benchmark.corpus_cache as cache
+
+    monkeypatch.setattr(
+        cache.os,
+        "open",
+        lambda *_: (_ for _ in ()).throw(OSError(errno.EACCES, "private lock path")),
+    )
+    with pytest.raises(RuntimeError) as caught:
+        with cache_writer_lock(tmp_path):
+            raise AssertionError("failed lock open must not enter")
+    assert str(caught.value) == "cache_lock_failed"
+    assert "private" not in str(caught.value)
+
+    monkeypatch.setattr(cache.os, "open", os.open)
+    monkeypatch.setattr(
+        fcntl,
+        "flock",
+        lambda *_: (_ for _ in ()).throw(OSError(errno.EACCES, "private flock detail")),
+    )
+    with pytest.raises(RuntimeError) as caught:
+        with cache_writer_lock(tmp_path):
+            raise AssertionError("failed flock must not enter")
+    assert str(caught.value) == "cache_lock_failed"
+    assert "private" not in str(caught.value)
+
+
+def test_writer_lock_rejects_a_preexisting_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "private-lock-target"
+    target.write_bytes(b"do not follow")
+    (tmp_path / ".index-v1.lock").symlink_to(target)
+
+    with pytest.raises(RuntimeError) as caught:
+        with cache_writer_lock(tmp_path):
+            raise AssertionError("symlinked lock must not enter")
+    assert str(caught.value) == "cache_lock_failed"
+    assert target.read_bytes() == b"do not follow"
 
 
 def test_writer_lock_reports_unsupported_platform_without_mutating_cache(
@@ -296,13 +495,13 @@ def test_checkpoint_serializes_concurrent_publications(
     active_writers = 0
     maximum_active_writers = 0
 
-    def publish() -> None:
+    def publish(entries: dict[tuple[str, str, str], CacheIndexEntry]) -> None:
         nonlocal active_writers, maximum_active_writers
         active_writers += 1
         maximum_active_writers = max(maximum_active_writers, active_writers)
         sleep(0.02)
         try:
-            original_publish()
+            original_publish(entries)
         finally:
             active_writers -= 1
 
