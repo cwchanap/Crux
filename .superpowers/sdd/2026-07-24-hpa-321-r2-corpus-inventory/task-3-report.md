@@ -44,3 +44,21 @@
 ### Commit
 
 - `fix: normalize R2 inventory ETags`
+
+## Fix Round 2
+
+### Implemented
+
+- Updated the stale conditional-request regression to pass domain-form `stale` and inspect the exact quoted `IfMatch` header before simulating the conditional failure.
+- Updated the weak-ETag regression to use an unconditional GET and prove that no `IfMatch` header is sent.
+
+### Verification
+
+- `rtk uv run --extra r2 pytest tests/benchmark/test_r2_inventory.py -q` — 28 passed.
+- `rtk uv run ruff check src/benchmark/r2_inventory.py tests/benchmark/test_r2_inventory.py` — passed.
+- `rtk uv run black --check src/benchmark/r2_inventory.py tests/benchmark/test_r2_inventory.py` — passed.
+- Full suite not rerun: this commit changes regression tests only; no production code changed.
+
+### Commit
+
+- `test: cover safe R2 conditional requests`
