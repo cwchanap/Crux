@@ -393,6 +393,82 @@ The benchmark uses these inputs:
 The benchmark does not require raw DTX chip assets unless you are using the optional
 `render-audio` fallback described later in this document.
 
+### R2 corpus inventory
+
+`crux benchmark sync-r2-corpus` inventories the authoritative `simfile-dtx` R2 bucket and
+caches only the chart-definition inputs needed by later benchmark work. R2 is the sole content
+authority for this stage: D1, GraphQL, local cache metadata, and pointers do not establish chart
+truth.
+
+Install the optional R2 dependency set separately from the base runtime:
+
+```bash
+rtk uv pip install -e '.[r2]'
+```
+
+This installs `boto3` and its `botocore`, `s3transfer`, `jmespath`, and `urllib3` footprint only
+where the `r2` extra is installed. The base API and CLI remain importable without those packages.
+
+Configure R2 through the environment; endpoint and credentials are intentionally not command-line
+options and must never be committed or pasted into reports:
+
+```bash
+export CRUX_R2_ENDPOINT_URL="https://<account-id>.r2.cloudflarestorage.com"
+export AWS_ACCESS_KEY_ID="<access-key-id>"
+export AWS_SECRET_ACCESS_KEY="<secret-access-key>"
+# Export AWS_SESSION_TOKEN as well when the credential provider requires it.
+export CRUX_R2_BUCKET="<bucket>"
+```
+
+`CRUX_R2_BUCKET` defaults to `simfile-dtx`. The optional tuning variables are
+`CRUX_R2_HEAD_CONCURRENCY` (default `8`, range `1..32`),
+`CRUX_R2_DOWNLOAD_CONCURRENCY` (default `4`, range `1..16`),
+`CRUX_R2_CONNECT_TIMEOUT_SECONDS` (default `10`),
+`CRUX_R2_READ_TIMEOUT_SECONDS` (default `60`), and `CRUX_R2_MAX_ATTEMPTS` (default `5`,
+including the initial request). Credentials may also come from the standard AWS credential
+provider chain.
+
+Start with a dry run, then run the real synchronization only after inspecting its report:
+
+```bash
+rtk uv run --extra r2 crux benchmark sync-r2-corpus \
+  --provenance-file config/corpus-provenance.json \
+  --dry-run
+rtk uv run --extra r2 crux benchmark sync-r2-corpus \
+  --provenance-file config/corpus-provenance.json
+```
+
+The local defaults are `artifacts/benchmark/r2-corpus/` for output and
+`artifacts/benchmark/r2-corpus/cache/` for the cache. `--include-simfile-id` and
+`--exclude-simfile-id` are repeatable JSON-number-safe (`0..9007199254740991`) filters. Crux
+first discovers the full root so malformed roots and aliases remain visible; an ID in both lists is
+excluded. Ambiguous numeric aliases are quarantined, and a prefix containing only zero-byte folder
+markers is recorded as `empty` rather than silently skipped.
+
+The fixed selection profile is `setdef_dtx_txt_v1`: case-insensitive `SET.DEF`, `.dtx`, and `.txt`
+objects are selected. Verified bodies live under `cache/sha256/<first-two-hex>/<full-sha256>` and
+the local cache index is non-authoritative. Rerunning safely resumes from verified SHA-256 bodies.
+Changing provenance intentionally re-keys the corpus version. Provider checksums are absent, and
+the R2 adapter reserves `version` as `null` in v1.
+
+Dry runs validate configuration, provenance, inventory, and cache identity but never fetch object
+bodies, modify the cache or index, publish a manifest, or update `latest.json`. They may write a
+timestamped report and update `latest-report.json`. Real runs publish an immutable manifest at
+`manifests/<manifest-sha256>.jsonl`, update `latest.json`, and publish a timestamped report under
+`reports/`; `latest-report.json` points to the most recently completed report. Before using a
+corpus, check `latest.json.overall_status == "complete"` and then pin that immutable manifest path;
+neither pointer is an input artifact.
+
+The command writes a single JSON summary to stdout and sanitized progress to stderr. Its exit codes
+are `0` for complete (including a complete dry run), `1` for partial, and `2` for a fatal result
+without a manifest. A failed report write has only a sanitized stderr fallback. Chart selection,
+DTX parsing, audio selection, inference, and scoring are HPA-322 responsibilities, not part of
+this inventory stage.
+
+A real credentialed smoke run is required before acceptance: first dry-run a small, diverse set,
+then perform and rerun the matching real sync to verify cache reuse and the immutable manifest.
+Never include credentials in repository files or smoke-test reports.
+
 ### Raw corpus assumptions for `prepare-corpus`
 
 `crux benchmark prepare-corpus` scans a raw song-folder corpus and selects one benchmark item per

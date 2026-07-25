@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from dataclasses import asdict
 from pathlib import Path
 
 import click
@@ -7,6 +9,8 @@ import click
 from src.benchmark.corpus import validate_score_midi_corpus
 from src.benchmark.dtx_parser import parse_dtx_file
 from src.benchmark.prepare import prepare_corpus
+from src.benchmark.r2_corpus_models import MAX_SIMFILE_ID, SyncOutcome, SyncRequest
+from src.benchmark.r2_corpus_sync import ProgressEvent, sync_r2_corpus
 from src.benchmark.render_audio import render_audio_corpus, render_audio_song
 from src.benchmark.runner import export_reference_midis, run_score_midi, run_transcribe_and_score
 from src.cli.options import (
@@ -25,6 +29,88 @@ from src.cli.options import (
 @click.group()
 def benchmark() -> None:
     """Benchmark drum transcription against DTX ground truth."""
+
+
+def _emit_progress(event: ProgressEvent) -> None:
+    click.echo(event.message, err=True)
+
+
+def _emit_sync_summary(outcome: SyncOutcome) -> None:
+    click.echo(
+        json.dumps(
+            {
+                "corpus_version": (
+                    outcome.manifest.corpus_version if outcome.manifest is not None else None
+                ),
+                "counts": asdict(outcome.counters),
+                "exit_code": outcome.exit_code,
+                "manifest_published": outcome.manifest is not None,
+                "report_path": (
+                    str(outcome.report_path) if outcome.report_path is not None else None
+                ),
+                "status": outcome.overall_status,
+            },
+            sort_keys=True,
+        )
+    )
+
+
+@benchmark.command("sync-r2-corpus")
+@click.option(
+    "--cache-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Local cache root (default: <output-dir>/cache/).",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=Path("artifacts/benchmark/r2-corpus"),
+    show_default=True,
+)
+@click.option(
+    "--include-simfile-id",
+    "include_simfile_ids",
+    type=click.IntRange(0, MAX_SIMFILE_ID),
+    multiple=True,
+)
+@click.option(
+    "--exclude-simfile-id",
+    "exclude_simfile_ids",
+    type=click.IntRange(0, MAX_SIMFILE_ID),
+    multiple=True,
+)
+@click.option(
+    "--provenance-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+)
+@click.option("--dry-run", is_flag=True)
+@click.pass_context
+def sync_r2_corpus_command(
+    ctx: click.Context,
+    cache_dir: Path | None,
+    output_dir: Path,
+    include_simfile_ids: tuple[int, ...],
+    exclude_simfile_ids: tuple[int, ...],
+    provenance_file: Path | None,
+    dry_run: bool,
+) -> None:
+    """Inventory selected R2 corpus metadata and cache chart definition files."""
+    request = SyncRequest(
+        cache_dir=output_dir / "cache" if cache_dir is None else cache_dir,
+        output_dir=output_dir,
+        include_simfile_ids=frozenset(include_simfile_ids),
+        exclude_simfile_ids=frozenset(exclude_simfile_ids),
+        provenance_file=provenance_file,
+        dry_run=dry_run,
+    )
+    outcome = sync_r2_corpus(request, progress=_emit_progress)
+    if outcome.overall_status == "failed" and outcome.report_path is None:
+        click.echo("R2 synchronization failed before a report could be written.", err=True)
+    _emit_sync_summary(outcome)
+    if outcome.exit_code:
+        ctx.exit(outcome.exit_code)
 
 
 @benchmark.command("prepare-corpus")
