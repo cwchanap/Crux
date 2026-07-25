@@ -605,6 +605,34 @@ def test_sync_r2_corpus_fatal_report_failure_uses_one_sanitized_stderr_line(monk
     assert credential not in result.stderr
 
 
+def test_sync_r2_corpus_nonterminal_failed_progress_keeps_cli_fallback(monkeypatch, tmp_path):
+    def fake_sync(request: SyncRequest, *, progress):
+        progress(ProgressEvent("failed", 0, None, "failed phase started."))
+        return make_sync_outcome("failed", tmp_path, report=False)
+
+    monkeypatch.setattr(benchmark_cli, "sync_r2_corpus", fake_sync)
+
+    result = runner.invoke(main, ["benchmark", "sync-r2-corpus"])
+
+    assert result.exit_code == 2
+    assert result.stderr == (
+        "failed phase started.\nR2 synchronization failed before a report could be written.\n"
+    )
+
+
+def test_sync_r2_corpus_terminal_failed_progress_suppresses_cli_fallback(monkeypatch, tmp_path):
+    def fake_sync(request: SyncRequest, *, progress):
+        progress(ProgressEvent("failed", 1, 1, "failed synchronization outcome."))
+        return make_sync_outcome("failed", tmp_path, report=False)
+
+    monkeypatch.setattr(benchmark_cli, "sync_r2_corpus", fake_sync)
+
+    result = runner.invoke(main, ["benchmark", "sync-r2-corpus"])
+
+    assert result.exit_code == 2
+    assert result.stderr == "failed synchronization outcome.\n"
+
+
 def test_sync_r2_corpus_real_report_write_failure_keeps_one_final_stderr_line(
     monkeypatch, tmp_path
 ):

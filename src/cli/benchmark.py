@@ -35,7 +35,12 @@ class _ProgressEmitter:
         self.emitted_failed_final = False
 
     def __call__(self, event: ProgressEvent) -> None:
-        if event.phase == "failed":
+        if (
+            event.phase == "failed"
+            and event.completed == 1
+            and event.total == 1
+            and event.message == "failed synchronization outcome."
+        ):
             self.emitted_failed_final = True
         _emit_progress(event)
 

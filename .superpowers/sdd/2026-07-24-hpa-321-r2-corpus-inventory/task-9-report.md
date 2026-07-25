@@ -37,6 +37,9 @@
   `failed` progress message and the CLI fallback, while an installed help subprocess imported the
   `pretty_midi` spy and exited nonzero. The scoped progress wrapper and command-local imports make
   both regressions pass.
+- Fix round 2 RED coverage showed that a nonterminal `failed` phase-start event incorrectly
+  suppressed the CLI fallback. The emitter now requires the tracker finish shape: failed phase,
+  `1/1` final counts, and the canonical `failed synchronization outcome.` message.
 
 ## Verification
 
@@ -56,6 +59,9 @@
 - Fix round 1 Ruff and Black checks on `src/cli/benchmark.py` and
   `tests/test_cli_benchmark.py` — passed.
 - Fix round 1 `rtk uv run --extra r2 pytest -q` — 524 passed.
+- Fix round 2 `rtk uv run --extra r2 pytest tests/test_cli_benchmark.py -q` — 27 passed.
+- Fix round 2 Ruff and Black checks on `src/cli/benchmark.py` and
+  `tests/test_cli_benchmark.py` — passed.
 
 ## Notes
 
@@ -63,8 +69,12 @@
   this task uses injected fake outcomes and the existing fake-backed synchronization suite.
 - The installed-entrypoint regression uses subprocess import sentinels for `pretty_midi` and
   `boto3`; it does not suppress warnings and proves those modules are not imported for R2 help.
+- The full suite was intentionally not repeated in fix round 2: the change is one terminal-event
+  predicate, both branches have direct CLI regressions, and the immediately preceding full suite
+  passed 524 tests.
 
 ## Commit
 
 - Initial conventional commit: `feat: expose R2 corpus sync command`.
 - Fix round 1 planned conventional commit: `fix: silence R2 sync CLI help`.
+- Fix round 2 planned conventional commit: `fix: distinguish R2 terminal progress`.
