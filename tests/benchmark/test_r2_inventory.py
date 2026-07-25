@@ -135,12 +135,12 @@ def test_adapter_normalizes_weak_sdk_etags_at_every_metadata_boundary():
     store = Boto3R2Store(WeakEtagsClient(), "simfile-dtx")
     listed = store.list_objects()[0]
     head = store.head_object(listed.key)
-    with store.open_object(listed.key, if_match="download") as download:
+    with store.open_object(listed.key, if_match=None) as download:
         assert (download.etag, download.etag_is_weak) == ("download", True)
 
     assert (listed.etag, listed.etag_is_weak) == ("listed", True)
     assert (head.etag, head.etag_is_weak) == ("head", True)
-    assert store.client.get_calls[0]["IfMatch"] == '"download"'
+    assert "IfMatch" not in store.client.get_calls[0]
 
 
 def test_adapter_never_requests_provider_checksum_mode():
@@ -275,16 +275,20 @@ def test_adapter_maps_missing_credentials_and_conditional_change():
 
     class ChangedClient(FakeClient):
         def get_object(self, **kwargs):
+            self.get_calls.append(kwargs)
+            assert kwargs == {"Bucket": "simfile-dtx", "Key": "42/SET.DEF", "IfMatch": '"stale"'}
             raise client_error("PreconditionFailed", "GetObject", 412)
 
+    client = ChangedClient()
     assert_store_error(
-        lambda: Boto3R2Store(ChangedClient(), "simfile-dtx")
-        .open_object("42/SET.DEF", '"stale"')
-        .__enter__(),
+        lambda: Boto3R2Store(client, "simfile-dtx").open_object("42/SET.DEF", "stale").__enter__(),
         "source_changed_during_sync",
         "Object metadata changed after inventory.",
         "42/SET.DEF",
     )
+    assert client.get_calls == [
+        {"Bucket": "simfile-dtx", "Key": "42/SET.DEF", "IfMatch": '"stale"'}
+    ]
 
 
 def test_adapter_rejects_malformed_sdk_metadata_with_closed_error():
