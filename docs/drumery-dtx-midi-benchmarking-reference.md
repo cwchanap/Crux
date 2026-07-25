@@ -410,7 +410,8 @@ This installs `boto3` and its `botocore`, `s3transfer`, `jmespath`, and `urllib3
 where the `r2` extra is installed. The base API and CLI remain importable without those packages.
 
 Configure R2 through the environment; endpoint and credentials are intentionally not command-line
-options and must never be committed or pasted into reports:
+options and must never be committed or pasted into reports. The values below are placeholders, not
+live credentials:
 
 ```bash
 export CRUX_R2_ENDPOINT_URL="https://<account-id>.r2.cloudflarestorage.com"
@@ -447,9 +448,16 @@ markers is recorded as `empty` rather than silently skipped.
 
 The fixed selection profile is `setdef_dtx_txt_v1`: case-insensitive `SET.DEF`, `.dtx`, and `.txt`
 objects are selected. Verified bodies live under `cache/sha256/<first-two-hex>/<full-sha256>` and
-the local cache index is non-authoritative. Rerunning safely resumes from verified SHA-256 bodies.
-Changing provenance intentionally re-keys the corpus version. Provider checksums are absent, and
-the R2 adapter reserves `version` as `null` in v1.
+the local cache index is non-authoritative. Successful bodies are checkpointed as they become
+durable, so rerunning after interruption safely resumes from verified SHA-256 bodies; there is no
+separate remote checkpoint protocol. Changing provenance intentionally re-keys the corpus version.
+Provider checksums are absent, and the R2 adapter reserves `version` as `null` in v1.
+
+The whole-run advisory lock coordinates cooperating writers that use the same cache root. It is not
+a defense against a hostile same-UID process rebinding cache leaf names between the final inode
+check and a portable atomic replace or unlink. Protect the cache directory from untrusted local
+writers. Detectable namespace changes fail closed, and the next cache validation detects a body
+changed or removed after publication and routes it through the repair flow.
 
 Dry runs validate configuration, provenance, inventory, and cache identity but never fetch object
 bodies, modify the cache or index, publish a manifest, or update `latest.json`. They may write a
