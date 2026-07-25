@@ -89,15 +89,58 @@ def test_adapter_lists_heads_and_opens_strong_and_weak_downloads():
     store = Boto3R2Store(FakeClient(), "simfile-dtx")
     listed = store.list_objects()
     assert listed[0].key == "42/曲/SET.DEF"
-    assert store.head_object(listed[0].key).content_type == "text/plain"
+    assert (listed[0].etag, listed[0].etag_is_weak) == ("etag-2", False)
+    head = store.head_object(listed[0].key)
+    assert (head.etag, head.etag_is_weak, head.content_type) == ("etag-2", False, "text/plain")
 
-    with store.open_object(listed[0].key, if_match='"etag-2"') as response:
+    with store.open_object(listed[0].key, if_match=listed[0].etag) as response:
         assert response.body.read() == b"chart"
+        assert (response.etag, response.etag_is_weak) == ("etag-2", False)
     with store.open_object(listed[0].key, if_match=None):
         pass
 
     assert store.client.get_calls[0]["IfMatch"] == '"etag-2"'
     assert "IfMatch" not in store.client.get_calls[1]
+
+
+def test_adapter_normalizes_weak_sdk_etags_at_every_metadata_boundary():
+    class WeakEtagsPaginator:
+        def paginate(self, **kwargs):
+            assert kwargs == {"Bucket": "simfile-dtx"}
+            return [
+                {
+                    "Contents": [
+                        {
+                            "Key": "42/SET.DEF",
+                            "Size": 5,
+                            "ETag": 'W/"listed"',
+                            "LastModified": datetime(2026, 7, 25, tzinfo=timezone.utc),
+                        }
+                    ]
+                }
+            ]
+
+    class WeakEtagsClient(FakeClient):
+        def get_paginator(self, name):
+            assert name == "list_objects_v2"
+            return WeakEtagsPaginator()
+
+        def head_object(self, **kwargs):
+            return {"ETag": 'W/"head"'}
+
+        def get_object(self, **kwargs):
+            self.get_calls.append(kwargs)
+            return {"Body": BytesIO(b"chart"), "ETag": 'W/"download"'}
+
+    store = Boto3R2Store(WeakEtagsClient(), "simfile-dtx")
+    listed = store.list_objects()[0]
+    head = store.head_object(listed.key)
+    with store.open_object(listed.key, if_match="download") as download:
+        assert (download.etag, download.etag_is_weak) == ("download", True)
+
+    assert (listed.etag, listed.etag_is_weak) == ("listed", True)
+    assert (head.etag, head.etag_is_weak) == ("head", True)
+    assert store.client.get_calls[0]["IfMatch"] == '"download"'
 
 
 def test_adapter_never_requests_provider_checksum_mode():
@@ -372,7 +415,7 @@ def listed(key: str, size: int = 5) -> ListedObject:
     return ListedObject(
         key=key,
         size=size,
-        etag='"listed-etag"',
+        etag="listed-etag",
         etag_is_weak=False,
         last_modified=datetime(2026, 7, 25, tzinfo=timezone.utc),
     )
@@ -506,7 +549,7 @@ def test_head_failure_retains_listing_identity_and_only_its_simfile_is_partial()
     failed, complete = result.simfiles
     assert failed.sync_status == "partial"
     assert failed.objects[0].size == 5
-    assert failed.objects[0].etag == '"listed-etag"'
+    assert failed.objects[0].etag == "listed-etag"
     assert failed.objects[0].content_type is None
     assert failed.objects[0].errors[0].code == "object_head_failed"
     assert complete.sync_status == "complete"
@@ -523,7 +566,7 @@ def test_invalid_head_metadata_retains_listing_identity_and_records_error():
 
     obj = result.simfiles[0].objects[0]
     assert obj.size == 5
-    assert obj.etag == '"listed-etag"'
+    assert obj.etag == "listed-etag"
     assert obj.errors[0].code == "object_metadata_invalid"
     assert result.simfiles[0].sync_status == "partial"
 
@@ -533,7 +576,7 @@ def test_head_metadata_overrides_listing_identity_without_checksum_fields():
     updated = datetime(2026, 7, 26, tzinfo=timezone.utc)
     store = FakeStore(
         objects=[listed(key)],
-        heads={key: HeadMetadata(7, 'W/"head-etag"', True, updated, "text/plain")},
+        heads={key: HeadMetadata(7, "head-etag", True, updated, "text/plain")},
     )
 
     result = build_inventory(store, frozenset(), frozenset(), 2)
@@ -541,7 +584,7 @@ def test_head_metadata_overrides_listing_identity_without_checksum_fields():
     obj = result.simfiles[0].objects[0]
     assert (obj.size, obj.etag, obj.etag_is_weak, obj.last_modified, obj.content_type) == (
         7,
-        'W/"head-etag"',
+        "head-etag",
         True,
         updated,
         "text/plain",
@@ -549,6 +592,23 @@ def test_head_metadata_overrides_listing_identity_without_checksum_fields():
     assert not {"checksum_algorithm", "checksum_type", "checksum_value"} & set(
         obj.__dataclass_fields__
     )
+
+
+def test_marker_only_prefix_with_head_failure_is_partial_and_keeps_both_errors():
+    key = "42/"
+    result = build_inventory(
+        FakeStore(
+            objects=[listed(key, size=0)],
+            heads={key: R2StoreError("object_head_failed", "closed", key)},
+        ),
+        frozenset(),
+        frozenset(),
+        2,
+    )
+
+    row = result.simfiles[0]
+    assert row.sync_status == "partial"
+    assert [error.code for error in row.sync_errors] == ["object_head_failed", "empty_prefix"]
 
 
 def test_inventory_preserves_encoded_and_unicode_keys_exactly():
