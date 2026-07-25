@@ -103,3 +103,35 @@ The R2 inventory section now explicitly records:
 - HPA-322 ownership of chart parsing/selection, audio selection, inference, and
   scoring;
 - the pending credentialed smoke requirement.
+
+## Fix Round 1: Independent Fixture Expectations
+
+Strengthened the acceptance proof without changing production code:
+
+- added a test-local literal mapping for all four selected keys to exact body bytes,
+  byte sizes, and independently calculated standard-library SHA-256 values;
+- asserted each selected manifest entry and cache-index entry uses the literal size,
+  digest, and `sha256/<two-hex>/<digest>` path;
+- asserted every on-disk selected body equals the expected literal bytes and
+  independently hashes to the expected digest;
+- asserted the complete ordered object inventory for simfiles `1`, `2`, and `3`,
+  including `1/assets/音源/`, both simfile `3` markers, the non-selected audio
+  object, sizes, row statuses, and selected/non-selected cache statuses;
+- added an independently authored expected body, size, digest, cache path, and
+  on-disk byte assertion for the changed chart while retaining independent
+  `corpus_version` and final manifest SHA-256 recomputation.
+
+Fix-round verification:
+
+- `rtk uv run --extra r2 pytest tests/benchmark/test_r2_corpus_acceptance.py -q`
+  - passed: `3 passed in 0.39s`;
+- `rtk uv run --extra r2 pytest tests/benchmark/test_r2_corpus_models.py tests/benchmark/test_r2_inventory.py tests/benchmark/test_corpus_provenance.py tests/benchmark/test_corpus_cache.py tests/benchmark/test_corpus_manifest.py tests/benchmark/test_r2_corpus_sync.py tests/benchmark/test_r2_corpus_acceptance.py tests/test_cli_benchmark.py -q`
+  - passed: `335 passed in 4.68s`;
+- `rtk uv run ruff check tests/benchmark/test_r2_corpus_acceptance.py`
+  - passed: `All checks passed!`;
+- `rtk uv run black --check tests/benchmark/test_r2_corpus_acceptance.py`
+  - passed: `1 file would be left unchanged`.
+
+The repository-wide suite was intentionally not rerun in this test-only fix round.
+The reviewer had already rerun and passed all `529` tests on the Task 10 commit, and
+this round changes only stronger assertions in the acceptance test plus this report.
