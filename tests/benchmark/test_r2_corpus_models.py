@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from hashlib import sha256
+from pathlib import Path
 
 import pytest
 
@@ -7,6 +8,7 @@ from src.benchmark.r2_corpus_models import (
     CACHE_PROFILE,
     MAX_SIMFILE_ID,
     R2Config,
+    SyncRequest,
     format_manifest_timestamp,
     format_report_filename_timestamp,
     parse_etag,
@@ -92,6 +94,33 @@ def test_config_errors_are_sanitized(environ, variable):
     for value in environ.values():
         if value:
             assert value not in str(error.value)
+
+
+def test_config_conversion_errors_do_not_retain_the_supplied_value():
+    secret = "signed-url-secret"
+    with pytest.raises(ValueError) as error:
+        R2Config.from_environ(
+            {
+                "CRUX_R2_ENDPOINT_URL": "https://example.com",
+                "CRUX_R2_READ_TIMEOUT_SECONDS": secret,
+            }
+        )
+    assert error.value.__cause__ is None
+    assert secret not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "simfile_id"),
+    [("include_simfile_ids", -1), ("exclude_simfile_ids", MAX_SIMFILE_ID + 1)],
+)
+def test_sync_request_rejects_out_of_range_simfile_ids(field_name, simfile_id):
+    with pytest.raises(ValueError, match="simfile ID"):
+        SyncRequest(
+            output_dir=Path("output"),
+            cache_dir=Path("cache"),
+            provenance_file=None,
+            **{field_name: frozenset({simfile_id})},
+        )
 
 
 def test_etag_and_timestamp_normalization_are_canonical():
