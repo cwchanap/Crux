@@ -1833,3 +1833,198 @@ def test_same_digest_repair_is_independent_of_download_completion_order(
         "verified",
     ]
     assert [action.action for action in result.actions] == ["downloaded", "downloaded"]
+
+
+@pytest.mark.parametrize("final_state", ["missing", "identical"])
+def test_temporary_name_replacement_between_prepare_and_install_is_never_consumed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    final_state: str,
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    body = b"chart"
+    digest = sha256(body).hexdigest()
+    final_path = tmp_path / "sha256" / digest[:2] / digest
+    if final_state == "identical":
+        final_path.parent.mkdir(parents=True)
+        final_path.write_bytes(body)
+    index = empty_index(tmp_path)
+    replacement = b"unowned replacement"
+    replacement_path: Path | None = None
+    owned_descriptors: list[int] = []
+    swapped = False
+    real_open = os.open
+    real_replace = os.replace
+
+    def replace_temporary_name() -> None:
+        nonlocal replacement_path, swapped
+        if swapped:
+            return
+        swapped = True
+        incoming = tmp_path / "sha256" / ".incoming"
+        replacement_path = next(incoming.glob("*.tmp"))
+        unowned_source = tmp_path / "unowned-replacement"
+        unowned_source.write_bytes(replacement)
+        real_replace(unowned_source, replacement_path)
+
+    def track_open(path, flags, *args, **kwargs):
+        if (
+            not swapped
+            and str(path) == digest
+            and kwargs.get("dir_fd") is not None
+            and flags & os.O_ACCMODE == os.O_RDONLY
+        ):
+            replace_temporary_name()
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if flags & os.O_CREAT and flags & os.O_EXCL and str(path).endswith(".tmp"):
+            owned_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(cache.os, "open", track_open)
+
+    result = sync_cache(
+        (simfile(remote_object()),),
+        FakeStore(body=body),
+        index,
+        config(),
+        False,
+    )
+
+    assert swapped
+    assert replacement_path is not None
+    assert replacement_path.read_bytes() == replacement
+    if final_state == "missing":
+        assert not final_path.exists()
+    else:
+        assert final_path.read_bytes() == body
+    assert not (tmp_path / "index-v1.json").exists()
+    assert result.actions[0].action == "failed"
+    assert [error.code for error in result.actions[0].errors] == ["artifact_write_failed"]
+    assert owned_descriptors
+    for descriptor in owned_descriptors:
+        with pytest.raises(OSError, match="Bad file descriptor") as error:
+            os.fstat(descriptor)
+        assert error.value.errno == errno.EBADF
+
+
+def test_content_descriptors_remain_open_through_checkpoint_and_close_after(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    body = b"chart"
+    digest = sha256(body).hexdigest()
+    index = empty_index(tmp_path)
+    descriptors: dict[str, int] = {}
+    real_open = os.open
+    real_checkpoint = index.checkpoint
+
+    def track_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        name = str(path)
+        if flags & getattr(os, "O_DIRECTORY", 0):
+            if Path(path) == tmp_path:
+                descriptors["cache"] = descriptor
+            elif name == "sha256":
+                descriptors["sha256"] = descriptor
+            elif name == ".incoming":
+                descriptors["incoming"] = descriptor
+            elif name == digest[:2]:
+                descriptors["shard"] = descriptor
+        elif name == digest and kwargs.get("dir_fd") is not None:
+            descriptors["final"] = descriptor
+        return descriptor
+
+    def checkpoint(entry: CacheIndexEntry) -> None:
+        assert set(descriptors) == {"cache", "sha256", "incoming", "shard", "final"}
+        for descriptor in descriptors.values():
+            os.fstat(descriptor)
+        real_checkpoint(entry)
+
+    monkeypatch.setattr(cache.os, "open", track_open)
+    monkeypatch.setattr(index, "checkpoint", checkpoint)
+
+    result = sync_cache(
+        (simfile(remote_object()),),
+        FakeStore(body=body),
+        index,
+        config(),
+        False,
+    )
+
+    assert result.actions[0].action == "downloaded"
+    for descriptor in descriptors.values():
+        with pytest.raises(OSError, match="Bad file descriptor") as error:
+            os.fstat(descriptor)
+        assert error.value.errno == errno.EBADF
+
+
+def test_shard_swap_during_temporary_cleanup_never_checkpoints_stale_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    body = b"chart"
+    digest = sha256(body).hexdigest()
+    shard = tmp_path / "sha256" / digest[:2]
+    pinned_shard = tmp_path / "pinned-shard-after-install"
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "sentinel").write_bytes(b"unchanged")
+    shard_descriptors: list[int] = []
+    swapped = False
+    real_open = os.open
+    real_unlink = os.unlink
+
+    def track_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if (
+            str(path) == digest[:2]
+            and kwargs.get("dir_fd") is not None
+            and flags & getattr(os, "O_DIRECTORY", 0)
+        ):
+            shard_descriptors.append(descriptor)
+        return descriptor
+
+    def swap_shard_then_unlink(path, *args, **kwargs) -> None:
+        nonlocal swapped
+        if not swapped and str(path).endswith(".tmp") and kwargs.get("dir_fd") is not None:
+            swapped = True
+            shard.rename(pinned_shard)
+            shard.symlink_to(external, target_is_directory=True)
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(cache.os, "open", track_open)
+    monkeypatch.setattr(cache.os, "unlink", swap_shard_then_unlink)
+
+    result = sync_cache(
+        (
+            simfile(
+                remote_object("42/first.dtx"),
+                remote_object("42/second.dtx"),
+            ),
+        ),
+        FakeStore(body=body),
+        empty_index(tmp_path),
+        config(),
+        False,
+    )
+
+    assert swapped
+    assert (external / "sentinel").read_bytes() == b"unchanged"
+    assert not (external / digest).exists()
+    assert not (tmp_path / "index-v1.json").exists()
+    assert (pinned_shard / digest).read_bytes() == body
+    assert [action.action for action in result.actions] == ["failed", "failed"]
+    assert [[error.code for error in action.errors] for action in result.actions] == [
+        ["artifact_write_failed"],
+        ["artifact_write_failed"],
+    ]
+    assert shard_descriptors
+    for descriptor in shard_descriptors:
+        with pytest.raises(OSError, match="Bad file descriptor") as error:
+            os.fstat(descriptor)
+        assert error.value.errno == errno.EBADF

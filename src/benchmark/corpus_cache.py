@@ -87,11 +87,25 @@ class _DownloadResult:
     action: CacheAction
 
 
+@dataclass
+class _OwnedTemporaryFile:
+    name: str
+    descriptor: int
+    device: int
+    inode: int
+    closed: bool = False
+
+    def close(self) -> None:
+        if not self.closed:
+            os.close(self.descriptor)
+            self.closed = True
+
+
 @dataclass(frozen=True)
 class _PreparedDownload:
     remote: RemoteObject
     validation: CacheValidation
-    temporary_name: str
+    temporary: _OwnedTemporaryFile
     sha256: str
     size: int
 
@@ -277,9 +291,9 @@ def sync_cache(
             misses.append((simfile_index, object_index, remote, validation))
 
     if misses:
+        prepared: list[tuple[tuple[int, int], _PreparedDownload]] = []
         try:
             with _open_content_directories(index.cache_dir) as directories:
-                prepared: list[tuple[tuple[int, int], _PreparedDownload]] = []
                 with ThreadPoolExecutor(max_workers=config.download_concurrency) as executor:
                     futures = [
                         (
@@ -322,6 +336,9 @@ def sync_cache(
                 )
                 object_results[identity] = result.object
                 actions[identity] = result.action
+        finally:
+            for _, download in prepared:
+                download.temporary.close()
 
     rebuilt_simfiles = tuple(
         _rebuild_simfile(simfile, simfile_index, object_results)
@@ -362,7 +379,7 @@ def _prepare_download(
     validation: CacheValidation,
 ) -> _PreparedDownload | _DownloadResult:
     temporary_name = f"{uuid4().hex}.tmp"
-    temporary_created = False
+    temporary: _OwnedTemporaryFile | None = None
     errors: list[SyncError] = []
     byte_count = 0
     digest = sha256()
@@ -373,19 +390,24 @@ def _prepare_download(
             weak_error = _weak_response_error(remote, download)
             if weak_error is not None:
                 raise _DownloadRejected(weak_error)
-            incoming = _create_temporary_file(directories.incoming_fd, temporary_name)
-            temporary_created = True
+            temporary = _create_temporary_file(directories.incoming_fd, temporary_name)
+            writer_descriptor = os.dup(temporary.descriptor)
+            try:
+                incoming = os.fdopen(writer_descriptor, "wb")
+            except OSError:
+                os.close(writer_descriptor)
+                raise
             with incoming:
                 while chunk := download.body.read(1024 * 1024):
                     incoming.write(chunk)
                     digest.update(chunk)
                     byte_count += len(chunk)
                 incoming.flush()
-                os.fsync(incoming.fileno())
+                os.fsync(temporary.descriptor)
                 _verify_regular_file_binding(
                     directories.incoming_fd,
                     temporary_name,
-                    incoming.fileno(),
+                    temporary.descriptor,
                 )
         _verify_content_directories(directories)
         if byte_count != remote.size:
@@ -408,13 +430,20 @@ def _prepare_download(
         errors.append(_download_error("artifact_write_failed", remote.key))
 
     if errors:
-        if temporary_created and not _unlink_temporary(directories.incoming_fd, temporary_name):
-            errors.append(_download_error("artifact_write_failed", remote.key))
+        if temporary is not None:
+            if not _unlink_owned_temporary(
+                directories.incoming_fd,
+                temporary,
+                missing_ok=False,
+            ):
+                errors.append(_download_error("artifact_write_failed", remote.key))
+            temporary.close()
         return _failed_download(remote, validation, tuple(errors))
+    assert temporary is not None
     return _PreparedDownload(
         remote,
         validation,
-        temporary_name,
+        temporary,
         digest.hexdigest(),
         byte_count,
     )
@@ -448,96 +477,157 @@ def _install_digest_group(
     shard_fd: int | None = None
     final_fd: int | None = None
     install_error: SyncError | None = None
+    moved_temporary: _OwnedTemporaryFile | None = None
+    cleanup_errors: set[tuple[int, int]] = set()
+    results: dict[tuple[int, int], _DownloadResult] = {}
     try:
         with _body_install_lock:
-            _verify_content_directories(directories)
-            shard_fd = _open_or_create_directory_at(directories.sha256_fd, shard_name)
-            _verify_directory_binding(directories.sha256_fd, shard_name, shard_fd)
-            if os.fstat(directories.incoming_fd).st_dev != os.fstat(shard_fd).st_dev:
-                raise _DownloadRejected(
-                    _download_error("artifact_write_failed", group[0][1].remote.key)
-                )
-
             try:
-                final_fd = _open_regular_file_at(shard_fd, content_sha256)
-            except FileNotFoundError:
-                replacement = group[0][1]
-            else:
-                existing_digest, existing_size = _hash_fd(final_fd)
-                if existing_digest == content_sha256 and existing_size == group[0][1].size:
-                    replacement = None
-                else:
-                    replacement = next(
-                        (
-                            download
-                            for _, download in group
-                            if _can_repair_content_address(download, cache_path)
-                        ),
-                        None,
-                    )
-                    if replacement is None:
-                        raise _DownloadRejected(
-                            _download_error(
-                                "artifact_write_failed",
-                                group[0][1].remote.key,
-                            )
-                        )
-                    os.close(final_fd)
-                    final_fd = None
-
-            if replacement is not None:
-                os.replace(
-                    replacement.temporary_name,
-                    content_sha256,
-                    src_dir_fd=directories.incoming_fd,
-                    dst_dir_fd=shard_fd,
-                )
-                final_fd = _open_regular_file_at(shard_fd, content_sha256)
-                installed_digest, installed_size = _hash_fd(final_fd)
-                if installed_digest != content_sha256 or installed_size != replacement.size:
+                _verify_content_directories(directories)
+                shard_fd = _open_or_create_directory_at(directories.sha256_fd, shard_name)
+                _verify_directory_binding(directories.sha256_fd, shard_name, shard_fd)
+                if os.fstat(directories.incoming_fd).st_dev != os.fstat(shard_fd).st_dev:
                     raise _DownloadRejected(
-                        _download_error("artifact_write_failed", replacement.remote.key)
+                        _download_error("artifact_write_failed", group[0][1].remote.key)
                     )
 
-            assert final_fd is not None
-            os.fsync(final_fd)
-            _verify_regular_file_binding(shard_fd, content_sha256, final_fd)
-            os.fsync(shard_fd)
-            _verify_content_directories(directories)
-            _verify_directory_binding(directories.sha256_fd, shard_name, shard_fd)
-            _verify_regular_file_binding(shard_fd, content_sha256, final_fd)
-    except (_DownloadRejected, OSError, ValueError) as error:
-        install_error = (
-            error.error
-            if isinstance(error, _DownloadRejected)
-            else _download_error("artifact_write_failed", group[0][1].remote.key)
-        )
+                try:
+                    final_fd = _open_regular_file_at(shard_fd, content_sha256)
+                except FileNotFoundError:
+                    replacement = group[0][1]
+                else:
+                    existing_digest, existing_size = _hash_fd(final_fd)
+                    if existing_digest == content_sha256 and existing_size == group[0][1].size:
+                        replacement = None
+                    else:
+                        replacement = next(
+                            (
+                                download
+                                for _, download in group
+                                if _can_repair_content_address(download, cache_path)
+                            ),
+                            None,
+                        )
+                        if replacement is None:
+                            raise _DownloadRejected(
+                                _download_error(
+                                    "artifact_write_failed",
+                                    group[0][1].remote.key,
+                                )
+                            )
+                        os.close(final_fd)
+                        final_fd = None
+
+                if replacement is not None:
+                    _verify_owned_temporary_binding(
+                        directories.incoming_fd,
+                        replacement.temporary,
+                    )
+                    os.replace(
+                        replacement.temporary.name,
+                        content_sha256,
+                        src_dir_fd=directories.incoming_fd,
+                        dst_dir_fd=shard_fd,
+                    )
+                    moved_temporary = replacement.temporary
+                    final_fd = _open_regular_file_at(shard_fd, content_sha256)
+                    _verify_owned_descriptor(replacement.temporary, final_fd)
+                    installed_digest, installed_size = _hash_fd(final_fd)
+                    if installed_digest != content_sha256 or installed_size != replacement.size:
+                        raise _DownloadRejected(
+                            _download_error("artifact_write_failed", replacement.remote.key)
+                        )
+
+                assert final_fd is not None
+                os.fsync(final_fd)
+                _verify_regular_file_binding(shard_fd, content_sha256, final_fd)
+                os.fsync(shard_fd)
+                _verify_installed_content_path(
+                    directories,
+                    shard_name,
+                    shard_fd,
+                    content_sha256,
+                    final_fd,
+                )
+            except (_DownloadRejected, OSError, ValueError) as error:
+                install_error = (
+                    error.error
+                    if isinstance(error, _DownloadRejected)
+                    else _download_error("artifact_write_failed", group[0][1].remote.key)
+                )
+
+            for identity, download in group:
+                if not _unlink_owned_temporary(
+                    directories.incoming_fd,
+                    download.temporary,
+                    missing_ok=download.temporary is moved_temporary,
+                ):
+                    cleanup_errors.add(identity)
+                download.temporary.close()
+
+            binding_error: SyncError | None = None
+            if install_error is None:
+                try:
+                    assert shard_fd is not None
+                    assert final_fd is not None
+                    _verify_installed_content_path(
+                        directories,
+                        shard_name,
+                        shard_fd,
+                        content_sha256,
+                        final_fd,
+                    )
+                except (OSError, ValueError):
+                    binding_error = _download_error(
+                        "artifact_write_failed",
+                        group[0][1].remote.key,
+                    )
+
+            for identity, download in group:
+                errors: list[SyncError] = []
+                if install_error is not None:
+                    errors.append(replace(install_error, object_key=download.remote.key))
+                if identity in cleanup_errors:
+                    errors.append(_download_error("artifact_write_failed", download.remote.key))
+                if binding_error is not None:
+                    errors.append(replace(binding_error, object_key=download.remote.key))
+                if errors:
+                    results[identity] = _failed_download(
+                        download.remote,
+                        download.validation,
+                        tuple(errors),
+                    )
+                    continue
+                try:
+                    assert shard_fd is not None
+                    assert final_fd is not None
+                    _verify_installed_content_path(
+                        directories,
+                        shard_name,
+                        shard_fd,
+                        content_sha256,
+                        final_fd,
+                    )
+                except (OSError, ValueError):
+                    results[identity] = _failed_download(
+                        download.remote,
+                        download.validation,
+                        (_download_error("artifact_write_failed", download.remote.key),),
+                    )
+                    continue
+                results[identity] = _checkpoint_download(
+                    download,
+                    index,
+                    config,
+                    cache_path,
+                )
     finally:
+        for _, download in group:
+            download.temporary.close()
         if final_fd is not None:
             os.close(final_fd)
         if shard_fd is not None:
             os.close(shard_fd)
-
-    results: dict[tuple[int, int], _DownloadResult] = {}
-    for identity, download in group:
-        errors: list[SyncError] = []
-        if install_error is not None:
-            errors.append(replace(install_error, object_key=download.remote.key))
-        if not _unlink_temporary(directories.incoming_fd, download.temporary_name):
-            errors.append(_download_error("artifact_write_failed", download.remote.key))
-        if errors:
-            results[identity] = _failed_download(
-                download.remote,
-                download.validation,
-                tuple(errors),
-            )
-            continue
-        results[identity] = _checkpoint_download(
-            download,
-            index,
-            config,
-            cache_path,
-        )
     return results
 
 
@@ -799,6 +889,42 @@ def _verify_regular_file_binding(parent_fd: int, name: str, descriptor: int) -> 
         raise OSError("cache content file binding changed")
 
 
+def _verify_owned_descriptor(temporary: _OwnedTemporaryFile, descriptor: int) -> None:
+    owned_stat = os.fstat(temporary.descriptor)
+    descriptor_stat = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(owned_stat.st_mode)
+        or (owned_stat.st_dev, owned_stat.st_ino) != (temporary.device, temporary.inode)
+        or not _same_inode(owned_stat, descriptor_stat)
+    ):
+        raise OSError("cache temporary file ownership changed")
+
+
+def _verify_owned_temporary_binding(
+    parent_fd: int,
+    temporary: _OwnedTemporaryFile,
+) -> None:
+    _verify_regular_file_binding(parent_fd, temporary.name, temporary.descriptor)
+    descriptor_stat = os.fstat(temporary.descriptor)
+    if (descriptor_stat.st_dev, descriptor_stat.st_ino) != (
+        temporary.device,
+        temporary.inode,
+    ):
+        raise OSError("cache temporary file ownership changed")
+
+
+def _verify_installed_content_path(
+    directories: _PinnedContentDirectories,
+    shard_name: str,
+    shard_fd: int,
+    content_sha256: str,
+    final_fd: int,
+) -> None:
+    _verify_content_directories(directories)
+    _verify_directory_binding(directories.sha256_fd, shard_name, shard_fd)
+    _verify_regular_file_binding(shard_fd, content_sha256, final_fd)
+
+
 def _same_inode(first: os.stat_result, second: os.stat_result) -> bool:
     return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
@@ -814,28 +940,45 @@ def _open_regular_file_at(parent_fd: int, name: str) -> int:
     return descriptor
 
 
-def _create_temporary_file(parent_fd: int, name: str):
+def _create_temporary_file(parent_fd: int, name: str) -> _OwnedTemporaryFile:
     no_follow = getattr(os, "O_NOFOLLOW", None)
     if no_follow is None:
         raise OSError(ENOTSUP, "no-follow file descriptors are unavailable")
     descriptor = os.open(
         name,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow,
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | no_follow,
         0o600,
         dir_fd=parent_fd,
     )
     try:
-        return os.fdopen(descriptor, "wb")
-    except OSError:
+        descriptor_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            raise OSError("cache temporary file is not a regular file")
+        return _OwnedTemporaryFile(
+            name,
+            descriptor,
+            descriptor_stat.st_dev,
+            descriptor_stat.st_ino,
+        )
+    except Exception:
         os.close(descriptor)
         raise
 
 
-def _unlink_temporary(parent_fd: int, name: str) -> bool:
+def _unlink_owned_temporary(
+    parent_fd: int,
+    temporary: _OwnedTemporaryFile,
+    *,
+    missing_ok: bool,
+) -> bool:
     try:
-        os.unlink(name, dir_fd=parent_fd)
+        _verify_owned_temporary_binding(parent_fd, temporary)
     except FileNotFoundError:
-        return True
+        return missing_ok
+    except OSError:
+        return False
+    try:
+        os.unlink(temporary.name, dir_fd=parent_fd)
     except OSError:
         return False
     return True
