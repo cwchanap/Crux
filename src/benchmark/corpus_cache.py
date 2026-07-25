@@ -5,6 +5,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from errno import EAGAIN, ENOSYS, ENOTSUP, EOPNOTSUPP, EWOULDBLOCK
 from pathlib import Path, PurePosixPath
 from threading import Lock
 from typing import Iterator
@@ -24,6 +25,16 @@ _ENTRY_FIELDS = {
     "sha256",
     "cache_path",
 }
+_STRING_ENTRY_FIELDS = {
+    "source_endpoint_sha256",
+    "bucket",
+    "key",
+    "etag",
+    "last_modified",
+    "sha256",
+    "cache_path",
+}
+_UNSUPPORTED_LOCK_ERRNOS = {ENOSYS, ENOTSUP, EOPNOTSUPP}
 
 
 @dataclass(frozen=True)
@@ -65,22 +76,25 @@ class CacheIndexStore:
         return cls(cache_dir, entries)
 
     def get(self, endpoint_hash: str, bucket: str, key: str) -> CacheIndexEntry | None:
-        return self._entries.get((endpoint_hash, bucket, key))
+        with self._checkpoint_lock:
+            return self._entries.get((endpoint_hash, bucket, key))
 
     def checkpoint(self, entry: CacheIndexEntry) -> None:
         entry = _validated_entry(asdict(entry))
         with self._checkpoint_lock:
-            self._entries[(entry.source_endpoint_sha256, entry.bucket, entry.key)] = entry
-            self._publish_locked()
+            entries = dict(self._entries)
+            entries[(entry.source_endpoint_sha256, entry.bucket, entry.key)] = entry
+            self._publish_locked(entries)
+            self._entries = entries
 
-    def _publish_locked(self) -> None:
+    def _publish_locked(self, entries: dict[tuple[str, str, str], CacheIndexEntry]) -> None:
         _ensure_durable_directory(self.cache_dir)
         payload = {
             "schema_version": CACHE_INDEX_SCHEMA,
             "entries": [
                 asdict(entry)
                 for entry in sorted(
-                    self._entries.values(),
+                    entries.values(),
                     key=lambda item: (
                         item.source_endpoint_sha256,
                         item.bucket,
@@ -123,13 +137,12 @@ def cache_writer_lock(cache_dir: Path) -> Iterator[None]:
         raise RuntimeError("unsupported_platform") from exc
 
     _ensure_durable_directory(cache_dir)
-    lock_path = cache_dir / ".index-v1.lock"
-    handle = lock_path.open("a+b")
+    handle = _open_lock_file(cache_dir / ".index-v1.lock")
     try:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError("cache_locked") from exc
+        except OSError as exc:
+            raise RuntimeError(_lock_error_message(exc)) from exc
         yield
     finally:
         handle.close()
@@ -139,7 +152,7 @@ def _load_index_document(index_path: Path) -> object:
     try:
         content = index_path.read_text(encoding="utf-8")
         return json.loads(content, object_pairs_hook=_unique_object)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, _DuplicateObjectField) as exc:
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise ValueError("invalid cache index JSON") from exc
 
 
@@ -176,18 +189,9 @@ def _validated_entries(document: object) -> dict[tuple[str, str, str], CacheInde
 def _validated_entry(raw_entry: object) -> CacheIndexEntry:
     if type(raw_entry) is not dict or set(raw_entry) != _ENTRY_FIELDS:
         raise ValueError("invalid cache index entry")
-    if any(
-        type(raw_entry[name]) is not str
-        for name in (
-            "source_endpoint_sha256",
-            "bucket",
-            "key",
-            "etag",
-            "last_modified",
-            "sha256",
-            "cache_path",
-        )
-    ):
+    if any(type(raw_entry[name]) is not str for name in _STRING_ENTRY_FIELDS):
+        raise ValueError("invalid cache index entry")
+    if any(not _is_utf8_encodable(raw_entry[name]) for name in _STRING_ENTRY_FIELDS):
         raise ValueError("invalid cache index entry")
     if type(raw_entry["etag_is_weak"]) is not bool:
         raise ValueError("invalid cache index entry")
@@ -219,6 +223,14 @@ def _validated_entry(raw_entry: object) -> CacheIndexEntry:
 
 def _is_lower_hex_sha256(value: str) -> bool:
     return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _is_utf8_encodable(value: str) -> bool:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _is_canonical_utc_timestamp(value: str) -> bool:
@@ -270,6 +282,33 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _open_lock_file(lock_path: Path):
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise RuntimeError("unsupported_platform")
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_APPEND | os.O_CREAT | no_follow,
+            0o600,
+        )
+    except OSError as exc:
+        raise RuntimeError(_lock_error_message(exc)) from exc
+    try:
+        return os.fdopen(descriptor, "a+b")
+    except OSError as exc:
+        os.close(descriptor)
+        raise RuntimeError(_lock_error_message(exc)) from exc
+
+
+def _lock_error_message(exc: OSError) -> str:
+    if exc.errno in {EAGAIN, EWOULDBLOCK}:
+        return "cache_locked"
+    if exc.errno in _UNSUPPORTED_LOCK_ERRNOS:
+        return "unsupported_platform"
+    return "cache_lock_failed"
 
 
 class _DuplicateObjectField(ValueError):
