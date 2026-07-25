@@ -880,6 +880,7 @@ def _validate_platform_support() -> None:
     if (
         not callable(getattr(fcntl, "flock", None))
         or getattr(fcntl, "LOCK_EX", None) is None
+        or getattr(fcntl, "LOCK_NB", None) is None
         or getattr(fcntl, "LOCK_UN", None) is None
     ):
         raise _SyncFailure(_safe_error("unsupported_platform"))

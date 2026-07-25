@@ -1159,6 +1159,28 @@ def test_incompatible_fcntl_fails_preflight_without_network_or_local_mutation(
     assert not (tmp_path / "cache").exists()
 
 
+def test_fcntl_without_nonblocking_lock_fails_preflight_without_mutation(tmp_path, monkeypatch):
+    class PartialFcntl:
+        LOCK_EX = 2
+        LOCK_UN = 8
+
+        @staticmethod
+        def flock(_descriptor, _operation):
+            return None
+
+    store = complete_store()
+    monkeypatch.setattr(r2_corpus_sync, "_load_fcntl", lambda: PartialFcntl)
+
+    outcome, _ = invoke_sync(tmp_path, store, dry_run=True)
+
+    assert outcome.exit_code == 2
+    assert outcome.report_path is None
+    assert [error.code for error in outcome.errors] == ["unsupported_platform"]
+    assert store.calls == []
+    assert not (tmp_path / "output").exists()
+    assert not (tmp_path / "cache").exists()
+
+
 def test_fixed_input_rerun_reuses_byte_identical_immutable_manifest(tmp_path):
     first, _ = invoke_sync(tmp_path, complete_store(), run_id=RUN_ID)
     second_store = complete_store()
