@@ -160,6 +160,42 @@ def test_config_rejects_non_https_origin(endpoint):
         R2Config.from_environ({"CRUX_R2_ENDPOINT_URL": endpoint})
 
 
+@pytest.mark.parametrize(
+    "bucket",
+    [
+        "",
+        "bad bucket",
+        "Bucket",
+        "b",
+        "bu",
+        "bucket?x",
+        "bucket_underscore",
+        "bucket.with.dots",
+        "a--b",
+        "-leading",
+        "trailing-",
+        "192.168.0.1",
+        "x" * 64,
+    ],
+)
+def test_config_rejects_invalid_bucket_name(bucket):
+    with pytest.raises(ValueError, match="CRUX_R2_BUCKET"):
+        R2Config.from_environ(
+            {"CRUX_R2_ENDPOINT_URL": "https://abc.r2.cloudflarestorage.com", "CRUX_R2_BUCKET": bucket}
+        )
+
+
+@pytest.mark.parametrize(
+    "bucket",
+    ["simfile-dtx", "a-b", "abc123", "n" * 63, "0-9"],
+)
+def test_config_accepts_valid_bucket_name(bucket):
+    config = R2Config.from_environ(
+        {"CRUX_R2_ENDPOINT_URL": "https://abc.r2.cloudflarestorage.com", "CRUX_R2_BUCKET": bucket}
+    )
+    assert config.bucket == bucket
+
+
 def test_etag_and_timestamp_normalization_are_canonical():
     assert parse_etag('"abc-2"') == ("abc-2", False)
     assert parse_etag('W/"weak-value"') == ("weak-value", True)
@@ -303,8 +339,7 @@ class R2Config:
         port = "" if parts.port in (None, 443) else f":{parts.port}"
         normalized = f"https://{hostname}{port}"
         bucket = environ.get("CRUX_R2_BUCKET", "simfile-dtx")
-        if not bucket or "/" in bucket:
-            raise ValueError("CRUX_R2_BUCKET must be a non-empty bucket name")
+        _validate_bucket_name(bucket)
         return cls(
             endpoint_url=normalized,
             source_endpoint_sha256=sha256(normalized.encode("ascii")).hexdigest(),
@@ -350,7 +385,38 @@ def _bounded_int(
     if not minimum <= value <= maximum:
         raise ValueError(f"{name} must be in {minimum}..{maximum}")
     return value
+
+
+import re
+
+_BUCKET_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$")
+
+
+def _validate_bucket_name(bucket: str) -> None:
+    """Apply the R2/S3 DNS-compatible bucket-name grammar.
+
+    Rejects names that would otherwise reach the SDK and surface as remote-access
+    or internal errors instead of the documented deterministic ``invalid_config``.
+    Rules: 3-63 chars, lowercase letters/digits/hyphens, must start and end with
+    an alphanumeric character, no consecutive hyphens, no ``.``-separated
+    IP-address format, and not the reserved ``.`` or ``..`` names. The message
+    never echoes the offending value.
+    """
+    if not bucket:
+        raise ValueError("CRUX_R2_BUCKET must be a non-empty bucket name")
+    if not _BUCKET_NAME_RE.match(bucket):
+        raise ValueError("CRUX_R2_BUCKET must use lowercase letters, digits, and hyphens")
+    if "--" in bucket:
+        raise ValueError("CRUX_R2_BUCKET must not contain consecutive hyphens")
+    if len(bucket) < 3 or len(bucket) > 63:
+        raise ValueError("CRUX_R2_BUCKET must be 3-63 characters")
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", bucket):
+        raise ValueError("CRUX_R2_BUCKET must not be an IP-address format")
 ```
+
+Add `re` to the module's top-level imports (Ruff `I`-sorted) alongside the
+existing `datetime`, `json`, `pathlib`, and `hashlib` imports; do not import it
+inline.
 
 Wrap URL parsing, IDNA encoding, and port extraction so malformed input becomes the
 same deterministic HTTPS-origin error without echoing the value. Add these immutable
@@ -1052,7 +1118,12 @@ def test_rejects_duplicate_ids_after_numeric_normalization(tmp_path: Path):
 
 Add cases for malformed JSON, non-object `simfiles`, negative and above-safe-range
 keys, unknown record fields, wrong string types, and non-boolean
-`redistribution_allowed`. Assert error messages never echo field values.
+`redistribution_allowed`. Assert error messages never echo field values. Add cases
+for a nonexistent `--provenance-file` and an unreadable one (e.g. a path inside a
+directory with `0o000` permissions, skipped on platforms where the test runner
+cannot create it): both must raise `ValueError` with a `provenance file` message so
+the command boundary maps them to `provenance_invalid` rather than
+`internal_error`.
 
 - [ ] **Step 2: Run tests and verify the missing-module failure**
 
@@ -1093,7 +1164,13 @@ ALLOWED_FIELDS = {
 def load_provenance(path: Path | None) -> dict[int, ProvenanceRecord]:
     if path is None:
         return {}
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ValueError(f"provenance file not found: {path}") from exc
+    except OSError as exc:
+        raise ValueError(f"provenance file unreadable: {path}") from exc
+    payload = json.loads(raw)
     if not isinstance(payload, dict) or payload.get("schema_version") != PROVENANCE_SCHEMA:
         raise ValueError("unsupported provenance schema_version")
     raw_simfiles = payload.get("simfiles")
@@ -1526,10 +1603,17 @@ Add cases for:
 - remote identity mismatch producing `remote_changed`;
 - weak response missing ETag/size/mtime producing `weak_etag_unverifiable`;
 - weak response metadata drift producing `source_changed_during_sync`;
+- strong-ETag GET whose response `Last-Modified` or `Content-Length` differs
+  from the HEAD identity (metadata-only rewrite preserving the content ETag)
+  producing `source_changed_during_sync` with no accepted bytes and no
+  checkpoint;
 - strong 412 producing `source_changed_during_sync` with no SDK details;
 - streamed byte-count mismatch;
 - failed GET and failed local write;
-- successful repair producing no `cache_corrupt`;
+- successful repair producing no `cache_corrupt`; the repaired entry's indexed
+  `cache_path` is the digest-derived final path, so a size/SHA-mismatched indexed
+  entry means that final path already holds corrupt bytes — repair must replace
+  those bytes, not reject them;
 - failed repair of a locally missing, size-mismatched, or SHA-mismatched entry
   producing `cache_corrupt` plus the operational error;
 - a failed `remote_changed` download producing only its operational error;
@@ -1537,7 +1621,14 @@ Add cases for:
 - incoming/final `st_dev` mismatch failing before replace;
 - file `fsync`, `os.replace`, shard-directory `fsync`, then index checkpoint order;
 - deduplication when a final SHA path already contains identical bytes;
-- rejection when an existing final SHA path contains mismatched bytes;
+- replacement of an existing final SHA path whose bytes mismatch **only when that
+  path is the indexed entry currently being repaired** (the corrupt-indexed case
+  above);
+- rejection (no `os.replace`, no checkpoint, sanitized `cache_corrupt` with a
+  collision/`artifact_write_failed` operational error) when a final SHA path
+  already contains mismatched bytes for a **fresh install or an entry whose
+  indexed `cache_path` is not this path** — i.e. an unrelated collision or
+  filesystem anomaly, never the indexed corrupt entry itself;
 - failed temporary-file cleanup;
 - independent download workers never exceeding `download_concurrency`;
 - restart after checkpoint becoming a verified hit.
@@ -1605,14 +1696,32 @@ with this concrete flow:
 Implement `_download_one` to:
 
 - create and durability-sync `<cache-dir>/sha256/.incoming`;
-- reconstruct strong `If-Match` as a quoted ETag;
-- omit it for weak ETags and verify response identity before accepting bytes;
+- reconstruct strong `If-Match` as a quoted ETag; `If-Match` only asserts the
+  content ETag, so after a successful strong-ETag GET also verify the response's
+  `Last-Modified` and `Content-Length` match the HEAD identity exactly — a
+  metadata-only rewrite between HEAD and GET can preserve the strong ETag while
+  changing `Last-Modified`, which would otherwise checkpoint a stale mtime into
+  the cache and manifest. On mismatch, emit `source_changed_during_sync` (the
+  same code as a 412) and do not accept bytes or checkpoint;
+- omit `If-Match` for weak ETags and verify response identity (ETag weakness,
+  size, mtime) before accepting bytes;
 - stream in fixed-size chunks to a unique incoming file while hashing/counting;
 - flush and `fsync` the incoming file;
 - create and sync the two-hex shard directory;
 - require incoming and shard directories to share `st_dev`;
-- verify an existing final path has the expected bytes, otherwise `os.replace` into
-  the extensionless final path while serializing same-digest installations;
+- verify an existing final path has the expected bytes; if they match, dedup
+  (no rewrite); if they mismatch, distinguish the two cases:
+  - **indexed-corrupt repair**: the entry being downloaded has `cache_path`
+    equal to this final path and was flagged `size_mismatch`/`sha256_mismatch`
+    by `validate_cached_body` — `os.replace` the freshly downloaded bytes into
+    the extensionless final path (the corrupt bytes are exactly what repair
+    must overwrite);
+  - **unrelated collision**: any other case (fresh install, or the path belongs
+    to a different indexed entry) — do **not** `os.replace`; emit a sanitized
+    `cache_corrupt` row with an `artifact_write_failed` operational error, do
+    not checkpoint, and delete the incoming file;
+  in both branches serialize same-digest installations under
+  `_body_install_lock`;
 - `fsync` the shard directory;
 - call `index.checkpoint` only afterward;
 - delete the invocation's incoming file on every failure path.
@@ -2110,8 +2219,41 @@ Define `ManifestPublicationError` with one sanitized `SyncError` field.
 
 `_atomic_replace_json` must write canonical UTF-8 JSON plus one newline, flush and
 `fsync` the temporary file, `os.replace` it, and `fsync` its parent directory.
+`os.replace` is the commit point: once it succeeds the new pointer content is
+visible at the target path, so a failure of the subsequent parent-directory
+`fsync` must not produce a mismatch between the on-disk pointer, the published
+report, and the command exit code. Handle that case as follows:
+
+- treat `os.replace` as the irreversible commit; the pointer publication is
+  considered successful once `os.replace` returns;
+- if the parent-directory `fsync` raises `OSError` after `os.replace` succeeded,
+  record a sanitized `artifact_write_failed` error but **do not** rewrite the
+  already-published report, `latest-report.json`, or `latest.json` to a failed
+  status, and **do not** change the outcome's `overall_status` or exit code;
+  the durability gap is a recoverable filesystem concern, not a logical
+  failure of the sync;
+- if the caller is `publish_latest_manifest` and the report/`latest-report.json`
+  have already been published with a `complete`/`partial` status, the
+  `latest.json` replacement is the final commit and a post-replace `fsync`
+  failure leaves `latest.json` pointing at the new manifest — which is the
+  intended end state. Return normally in that case after logging the
+  durability warning through the standard sanitized error channel.
+
+Equivalently: never let a post-`os.replace` `fsync` failure cause the command
+to return exit `2` after the report and pointers already record
+`complete`/`partial`. If `os.replace` itself fails (the pointer was not
+advanced), that remains a fatal `artifact_write_failed` with exit `2` and the
+report/pointers keep their prior state.
+
 Test explicitly that `publish_manifest` alone leaves an existing `latest.json`
 unchanged; only `publish_latest_manifest` may move the convenience pointer.
+Add a test that injects an `OSError` on the parent-directory `fsync` after a
+successful `os.replace` in `publish_latest_manifest` and asserts: the new
+`latest.json` is in place, the previously published report and
+`latest-report.json` are unchanged, and the call returns without raising. Add a
+second test that injects `OSError` on `os.replace` itself and asserts the
+prior `latest.json`, report, and `latest-report.json` are all unchanged and the
+call raises a sanitized `artifact_write_failed`.
 
 - [ ] **Step 5: Run manifest tests and deterministic-byte checks**
 
@@ -2337,7 +2479,11 @@ Use this exact phase order:
 10. assemble and publish the report;
 11. for a real run, publish `latest-report.json` only after the report is durable;
 12. publish `latest.json` only after the manifest, report, and report pointer are all
-   durable, so a fatal pointer failure cannot leave the manifest pointer advanced;
+   durable; treat `os.replace` as the commit point so a failure of the
+   subsequent parent-directory `fsync` is a recoverable durability warning
+   (sanitized `artifact_write_failed` logged without changing exit code or
+   already-published status) rather than a fatal pointer failure — only an
+   `os.replace` failure leaves the manifest pointer un-advanced and is fatal;
 13. release the whole-run writer lock;
 14. return the explicit outcome.
 
