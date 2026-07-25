@@ -145,6 +145,16 @@ def parse_etag(value: str) -> tuple[str, bool]:
 
 
 def format_manifest_timestamp(value: datetime) -> str:
+    try:
+        is_aware = (
+            isinstance(value, datetime)
+            and value.tzinfo is not None
+            and value.utcoffset() is not None
+        )
+    except Exception:
+        is_aware = False
+    if not is_aware:
+        raise ValueError("timestamp must be timezone-aware")
     normalized = value.astimezone(timezone.utc)
     fraction = f"{normalized.microsecond:06d}".rstrip("0")
     suffix = f".{fraction}" if fraction else ""

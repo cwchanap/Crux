@@ -308,6 +308,61 @@ def test_adapter_rejects_malformed_sdk_metadata_with_closed_error():
     )
 
 
+@pytest.mark.parametrize("boundary", ["list", "head", "download"])
+def test_adapter_rejects_naive_datetimes_at_metadata_boundaries(boundary):
+    naive = datetime(2026, 7, 25, 1, 2, 3)
+
+    class NaiveTimestampPaginator:
+        def paginate(self, **kwargs):
+            assert kwargs == {"Bucket": "simfile-dtx"}
+            return [
+                {
+                    "Contents": [
+                        {
+                            "Key": "42/SET.DEF",
+                            "Size": 5,
+                            "ETag": '"etag-2"',
+                            "LastModified": naive,
+                        }
+                    ]
+                }
+            ]
+
+    class NaiveTimestampClient(FakeClient):
+        def get_paginator(self, name):
+            assert name == "list_objects_v2"
+            return NaiveTimestampPaginator()
+
+        def head_object(self, **kwargs):
+            return {
+                "ContentLength": 5,
+                "ETag": '"etag-2"',
+                "LastModified": naive,
+            }
+
+        def get_object(self, **kwargs):
+            return {
+                "Body": BytesIO(b"chart"),
+                "ContentLength": 5,
+                "ETag": '"etag-2"',
+                "LastModified": naive,
+            }
+
+    store = Boto3R2Store(NaiveTimestampClient(), "simfile-dtx")
+    actions = {
+        "list": store.list_objects,
+        "head": lambda: store.head_object("42/SET.DEF"),
+        "download": lambda: store.open_object("42/SET.DEF", None).__enter__(),
+    }
+
+    assert_store_error(
+        actions[boundary],
+        "object_metadata_invalid",
+        "Object metadata is invalid.",
+        "42/SET.DEF",
+    )
+
+
 def test_adapter_keeps_the_object_key_separate_for_malformed_object_metadata():
     class MalformedHeadClient(FakeClient):
         def head_object(self, **kwargs):
