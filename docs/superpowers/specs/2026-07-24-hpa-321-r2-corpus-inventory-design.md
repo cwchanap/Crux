@@ -365,7 +365,13 @@ For each selected object:
    directory's parent.
 5. For a strong ETag, download to a uniquely named cache-local temporary file under
    `<cache-dir>/sha256/.incoming/` with `If-Match` using the exact quoted entity tag
-   reconstructed from `etag`.
+   reconstructed from `etag`. `If-Match` only asserts the content ETag, so after a
+   successful strong-ETag GET also verify the response's `Last-Modified` and
+   `Content-Length` match the HEAD identity exactly — a metadata-only rewrite between
+   HEAD and GET can preserve the strong ETag while changing `Last-Modified`, which
+   would otherwise checkpoint a stale mtime into the cache and manifest. On mismatch,
+   emit `source_changed_during_sync` (the same code as a 412) and do not accept bytes
+   or checkpoint.
 6. For a weak ETag, do not send `If-Match`, because HTTP preconditions use strong
    comparison for that header. Download to the same cache-local incoming directory
    with an unconditional GET and require its normalized ETag, content length, and
@@ -373,8 +379,8 @@ For each selected object:
    comparison metadata produces `weak_etag_unverifiable`; changed metadata produces
    `source_changed_during_sync`.
 7. Stream-compute SHA-256 and byte count during either download path.
-8. Reject a byte-count mismatch, strong conditional-request failure, or weak-path
-   response-metadata mismatch.
+8. Reject a byte-count mismatch, strong conditional-request failure, strong-path
+   response-metadata mismatch (step 5), or weak-path response-metadata mismatch.
 9. Create the content-addressed shard directory, synchronizing each newly created
    directory's parent. Incoming and final paths must resolve to the same filesystem;
    Crux never stages bodies in the process-wide `TMPDIR`.
@@ -620,7 +626,7 @@ input.
 Every attempt writes a machine-readable report outside the immutable manifest
 identity. It contains:
 
-- report schema version;
+- report schema version `crux.r2-corpus-sync-report/v1`;
 - start and end timestamps;
 - dry-run flag;
 - source endpoint SHA-256 and bucket name, excluding the raw endpoint URL;
@@ -636,6 +642,29 @@ identity. It contains:
 - overall status: `complete`, `partial`, `failed`, `dry_run_complete`, or
   `dry_run_partial`;
 - manifest corpus version, hash, and relative path when published.
+
+The `simfiles` array carries one row per included simfile, sorted by numeric
+`simfile_id` then exact `object_prefix`. Each report row is invocation-specific
+and distinct from the immutable manifest row: it carries no `corpus_version`,
+`schema_version`, `cache_profile`, `source_endpoint_sha256`, `source_bucket`,
+`source_discovery_method`, provenance, or manifest object-content fields. Each
+row contains:
+
+- `simfile_id` (int) and `object_prefix` (str);
+- `sync_status` using the same enum as the manifest (`complete`, `partial`,
+  `failed`, `empty`);
+- `sync_errors` using the same error structure as the manifest, sorted by the
+  manifest error sort key;
+- `objects`, an array of per-object action rows sorted by exact key, each with:
+  - `key`;
+  - `action` ∈ `planned`, `cache_hit`, `downloaded`, `failed`;
+  - `bytes`;
+  - `miss_reason` ∈ `remote_changed`, `missing`, `size_mismatch`,
+    `sha256_mismatch`, or `null` when the action is not a miss;
+  - `errors`, the per-object `SyncError` entries (possibly empty).
+
+Report rows never carry credentials, raw endpoint URLs, raw SDK exception names
+or messages, signed URLs, or authorization headers.
 
 At command start, Crux creates a UUID4 `run_id`. Reports use:
 

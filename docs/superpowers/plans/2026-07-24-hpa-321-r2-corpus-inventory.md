@@ -8,6 +8,8 @@
 
 **Tech Stack:** Python 3.12, Click 8, optional boto3/botocore, dataclasses, SHA-256, canonical JSON/JSONL, POSIX `fcntl.flock`, `ThreadPoolExecutor`, pytest
 
+**Command prefix:** Runnable shell snippets are prefixed with `rtk`, a local shell alias/function the operator defines to prepend the project's `uv run` environment (e.g. `alias rtk='cd <repo-root> && uv run'`). Strip the prefix if your environment already activates the project venv, or replace it with whatever wrapper you use to run commands inside the project's `uv` environment.
+
 ## Global Constraints
 
 - R2 object contents are authoritative; D1 and GraphQL must not determine chart truth.

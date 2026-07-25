@@ -11,13 +11,13 @@ uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 Run the worker entry point with `uv run python src/worker.py` when processing jobs outside the request cycle. Key checks:
 ```bash
 uv run pytest
-uv run ruff check src tests
-uv run black --check src tests
+uv run ruff check .
+uv run ruff format --check .
 uv run pylint src/app src/cli
 ```
 
 ## Coding Style & Naming Conventions
-We target Python 3.13 with 4-space indentation and a 100-character soft line limit (enforced by Ruff and Pylint). Prefer descriptive module and function names (`verb_noun` for actions, `PascalCase` for classes). Keep imports sorted (Ruff’s `I` rules) and avoid eager TensorFlow imports—follow the lazy-loading pattern already used in `src/app/main.py`. Format code with Black before committing.
+We target Python 3.13 with 4-space indentation and a 100-character soft line limit (enforced by Ruff and Pylint). Prefer descriptive module and function names (`verb_noun` for actions, `PascalCase` for classes). Keep imports sorted (Ruff’s `I` rules) and avoid eager TensorFlow imports—follow the lazy-loading pattern already used in `src/app/main.py`. Format code with Ruff format before committing.
 
 ## Testing Guidelines
 Pytest is configured via `pytest.ini` to collect under `tests/`. Name files `test_<feature>.py` and favor small, deterministic fixtures; async endpoints should use `pytest.mark.asyncio`. Mock heavy model calls or set `PRELOAD_MODEL=0` so suites remain fast. Add regression tests whenever touching request handlers, storage adapters, or CLI flows.
