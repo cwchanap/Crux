@@ -6,13 +6,8 @@ from pathlib import Path
 
 import click
 
-from src.benchmark.corpus import validate_score_midi_corpus
-from src.benchmark.dtx_parser import parse_dtx_file
-from src.benchmark.prepare import prepare_corpus
 from src.benchmark.r2_corpus_models import MAX_SIMFILE_ID, SyncOutcome, SyncRequest
 from src.benchmark.r2_corpus_sync import ProgressEvent, sync_r2_corpus
-from src.benchmark.render_audio import render_audio_corpus, render_audio_song
-from src.benchmark.runner import export_reference_midis, run_score_midi, run_transcribe_and_score
 from src.cli.options import (
     audio_dir_option,
     charts_dir_option,
@@ -33,6 +28,16 @@ def benchmark() -> None:
 
 def _emit_progress(event: ProgressEvent) -> None:
     click.echo(event.message, err=True)
+
+
+class _ProgressEmitter:
+    def __init__(self) -> None:
+        self.emitted_failed_final = False
+
+    def __call__(self, event: ProgressEvent) -> None:
+        if event.phase == "failed":
+            self.emitted_failed_final = True
+        _emit_progress(event)
 
 
 def _emit_sync_summary(outcome: SyncOutcome) -> None:
@@ -105,8 +110,13 @@ def sync_r2_corpus_command(
         provenance_file=provenance_file,
         dry_run=dry_run,
     )
-    outcome = sync_r2_corpus(request, progress=_emit_progress)
-    if outcome.overall_status == "failed" and outcome.report_path is None:
+    progress = _ProgressEmitter()
+    outcome = sync_r2_corpus(request, progress=progress)
+    if (
+        outcome.overall_status == "failed"
+        and outcome.report_path is None
+        and not progress.emitted_failed_final
+    ):
         click.echo("R2 synchronization failed before a report could be written.", err=True)
     _emit_sync_summary(outcome)
     if outcome.exit_code:
@@ -119,6 +129,8 @@ def sync_r2_corpus_command(
 @output_dir_option
 def prepare_benchmark_corpus(raw_dir: Path, run_name: str | None, output_dir: Path | None) -> None:
     """Convert raw song folders into the parsed benchmark corpus format."""
+    from src.benchmark.prepare import prepare_corpus
+
     result = prepare_corpus(raw_dir, resolve_benchmark_output_dir(output_dir, run_name, raw_dir))
     click.echo(
         f"Prepared {len(result.valid_items)} benchmark item(s); "
@@ -151,6 +163,8 @@ def score_midi(
     export_reference_midi: bool,
 ) -> None:
     """Score precomputed prediction MIDI files."""
+    from src.benchmark.runner import run_score_midi
+
     resolved_output_dir = resolve_benchmark_output_dir(output_dir, run_name, charts_dir.parent)
     try:
         reports = run_score_midi(
@@ -173,6 +187,8 @@ def score_midi(
 @predictions_dir_option
 def validate_corpus(charts_dir: Path, predictions_dir: Path) -> None:
     """Check DTX charts and prediction MIDIs for missing files, stray files, and duplicate stems."""
+    from src.benchmark.corpus import validate_score_midi_corpus
+
     result = validate_score_midi_corpus(charts_dir, predictions_dir)
     for error in result.errors:
         click.echo(error, err=True)
@@ -185,6 +201,8 @@ def validate_corpus(charts_dir: Path, predictions_dir: Path) -> None:
 @click.argument("dtx_path", type=click.Path(exists=True, path_type=Path))
 def inspect_dtx(dtx_path: Path) -> None:
     """Print parsed DTX chart metadata: event count, BPM, measure changes, and lane list."""
+    from src.benchmark.dtx_parser import parse_dtx_file
+
     chart = parse_dtx_file(dtx_path, chart_id=dtx_path.stem)
     lanes = sorted({event.lane_id for event in chart.events})
     click.echo(f"chart_id: {chart.chart_id}")
@@ -202,6 +220,8 @@ def inspect_dtx(dtx_path: Path) -> None:
 @output_dir_option
 def export_reference_midi(charts_dir: Path, run_name: str | None, output_dir: Path | None) -> None:
     """Export MIDI files derived from DTX charts for manual inspection (not used for scoring)."""
+    from src.benchmark.runner import export_reference_midis
+
     count = export_reference_midis(
         charts_dir, resolve_benchmark_output_dir(output_dir, run_name, charts_dir.parent)
     )
@@ -220,6 +240,8 @@ def render_audio(
     output_dir: Path | None,
 ) -> None:
     """Render drum-only audio from a song folder or raw corpus."""
+    from src.benchmark.render_audio import render_audio_corpus, render_audio_song
+
     if (song_dir is None) == (raw_dir is None):
         raise click.UsageError("Provide exactly one of --song-dir or --raw-dir")
 
@@ -257,6 +279,8 @@ def transcribe_and_score(
     tolerance_ms: tuple[int, ...],
 ) -> None:
     """Run transcription and score generated MIDI."""
+    from src.benchmark.runner import run_transcribe_and_score
+
     reports = run_transcribe_and_score(
         charts_dir,
         audio_dir,
