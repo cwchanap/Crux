@@ -159,7 +159,7 @@ class Boto3R2Store:
         except Exception as error:
             raise self._map_sdk_error(error, "object_get_failed", key) from None
         try:
-            body, download = self._parse_download(response)
+            body, download = self._parse_download(response, key)
         except R2StoreError as error:
             if error.code == "object_metadata_invalid" and error.object_key is None:
                 raise self._metadata_error(key) from None
@@ -216,12 +216,15 @@ class Boto3R2Store:
             content_type=_nullable_string(response.get("ContentType")),
         )
 
-    def _parse_download(self, response: Any) -> tuple[BinaryIO, ObjectDownload]:
+    def _parse_download(self, response: Any, key: str) -> tuple[BinaryIO, ObjectDownload]:
         if not isinstance(response, dict):
             raise self._metadata_error()
-        body = response.get("Body")
-        if not callable(getattr(body, "read", None)) or not callable(getattr(body, "close", None)):
+        raw_body = response.get("Body")
+        if not callable(getattr(raw_body, "read", None)) or not callable(
+            getattr(raw_body, "close", None)
+        ):
             raise self._metadata_error()
+        body = _SanitizedObjectBody(raw_body, self, key)
         etag, etag_is_weak = _nullable_etag(response.get("ETag"))
         return body, ObjectDownload(
             body=body,
@@ -256,6 +259,25 @@ class Boto3R2Store:
         return R2StoreError(
             "object_metadata_invalid", _MESSAGES["object_metadata_invalid"], object_key
         )
+
+
+class _SanitizedObjectBody:
+    def __init__(self, body: BinaryIO, store: Boto3R2Store, object_key: str):
+        self._body = body
+        self._store = store
+        self._object_key = object_key
+
+    def read(self, size: int = -1) -> bytes:
+        try:
+            return self._body.read(size)
+        except Exception as error:
+            raise self._store._map_sdk_error(error, "object_get_failed", self._object_key) from None
+
+    def close(self) -> None:
+        try:
+            self._body.close()
+        except Exception as error:
+            raise self._store._map_sdk_error(error, "object_get_failed", self._object_key) from None
 
 
 def create_boto3_store(config: R2Config) -> Boto3R2Store:

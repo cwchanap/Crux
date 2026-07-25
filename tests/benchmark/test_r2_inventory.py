@@ -318,9 +318,32 @@ def test_adapter_redacts_body_close_failures():
     )
 
 
+def test_adapter_redacts_body_read_failures():
+    class FailingBody(BytesIO):
+        def read(self, size=-1):
+            raise ConnectTimeoutError(endpoint_url="https://private.example")
+
+    class ReadFailureClient(FakeClient):
+        def get_object(self, **kwargs):
+            return {"Body": FailingBody(b"chart")}
+
+    store = Boto3R2Store(ReadFailureClient(), "simfile-dtx")
+    assert_store_error(
+        lambda: _read_download(store),
+        "object_get_failed",
+        "Object body read failed.",
+        "42/SET.DEF",
+    )
+
+
 def _consume_download(store: Boto3R2Store) -> None:
     with store.open_object("42/SET.DEF", None):
         pass
+
+
+def _read_download(store: Boto3R2Store) -> None:
+    with store.open_object("42/SET.DEF", None) as download:
+        download.body.read()
 
 
 def test_missing_r2_dependency_has_closed_install_hint(monkeypatch):
