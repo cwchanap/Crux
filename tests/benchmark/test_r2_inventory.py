@@ -1,14 +1,21 @@
 import logging
 from datetime import datetime, timezone
 from io import BytesIO
+from threading import Condition, Event, Thread
 
 import pytest
 from botocore.exceptions import ClientError, ConnectTimeoutError, NoCredentialsError
 
-from src.benchmark.r2_corpus_models import R2Config
+from src.benchmark.r2_corpus_models import (
+    MAX_SIMFILE_ID,
+    HeadMetadata,
+    ListedObject,
+    R2Config,
+)
 from src.benchmark.r2_inventory import (
     Boto3R2Store,
     R2StoreError,
+    build_inventory,
     create_boto3_store,
 )
 
@@ -359,3 +366,263 @@ def test_missing_r2_dependency_has_closed_install_hint(monkeypatch):
         "missing_optional_dependency",
         "R2 support is not installed. Install it with uv pip install -e '.[r2]'.",
     )
+
+
+def listed(key: str, size: int = 5) -> ListedObject:
+    return ListedObject(
+        key=key,
+        size=size,
+        etag='"listed-etag"',
+        etag_is_weak=False,
+        last_modified=datetime(2026, 7, 25, tzinfo=timezone.utc),
+    )
+
+
+class FakeStore:
+    def __init__(
+        self,
+        objects: list[ListedObject],
+        heads: dict[str, HeadMetadata | R2StoreError] | None = None,
+    ):
+        self.listed = tuple(objects)
+        self.heads = heads or {}
+        self.list_calls = 0
+        self.head_calls: list[str] = []
+
+    def list_objects(self) -> tuple[ListedObject, ...]:
+        self.list_calls += 1
+        return self.listed
+
+    def head_object(self, key: str) -> HeadMetadata:
+        self.head_calls.append(key)
+        result = self.heads.get(key, HeadMetadata(None, None, None, None, None))
+        if isinstance(result, R2StoreError):
+            raise result
+        return result
+
+
+def test_inventory_discovers_before_filtering_and_preserves_exact_keys():
+    store = FakeStore(
+        objects=[
+            listed("42/SET.DEF"),
+            listed("42/assets/曲 name.ogg"),
+            listed("99/chart.dtx"),
+            listed("README"),
+            listed("other/file.txt"),
+        ]
+    )
+
+    result = build_inventory(
+        store,
+        include_ids=frozenset({42}),
+        exclude_ids=frozenset(),
+        head_concurrency=2,
+    )
+
+    assert store.list_calls == 1
+    assert [item.simfile_id for item in result.simfiles] == [42]
+    assert result.simfiles_discovered == 2
+    assert result.simfiles_excluded_by_filter == 1
+    assert result.objects_listed == 5
+    assert result.malformed_root_keys == ("README", "other/file.txt")
+    assert result.simfiles[0].objects[1].key == "42/assets/曲 name.ogg"
+    assert sorted(store.head_calls) == ["42/SET.DEF", "42/assets/曲 name.ogg"]
+
+
+def test_ambiguous_aliases_are_quarantined_even_when_included():
+    store = FakeStore(objects=[listed("1/chart.dtx"), listed("01/chart.dtx")])
+
+    result = build_inventory(store, frozenset({1}), frozenset(), 2)
+
+    assert result.simfiles == ()
+    assert result.ambiguous_prefixes == {1: ("01/", "1/")}
+    assert result.root_errors[0].code == "ambiguous_simfile_prefix"
+
+
+def test_nested_marker_only_prefix_is_empty_and_retains_markers():
+    store = FakeStore(objects=[listed("42/", size=0), listed("42/assets/", size=0)])
+
+    result = build_inventory(store, frozenset(), frozenset(), 2)
+
+    row = result.simfiles[0]
+    assert row.sync_status == "empty"
+    assert [item.key for item in row.objects] == ["42/", "42/assets/"]
+    assert all(item.cache_status == "not_selected" for item in row.objects)
+    assert row.sync_errors[0].code == "empty_prefix"
+
+
+def test_explicit_missing_id_creates_empty_row_with_no_objects():
+    result = build_inventory(FakeStore(objects=[]), frozenset({42}), frozenset(), 2)
+
+    assert result.simfiles[0].simfile_id == 42
+    assert result.simfiles[0].objects == ()
+    assert result.simfiles[0].sync_errors[0].code == "empty_prefix"
+
+
+def test_exclude_wins_when_id_is_also_included():
+    store = FakeStore(objects=[listed("42/SET.DEF")])
+
+    result = build_inventory(store, frozenset({42}), frozenset({42}), 2)
+
+    assert result.simfiles == ()
+    assert result.simfiles_discovered == 1
+    assert result.simfiles_excluded_by_filter == 1
+    assert store.head_calls == []
+
+
+def test_boundary_ids_are_valid_and_out_of_range_root_is_malformed():
+    store = FakeStore(
+        objects=[
+            listed("0/SET.DEF"),
+            listed(f"{MAX_SIMFILE_ID}/SET.DEF"),
+            listed(f"{MAX_SIMFILE_ID + 1}/SET.DEF"),
+        ]
+    )
+
+    result = build_inventory(store, frozenset(), frozenset(), 2)
+
+    assert [row.simfile_id for row in result.simfiles] == [0, MAX_SIMFILE_ID]
+    assert result.malformed_root_keys == (f"{MAX_SIMFILE_ID + 1}/SET.DEF",)
+
+
+def test_zero_byte_non_marker_is_content_and_complete():
+    result = build_inventory(
+        FakeStore(objects=[listed("42/empty.dtx", size=0)]), frozenset(), frozenset(), 2
+    )
+
+    assert result.simfiles[0].sync_status == "complete"
+    assert result.simfiles[0].sync_errors == ()
+
+
+def test_head_failure_retains_listing_identity_and_only_its_simfile_is_partial():
+    failed_key = "42/SET.DEF"
+    store = FakeStore(
+        objects=[listed(failed_key), listed("43/SET.DEF")],
+        heads={failed_key: R2StoreError("object_head_failed", "closed", failed_key)},
+    )
+
+    result = build_inventory(store, frozenset(), frozenset(), 2)
+
+    failed, complete = result.simfiles
+    assert failed.sync_status == "partial"
+    assert failed.objects[0].size == 5
+    assert failed.objects[0].etag == '"listed-etag"'
+    assert failed.objects[0].content_type is None
+    assert failed.objects[0].errors[0].code == "object_head_failed"
+    assert complete.sync_status == "complete"
+
+
+def test_invalid_head_metadata_retains_listing_identity_and_records_error():
+    key = "42/SET.DEF"
+    store = FakeStore(
+        objects=[listed(key)],
+        heads={key: R2StoreError("object_metadata_invalid", "closed", key)},
+    )
+
+    result = build_inventory(store, frozenset(), frozenset(), 2)
+
+    obj = result.simfiles[0].objects[0]
+    assert obj.size == 5
+    assert obj.etag == '"listed-etag"'
+    assert obj.errors[0].code == "object_metadata_invalid"
+    assert result.simfiles[0].sync_status == "partial"
+
+
+def test_head_metadata_overrides_listing_identity_without_checksum_fields():
+    key = "42/SET.DEF"
+    updated = datetime(2026, 7, 26, tzinfo=timezone.utc)
+    store = FakeStore(
+        objects=[listed(key)],
+        heads={key: HeadMetadata(7, 'W/"head-etag"', True, updated, "text/plain")},
+    )
+
+    result = build_inventory(store, frozenset(), frozenset(), 2)
+
+    obj = result.simfiles[0].objects[0]
+    assert (obj.size, obj.etag, obj.etag_is_weak, obj.last_modified, obj.content_type) == (
+        7,
+        'W/"head-etag"',
+        True,
+        updated,
+        "text/plain",
+    )
+    assert not {"checksum_algorithm", "checksum_type", "checksum_value"} & set(
+        obj.__dataclass_fields__
+    )
+
+
+def test_inventory_preserves_encoded_and_unicode_keys_exactly():
+    keys = [
+        "42/a space.ogg",
+        "42/a+plus.ogg",
+        "42/a%2Fencoded.ogg",
+        "42/a#fragment.ogg",
+        "42/a?query.ogg",
+        "42/曲.ogg",
+    ]
+
+    result = build_inventory(
+        FakeStore(objects=[listed(key) for key in reversed(keys)]), frozenset(), frozenset(), 2
+    )
+
+    assert [obj.key for obj in result.simfiles[0].objects] == sorted(keys)
+
+
+def test_inventory_orders_simfiles_prefixes_and_objects_deterministically():
+    store = FakeStore(
+        objects=[
+            listed("10/z"),
+            listed("2/z"),
+            listed("2/a"),
+            listed("0/z"),
+        ]
+    )
+
+    result = build_inventory(store, frozenset(), frozenset(), 2)
+
+    assert [(row.simfile_id, row.object_prefix) for row in result.simfiles] == [
+        (0, "0/"),
+        (2, "2/"),
+        (10, "10/"),
+    ]
+    assert [obj.key for obj in result.simfiles[1].objects] == ["2/a", "2/z"]
+
+
+def test_head_requests_respect_the_configured_concurrency_bound():
+    class BlockingStore(FakeStore):
+        def __init__(self):
+            super().__init__([listed(f"42/{index}.dtx") for index in range(4)])
+            self.condition = Condition()
+            self.started = Event()
+            self.release = False
+            self.active = 0
+            self.max_active = 0
+
+        def head_object(self, key: str) -> HeadMetadata:
+            with self.condition:
+                self.head_calls.append(key)
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                if self.active == 2:
+                    self.started.set()
+                self.condition.wait_for(lambda: self.release, timeout=5)
+                self.active -= 1
+            return HeadMetadata(None, None, None, None, None)
+
+    store = BlockingStore()
+    result: list[object] = []
+    thread = Thread(
+        target=lambda: result.append(build_inventory(store, frozenset(), frozenset(), 2)),
+        daemon=True,
+    )
+    thread.start()
+    assert store.started.wait(timeout=2)
+    with store.condition:
+        assert store.max_active == 2
+        store.release = True
+        store.condition.notify_all()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert result
+    assert store.max_active <= 2
