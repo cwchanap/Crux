@@ -926,9 +926,11 @@ Classification rules:
 8. Count valid, non-quarantined discovered simfiles removed by filters.
 9. Record total root objects and valid, non-quarantined discovered simfiles before
    filters.
-10. Derive requested-but-absent IDs as `include_ids - exclude_ids - discovered_ids`,
-    preserving exclude precedence over include, and add each as a canonical `<id>/`
-    empty row. Excluded IDs never produce absent rows even when explicitly included.
+10. Derive requested-but-absent IDs as
+    `include_ids - exclude_ids - discovered_ids - ambiguous_ids`, preserving exclude
+    precedence over include, and add each as a canonical `<id>/` empty row. Excluded
+    and quarantined (ambiguous) IDs never produce absent rows even when explicitly
+    included.
 
 - [ ] **Step 4: Implement bounded HEAD merge and row statuses**
 
@@ -1566,7 +1568,7 @@ def validate_cached_body(
     entry: CacheIndexEntry | None,
 ) -> CacheValidation:
     if entry is None:
-        return CacheValidation("remote_changed", None)
+        return CacheValidation("missing", None)
     path = cache_dir / PurePosixPath(entry.cache_path)
     if not path.is_file():
         return CacheValidation("missing", entry)
@@ -1660,11 +1662,12 @@ Create `tests/benchmark/test_corpus_manifest.py`. Add compact constructors for
 `RemoteObject`, `SimfileInventory`, and `CacheSyncResult` at the top of the file so
 every test builds complete records without mocks hidden in another suite. The
 `render_for_action` helper routes through `sync_cache`, so also import
-`sync_cache`, `CacheIndexStore`, `CacheIndexEntry`, `R2Config`, and
-`ObjectDownload` from `src.benchmark.corpus_cache` and `r2_corpus_models`, plus
-`contextmanager`, `BytesIO`, `sha256`, and `Path` for the in-file fakes. Define a
-local `OpenCall` record for the fake store's call log rather than importing it
-from another test suite.
+`sync_cache`, `CacheIndexStore`, `CacheIndexEntry`, and `R2Config` from
+`src.benchmark.corpus_cache` and `r2_corpus_models`, plus `ObjectDownload` from
+`src.benchmark.r2_inventory` (where Task 2 defines it), plus `contextmanager`,
+`BytesIO`, `sha256`, and `Path` for the in-file fakes. Define a local `OpenCall`
+record for the fake store's call log rather than importing it from another test
+suite.
 
 ```python
 FIXED_TIME = datetime(2026, 7, 25, 1, 2, 3, tzinfo=timezone.utc)
@@ -1791,7 +1794,7 @@ def _seeded_manifest_index(cache_dir: Path, *, body: bytes) -> CacheIndexStore:
         etag="etag",
         etag_is_weak=False,
         size=len(body),
-        last_modified="2026-07-25T00:00:00Z",
+        last_modified="2026-07-25T01:02:03Z",
         sha256=digest,
         cache_path=cache_path,
     )
@@ -2332,9 +2335,9 @@ Use this exact phase order:
 9. for a real run, build, render, and install the immutable manifest without moving
    `latest.json`;
 10. assemble and publish the report;
-11. for a real run, publish `latest.json` only after both the manifest and report are
-   durable;
-12. publish `latest-report.json` only after the report is durable;
+11. for a real run, publish `latest-report.json` only after the report is durable;
+12. publish `latest.json` only after the manifest, report, and report pointer are all
+   durable, so a fatal pointer failure cannot leave the manifest pointer advanced;
 13. release the whole-run writer lock;
 14. return the explicit outcome.
 
@@ -2512,12 +2515,16 @@ rtk git commit -m "feat: orchestrate R2 corpus synchronization"
 Append these imports and tests to `tests/test_cli_benchmark.py`:
 
 ```python
+import pytest
+
 from src.benchmark.r2_corpus_models import (
     OverallStatus,
     PublishedManifest,
     SyncOutcome,
 )
 from src.cli import benchmark as benchmark_cli
+
+runner = CliRunner()
 
 
 def test_sync_r2_corpus_help_lists_local_options_without_endpoint_flag():
