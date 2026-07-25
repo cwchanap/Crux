@@ -12,12 +12,12 @@ Run the worker entry point with `uv run python src/worker.py` when processing jo
 ```bash
 uv run pytest
 uv run ruff check .
-uv run ruff format --check .
+uv run ruff format --check src tests
 uv run pylint src/app src/cli
 ```
 
 ## Coding Style & Naming Conventions
-We target Python 3.13 with 4-space indentation and a 100-character soft line limit (enforced by Ruff and Pylint). Prefer descriptive module and function names (`verb_noun` for actions, `PascalCase` for classes). Keep imports sorted (Ruff’s `I` rules) and avoid eager TensorFlow imports—follow the lazy-loading pattern already used in `src/app/main.py`. Format code with Ruff format before committing.
+We target Python 3.13 with 4-space indentation and a 100-character soft line limit (enforced by Ruff and Pylint). Prefer descriptive module and function names (`verb_noun` for actions, `PascalCase` for classes). Keep imports sorted (Ruff’s `I` rules) and avoid eager TensorFlow imports—follow the lazy-loading pattern already used in `src/app/main.py`. Format code with `uv run ruff format src tests` before committing.
 
 ## Testing Guidelines
 Pytest is configured via `pytest.ini` to collect under `tests/`. Name files `test_<feature>.py` and favor small, deterministic fixtures; async endpoints should use `pytest.mark.asyncio`. Mock heavy model calls or set `PRELOAD_MODEL=0` so suites remain fast. Add regression tests whenever touching request handlers, storage adapters, or CLI flows.
