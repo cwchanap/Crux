@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
@@ -84,6 +85,23 @@ class CacheValidation:
 class _DownloadResult:
     object: RemoteObject
     action: CacheAction
+
+
+@dataclass(frozen=True)
+class _PreparedDownload:
+    remote: RemoteObject
+    validation: CacheValidation
+    temporary_name: str
+    sha256: str
+    size: int
+
+
+@dataclass(frozen=True)
+class _PinnedContentDirectories:
+    cache_dir: Path
+    cache_fd: int
+    sha256_fd: int
+    incoming_fd: int
 
 
 class _DownloadRejected(Exception):
@@ -177,15 +195,27 @@ def validate_cached_body(
 ) -> CacheValidation:
     if entry is None:
         return CacheValidation("remote_changed", None)
-    if _path_has_symlink(cache_dir, PurePosixPath(entry.cache_path)):
-        return CacheValidation("sha256_mismatch", entry)
-    path = cache_dir / PurePosixPath(entry.cache_path)
-    if not path.is_file():
-        return CacheValidation("missing", entry)
+    shard_fd: int | None = None
+    final_fd: int | None = None
     try:
-        digest, size = _hash_file(path)
+        with _open_existing_content_root(cache_dir) as (cache_fd, sha256_fd):
+            shard_name = entry.sha256[:2]
+            shard_fd = _open_directory_at(sha256_fd, shard_name)
+            _verify_directory_binding(sha256_fd, shard_name, shard_fd)
+            final_fd = _open_regular_file_at(shard_fd, entry.sha256)
+            digest, size = _hash_fd(final_fd)
+            _verify_regular_file_binding(shard_fd, entry.sha256, final_fd)
+            _verify_directory_binding(sha256_fd, shard_name, shard_fd)
+            _verify_directory_binding(cache_fd, "sha256", sha256_fd)
+    except FileNotFoundError:
+        return CacheValidation("missing", entry)
     except OSError:
         return CacheValidation("sha256_mismatch", entry)
+    finally:
+        if final_fd is not None:
+            os.close(final_fd)
+        if shard_fd is not None:
+            os.close(shard_fd)
     if size != entry.size:
         return CacheValidation("size_mismatch", entry)
     if digest != entry.sha256:
@@ -247,23 +277,49 @@ def sync_cache(
             misses.append((simfile_index, object_index, remote, validation))
 
     if misses:
-        with ThreadPoolExecutor(max_workers=config.download_concurrency) as executor:
-            futures = [
-                (
-                    (simfile_index, object_index),
-                    executor.submit(
-                        _download_one,
-                        store,
-                        index,
-                        config,
-                        remote,
-                        validation,
-                    ),
+        try:
+            with _open_content_directories(index.cache_dir) as directories:
+                prepared: list[tuple[tuple[int, int], _PreparedDownload]] = []
+                with ThreadPoolExecutor(max_workers=config.download_concurrency) as executor:
+                    futures = [
+                        (
+                            (simfile_index, object_index),
+                            executor.submit(
+                                _prepare_download,
+                                store,
+                                directories,
+                                remote,
+                                validation,
+                            ),
+                        )
+                        for simfile_index, object_index, remote, validation in misses
+                    ]
+                    for identity, future in futures:
+                        result = future.result()
+                        if isinstance(result, _PreparedDownload):
+                            prepared.append((identity, result))
+                        else:
+                            object_results[identity] = result.object
+                            actions[identity] = result.action
+                for identity, result in _install_prepared_downloads(
+                    prepared,
+                    directories,
+                    index,
+                    config,
+                ).items():
+                    object_results[identity] = result.object
+                    actions[identity] = result.action
+        except (OSError, ValueError):
+            error = _download_error("artifact_write_failed", "")
+            for simfile_index, object_index, remote, validation in misses:
+                identity = (simfile_index, object_index)
+                if identity in object_results:
+                    continue
+                result = _failed_download(
+                    remote,
+                    validation,
+                    (replace(error, object_key=remote.key),),
                 )
-                for simfile_index, object_index, remote, validation in misses
-            ]
-            for identity, future in futures:
-                result = future.result()
                 object_results[identity] = result.object
                 actions[identity] = result.action
 
@@ -299,31 +355,26 @@ def _remote_identity_matches(
     )
 
 
-def _download_one(
+def _prepare_download(
     store: R2ObjectStore,
-    index: CacheIndexStore,
-    config: R2Config,
+    directories: _PinnedContentDirectories,
     remote: RemoteObject,
     validation: CacheValidation,
-) -> _DownloadResult:
-    incoming_path: Path | None = None
-    incoming_created = False
+) -> _PreparedDownload | _DownloadResult:
+    temporary_name = f"{uuid4().hex}.tmp"
+    temporary_created = False
     errors: list[SyncError] = []
     byte_count = 0
-    content_sha256 = ""
-    cache_path = ""
+    digest = sha256()
     try:
-        incoming_dir = index.cache_dir / "sha256" / ".incoming"
-        _ensure_safe_content_directory(index.cache_dir, incoming_dir)
-        incoming_path = incoming_dir / f"{uuid4().hex}.tmp"
-        digest = sha256()
+        _verify_content_directories(directories)
         if_match = None if remote.etag_is_weak else remote.etag
         with store.open_object(remote.key, if_match) as download:
             weak_error = _weak_response_error(remote, download)
             if weak_error is not None:
                 raise _DownloadRejected(weak_error)
-            incoming = incoming_path.open("xb")
-            incoming_created = True
+            incoming = _create_temporary_file(directories.incoming_fd, temporary_name)
+            temporary_created = True
             with incoming:
                 while chunk := download.body.read(1024 * 1024):
                     incoming.write(chunk)
@@ -331,35 +382,14 @@ def _download_one(
                     byte_count += len(chunk)
                 incoming.flush()
                 os.fsync(incoming.fileno())
-
+                _verify_regular_file_binding(
+                    directories.incoming_fd,
+                    temporary_name,
+                    incoming.fileno(),
+                )
+        _verify_content_directories(directories)
         if byte_count != remote.size:
             raise _DownloadRejected(_download_error("byte_count_mismatch", remote.key))
-
-        content_sha256 = digest.hexdigest()
-        cache_path = f"sha256/{content_sha256[:2]}/{content_sha256}"
-        shard_dir = index.cache_dir / "sha256" / content_sha256[:2]
-        _ensure_safe_content_directory(index.cache_dir, shard_dir)
-        if incoming_dir.stat().st_dev != shard_dir.stat().st_dev:
-            raise _DownloadRejected(_download_error("artifact_write_failed", remote.key))
-        final_path = index.cache_dir / PurePosixPath(cache_path)
-        with _body_install_lock:
-            if _path_has_symlink(index.cache_dir, PurePosixPath(cache_path)):
-                raise _DownloadRejected(_download_error("artifact_write_failed", remote.key))
-            if final_path.exists():
-                existing_digest, existing_size = _hash_file(final_path)
-                if existing_digest != content_sha256 or existing_size != byte_count:
-                    if (
-                        validation.state not in {"size_mismatch", "sha256_mismatch"}
-                        or validation.entry is None
-                        or validation.entry.cache_path != cache_path
-                    ):
-                        raise _DownloadRejected(
-                            _download_error("artifact_write_failed", remote.key)
-                        )
-                    os.replace(incoming_path, final_path)
-            else:
-                os.replace(incoming_path, final_path)
-            _fsync_directory(shard_dir)
     except _DownloadRejected as error:
         errors.append(error.error)
     except R2StoreError as error:
@@ -377,23 +407,156 @@ def _download_one(
     except (OSError, ValueError):
         errors.append(_download_error("artifact_write_failed", remote.key))
 
-    if incoming_created and incoming_path is not None:
-        try:
-            incoming_path.unlink(missing_ok=True)
-        except OSError:
-            errors.append(_download_error("artifact_write_failed", remote.key))
     if errors:
+        if temporary_created and not _unlink_temporary(directories.incoming_fd, temporary_name):
+            errors.append(_download_error("artifact_write_failed", remote.key))
         return _failed_download(remote, validation, tuple(errors))
+    return _PreparedDownload(
+        remote,
+        validation,
+        temporary_name,
+        digest.hexdigest(),
+        byte_count,
+    )
 
+
+def _install_prepared_downloads(
+    prepared: list[tuple[tuple[int, int], _PreparedDownload]],
+    directories: _PinnedContentDirectories,
+    index: CacheIndexStore,
+    config: R2Config,
+) -> dict[tuple[int, int], _DownloadResult]:
+    groups: dict[str, list[tuple[tuple[int, int], _PreparedDownload]]] = {}
+    for identity, download in prepared:
+        groups.setdefault(download.sha256, []).append((identity, download))
+
+    results: dict[tuple[int, int], _DownloadResult] = {}
+    for group in groups.values():
+        results.update(_install_digest_group(group, directories, index, config))
+    return results
+
+
+def _install_digest_group(
+    group: list[tuple[tuple[int, int], _PreparedDownload]],
+    directories: _PinnedContentDirectories,
+    index: CacheIndexStore,
+    config: R2Config,
+) -> dict[tuple[int, int], _DownloadResult]:
+    content_sha256 = group[0][1].sha256
+    shard_name = content_sha256[:2]
+    cache_path = f"sha256/{shard_name}/{content_sha256}"
+    shard_fd: int | None = None
+    final_fd: int | None = None
+    install_error: SyncError | None = None
+    try:
+        with _body_install_lock:
+            _verify_content_directories(directories)
+            shard_fd = _open_or_create_directory_at(directories.sha256_fd, shard_name)
+            _verify_directory_binding(directories.sha256_fd, shard_name, shard_fd)
+            if os.fstat(directories.incoming_fd).st_dev != os.fstat(shard_fd).st_dev:
+                raise _DownloadRejected(
+                    _download_error("artifact_write_failed", group[0][1].remote.key)
+                )
+
+            try:
+                final_fd = _open_regular_file_at(shard_fd, content_sha256)
+            except FileNotFoundError:
+                replacement = group[0][1]
+            else:
+                existing_digest, existing_size = _hash_fd(final_fd)
+                if existing_digest == content_sha256 and existing_size == group[0][1].size:
+                    replacement = None
+                else:
+                    replacement = next(
+                        (
+                            download
+                            for _, download in group
+                            if _can_repair_content_address(download, cache_path)
+                        ),
+                        None,
+                    )
+                    if replacement is None:
+                        raise _DownloadRejected(
+                            _download_error(
+                                "artifact_write_failed",
+                                group[0][1].remote.key,
+                            )
+                        )
+                    os.close(final_fd)
+                    final_fd = None
+
+            if replacement is not None:
+                os.replace(
+                    replacement.temporary_name,
+                    content_sha256,
+                    src_dir_fd=directories.incoming_fd,
+                    dst_dir_fd=shard_fd,
+                )
+                final_fd = _open_regular_file_at(shard_fd, content_sha256)
+                installed_digest, installed_size = _hash_fd(final_fd)
+                if installed_digest != content_sha256 or installed_size != replacement.size:
+                    raise _DownloadRejected(
+                        _download_error("artifact_write_failed", replacement.remote.key)
+                    )
+
+            assert final_fd is not None
+            os.fsync(final_fd)
+            _verify_regular_file_binding(shard_fd, content_sha256, final_fd)
+            os.fsync(shard_fd)
+            _verify_content_directories(directories)
+            _verify_directory_binding(directories.sha256_fd, shard_name, shard_fd)
+            _verify_regular_file_binding(shard_fd, content_sha256, final_fd)
+    except (_DownloadRejected, OSError, ValueError) as error:
+        install_error = (
+            error.error
+            if isinstance(error, _DownloadRejected)
+            else _download_error("artifact_write_failed", group[0][1].remote.key)
+        )
+    finally:
+        if final_fd is not None:
+            os.close(final_fd)
+        if shard_fd is not None:
+            os.close(shard_fd)
+
+    results: dict[tuple[int, int], _DownloadResult] = {}
+    for identity, download in group:
+        errors: list[SyncError] = []
+        if install_error is not None:
+            errors.append(replace(install_error, object_key=download.remote.key))
+        if not _unlink_temporary(directories.incoming_fd, download.temporary_name):
+            errors.append(_download_error("artifact_write_failed", download.remote.key))
+        if errors:
+            results[identity] = _failed_download(
+                download.remote,
+                download.validation,
+                tuple(errors),
+            )
+            continue
+        results[identity] = _checkpoint_download(
+            download,
+            index,
+            config,
+            cache_path,
+        )
+    return results
+
+
+def _checkpoint_download(
+    download: _PreparedDownload,
+    index: CacheIndexStore,
+    config: R2Config,
+    cache_path: str,
+) -> _DownloadResult:
+    remote = download.remote
     entry = CacheIndexEntry(
         source_endpoint_sha256=config.source_endpoint_sha256,
         bucket=config.bucket,
         key=remote.key,
         etag=remote.etag,
         etag_is_weak=remote.etag_is_weak,
-        size=byte_count,
+        size=download.size,
         last_modified=format_manifest_timestamp(remote.last_modified),
-        sha256=content_sha256,
+        sha256=download.sha256,
         cache_path=cache_path,
     )
     try:
@@ -401,13 +564,13 @@ def _download_one(
     except (OSError, ValueError):
         return _failed_download(
             remote,
-            validation,
+            download.validation,
             (_download_error("artifact_write_failed", remote.key),),
         )
     verified = replace(
         remote,
         cache_status="verified",
-        sha256=content_sha256,
+        sha256=download.sha256,
         cache_path=cache_path,
     )
     return _DownloadResult(
@@ -415,9 +578,21 @@ def _download_one(
         CacheAction(
             remote.key,
             "downloaded",
-            byte_count,
-            validation.state,
+            download.size,
+            download.validation.state,
         ),
+    )
+
+
+def _can_repair_content_address(
+    download: _PreparedDownload,
+    cache_path: str,
+) -> bool:
+    validation = download.validation
+    return (
+        validation.state in {"size_mismatch", "sha256_mismatch"}
+        and validation.entry is not None
+        and validation.entry.cache_path == cache_path
     )
 
 
@@ -508,45 +683,171 @@ def _rebuild_simfile(
     )
 
 
-def _ensure_safe_content_directory(cache_dir: Path, path: Path) -> None:
-    _ensure_durable_directory(cache_dir)
+@contextmanager
+def _open_existing_content_root(cache_dir: Path) -> Iterator[tuple[int, int]]:
+    cache_fd = _open_directory_path(cache_dir)
+    sha256_fd: int | None = None
     try:
-        relative = path.relative_to(cache_dir)
-    except ValueError as exc:
-        raise ValueError("cache directory is unavailable") from exc
-    current = cache_dir
-    for part in relative.parts:
-        current = current / part
-        if current.is_symlink():
-            raise ValueError("cache directory is unavailable")
-        if current.exists():
-            if not current.is_dir():
-                raise ValueError("cache directory is unavailable")
-            continue
-        current.mkdir(exist_ok=True)
-        if current.is_symlink() or not current.is_dir():
-            raise ValueError("cache directory is unavailable")
-        _fsync_directory(current.parent)
+        _verify_cache_directory_binding(cache_dir, cache_fd)
+        sha256_fd = _open_directory_at(cache_fd, "sha256")
+        _verify_directory_binding(cache_fd, "sha256", sha256_fd)
+        yield cache_fd, sha256_fd
+        _verify_cache_directory_binding(cache_dir, cache_fd)
+        _verify_directory_binding(cache_fd, "sha256", sha256_fd)
+    finally:
+        if sha256_fd is not None:
+            os.close(sha256_fd)
+        os.close(cache_fd)
 
 
-def _path_has_symlink(cache_dir: Path, relative_path: PurePosixPath) -> bool:
-    current = cache_dir
-    for part in relative_path.parts:
-        current = current / part
-        if current.is_symlink():
-            return True
-    return False
+@contextmanager
+def _open_content_directories(
+    cache_dir: Path,
+) -> Iterator[_PinnedContentDirectories]:
+    _ensure_durable_directory(cache_dir)
+    cache_fd = _open_directory_path(cache_dir)
+    sha256_fd: int | None = None
+    incoming_fd: int | None = None
+    try:
+        sha256_fd = _open_or_create_directory_at(cache_fd, "sha256")
+        incoming_fd = _open_or_create_directory_at(sha256_fd, ".incoming")
+        directories = _PinnedContentDirectories(
+            cache_dir,
+            cache_fd,
+            sha256_fd,
+            incoming_fd,
+        )
+        _verify_content_directories(directories)
+        yield directories
+    finally:
+        if incoming_fd is not None:
+            os.close(incoming_fd)
+        if sha256_fd is not None:
+            os.close(sha256_fd)
+        os.close(cache_fd)
 
 
-def _hash_file(path: Path) -> tuple[str, int]:
+def _open_directory_path(path: Path) -> int:
+    return os.open(path, _directory_open_flags())
+
+
+def _open_directory_at(parent_fd: int, name: str) -> int:
+    descriptor = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise OSError("cache content directory is unavailable")
+    return descriptor
+
+
+def _open_or_create_directory_at(parent_fd: int, name: str) -> int:
+    created = False
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+        created = True
+    except FileExistsError:
+        pass
+    descriptor = _open_directory_at(parent_fd, name)
+    try:
+        _verify_directory_binding(parent_fd, name, descriptor)
+        if created:
+            os.fsync(parent_fd)
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _directory_open_flags() -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory is None:
+        raise OSError(ENOTSUP, "no-follow directory descriptors are unavailable")
+    return os.O_RDONLY | no_follow | directory
+
+
+def _verify_content_directories(directories: _PinnedContentDirectories) -> None:
+    _verify_cache_directory_binding(directories.cache_dir, directories.cache_fd)
+    _verify_directory_binding(
+        directories.cache_fd,
+        "sha256",
+        directories.sha256_fd,
+    )
+    _verify_directory_binding(
+        directories.sha256_fd,
+        ".incoming",
+        directories.incoming_fd,
+    )
+
+
+def _verify_cache_directory_binding(cache_dir: Path, descriptor: int) -> None:
+    cache_stat = os.stat(cache_dir, follow_symlinks=False)
+    if not stat.S_ISDIR(cache_stat.st_mode) or not _same_inode(cache_stat, os.fstat(descriptor)):
+        raise OSError("cache directory binding changed")
+
+
+def _verify_directory_binding(parent_fd: int, name: str, descriptor: int) -> None:
+    path_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    descriptor_stat = os.fstat(descriptor)
+    if not stat.S_ISDIR(path_stat.st_mode) or not _same_inode(path_stat, descriptor_stat):
+        raise OSError("cache content directory binding changed")
+
+
+def _verify_regular_file_binding(parent_fd: int, name: str, descriptor: int) -> None:
+    path_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    descriptor_stat = os.fstat(descriptor)
+    if not stat.S_ISREG(path_stat.st_mode) or not _same_inode(path_stat, descriptor_stat):
+        raise OSError("cache content file binding changed")
+
+
+def _same_inode(first: os.stat_result, second: os.stat_result) -> bool:
+    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
+def _open_regular_file_at(parent_fd: int, name: str) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise OSError(ENOTSUP, "no-follow file descriptors are unavailable")
+    descriptor = os.open(name, os.O_RDONLY | no_follow, dir_fd=parent_fd)
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise OSError("cache content body is not a regular file")
+    return descriptor
+
+
+def _create_temporary_file(parent_fd: int, name: str):
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise OSError(ENOTSUP, "no-follow file descriptors are unavailable")
+    descriptor = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow,
+        0o600,
+        dir_fd=parent_fd,
+    )
+    try:
+        return os.fdopen(descriptor, "wb")
+    except OSError:
+        os.close(descriptor)
+        raise
+
+
+def _unlink_temporary(parent_fd: int, name: str) -> bool:
+    try:
+        os.unlink(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _hash_fd(descriptor: int) -> tuple[str, int]:
     digest = sha256()
     size = 0
-    no_follow = getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, os.O_RDONLY | no_follow)
-    with os.fdopen(descriptor, "rb") as body:
-        while chunk := body.read(1024 * 1024):
-            digest.update(chunk)
-            size += len(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+        size += len(chunk)
     return digest.hexdigest(), size
 
 

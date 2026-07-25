@@ -99,6 +99,60 @@ class ConcurrentStore:
                 self.active -= 1
 
 
+class DelayedBody(BytesIO):
+    def __init__(
+        self,
+        body: bytes,
+        delay: float,
+        key: str,
+        completions: list[str],
+        lock: Lock,
+    ) -> None:
+        super().__init__(body)
+        self._delay = delay
+        self._key = key
+        self._completions = completions
+        self._lock = lock
+        self._started = False
+        self._completed = False
+
+    def read(self, size: int = -1) -> bytes:
+        if not self._started:
+            self._started = True
+            sleep(self._delay)
+        chunk = super().read(size)
+        if not chunk and not self._completed:
+            self._completed = True
+            with self._lock:
+                self._completions.append(self._key)
+        return chunk
+
+
+class DelayedSameBodyStore:
+    def __init__(self, delays: dict[str, float], body: bytes = b"chart") -> None:
+        self.delays = delays
+        self.body = body
+        self.completions: list[str] = []
+        self._lock = Lock()
+
+    @contextmanager
+    def open_object(self, key: str, if_match: str | None) -> Iterator[ObjectDownload]:
+        del if_match
+        yield ObjectDownload(
+            body=DelayedBody(
+                self.body,
+                self.delays[key],
+                key,
+                self.completions,
+                self._lock,
+            ),
+            size=len(self.body),
+            etag="etag",
+            etag_is_weak=False,
+            last_modified=FIXED_MTIME,
+        )
+
+
 def remote_object(
     key: str = "42/chart.dtx",
     *,
@@ -956,14 +1010,16 @@ def test_failed_get_is_sanitized_and_does_not_checkpoint(tmp_path: Path) -> None
 def test_failed_local_body_write_is_sanitized(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    real_path_open = Path.open
+    import src.benchmark.corpus_cache as cache
 
-    def fail_incoming_write(path: Path, *args, **kwargs):
-        if path.parent.name == ".incoming":
+    real_os_open = os.open
+
+    def fail_incoming_write(path, flags, *args, **kwargs):
+        if flags & os.O_CREAT and flags & os.O_EXCL and kwargs.get("dir_fd") is not None:
             raise OSError("private local path")
-        return real_path_open(path, *args, **kwargs)
+        return real_os_open(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", fail_incoming_write)
+    monkeypatch.setattr(cache.os, "open", fail_incoming_write)
 
     result = sync_cache(
         (simfile(remote_object()),),
@@ -1038,15 +1094,19 @@ def test_failed_remote_changed_download_has_no_cache_corrupt_error(
 def test_body_temporary_file_is_created_only_under_cache_incoming(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    opened_temporary_paths: list[Path] = []
-    real_path_open = Path.open
+    import src.benchmark.corpus_cache as cache
 
-    def track_open(path: Path, *args, **kwargs):
-        if args and args[0] == "xb" and path.parent.name == ".incoming":
-            opened_temporary_paths.append(path)
-        return real_path_open(path, *args, **kwargs)
+    temporary_parent_inodes: list[tuple[int, int]] = []
+    real_os_open = os.open
 
-    monkeypatch.setattr(Path, "open", track_open)
+    def track_open(path, flags, *args, **kwargs):
+        directory_fd = kwargs.get("dir_fd")
+        if flags & os.O_CREAT and flags & os.O_EXCL and directory_fd is not None:
+            parent_stat = os.fstat(directory_fd)
+            temporary_parent_inodes.append((parent_stat.st_dev, parent_stat.st_ino))
+        return real_os_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(cache.os, "open", track_open)
 
     sync_cache(
         (simfile(remote_object()),),
@@ -1056,8 +1116,8 @@ def test_body_temporary_file_is_created_only_under_cache_incoming(
         False,
     )
 
-    assert len(opened_temporary_paths) == 1
-    assert opened_temporary_paths[0].parent == tmp_path / "sha256" / ".incoming"
+    incoming_stat = (tmp_path / "sha256" / ".incoming").stat()
+    assert temporary_parent_inodes == [(incoming_stat.st_dev, incoming_stat.st_ino)]
 
 
 def test_cross_device_incoming_and_shard_fail_before_body_replace(
@@ -1065,9 +1125,12 @@ def test_cross_device_incoming_and_shard_fail_before_body_replace(
 ) -> None:
     import src.benchmark.corpus_cache as cache
 
-    real_stat = Path.stat
+    digest = sha256(b"chart").hexdigest()
+    real_open = os.open
+    real_fstat = os.fstat
     real_replace = os.replace
-    body_replacements: list[tuple[Path, Path]] = []
+    shard_fds: set[int] = set()
+    body_replacements: list[tuple[str, str]] = []
 
     class StatWithDifferentDevice:
         def __init__(self, wrapped, st_dev: int):
@@ -1077,18 +1140,25 @@ def test_cross_device_incoming_and_shard_fail_before_body_replace(
         def __getattr__(self, name):
             return getattr(self._wrapped, name)
 
-    def differing_stat(path: Path, *args, **kwargs):
-        result = real_stat(path, *args, **kwargs)
-        if path.parent.name == "sha256" and path.name != ".incoming":
+    def track_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if str(path) == digest[:2] and flags & getattr(os, "O_DIRECTORY", 0):
+            shard_fds.add(descriptor)
+        return descriptor
+
+    def differing_fstat(descriptor: int):
+        result = real_fstat(descriptor)
+        if descriptor in shard_fds:
             return StatWithDifferentDevice(result, result.st_dev + 1)
         return result
 
-    def track_replace(source, target) -> None:
-        if Path(source).parent.name == ".incoming":
-            body_replacements.append((Path(source), Path(target)))
-        real_replace(source, target)
+    def track_replace(source, target, *args, **kwargs) -> None:
+        if kwargs.get("src_dir_fd") is not None:
+            body_replacements.append((str(source), str(target)))
+        real_replace(source, target, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "stat", differing_stat)
+    monkeypatch.setattr(cache.os, "open", track_open)
+    monkeypatch.setattr(cache.os, "fstat", differing_fstat)
     monkeypatch.setattr(cache.os, "replace", track_replace)
 
     result = sync_cache(
@@ -1112,38 +1182,18 @@ def test_body_is_synced_replaced_and_directory_synced_before_checkpoint(
     events: list[str] = []
     body_fds: set[int] = set()
     shard_fds: set[int] = set()
-    real_path_open = Path.open
+    digest = sha256(b"chart").hexdigest()
     real_os_open = os.open
     real_fsync = os.fsync
     real_replace = os.replace
     index = empty_index(tmp_path)
     real_checkpoint = index.checkpoint
 
-    class TrackingBody:
-        def __init__(self, wrapped):
-            self._wrapped = wrapped
-            body_fds.add(wrapped.fileno())
-
-        def __enter__(self):
-            self._wrapped.__enter__()
-            return self
-
-        def __exit__(self, *args):
-            return self._wrapped.__exit__(*args)
-
-        def __getattr__(self, name):
-            return getattr(self._wrapped, name)
-
-    def path_open(path: Path, *args, **kwargs):
-        opened = real_path_open(path, *args, **kwargs)
-        if path.parent.name == ".incoming":
-            return TrackingBody(opened)
-        return opened
-
-    def directory_open(path, flags, *args):
-        descriptor = real_os_open(path, flags, *args)
-        candidate = Path(path)
-        if candidate.parent.name == "sha256" and candidate.name != ".incoming":
+    def descriptor_open(path, flags, *args, **kwargs):
+        descriptor = real_os_open(path, flags, *args, **kwargs)
+        if flags & os.O_CREAT and flags & os.O_EXCL:
+            body_fds.add(descriptor)
+        if str(path) == digest[:2] and flags & getattr(os, "O_DIRECTORY", 0):
             shard_fds.add(descriptor)
         return descriptor
 
@@ -1154,17 +1204,16 @@ def test_body_is_synced_replaced_and_directory_synced_before_checkpoint(
             events.append("body_fsync")
         real_fsync(descriptor)
 
-    def replace_body(source, target) -> None:
-        if Path(source).parent.name == ".incoming":
+    def replace_body(source, target, *args, **kwargs) -> None:
+        if kwargs.get("src_dir_fd") is not None:
             events.append("body_replace")
-        real_replace(source, target)
+        real_replace(source, target, *args, **kwargs)
 
     def checkpoint(index_entry: CacheIndexEntry) -> None:
         events.append("index_checkpoint")
         real_checkpoint(index_entry)
 
-    monkeypatch.setattr(Path, "open", path_open)
-    monkeypatch.setattr(cache.os, "open", directory_open)
+    monkeypatch.setattr(cache.os, "open", descriptor_open)
     monkeypatch.setattr(cache.os, "fsync", fsync)
     monkeypatch.setattr(cache.os, "replace", replace_body)
     monkeypatch.setattr(index, "checkpoint", checkpoint)
@@ -1255,14 +1304,16 @@ def test_preexisting_incoming_collision_is_never_deleted(
 def test_failed_owned_temporary_cleanup_is_reported(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    real_unlink = Path.unlink
+    import src.benchmark.corpus_cache as cache
 
-    def fail_owned_cleanup(path: Path, *args, **kwargs):
-        if path.parent.name == ".incoming":
+    real_unlink = os.unlink
+
+    def fail_owned_cleanup(path, *args, **kwargs):
+        if kwargs.get("dir_fd") is not None and str(path).endswith(".tmp"):
             raise OSError("private cleanup path")
         return real_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "unlink", fail_owned_cleanup)
+    monkeypatch.setattr(cache.os, "unlink", fail_owned_cleanup)
 
     result = sync_cache(
         (simfile(remote_object(size=5)),),
@@ -1511,7 +1562,7 @@ def test_unreadable_indexed_body_is_a_repairable_validation_miss(
     index = seeded_index(tmp_path, remote_object(), cache_path)
     monkeypatch.setattr(
         cache,
-        "_hash_file",
+        "_hash_fd",
         lambda _: (_ for _ in ()).throw(OSError("private local path")),
     )
 
@@ -1534,20 +1585,20 @@ def test_repeated_local_failure_code_is_reported_once(
     import src.benchmark.corpus_cache as cache
 
     real_replace = os.replace
-    real_unlink = Path.unlink
+    real_unlink = os.unlink
 
-    def fail_body_replace(source, target) -> None:
-        if Path(source).parent.name == ".incoming":
+    def fail_body_replace(source, target, *args, **kwargs) -> None:
+        if kwargs.get("src_dir_fd") is not None:
             raise OSError("private replace path")
-        real_replace(source, target)
+        real_replace(source, target, *args, **kwargs)
 
-    def fail_owned_cleanup(path: Path, *args, **kwargs):
-        if path.parent.name == ".incoming":
+    def fail_owned_cleanup(path, *args, **kwargs):
+        if kwargs.get("dir_fd") is not None and str(path).endswith(".tmp"):
             raise OSError("private cleanup path")
         return real_unlink(path, *args, **kwargs)
 
     monkeypatch.setattr(cache.os, "replace", fail_body_replace)
-    monkeypatch.setattr(Path, "unlink", fail_owned_cleanup)
+    monkeypatch.setattr(cache.os, "unlink", fail_owned_cleanup)
 
     result = sync_cache(
         (simfile(remote_object()),),
@@ -1558,3 +1609,227 @@ def test_repeated_local_failure_code_is_reported_once(
     )
 
     assert [error.code for error in result.actions[0].errors] == ["artifact_write_failed"]
+
+
+@pytest.mark.parametrize("component", ["sha256", "incoming"])
+def test_directory_swap_before_temporary_create_never_touches_replacement_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    component: str,
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    body = b"chart"
+    digest = sha256(body).hexdigest()
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "sentinel").write_bytes(b"unchanged")
+    if component == "sha256":
+        (external / ".incoming").mkdir()
+        (external / digest[:2]).mkdir()
+    sha_dir = tmp_path / "sha256"
+    incoming_dir = sha_dir / ".incoming"
+    swapped = False
+    external_temporary_created = False
+    real_path_open = Path.open
+    real_os_open = os.open
+
+    def swap_namespace() -> None:
+        nonlocal swapped
+        if swapped:
+            return
+        swapped = True
+        if component == "sha256":
+            sha_dir.rename(tmp_path / "pinned-sha256")
+            sha_dir.symlink_to(external, target_is_directory=True)
+        else:
+            incoming_dir.rename(sha_dir / "pinned-incoming")
+            incoming_dir.symlink_to(external, target_is_directory=True)
+
+    def record_external_temp(name: str) -> None:
+        nonlocal external_temporary_created
+        external_temp = external / ".incoming" / name if component == "sha256" else external / name
+        external_temporary_created = external_temporary_created or external_temp.exists()
+
+    def path_open(path: Path, *args, **kwargs):
+        if args and args[0] == "xb" and path.parent.name == ".incoming":
+            swap_namespace()
+            opened = real_path_open(path, *args, **kwargs)
+            record_external_temp(path.name)
+            return opened
+        return real_path_open(path, *args, **kwargs)
+
+    def descriptor_open(path, flags, *args, **kwargs):
+        if flags & os.O_CREAT and flags & os.O_EXCL and str(path).endswith(".tmp"):
+            swap_namespace()
+            descriptor = real_os_open(path, flags, *args, **kwargs)
+            record_external_temp(str(path))
+            return descriptor
+        return real_os_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", path_open)
+    monkeypatch.setattr(cache.os, "open", descriptor_open)
+
+    result = sync_cache(
+        (simfile(remote_object()),),
+        FakeStore(body=body),
+        empty_index(tmp_path),
+        config(),
+        False,
+    )
+
+    assert swapped
+    assert not external_temporary_created
+    assert (external / "sentinel").read_bytes() == b"unchanged"
+    assert not (external / digest).exists()
+    assert not (tmp_path / "index-v1.json").exists()
+    assert result.actions[0].action == "failed"
+    assert [error.code for error in result.actions[0].errors] == ["artifact_write_failed"]
+
+
+def test_shard_swap_before_replace_never_installs_or_checkpoints_outside_pinned_shard(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    body = b"chart"
+    digest = sha256(body).hexdigest()
+    shard = tmp_path / "sha256" / digest[:2]
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "sentinel").write_bytes(b"unchanged")
+    swapped = False
+    real_replace = os.replace
+
+    def swap_then_replace(source, target, *args, **kwargs) -> None:
+        nonlocal swapped
+        source_name = str(source)
+        if not swapped and (
+            Path(source_name).parent.name == ".incoming" or kwargs.get("src_dir_fd") is not None
+        ):
+            swapped = True
+            shard.rename(tmp_path / "pinned-shard")
+            shard.symlink_to(external, target_is_directory=True)
+        real_replace(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(cache.os, "replace", swap_then_replace)
+
+    result = sync_cache(
+        (simfile(remote_object()),),
+        FakeStore(body=body),
+        empty_index(tmp_path),
+        config(),
+        False,
+    )
+
+    assert swapped
+    assert (external / "sentinel").read_bytes() == b"unchanged"
+    assert not (external / digest).exists()
+    assert not (tmp_path / "index-v1.json").exists()
+    assert result.actions[0].action == "failed"
+    assert [error.code for error in result.actions[0].errors] == ["artifact_write_failed"]
+
+
+def test_identical_final_is_fsynced_before_shard_and_index_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    body = b"chart"
+    digest = sha256(body).hexdigest()
+    final_path = tmp_path / "sha256" / digest[:2] / digest
+    final_path.parent.mkdir(parents=True)
+    final_path.write_bytes(body)
+    index = empty_index(tmp_path)
+    real_checkpoint = index.checkpoint
+    real_open = os.open
+    real_fsync = os.fsync
+    final_fds: set[int] = set()
+    shard_fds: set[int] = set()
+    events: list[str] = []
+
+    def track_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if Path(path) == final_path or str(path) == digest:
+            final_fds.add(descriptor)
+        if Path(path) == final_path.parent or (
+            str(path) == digest[:2] and flags & getattr(os, "O_DIRECTORY", 0)
+        ):
+            shard_fds.add(descriptor)
+        return descriptor
+
+    def track_fsync(descriptor: int) -> None:
+        if descriptor in shard_fds:
+            events.append("shard_fsync")
+        elif descriptor in final_fds:
+            events.append("final_fsync")
+        real_fsync(descriptor)
+
+    def checkpoint(entry: CacheIndexEntry) -> None:
+        events.append("index_checkpoint")
+        real_checkpoint(entry)
+
+    monkeypatch.setattr(cache.os, "open", track_open)
+    monkeypatch.setattr(cache.os, "fsync", track_fsync)
+    monkeypatch.setattr(index, "checkpoint", checkpoint)
+
+    result = sync_cache(
+        (simfile(remote_object()),),
+        FakeStore(body=body),
+        index,
+        config(),
+        False,
+    )
+
+    assert result.actions[0].action == "downloaded"
+    assert events.index("final_fsync") < events.index("shard_fsync")
+    assert events.index("shard_fsync") < events.index("index_checkpoint")
+
+
+def test_same_digest_repair_is_independent_of_download_completion_order(
+    tmp_path: Path,
+) -> None:
+    body = b"chart"
+    digest = sha256(body).hexdigest()
+    ordinary = remote_object("42/ordinary.dtx")
+    repair = remote_object("42/repair.dtx")
+
+    def run(
+        cache_dir: Path,
+        delays: dict[str, float],
+    ) -> tuple[object, bytes, list[str]]:
+        final_path = cache_dir / "sha256" / digest[:2] / digest
+        index = seeded_index(cache_dir, repair, final_path, body=body)
+        final_path.write_bytes(b"wrong")
+        store = DelayedSameBodyStore(delays, body)
+        result = sync_cache(
+            (simfile(ordinary, repair),),
+            store,
+            index,
+            config(download_concurrency=2),
+            False,
+        )
+        return result, (cache_dir / "index-v1.json").read_bytes(), store.completions
+
+    ordinary_first = run(
+        tmp_path / "ordinary-first",
+        {ordinary.key: 0.0, repair.key: 0.1},
+    )
+    repair_first = run(
+        tmp_path / "repair-first",
+        {ordinary.key: 0.1, repair.key: 0.0},
+    )
+
+    assert ordinary_first[2] == [ordinary.key, repair.key]
+    assert repair_first[2] == [repair.key, ordinary.key]
+    assert ordinary_first[0] == repair_first[0]
+    assert ordinary_first[1] == repair_first[1]
+    result = ordinary_first[0]
+    assert result.simfiles[0].sync_status == "complete"
+    assert [remote.cache_status for remote in result.simfiles[0].objects] == [
+        "verified",
+        "verified",
+    ]
+    assert [action.action for action in result.actions] == ["downloaded", "downloaded"]
