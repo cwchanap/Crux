@@ -81,6 +81,11 @@ Configuration uses:
 - `AWS_ACCESS_KEY_ID`;
 - `AWS_SECRET_ACCESS_KEY`;
 - optional `AWS_SESSION_TOKEN`;
+- `CRUX_R2_HEAD_CONCURRENCY`, default `8`, constrained to `1..32`;
+- `CRUX_R2_DOWNLOAD_CONCURRENCY`, default `4`, constrained to `1..16`;
+- `CRUX_R2_CONNECT_TIMEOUT_SECONDS`, default `10`;
+- `CRUX_R2_READ_TIMEOUT_SECONDS`, default `60`;
+- `CRUX_R2_MAX_ATTEMPTS`, default `5`, counting the initial request;
 - region `auto`.
 
 Crux does not expose credential-valued command-line options. The implementation uses
@@ -110,8 +115,32 @@ The command coordinates four focused components.
   metadata unavailable from the listing;
 - returns domain records rather than leaking raw SDK response objects.
 
+The default HEAD concurrency is `8`; selected-body downloads use a separate default
+concurrency of `4`. The botocore connection pool is at least `16` and never smaller
+than the sum of both concurrency settings.
+
 The SDK client is created only when the command runs. Tests use a fake implementation
 of the R2 protocol and do not require credentials or network access.
+
+### Network policy
+
+The botocore client uses:
+
+- a 10-second connect timeout;
+- a 60-second read timeout;
+- TCP keepalive;
+- `standard` retry mode;
+- five total attempts per request, including the initial attempt;
+- botocore's standard exponential backoff for retryable throttling, connection, and
+  transient service failures.
+
+The explicit standard mode is preferred over adaptive mode because its retry behavior
+does not add client-wide rate-throttling state that can make bounded worker timing
+surprising. Crux does not wrap SDK calls in another general retry loop, which avoids
+multiplying the configured attempt count. After SDK retries are exhausted, root-list
+failures are fatal while per-object HEAD or GET failures follow the partial-failure
+policy. Conditional `412 Precondition Failed` responses are not retried because they
+mean the inventory snapshot changed.
 
 ### Corpus cache
 
@@ -129,8 +158,9 @@ Future stages may add explicit cache profiles without changing the inventory for
 keyed by decimal simfile ID. It does not read D1 or GraphQL.
 
 Missing mapping entries are allowed and receive explicit unknown values. Invalid field
-types, duplicate IDs after numeric normalization, or malformed JSON are fatal
-configuration errors.
+types, duplicate IDs after numeric normalization, malformed JSON, or any
+`schema_version` other than the exact supported `crux.corpus-provenance/v1` value are
+fatal configuration errors.
 
 ### Corpus manifest
 
@@ -161,9 +191,14 @@ Rules:
 2. The manifest stores `simfile_id` as an integer and `object_prefix` as the exact
    source string.
 3. A zero-byte folder marker whose key equals the prefix is inventory metadata but is
-   not selected for caching.
+   not selected for caching. A prefix containing only that marker is `empty`, retains
+   the marker as a `not_selected` object, makes the overall attempt `partial`, and
+   produces a nonzero exit.
 4. If distinct prefixes normalize to the same integer, such as `1/` and `01/`, both
-   are quarantined as an ambiguous prefix rather than silently merged.
+   are quarantined as an ambiguous prefix rather than silently merged. Quarantine wins
+   even when the operator explicitly passes `--include-simfile-id 1`; the report uses
+   `ambiguous_simfile_prefix`, names the requested ID and conflicting prefixes, and no
+   simfile row is emitted.
 5. Root objects without a slash and non-numeric top-level segments are reported as
    malformed root keys. They do not disappear and do not become simfile rows.
 6. Include and exclude filters are applied after authoritative root discovery. HPA-321
@@ -177,6 +212,11 @@ a structured error and its simfile status becomes `partial`.
 
 An R2 ETag is a remote change signal, not a universal content hash. Multipart ETags
 encode part hashes and part count rather than the complete object's ordinary MD5.
+Crux parses the returned ETag as an HTTP entity tag. It removes surrounding quotes,
+stores the opaque value as `etag`, and stores weakness separately as
+`etag_is_weak: true|false`; it never strips a leading `W/` without retaining that
+flag. R2 conditional operations support weak ETags, so the parser and fixtures handle
+both strong and weak forms. A malformed entity tag is an object metadata error.
 
 The cache index records, per exact source endpoint, bucket, and key:
 
@@ -184,6 +224,7 @@ The cache index records, per exact source endpoint, bucket, and key:
 - bucket name;
 - exact object key;
 - normalized ETag;
+- ETag weakness;
 - size;
 - last-modified time;
 - locally verified SHA-256;
@@ -191,12 +232,34 @@ The cache index records, per exact source endpoint, bucket, and key:
 
 Raw endpoint URLs and credentials are not stored.
 
+The index is canonical UTF-8 JSON at:
+
+```text
+<cache-dir>/index-v1.json
+```
+
+It has `schema_version: "crux.r2-cache-index/v1"` and an `entries` array sorted by
+source endpoint SHA-256, bucket, and exact key. Each entry contains the fields listed
+above; an array avoids inventing an escaping scheme for composite JSON object keys.
+
+A real sync holds an exclusive advisory lock on `<cache-dir>/.index-v1.lock` while
+reading and publishing index state. Index publication serializes the complete new
+document to a uniquely named sibling temporary file, flushes and `fsync`s the file,
+uses `os.replace` to install `index-v1.json`, and `fsync`s the cache directory where
+the platform supports directory synchronization. Dry runs read the index without
+rewriting it. The operating-system lock is released automatically when the process
+exits; the lock file itself may remain harmlessly. A live lock conflict fails fast
+with a sanitized `cache_locked` error. Invalid JSON or an unsupported cache-index
+schema version is fatal rather than being treated as a cache miss.
+
 For each selected object:
 
 1. Compare key, ETag, size, and modification time with the index.
 2. If they match, stream-hash the referenced local file.
 3. Reuse the entry only when the computed SHA-256 and byte count match the index.
-4. Otherwise download to a temporary file with `If-Match` using the listed ETag.
+4. Otherwise download to a temporary file with `If-Match` using the exact serialized
+   entity tag reconstructed from `etag` and `etag_is_weak`, including quotes and the
+   `W/` marker when present.
 5. Stream-compute SHA-256 and byte count during download.
 6. Reject a byte-count mismatch or conditional-request failure.
 7. Atomically move valid content to:
@@ -205,7 +268,9 @@ For each selected object:
    sha256/<first-two-hex>/<full-sha256>
    ```
 
-8. Atomically update the cache index only after the content file is durable.
+8. Atomically checkpoint the cache index after each successfully installed selected
+   body and only after the content file is durable. Concurrent download workers
+   serialize these short index-publication sections.
 
 The cache is content-addressed and extensionless. Manifest metadata retains the source
 key and media type, so the cache filename does not need to reproduce a potentially
@@ -214,6 +279,12 @@ unsafe object basename.
 If the same key changes, its new content receives a new SHA-256 path. The old cache
 file and every previously published manifest remain untouched. Orphaned cache cleanup
 is outside HPA-321.
+
+Resumability means safe re-execution, not a separate remote checkpoint protocol.
+Successfully checkpointed cache entries survive interruption and become verified cache
+hits on the next run. If a process stops after installing a content file but before
+publishing its index entry, the next run may download that object again, then safely
+deduplicate it to the same SHA-256 path.
 
 ## Provenance Mapping
 
@@ -256,7 +327,7 @@ credentials, signed URLs, or source file bodies.
 The manifest is UTF-8 JSONL with one record per simfile. A representative record is:
 
 ```json
-{"schema_version":"crux.r2-corpus-manifest/v1","corpus_version":"sha256:…","simfile_id":42,"object_prefix":"42/","source_endpoint_sha256":"…","source_bucket":"simfile-dtx","source_discovery_method":"r2_list_objects_v2","objects":[{"key":"42/SET.DEF","size":1234,"etag":"…","version":null,"last_modified":"2026-07-24T12:34:56Z","content_type":"text/plain","remote_checksums":{},"cache_status":"verified","sha256":"…","cache_path":"sha256/ab/ab…"}],"sync_status":"complete","sync_errors":[],"source_origin":null,"source_author_or_pack":null,"source_reference":null,"rights_status":"unknown","redistribution_allowed":null,"provenance_notes":null}
+{"schema_version":"crux.r2-corpus-manifest/v1","corpus_version":"sha256:…","simfile_id":42,"object_prefix":"42/","source_endpoint_sha256":"…","source_bucket":"simfile-dtx","source_discovery_method":"r2_list_objects_v2","objects":[{"key":"42/SET.DEF","size":1234,"etag":"…","etag_is_weak":false,"version":null,"last_modified":"2026-07-24T12:34:56Z","content_type":"text/plain","checksum_algorithms":["sha256"],"checksum_type":"full_object","remote_checksums":{"sha256":"base64-value"},"cache_status":"verified","sha256":"…","cache_path":"sha256/ab/ab…"}],"sync_status":"complete","sync_errors":[],"source_origin":null,"source_author_or_pack":null,"source_reference":null,"rights_status":"unknown","redistribution_allowed":null,"provenance_notes":null}
 ```
 
 Each row includes `source_endpoint_sha256` and `source_bucket` so its remote source is
@@ -267,14 +338,35 @@ Each object contains:
 - `key`;
 - `size`;
 - `etag`;
-- `version`, nullable because R2's S3 compatibility does not expose bucket
-  version-history semantics;
+- `etag_is_weak`;
+- `version`, reserved for a future adapter and always `null` in the HPA-321 S3
+  implementation because R2's S3 compatibility does not expose bucket version-history
+  semantics;
 - `last_modified` as UTC ISO 8601;
 - `content_type`, nullable;
-- `remote_checksums`, an object containing only checksums actually returned;
+- `checksum_algorithms`, a sorted list of algorithms advertised by `ListObjectsV2` or
+  inferred from checksum values returned by `HeadObject`;
+- `checksum_type`, normalized to `full_object`, `composite`, or `null`;
+- `remote_checksums`, an object containing only checksum values actually returned by
+  `HeadObject`;
 - `cache_status`;
 - `sha256`, nullable for bodies not cached or not successfully downloaded;
 - `cache_path`, nullable and relative to the configured cache root.
+
+Checksum algorithm names use the closed lowercase set `crc32`, `crc32c`, `crc64nvme`,
+`sha1`, and `sha256`. Remote checksum values remain in the base64 representation
+returned by the SDK. The adapter maps `ChecksumCRC32`, `ChecksumCRC32C`,
+`ChecksumCRC64NVME`, `ChecksumSHA1`, and `ChecksumSHA256` to those keys and never
+places ETag values in `remote_checksums`. `checksum_type` uses the HEAD value when
+present and otherwise the listing value; contradictory non-null values are an object
+metadata error.
+
+Before launching concurrent HEAD requests, the adapter probes one selected listed
+object with `ChecksumMode="ENABLED"`. If R2 explicitly reports that checksum mode is
+unsupported, the adapter retries that object without checksum mode, disables
+checksum-value retrieval for the remainder of the run, and adds one non-fatal
+capability note to the sync report. Other probe failures follow normal per-object
+failure semantics.
 
 The cache path is a logical content-addressed path such as
 `sha256/ab/<full-sha256>`. It is independent of the operator's absolute output and
@@ -326,7 +418,8 @@ Canonicalization rules are:
 - one `\n` after every record, including the final record;
 - UTC timestamps normalized to `YYYY-MM-DDTHH:MM:SS.ffffffZ`, with trailing fractional
   zeroes removed consistently;
-- ETags stored without surrounding HTTP quotes;
+- ETag values stored without surrounding HTTP quotes or the `W/` marker, with weakness
+  represented only by `etag_is_weak`;
 - no invocation timestamps, local absolute paths, or report-only counters in the
   manifest.
 
@@ -337,6 +430,16 @@ To avoid a self-referential hash:
 3. Set every record's `corpus_version` to `sha256:<payload-hash>`.
 4. Serialize the final JSONL.
 5. Compute the final manifest SHA-256.
+
+`corpus_version` intentionally appears on every simfile row. This lets a JSONL row
+remain self-identifying when streamed, extracted, or sharded without introducing a
+special header-record shape that every consumer must branch around. At the expected
+corpus size, the duplicated value is negligible.
+
+Provenance is part of the normalized corpus payload. Editing any provenance or rights
+field therefore creates a new corpus version and manifest identity even when the R2
+inventory is unchanged; provenance edits are not metadata-only mutations of an
+existing manifest.
 
 The final manifest is published as:
 
@@ -354,9 +457,12 @@ After publication, Crux atomically updates:
 latest.json
 ```
 
-The pointer contains the corpus version, manifest SHA-256, relative path, and
-publication time. It is operational convenience only. Benchmark runs must record and
-open the concrete hash path, never rely on `latest.json` as immutable input.
+The pointer contains the corpus version, manifest SHA-256, relative path, publication
+time, and `overall_status` (`complete` or `partial`). Fatal attempts publish no
+manifest and do not update it. The pointer is operational convenience only, and its
+presence is not a fitness signal. Benchmark runs must require `overall_status:
+"complete"`, record the concrete hash path, and never use `latest.json` as immutable
+input.
 
 ## Sync Report
 
@@ -369,16 +475,34 @@ identity. It contains:
 - source endpoint SHA-256 and bucket name, excluding the raw endpoint URL;
 - include and exclude filters;
 - selected cache profile;
+- effective concurrency, timeout, and retry settings;
 - simfile and object counts;
 - cache hits, planned downloads, completed downloads, failed downloads, and bytes;
 - malformed root keys and ambiguous prefixes;
 - sanitized errors;
-- overall status;
+- overall status: `complete`, `partial`, `failed`, `dry_run_complete`, or
+  `dry_run_partial`;
 - manifest corpus version, hash, and relative path when published.
 
-Reports may use a timestamped filename beneath `reports/`; a convenience
-`latest-report.json` may point to the latest attempt. Reports do not contain
-credentials, signed URLs, request headers, or audio bodies.
+At command start, Crux creates a UUID4 `run_id`. Reports use:
+
+```text
+reports/<UTC-YYYYMMDDTHHMMSS.ffffffZ>-<run-id>.json
+```
+
+The high-resolution timestamp and random run ID prevent collisions across rapid or
+concurrent invocations. The report includes the run ID, and `latest-report.json`
+points to the latest attempt. Reports do not contain credentials, signed URLs, request
+headers, or audio bodies.
+
+### Operator progress
+
+The command emits sanitized human progress to stderr at phase boundaries and after
+each 100 completed objects or five seconds of observed completions, whichever comes
+first. Updates contain phase names, counts, and bytes only; they do not print endpoint
+URLs, signatures, credentials, or object keys. Stdout is reserved for the final
+summary and report or manifest paths. Progress output is transient and never used as
+machine-readable state; the sync report remains authoritative.
 
 ## Dry-run Behavior
 
@@ -455,13 +579,19 @@ Unit and CLI tests use fake R2 clients and temporary directories. They cover:
 - non-ASCII, space-containing, and special-character keys;
 - exact-key preservation and deterministic ordering;
 - folder markers;
+- marker-only prefixes becoming `empty`;
 - malformed root objects;
 - ambiguous numeric prefixes;
+- explicit includes not overriding ambiguous-prefix quarantine;
 - explicitly included empty prefixes;
 - include and exclude precedence;
 - metadata HEAD failures;
 - single-part and multipart-style ETags;
+- strong and weak ETag parsing and exact conditional serialization;
 - remote checksum preservation without treating ETags as checksums;
+- checksum key normalization and unsupported checksum-mode fallback;
+- configured concurrency, connection-pool, timeout, retry, and exhausted-retry
+  behavior;
 - initial downloads;
 - verified cache hits causing no body request;
 - identical manifest bytes after the first run changes from a download action to a
@@ -470,13 +600,19 @@ Unit and CLI tests use fake R2 clients and temporary directories. They cover:
 - byte-count mismatches;
 - `If-Match` failures when remote content changes after listing;
 - temporary-file cleanup after failed downloads;
+- atomic cache-index publication, lock conflicts, and restart cache hits after an
+  interrupted run;
 - unchanged reruns producing identical corpus and manifest identities;
 - object changes producing new identities while preserving old manifests and cache
   files;
 - provenance changes producing new identities;
 - missing provenance producing explicit unknown values;
 - malformed provenance failing before network access;
+- unsupported provenance schema versions failing before network access;
 - partial failures remaining visible per simfile;
+- `latest.json` carrying complete or partial status;
+- collision-resistant report filenames;
+- sanitized periodic progress on stderr;
 - dry runs issuing no body reads and changing neither cache nor manifests;
 - atomic, idempotent manifest publication;
 - secret, signed-query, endpoint, and header redaction;
@@ -499,9 +635,23 @@ considered fully accepted.
 ## Dependencies
 
 - Add `boto3` as a runtime dependency.
+- Accept its transitive `botocore`, `s3transfer`, `jmespath`, and `urllib3`
+  installation and lockfile footprint; the dependency is isolated to the corpus-sync
+  command's adapter even though it is installed with the Crux runtime.
 - Do not add Parquet or database dependencies. JSONL is sufficient for the base
   inventory and keeps canonicalization directly inspectable.
 - Do not introduce SQLite as an intermediate authority.
+
+## Reference Behavior
+
+- [Cloudflare R2 S3 compatibility](https://developers.cloudflare.com/r2/api/s3/api/)
+  defines supported listing, HEAD, GET, conditional, and checksum-type behavior.
+- [Cloudflare R2 upload behavior](https://developers.cloudflare.com/r2/objects/upload-objects/)
+  documents multipart ETag construction.
+- [Botocore client configuration](https://docs.aws.amazon.com/botocore/latest/reference/config.html)
+  defines timeout, connection-pool, and retry settings.
+- [Boto3 `HeadObject`](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/head_object.html)
+  defines checksum-mode request and response fields.
 
 ## Acceptance Mapping
 
