@@ -1676,7 +1676,7 @@ def test_indexed_symlinked_body_is_not_a_verified_hit(tmp_path: Path) -> None:
     )
 
     assert result.actions[0].action == "planned"
-    assert result.actions[0].miss_reason == "sha256_mismatch"
+    assert result.actions[0].miss_reason == "unreadable"
     assert external.read_bytes() == body
 
 
@@ -1822,7 +1822,7 @@ def test_downloaded_body_uses_extensionless_content_address(tmp_path: Path) -> N
     assert (tmp_path / remote.cache_path).suffix == ""
 
 
-def test_unreadable_indexed_body_is_a_repairable_validation_miss(
+def test_unreadable_indexed_body_is_an_unreadable_validation_miss(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     import src.benchmark.corpus_cache as cache
@@ -1846,7 +1846,7 @@ def test_unreadable_indexed_body_is_a_repairable_validation_miss(
     )
 
     assert result.actions[0].action == "planned"
-    assert result.actions[0].miss_reason == "sha256_mismatch"
+    assert result.actions[0].miss_reason == "unreadable"
     assert result.actions[0].errors == ()
 
 

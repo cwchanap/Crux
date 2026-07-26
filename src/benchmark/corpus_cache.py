@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 from threading import Lock
 from uuid import uuid4
 
+from src.benchmark.durability import ensure_durable_directory, fsync_directory
 from src.benchmark.r2_corpus_models import (
     CACHE_INDEX_SCHEMA,
     CacheAction,
@@ -162,7 +163,7 @@ class CacheIndexStore:
             self._entries = entries
 
     def _publish_locked(self, entries: dict[tuple[str, str, str], CacheIndexEntry]) -> None:
-        _ensure_durable_directory(self.cache_dir)
+        ensure_durable_directory(self.cache_dir)
         payload = {
             "schema_version": CACHE_INDEX_SCHEMA,
             "entries": [
@@ -193,7 +194,7 @@ class CacheIndexStore:
                 file.flush()
                 os.fsync(file.fileno())
             os.replace(temporary_path, index_path)
-            _fsync_directory(self.cache_dir)
+            fsync_directory(self.cache_dir)
         except Exception:
             if temporary_created:
                 try:
@@ -230,7 +231,7 @@ def validate_cached_body(
     except FileNotFoundError:
         return CacheValidation("missing", entry)
     except OSError:
-        return CacheValidation("sha256_mismatch", entry)
+        return CacheValidation("unreadable", entry)
     finally:
         if final_fd is not None:
             os.close(final_fd)
@@ -738,7 +739,7 @@ def _failed_download(
     operational_errors: tuple[SyncError, ...],
 ) -> _DownloadResult:
     errors = list(operational_errors)
-    if validation.state in {"missing", "size_mismatch", "sha256_mismatch"}:
+    if validation.state in {"missing", "size_mismatch", "sha256_mismatch", "unreadable"}:
         errors.insert(0, _download_error("cache_corrupt", remote.key))
     unique_errors = {
         (error.scope, error.code, error.message, error.object_key): error for error in errors
@@ -820,7 +821,7 @@ def _open_existing_content_root(cache_dir: Path) -> Iterator[tuple[int, int]]:
 def _open_content_directories(
     cache_dir: Path,
 ) -> Iterator[_PinnedContentDirectories]:
-    _ensure_durable_directory(cache_dir)
+    ensure_durable_directory(cache_dir)
     cache_fd = _open_directory_path(cache_dir)
     sha256_fd: int | None = None
     incoming_fd: int | None = None
@@ -1034,7 +1035,7 @@ def cache_writer_lock(cache_dir: Path) -> Iterator[None]:
     except ImportError as exc:
         raise RuntimeError("unsupported_platform") from exc
 
-    _ensure_durable_directory(cache_dir)
+    ensure_durable_directory(cache_dir)
     handle = _open_lock_file(cache_dir / ".index-v1.lock")
     try:
         try:
@@ -1179,37 +1180,6 @@ def _validate_relative_cache_path(cache_path: str, sha256: str) -> None:
     expected = PurePosixPath("sha256", sha256[:2], sha256)
     if path.is_absolute() or path != expected:
         raise ValueError("invalid cache index entry")
-
-
-def _ensure_durable_directory(path: Path) -> None:
-    if path.exists():
-        if not path.is_dir():
-            raise ValueError("cache directory is unavailable")
-        return
-
-    missing: list[Path] = []
-    current = path
-    while not current.exists():
-        missing.append(current)
-        parent = current.parent
-        if parent == current:
-            raise ValueError("cache directory is unavailable")
-        current = parent
-    if not current.is_dir():
-        raise ValueError("cache directory is unavailable")
-    for directory in reversed(missing):
-        directory.mkdir(exist_ok=True)
-        if not directory.is_dir():
-            raise ValueError("cache directory is unavailable")
-        _fsync_directory(directory.parent)
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _open_lock_file(lock_path: Path):

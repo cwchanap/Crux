@@ -568,6 +568,30 @@ def test_writer_lock_conflict_fails_before_store_creation_or_network(tmp_path):
     assert read_report(outcome.report_path)["errors"][0]["code"] == "cache_locked"
 
 
+def test_writer_lock_unexpected_failure_surfaces_cache_lock_failed(tmp_path, monkeypatch):
+    import errno
+
+    import src.benchmark.corpus_cache as cache
+
+    store = complete_store()
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    real_os_open = cache.os.open
+
+    def fail_only_lock_file(path, *args, **kwargs):
+        if str(path).endswith(".index-v1.lock"):
+            raise OSError(errno.EACCES, "private lock detail")
+        return real_os_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(cache.os, "open", fail_only_lock_file)
+
+    outcome, _ = invoke_sync(tmp_path, store)
+
+    assert outcome.exit_code == 2
+    assert store.calls == []
+    assert [error.code for error in outcome.errors] == ["cache_lock_failed"]
+
+
 def test_empty_include_and_ambiguous_prefixes_publish_partial_manifest(tmp_path):
     store = store_from_bodies(
         {
@@ -728,7 +752,7 @@ def test_latest_report_directory_fsync_failure_restores_both_prior_pointers(tmp_
     (output_dir / "latest.json").write_bytes(previous_latest)
     (output_dir / "latest-report.json").write_bytes(previous_latest_report)
     real_replace = r2_corpus_sync.os.replace
-    real_fsync_directory = r2_corpus_sync._fsync_directory
+    real_fsync_directory = r2_corpus_sync.fsync_directory
     latest_report_replaced = False
     failed_once = False
 
@@ -746,7 +770,7 @@ def test_latest_report_directory_fsync_failure_restores_both_prior_pointers(tmp_
         real_fsync_directory(path)
 
     monkeypatch.setattr(r2_corpus_sync.os, "replace", record_replace)
-    monkeypatch.setattr(r2_corpus_sync, "_fsync_directory", fail_after_latest_report_replace)
+    monkeypatch.setattr(r2_corpus_sync, "fsync_directory", fail_after_latest_report_replace)
 
     outcome, _ = invoke_sync(tmp_path, complete_store())
 
@@ -825,6 +849,7 @@ def test_report_counters_and_cache_miss_reasons_are_exact(tmp_path):
         "remote_changed": 2,
         "sha256_mismatch": 0,
         "size_mismatch": 0,
+        "unreadable": 0,
     }
 
 
