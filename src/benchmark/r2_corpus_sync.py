@@ -5,13 +5,12 @@ import os
 import stat
 import time
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from threading import Lock
-from typing import ContextManager
 from uuid import UUID, uuid4
 
 from src.benchmark.corpus_cache import (
@@ -40,6 +39,7 @@ from src.benchmark.r2_corpus_models import (
     ProvenanceRecord,
     PublishedManifest,
     R2Config,
+    RenderedManifest,
     SyncCounters,
     SyncError,
     SyncOutcome,
@@ -317,7 +317,7 @@ def _run_sync(
             request, run_id, started_at, clock, tracker, state, _safe_error("internal_error")
         )
 
-    lock: ContextManager[None]
+    lock: AbstractContextManager[None]
     lock = nullcontext() if request.dry_run else cache_writer_lock(request.cache_dir)
     try:
         with lock:
@@ -436,7 +436,7 @@ def _run_transaction(
     exit_code = 1 if is_partial else 0
 
     tracker.enter("manifest")
-    rendered_manifest: bytes | None = None
+    rendered_manifest: RenderedManifest | None = None
     if not request.dry_run:
         rows = build_manifest_rows(
             state.cache_result.simfiles,
@@ -1096,7 +1096,7 @@ def _adapter_error(error: R2StoreError) -> SyncError:
 
 
 def _safe_error(code: ErrorCode) -> SyncError:
-    if code in {"artifact_write_failed"}:
+    if code == "artifact_write_failed":
         scope = "artifact"
     elif code == "root_list_failed":
         scope = "root"

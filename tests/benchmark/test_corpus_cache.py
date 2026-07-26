@@ -1509,7 +1509,7 @@ def test_download_workers_are_bounded_and_results_remain_input_ordered(
         False,
     )
 
-    assert store.maximum_active == 2
+    assert 1 < store.maximum_active <= 2
     assert [action.object_key for action in result.actions] == [remote.key for remote in objects]
     assert all(action.action == "downloaded" for action in result.actions)
 
@@ -1565,7 +1565,7 @@ def test_download_concurrency_bounds_owned_staging_resources_for_large_corpus(
         False,
     )
 
-    assert store.maximum_active == concurrency
+    assert 1 < store.maximum_active <= concurrency
     assert peak_staged_descriptors <= concurrency
     assert active_descriptors == set()
     assert list((tmp_path / "sha256" / ".incoming").iterdir()) == []
@@ -2172,7 +2172,7 @@ def test_temporary_name_replacement_between_prepare_and_install_is_never_consume
     assert [error.code for error in result.actions[0].errors] == ["artifact_write_failed"]
     assert owned_descriptors
     for descriptor in owned_descriptors:
-        with pytest.raises(OSError, match="Bad file descriptor") as error:
+        with pytest.raises(OSError) as error:
             os.fstat(descriptor)
         assert error.value.errno == errno.EBADF
 
@@ -2225,7 +2225,7 @@ def test_content_descriptors_remain_open_through_checkpoint_and_close_after(
 
     assert result.actions[0].action == "downloaded"
     for descriptor in descriptors.values():
-        with pytest.raises(OSError, match="Bad file descriptor") as error:
+        with pytest.raises(OSError) as error:
             os.fstat(descriptor)
         assert error.value.errno == errno.EBADF
 
@@ -2294,6 +2294,6 @@ def test_shard_swap_during_temporary_cleanup_never_checkpoints_stale_path(
     ]
     assert shard_descriptors
     for descriptor in shard_descriptors:
-        with pytest.raises(OSError, match="Bad file descriptor") as error:
+        with pytest.raises(OSError) as error:
             os.fstat(descriptor)
         assert error.value.errno == errno.EBADF

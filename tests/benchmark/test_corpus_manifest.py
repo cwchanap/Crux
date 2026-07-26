@@ -511,7 +511,6 @@ def test_publish_manifest_accepts_an_identical_concurrent_winner(
     tmp_path: Path,
 ) -> None:
     rendered = render_fixture()
-    real_link = os.link
     link_calls = 0
 
     def concurrent_link(source: Path, destination: Path) -> None:
@@ -527,7 +526,6 @@ def test_publish_manifest_accepts_an_identical_concurrent_winner(
     assert published.path.read_bytes() == rendered.content
     assert link_calls == 1
     assert not list(published.path.parent.glob(".*.tmp"))
-    monkeypatch.setattr(corpus_manifest.os, "link", real_link)
 
 
 def test_publish_manifest_rejects_a_concurrent_matching_symlink_winner(

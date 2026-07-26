@@ -201,7 +201,8 @@ def test_rejects_duplicate_root_field_names_from_raw_json(tmp_path: Path) -> Non
     path = tmp_path / "provenance.json"
     write_raw_mapping(
         path,
-        '{"schema_version":"crux.corpus-provenance/v1","schema_version":"secret-schema","simfiles":{}}',
+        '{"schema_version":"crux.corpus-provenance/v1",'
+        '"schema_version":"secret-schema","simfiles":{}}',
     )
 
     with pytest.raises(ValueError) as error:

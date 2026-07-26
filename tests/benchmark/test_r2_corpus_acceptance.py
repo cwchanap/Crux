@@ -229,6 +229,11 @@ def read_json(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def read_report(report_path: Path | None) -> dict[str, object]:
+    assert report_path is not None, "expected a published report path"
+    return read_json(report_path)
+
+
 def read_manifest(path: Path) -> tuple[dict[str, object], ...]:
     content = path.read_bytes()
     assert content.endswith(b"\n")
@@ -335,8 +340,8 @@ def test_sync_is_repeatable_and_preserves_changed_history(tmp_path: Path):
     ]
     assert second_store.get_calls == []
 
-    first_report = read_json(first.report_path)
-    second_report = read_json(second.report_path)
+    first_report = read_report(first.report_path)
+    second_report = read_report(second.report_path)
     assert first_report["counters"]["downloads_completed"] == 4
     assert second_report["counters"]["cache_hits"] == 4
     assert first_report["ambiguous_prefixes"] == {"4": ["04/", "4/"]}
@@ -395,7 +400,7 @@ def test_sync_is_repeatable_and_preserves_changed_history(tmp_path: Path):
     assert latest["manifest_sha256"] == third.manifest.manifest_sha256
     assert latest["manifest_path"] == third.manifest.relative_path
     assert latest["overall_status"] == "partial"
-    third_report = read_json(third.report_path)
+    third_report = read_report(third.report_path)
     assert third_report["overall_status"] == "partial"
     assert third_report["exit_code"] == third.exit_code
     assert third_report["counters"]["cache_hits"] == 3
@@ -482,6 +487,7 @@ def test_base_cli_import_does_not_import_boto3():
         check=False,
         capture_output=True,
         text=True,
+        timeout=30,
     )
 
     assert completed.returncode == 0, completed.stderr
