@@ -2327,3 +2327,502 @@ def test_open_regular_file_at_rejects_a_fifo_without_blocking(tmp_path: Path) ->
         assert stat.S_ISFIFO(os.stat(tmp_path / fifo_name).st_mode)
     finally:
         os.close(parent_fd)
+
+
+# ---------------------------------------------------------------------------
+# Coverage gap closures for corpus_cache error paths
+# ---------------------------------------------------------------------------
+
+
+def test_index_load_wraps_non_filenotfound_oserror_as_invalid_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    (tmp_path / "index-v1.json").write_text("{}", encoding="utf-8")
+
+    def raising_stat(path, *, follow_symlinks=True):
+        raise OSError(errno.EACCES, "private permission detail")
+
+    monkeypatch.setattr(cache.os, "stat", raising_stat)
+
+    with pytest.raises(ValueError, match="invalid cache index JSON") as caught:
+        CacheIndexStore.load(tmp_path)
+
+    assert "private" not in str(caught.value)
+
+
+def test_checkpoint_cleanup_swallows_unlink_oserror(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    def fail_replace(source, target):
+        raise OSError("private replace failure")
+
+    def fail_unlink(self, missing_ok=False):
+        raise OSError("private unlink failure")
+
+    monkeypatch.setattr(cache.os, "replace", fail_replace)
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+
+    store = CacheIndexStore.load(tmp_path)
+    with pytest.raises(OSError):
+        store.checkpoint(entry())
+
+    # The original OSError from replace propagates; unlink failure is swallowed.
+    assert not (tmp_path / "index-v1.json").exists()
+
+
+def test_streamed_byte_count_exceeding_declared_size_rejects_download(
+    tmp_path: Path,
+) -> None:
+    result = sync_cache(
+        (simfile(remote_object(size=3)),),
+        FakeStore(body=b"chart", response_size=3),
+        empty_index(tmp_path),
+        config(),
+        False,
+    )
+
+    assert result.actions[0].action == "failed"
+    assert [error.code for error in result.actions[0].errors] == ["byte_count_mismatch"]
+
+
+def test_fdopen_failure_closes_writer_descriptor_and_propagates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    closed_fds: list[int] = []
+    real_fdopen = cache.os.fdopen
+
+    def failing_fdopen(fd, *args, **kwargs):
+        # Only fail for the writer descriptor (wb mode), not the lock file (a+b).
+        if args and "wb" in args:
+            closed_fds.append(fd)
+            raise OSError("private fdopen failure")
+        return real_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(cache.os, "fdopen", failing_fdopen)
+
+    result = sync_cache(
+        (simfile(remote_object()),),
+        FakeStore(),
+        empty_index(tmp_path),
+        config(),
+        False,
+    )
+
+    assert result.actions[0].action == "failed"
+    assert "artifact_write_failed" in [e.code for e in result.actions[0].errors]
+    assert closed_fds, "writer descriptor should have been closed on fdopen failure"
+
+
+def test_cross_device_check_reached_when_binding_verification_is_bypassed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    digest = sha256(b"chart").hexdigest()
+    real_fstat = cache.os.fstat
+    shard_fds: set[int] = set()
+
+    class ShiftedDev:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+            self.st_dev = wrapped.st_dev + 1
+
+        def __getattr__(self, name):
+            return getattr(self._wrapped, name)
+
+    real_open = cache.os.open
+
+    def track_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if str(path) == digest[:2] and flags & getattr(os, "O_DIRECTORY", 0):
+            shard_fds.add(fd)
+        return fd
+
+    def shifted_fstat(fd):
+        result = real_fstat(fd)
+        if fd in shard_fds:
+            return ShiftedDev(result)
+        return result
+
+    # Bypass binding verification so the cross-device check at line 533 is reached.
+    monkeypatch.setattr(cache, "_verify_directory_binding", lambda *a, **kw: None)
+    monkeypatch.setattr(cache, "_verify_content_directories", lambda *a, **kw: None)
+    monkeypatch.setattr(cache.os, "open", track_open)
+    monkeypatch.setattr(cache.os, "fstat", shifted_fstat)
+
+    result = sync_cache(
+        (simfile(remote_object()),),
+        FakeStore(),
+        empty_index(tmp_path),
+        config(),
+        False,
+    )
+
+    assert [error.code for error in result.actions[0].errors] == ["artifact_write_failed"]
+
+
+def test_open_directory_at_rejects_non_directory_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    file_path = tmp_path / "not_a_dir"
+    file_path.write_text("data")
+    parent_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        # On most platforms O_DIRECTORY causes NotADirectoryError at os.open.
+        # Patch os.open to succeed so the S_ISDIR defensive check is exercised.
+        real_open = cache.os.open
+
+        def open_as_file(name, flags, *args, **kwargs):
+            if name == "not_a_dir" and flags & getattr(os, "O_DIRECTORY", 0):
+                return real_open(str(file_path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            return real_open(name, flags, *args, **kwargs)
+
+        monkeypatch.setattr(cache.os, "open", open_as_file)
+        with pytest.raises(OSError, match="cache content directory is unavailable"):
+            cache._open_directory_at(parent_fd, "not_a_dir")
+    finally:
+        os.close(parent_fd)
+
+
+def test_directory_open_flags_rejects_missing_nofollow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    with pytest.raises(OSError, match="no-follow directory descriptors"):
+        cache._directory_open_flags()
+
+
+def test_verify_cache_directory_binding_detects_swap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    real_stat = cache.os.stat
+
+    def swapped_stat(path, *, follow_symlinks=True):
+        real_stat(path, follow_symlinks=follow_symlinks)
+        return os.stat_result((0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+
+    fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        monkeypatch.setattr(cache.os, "stat", swapped_stat)
+        with pytest.raises(OSError, match="cache directory binding changed"):
+            cache._verify_cache_directory_binding(tmp_path, fd)
+    finally:
+        os.close(fd)
+
+
+def test_verify_owned_descriptor_detects_ownership_change(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    real_fstat = cache.os.fstat
+
+    def shifted_fstat(fd):
+        result = real_fstat(fd)
+        return os.stat_result((result.st_mode, result.st_ino + 1, 0, 0, 0, 0, 0, 0, 0, 0))
+
+    fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        monkeypatch.setattr(cache.os, "fstat", shifted_fstat)
+        owned = cache._OwnedTemporaryFile("name", fd, 0, 0)
+        with pytest.raises(OSError, match="cache temporary file ownership changed"):
+            cache._verify_owned_descriptor(owned, fd)
+    finally:
+        os.close(fd)
+
+
+def test_verify_owned_temporary_binding_detects_ownership_change(tmp_path: Path) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        tmp_name = ".test_tmp"
+        tmp_fd = os.open(
+            tmp_name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=fd,
+        )
+        try:
+            stat_result = cache.os.fstat(tmp_fd)
+            # Create owned temporary with WRONG device/inode so the binding check
+            # passes but the ownership check at line 936-940 fails.
+            owned = cache._OwnedTemporaryFile(
+                tmp_name, tmp_fd, stat_result.st_dev + 1, stat_result.st_ino + 1
+            )
+            with pytest.raises(OSError, match="cache temporary file ownership changed"):
+                cache._verify_owned_temporary_binding(fd, owned)
+        finally:
+            os.close(tmp_fd)
+            os.unlink(tmp_name, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+def test_open_regular_file_at_rejects_missing_nofollow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    parent_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        with pytest.raises(OSError, match="no-follow file descriptors"):
+            _open_regular_file_at(parent_fd, "anything")
+    finally:
+        os.close(parent_fd)
+
+
+def test_open_regular_file_at_rejects_missing_nonblock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delattr(os, "O_NONBLOCK", raising=False)
+    parent_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        with pytest.raises(OSError, match="non-blocking file descriptors"):
+            _open_regular_file_at(parent_fd, "anything")
+    finally:
+        os.close(parent_fd)
+
+
+def test_create_temporary_file_rejects_missing_nofollow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    parent_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        with pytest.raises(OSError, match="no-follow file descriptors"):
+            cache._create_temporary_file(parent_fd, "test_tmp")
+    finally:
+        os.close(parent_fd)
+
+
+def test_create_temporary_file_rejects_non_regular_descriptor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    real_fstat = cache.os.fstat
+
+    def non_regular_fstat(fd):
+        result = real_fstat(fd)
+        # Return a socket mode instead of regular file mode.
+        return os.stat_result((0o140000, result.st_ino, result.st_dev, 0, 0, 0, 0, 0, 0, 0))
+
+    parent_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        monkeypatch.setattr(cache.os, "fstat", non_regular_fstat)
+        with pytest.raises(OSError, match="cache temporary file is not a regular file"):
+            cache._create_temporary_file(parent_fd, "test_tmp")
+    finally:
+        # Clean up the file that was created on disk but whose descriptor was
+        # closed by the exception handler.
+        if (tmp_path / "test_tmp").exists():
+            os.unlink("test_tmp", dir_fd=parent_fd)
+        os.close(parent_fd)
+
+
+def test_load_index_document_rejects_missing_nofollow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    index_path = tmp_path / "index-v1.json"
+    index_path.write_text("{}", encoding="utf-8")
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+
+    with pytest.raises(ValueError, match="invalid cache index JSON"):
+        cache._load_index_document(index_path)
+
+
+def test_load_index_document_swallows_close_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    index_path = tmp_path / "index-v1.json"
+    index_path.write_text(
+        '{"schema_version":"crux.r2-cache-index/v1","entries":[]}',
+        encoding="utf-8",
+    )
+
+    real_close = cache.os.close
+    real_open = cache.os.open
+    open_fd: list[int] = []
+
+    def tracking_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if Path(path) == index_path:
+            open_fd.append(fd)
+        return fd
+
+    def failing_close(fd):
+        if fd in open_fd:
+            raise OSError("private close failure")
+        return real_close(fd)
+
+    monkeypatch.setattr(cache.os, "open", tracking_open)
+    monkeypatch.setattr(cache.os, "close", failing_close)
+
+    # Should succeed despite close failure in finally block.
+    doc = cache._load_index_document(index_path)
+    assert doc["schema_version"] == "crux.r2-cache-index/v1"
+
+
+def test_unique_object_rejects_duplicate_fields() -> None:
+    import src.benchmark.corpus_cache as cache
+
+    with pytest.raises(ValueError):
+        cache._unique_object([("a", 1), ("a", 2)])
+
+
+def test_validated_entries_rejects_non_dict_document() -> None:
+    import src.benchmark.corpus_cache as cache
+
+    with pytest.raises(ValueError, match="invalid cache index document"):
+        cache._validated_entries([])
+    with pytest.raises(ValueError, match="invalid cache index document"):
+        cache._validated_entries({"wrong": "keys"})
+
+
+def test_validated_entries_rejects_non_list_entries() -> None:
+    import src.benchmark.corpus_cache as cache
+
+    with pytest.raises(ValueError, match="invalid cache index entries"):
+        cache._validated_entries(
+            {"schema_version": "crux.r2-cache-index/v1", "entries": "not-a-list"}
+        )
+
+
+def test_validated_entry_rejects_wrong_type_or_fields() -> None:
+    import src.benchmark.corpus_cache as cache
+
+    with pytest.raises(ValueError, match="invalid cache index entry"):
+        cache._validated_entry("not-a-dict")
+    with pytest.raises(ValueError, match="invalid cache index entry"):
+        cache._validated_entry({"extra": "field"})
+
+
+def test_is_canonical_utc_timestamp_rejects_invalid_iso_format() -> None:
+    import src.benchmark.corpus_cache as cache
+
+    assert cache._is_canonical_utc_timestamp("not-a-timestampZ") is False
+
+
+def test_validate_relative_cache_path_rejects_mismatched_sha256() -> None:
+    import src.benchmark.corpus_cache as cache
+
+    with pytest.raises(ValueError, match="invalid cache index entry"):
+        cache._validate_relative_cache_path("sha256/cc/" + "c" * 64, "b" * 64)
+
+
+def test_open_lock_file_rejects_missing_nofollow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    with pytest.raises(RuntimeError, match="unsupported_platform"):
+        cache._open_lock_file(tmp_path / ".index-v1.lock")
+
+
+def test_open_lock_file_wraps_fdopen_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import src.benchmark.corpus_cache as cache
+
+    def failing_fdopen(fd, *args, **kwargs):
+        raise OSError("private fdopen failure")
+
+    monkeypatch.setattr(cache.os, "fdopen", failing_fdopen)
+
+    with pytest.raises(RuntimeError, match="cache_lock_failed"):
+        cache._open_lock_file(tmp_path / ".index-v1.lock")
+
+
+def test_lock_open_error_message_returns_unsupported_for_notsup() -> None:
+    import src.benchmark.corpus_cache as cache
+
+    exc = OSError(errno.ENOTSUP, "private")
+    assert cache._lock_open_error_message(exc) == "unsupported_platform"
+
+
+def test_error_recovery_skips_already_processed_and_deduplicates_progress(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cover lines 268 (duplicate progress) and 375 (skip processed in recovery)."""
+    import src.benchmark.corpus_cache as cache
+
+    class MixedStore:
+        @contextmanager
+        def open_object(self, key: str, if_match: str | None) -> Iterator[ObjectDownload]:
+            if "fail" in key:
+                raise R2StoreError("object_get_failed", "private detail", key)
+            yield ObjectDownload(
+                body=BytesIO(b"chart"),
+                size=5,
+                etag="etag",
+                etag_is_weak=False,
+                last_modified=FIXED_MTIME,
+            )
+
+    def failing_install(*_args, **_kwargs):
+        raise OSError("private install failure")
+
+    monkeypatch.setattr(cache, "_install_prepared_downloads", failing_install)
+
+    result = sync_cache(
+        (
+            simfile(
+                remote_object(key="42/fail.dtx"),
+                remote_object(key="42/ok.dtx"),
+            ),
+        ),
+        MixedStore(),
+        empty_index(tmp_path),
+        config(),
+        False,
+    )
+
+    # Both objects should fail; the install failure is sanitized.
+    assert all(action.action == "failed" for action in result.actions)
+    assert not (tmp_path / "index-v1.json").exists()
+
+
+def test_installed_content_hash_mismatch_after_repair_rejects_download(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cover line 581: installed digest mismatch after repair replacement."""
+    import src.benchmark.corpus_cache as cache
+
+    store = index_with_local_state(tmp_path, "sha256_mismatch")
+
+    # Make _hash_fd return a wrong digest so that:
+    # 1. The existing file is seen as mismatched (repair path taken)
+    # 2. The installed file after replacement is also seen as mismatched (line 581)
+    monkeypatch.setattr(cache, "_hash_fd", lambda fd: ("0" * 64, 0))
+
+    result = sync_cache(
+        (simfile(remote_object()),),
+        FakeStore(body=b"chart"),
+        store,
+        config(),
+        False,
+    )
+
+    assert "artifact_write_failed" in [error.code for error in result.actions[0].errors]
+    # The index file pre-exists from index_with_local_state; the failed install
+    # must not have updated it with the rejected content.
+    assert result.actions[0].action == "failed"

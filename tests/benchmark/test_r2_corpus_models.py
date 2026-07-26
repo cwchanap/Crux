@@ -150,6 +150,27 @@ def test_report_filename_timestamp_rejects_naive_values_instead_of_using_host_ti
         format_report_filename_timestamp(naive)
 
 
+class _BrokenTzDatetime(datetime):
+    """Datetime subclass whose utcoffset() raises to exercise the except branch."""
+
+    def utcoffset(self, *args, **kwargs):
+        raise RuntimeError("boom")
+
+
+def test_manifest_timestamp_treats_utcoffset_errors_as_naive():
+    broken = _BrokenTzDatetime(2026, 7, 25, 1, 2, 3, 120000, tzinfo=timezone.utc)
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        format_manifest_timestamp(broken)
+
+
+def test_report_filename_timestamp_treats_utcoffset_errors_as_naive():
+    broken = _BrokenTzDatetime(2026, 7, 25, 1, 2, 3, 120000, tzinfo=timezone.utc)
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        format_report_filename_timestamp(broken)
+
+
 def test_fixed_contract_constants_are_stable():
     assert CACHE_PROFILE == "setdef_dtx_txt_v1"
     assert MAX_SIMFILE_ID == 9_007_199_254_740_991

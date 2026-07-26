@@ -1001,3 +1001,274 @@ def test_head_progress_callback_runs_while_another_head_is_still_blocked():
 
     assert errors == []
     assert progress == [(1, 2, 5), (2, 2, 10)]
+
+
+def test_r2_object_store_protocol_stubs_raise_not_implemented():
+    from src.benchmark.r2_inventory import R2ObjectStore
+
+    class _StubCaller(R2ObjectStore):
+        def __init__(self):
+            pass
+
+    stub = _StubCaller()
+    with pytest.raises(NotImplementedError):
+        stub.validate_bucket()
+    with pytest.raises(NotImplementedError):
+        stub.list_objects()
+    with pytest.raises(NotImplementedError):
+        stub.head_object("key")
+    with pytest.raises(NotImplementedError):
+        stub.open_object("key", None).__enter__()
+
+
+def test_list_objects_rejects_non_dict_page():
+    class NonDictPageClient(FakeClient):
+        def get_paginator(self, name):
+            return type(
+                "NonDictPaginator",
+                (),
+                {"paginate": lambda self, **kwargs: ["not-a-dict"]},
+            )()
+
+    assert_store_error(
+        Boto3R2Store(NonDictPageClient(), "simfile-dtx").list_objects,
+        "object_metadata_invalid",
+        "Object metadata is invalid.",
+    )
+
+
+def test_list_objects_rejects_non_list_contents():
+    class NonListContentsClient(FakeClient):
+        def get_paginator(self, name):
+            return type(
+                "NonListPaginator",
+                (),
+                {"paginate": lambda self, **kwargs: [{"Contents": "not-a-list"}]},
+            )()
+
+    assert_store_error(
+        Boto3R2Store(NonListContentsClient(), "simfile-dtx").list_objects,
+        "object_metadata_invalid",
+        "Object metadata is invalid.",
+    )
+
+
+def test_head_object_reraises_r2_store_error_from_parse():
+    class MalformedHeadClient(FakeClient):
+        def head_object(self, **kwargs):
+            return "not-a-dict"
+
+    # _parse_head_metadata calls _metadata_error() without a key, so the
+    # re-raised R2StoreError carries object_key=None.
+    assert_store_error(
+        lambda: Boto3R2Store(MalformedHeadClient(), "simfile-dtx").head_object("42/SET.DEF"),
+        "object_metadata_invalid",
+        "Object metadata is invalid.",
+        None,
+    )
+
+
+def test_open_object_reraises_metadata_error_with_key_when_object_key_is_none():
+    class NonDictDownloadClient(FakeClient):
+        def get_object(self, **kwargs):
+            return "not-a-dict"
+
+    store = Boto3R2Store(NonDictDownloadClient(), "simfile-dtx")
+    assert_store_error(
+        lambda: store.open_object("42/SET.DEF", None).__enter__(),
+        "object_metadata_invalid",
+        "Object metadata is invalid.",
+        "42/SET.DEF",
+    )
+
+
+def test_open_object_reraises_r2_store_error_that_already_has_object_key(
+    monkeypatch,
+):
+    class PlainClient(FakeClient):
+        def get_object(self, **kwargs):
+            return {"Body": BytesIO(b"chart")}
+
+    store = Boto3R2Store(PlainClient(), "simfile-dtx")
+
+    # Simulate _parse_download raising an R2StoreError that already carries a
+    # key (so the `if object_key is None` branch is skipped and line 395 runs).
+    sentinel = R2StoreError("object_head_failed", "private detail", "42/SET.DEF")
+
+    def raising_parse(self, response, key):
+        del self, response, key
+        raise sentinel
+
+    monkeypatch.setattr(Boto3R2Store, "_parse_download", raising_parse)
+
+    with pytest.raises(R2StoreError) as caught:
+        store.open_object("42/SET.DEF", None).__enter__()
+
+    assert caught.value is sentinel
+
+
+def test_open_object_closes_body_on_base_exception_during_yield():
+    closed = {"count": 0}
+
+    class TrackingBody(BytesIO):
+        def close(self):
+            closed["count"] += 1
+            super().close()
+
+    class PlainClient(FakeClient):
+        def get_object(self, **kwargs):
+            return {
+                "Body": TrackingBody(b"chart"),
+                "ContentLength": 5,
+                "ETag": '"etag-2"',
+                "LastModified": datetime(2026, 7, 25, tzinfo=timezone.utc),
+            }
+
+    store = Boto3R2Store(PlainClient(), "simfile-dtx")
+
+    class _Sentinel(BaseException):
+        pass
+
+    with pytest.raises(_Sentinel):
+        with store.open_object("42/SET.DEF", None):
+            raise _Sentinel
+
+    assert closed["count"] == 1
+
+
+def test_open_object_swallows_body_close_failure_during_base_exception():
+    class FailingCloseBody(BytesIO):
+        def close(self):
+            raise RuntimeError("private close failure")
+
+    class PlainClient(FakeClient):
+        def get_object(self, **kwargs):
+            return {
+                "Body": FailingCloseBody(b"chart"),
+                "ContentLength": 5,
+                "ETag": '"etag-2"',
+                "LastModified": datetime(2026, 7, 25, tzinfo=timezone.utc),
+            }
+
+    store = Boto3R2Store(PlainClient(), "simfile-dtx")
+
+    class _Sentinel(BaseException):
+        pass
+
+    # The close failure is swallowed; the original BaseException propagates.
+    with pytest.raises(_Sentinel):
+        with store.open_object("42/SET.DEF", None):
+            raise _Sentinel
+
+
+def test_parse_listed_object_rejects_non_int_size():
+    class BadSizeClient(FakeClient):
+        def get_paginator(self, name):
+            return type(
+                "BadSizePaginator",
+                (),
+                {
+                    "paginate": lambda self, **kwargs: [
+                        {
+                            "Contents": [
+                                {
+                                    "Key": "42/SET.DEF",
+                                    "Size": -1,
+                                    "ETag": '"etag-2"',
+                                    "LastModified": datetime(2026, 7, 25, tzinfo=timezone.utc),
+                                }
+                            ]
+                        }
+                    ]
+                },
+            )()
+
+    objects = Boto3R2Store(BadSizeClient(), "simfile-dtx").list_objects()
+    assert [e.code for e in objects[0].errors] == ["object_metadata_invalid"]
+
+
+def test_parse_listed_object_rejects_non_string_etag():
+    class BadEtagClient(FakeClient):
+        def get_paginator(self, name):
+            return type(
+                "BadEtagPaginator",
+                (),
+                {
+                    "paginate": lambda self, **kwargs: [
+                        {
+                            "Contents": [
+                                {
+                                    "Key": "42/SET.DEF",
+                                    "Size": 5,
+                                    "ETag": 42,
+                                    "LastModified": datetime(2026, 7, 25, tzinfo=timezone.utc),
+                                }
+                            ]
+                        }
+                    ]
+                },
+            )()
+
+    objects = Boto3R2Store(BadEtagClient(), "simfile-dtx").list_objects()
+    assert [e.code for e in objects[0].errors] == ["object_metadata_invalid"]
+
+
+def test_close_response_body_handles_non_dict_response():
+    from src.benchmark.r2_inventory import _close_response_body
+
+    # Should be a no-op for non-dict responses.
+    _close_response_body("not-a-dict")
+    _close_response_body(None)
+
+
+def test_close_response_body_swallows_close_exceptions():
+    from src.benchmark.r2_inventory import _close_response_body
+
+    class FailingClose:
+        def close(self):
+            raise RuntimeError("private close failure")
+
+    # Should not raise even if close() fails.
+    _close_response_body({"Body": FailingClose()})
+
+
+def test_nullable_size_rejects_invalid_values():
+    from src.benchmark.r2_inventory import _nullable_size
+
+    assert _nullable_size(None) is None
+    assert _nullable_size(5) == 5
+    with pytest.raises(ValueError):
+        _nullable_size(-1)
+    with pytest.raises(ValueError):
+        _nullable_size("5")
+    with pytest.raises(ValueError):
+        _nullable_size(True)
+
+
+def test_is_aware_datetime_treats_utcoffset_errors_as_naive():
+    from src.benchmark.r2_inventory import _is_aware_datetime
+
+    class BrokenTz(datetime):
+        def utcoffset(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    broken = BrokenTz(2026, 7, 25, tzinfo=timezone.utc)
+    assert _is_aware_datetime(broken) is False
+
+
+def test_nullable_string_rejects_non_strings():
+    from src.benchmark.r2_inventory import _nullable_string
+
+    assert _nullable_string(None) is None
+    assert _nullable_string("text") == "text"
+    with pytest.raises(ValueError):
+        _nullable_string(42)
+
+
+def test_client_error_details_returns_none_for_non_dict_response():
+    from src.benchmark.r2_inventory import _client_error_details
+
+    error = ClientError({"Error": {"Code": "X"}}, "op")
+    # Patch the response attribute to be a non-dict.
+    error.response = "not-a-dict"
+    assert _client_error_details(error) == (None, None)
