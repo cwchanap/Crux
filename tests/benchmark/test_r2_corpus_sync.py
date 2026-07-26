@@ -708,7 +708,9 @@ def test_latest_report_failure_restores_previous_latest_manifest_pointer(tmp_pat
     assert outcome.manifest is None
     assert_only_failed_attempt_report(output_dir, outcome.report_path)
     assert (output_dir / "latest.json").read_bytes() == previous_latest
-    assert (output_dir / "latest-report.json").read_bytes() == previous_latest_report
+    latest_report = read_json(output_dir / "latest-report.json")
+    assert latest_report["overall_status"] == "failed"
+    assert latest_report["exit_code"] == 2
 
 
 def test_latest_manifest_failure_restores_previous_pointer_before_fatal_report(
@@ -741,10 +743,14 @@ def test_latest_manifest_failure_restores_previous_pointer_before_fatal_report(
     assert outcome.manifest is None
     assert_only_failed_attempt_report(output_dir, outcome.report_path)
     assert (output_dir / "latest.json").read_bytes() == previous_latest
-    assert (output_dir / "latest-report.json").read_bytes() == previous_latest_report
+    latest_report = read_json(output_dir / "latest-report.json")
+    assert latest_report["overall_status"] == "failed"
+    assert latest_report["exit_code"] == 2
 
 
-def test_latest_report_directory_fsync_failure_restores_both_prior_pointers(tmp_path, monkeypatch):
+def test_latest_report_directory_fsync_failure_restores_manifest_pointer_and_updates_report_pointer(
+    tmp_path, monkeypatch
+):
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     previous_latest = b'{"previous":"manifest"}\n'
@@ -779,7 +785,9 @@ def test_latest_report_directory_fsync_failure_restores_both_prior_pointers(tmp_
     assert_only_failed_attempt_report(output_dir, outcome.report_path)
     assert outcome.manifest is None
     assert (output_dir / "latest.json").read_bytes() == previous_latest
-    assert (output_dir / "latest-report.json").read_bytes() == previous_latest_report
+    latest_report = read_json(output_dir / "latest-report.json")
+    assert latest_report["overall_status"] == "failed"
+    assert latest_report["exit_code"] == 2
 
 
 def test_failed_fatal_rewrite_removes_stale_success_report_and_restores_pointers(

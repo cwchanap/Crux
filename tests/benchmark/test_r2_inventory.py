@@ -291,7 +291,7 @@ def test_adapter_maps_missing_credentials_and_conditional_change():
     ]
 
 
-def test_adapter_rejects_malformed_sdk_metadata_with_closed_error():
+def test_adapter_isolates_malformed_listed_object_metadata_with_error_entry():
     class MalformedClient(FakeClient):
         def get_paginator(self, name):
             return type(
@@ -300,15 +300,16 @@ def test_adapter_rejects_malformed_sdk_metadata_with_closed_error():
                 {"paginate": lambda self, **kwargs: [{"Contents": [{"Key": "42/SET.DEF"}]}]},
             )()
 
-    assert_store_error(
-        Boto3R2Store(MalformedClient(), "simfile-dtx").list_objects,
-        "object_metadata_invalid",
-        "Object metadata is invalid.",
-        "42/SET.DEF",
-    )
+    objects = Boto3R2Store(MalformedClient(), "simfile-dtx").list_objects()
+
+    assert len(objects) == 1
+    item = objects[0]
+    assert item.key == "42/SET.DEF"
+    assert [error.code for error in item.errors] == ["object_metadata_invalid"] * 3
+    assert all(error.object_key == "42/SET.DEF" for error in item.errors)
 
 
-@pytest.mark.parametrize("boundary", ["list", "head", "download"])
+@pytest.mark.parametrize("boundary", ["head", "download"])
 def test_adapter_rejects_naive_datetimes_at_metadata_boundaries(boundary):
     naive = datetime(2026, 7, 25, 1, 2, 3)
 
@@ -350,7 +351,6 @@ def test_adapter_rejects_naive_datetimes_at_metadata_boundaries(boundary):
 
     store = Boto3R2Store(NaiveTimestampClient(), "simfile-dtx")
     actions = {
-        "list": store.list_objects,
         "head": lambda: store.head_object("42/SET.DEF"),
         "download": lambda: store.open_object("42/SET.DEF", None).__enter__(),
     }
@@ -361,6 +361,39 @@ def test_adapter_rejects_naive_datetimes_at_metadata_boundaries(boundary):
         "Object metadata is invalid.",
         "42/SET.DEF",
     )
+
+
+def test_adapter_isolates_naive_listing_datetime_as_error_entry():
+    naive = datetime(2026, 7, 25, 1, 2, 3)
+
+    class NaiveTimestampPaginator:
+        def paginate(self, **kwargs):
+            assert kwargs == {"Bucket": "simfile-dtx"}
+            return [
+                {
+                    "Contents": [
+                        {
+                            "Key": "42/SET.DEF",
+                            "Size": 5,
+                            "ETag": '"etag-2"',
+                            "LastModified": naive,
+                        }
+                    ]
+                }
+            ]
+
+    class NaiveTimestampClient(FakeClient):
+        def get_paginator(self, name):
+            assert name == "list_objects_v2"
+            return NaiveTimestampPaginator()
+
+    objects = Boto3R2Store(NaiveTimestampClient(), "simfile-dtx").list_objects()
+
+    assert len(objects) == 1
+    item = objects[0]
+    assert item.key == "42/SET.DEF"
+    assert [error.code for error in item.errors] == ["object_metadata_invalid"]
+    assert item.errors[0].object_key == "42/SET.DEF"
 
 
 def test_adapter_keeps_the_object_key_separate_for_malformed_object_metadata():
@@ -672,6 +705,38 @@ def test_explicit_missing_id_creates_empty_row_with_no_objects():
     assert result.simfiles[0].simfile_id == 42
     assert result.simfiles[0].objects == ()
     assert result.simfiles[0].sync_errors[0].code == "empty_prefix"
+
+
+def test_malformed_listed_object_metadata_isolates_to_partial_row():
+    from src.benchmark.r2_corpus_models import SyncError
+
+    malformed = ListedObject(
+        key="42/bad.dtx",
+        size=0,
+        etag="",
+        etag_is_weak=False,
+        last_modified=datetime(1970, 1, 1, tzinfo=timezone.utc),
+        errors=(
+            SyncError(
+                "object",
+                "object_metadata_invalid",
+                "Object metadata is invalid.",
+                "42/bad.dtx",
+            ),
+        ),
+    )
+    store = FakeStore(
+        objects=[malformed, listed("42/good.dtx"), listed("99/chart.dtx")],
+    )
+
+    result = build_inventory(store, frozenset(), frozenset(), 2)
+
+    by_id = {row.simfile_id: row for row in result.simfiles}
+    assert by_id[42].sync_status == "partial"
+    assert by_id[99].sync_status == "complete"
+    bad = next(obj for obj in by_id[42].objects if obj.key == "42/bad.dtx")
+    assert any(error.code == "object_metadata_invalid" for error in bad.errors)
+    assert any(error.code == "object_metadata_invalid" for error in by_id[42].sync_errors)
 
 
 def test_exclude_wins_when_id_is_also_included():

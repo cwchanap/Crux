@@ -574,7 +574,7 @@ def _rewrite_attempt_as_failed(
         manifest=None,
     )
     try:
-        report_path, _, _ = _publish_report_file(
+        report_path, relative_report_path, report_sha256 = _publish_report_file(
             request.output_dir,
             started_at,
             run_id,
@@ -583,6 +583,18 @@ def _rewrite_attempt_as_failed(
     except Exception:
         _remove_attempt_report(request.output_dir, started_at, run_id)
         raise _ReportWriteFailure(error) from None
+    try:
+        _publish_latest_report(
+            request.output_dir,
+            relative_report_path,
+            "failed",
+            2,
+            None,
+            report_sha256,
+            completed_at,
+        )
+    except Exception:
+        pass
     tracker.finish("failed")
     return SyncOutcome("failed", 2, report_path, None, (error,), state.counters)
 
