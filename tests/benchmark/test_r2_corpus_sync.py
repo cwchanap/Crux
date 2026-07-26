@@ -1832,3 +1832,545 @@ def test_dry_run_finishing_after_real_run_moves_only_latest_report(tmp_path):
     latest_report = read_json(output_dir / "latest-report.json")
     assert latest_report["report_path"].endswith(f"{RUN_ID}.json")
     assert latest_report["overall_status"] == "dry_run_complete"
+
+
+# ---------------------------------------------------------------------------
+# Coverage gap closures for r2_corpus_sync error paths
+# ---------------------------------------------------------------------------
+
+
+def test_utc_now_and_new_run_id_helpers_return_trusted_values() -> None:
+    now = r2_corpus_sync.utc_now()
+    assert now.tzinfo is not None
+    run_id = r2_corpus_sync.new_run_id()
+    # Should be a canonical UUID4 string.
+    from uuid import UUID
+
+    parsed = UUID(run_id)
+    assert parsed.version == 4
+    assert str(parsed) == run_id
+
+
+def test_run_sync_internal_error_path_returns_internal_error(tmp_path) -> None:
+    """Cover line 318-321: catch-all Exception in _run_sync configuration phase."""
+    request = SyncRequest(tmp_path / "output", tmp_path / "cache", None)
+
+    def raising_dependency_check() -> None:
+        raise RuntimeError("SECRET dependency detail")
+
+    outcome = sync_r2_corpus(
+        request,
+        environ=DEFAULT_ENVIRON,
+        dependency_check=raising_dependency_check,
+        store_factory=lambda _config: complete_store(),
+        clock=lambda: STARTED_AT,
+        run_id_factory=lambda: RUN_ID,
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.errors[0].code == "internal_error"
+    assert "SECRET" not in repr(outcome)
+
+
+def test_run_sync_oserror_from_lock_returns_artifact_write_failed(tmp_path, monkeypatch) -> None:
+    """Cover lines 364-373: OSError from lock context manager (outside with lock)."""
+    store = complete_store()
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    @contextmanager
+    def raising_lock(_path: Path):
+        raise OSError("SECRET lock detail")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(r2_corpus_sync, "cache_writer_lock", raising_lock)
+
+    outcome, _ = invoke_sync(tmp_path, store)
+
+    assert outcome.exit_code == 2
+    assert outcome.errors[0].code == "artifact_write_failed"
+    assert "SECRET" not in repr(outcome)
+
+
+def test_run_sync_unexpected_exception_from_lock_returns_internal_error(
+    tmp_path, monkeypatch
+) -> None:
+    """Cover lines 374-377: catch-all Exception from lock context manager."""
+    store = complete_store()
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    @contextmanager
+    def raising_lock(_path: Path):
+        raise KeyError("SECRET lock detail")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(r2_corpus_sync, "cache_writer_lock", raising_lock)
+
+    outcome, _ = invoke_sync(tmp_path, store)
+
+    assert outcome.exit_code == 2
+    assert outcome.errors[0].code == "internal_error"
+    assert "SECRET" not in repr(outcome)
+
+
+def test_snapshot_pointers_failure_raises_report_write_failure(tmp_path, monkeypatch) -> None:
+    """Cover lines 457-458: _snapshot_pointers failure in _run_transaction."""
+    store = complete_store()
+
+    def raising_snapshot(_output_dir: Path):
+        raise OSError("SECRET snapshot detail")
+
+    monkeypatch.setattr(r2_corpus_sync, "_snapshot_pointers", raising_snapshot)
+
+    outcome, _ = invoke_sync(tmp_path, store)
+
+    assert outcome.exit_code == 2
+    assert outcome.report_path is None
+    assert outcome.errors[0].code == "artifact_write_failed"
+    assert "SECRET" not in repr(outcome)
+
+
+def test_manifest_publication_unexpected_exception_restores_and_raises(
+    tmp_path, monkeypatch
+) -> None:
+    """Cover lines 473-475: non-ManifestPublicationError during publish_manifest."""
+    store = complete_store()
+
+    def raising_manifest(*_args, **_kwargs):
+        raise RuntimeError("SECRET manifest detail")
+
+    monkeypatch.setattr(r2_corpus_sync, "publish_manifest", raising_manifest)
+
+    outcome, _ = invoke_sync(tmp_path, store)
+
+    assert outcome.exit_code == 2
+    assert outcome.report_path is None
+    assert outcome.errors[0].code == "artifact_write_failed"
+    assert "SECRET" not in repr(outcome)
+
+
+def test_report_publication_restore_failure_removes_attempt_report(tmp_path, monkeypatch) -> None:
+    """Cover lines 531-533: _restore_pointers failure during publication error."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    store = complete_store()
+
+    # Make _publish_latest_report fail to trigger the restore path.
+    def fail_latest_report(*_args, **_kwargs):
+        raise OSError("SECRET report detail")
+
+    # Make _restore_pointers fail to trigger _remove_attempt_report path.
+    def fail_restore(_output_dir: Path, _snapshots) -> None:
+        raise OSError("SECRET restore detail")
+
+    monkeypatch.setattr(r2_corpus_sync, "_publish_latest_report", fail_latest_report)
+    monkeypatch.setattr(r2_corpus_sync, "_restore_pointers", fail_restore)
+
+    outcome, _ = invoke_sync(tmp_path, store)
+
+    assert outcome.exit_code == 2
+    assert outcome.report_path is None
+    assert outcome.errors[0].code == "artifact_write_failed"
+    assert "SECRET" not in repr(outcome)
+
+
+def test_fatal_outcome_publication_restore_failure_returns_fallback(tmp_path, monkeypatch) -> None:
+    """Cover lines 643-645: _restore_pointers_or_report_failure in _fatal_outcome."""
+    store = complete_store()
+
+    # Trigger a fatal outcome by making the cache index invalid.
+    def raising_load(_path: Path):
+        raise ValueError("SECRET invalid cache")
+
+    monkeypatch.setattr(r2_corpus_sync.CacheIndexStore, "load", raising_load)
+
+    # Make the report publication fail in _fatal_outcome to trigger restore.
+    def fail_publish_report(*_args, **_kwargs):
+        raise OSError("SECRET fatal report detail")
+
+    monkeypatch.setattr(r2_corpus_sync, "_publish_report_file", fail_publish_report)
+
+    outcome, _ = invoke_sync(tmp_path, store)
+
+    assert outcome.exit_code == 2
+    assert outcome.report_path is None
+    assert outcome.errors[0].code == "cache_index_invalid"
+    assert "SECRET" not in repr(outcome)
+
+
+def test_report_fallback_outcome_with_primary_error_includes_both_errors() -> None:
+    """Cover line 665: primary_error + artifact_error in _report_fallback_outcome."""
+    tracker = r2_corpus_sync._Progress(lambda _event: None, lambda: 0.0)
+    primary = r2_corpus_sync.SyncError(
+        "configuration", "invalid_config", "Configuration is invalid."
+    )
+    outcome = r2_corpus_sync._report_fallback_outcome(tracker, primary)
+    assert outcome.exit_code == 2
+    assert [e.code for e in outcome.errors] == ["invalid_config", "artifact_write_failed"]
+
+
+def test_output_publication_lock_swallows_flock_unlock_oserror(tmp_path, monkeypatch) -> None:
+    """Cover lines 876-877: flock unlock OSError is swallowed."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    import fcntl
+
+    real_flock = fcntl.flock
+    unlock_calls: list[int] = []
+
+    def failing_flock(fd, operation):
+        if operation == fcntl.LOCK_UN:
+            unlock_calls.append(fd)
+            raise OSError("SECRET unlock detail")
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", failing_flock)
+
+    outcome, _ = invoke_sync(tmp_path, complete_store())
+
+    assert outcome.exit_code == 0
+    assert unlock_calls, "flock unlock should have been attempted"
+
+
+def test_output_publication_lock_swallows_close_oserror(tmp_path, monkeypatch) -> None:
+    """Cover lines 880-881: os.close OSError is swallowed."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    real_close = r2_corpus_sync.os.close
+    real_fstat = r2_corpus_sync.os.fstat
+    lock_path = output_dir / ".r2-corpus-publication.lock"
+    lock_inodes: set[int] = set()
+    real_open = r2_corpus_sync.os.open
+
+    def tracking_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if str(path) == str(lock_path):
+            lock_inodes.add(real_fstat(fd).st_ino)
+        return fd
+
+    def failing_close(fd):
+        try:
+            stat = real_fstat(fd)
+        except OSError:
+            return real_close(fd)
+        if stat.st_ino in lock_inodes:
+            raise OSError("SECRET close detail")
+        return real_close(fd)
+
+    monkeypatch.setattr(r2_corpus_sync.os, "open", tracking_open)
+    monkeypatch.setattr(r2_corpus_sync.os, "close", failing_close)
+
+    outcome, _ = invoke_sync(tmp_path, complete_store())
+
+    assert outcome.exit_code == 0
+
+
+def test_validate_platform_support_rejects_missing_fcntl_attribute(tmp_path, monkeypatch) -> None:
+    """Cover lines 895-896: ImportError/AttributeError in _load_fcntl."""
+    real_import = __import__
+
+    def import_without_fcntl(name, *args, **kwargs):
+        if name == "fcntl":
+            raise ImportError("not available")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", import_without_fcntl)
+
+    with pytest.raises(r2_corpus_sync._SyncFailure) as caught:
+        r2_corpus_sync._validate_platform_support()
+    assert caught.value.error.code == "unsupported_platform"
+
+
+def test_acquire_output_lock_rejects_non_regular_lock_file(tmp_path, monkeypatch) -> None:
+    """Cover line 927: non-regular lock file raises OSError."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    lock_path = output_dir / ".r2-corpus-publication.lock"
+    # Create a FIFO instead of a regular file.
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(lock_path)
+    else:
+        pytest.skip("mkfifo unavailable")
+
+    with pytest.raises(r2_corpus_sync._SyncFailure) as caught:
+        r2_corpus_sync._acquire_output_lock(output_dir)
+    assert caught.value.error.code == "artifact_write_failed"
+
+
+def test_acquire_output_lock_rejects_flock_unsupported_errno(tmp_path, monkeypatch) -> None:
+    """Cover lines 931-938: flock raises unsupported errno."""
+    import errno
+    import fcntl
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    def unsupported_flock(_fd, _operation):
+        raise OSError(errno.ENOTSUP, "private")
+
+    monkeypatch.setattr(fcntl, "flock", unsupported_flock)
+
+    with pytest.raises(r2_corpus_sync._SyncFailure) as caught:
+        r2_corpus_sync._acquire_output_lock(output_dir)
+    assert caught.value.error.code == "unsupported_platform"
+
+
+def test_acquire_output_lock_closes_descriptor_on_oserror(tmp_path, monkeypatch) -> None:
+    """Cover lines 941-947: descriptor cleanup on OSError."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    real_open = r2_corpus_sync.os.open
+
+    def fail_open(path, flags, *args, **kwargs):
+        if str(path).endswith(".r2-corpus-publication.lock"):
+            fd = real_open(path, flags, *args, **kwargs)
+            # Return a valid fd, but make fstat fail to trigger the OSError path.
+            return fd
+        return real_open(path, flags, *args, **kwargs)
+
+    def fail_fstat(_fd):
+        raise OSError("SECRET fstat detail")
+
+    monkeypatch.setattr(r2_corpus_sync.os, "open", fail_open)
+    monkeypatch.setattr(r2_corpus_sync.os, "fstat", fail_fstat)
+
+    with pytest.raises(r2_corpus_sync._SyncFailure) as caught:
+        r2_corpus_sync._acquire_output_lock(output_dir)
+    assert caught.value.error.code == "artifact_write_failed"
+    assert "SECRET" not in str(caught.value)
+
+
+def test_snapshot_pointer_rejects_non_regular_file(tmp_path) -> None:
+    """Cover line 965: non-regular file in _snapshot_pointer."""
+    path = tmp_path / "latest.json"
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(path)
+    else:
+        pytest.skip("mkfifo unavailable")
+
+    with pytest.raises(OSError, match="artifact pointer is unavailable"):
+        r2_corpus_sync._snapshot_pointer(path)
+
+
+def test_snapshot_pointer_rejects_binding_change(tmp_path, monkeypatch) -> None:
+    """Cover line 976: descriptor/path binding mismatch in _snapshot_pointer."""
+    path = tmp_path / "latest.json"
+    path.write_bytes(b'{"data":"latest"}\n')
+
+    real_fstat = r2_corpus_sync.os.fstat
+
+    def shifted_fstat(fd):
+        result = real_fstat(fd)
+        return r2_corpus_sync.os.stat_result(
+            (result.st_mode, result.st_ino + 1, result.st_dev, 0, 0, 0, 0, 0, 0, 0)
+        )
+
+    monkeypatch.setattr(r2_corpus_sync.os, "fstat", shifted_fstat)
+
+    with pytest.raises(OSError, match="artifact pointer is unavailable"):
+        r2_corpus_sync._snapshot_pointer(path)
+
+
+def test_restore_pointers_aggregates_failures(tmp_path, monkeypatch) -> None:
+    """Cover lines 993-996: _restore_pointers collects failures and raises."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    def fail_restore(_path, _content):
+        raise OSError("SECRET restore detail")
+
+    monkeypatch.setattr(r2_corpus_sync, "_restore_pointer", fail_restore)
+
+    snapshots = r2_corpus_sync._PointerSnapshots(latest_manifest=b"x", latest_report=b"y")
+    with pytest.raises(OSError, match="artifact pointer rollback failed"):
+        r2_corpus_sync._restore_pointers(output_dir, snapshots)
+
+
+def test_restore_pointers_or_report_failure_wraps_as_report_write_failure(
+    tmp_path, monkeypatch
+) -> None:
+    """Cover lines 1006-1007: _restore_pointers_or_report_failure wraps exception."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    def fail_restore(_output_dir, _snapshots) -> None:
+        raise OSError("SECRET detail")
+
+    monkeypatch.setattr(r2_corpus_sync, "_restore_pointers", fail_restore)
+
+    primary = r2_corpus_sync.SyncError("artifact", "artifact_write_failed", "primary failure")
+    with pytest.raises(r2_corpus_sync._ReportWriteFailure) as caught:
+        r2_corpus_sync._restore_pointers_or_report_failure(output_dir, None, primary)
+    assert caught.value.primary_error is primary
+
+
+def test_restore_pointer_rejects_non_regular_for_removal(tmp_path) -> None:
+    """Cover lines 1018-1019: non-regular file in _restore_pointer removal path."""
+    path = tmp_path / "latest.json"
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(path)
+    else:
+        pytest.skip("mkfifo unavailable")
+
+    with pytest.raises(OSError, match="artifact pointer is unavailable"):
+        r2_corpus_sync._restore_pointer(path, None)
+
+
+def test_restore_pointer_removes_existing_regular_file(tmp_path) -> None:
+    """Cover lines 1020-1021: regular file is unlinked and directory fsynced."""
+    path = tmp_path / "latest.json"
+    path.write_bytes(b'{"old":"data"}\n')
+
+    r2_corpus_sync._restore_pointer(path, None)
+
+    assert not path.exists()
+
+
+def test_remove_attempt_report_skips_non_regular_file(tmp_path) -> None:
+    """Cover lines 1030-1031: non-regular file is skipped in _remove_attempt_report."""
+    reports_dir = tmp_path / "output" / "reports"
+    reports_dir.mkdir(parents=True)
+    report_path = reports_dir / report_filename(STARTED_AT, RUN_ID)
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(report_path)
+    else:
+        pytest.skip("mkfifo unavailable")
+
+    # Should not raise; non-regular file is skipped.
+    r2_corpus_sync._remove_attempt_report(tmp_path / "output", STARTED_AT, RUN_ID)
+    assert report_path.exists()
+
+
+def test_remove_attempt_report_swallows_unlink_oserror(tmp_path, monkeypatch) -> None:
+    """Cover lines 1035-1036: OSError during unlink is swallowed."""
+    reports_dir = tmp_path / "output" / "reports"
+    reports_dir.mkdir(parents=True)
+    report_path = reports_dir / report_filename(STARTED_AT, RUN_ID)
+    report_path.write_text("{}", encoding="utf-8")
+
+    def fail_unlink(_path, *_args, **_kwargs):
+        raise OSError("SECRET unlink detail")
+
+    monkeypatch.setattr(r2_corpus_sync.Path, "unlink", fail_unlink)
+
+    # Should not raise; OSError is swallowed.
+    r2_corpus_sync._remove_attempt_report(tmp_path / "output", STARTED_AT, RUN_ID)
+
+
+def test_atomic_replace_bytes_cleanup_failure_sets_cleanup_flag(tmp_path, monkeypatch) -> None:
+    """Cover lines 1058-1061: temporary file cleanup failure sets cleanup_failed."""
+    path = tmp_path / "output" / "target.json"
+    path.parent.mkdir(parents=True)
+
+    def fail_unlink(_self, missing_ok=False):
+        raise OSError("SECRET unlink detail")
+
+    # Make os.replace fail so the temporary file needs cleanup.
+    monkeypatch.setattr(
+        r2_corpus_sync.os,
+        "replace",
+        lambda *_: (_ for _ in ()).throw(OSError("SECRET replace detail")),
+    )
+    monkeypatch.setattr(r2_corpus_sync.Path, "unlink", fail_unlink)
+
+    with pytest.raises(OSError, match="artifact publication failed"):
+        r2_corpus_sync._atomic_replace_bytes(path, b'{"data":"new"}\n')
+
+
+def test_adapter_error_assigns_object_scope_for_keyed_metadata() -> None:
+    """Cover line 1077: object scope for keyed object_metadata_invalid."""
+    error = r2_corpus_sync.R2StoreError("object_metadata_invalid", "private detail", "42/chart.dtx")
+    sync_error = r2_corpus_sync._adapter_error(error)
+    assert sync_error.scope == "object"
+    assert sync_error.code == "object_metadata_invalid"
+
+
+def test_adapter_error_assigns_root_scope_for_unkeyable_listing() -> None:
+    """Cover line 1087: root scope for root_list_failed."""
+    error = r2_corpus_sync.R2StoreError("root_list_failed", "private detail", None)
+    sync_error = r2_corpus_sync._adapter_error(error)
+    assert sync_error.scope == "root"
+
+
+def test_lock_error_code_returns_unsupported_platform() -> None:
+    """Cover line 1097: unsupported_platform lock error code."""
+    error = RuntimeError("unsupported_platform")
+    assert r2_corpus_sync._lock_error_code(error) == "unsupported_platform"
+
+
+def test_lock_error_code_returns_cache_lock_failed() -> None:
+    """Cover line 1099-1100: cache_lock_failed and fallback to artifact_write_failed."""
+    error = RuntimeError("cache_lock_failed")
+    assert r2_corpus_sync._lock_error_code(error) == "cache_lock_failed"
+    unknown = RuntimeError("unknown detail")
+    assert r2_corpus_sync._lock_error_code(unknown) == "artifact_write_failed"
+
+
+def test_validate_request_paths_rejects_non_path_output_dir(tmp_path) -> None:
+    """Cover line 1119: non-Path output_dir raises ValueError."""
+    request = SyncRequest("not-a-path", tmp_path / "cache", None)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="pathlib paths"):
+        r2_corpus_sync._validate_request_paths(request)
+
+
+def test_validate_request_paths_rejects_non_path_provenance(tmp_path) -> None:
+    """Cover line 1122: non-Path provenance_file raises ValueError."""
+    request = SyncRequest(tmp_path / "output", tmp_path / "cache", "not-a-path")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="pathlib path"):
+        r2_corpus_sync._validate_request_paths(request)
+
+
+def test_validate_directory_components_rejects_parent_traversal() -> None:
+    """Cover line 1127: parent traversal in path raises ValueError."""
+    path = Path("/safe/../escape")
+    with pytest.raises(ValueError, match="parent traversal"):
+        r2_corpus_sync._validate_directory_components(path)
+
+
+def test_validate_directory_components_rejects_oserror_on_lstat(tmp_path, monkeypatch) -> None:
+    """Cover lines 1136-1137: OSError during lstat raises ValueError."""
+    path = tmp_path / "subdir"
+    real_lstat = r2_corpus_sync.Path.lstat
+
+    def fail_lstat(self):
+        if str(self) == str(path):
+            raise OSError("SECRET lstat detail")
+        return real_lstat(self)
+
+    monkeypatch.setattr(r2_corpus_sync.Path, "lstat", fail_lstat)
+
+    with pytest.raises(ValueError, match="artifact path is unavailable"):
+        r2_corpus_sync._validate_directory_components(path)
+
+
+def test_validate_run_id_rejects_non_string() -> None:
+    """Cover line 1144: non-string run_id raises ValueError."""
+    with pytest.raises(ValueError, match="canonical UUID4"):
+        r2_corpus_sync._validate_run_id(12345)  # type: ignore[arg-type]
+
+
+def test_acquire_output_lock_reraises_non_unsupported_flock_oserror(tmp_path, monkeypatch) -> None:
+    """Cover line 939: non-unsupported flock errno is re-raised as _SyncFailure."""
+    import errno
+    import fcntl
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    def flock_with_eacces(_fd, _operation):
+        raise OSError(errno.EACCES, "private flock detail")
+
+    monkeypatch.setattr(fcntl, "flock", flock_with_eacces)
+
+    with pytest.raises(r2_corpus_sync._SyncFailure) as caught:
+        r2_corpus_sync._acquire_output_lock(output_dir)
+    assert caught.value.error.code == "artifact_write_failed"
+    assert "private" not in str(caught.value)
+
+
+def test_safe_error_assigns_root_scope_for_root_list_failed() -> None:
+    """Cover line 1087: root scope for root_list_failed in _safe_error."""
+    error = r2_corpus_sync._safe_error("root_list_failed")
+    assert error.scope == "root"
+    assert error.code == "root_list_failed"

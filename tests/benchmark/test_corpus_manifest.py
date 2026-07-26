@@ -890,3 +890,160 @@ def test_reversed_equivalent_error_inputs_render_byte_identically() -> None:
 
     assert first_rendered.content == second_rendered.content
     assert first_rendered.corpus_version == second_rendered.corpus_version
+
+
+def test_publish_manifest_wraps_durable_directory_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    unsafe = "unsafe raw endpoint https://account-id.example"
+
+    def failed_ensure(path: Path) -> None:
+        del path
+        raise RuntimeError(unsafe)
+
+    monkeypatch.setattr(corpus_manifest, "ensure_durable_directory", failed_ensure)
+
+    with pytest.raises(ManifestPublicationError) as raised:
+        publish_manifest(tmp_path, render_fixture())
+
+    assert raised.value.error.code == "artifact_write_failed"
+    assert unsafe not in str(raised.value)
+
+
+class _BrokenTzDatetime(datetime):
+    """Datetime subclass whose utcoffset() raises to exercise the except branch."""
+
+    def utcoffset(self, *args, **kwargs):
+        raise RuntimeError("boom")
+
+
+def test_publish_latest_wraps_utcoffset_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    published = publish_manifest(tmp_path, render_fixture())
+    latest_path = tmp_path / "latest.json"
+    latest_path.write_bytes(b'{"existing":true}\n')
+
+    broken = _BrokenTzDatetime(2026, 7, 25, 1, 2, 3, tzinfo=timezone.utc)
+
+    with pytest.raises(ManifestPublicationError) as raised:
+        publish_latest_manifest(tmp_path, published, "complete", broken)
+
+    assert raised.value.error.code == "artifact_write_failed"
+    assert latest_path.read_bytes() == b'{"existing":true}\n'
+
+
+def test_publish_latest_wraps_format_timestamp_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    published = publish_manifest(tmp_path, render_fixture())
+    latest_path = tmp_path / "latest.json"
+    latest_path.write_bytes(b'{"existing":true}\n')
+
+    unsafe = "unsafe signed query X-Amz-Signature=secret"
+
+    def failed_format(value: datetime) -> str:
+        del value
+        raise RuntimeError(unsafe)
+
+    monkeypatch.setattr(corpus_manifest, "format_manifest_timestamp", failed_format)
+
+    with pytest.raises(ManifestPublicationError) as raised:
+        publish_latest_manifest(tmp_path, published, "complete", FIXED_TIME)
+
+    assert raised.value.error.code == "artifact_write_failed"
+    assert unsafe not in str(raised.value)
+    assert latest_path.read_bytes() == b'{"existing":true}\n'
+
+
+def test_publish_latest_cleanup_failure_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    published = publish_manifest(tmp_path, render_fixture())
+    latest_path = tmp_path / "latest.json"
+    latest_path.write_bytes(b'{"existing":true}\n')
+
+    def failed_replace(source: Path, destination: Path) -> None:
+        del source, destination
+        raise OSError("replace failed")
+
+    def failed_unlink(self: Path, missing_ok: bool = False) -> None:
+        del self, missing_ok
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(corpus_manifest.os, "replace", failed_replace)
+    monkeypatch.setattr(Path, "unlink", failed_unlink)
+
+    with pytest.raises(ManifestPublicationError) as raised:
+        publish_latest_manifest(tmp_path, published, "complete", FIXED_TIME)
+
+    assert raised.value.error.code == "artifact_write_failed"
+    assert latest_path.read_bytes() == b'{"existing":true}\n'
+
+
+def test_publish_manifest_rejects_destination_when_no_follow_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    rendered = render_fixture()
+    version_path = tmp_path / "manifests" / f"{rendered.manifest_sha256}.jsonl"
+    version_path.parent.mkdir(parents=True)
+    version_path.write_bytes(rendered.content)
+
+    # Bypass the durability helpers (which also rely on O_NOFOLLOW) so the
+    # missing flag is first encountered inside _regular_file_open_flags.
+    monkeypatch.setattr(corpus_manifest, "ensure_durable_directory", lambda _p: None)
+    monkeypatch.setattr(corpus_manifest, "fsync_directory", lambda _p: None)
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+
+    with pytest.raises(ManifestPublicationError) as raised:
+        publish_manifest(tmp_path, rendered)
+
+    assert raised.value.error.code == "artifact_write_failed"
+
+
+def test_publish_manifest_rejects_destination_when_nonblock_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    rendered = render_fixture()
+    version_path = tmp_path / "manifests" / f"{rendered.manifest_sha256}.jsonl"
+    version_path.parent.mkdir(parents=True)
+    version_path.write_bytes(rendered.content)
+
+    monkeypatch.setattr(corpus_manifest, "ensure_durable_directory", lambda _p: None)
+    monkeypatch.setattr(corpus_manifest, "fsync_directory", lambda _p: None)
+    monkeypatch.delattr(os, "O_NONBLOCK", raising=False)
+
+    with pytest.raises(ManifestPublicationError) as raised:
+        publish_manifest(tmp_path, rendered)
+
+    assert raised.value.error.code == "artifact_write_failed"
+
+
+def test_publish_manifest_rejects_destination_whose_binding_changed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    rendered = render_fixture()
+    version_path = tmp_path / "manifests" / f"{rendered.manifest_sha256}.jsonl"
+    version_path.parent.mkdir(parents=True)
+    version_path.write_bytes(rendered.content)
+
+    real_stat = Path.stat
+
+    def shifted_stat(self: Path, follow_symlinks: bool = True) -> os.stat_result:
+        if not follow_symlinks and self == version_path:
+            return os.stat_result((0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        return real_stat(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", shifted_stat)
+
+    with pytest.raises(ManifestPublicationError) as raised:
+        publish_manifest(tmp_path, rendered)
+
+    assert raised.value.error.code == "artifact_write_failed"
