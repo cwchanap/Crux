@@ -28,6 +28,7 @@ from src.benchmark.corpus_manifest import (
     render_manifest,
 )
 from src.benchmark.corpus_provenance import load_provenance
+from src.benchmark.durability import ensure_durable_directory, fsync_directory
 from src.benchmark.r2_corpus_models import (
     CACHE_PROFILE,
     REPORT_SCHEMA,
@@ -80,6 +81,7 @@ _SAFE_MESSAGES: dict[ErrorCode, str] = {
     "bucket_inaccessible": "The configured R2 bucket is inaccessible.",
     "root_list_failed": "R2 root listing did not complete.",
     "cache_locked": "Another synchronization writer holds the cache lock.",
+    "cache_lock_failed": "The cache writer lock could not be acquired.",
     "cache_index_invalid": "The cache index is malformed or unsupported.",
     "unsupported_platform": "Required POSIX locking or durability support is unavailable.",
     "provenance_invalid": "The provenance document is malformed or unsupported.",
@@ -116,6 +118,7 @@ _CACHE_MISS_REASONS = (
     "missing",
     "size_mismatch",
     "sha256_mismatch",
+    "unreadable",
 )
 _OUTPUT_LOCK_FILENAME = ".r2-corpus-publication.lock"
 _publication_lock = Lock()
@@ -720,7 +723,9 @@ def _build_report(
         "ambiguous_prefixes": (
             {
                 str(simfile_id): list(prefixes)
-                for simfile_id, prefixes in sorted(inventory.ambiguous_prefixes.items())
+                for simfile_id, prefixes in sorted(
+                    inventory.ambiguous_prefixes.items(), key=lambda item: str(item[0])
+                )
             }
             if inventory is not None
             else {}
@@ -815,9 +820,9 @@ def _publish_report_file(
     run_id: str,
     report: dict[str, object],
 ) -> tuple[Path, str, str]:
-    _ensure_durable_directory(output_dir)
+    ensure_durable_directory(output_dir)
     reports_dir = output_dir / "reports"
-    _ensure_durable_directory(reports_dir)
+    ensure_durable_directory(reports_dir)
     filename = report_filename(started_at, run_id)
     report_path = reports_dir / filename
     content = canonical_json_line(report)
@@ -849,7 +854,7 @@ def _publish_latest_report(
 @contextmanager
 def _output_publication_lock(output_dir: Path):
     with _publication_lock:
-        _ensure_durable_directory(output_dir)
+        ensure_durable_directory(output_dir)
         descriptor, flock, unlock_operation = _acquire_output_lock(output_dir)
         try:
             yield
@@ -908,7 +913,7 @@ def _acquire_output_lock(output_dir: Path):
             or descriptor_metadata.st_ino != path_metadata.st_ino
         ):
             raise OSError("publication lock is unavailable")
-        _fsync_directory(output_dir)
+        fsync_directory(output_dir)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
         except OSError as error:
@@ -1001,7 +1006,7 @@ def _restore_pointer(path: Path, previous_content: bytes | None) -> None:
     if not stat.S_ISREG(metadata.st_mode):
         raise OSError("artifact pointer is unavailable")
     path.unlink()
-    _fsync_directory(path.parent)
+    fsync_directory(path.parent)
 
 
 def _remove_attempt_report(output_dir: Path, started_at: datetime, run_id: str) -> None:
@@ -1014,7 +1019,7 @@ def _remove_attempt_report(output_dir: Path, started_at: datetime, run_id: str) 
         return
     try:
         path.unlink()
-        _fsync_directory(path.parent)
+        fsync_directory(path.parent)
     except OSError:
         return
 
@@ -1032,7 +1037,7 @@ def _atomic_replace_bytes(path: Path, content: bytes) -> None:
             os.fsync(temporary.fileno())
         os.replace(temporary_path, path)
         temporary_exists = False
-        _fsync_directory(path.parent)
+        fsync_directory(path.parent)
         completed = True
     except Exception:
         completed = False
@@ -1044,46 +1049,6 @@ def _atomic_replace_bytes(path: Path, content: bytes) -> None:
                 cleanup_failed = True
     if not completed or cleanup_failed:
         raise OSError("artifact publication failed")
-
-
-def _ensure_durable_directory(path: Path) -> None:
-    missing: list[Path] = []
-    candidate = path
-    while True:
-        try:
-            metadata = candidate.lstat()
-        except FileNotFoundError:
-            missing.append(candidate)
-            parent = candidate.parent
-            if parent == candidate:
-                raise OSError("artifact directory ancestor is unavailable")
-            candidate = parent
-            continue
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise OSError("artifact directory path is unavailable")
-        break
-    for directory in reversed(missing):
-        try:
-            directory.mkdir()
-        except FileExistsError:
-            metadata = directory.lstat()
-            if not stat.S_ISDIR(metadata.st_mode):
-                raise OSError("artifact directory path is unavailable") from None
-        _fsync_directory(directory.parent)
-
-
-def _fsync_directory(path: Path) -> None:
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    directory = getattr(os, "O_DIRECTORY", None)
-    if no_follow is None or directory is None:
-        raise OSError("directory durability support is unavailable")
-    descriptor = os.open(path, os.O_RDONLY | no_follow | directory)
-    try:
-        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
-            raise OSError("artifact directory is unavailable")
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _adapter_error(error: R2StoreError) -> SyncError:
@@ -1110,6 +1075,8 @@ def _lock_error_code(error: RuntimeError) -> ErrorCode:
         return "cache_locked"
     if error.args == ("unsupported_platform",):
         return "unsupported_platform"
+    if error.args == ("cache_lock_failed",):
+        return "cache_lock_failed"
     return "artifact_write_failed"
 
 

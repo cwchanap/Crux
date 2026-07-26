@@ -23,6 +23,7 @@ ErrorCode = Literal[
     "bucket_inaccessible",
     "root_list_failed",
     "cache_locked",
+    "cache_lock_failed",
     "cache_index_invalid",
     "unsupported_platform",
     "provenance_invalid",
@@ -43,7 +44,9 @@ CacheStatus = Literal["not_selected", "verified", "failed"]
 SimfileStatus = Literal["complete", "partial", "failed", "empty"]
 OverallStatus = Literal["complete", "partial", "failed", "dry_run_complete", "dry_run_partial"]
 CacheActionName = Literal["planned", "cache_hit", "downloaded", "failed"]
-CacheMissReason = Literal["remote_changed", "missing", "size_mismatch", "sha256_mismatch"]
+CacheMissReason = Literal[
+    "remote_changed", "missing", "size_mismatch", "sha256_mismatch", "unreadable"
+]
 
 
 @dataclass(frozen=True)
@@ -162,6 +165,16 @@ def format_manifest_timestamp(value: datetime) -> str:
 
 
 def format_report_filename_timestamp(value: datetime) -> str:
+    try:
+        is_aware = (
+            isinstance(value, datetime)
+            and value.tzinfo is not None
+            and value.utcoffset() is not None
+        )
+    except Exception:
+        is_aware = False
+    if not is_aware:
+        raise ValueError("timestamp must be timezone-aware")
     return value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
 
 

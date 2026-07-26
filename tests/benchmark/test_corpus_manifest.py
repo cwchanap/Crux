@@ -10,6 +10,7 @@ from threading import Thread
 import pytest
 
 import src.benchmark.corpus_manifest as corpus_manifest
+import src.benchmark.durability as durability
 from src.benchmark.corpus_manifest import (
     ManifestPublicationError,
     build_manifest_rows,
@@ -652,13 +653,14 @@ def test_fresh_multilevel_output_tree_fsyncs_every_created_child_attachment(
 ) -> None:
     output_dir = tmp_path / "level-one" / "level-two" / "output"
     fsynced: list[Path] = []
-    real_fsync_directory = corpus_manifest._fsync_directory
+    real_fsync_directory = durability.fsync_directory
 
     def tracked_fsync_directory(path: Path) -> None:
         fsynced.append(path)
         real_fsync_directory(path)
 
-    monkeypatch.setattr(corpus_manifest, "_fsync_directory", tracked_fsync_directory)
+    monkeypatch.setattr(durability, "fsync_directory", tracked_fsync_directory)
+    monkeypatch.setattr(corpus_manifest, "fsync_directory", tracked_fsync_directory)
 
     publish_manifest(output_dir, render_fixture())
 
@@ -678,7 +680,7 @@ def test_latest_pointer_replacement_happens_after_manifest_directory_is_durable(
 ) -> None:
     events: list[tuple[str, Path]] = []
     real_replace = os.replace
-    real_fsync_directory = corpus_manifest._fsync_directory
+    real_fsync_directory = durability.fsync_directory
 
     def tracked_replace(source: Path, destination: Path) -> None:
         events.append(("replace", Path(destination)))
@@ -689,7 +691,8 @@ def test_latest_pointer_replacement_happens_after_manifest_directory_is_durable(
         real_fsync_directory(path)
 
     monkeypatch.setattr(corpus_manifest.os, "replace", tracked_replace)
-    monkeypatch.setattr(corpus_manifest, "_fsync_directory", tracked_fsync_directory)
+    monkeypatch.setattr(durability, "fsync_directory", tracked_fsync_directory)
+    monkeypatch.setattr(corpus_manifest, "fsync_directory", tracked_fsync_directory)
     published = publish_manifest(tmp_path, render_fixture())
     publish_latest_manifest(tmp_path, published, "complete", FIXED_TIME)
 

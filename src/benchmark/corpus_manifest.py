@@ -12,6 +12,7 @@ from typing import Literal
 from uuid import uuid4
 
 from src.benchmark.corpus_provenance import provenance_for
+from src.benchmark.durability import ensure_durable_directory, fsync_directory
 from src.benchmark.r2_corpus_models import (
     CACHE_PROFILE,
     MANIFEST_SCHEMA,
@@ -91,10 +92,10 @@ def publish_manifest(
     rendered: RenderedManifest,
 ) -> PublishedManifest:
     try:
-        _ensure_durable_directory(output_dir)
+        ensure_durable_directory(output_dir)
         manifests_dir = output_dir / "manifests"
-        _ensure_durable_directory(manifests_dir)
-        _fsync_directory(manifests_dir)
+        ensure_durable_directory(manifests_dir)
+        fsync_directory(manifests_dir)
         manifest_path = manifests_dir / f"{rendered.manifest_sha256}.jsonl"
         _publish_immutable(manifest_path, rendered.content, rendered.manifest_sha256)
         return PublishedManifest(
@@ -260,7 +261,7 @@ def _verify_existing_manifest(path: Path, expected_content: bytes) -> None:
     finally:
         if descriptor is not None:
             os.close(descriptor)
-    _fsync_directory(path.parent)
+    fsync_directory(path.parent)
 
 
 def _atomic_replace_json(path: Path, payload: dict[str, object]) -> None:
@@ -278,7 +279,7 @@ def _atomic_replace_json(path: Path, payload: dict[str, object]) -> None:
             os.fsync(temporary.fileno())
         os.replace(temporary_path, path)
         temporary_exists = False
-        _fsync_directory(path.parent)
+        fsync_directory(path.parent)
         completed = True
     except Exception:
         completed = False
@@ -290,43 +291,6 @@ def _atomic_replace_json(path: Path, payload: dict[str, object]) -> None:
                 cleanup_failed = True
     if not completed or cleanup_failed:
         raise ManifestPublicationError(_PUBLICATION_ERROR) from None
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, _directory_open_flags())
-    try:
-        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
-            raise OSError("manifest directory is unavailable")
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _ensure_durable_directory(path: Path) -> None:
-    missing: list[Path] = []
-    candidate = path
-    while True:
-        try:
-            metadata = candidate.lstat()
-        except FileNotFoundError:
-            missing.append(candidate)
-            parent = candidate.parent
-            if parent == candidate:
-                raise OSError("manifest directory ancestor is unavailable")
-            candidate = parent
-            continue
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise OSError("manifest directory path is not a directory")
-        break
-
-    for directory in reversed(missing):
-        try:
-            directory.mkdir()
-        except FileExistsError:
-            metadata = directory.lstat()
-            if not stat.S_ISDIR(metadata.st_mode):
-                raise OSError("manifest directory path is not a directory") from None
-        _fsync_directory(directory.parent)
 
 
 def _path_exists_no_follow(path: Path) -> bool:
@@ -345,14 +309,6 @@ def _regular_file_open_flags() -> int:
     if non_block is None:
         raise OSError("non-blocking file descriptors are unavailable")
     return os.O_RDONLY | no_follow | non_block
-
-
-def _directory_open_flags() -> int:
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    directory = getattr(os, "O_DIRECTORY", None)
-    if no_follow is None or directory is None:
-        raise OSError("no-follow directory descriptors are unavailable")
-    return os.O_RDONLY | no_follow | directory
 
 
 def _read_descriptor(descriptor: int) -> bytes:

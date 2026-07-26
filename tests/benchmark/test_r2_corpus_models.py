@@ -143,6 +143,13 @@ def test_manifest_timestamp_rejects_naive_values_instead_of_using_host_timezone(
         format_manifest_timestamp(naive)
 
 
+def test_report_filename_timestamp_rejects_naive_values_instead_of_using_host_timezone():
+    naive = datetime(2026, 7, 25, 1, 2, 3, 120000)
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        format_report_filename_timestamp(naive)
+
+
 def test_fixed_contract_constants_are_stable():
     assert CACHE_PROFILE == "setdef_dtx_txt_v1"
     assert MAX_SIMFILE_ID == 9_007_199_254_740_991
