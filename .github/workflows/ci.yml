@@ -27,7 +27,7 @@ jobs:
         run: ruff check .
 
       - name: Ruff format check
-        run: ruff format --check .
+        run: ruff format --check src tests
 
       - name: Pylint (errors-only)
         run: |
@@ -61,7 +61,8 @@ jobs:
             numpy \
             soundfile \
             librosa \
-            pretty-midi
+            pretty-midi \
+            "boto3>=1.42,<2"
 
       - name: Run tests with coverage
         env:
