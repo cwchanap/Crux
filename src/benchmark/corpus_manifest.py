@@ -339,9 +339,12 @@ def _path_exists_no_follow(path: Path) -> bool:
 
 def _regular_file_open_flags() -> int:
     no_follow = getattr(os, "O_NOFOLLOW", None)
+    non_block = getattr(os, "O_NONBLOCK", None)
     if no_follow is None:
         raise OSError("no-follow file descriptors are unavailable")
-    return os.O_RDONLY | no_follow
+    if non_block is None:
+        raise OSError("non-blocking file descriptors are unavailable")
+    return os.O_RDONLY | no_follow | non_block
 
 
 def _directory_open_flags() -> int:

@@ -385,10 +385,12 @@ class Boto3R2Store:
         try:
             body, download = self._parse_download(response, key)
         except R2StoreError as error:
+            _close_response_body(response)
             if error.code == "object_metadata_invalid" and error.object_key is None:
                 raise self._metadata_error(key) from None
             raise
         except (KeyError, TypeError, ValueError):
+            _close_response_body(response)
             raise self._metadata_error(key) from None
         try:
             yield download
@@ -510,6 +512,19 @@ class _SanitizedObjectBody:
             raise self._store._map_sdk_error(error, "object_get_failed", self._object_key) from None
 
 
+def _close_response_body(response: Any) -> None:
+    if not isinstance(response, dict):
+        return
+    body = response.get("Body")
+    close = getattr(body, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception:
+        pass
+
+
 def create_boto3_store(config: R2Config) -> Boto3R2Store:
     dependencies = ensure_r2_dependency()
     _suppress_sdk_loggers()
@@ -520,12 +535,15 @@ def create_boto3_store(config: R2Config) -> Boto3R2Store:
         retries={"mode": "standard", "total_max_attempts": config.max_attempts},
         max_pool_connections=max(16, config.head_concurrency + config.download_concurrency),
     )
-    client = dependencies.boto3.client(
-        "s3",
-        endpoint_url=config.endpoint_url,
-        region_name=config.region_name,
-        config=client_config,
-    )
+    try:
+        client = dependencies.boto3.client(
+            "s3",
+            endpoint_url=config.endpoint_url,
+            region_name=config.region_name,
+            config=client_config,
+        )
+    except (dependencies.no_credentials_error, dependencies.partial_credentials_error):
+        raise R2StoreError("missing_credentials", _MESSAGES["missing_credentials"]) from None
     return Boto3R2Store(client, config.bucket)
 
 

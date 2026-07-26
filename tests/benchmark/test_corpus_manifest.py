@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
+from threading import Thread
 
 import pytest
 
@@ -482,6 +483,35 @@ def test_publish_manifest_rejects_a_non_regular_destination(tmp_path: Path) -> N
 
     assert raised.value.error.code == "artifact_write_failed"
     assert version_path.is_dir()
+
+
+def test_publish_manifest_rejects_a_fifo_destination_without_blocking(
+    tmp_path: Path,
+) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("mkfifo is unavailable on this platform")
+
+    rendered = render_fixture()
+    version_path = tmp_path / "manifests" / f"{rendered.manifest_sha256}.jsonl"
+    version_path.parent.mkdir(parents=True)
+    os.mkfifo(version_path)
+
+    result: dict[str, object] = {}
+
+    def publish() -> None:
+        try:
+            publish_manifest(tmp_path, rendered)
+        except ManifestPublicationError as error:
+            result["error"] = error
+
+    worker = Thread(target=publish, daemon=True)
+    worker.start()
+    worker.join(timeout=5.0)
+    assert not worker.is_alive(), "publish_manifest hung opening a FIFO destination"
+    error = result.get("error")
+    assert isinstance(error, ManifestPublicationError)
+    assert error.error.code == "artifact_write_failed"
+    assert stat.S_ISFIFO(os.stat(version_path, follow_symlinks=False).st_mode)
 
 
 def test_publish_manifest_rejects_content_that_does_not_match_rendered_hash(

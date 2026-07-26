@@ -957,9 +957,12 @@ def _same_inode(first: os.stat_result, second: os.stat_result) -> bool:
 
 def _open_regular_file_at(parent_fd: int, name: str) -> int:
     no_follow = getattr(os, "O_NOFOLLOW", None)
+    non_block = getattr(os, "O_NONBLOCK", None)
     if no_follow is None:
         raise OSError(ENOTSUP, "no-follow file descriptors are unavailable")
-    descriptor = os.open(name, os.O_RDONLY | no_follow, dir_fd=parent_fd)
+    if non_block is None:
+        raise OSError(ENOTSUP, "non-blocking file descriptors are unavailable")
+    descriptor = os.open(name, os.O_RDONLY | no_follow | non_block, dir_fd=parent_fd)
     if not stat.S_ISREG(os.fstat(descriptor).st_mode):
         os.close(descriptor)
         raise OSError("cache content body is not a regular file")

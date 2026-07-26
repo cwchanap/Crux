@@ -470,6 +470,119 @@ def test_missing_r2_dependency_has_closed_install_hint(monkeypatch):
     )
 
 
+def test_factory_maps_partial_credentials_to_missing_credentials(monkeypatch):
+    import boto3
+    from botocore.exceptions import PartialCredentialsError
+
+    def raise_partial_credentials(service_name, **kwargs):
+        raise PartialCredentialsError(provider="env", cred_var="aws_access_key_id")
+
+    monkeypatch.setattr(boto3, "client", raise_partial_credentials)
+
+    config = R2Config(
+        endpoint_url="https://account.r2.cloudflarestorage.com",
+        source_endpoint_sha256="x",
+        bucket="simfile-dtx",
+        head_concurrency=12,
+        download_concurrency=8,
+        connect_timeout_seconds=7,
+        read_timeout_seconds=31,
+        max_attempts=6,
+    )
+
+    assert_store_error(
+        lambda: create_boto3_store(config),
+        "missing_credentials",
+        "No usable R2 credentials were resolved.",
+    )
+
+
+def test_factory_maps_no_credentials_to_missing_credentials(monkeypatch):
+    import boto3
+    from botocore.exceptions import NoCredentialsError
+
+    def raise_no_credentials(service_name, **kwargs):
+        raise NoCredentialsError()
+
+    monkeypatch.setattr(boto3, "client", raise_no_credentials)
+
+    config = R2Config(
+        endpoint_url="https://account.r2.cloudflarestorage.com",
+        source_endpoint_sha256="x",
+        bucket="simfile-dtx",
+        head_concurrency=12,
+        download_concurrency=8,
+        connect_timeout_seconds=7,
+        read_timeout_seconds=31,
+        max_attempts=6,
+    )
+
+    assert_store_error(
+        lambda: create_boto3_store(config),
+        "missing_credentials",
+        "No usable R2 credentials were resolved.",
+    )
+
+
+def test_open_object_closes_response_body_when_download_metadata_is_malformed():
+    closed = {"count": 0}
+
+    class TrackingBody(BytesIO):
+        def close(self):
+            closed["count"] += 1
+            super().close()
+
+    class MalformedDownloadClient(FakeClient):
+        def get_object(self, **kwargs):
+            # Body present but LastModified is naive -> _parse_download rejects
+            # after extracting the body, so the body must still be closed.
+            return {
+                "Body": TrackingBody(b"chart"),
+                "ContentLength": 5,
+                "ETag": '"etag-2"',
+                "LastModified": datetime(2026, 7, 25),
+            }
+
+    store = Boto3R2Store(MalformedDownloadClient(), "simfile-dtx")
+    assert_store_error(
+        lambda: store.open_object("42/SET.DEF", None).__enter__(),
+        "object_metadata_invalid",
+        "Object metadata is invalid.",
+        "42/SET.DEF",
+    )
+    assert closed["count"] == 1
+
+
+def test_open_object_closes_response_body_when_etag_is_malformed():
+    closed = {"count": 0}
+
+    class TrackingBody(BytesIO):
+        def close(self):
+            closed["count"] += 1
+            super().close()
+
+    class MalformedEtagClient(FakeClient):
+        def get_object(self, **kwargs):
+            # Body present but ETag is non-string -> _parse_download extracts
+            # the body then rejects on the malformed ETag, so the body must
+            # still be closed.
+            return {
+                "Body": TrackingBody(b"chart"),
+                "ContentLength": 5,
+                "ETag": 42,
+                "LastModified": datetime(2026, 7, 25, tzinfo=timezone.utc),
+            }
+
+    store = Boto3R2Store(MalformedEtagClient(), "simfile-dtx")
+    assert_store_error(
+        lambda: store.open_object("42/SET.DEF", None).__enter__(),
+        "object_metadata_invalid",
+        "Object metadata is invalid.",
+        "42/SET.DEF",
+    )
+    assert closed["count"] == 1
+
+
 def listed(key: str, size: int = 5) -> ListedObject:
     return ListedObject(
         key=key,
