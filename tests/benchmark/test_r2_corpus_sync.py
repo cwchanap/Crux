@@ -943,6 +943,26 @@ def test_secrets_urls_headers_and_raw_adapter_messages_are_not_serialized(tmp_pa
     assert "https://evil.invalid" not in serialized
 
 
+def test_unkeyable_listing_entry_is_reported_as_root_scope(tmp_path):
+    store = complete_store()
+    store.errors[("list", None)] = R2StoreError(
+        "object_metadata_invalid", "Object metadata is invalid.", None
+    )
+
+    outcome, _ = invoke_sync(tmp_path, store, dry_run=True)
+
+    assert outcome.exit_code == 2
+    report = read_report(outcome.report_path)
+    assert report["errors"] == [
+        {
+            "scope": "root",
+            "code": "object_metadata_invalid",
+            "object_key": None,
+            "message": "Object metadata is invalid.",
+        }
+    ]
+
+
 def test_progress_emits_phase_entries_and_count_throttled_metadata_updates(tmp_path):
     store = store_from_bodies({f"2/file-{index:03}.bin": b"x" for index in range(201)})
 
