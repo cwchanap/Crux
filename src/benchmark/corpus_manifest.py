@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import stat
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, Mapping
+from typing import Literal
 from uuid import uuid4
 
 from src.benchmark.corpus_provenance import provenance_for
@@ -28,6 +30,7 @@ _PUBLICATION_ERROR = SyncError(
     "artifact_write_failed",
     "A required manifest artifact write failed.",
 )
+_logger = logging.getLogger(__name__)
 
 
 class ManifestPublicationError(Exception):
@@ -223,14 +226,20 @@ def _publish_immutable(path: Path, content: bytes, expected_sha256: str) -> None
             temporary_exists = False
             _verify_existing_manifest(path, content)
             completed = True
-    except Exception:
+    except Exception as original_error:
         completed = False
+        _logger.debug("immutable manifest publication failed for %s", path, exc_info=original_error)
     finally:
         if temporary_exists and temporary_path is not None:
             try:
                 temporary_path.unlink(missing_ok=True)
-            except Exception:
+            except Exception as cleanup_error:
                 cleanup_failed = True
+                _logger.debug(
+                    "immutable manifest cleanup failed for %s",
+                    temporary_path,
+                    exc_info=cleanup_error,
+                )
     if not completed or cleanup_failed:
         raise ManifestPublicationError(_PUBLICATION_ERROR) from None
 

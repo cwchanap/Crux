@@ -392,7 +392,13 @@ class Boto3R2Store:
             raise self._metadata_error(key) from None
         try:
             yield download
-        finally:
+        except BaseException:
+            try:
+                body.close()
+            except Exception:
+                pass
+            raise
+        else:
             try:
                 body.close()
             except Exception as error:
@@ -517,7 +523,7 @@ def create_boto3_store(config: R2Config) -> Boto3R2Store:
     client = dependencies.boto3.client(
         "s3",
         endpoint_url=config.endpoint_url,
-        region_name="auto",
+        region_name=config.region_name,
         config=client_config,
     )
     return Boto3R2Store(client, config.bucket)

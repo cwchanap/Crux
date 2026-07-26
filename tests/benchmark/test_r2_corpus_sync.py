@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import os
 import stat
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -1547,7 +1548,7 @@ def process_sync_worker(
 
 
 def test_two_process_real_runs_publish_as_one_serialized_unit(tmp_path):
-    context = multiprocessing.get_context("fork")
+    context = multiprocessing.get_context("fork" if sys.platform != "win32" else "spawn")
     output_dir = tmp_path / "output"
     reached_publication = context.Event()
     release_publication = context.Event()
@@ -1617,7 +1618,7 @@ def test_two_process_real_runs_publish_as_one_serialized_unit(tmp_path):
 
 
 def test_two_process_dry_run_waits_for_real_publication_then_moves_only_report(tmp_path):
-    context = multiprocessing.get_context("fork")
+    context = multiprocessing.get_context("fork" if sys.platform != "win32" else "spawn")
     output_dir = tmp_path / "output"
     reached_publication = context.Event()
     release_publication = context.Event()

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
@@ -12,7 +12,6 @@ from errno import EAGAIN, ENOSYS, ENOTSUP, EOPNOTSUPP, EWOULDBLOCK
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from threading import Lock
-from typing import Iterator
 from uuid import uuid4
 
 from src.benchmark.r2_corpus_models import (
@@ -441,9 +440,11 @@ def _prepare_download(
                 raise
             with incoming:
                 while chunk := download.body.read(1024 * 1024):
+                    byte_count += len(chunk)
+                    if byte_count > remote.size:
+                        raise _DownloadRejected(_download_error("byte_count_mismatch", remote.key))
                     incoming.write(chunk)
                     digest.update(chunk)
-                    byte_count += len(chunk)
                 incoming.flush()
                 os.fsync(temporary.descriptor)
                 _verify_regular_file_binding(
@@ -638,23 +639,6 @@ def _install_digest_group(
                         download.remote,
                         download.validation,
                         tuple(errors),
-                    )
-                    continue
-                try:
-                    assert shard_fd is not None
-                    assert final_fd is not None
-                    _verify_installed_content_path(
-                        directories,
-                        shard_name,
-                        shard_fd,
-                        content_sha256,
-                        final_fd,
-                    )
-                except (OSError, ValueError):
-                    results[identity] = _failed_download(
-                        download.remote,
-                        download.validation,
-                        (_download_error("artifact_write_failed", download.remote.key),),
                     )
                     continue
                 results[identity] = _checkpoint_download(
