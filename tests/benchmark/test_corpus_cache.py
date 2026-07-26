@@ -2,6 +2,7 @@ import builtins
 import errno
 import json
 import os
+import stat
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ import pytest
 from src.benchmark.corpus_cache import (
     CacheIndexEntry,
     CacheIndexStore,
+    _open_regular_file_at,
     cache_writer_lock,
     sync_cache,
 )
@@ -2297,3 +2299,31 @@ def test_shard_swap_during_temporary_cleanup_never_checkpoints_stale_path(
         with pytest.raises(OSError) as error:
             os.fstat(descriptor)
         assert error.value.errno == errno.EBADF
+
+
+def test_open_regular_file_at_rejects_a_fifo_without_blocking(tmp_path: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("mkfifo is unavailable on this platform")
+
+    fifo_name = "leaf"
+    os.mkfifo(tmp_path / fifo_name)
+
+    parent_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        result: dict[str, object] = {}
+
+        def open_leaf() -> None:
+            try:
+                _open_regular_file_at(parent_fd, fifo_name)
+            except OSError as error:
+                result["error"] = error
+
+        worker = Thread(target=open_leaf, daemon=True)
+        worker.start()
+        worker.join(timeout=5.0)
+        assert not worker.is_alive(), "_open_regular_file_at hung opening a FIFO"
+        error = result.get("error")
+        assert isinstance(error, OSError)
+        assert stat.S_ISFIFO(os.stat(tmp_path / fifo_name).st_mode)
+    finally:
+        os.close(parent_fd)
