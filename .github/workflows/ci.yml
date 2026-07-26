@@ -76,6 +76,13 @@ jobs:
           tail -n 160 pytest.log
           exit "$status"
 
+      - name: Upload pytest failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-log
+          path: pytest.log
+
       - name: Upload coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v5
