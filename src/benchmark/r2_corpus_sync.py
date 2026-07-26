@@ -1066,9 +1066,17 @@ def _atomic_replace_bytes(path: Path, content: bytes) -> None:
 def _adapter_error(error: R2StoreError) -> SyncError:
     code: ErrorCode = error.code if error.code in _ADAPTER_CODES else "internal_error"
     object_key = error.object_key if error.object_key else None
-    scope = "root" if code == "root_list_failed" else "configuration"
-    if object_key is not None:
+    if code == "root_list_failed":
+        scope = "root"
+    elif code == "object_metadata_invalid" and object_key is None:
+        # An unkeyable entry in the root listing is corrupted listing data,
+        # not a configuration failure; a per-object metadata error keeps
+        # the object scope via the branch below.
+        scope = "root"
+    elif object_key is not None:
         scope = "object"
+    else:
+        scope = "configuration"
     return SyncError(scope, code, _SAFE_MESSAGES[code], object_key)
 
 
