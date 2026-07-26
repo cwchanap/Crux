@@ -4,7 +4,7 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from importlib import import_module
 from logging import WARNING, getLogger
 from typing import Any, BinaryIO, ContextManager, Protocol
@@ -198,12 +198,14 @@ def _build_simfile_inventory(
                     etag_is_weak=item.etag_is_weak,
                     last_modified=item.last_modified,
                     content_type=None,
-                    errors=(error,),
+                    errors=(*item.errors, error),
                 )
             )
             row_errors.append(error)
+            row_errors.extend(item.errors)
             continue
         objects.append(_merge_metadata(item, result))
+        row_errors.extend(item.errors)
 
     has_object_errors = bool(row_errors)
     is_empty = not objects or all(item.size == 0 and item.key.endswith("/") for item in objects)
@@ -265,6 +267,7 @@ def _merge_metadata(item: ListedObject, metadata: HeadMetadata) -> RemoteObject:
         ),
         last_modified=metadata.last_modified or item.last_modified,
         content_type=metadata.content_type,
+        errors=item.errors,
     )
 
 
@@ -347,14 +350,18 @@ class Boto3R2Store:
     def list_objects(self) -> tuple[ListedObject, ...]:
         try:
             paginator = self.client.get_paginator("list_objects_v2")
-            objects = []
+            objects: list[ListedObject] = []
             for page in paginator.paginate(Bucket=self.bucket):
                 if not isinstance(page, dict):
                     raise self._metadata_error()
                 contents = page.get("Contents", [])
                 if not isinstance(contents, list):
                     raise self._metadata_error()
-                objects.extend(self._parse_listed_object(item) for item in contents)
+                for item in contents:
+                    try:
+                        objects.append(self._parse_listed_object(item))
+                    except R2StoreError:
+                        continue
             return tuple(objects)
         except R2StoreError:
             raise
@@ -407,34 +414,58 @@ class Boto3R2Store:
                 raise self._map_sdk_error(error, "object_get_failed", key) from None
 
     def _parse_listed_object(self, response: Any) -> ListedObject:
+        if not isinstance(response, dict):
+            raise self._metadata_error()
+        key = response.get("Key")
+        if not isinstance(key, str) or not key:
+            raise self._metadata_error(key if isinstance(key, str) else None) from None
+        errors: list[SyncError] = []
+        size: int = 0
         try:
-            if not isinstance(response, dict):
+            raw_size = response["Size"]
+            if not _is_nonnegative_int(raw_size):
                 raise ValueError
-            key = response["Key"]
-            size = response["Size"]
+            size = raw_size
+        except (KeyError, TypeError, ValueError):
+            errors.append(
+                SyncError(
+                    "object", "object_metadata_invalid", _MESSAGES["object_metadata_invalid"], key
+                )
+            )
+        raw_etag: str = ""
+        etag: str = ""
+        etag_is_weak: bool = False
+        try:
             raw_etag = response["ETag"]
-            last_modified = response["LastModified"]
-            if (
-                not isinstance(key, str)
-                or not key
-                or not _is_nonnegative_int(size)
-                or not isinstance(raw_etag, str)
-                or not _is_aware_datetime(last_modified)
-            ):
+            if not isinstance(raw_etag, str):
                 raise ValueError
             etag, etag_is_weak = parse_etag(raw_etag)
-            return ListedObject(
-                key=key,
-                size=size,
-                etag=etag,
-                etag_is_weak=etag_is_weak,
-                last_modified=last_modified,
-            )
         except (KeyError, TypeError, ValueError):
-            object_key = response.get("Key") if isinstance(response, dict) else None
-            raise self._metadata_error(
-                object_key if isinstance(object_key, str) else None
-            ) from None
+            errors.append(
+                SyncError(
+                    "object", "object_metadata_invalid", _MESSAGES["object_metadata_invalid"], key
+                )
+            )
+        last_modified: datetime = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        try:
+            raw_last_modified = response["LastModified"]
+            if not _is_aware_datetime(raw_last_modified):
+                raise ValueError
+            last_modified = raw_last_modified
+        except (KeyError, TypeError, ValueError):
+            errors.append(
+                SyncError(
+                    "object", "object_metadata_invalid", _MESSAGES["object_metadata_invalid"], key
+                )
+            )
+        return ListedObject(
+            key=key,
+            size=size,
+            etag=etag,
+            etag_is_weak=etag_is_weak,
+            last_modified=last_modified,
+            errors=tuple(errors),
+        )
 
     def _parse_head_metadata(self, response: Any) -> HeadMetadata:
         if not isinstance(response, dict):

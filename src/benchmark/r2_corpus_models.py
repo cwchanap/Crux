@@ -185,6 +185,7 @@ class ListedObject:
     etag: str
     etag_is_weak: bool
     last_modified: datetime
+    errors: tuple[SyncError, ...] = ()
 
 
 @dataclass(frozen=True)
