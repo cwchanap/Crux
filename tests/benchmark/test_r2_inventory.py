@@ -309,6 +309,36 @@ def test_adapter_isolates_malformed_listed_object_metadata_with_error_entry():
     assert all(error.object_key == "42/SET.DEF" for error in item.errors)
 
 
+@pytest.mark.parametrize(
+    ("bad_entry", "expected_object_key"),
+    [
+        pytest.param("not-a-dict", None, id="non_dict_entry"),
+        pytest.param({}, None, id="missing_key"),
+        pytest.param({"Key": ""}, "", id="empty_key"),
+        pytest.param({"Key": 42}, None, id="non_string_key"),
+    ],
+)
+def test_adapter_fails_root_listing_for_entry_without_usable_key(bad_entry, expected_object_key):
+    class UnkeyableEntryClient(FakeClient):
+        def get_paginator(self, name):
+            return type(
+                "UnkeyableEntryPaginator",
+                (),
+                {
+                    "paginate": lambda self, **kwargs: [
+                        {"Contents": [bad_entry, {"Key": "42/SET.DEF"}]}
+                    ]
+                },
+            )()
+
+    assert_store_error(
+        Boto3R2Store(UnkeyableEntryClient(), "simfile-dtx").list_objects,
+        "object_metadata_invalid",
+        "Object metadata is invalid.",
+        expected_object_key,
+    )
+
+
 @pytest.mark.parametrize("boundary", ["head", "download"])
 def test_adapter_rejects_naive_datetimes_at_metadata_boundaries(boundary):
     naive = datetime(2026, 7, 25, 1, 2, 3)

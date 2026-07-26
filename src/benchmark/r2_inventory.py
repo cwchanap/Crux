@@ -358,10 +358,7 @@ class Boto3R2Store:
                 if not isinstance(contents, list):
                     raise self._metadata_error()
                 for item in contents:
-                    try:
-                        objects.append(self._parse_listed_object(item))
-                    except R2StoreError:
-                        continue
+                    objects.append(self._parse_listed_object(item))
             return tuple(objects)
         except R2StoreError:
             raise
