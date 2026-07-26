@@ -63,6 +63,7 @@ jobs:
             librosa \
             pretty-midi \
             "boto3>=1.42,<2"
+          pip install --no-deps -e .
 
       - name: Run tests with coverage
         env:
