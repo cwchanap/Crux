@@ -657,14 +657,19 @@ rtk git commit -m "feat: control isolated transcription runner"
 
 - Create: `tools/hpa320/vendor_magenta.py`
 - Create: `tools/hpa320/resolve_oaf_runtime.py`
+- Create: `tools/hpa320/oaf_system_packages.py`
 - Create: `tools/hpa320/generate_smoke_fixture.py`
 - Create: `runtime/oaf_tf1/requirements.in`
 - Create: `runtime/oaf_tf1/requirements-test.in`
+- Create: `runtime/oaf_tf1/requirements-build.in`
 - Generate: `runtime/oaf_tf1/vendor/magenta/`
 - Generate: `runtime/oaf_tf1/source-manifest.json`
 - Generate: `runtime/oaf_tf1/requirements.lock`
 - Generate: `runtime/oaf_tf1/requirements-test.lock`
+- Generate: `runtime/oaf_tf1/requirements-build.lock`
+- Generate: `runtime/oaf_tf1/distribution-build-manifest.json`
 - Create: `runtime/oaf_tf1/Dockerfile`
+- Create: `runtime/oaf_tf1/tests/.gitkeep`
 - Create: `tests/benchmark/test_oaf_smoke_generator.py`
 - Generate: `tests/fixtures/oaf_tf1_smoke/generator-parameters.json`
 - Generate: `tests/fixtures/oaf_tf1_smoke/canonical.wav`
@@ -679,9 +684,11 @@ rtk git commit -m "feat: control isolated transcription runner"
 - [ ] **Step 1: Write failing vendor/runtime/smoke tests**
 
 Test that vendor generation rejects the wrong commit, symlinks, unlisted paths, and
-hash drift; runtime resolution rejects non-cp37/non-x86_64 wheels and the wrong
-TensorFlow wheel; smoke generation produces RIFF PCM16 mono 44.1-kHz bytes
-identically twice and matches the checked-in parameter/WAV hash.
+hash drift; runtime resolution rejects non-cp37/non-x86_64 wheels, unapproved sdists,
+and the wrong TensorFlow wheel; the explicit `pretty_midi==0.2.10` sdist exception
+builds byte-identical pure-Python wheels twice under the pinned offline toolchain;
+smoke generation produces RIFF PCM16 mono 44.1-kHz bytes identically twice and
+matches the checked-in parameter/WAV hash.
 
 ```python
 def test_smoke_generator_is_byte_deterministic(tmp_path: Path) -> None:
@@ -742,14 +749,45 @@ rtk uv run python tools/hpa320/vendor_magenta.py \
 `requirements.in` contains the explicit TensorFlow pin and direct packages imported
 by the vendored closure. `requirements-test.in` contains only `pytest==7.4.4`;
 its transitive test dependencies remain separate from the final runtime.
+`requirements-build.in` contains only the exact CPython-3.7-compatible build
+toolchain used for explicitly allowlisted sdist exceptions; those tools never enter
+the final runtime.
 `resolve_oaf_runtime.py` runs package resolution for CPython 3.7
-`manylinux2010_x86_64`, downloads every wheel, requires the fixed TensorFlow wheel
-hash, records name/version/filename/SHA-256 for every transitive distribution, and
-renders hash-required runtime and test locks. The Dockerfile installs the runtime
-lock into its final stage with `--require-hashes --no-index`; a separate `test`
-stage installs the test lock and copies `runtime/oaf_tf1/tests`. Both stages copy
-vendored/runtime sources and run as the seal-selected numeric UID/GID. Final lock
-files remain outside the image.
+`manylinux2010_x86_64`, downloads every published wheel, requires the fixed
+TensorFlow wheel hash, records name/version/filename/SHA-256 for every transitive
+distribution, and renders hash-required runtime and test locks. If the exact resolver
+proves that a required version has no compatible published wheel, it may add that
+package/version to an explicit closure-derived sdist allowlist only after proving the
+sdist builds a pure-Python `py3-none-any` wheel. For every allowlisted entry, verify
+the exact source-archive hash, build it twice with network disabled under the
+hash-locked build toolchain and canonical environment/recipe, require byte-identical
+wheels, and record the complete source/toolchain/recipe/result identity in
+`distribution-build-manifest.json`. That manifest also records every file published
+for each allowlisted PyPI release and derives `required_by` from the selected direct
+requirements and wheel `Requires-Dist` graph. The resolver provides an exact
+`--materialize-wheelhouse` workflow which reconstructs ignored runtime/test
+wheelhouses from checked locks, uses an explicit offline cache for locally built
+allowlisted wheels, and rejects extras, symlinks, or hash drift. The initial proven entries are
+`pretty_midi==0.2.10` and TensorFlow dependency `gast==0.2.2`. A native-extension
+sdist or a package with a compatible published wheel is not eligible. Task 8 must
+reproduce every allowlisted wheel natively before sealing. The Dockerfile installs
+the runtime lock into its final stage with
+`--require-hashes --no-index`; a separate `test` stage installs the test lock and
+copies `runtime/oaf_tf1/tests`. Build-tool distributions do not enter either final
+runtime or test dependency closure. Both stages copy vendored/runtime sources and run
+as the seal-selected numeric UID/GID. Final lock files remain outside the image.
+The final-only image stage consumes an ignored
+`crux.oaf-system-package-bundle/v2` bundle containing a canonical manifest, exact
+`InRelease`, selected signed `Packages`/`Packages.xz` indexes at their Release paths,
+every local `.deb`, and the complete three-column expected `dpkg` inventory. The
+only trust anchor is `/usr/share/keyrings/debian-archive-keyring.gpg` already inside
+the digest-pinned base image; a bundle-supplied keyring is forbidden. It verifies
+that base keyring's expected hash, the archive signature and exact single reviewed
+`VALIDSIG` fingerprint, codename, `amd64` architecture, each signed index
+path/size/hash, bounded decompression and strict stanza parsing, and exact local
+package/inventory binding before installation. It installs only the authenticated
+local closure and requires exact final inventory equality. Task 8 owns materializing
+the native bundle and final values.
 
 - [ ] **Step 5: Run generators twice and inspect diffs**
 
@@ -774,13 +812,18 @@ Expected: the second generation changes no bytes.
 rtk git add \
   tools/hpa320/vendor_magenta.py \
   tools/hpa320/resolve_oaf_runtime.py \
+  tools/hpa320/oaf_system_packages.py \
   tools/hpa320/generate_smoke_fixture.py \
   runtime/oaf_tf1/Dockerfile \
   runtime/oaf_tf1/requirements.in \
   runtime/oaf_tf1/requirements.lock \
+  runtime/oaf_tf1/requirements-build.in \
+  runtime/oaf_tf1/requirements-build.lock \
+  runtime/oaf_tf1/distribution-build-manifest.json \
   runtime/oaf_tf1/requirements-test.in \
   runtime/oaf_tf1/requirements-test.lock \
   runtime/oaf_tf1/source-manifest.json \
+  runtime/oaf_tf1/tests/.gitkeep \
   runtime/oaf_tf1/vendor/magenta \
   tests/benchmark/test_oaf_smoke_generator.py \
   tests/fixtures/oaf_tf1_smoke/generator-parameters.json \
@@ -893,21 +936,38 @@ quantization.
 - [ ] **Step 5: Run runtime tests inside the provisional image**
 
 ```bash
+rtk uv run python tools/hpa320/resolve_oaf_runtime.py \
+  --materialize-wheelhouse \
+  --lock runtime/oaf_tf1/requirements.lock \
+  --wheelhouse runtime/oaf_tf1/wheelhouse/runtime \
+  --offline-cache /workspace/hpa320/oaf-wheel-cache
+rtk uv run python tools/hpa320/resolve_oaf_runtime.py \
+  --materialize-wheelhouse \
+  --lock runtime/oaf_tf1/requirements-test.lock \
+  --wheelhouse runtime/oaf_tf1/wheelhouse/test \
+  --offline-cache /workspace/hpa320/oaf-wheel-cache
 rtk docker buildx build \
   --platform linux/amd64 \
   --target test \
   --load \
   --tag crux-oaf-tf1:hpa320-provisional \
+  --build-arg RUNTIME_UID=10001 \
+  --build-arg RUNTIME_GID=10001 \
   --file runtime/oaf_tf1/Dockerfile \
   .
 rtk docker run --rm \
   --platform linux/amd64 \
+  --entrypoint /bin/sh \
   crux-oaf-tf1:hpa320-provisional \
-  python -m pytest -q /opt/crux/runtime/tests
+  -ec 'test "$(id -u)" = 10001; test "$(id -g)" = 10001; \
+    test -r /opt/crux/runtime/tests; \
+    /opt/crux/venv/bin/python -m pytest -q /opt/crux/runtime/tests'
 ```
 
 Expected on emulation: tests may establish diagnostic behavior but cannot produce a
 seal. All pure protocol/instrumentation tests must pass.
+The numeric IDs above are explicit diagnostic provisional values only; they are not
+eligible for the final lock or seal.
 
 - [ ] **Step 6: Commit the provisional runner**
 
@@ -1067,6 +1127,10 @@ rtk git commit -m "feat: verify frozen OaF backend"
 - Create: `tests/benchmark/test_oaf_real_checkpoint.py`
 - Generate: final backend/runtime locks, seal evidence, conversion audit, smoke
   oracle, tensor coverage report, OCI archive evidence.
+- Generate, ignored: `runtime/oaf_tf1/wheelhouse/runtime/`
+- Generate, ignored: `runtime/oaf_tf1/wheelhouse/test/`
+- Generate, ignored: `runtime/oaf_tf1/system-packages/`
+- Generate, ignored: `/workspace/hpa320/hpa320-system-package-build-args.env`
 - Modify after review: exact generated files only.
 
 **Interfaces:**
@@ -1131,10 +1195,36 @@ Expected: canonical summary with `status: "ready"` and exit `0`.
 - [ ] **Step 3: Build and preserve the provisional image**
 
 ```bash
+rtk uv run python tools/hpa320/resolve_oaf_runtime.py \
+  --materialize-wheelhouse \
+  --lock runtime/oaf_tf1/requirements.lock \
+  --wheelhouse runtime/oaf_tf1/wheelhouse/runtime \
+  --offline-cache /workspace/hpa320/oaf-wheel-cache
+rtk uv run python tools/hpa320/resolve_oaf_runtime.py \
+  --materialize-wheelhouse \
+  --lock runtime/oaf_tf1/requirements-test.lock \
+  --wheelhouse runtime/oaf_tf1/wheelhouse/test \
+  --offline-cache /workspace/hpa320/oaf-wheel-cache
+rtk uv run python tools/hpa320/seal_oaf_backend.py \
+  materialize-system-packages \
+  --host-evidence /workspace/hpa320/native-host-evidence.json \
+  --bundle runtime/oaf_tf1/system-packages \
+  --build-args-output /workspace/hpa320/hpa320-system-package-build-args.env
+. /workspace/hpa320/hpa320-system-package-build-args.env
 rtk docker buildx build \
   --platform linux/amd64 \
   --load \
   --tag crux-oaf-tf1:hpa320-seal \
+  --build-arg RUNTIME_UID="${HPA320_RUNTIME_UID:?}" \
+  --build-arg RUNTIME_GID="${HPA320_RUNTIME_GID:?}" \
+  --build-arg DEBIAN_SNAPSHOT_URL="${HPA320_DEBIAN_SNAPSHOT_URL:?}" \
+  --build-arg DEBIAN_INRELEASE_SHA256="${HPA320_DEBIAN_INRELEASE_SHA256:?}" \
+  --build-arg DEBIAN_ARCHIVE_KEYRING_SHA256="${HPA320_DEBIAN_ARCHIVE_KEYRING_SHA256:?}" \
+  --build-arg DEBIAN_SIGNING_FINGERPRINT="${HPA320_DEBIAN_SIGNING_FINGERPRINT:?}" \
+  --build-arg DEBIAN_CODENAME="${HPA320_DEBIAN_CODENAME:?}" \
+  --build-arg DEBIAN_ARCHITECTURE="${HPA320_DEBIAN_ARCHITECTURE:?}" \
+  --build-arg SYSTEM_PACKAGE_MANIFEST_SHA256="${HPA320_SYSTEM_PACKAGE_MANIFEST_SHA256:?}" \
+  --build-arg SYSTEM_PACKAGE_INVENTORY_SHA256="${HPA320_SYSTEM_PACKAGE_INVENTORY_SHA256:?}" \
   --file runtime/oaf_tf1/Dockerfile \
   .
 rtk docker image inspect crux-oaf-tf1:hpa320-seal
@@ -1143,6 +1233,11 @@ rtk docker image inspect crux-oaf-tf1:hpa320-seal
 Prove the base manifest digest, installed wheel/system-package bytes, Python/TF ABI,
 numeric UID/GID, and runner/source manifests. Export the complete image as an OCI
 layout through `seal_oaf_backend.py`; record manifest/config/layer and archive hashes.
+The materializer must obtain the Debian snapshot `InRelease`, selected exact signed
+package indexes, complete authenticated local `.deb` closure, reviewed
+fingerprint/codename/architecture, digest-pinned base-keyring hash, and expected full
+three-column `dpkg` inventory on the accepted native worker. It must never copy a
+keyring into the bundle; it writes no final lock and emits no provisional identity.
 
 - [ ] **Step 4: Calibrate exact resource and input bounds**
 

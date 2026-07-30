@@ -51,6 +51,10 @@ backend lock and its review history.
 The exact upstream files needed by the runner are vendored from that commit. A source
 manifest records each upstream path, its SHA-256, and the Apache-2.0 notice. The
 runner never clones a repository or resolves a mutable branch at runtime.
+Vendoring does not treat `git status` as provenance: every selected no-follow
+worktree file must match the exact `HEAD` tree blob and index entry, and selected
+paths carrying `assume-unchanged`, `skip-worktree`, nonzero-stage, or other
+unsupported index state are rejected.
 
 ### Released checkpoint
 
@@ -224,17 +228,56 @@ The frozen backend runs as a persistent subprocess in a pinned Linux container:
 | TensorFlow CPython 3.7 Linux wheel SHA-256 | `29831dda98d668067de75403b2fca0d06a2f026ef6f217fa2ca873c20b4ee4d3` |
 
 Every direct and transitive Python package is pinned with a distribution hash in a
-checked-in runtime requirements lock. System packages are installed from a
-snapshot-addressed Debian source and recorded by exact package version and package
-hash in the runtime lock. The built image is referenced by its `linux/amd64` OCI
+checked-in runtime requirements lock. Published compatible wheels are required by
+default. An explicitly reviewed exception may consume an exact hash-pinned sdist only
+to build a pure-Python wheel in a network-disabled, pinned CPython/build-toolchain
+environment. The sdist, toolchain distributions, canonical build recipe/environment,
+and resulting wheel are recorded by byte identity in a checked-in distribution-build
+manifest. For each exception that manifest canonically records every file in the
+exact PyPI release, including filename, package type, Python/tag identity, yanked
+state, immutable URL, byte length, and SHA-256. Online generation re-fetches and
+exact-compares the complete release; offline verification independently counts
+target-compatible wheel tags and derives every `required_by` edge from direct pins
+and selected wheel metadata. Two fresh builds must reproduce the wheel byte-for-byte, and Task 8 must
+repeat that build on native `linux/amd64`; a version match is not a substitute for
+reproducing the locked wheel hash. Requirement markers use a complete frozen
+CPython-3.7.17/Linux/x86_64 environment independent of the resolver host;
+`platform_release` and `platform_version` are not frozen and therefore make a
+dependency invalid rather than inheriting host values.
+
+Checked locks are materialized into ignored wheelhouses by a deterministic command
+which verifies every filename, byte length, and hash, rejects extras and symlinks,
+and supports an explicit offline cache for locally built allowlisted wheels. System
+packages are installed only from a materialized snapshot bundle using schema
+`crux.oaf-system-package-bundle/v2`. The digest-pinned base image's fixed
+`/usr/share/keyrings/debian-archive-keyring.gpg` is the only trust anchor; no bundle
+keyring is accepted. The bundle contains exact `InRelease`, every selected signed
+`Packages`/`Packages.xz` index at its Release path, every local `.deb`, a canonical
+manifest, and the expected complete `Package<TAB>Version<TAB>Architecture` `dpkg`
+inventory. The build verifies the base keyring hash, `InRelease` hash and signature,
+requires exactly one reviewed `VALIDSIG` fingerprint plus the reviewed codename and
+`amd64` architecture, and exact-compares every selected index path/size/SHA-256 to
+the signed `InRelease` SHA256 section. It bounded-decompresses and strict-parses the
+selected indexes, then binds every local `.deb` to authenticated
+`Package`/`Version`/`Architecture`/`Filename`/`Size`/`SHA256` fields before installing
+only that closure without a repository fetch and comparing the final inventory
+byte-for-byte. Missing, extra, duplicate, traversal, ambiguous, or unsigned
+manifest-only inputs fail closed. These
+system inputs and all final build arguments remain a native Task 8 output; the
+provisional test target requires only explicit diagnostic UID/GID values.
+The built image is referenced by its `linux/amd64` OCI
 manifest digest, never by a mutable tag.
 
 The runtime lock records:
 
 - base image name, platform manifest digest, and Python version;
 - every Python distribution name, version, filename, and SHA-256;
-- the snapshot-addressed Debian repository URL, signed Release-file SHA-256, and
-  every installed system package version, `.deb` filename, and SHA-256;
+- the Python distribution-build-manifest SHA-256, including any exceptional sdist,
+  pinned build toolchain, recipe/environment, and reproduced wheel identity;
+- the snapshot-addressed Debian repository URL, base-image archive-keyring SHA-256,
+  reviewed signing fingerprint/codename/architecture, signed Release-file SHA-256,
+  selected signed package-index identities, and every installed system package
+  version, architecture, authenticated repository filename, size, and SHA-256;
 - the vendored upstream source-manifest SHA-256;
 - the runner source-manifest SHA-256;
 - the exact deterministic process environment listed below;
@@ -333,8 +376,9 @@ config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.seal-evidence.json
 
 under schema `crux.backend-seal-evidence/v1`. It records which accepted native-host
 evidence form was used and its immutable reference/signature, base-manifest
-verification, Debian snapshot and package hashes, wheel filenames and hashes, numeric
-UID/GID, tmpfs sizes, CPU/memory/PID limits, standard-error drain bounds, the
+verification, Debian snapshot and package hashes, wheel filenames and hashes,
+distribution-build-manifest and exceptional sdist/toolchain/reproduction evidence,
+numeric UID/GID, tmpfs sizes, CPU/memory/PID limits, standard-error drain bounds, the
 standard-output protocol-line bound, startup and request deadlines, the proposed
 positive integer `max_input_audio_frames`,
 measurements at that exact bound, tensor inventories, smoke generation inputs and
