@@ -64,26 +64,35 @@ def test_scorer_gate_import_and_use_are_backend_and_mapping_independent(
 ) -> None:
     content = render_prediction_artifact(make_heuristic_prediction())
     real_import = builtins.__import__
+    module_name = "src.benchmark.scorer_input"
+    original = sys.modules[module_name]
+    saved_state = dict(original.__dict__)
 
-    def guarded_import(
-        name: str,
-        globals_: dict[str, object] | None = None,
-        locals_: dict[str, object] | None = None,
-        fromlist: tuple[str, ...] = (),
-        level: int = 0,
-    ) -> object:
-        forbidden_fromlist = {"mapping", "oaf_adapter", "oaf_backend"}
-        if (
-            "oaf" in name
-            or name == "src.benchmark.mapping"
-            or forbidden_fromlist.intersection(fromlist)
-        ):
-            raise AssertionError(f"forbidden scorer import: {name}")
-        return real_import(name, globals_, locals_, fromlist, level)
+    try:
 
-    monkeypatch.delitem(sys.modules, "src.benchmark.mapping", raising=False)
-    monkeypatch.setattr(builtins, "__import__", guarded_import)
-    module = importlib.reload(sys.modules["src.benchmark.scorer_input"])
+        def guarded_import(
+            name: str,
+            globals_: dict[str, object] | None = None,
+            locals_: dict[str, object] | None = None,
+            fromlist: tuple[str, ...] = (),
+            level: int = 0,
+        ) -> object:
+            forbidden_fromlist = {"mapping", "oaf_adapter", "oaf_backend"}
+            if (
+                "oaf" in name
+                or name == "src.benchmark.mapping"
+                or forbidden_fromlist.intersection(fromlist)
+            ):
+                raise AssertionError(f"forbidden scorer import: {name}")
+            return real_import(name, globals_, locals_, fromlist, level)
 
-    with pytest.raises(module.CanonicalMappingRequired, match="canonical_mapping_required"):
-        module.read_scorer_events(content)
+        monkeypatch.delitem(sys.modules, "src.benchmark.mapping", raising=False)
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+        module = importlib.reload(original)
+
+        with pytest.raises(module.CanonicalMappingRequired, match="canonical_mapping_required"):
+            module.read_scorer_events(content)
+    finally:
+        sys.modules[module_name] = original
+        original.__dict__.clear()
+        original.__dict__.update(saved_state)

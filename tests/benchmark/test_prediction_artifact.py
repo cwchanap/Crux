@@ -898,28 +898,37 @@ def test_generic_reader_does_not_import_oaf_or_mapping_modules(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     real_import = builtins.__import__
+    module_name = "src.benchmark.prediction_artifact"
+    original = sys.modules[module_name]
+    saved_state = dict(original.__dict__)
 
-    def guarded_import(
-        name: str,
-        globals_: dict[str, object] | None = None,
-        locals_: dict[str, object] | None = None,
-        fromlist: tuple[str, ...] = (),
-        level: int = 0,
-    ) -> object:
-        forbidden_fromlist = {"mapping", "oaf_adapter", "oaf_backend"}
-        if (
-            "oaf" in name
-            or name == "src.benchmark.mapping"
-            or forbidden_fromlist.intersection(fromlist)
-        ):
-            raise AssertionError(f"forbidden backend-specific import: {name}")
-        return real_import(name, globals_, locals_, fromlist, level)
+    try:
 
-    monkeypatch.delitem(sys.modules, "src.benchmark.mapping", raising=False)
-    monkeypatch.setattr(builtins, "__import__", guarded_import)
-    module = importlib.reload(sys.modules["src.benchmark.prediction_artifact"])
+        def guarded_import(
+            name: str,
+            globals_: dict[str, object] | None = None,
+            locals_: dict[str, object] | None = None,
+            fromlist: tuple[str, ...] = (),
+            level: int = 0,
+        ) -> object:
+            forbidden_fromlist = {"mapping", "oaf_adapter", "oaf_backend"}
+            if (
+                "oaf" in name
+                or name == "src.benchmark.mapping"
+                or forbidden_fromlist.intersection(fromlist)
+            ):
+                raise AssertionError(f"forbidden backend-specific import: {name}")
+            return real_import(name, globals_, locals_, fromlist, level)
 
-    assert module.read_prediction_artifact(EXPECTED_ARTIFACT).event_count == 1
+        monkeypatch.delitem(sys.modules, "src.benchmark.mapping", raising=False)
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+        module = importlib.reload(original)
+
+        assert module.read_prediction_artifact(EXPECTED_ARTIFACT).event_count == 1
+    finally:
+        sys.modules[module_name] = original
+        original.__dict__.clear()
+        original.__dict__.update(saved_state)
 
 
 def test_publish_prediction_artifact_returns_strict_read_immutable_bytes(

@@ -5,7 +5,7 @@ import json
 import math
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import TypeAlias
 
@@ -82,7 +82,10 @@ class BackendDescriptor:
 def quantize_six(value: float) -> Decimal:
     if not math.isfinite(value):
         raise StrictJsonError("nonfinite binary float")
-    quantized = Decimal.from_float(value).quantize(SIX_PLACES, rounding=ROUND_HALF_EVEN)
+    try:
+        quantized = Decimal.from_float(value).quantize(SIX_PLACES, rounding=ROUND_HALF_EVEN)
+    except InvalidOperation as error:
+        raise StrictJsonError("binary float quantization failed") from error
     return Decimal(0) if quantized.is_zero() else quantized
 
 

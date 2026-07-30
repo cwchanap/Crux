@@ -110,7 +110,9 @@ def _calibration_authorities(tmp_path: Path) -> dict[str, Path]:
     ]
     model_cache = tmp_path / "model"
     model_cache.mkdir()
-    for row, content in zip(checkpoint_components, (b"data", b"index", b"meta"), strict=True):
+    contents = (b"data", b"index", b"meta")
+    assert len(checkpoint_components) == len(contents)
+    for row, content in zip(checkpoint_components, contents):
         row["sha256"] = _sha256(content)
         (model_cache / str(row["name"])).write_bytes(content)
     archive = {"name": "checkpoint.zip", "sha256": "1" * 64, "size": 1}

@@ -63,8 +63,8 @@ def _wav_bytes(sample_frames: int = 4) -> bytes:
     )
 
 
-def _host_evidence(*, cpu_model: str = "143") -> NativeHostEvidence:
-    payload = {
+def _host_evidence_payload(*, cpu_model: str = "143") -> dict[str, object]:
+    return {
         "api_record_sha256": "a" * 64,
         "approved_labels": ["Linux", "X64"],
         "job_id": 123,
@@ -80,6 +80,10 @@ def _host_evidence(*, cpu_model: str = "143") -> NativeHostEvidence:
             "cpu_stepping": "8",
         },
     }
+
+
+def _host_evidence(*, cpu_model: str = "143") -> NativeHostEvidence:
+    payload = _host_evidence_payload(cpu_model=cpu_model)
     return NativeHostEvidence(
         kind="github_hosted",
         payload=payload,
@@ -374,7 +378,13 @@ def _harness(
         "cpu_limit_millis": 2500,
         "memory_limit_bytes": 1073741824,
         "native_host_evidence": {
-            "form": "github_hosted_linux_x64",
+            "kind": "github_hosted",
+            "official_execution_allowed": True,
+            "payload": (
+                _host_evidence_payload(cpu_model=native_cpu_model)
+                if native_evidence_matches
+                else {}
+            ),
             "sha256": evidence.sha256 if native_evidence_matches else "0" * 64,
         },
         "pid_limit": 64,

@@ -1642,7 +1642,9 @@ class FrozenOafBackend:
                 "The frozen model failed an inference integrity check.",
                 fatal=True,
             ) from None
-        except BaseException:
+        except (SystemExit, KeyboardInterrupt, MemoryError, ProtocolFailure):
+            raise
+        except Exception:
             raise ProtocolFailure(
                 "inference_failed",
                 "The frozen model could not transcribe this canonical input.",
