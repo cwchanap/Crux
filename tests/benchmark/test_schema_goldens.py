@@ -100,7 +100,11 @@ def test_phase_a_and_b_schema_goldens_are_complete_and_strict(repository_root: P
         "crux.legacy-tf2-conversion-coverage/v1",
         "crux.oaf-checkpoint-acquisition-request/v1",
         "crux.oaf-base-system-package-request/v1",
+        "crux.oaf-build-context-manifest/v1",
+        "crux.oaf-calibration-bootstrap-evidence/v1",
+        "crux.oaf-calibration-bootstrap-request/v1",
         "crux.oaf-calibration-measurement-request/v1",
+        "crux.oaf-native-host-attestation-bundle/v1",
         "crux.oaf-seal-profile-request/v1",
         "crux.transcription-runner/v1",
         "crux.transcription-runner-response/v1",
@@ -251,6 +255,39 @@ def test_phase_a_schema_goldens_reject_nonfirst_critical_field_drift(
         validator = getattr(importlib.import_module(module_name), "validate_schema_golden")
         with pytest.raises(ValueError):
             validator(entry.schema, mutated)
+
+
+@pytest.mark.parametrize(
+    ("schema", "field"),
+    [
+        ("crux.oaf-calibration-bootstrap-evidence/v1", "runtime_image_layer_digests"),
+        ("crux.oaf-oci-layout-manifest/v1", "layer_digests"),
+        ("crux.backend-seal-evidence/v1", "runtime_image_layer_digests"),
+    ],
+)
+def test_oaf_schema_goldens_reject_reordered_image_layers(
+    repository_root: Path,
+    schema: str,
+    field: str,
+) -> None:
+    entry = next(
+        item for item in load_schema_golden_manifest(repository_root) if item.schema == schema
+    )
+    payload = json.loads((repository_root / entry.golden_path).read_bytes())
+    assert len(payload[field]) > 1
+    payload[field].reverse()
+    mutated = canonical_json_bytes(payload, trailing_newline=True)
+
+    outcomes: list[bool] = []
+    for module_name in entry.validator_modules:
+        validator = getattr(importlib.import_module(module_name), "validate_schema_golden")
+        try:
+            validator(entry.schema, mutated)
+        except ValueError:
+            outcomes.append(False)
+        else:
+            outcomes.append(True)
+    assert outcomes and outcomes == [False] * len(outcomes)
 
 
 @pytest.mark.parametrize(

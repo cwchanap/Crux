@@ -21,6 +21,16 @@ EXPECTED_ENVIRONMENT = {
     "TF_NUM_INTEROP_THREADS": "1",
     "TF_NUM_INTRAOP_THREADS": "1",
 }
+CALIBRATION_MODE_MOUNTS = (
+    "/run/crux/calibration-bootstrap-request.json",
+    "/run/crux/calibration-bootstrap-evidence.json",
+    "/run/crux/checkpoint-acquisition-request.json",
+    "/run/crux/checkpoint-acquisition-evidence.json",
+    "/run/crux/base-system-package-request.json",
+    "/run/crux/base-system-package-evidence.json",
+    "/run/crux/runtime-image-config-digest.txt",
+    "/run/crux/calibration-measurement-request.json",
+)
 
 
 def discard_interpreter_bootstrap_environment():
@@ -34,6 +44,13 @@ def validate_process_environment(expected_environment):
     """Exit before runner imports when any locked process value differs."""
     if dict(os.environ) != dict(expected_environment):
         os.write(2, b"code=process_environment_invalid count=1\n")
+        raise SystemExit(2)
+
+
+def reject_calibration_mode_mounts(paths=CALIBRATION_MODE_MOUNTS):
+    """Reject calibration authorities before importing production dependencies."""
+    if any(os.path.lexists(path) for path in paths):
+        os.write(2, b"code=runner_mode_invalid count=1\n")
         raise SystemExit(2)
 
 
@@ -81,6 +98,7 @@ def _import_numeric_modules():
 def main() -> int:
     discard_interpreter_bootstrap_environment()
     validate_process_environment(EXPECTED_ENVIRONMENT)
+    reject_calibration_mode_mounts()
     vendor_root = "/opt/crux/vendor"
     if vendor_root not in sys.path:
         sys.path.insert(0, vendor_root)

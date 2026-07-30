@@ -17,8 +17,11 @@ from typing import Mapping, Optional, Sequence
 SCHEMA = "crux.oaf-runner-source-manifest/v1"
 MANIFEST_PATH = "runtime/oaf_tf1/runner-source-manifest.json"
 SOURCE_PATHS = (
+    ".github/workflows/hpa320-native-bootstrap.yml",
     "runtime/oaf_tf1/Dockerfile",
     "runtime/oaf_tf1/apply_instrumentation_patch.py",
+    "runtime/oaf_tf1/calibration_entrypoint.py",
+    "runtime/oaf_tf1/calibration_protocol.py",
     "runtime/oaf_tf1/distribution-build-manifest.json",
     "runtime/oaf_tf1/entrypoint.py",
     "runtime/oaf_tf1/oaf_backend.py",
@@ -31,12 +34,23 @@ SOURCE_PATHS = (
     "runtime/oaf_tf1/requirements.in",
     "runtime/oaf_tf1/requirements.lock",
     "runtime/oaf_tf1/tests/test_instrumentation.py",
+    "runtime/oaf_tf1/tests/test_calibration_protocol.py",
     "runtime/oaf_tf1/tests/test_protocol.py",
     "runtime/oaf_tf1/tests/test_tensor_coverage.py",
+    "tools/hpa320/audit_legacy_tf2_conversion.py",
     "tools/hpa320/generate_runner_source_manifest.py",
+    "tools/hpa320/github_host_evidence.py",
+    "tools/hpa320/oaf_build_context.py",
+    "tools/hpa320/oaf_candidate_builder.py",
+    "tools/hpa320/oaf_host_attestation.py",
+    "tools/hpa320/oaf_native_calibration.py",
+    "tools/hpa320/oaf_native_runner.py",
+    "tools/hpa320/oaf_oci.py",
     "tools/hpa320/oaf_system_packages.py",
+    "tools/hpa320/seal_oaf_backend.py",
 )
 COVERED_ROOTS = (
+    ".github/workflows",
     "runtime/oaf_tf1",
     "tools/hpa320",
 )

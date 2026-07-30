@@ -1,0 +1,140 @@
+name: HPA-320 Native Candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact lowercase 40-character commit to execute
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  observe-native-host:
+    name: observe-native-host
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      observation: ${{ steps.observe.outputs.observation }}
+    env:
+      COMMIT_SHA: ${{ inputs.commit_sha }}
+
+    steps:
+      - name: Check out exact profile commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.commit_sha }}
+
+      - name: Install exact UV
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          version: "0.11.8"
+          python-version: "3.12"
+          enable-cache: false
+
+      - name: Observe exact native host
+        id: observe
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${COMMIT_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          uv run python -m tools.hpa320.oaf_host_attestation observe-github \
+            --output native-host-observation.json \
+            --github-output "${GITHUB_OUTPUT}"
+
+  native-candidate:
+    name: native-candidate
+    needs: observe-native-host
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      COMMIT_SHA: ${{ inputs.commit_sha }}
+      GH_TOKEN: ${{ github.token }}
+      NATIVE_HOST_OBSERVATION: ${{ needs.observe-native-host.outputs.observation }}
+
+    steps:
+      - name: Check out exact profile commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.commit_sha }}
+
+      - name: Install exact UV
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          version: "0.11.8"
+          python-version: "3.12"
+          enable-cache: false
+
+      - name: Finalize candidate host attestation
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${COMMIT_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git rev-parse HEAD)" == "${COMMIT_SHA}" ]]
+          printf '%s\n' "${NATIVE_HOST_OBSERVATION}" > native-host-observation.json
+          uv run python -m tools.hpa320.oaf_host_attestation finalize-github \
+            --phase candidate \
+            --observation native-host-observation.json \
+            --output artifacts/benchmark/backends/hpa320-candidate/candidate-host-attestation
+
+      - name: Reacquire authenticated checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run crux benchmark prepare-backend \
+            --backend magenta-egmd-tf1-94529798-8hit-v1 \
+            --download \
+            --cache-root artifacts/benchmark/model-cache \
+            --acquisition-request config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.checkpoint-acquisition-request.json \
+            --evidence-output artifacts/benchmark/backends/hpa320-candidate/operational-checkpoint-acquisition-evidence.json
+
+      - name: Rebuild and import the accepted image identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -m tools.hpa320.seal_oaf_backend bootstrap-image \
+            --request config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.calibration-bootstrap-request.json \
+            --host-attestation-bundle artifacts/benchmark/backends/hpa320-candidate/candidate-host-attestation/attestation-bundle.json \
+            --host-evidence artifacts/benchmark/backends/hpa320-candidate/candidate-host-attestation/native-host-evidence.json \
+            --output artifacts/benchmark/backends/hpa320-candidate/operational-image \
+            --repository-root .
+          uv run python -c 'import json,pathlib; a=json.loads(pathlib.Path("docs/superpowers/evidence/hpa-320/native/calibration-bootstrap-evidence.json").read_bytes()); b=json.loads(pathlib.Path("artifacts/benchmark/backends/hpa320-candidate/operational-image/calibration-bootstrap-evidence.json").read_bytes()); fields=("base_image_config_digest","base_image_layer_diff_ids","base_image_layer_digests","build_context_manifest_sha256","calibration_bootstrap_request_sha256","image_build","oci_layout_archive","oci_layout_manifest_sha256","runtime_image_config_digest","runtime_image_index_digest","runtime_image_layer_diff_ids","runtime_image_layer_digests","runtime_image_manifest_digest"); assert all(a[field] == b[field] for field in fields)'
+
+      - name: Generate the sealed candidate without publishing it
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -m tools.hpa320.seal_oaf_backend calibrate \
+            --request config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.seal-profile-request.json \
+            --measurement-evidence docs/superpowers/evidence/hpa-320/native/calibration-measurement-evidence.json \
+            --bootstrap-request config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.calibration-bootstrap-request.json \
+            --bootstrap-evidence docs/superpowers/evidence/hpa-320/native/calibration-bootstrap-evidence.json \
+            --host-attestation-bundle artifacts/benchmark/backends/hpa320-candidate/candidate-host-attestation/attestation-bundle.json \
+            --host-evidence artifacts/benchmark/backends/hpa320-candidate/candidate-host-attestation/native-host-evidence.json \
+            --model-cache artifacts/benchmark/model-cache \
+            --checkpoint-evidence docs/superpowers/evidence/hpa-320/native/checkpoint-acquisition-evidence.json \
+            --base-system-evidence docs/superpowers/evidence/hpa-320/native/base-system-package-evidence.json \
+            --output artifacts/benchmark/backends/hpa320-candidate/seal-candidate
+
+      - name: Record artifact hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts/benchmark/backends/hpa320-candidate
+          LC_ALL=C find . -type f ! -name artifact-sha256s.txt -print0 \
+            | LC_ALL=C sort -z \
+            | xargs -0 sha256sum > artifact-sha256s.txt
+
+      - name: Upload native seal candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: hpa320-native-candidate-${{ inputs.commit_sha }}
+          path: artifacts/benchmark/backends/hpa320-candidate
+          if-no-files-found: error
+          retention-days: 30

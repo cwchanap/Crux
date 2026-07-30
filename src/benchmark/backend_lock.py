@@ -251,18 +251,26 @@ RUNTIME_LOCK_KEYS = frozenset(
         "additional_system_packages",
         "base_image",
         "base_image_archive_keyring_sha256",
+        "base_image_config_digest",
+        "base_image_layer_diff_ids",
+        "base_image_layer_digests",
         "base_image_manifest_digest",
         "base_system_package_evidence_sha256",
         "base_system_package_inventory",
         "base_system_package_inventory_sha256",
         "base_system_package_request_sha256",
+        "build_context_manifest_sha256",
+        "calibration_bootstrap_evidence_sha256",
+        "calibration_bootstrap_request_sha256",
         "distribution_build_manifest_sha256",
         "environment",
+        "image_build",
         "oci_layout_manifest_sha256",
         "platform",
         "python_distributions",
         "python_version",
         "runner_source_manifest_sha256",
+        "runtime_image_config_digest",
         "runtime_image_manifest_digest",
         "schema",
         "seal_evidence_sha256",
@@ -280,11 +288,18 @@ SEAL_EVIDENCE_KEYS = frozenset(
         "additional_system_packages",
         "advisory_snapshot_sha256",
         "base_image_archive_keyring_sha256",
+        "base_image_config_digest",
+        "base_image_layer_diff_ids",
+        "base_image_layer_digests",
         "base_image_manifest_digest",
         "base_system_package_evidence_sha256",
         "base_system_package_inventory",
         "base_system_package_inventory_sha256",
         "base_system_package_request_sha256",
+        "boundary_probes",
+        "build_context_manifest_sha256",
+        "calibration_bootstrap_evidence_sha256",
+        "calibration_bootstrap_request_sha256",
         "calibration_measurement_evidence_sha256",
         "calibration_measurement_request_sha256",
         "checkpoint_acquisition_evidence_sha256",
@@ -300,6 +315,7 @@ SEAL_EVIDENCE_KEYS = frozenset(
         "max_input_audio_frames",
         "measurements",
         "memory_limit_bytes",
+        "native_host_attestation_bundle_sha256",
         "native_host_evidence",
         "non_inference_inventory",
         "oci_layout_archive",
@@ -312,11 +328,12 @@ SEAL_EVIDENCE_KEYS = frozenset(
         "runner_source_manifest_sha256",
         "runtime_gid",
         "runtime_image_config_digest",
+        "runtime_image_index_digest",
+        "runtime_image_layer_diff_ids",
         "runtime_image_layer_digests",
         "runtime_image_manifest_digest",
         "runtime_uid",
         "schema",
-        "seal_candidate_sha256",
         "seal_profile_request_sha256",
         "security_scan_sha256",
         "shm_bytes",
@@ -360,24 +377,94 @@ _BASE_SYSTEM_PACKAGE_KEYS = frozenset({"architecture", "name", "version"})
 _HOST_NUMERIC_FINGERPRINT_KEYS = frozenset(
     {"architecture", "cpu_family", "cpu_model", "cpu_stepping", "cpu_vendor_id"}
 )
-_MEASUREMENT_KEYS = frozenset(
+_MEASUREMENT_ROW_KEYS = frozenset(
     {
+        "exit_code",
+        "inference_call_count_after",
+        "inference_call_count_before",
+        "input_audio_sha256",
+        "input_frame_count",
+        "oom_killed",
         "peak_cpu_millis",
         "peak_pid_count",
         "peak_rss_bytes",
         "peak_shm_bytes",
         "peak_tmp_bytes",
+        "prediction_sha256",
+        "process_instance_id",
+        "repetition",
         "request_millis",
+        "signal",
         "startup_millis",
+        "stderr_max_line_bytes",
+        "stdout_max_line_bytes",
+    }
+)
+_CALIBRATION_PROBE_KEYS = frozenset(
+    {
+        "inference_call_count_after",
+        "inference_call_count_before",
+        "persistent",
+        "rejected_before_inference",
+        "request_ordinal",
+        "row",
+    }
+)
+_NATIVE_HOST_EVIDENCE_KEYS = frozenset({"kind", "official_execution_allowed", "payload", "sha256"})
+_IMAGE_BUILD_KEYS = frozenset(
+    {
+        "annotations",
+        "buildkit_image",
+        "buildkit_version",
+        "buildx_binary_sha256",
+        "buildx_binary_size",
+        "buildx_binary_url",
+        "buildx_version",
+        "compression",
+        "compression_level",
+        "dockerfile_frontend",
+        "dockerfile_frontend_version",
+        "exporter",
+        "exporter_tar",
+        "force_compression",
+        "inline_cache",
+        "multi_platform_deterministic",
+        "oci_archive",
+        "oci_media_types",
+        "platform",
+        "provenance",
+        "rewrite_timestamp",
+        "sbom",
+        "source_date_epoch",
+    }
+)
+_OCI_ARCHIVE_RECIPE_KEYS = frozenset(
+    {
+        "compression",
+        "final_zero_blocks",
+        "format",
+        "gid",
+        "gname",
+        "member_mode",
+        "member_types",
+        "mtime",
+        "path_order",
+        "uid",
+        "uname",
     }
 )
 _RESOURCE_MEASUREMENT_RELATIONS = (
+    ("cpu_limit_millis", "peak_cpu_millis", 1),
     ("memory_limit_bytes", "peak_rss_bytes", 1),
     ("pid_limit", "peak_pid_count", 1),
     ("tmp_bytes", "peak_tmp_bytes", 1),
     ("shm_bytes", "peak_shm_bytes", 1),
     ("startup_deadline_seconds", "startup_millis", 1000),
     ("request_deadline_seconds", "request_millis", 1000),
+    ("stdout_max_line_bytes", "stdout_max_line_bytes", 1),
+    ("stderr_max_line_bytes", "stderr_max_line_bytes", 1),
+    ("stderr_read_chunk_bytes", "stderr_max_line_bytes", 1),
+    ("stderr_ring_buffer_bytes", "stderr_max_line_bytes", 1),
 )
 _CANDIDATE_MATCH_KEYS = frozenset(
     {
@@ -653,11 +740,18 @@ def validate_oaf_lock_set(
         "stdout_max_line_bytes",
         "additional_system_packages",
         "base_image_archive_keyring_sha256",
+        "base_image_config_digest",
+        "base_image_layer_diff_ids",
+        "base_image_layer_digests",
         "base_system_package_evidence_sha256",
         "base_system_package_inventory",
         "base_system_package_inventory_sha256",
         "base_system_package_request_sha256",
+        "build_context_manifest_sha256",
+        "calibration_bootstrap_evidence_sha256",
+        "calibration_bootstrap_request_sha256",
         "python_distributions",
+        "runtime_image_config_digest",
         "stderr_read_chunk_bytes",
         "stderr_max_line_bytes",
         "stderr_ring_buffer_bytes",
@@ -808,6 +902,9 @@ def _validate_runtime_lock(payload: dict[str, JsonValue]) -> None:
         "base_system_package_evidence_sha256",
         "base_system_package_inventory_sha256",
         "base_system_package_request_sha256",
+        "build_context_manifest_sha256",
+        "calibration_bootstrap_evidence_sha256",
+        "calibration_bootstrap_request_sha256",
         "distribution_build_manifest_sha256",
         "oci_layout_manifest_sha256",
         "runner_source_manifest_sha256",
@@ -815,7 +912,19 @@ def _validate_runtime_lock(payload: dict[str, JsonValue]) -> None:
         "upstream_source_manifest_sha256",
     ):
         _require_hash(payload[field], field)
-    _require_digest(payload["runtime_image_manifest_digest"], "runtime image manifest")
+    for field in (
+        "base_image_config_digest",
+        "runtime_image_config_digest",
+        "runtime_image_manifest_digest",
+    ):
+        _require_digest(payload[field], field)
+    base_layers = _validate_digest_array(payload["base_image_layer_digests"], "base image layers")
+    base_diff_ids = _validate_digest_array(
+        payload["base_image_layer_diff_ids"], "base image DiffIDs"
+    )
+    if len(base_layers) != len(base_diff_ids):
+        raise BackendLockError("base image layer and DiffID counts differ")
+    _validate_image_build(payload["image_build"])
     _require_nonempty_string(payload["tensorflow_abi"], "TensorFlow ABI")
     _require_nonempty_string(payload["tensorflow_build"], "TensorFlow build")
     if payload["environment"] != dict(REQUIRED_ENVIRONMENT):
@@ -855,6 +964,9 @@ def _validate_seal_evidence(payload: dict[str, JsonValue]) -> None:
         "base_system_package_evidence_sha256",
         "base_system_package_inventory_sha256",
         "base_system_package_request_sha256",
+        "build_context_manifest_sha256",
+        "calibration_bootstrap_evidence_sha256",
+        "calibration_bootstrap_request_sha256",
         "calibration_measurement_evidence_sha256",
         "calibration_measurement_request_sha256",
         "checkpoint_acquisition_evidence_sha256",
@@ -863,9 +975,9 @@ def _validate_seal_evidence(payload: dict[str, JsonValue]) -> None:
         "host_adapter_source_manifest_sha256",
         "instrumentation_patch_sha256",
         "legacy_conversion_coverage_sha256",
+        "native_host_attestation_bundle_sha256",
         "oci_layout_manifest_sha256",
         "runner_source_manifest_sha256",
-        "seal_candidate_sha256",
         "seal_profile_request_sha256",
         "security_scan_sha256",
         "smoke_audio_sha256",
@@ -876,8 +988,10 @@ def _validate_seal_evidence(payload: dict[str, JsonValue]) -> None:
     ):
         _require_hash(payload[field], field)
     for field in (
+        "base_image_config_digest",
         "base_image_manifest_digest",
         "runtime_image_config_digest",
+        "runtime_image_index_digest",
         "runtime_image_manifest_digest",
     ):
         _require_digest(payload[field], field)
@@ -900,24 +1014,19 @@ def _validate_seal_evidence(payload: dict[str, JsonValue]) -> None:
         "tmp_bytes",
     ):
         _require_positive_integer(payload[field], field)
-    measurements = _require_object(payload["measurements"], "seal measurements")
-    _require_fields(measurements, _MEASUREMENT_KEYS, "seal measurements")
-    for field in _MEASUREMENT_KEYS:
-        _require_positive_integer(measurements[field], f"measurements {field}")
+    measurements = _validate_measurement_rows(payload["measurements"], "seal measurements")
+    peaks = {
+        field: max(cast(int, row[field]) for row in measurements)
+        for field in {relation[1] for relation in _RESOURCE_MEASUREMENT_RELATIONS}
+    }
     for limit_field, measurement_field, scale in _RESOURCE_MEASUREMENT_RELATIONS:
         limit = cast(int, payload[limit_field])
-        measured = cast(int, measurements[measurement_field])
-        if limit * scale < measured:
-            raise BackendLockError(f"{limit_field} must cover {measurement_field}")
+        measured = peaks[measurement_field]
+        if limit * scale <= measured:
+            raise BackendLockError(f"{limit_field} must strictly exceed {measurement_field}")
+    _validate_boundary_probes(payload["boundary_probes"])
     host = _require_object(payload["native_host_evidence"], "native host evidence")
-    _require_fields(host, {"form", "sha256"}, "native host evidence")
-    if host["form"] not in {
-        "github_hosted_linux_x64",
-        "native_seal_host",
-        "orchestrator_signed",
-    }:
-        raise BackendLockError("native host evidence form is unsupported")
-    _require_hash(host["sha256"], "native host evidence sha256")
+    _validate_native_host_evidence(host)
     _validate_archive(payload["checkpoint_archive"])
     _validate_components(payload["checkpoint_components"])
     _validate_inventories(payload)
@@ -925,13 +1034,27 @@ def _validate_seal_evidence(payload: dict[str, JsonValue]) -> None:
     _validate_empty_additional_system_packages(payload["additional_system_packages"])
     _validate_base_system_package_inventory(payload["base_system_package_inventory"])
     _validate_reference_host_numeric_fingerprint(payload["reference_host_numeric_fingerprint"])
+    if (
+        host["payload"].get("host_numeric_fingerprint")
+        != payload["reference_host_numeric_fingerprint"]
+    ):
+        raise BackendLockError("native host evidence fingerprint differs")
     _validate_archive(payload["oci_layout_archive"], fixed_identity=False)
-    layers = _require_list(payload["runtime_image_layer_digests"], "runtime image layers")
-    if not layers:
-        raise BackendLockError("runtime image layers must not be empty")
-    normalized_layers = [_require_digest(layer, "runtime image layer") for layer in layers]
-    if len(set(normalized_layers)) != len(normalized_layers):
-        raise BackendLockError("runtime image layer digests must be unique")
+    base_layers = _validate_digest_array(payload["base_image_layer_digests"], "base image layers")
+    base_diff_ids = _validate_digest_array(
+        payload["base_image_layer_diff_ids"], "base image DiffIDs"
+    )
+    layers = _validate_digest_array(payload["runtime_image_layer_digests"], "runtime image layers")
+    diff_ids = _validate_digest_array(
+        payload["runtime_image_layer_diff_ids"], "runtime image DiffIDs"
+    )
+    if (
+        len(base_layers) != len(base_diff_ids)
+        or len(layers) != len(diff_ids)
+        or layers[: len(base_layers)] != base_layers
+        or diff_ids[: len(base_diff_ids)] != base_diff_ids
+    ):
+        raise BackendLockError("runtime image does not preserve the exact base prefix")
 
 
 def _validate_conversion_audit(payload: dict[str, JsonValue]) -> None:
@@ -1161,6 +1284,158 @@ def _validate_base_system_package_inventory(value: JsonValue) -> None:
         )
     if len(set(rows)) != len(rows) or rows != sorted(rows):
         raise BackendLockError("base-system package inventory must be unique and sorted")
+
+
+def _validate_digest_array(value: JsonValue, label: str) -> list[str]:
+    values = _require_list(value, label)
+    if not values:
+        raise BackendLockError(f"{label} must not be empty")
+    digests = [_require_digest(item, label) for item in values]
+    if len(set(digests)) != len(digests):
+        raise BackendLockError(f"{label} must be unique")
+    return digests
+
+
+def _validate_image_build(value: JsonValue) -> None:
+    build = _require_object(value, "image build")
+    _require_fields(build, _IMAGE_BUILD_KEYS, "image build")
+    archive = _require_object(build["oci_archive"], "OCI archive recipe")
+    _require_fields(archive, _OCI_ARCHIVE_RECIPE_KEYS, "OCI archive recipe")
+    if (
+        build["annotations"] != []
+        or build["platform"] != "linux/amd64"
+        or build["exporter"] != "oci"
+        or build["compression"] != "gzip"
+        or build["compression_level"] != 6
+        or build["source_date_epoch"] != 0
+        or any(
+            build[field] is not expected
+            for field, expected in (
+                ("exporter_tar", False),
+                ("force_compression", False),
+                ("inline_cache", False),
+                ("multi_platform_deterministic", True),
+                ("oci_media_types", True),
+                ("provenance", False),
+                ("rewrite_timestamp", True),
+                ("sbom", False),
+            )
+        )
+    ):
+        raise BackendLockError("image build recipe differs from the frozen contract")
+    for field in (
+        "buildkit_image",
+        "buildkit_version",
+        "buildx_binary_url",
+        "buildx_version",
+        "dockerfile_frontend",
+        "dockerfile_frontend_version",
+    ):
+        _require_nonempty_string(build[field], f"image build {field}")
+    _require_hash(build["buildx_binary_sha256"], "Buildx binary SHA-256")
+    _require_positive_integer(build["buildx_binary_size"], "Buildx binary size")
+    if archive != {
+        "compression": "none",
+        "final_zero_blocks": 2,
+        "format": "posix-ustar",
+        "gid": 0,
+        "gname": "",
+        "member_mode": 420,
+        "member_types": "regular-files-only",
+        "mtime": 0,
+        "path_order": "utf8-byte",
+        "uid": 0,
+        "uname": "",
+    }:
+        raise BackendLockError("OCI archive recipe differs from the frozen contract")
+
+
+def _validate_measurement_rows(value: JsonValue, label: str) -> list[dict[str, JsonValue]]:
+    values = _require_list(value, label)
+    if not values:
+        raise BackendLockError(f"{label} must not be empty")
+    rows = [_validate_measurement_row(item, f"{label} row") for item in values]
+    for row in rows:
+        if (
+            row["exit_code"] != 0
+            or row["signal"] is not None
+            or row["oom_killed"] is not False
+            or row["prediction_sha256"] is None
+            or cast(int, row["inference_call_count_after"])
+            != cast(int, row["inference_call_count_before"]) + 1
+        ):
+            raise BackendLockError(f"{label} must contain only healthy inference rows")
+    return rows
+
+
+def _validate_measurement_row(value: JsonValue, label: str) -> dict[str, JsonValue]:
+    row = _require_object(value, label)
+    _require_fields(row, _MEASUREMENT_ROW_KEYS, label)
+    for field in (
+        "exit_code",
+        "inference_call_count_after",
+        "inference_call_count_before",
+        "peak_cpu_millis",
+        "peak_pid_count",
+        "peak_rss_bytes",
+        "peak_shm_bytes",
+        "peak_tmp_bytes",
+        "request_millis",
+        "startup_millis",
+        "stderr_max_line_bytes",
+        "stdout_max_line_bytes",
+    ):
+        if not isinstance(row[field], int) or isinstance(row[field], bool) or row[field] < 0:
+            raise BackendLockError(f"{label} {field} must be a nonnegative integer")
+    for field in ("input_frame_count", "repetition"):
+        _require_positive_integer(row[field], f"{label} {field}")
+    for field in ("input_audio_sha256",):
+        _require_hash(row[field], f"{label} {field}")
+    _require_nonempty_string(row["process_instance_id"], f"{label} process instance")
+    if row["signal"] is not None:
+        _require_positive_integer(row["signal"], f"{label} signal")
+    if not isinstance(row["oom_killed"], bool):
+        raise BackendLockError(f"{label} OOM state must be boolean")
+    if row["prediction_sha256"] is not None:
+        _require_hash(row["prediction_sha256"], f"{label} prediction SHA-256")
+    return row
+
+
+def _validate_boundary_probes(value: JsonValue) -> None:
+    probes = _require_list(value, "boundary probes")
+    if not probes:
+        raise BackendLockError("boundary probes must not be empty")
+    ordinals: list[int] = []
+    for item in probes:
+        probe = _require_object(item, "boundary probe")
+        _require_fields(probe, _CALIBRATION_PROBE_KEYS, "boundary probe")
+        row = _validate_measurement_row(probe["row"], "boundary probe row")
+        for field in ("inference_call_count_after", "inference_call_count_before"):
+            if probe[field] != row[field]:
+                raise BackendLockError("boundary probe inference counters disagree")
+        if not isinstance(probe["persistent"], bool) or not isinstance(
+            probe["rejected_before_inference"], bool
+        ):
+            raise BackendLockError("boundary probe state must be boolean")
+        ordinal = _require_positive_integer(
+            probe["request_ordinal"], "boundary probe request ordinal"
+        )
+        ordinals.append(ordinal)
+    if ordinals != list(range(1, len(probes) + 1)):
+        raise BackendLockError("boundary probe ordinals must be consecutive")
+
+
+def _validate_native_host_evidence(host: Mapping[str, JsonValue]) -> None:
+    _require_fields(host, _NATIVE_HOST_EVIDENCE_KEYS, "native host evidence")
+    if (
+        host["kind"] not in {"github_hosted", "orchestrator_signed", "approved_local"}
+        or host["official_execution_allowed"] is not True
+    ):
+        raise BackendLockError("native host evidence form is unsupported")
+    payload = _require_object(host["payload"], "native host evidence payload")
+    digest = _require_hash(host["sha256"], "native host evidence sha256")
+    if sha256_hex(canonical_json_bytes(payload)) != digest:
+        raise BackendLockError("native host evidence payload hash differs")
 
 
 def _validate_reference_host_numeric_fingerprint(value: JsonValue) -> None:

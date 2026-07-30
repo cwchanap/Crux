@@ -13,6 +13,7 @@ import pytest
 
 import src.benchmark.backend_lock as backend_lock_module
 import src.benchmark.backend_prepare as backend_prepare_module
+from runtime.oaf_tf1.calibration_entrypoint import EXPECTED_IMAGE_BUILD
 from src.benchmark.backend_lock import (
     BackendLockError,
     LoadedBackendLock,
@@ -159,6 +160,19 @@ BASE_SYSTEM_PACKAGE_INVENTORY = [
         "version": "2.31-13+deb11u11",
     }
 ]
+BASE_IMAGE_CONFIG_DIGEST = f"sha256:{'8' * 64}"
+BASE_IMAGE_LAYER_DIGESTS = [f"sha256:{'9' * 64}"]
+BASE_IMAGE_LAYER_DIFF_IDS = [f"sha256:{'a' * 64}"]
+RUNTIME_IMAGE_CONFIG_DIGEST = f"sha256:{'e' * 64}"
+RUNTIME_IMAGE_INDEX_DIGEST = f"sha256:{'d' * 64}"
+RUNTIME_IMAGE_LAYER_DIGESTS = [
+    *BASE_IMAGE_LAYER_DIGESTS,
+    f"sha256:{'f' * 64}",
+]
+RUNTIME_IMAGE_LAYER_DIFF_IDS = [
+    *BASE_IMAGE_LAYER_DIFF_IDS,
+    f"sha256:{'0' * 64}",
+]
 
 
 def canonical_bytes(payload: Any) -> bytes:
@@ -265,6 +279,9 @@ def runtime_payload(*, seal_sha256: str = "b" * 64) -> dict[str, Any]:
         "additional_system_packages": [],
         "base_image": "python:3.7.17-slim-bullseye",
         "base_image_archive_keyring_sha256": "0" * 64,
+        "base_image_config_digest": BASE_IMAGE_CONFIG_DIGEST,
+        "base_image_layer_diff_ids": deepcopy(BASE_IMAGE_LAYER_DIFF_IDS),
+        "base_image_layer_digests": deepcopy(BASE_IMAGE_LAYER_DIGESTS),
         "base_image_manifest_digest": (
             "sha256:ea8897698c0955ba96144bd2b7310ef7884ccce4db7a1f97ffc21fb8b89d1673"
         ),
@@ -272,13 +289,18 @@ def runtime_payload(*, seal_sha256: str = "b" * 64) -> dict[str, Any]:
         "base_system_package_inventory": deepcopy(BASE_SYSTEM_PACKAGE_INVENTORY),
         "base_system_package_inventory_sha256": "9" * 64,
         "base_system_package_request_sha256": "a" * 64,
+        "build_context_manifest_sha256": "1" * 64,
+        "calibration_bootstrap_evidence_sha256": "2" * 64,
+        "calibration_bootstrap_request_sha256": "3" * 64,
         "distribution_build_manifest_sha256": "d" * 64,
         "environment": deepcopy(ENVIRONMENT),
+        "image_build": deepcopy(EXPECTED_IMAGE_BUILD),
         "oci_layout_manifest_sha256": "3" * 64,
         "platform": "linux/amd64",
         "python_distributions": deepcopy(PYTHON_DISTRIBUTIONS),
         "python_version": "3.7.17",
         "runner_source_manifest_sha256": "9" * 64,
+        "runtime_image_config_digest": RUNTIME_IMAGE_CONFIG_DIGEST,
         "runtime_image_manifest_digest": f"sha256:{'4' * 64}",
         "schema": "crux.transcription-runtime-lock/v1",
         "seal_evidence_sha256": seal_sha256,
@@ -294,13 +316,67 @@ def runtime_payload(*, seal_sha256: str = "b" * 64) -> dict[str, Any]:
 
 def seal_payload(*, audit_sha256: str = "c" * 64) -> dict[str, Any]:
     checkpoint, required, non_inference = inventories()
+    fingerprint = {
+        "architecture": "x86_64",
+        "cpu_family": "6",
+        "cpu_model": "143",
+        "cpu_stepping": "8",
+        "cpu_vendor_id": "GenuineIntel",
+    }
+    host_payload = {
+        "api_record_sha256": "b" * 64,
+        "approved_labels": ["Linux", "X64"],
+        "host_numeric_fingerprint": fingerprint,
+        "job_id": 123,
+        "run_url": "https://github.com/acme/crux/actions/runs/456/job/123",
+        "runner_arch": "X64",
+        "runner_os": "Linux",
+        "workflow_commit": "c" * 40,
+    }
+    measurement = {
+        "exit_code": 0,
+        "inference_call_count_after": 1,
+        "inference_call_count_before": 0,
+        "input_audio_sha256": "4" * 64,
+        "input_frame_count": 441000,
+        "oom_killed": False,
+        "peak_cpu_millis": 1000,
+        "peak_pid_count": 8,
+        "peak_rss_bytes": 536870912,
+        "peak_shm_bytes": 1048576,
+        "peak_tmp_bytes": 1048576,
+        "prediction_sha256": "5" * 64,
+        "process_instance_id": "fixture-process",
+        "repetition": 1,
+        "request_millis": 2000,
+        "signal": None,
+        "startup_millis": 10000,
+        "stderr_max_line_bytes": 100,
+        "stdout_max_line_bytes": 200,
+    }
     return {
         "additional_system_packages": [],
         "advisory_snapshot_sha256": "a" * 64,
         "base_image_archive_keyring_sha256": "0" * 64,
+        "base_image_config_digest": BASE_IMAGE_CONFIG_DIGEST,
+        "base_image_layer_diff_ids": deepcopy(BASE_IMAGE_LAYER_DIFF_IDS),
+        "base_image_layer_digests": deepcopy(BASE_IMAGE_LAYER_DIGESTS),
         "base_image_manifest_digest": (
             "sha256:ea8897698c0955ba96144bd2b7310ef7884ccce4db7a1f97ffc21fb8b89d1673"
         ),
+        "boundary_probes": [
+            {
+                "inference_call_count_after": 1,
+                "inference_call_count_before": 0,
+                "persistent": True,
+                "rejected_before_inference": False,
+                "request_ordinal": 1,
+                "row": deepcopy(measurement),
+            }
+        ],
+        "build_context_manifest_sha256": "1" * 64,
+        "calibration_bootstrap_evidence_sha256": "2" * 64,
+        "calibration_bootstrap_request_sha256": "3" * 64,
         "checkpoint_archive": {
             "name": "e-gmd_checkpoint.zip",
             "sha256": ARCHIVE_SHA256,
@@ -322,17 +398,15 @@ def seal_payload(*, audit_sha256: str = "c" * 64) -> dict[str, Any]:
         "instrumentation_patch_sha256": "b" * 64,
         "legacy_conversion_coverage_sha256": audit_sha256,
         "max_input_audio_frames": 441000,
-        "measurements": {
-            "peak_cpu_millis": 1000,
-            "peak_pid_count": 8,
-            "peak_rss_bytes": 536870912,
-            "peak_shm_bytes": 1048576,
-            "peak_tmp_bytes": 1048576,
-            "request_millis": 2000,
-            "startup_millis": 10000,
-        },
+        "measurements": [measurement],
         "memory_limit_bytes": 1073741824,
-        "native_host_evidence": {"form": "github_hosted_linux_x64", "sha256": "c" * 64},
+        "native_host_attestation_bundle_sha256": "4" * 64,
+        "native_host_evidence": {
+            "kind": "github_hosted",
+            "official_execution_allowed": True,
+            "payload": host_payload,
+            "sha256": identity_sha256(host_payload),
+        },
         "non_inference_inventory": non_inference,
         "oci_layout_archive": {"name": "oaf-runtime.oci.tar", "sha256": "d" * 64, "size": 777},
         "oci_layout_manifest_sha256": "3" * 64,
@@ -341,20 +415,15 @@ def seal_payload(*, audit_sha256: str = "c" * 64) -> dict[str, Any]:
         "request_deadline_seconds": 60,
         "required_inference_inventory": required,
         "runner_source_manifest_sha256": "9" * 64,
-        "reference_host_numeric_fingerprint": {
-            "architecture": "x86_64",
-            "cpu_family": "6",
-            "cpu_model": "143",
-            "cpu_stepping": "8",
-            "cpu_vendor_id": "GenuineIntel",
-        },
+        "reference_host_numeric_fingerprint": fingerprint,
         "runtime_gid": 10001,
-        "runtime_image_config_digest": f"sha256:{'e' * 64}",
-        "runtime_image_layer_digests": [f"sha256:{'f' * 64}"],
+        "runtime_image_config_digest": RUNTIME_IMAGE_CONFIG_DIGEST,
+        "runtime_image_index_digest": RUNTIME_IMAGE_INDEX_DIGEST,
+        "runtime_image_layer_diff_ids": deepcopy(RUNTIME_IMAGE_LAYER_DIFF_IDS),
+        "runtime_image_layer_digests": deepcopy(RUNTIME_IMAGE_LAYER_DIGESTS),
         "runtime_image_manifest_digest": f"sha256:{'4' * 64}",
         "runtime_uid": 10001,
         "schema": "crux.backend-seal-evidence/v1",
-        "seal_candidate_sha256": "d" * 64,
         "seal_profile_request_sha256": "e" * 64,
         "security_scan_sha256": "0" * 64,
         "shm_bytes": 67108864,
@@ -639,14 +708,14 @@ def test_lock_loaders_reject_zero_resource_values(
     payload = payload_factory()
     payload[field] = 0
 
-    with pytest.raises(BackendLockError, match="positive integer"):
+    with pytest.raises(BackendLockError, match="integer"):
         loader(write_json(tmp_path / f"{field}.json", payload))
 
 
 def test_seal_evidence_rejects_sentinels_and_final_lock_hashes(tmp_path: Path) -> None:
     payload = seal_payload()
-    payload["measurements"]["request_millis"] = "unlimited"
-    with pytest.raises(BackendLockError, match="positive integer"):
+    payload["measurements"][0]["request_millis"] = "unlimited"
+    with pytest.raises(BackendLockError, match="integer"):
         load_seal_evidence(write_json(tmp_path / "sentinel.json", payload))
 
     payload = seal_payload()
@@ -696,10 +765,13 @@ def test_seal_evidence_rejects_underprovisioned_resource_measurement(
     scale: int,
 ) -> None:
     payload = seal_payload()
-    measured = payload["measurements"][measurement_field]
+    measured = payload["measurements"][0][measurement_field]
     payload[limit_field] = (measured - 1) // scale
 
-    with pytest.raises(BackendLockError, match=rf"{limit_field} must cover {measurement_field}"):
+    with pytest.raises(
+        BackendLockError,
+        match=rf"{limit_field} must strictly exceed {measurement_field}",
+    ):
         load_seal_evidence(write_json(tmp_path / f"{limit_field}.json", payload))
 
 
@@ -714,20 +786,19 @@ def test_seal_evidence_rejects_underprovisioned_resource_measurement(
         ("request_deadline_seconds", "request_millis", 1000),
     ],
 )
-def test_seal_evidence_accepts_equal_resource_measurement_boundary(
+def test_seal_evidence_rejects_equal_resource_measurement_boundary(
     tmp_path: Path,
     limit_field: str,
     measurement_field: str,
     scale: int,
 ) -> None:
     payload = seal_payload()
-    measured = payload["measurements"][measurement_field]
+    measured = payload["measurements"][0][measurement_field]
     assert measured % scale == 0
     payload[limit_field] = measured // scale
 
-    loaded = load_seal_evidence(write_json(tmp_path / f"{limit_field}.json", payload))
-
-    assert loaded.payload[limit_field] * scale == measured
+    with pytest.raises(BackendLockError, match="strictly exceed"):
+        load_seal_evidence(write_json(tmp_path / f"{limit_field}.json", payload))
 
 
 def test_runtime_lock_requires_exact_platform_image_environment_and_tensorflow(
@@ -779,10 +850,12 @@ def test_seal_evidence_requires_acquisition_base_calibration_profile_and_candida
         "base_image_archive_keyring_sha256",
         "additional_system_packages",
         "reference_host_numeric_fingerprint",
+        "calibration_bootstrap_request_sha256",
+        "calibration_bootstrap_evidence_sha256",
         "calibration_measurement_request_sha256",
         "calibration_measurement_evidence_sha256",
         "seal_profile_request_sha256",
-        "seal_candidate_sha256",
+        "native_host_attestation_bundle_sha256",
     ):
         payload = seal_payload()
         del payload[field]
