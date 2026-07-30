@@ -13,6 +13,40 @@ class BackendError:
     code: str
     message: str
 
+    def __post_init__(self) -> None:
+        if (
+            not self.code
+            or self.code[0] not in "abcdefghijklmnopqrstuvwxyz"
+            or any(
+                character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in self.code
+            )
+        ):
+            raise ValueError("backend error code must be stable lowercase snake case")
+        if not self.message:
+            raise ValueError("backend error message must not be empty")
+        try:
+            self.message.encode("utf-8", errors="strict")
+        except UnicodeEncodeError:
+            raise ValueError("backend error message must be valid UTF-8") from None
+        if any(ord(character) < 32 or ord(character) == 127 for character in self.message):
+            raise ValueError("backend error message must be sanitized")
+
+
+class _BackendFailure(RuntimeError):
+    def __init__(self, error: BackendError) -> None:
+        if not isinstance(error, BackendError):
+            raise TypeError("backend failure requires one BackendError")
+        self.error = error
+        super().__init__(error.code)
+
+
+class BackendItemFailure(_BackendFailure):
+    pass
+
+
+class BackendFatalFailure(_BackendFailure):
+    pass
+
 
 @dataclass(frozen=True)
 class PublishedArtifact:

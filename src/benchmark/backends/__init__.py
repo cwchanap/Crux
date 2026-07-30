@@ -1,6 +1,8 @@
 from src.benchmark.backend_identity import BackendDescriptor
 from src.benchmark.backends.base import (
     BackendError,
+    BackendFatalFailure,
+    BackendItemFailure,
     BackendVerification,
     CanonicalAudio,
     MidiDerivative,
@@ -15,6 +17,8 @@ from src.benchmark.backends.base import (
 __all__ = [
     "BackendDescriptor",
     "BackendError",
+    "BackendFatalFailure",
+    "BackendItemFailure",
     "BackendVerification",
     "CanonicalAudio",
     "MidiDerivative",

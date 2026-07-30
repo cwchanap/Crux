@@ -12,6 +12,7 @@ import pytest
 from src.benchmark import backend_publication, backend_reports
 from src.benchmark.backend_identity import canonical_json_bytes, sha256_hex, strict_json_loads
 from src.benchmark.backend_reports import (
+    UNAVAILABLE_BACKEND_REPORT_ID,
     ExecutionReport,
     LegacyScoreReport,
     OperationalReportPublicationError,
@@ -596,7 +597,6 @@ def test_midi_failure_can_retain_prediction_as_incomplete_item() -> None:
         "runtime_lock_sha256",
         "seal_evidence_sha256",
         "execution_attestation",
-        "verification_report",
     ],
 )
 def test_complete_oaf_execution_requires_established_backend_relationships(
@@ -607,6 +607,160 @@ def test_complete_oaf_execution_requires_established_backend_relationships(
 
     with pytest.raises(ReportValidationError, match=field):
         ExecutionReport(payload)
+
+
+def test_complete_inline_execution_allows_null_verification_report() -> None:
+    report = ExecutionReport(make_execution_payload(verification_report=None))
+
+    assert report.payload["status"] == "complete"
+    assert report.payload["verification_report"] is None
+
+
+def unavailable_execution_payload(**changes: object) -> dict[str, object]:
+    payload = make_execution_payload(
+        status="failed",
+        exit_code=2,
+        descriptor=None,
+        descriptor_sha256=None,
+        backend_lock_sha256=None,
+        runtime_lock_sha256=None,
+        parameter_lock_sha256=None,
+        seal_evidence_sha256=None,
+        execution_attestation=None,
+        verification_report=None,
+        items=[],
+        errors=[
+            {
+                "code": "backend_unavailable",
+                "message": "Backend is unavailable.",
+            }
+        ],
+    )
+    payload.update(changes)
+    return payload
+
+
+def test_report_only_unavailable_namespace_accepts_exact_typed_failure(
+    tmp_path: Path,
+) -> None:
+    published = publish_operational_report(
+        tmp_path,
+        backend_id=UNAVAILABLE_BACKEND_REPORT_ID,
+        report=ExecutionReport(unavailable_execution_payload()),
+        now=FIXED_UTC,
+        run_id=FIXED_UUID,
+    )
+
+    assert published.path.parent.parent.name == UNAVAILABLE_BACKEND_REPORT_ID
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"status": "partial", "exit_code": 1},
+        {"backend_lock_sha256": "b" * 64},
+        {"items": [make_execution_item("failed", status="failed")]},
+        {
+            "errors": [
+                {
+                    "code": "different_error",
+                    "message": "Backend is unavailable.",
+                }
+            ]
+        },
+        {
+            "errors": [
+                {
+                    "code": "backend_unavailable",
+                    "message": "Different message.",
+                }
+            ]
+        },
+    ],
+)
+def test_report_only_unavailable_namespace_rejects_nonexact_execution_failure(
+    tmp_path: Path,
+    changes: dict[str, object],
+) -> None:
+    with pytest.raises(
+        OperationalReportPublicationError,
+        match="operational_report_publication_failed",
+    ):
+        publish_operational_report(
+            tmp_path,
+            backend_id=UNAVAILABLE_BACKEND_REPORT_ID,
+            report=ExecutionReport(unavailable_execution_payload(**changes)),
+            now=FIXED_UTC,
+            run_id=FIXED_UUID,
+        )
+
+
+def test_report_only_unavailable_namespace_rejects_verification_report(
+    tmp_path: Path,
+) -> None:
+    report = VerificationReport(
+        make_verification_payload(
+            status="failed",
+            exit_code=2,
+            descriptor=None,
+            descriptor_sha256=None,
+            backend_lock_sha256=None,
+            runtime_lock_sha256=None,
+            parameter_lock_sha256=None,
+            seal_evidence_sha256=None,
+            execution_attestation=None,
+            tensor_coverage={
+                "status": "not_run",
+                "required_count": 0,
+                "restored_count": 0,
+                "non_inference_count": 0,
+                "required_inventory_sha256": None,
+                "non_inference_inventory_sha256": None,
+                "report_path": None,
+                "report_sha256": None,
+            },
+            smoke={
+                "status": "not_run",
+                "audio_sha256": None,
+                "oracle_sha256": None,
+                "prediction_path": None,
+                "prediction_sha256": None,
+            },
+            artifacts=[],
+            errors=[
+                {
+                    "code": "backend_unavailable",
+                    "message": "Backend is unavailable.",
+                }
+            ],
+        )
+    )
+
+    with pytest.raises(
+        OperationalReportPublicationError,
+        match="operational_report_publication_failed",
+    ):
+        publish_operational_report(
+            tmp_path,
+            backend_id=UNAVAILABLE_BACKEND_REPORT_ID,
+            report=report,
+            now=FIXED_UTC,
+            run_id=FIXED_UUID,
+        )
+
+
+def test_known_legacy_transcription_namespace_accepts_only_unavailable_execution(
+    tmp_path: Path,
+) -> None:
+    published = publish_operational_report(
+        tmp_path,
+        backend_id="legacy-tf2-h5-v0",
+        report=ExecutionReport(unavailable_execution_payload()),
+        now=FIXED_UTC,
+        run_id=FIXED_UUID,
+    )
+
+    assert published.path.parent.parent.name == "legacy-tf2-h5-v0"
 
 
 def test_complete_heuristic_execution_requires_parameter_lock_only() -> None:
