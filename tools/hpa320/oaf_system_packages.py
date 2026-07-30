@@ -13,6 +13,7 @@ import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from typing import Any, cast
 
 from src.benchmark.backend_process import NativeHostEvidence
@@ -227,6 +228,31 @@ def load_base_system_package_evidence(
         native_host_evidence=host,
         sha256=hashlib.sha256(content).hexdigest(),
     )
+
+
+def validate_schema_golden(schema: str, content: bytes) -> None:
+    """Run the isolated request fixture through the production request loader."""
+    if schema == BASE_SYSTEM_PACKAGE_EVIDENCE_SCHEMA:
+        try:
+            payload = _strict_json_loads(content[:-1])
+            if not isinstance(payload, dict) or set(payload) != _BASE_SYSTEM_EVIDENCE_KEYS:
+                raise ValueError("base-system evidence schema golden fields are invalid")
+            if payload["schema"] != schema or not isinstance(
+                payload["additional_system_packages"], list
+            ):
+                raise ValueError("base-system evidence schema golden is invalid")
+            return
+        except (SystemPackageError, ValueError):
+            raise ValueError("base-system evidence schema golden is invalid") from None
+    if schema != BASE_SYSTEM_PACKAGE_REQUEST_SCHEMA:
+        raise ValueError("base-system schema golden is unsupported")
+    try:
+        with TemporaryDirectory(dir=Path.cwd()) as directory:
+            path = Path(directory) / "golden.json"
+            path.write_bytes(content)
+            load_base_system_package_request(path)
+    except (OSError, SystemPackageError) as error:
+        raise ValueError(str(error)) from None
 
 
 def _read_canonical_base_system_object(path: Path, label: str) -> tuple[dict[str, object], bytes]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,7 +14,12 @@ from runtime.oaf_tf1.oaf_backend import (
     assert_no_reachable_stochastic_ops,
     validate_tensor_coverage,
 )
-from runtime.oaf_tf1.protocol import AuthenticatedObject, VerifiedWav
+from runtime.oaf_tf1.protocol import (
+    AuthenticatedObject,
+    ProtocolFailure,
+    VerifiedWav,
+    load_authenticated_object,
+)
 
 
 def _entry(index: int) -> dict[str, object]:
@@ -53,6 +59,37 @@ def test_tensor_coverage_accepts_exact_130_78_52_partition() -> None:
     assert coverage.non_inference_count == 52
     assert len(coverage.required_inventory_sha256) == 64
     assert len(coverage.non_inference_inventory_sha256) == 64
+
+
+def test_runner_lock_key_sets_match_host_and_reject_legacy_runtime_fields(tmp_path: Path) -> None:
+    from src.benchmark import backend_lock
+
+    assert oaf_backend.BACKEND_LOCK_KEYS == backend_lock.BACKEND_LOCK_KEYS
+    assert oaf_backend.RUNTIME_LOCK_KEYS == backend_lock.RUNTIME_LOCK_KEYS
+    assert oaf_backend.SEAL_EVIDENCE_KEYS == backend_lock.SEAL_EVIDENCE_KEYS
+
+    payload = {key: "fixture" for key in oaf_backend.RUNTIME_LOCK_KEYS}
+    payload["schema"] = "crux.transcription-runtime-lock/v1"
+    path = tmp_path / "runtime-lock.json"
+    path.write_bytes(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+    loaded = load_authenticated_object(
+        path,
+        label="runtime_lock",
+        exact_keys=oaf_backend.RUNTIME_LOCK_KEYS,
+        expected_schema="crux.transcription-runtime-lock/v1",
+    )
+    assert loaded.payload["schema"] == "crux.transcription-runtime-lock/v1"
+
+    legacy = dict(payload)
+    legacy["debian_snapshot_repository"] = "legacy"
+    path.write_bytes(json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+    with pytest.raises(ProtocolFailure, match="mounted runner identity"):
+        load_authenticated_object(
+            path,
+            label="runtime_lock",
+            exact_keys=oaf_backend.RUNTIME_LOCK_KEYS,
+            expected_schema="crux.transcription-runtime-lock/v1",
+        )
 
 
 @pytest.mark.parametrize(

@@ -62,6 +62,8 @@ BACKEND_LOCK_KEYS = frozenset(
     {
         "architecture_id",
         "backend_id",
+        "checkpoint_acquisition_evidence_sha256",
+        "checkpoint_acquisition_request_sha256",
         "checkpoint_archive",
         "checkpoint_components",
         "checkpoint_inventory",
@@ -101,10 +103,14 @@ BACKEND_LOCK_KEYS = frozenset(
 )
 RUNTIME_LOCK_KEYS = frozenset(
     {
+        "additional_system_packages",
         "base_image",
+        "base_image_archive_keyring_sha256",
         "base_image_manifest_digest",
-        "debian_release_sha256",
-        "debian_snapshot_repository",
+        "base_system_package_evidence_sha256",
+        "base_system_package_inventory",
+        "base_system_package_inventory_sha256",
+        "base_system_package_request_sha256",
         "distribution_build_manifest_sha256",
         "environment",
         "oci_layout_manifest_sha256",
@@ -119,7 +125,6 @@ RUNTIME_LOCK_KEYS = frozenset(
         "stderr_max_line_bytes",
         "stderr_read_chunk_bytes",
         "stderr_ring_buffer_bytes",
-        "system_packages",
         "tensorflow_abi",
         "tensorflow_build",
         "upstream_source_manifest_sha256",
@@ -127,14 +132,22 @@ RUNTIME_LOCK_KEYS = frozenset(
 )
 SEAL_EVIDENCE_KEYS = frozenset(
     {
+        "additional_system_packages",
         "advisory_snapshot_sha256",
+        "base_image_archive_keyring_sha256",
         "base_image_manifest_digest",
+        "base_system_package_evidence_sha256",
+        "base_system_package_inventory",
+        "base_system_package_inventory_sha256",
+        "base_system_package_request_sha256",
+        "calibration_measurement_evidence_sha256",
+        "calibration_measurement_request_sha256",
+        "checkpoint_acquisition_evidence_sha256",
+        "checkpoint_acquisition_request_sha256",
         "checkpoint_archive",
         "checkpoint_components",
         "checkpoint_inventory",
         "cpu_limit_millis",
-        "debian_release_sha256",
-        "debian_snapshot_repository",
         "distribution_build_manifest_sha256",
         "host_adapter_source_manifest_sha256",
         "instrumentation_patch_sha256",
@@ -148,6 +161,7 @@ SEAL_EVIDENCE_KEYS = frozenset(
         "oci_layout_manifest_sha256",
         "pid_limit",
         "python_distributions",
+        "reference_host_numeric_fingerprint",
         "request_deadline_seconds",
         "required_inference_inventory",
         "runner_source_manifest_sha256",
@@ -157,6 +171,8 @@ SEAL_EVIDENCE_KEYS = frozenset(
         "runtime_image_manifest_digest",
         "runtime_uid",
         "schema",
+        "seal_candidate_sha256",
+        "seal_profile_request_sha256",
         "security_scan_sha256",
         "shm_bytes",
         "smoke_audio_sha256",
@@ -167,7 +183,6 @@ SEAL_EVIDENCE_KEYS = frozenset(
         "stderr_max_line_bytes",
         "stderr_read_chunk_bytes",
         "stderr_ring_buffer_bytes",
-        "system_packages",
         "tensor_coverage_sha256",
         "tensorflow_abi",
         "tensorflow_build",
@@ -210,6 +225,56 @@ DESCRIPTOR_FIELDS = (
     "training_data_map_id",
     "upstream_source_commit",
 )
+
+
+def validate_schema_golden(schema, content):
+    """Check the runner-side exact keys for isolated lock-schema drift fixtures."""
+    expected_by_schema = {
+        "crux.transcription-backend-lock/v1": BACKEND_LOCK_KEYS,
+        "crux.transcription-runtime-lock/v1": RUNTIME_LOCK_KEYS,
+        "crux.backend-seal-evidence/v1": SEAL_EVIDENCE_KEYS,
+        "crux.oaf-upstream-source-manifest/v1": UPSTREAM_MANIFEST_KEYS,
+        "crux.oaf-runner-source-manifest/v1": RUNNER_MANIFEST_KEYS,
+        "crux.oaf-smoke-oracle/v1": SMOKE_ORACLE_KEYS,
+        "crux.oaf-tensor-coverage/v1": {
+            "active_predict_dropout",
+            "checkpoint_inventory",
+            "non_inference_inventory",
+            "note_sequence_byte_parity",
+            "required_inference_inventory",
+            "schema",
+            "uninitialized_required",
+        },
+    }
+    try:
+        expected = expected_by_schema[schema]
+        if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+            raise ValueError("schema golden newline is invalid")
+        value = json.loads(content[:-1].decode("utf-8"))
+        if not isinstance(value, dict) or set(value) != expected or value.get("schema") != schema:
+            raise ValueError("schema golden keys are invalid")
+        if canonical_json_bytes(value, trailing_newline=True) != content:
+            raise ValueError("schema golden is not canonical")
+        if "additional_system_packages" in expected and not isinstance(
+            value["additional_system_packages"], list
+        ):
+            raise ValueError("schema golden additional packages are invalid")
+        if "architecture_id" in expected and not isinstance(value["architecture_id"], str):
+            raise ValueError("schema golden architecture is invalid")
+        if "covered_roots" in expected and not isinstance(value["covered_roots"], list):
+            raise ValueError("schema golden roots are invalid")
+        if "input_audio_frame_count" in expected and (
+            not isinstance(value["input_audio_frame_count"], int)
+            or isinstance(value["input_audio_frame_count"], bool)
+            or value["input_audio_frame_count"] <= 0
+        ):
+            raise ValueError("schema golden frame count is invalid")
+        if "active_predict_dropout" in expected and value["active_predict_dropout"] is not False:
+            raise ValueError("schema golden tensor coverage is invalid")
+    except (UnicodeDecodeError, ValueError, TypeError):
+        raise ValueError("runner schema golden is invalid") from None
+
+
 _STOCHASTIC_OPERATION_TYPES = frozenset(
     {
         "Multinomial",

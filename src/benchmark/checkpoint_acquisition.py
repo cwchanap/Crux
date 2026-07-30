@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from typing import Literal, cast
 
 from src.benchmark.backend_identity import (
@@ -68,7 +69,7 @@ _EVIDENCE_KEYS = frozenset(
         "acquisition_mode",
         "archive",
         "archive_members",
-        "published_component_names",
+        "published_components",
         "model_artifact_set_sha256",
         "cache_path",
     }
@@ -129,7 +130,11 @@ def render_checkpoint_acquisition_evidence(
         ],
         "cache_path": str(cache_path),
         "model_artifact_set_sha256": model_artifact_set_sha256,
-        "published_component_names": list(request.published_component_names),
+        "published_components": [
+            _identity_payload(member)
+            for member in request.archive_members
+            if member.role == "published_component"
+        ],
         "request_sha256": request.sha256,
         "schema": CHECKPOINT_ACQUISITION_EVIDENCE_SCHEMA,
     }
@@ -226,7 +231,12 @@ def load_checkpoint_acquisition_evidence(
         ]
         if value["archive_members"] != expected_members:
             raise CheckpointAcquisitionError("checkpoint acquisition evidence members are invalid")
-        if value["published_component_names"] != list(request.published_component_names):
+        expected_components = [
+            _identity_payload(member)
+            for member in request.archive_members
+            if member.role == "published_component"
+        ]
+        if value["published_components"] != expected_components:
             raise CheckpointAcquisitionError(
                 "checkpoint acquisition evidence components are invalid"
             )
@@ -249,6 +259,52 @@ def load_checkpoint_acquisition_evidence(
         if isinstance(error, CheckpointAcquisitionError):
             raise
         raise CheckpointAcquisitionError("checkpoint acquisition evidence is invalid") from None
+
+
+def validate_schema_golden(schema: str, content: bytes) -> None:
+    """Run isolated acquisition fixtures through production acquisition loaders."""
+    try:
+        with TemporaryDirectory(dir=Path.cwd()) as directory:
+            path = Path(directory) / "golden.json"
+            path.write_bytes(content)
+            if schema == CHECKPOINT_ACQUISITION_REQUEST_SCHEMA:
+                load_checkpoint_acquisition_request(path)
+            elif schema == CHECKPOINT_ACQUISITION_EVIDENCE_SCHEMA:
+                request_path = Path(directory) / "request.json"
+                request_path.write_bytes(
+                    canonical_json_bytes(
+                        {
+                            "archive": {
+                                "name": _ARCHIVE[0],
+                                "sha256": _ARCHIVE[1],
+                                "size": _ARCHIVE[2],
+                            },
+                            "archive_members": [
+                                {"name": name, "role": role, "sha256": digest, "size": size}
+                                for name, digest, size, role in _MEMBERS
+                            ],
+                            "backend_id": OFFICIAL_BACKEND_ID,
+                            "checkpoint_url": CHECKPOINT_URL,
+                            "published_component_names": [
+                                name
+                                for name, _digest, _size, role in _MEMBERS
+                                if role == "published_component"
+                            ],
+                            "schema": CHECKPOINT_ACQUISITION_REQUEST_SCHEMA,
+                        },
+                        trailing_newline=True,
+                    )
+                )
+                load_checkpoint_acquisition_evidence(
+                    path,
+                    request=load_checkpoint_acquisition_request(request_path),
+                )
+            else:
+                raise CheckpointAcquisitionError(
+                    "checkpoint acquisition schema golden is unsupported"
+                )
+    except (OSError, CheckpointAcquisitionError) as error:
+        raise ValueError(str(error)) from None
 
 
 def _identity(value: object, field: str) -> CheckpointIdentity:

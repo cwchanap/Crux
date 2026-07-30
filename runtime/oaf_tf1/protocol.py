@@ -278,6 +278,26 @@ def _validate_relative_path(value: Any) -> str:
     return value
 
 
+def validate_schema_golden(schema: str, content: bytes) -> None:
+    """Validate the runner request fixture through the production request parser."""
+    if schema != PROTOCOL_SCHEMA:
+        raise ValueError("runner protocol schema golden is unsupported")
+    try:
+        if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+            raise ValueError("runner protocol schema golden newline is invalid")
+        payload = _strict_json_loads(content[:-1])
+        if canonical_json_bytes(payload, trailing_newline=True) != content:
+            raise ValueError("runner protocol schema golden is not canonical")
+        if not isinstance(payload, Mapping):
+            raise ValueError("runner protocol schema golden is not an object")
+        validate_transcribe_request(
+            payload,
+            expected_descriptor_sha256="a" * 64,
+        )
+    except (ProtocolFailure, TypeError, ValueError):
+        raise ValueError("runner protocol schema golden is invalid") from None
+
+
 def validate_transcribe_request(
     payload: Mapping[str, Any], *, expected_descriptor_sha256: str
 ) -> TranscribeRequest:

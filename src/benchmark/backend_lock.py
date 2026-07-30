@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import os
-import re
 import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
@@ -61,10 +59,6 @@ _CHECKPOINT_URL = (
 )
 _HPARAMS_SOURCE = "magenta/models/onsets_frames_transcription/configs.py:drums"
 _OBSERVED_HDF5_SHA256 = "d36ced8b2ee241bc37ad6fbb918ba38e95d666350dd4888bca59a1243bf4d10e"
-_DEBIAN_SNAPSHOT_PATTERN = re.compile(
-    r"https://snapshot\.debian\.org/archive/debian/(?P<timestamp>[0-9]{8}T[0-9]{6}Z)/?"
-)
-_DEBIAN_SNAPSHOT_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 CHECKPOINT_COMPONENT_HASHES = MappingProxyType(
     {
         "model.ckpt-569400.data-00000-of-00001": (
@@ -198,8 +192,7 @@ TRAINING_GROUPS = (
     ),
 )
 _NATIVE_METADATA_FIELDS = (
-    MappingProxyType({"name": "frame_index", "nullable": False, "type": "integer"}),
-    MappingProxyType({"name": "upstream_group_id", "nullable": True, "type": "string"}),
+    MappingProxyType({"name": "upstream_8hit_group_id", "nullable": True, "type": "string"}),
 )
 _SERIALIZATION_RULES = MappingProxyType(
     {
@@ -214,6 +207,8 @@ BACKEND_LOCK_KEYS = frozenset(
     {
         "architecture_id",
         "backend_id",
+        "checkpoint_acquisition_evidence_sha256",
+        "checkpoint_acquisition_request_sha256",
         "checkpoint_archive",
         "checkpoint_components",
         "checkpoint_inventory",
@@ -253,10 +248,14 @@ BACKEND_LOCK_KEYS = frozenset(
 )
 RUNTIME_LOCK_KEYS = frozenset(
     {
+        "additional_system_packages",
         "base_image",
+        "base_image_archive_keyring_sha256",
         "base_image_manifest_digest",
-        "debian_release_sha256",
-        "debian_snapshot_repository",
+        "base_system_package_evidence_sha256",
+        "base_system_package_inventory",
+        "base_system_package_inventory_sha256",
+        "base_system_package_request_sha256",
         "distribution_build_manifest_sha256",
         "environment",
         "oci_layout_manifest_sha256",
@@ -271,7 +270,6 @@ RUNTIME_LOCK_KEYS = frozenset(
         "stderr_max_line_bytes",
         "stderr_read_chunk_bytes",
         "stderr_ring_buffer_bytes",
-        "system_packages",
         "tensorflow_abi",
         "tensorflow_build",
         "upstream_source_manifest_sha256",
@@ -279,14 +277,22 @@ RUNTIME_LOCK_KEYS = frozenset(
 )
 SEAL_EVIDENCE_KEYS = frozenset(
     {
+        "additional_system_packages",
         "advisory_snapshot_sha256",
+        "base_image_archive_keyring_sha256",
         "base_image_manifest_digest",
+        "base_system_package_evidence_sha256",
+        "base_system_package_inventory",
+        "base_system_package_inventory_sha256",
+        "base_system_package_request_sha256",
+        "calibration_measurement_evidence_sha256",
+        "calibration_measurement_request_sha256",
+        "checkpoint_acquisition_evidence_sha256",
+        "checkpoint_acquisition_request_sha256",
         "checkpoint_archive",
         "checkpoint_components",
         "checkpoint_inventory",
         "cpu_limit_millis",
-        "debian_release_sha256",
-        "debian_snapshot_repository",
         "distribution_build_manifest_sha256",
         "host_adapter_source_manifest_sha256",
         "instrumentation_patch_sha256",
@@ -300,6 +306,7 @@ SEAL_EVIDENCE_KEYS = frozenset(
         "oci_layout_manifest_sha256",
         "pid_limit",
         "python_distributions",
+        "reference_host_numeric_fingerprint",
         "request_deadline_seconds",
         "required_inference_inventory",
         "runner_source_manifest_sha256",
@@ -309,6 +316,8 @@ SEAL_EVIDENCE_KEYS = frozenset(
         "runtime_image_manifest_digest",
         "runtime_uid",
         "schema",
+        "seal_candidate_sha256",
+        "seal_profile_request_sha256",
         "security_scan_sha256",
         "shm_bytes",
         "smoke_audio_sha256",
@@ -319,7 +328,6 @@ SEAL_EVIDENCE_KEYS = frozenset(
         "stderr_max_line_bytes",
         "stderr_read_chunk_bytes",
         "stderr_ring_buffer_bytes",
-        "system_packages",
         "tensor_coverage_sha256",
         "tensorflow_abi",
         "tensorflow_build",
@@ -348,6 +356,10 @@ _COMPONENT_KEYS = frozenset({"name", "sha256", "size"})
 _VARIABLE_KEYS = frozenset({"dtype", "name", "shape"})
 _NON_INFERENCE_KEYS = frozenset({"dtype", "name", "reason", "shape"})
 _PACKAGE_KEYS = frozenset({"filename", "name", "sha256", "version"})
+_BASE_SYSTEM_PACKAGE_KEYS = frozenset({"architecture", "name", "version"})
+_HOST_NUMERIC_FINGERPRINT_KEYS = frozenset(
+    {"architecture", "cpu_family", "cpu_model", "cpu_stepping", "cpu_vendor_id"}
+)
 _MEASUREMENT_KEYS = frozenset(
     {
         "peak_cpu_millis",
@@ -523,6 +535,34 @@ def load_conversion_audit(path: Path) -> LoadedConversionAudit:
     )
 
 
+def validate_schema_golden(schema: str, content: bytes) -> None:
+    """Validate an isolated Phase A schema fixture without treating it as a lock authority."""
+    expected_by_schema = {
+        BACKEND_LOCK_SCHEMA: BACKEND_LOCK_KEYS,
+        RUNTIME_LOCK_SCHEMA: RUNTIME_LOCK_KEYS,
+        SEAL_EVIDENCE_SCHEMA: SEAL_EVIDENCE_KEYS,
+        CONVERSION_AUDIT_SCHEMA: CONVERSION_AUDIT_KEYS,
+    }
+    try:
+        expected = expected_by_schema[schema]
+        if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+            raise BackendLockError("schema golden must have exactly one final newline")
+        payload = strict_json_loads(content[:-1], require_canonical=True)
+        if not isinstance(payload, dict):
+            raise BackendLockError("schema golden must be an object")
+        _require_fields(payload, expected, "schema golden")
+        _require_exact_string(payload, "schema", schema, "schema golden schema")
+        first_key = min(expected)
+        if first_key == "additional_system_packages" and not isinstance(payload[first_key], list):
+            raise BackendLockError("schema golden additional system packages must be an array")
+        if first_key == "architecture_id":
+            _require_nonempty_string(payload[first_key], "schema golden architecture")
+        if first_key == "candidate_matches" and not isinstance(payload[first_key], list):
+            raise BackendLockError("schema golden candidate matches must be an array")
+    except (KeyError, StrictJsonError, BackendLockError) as error:
+        raise ValueError(str(error)) from None
+
+
 # The cross-record gate spells out each independent identity comparison.
 # pylint: disable-next=too-many-branches
 def validate_oaf_lock_set(
@@ -619,10 +659,13 @@ def validate_oaf_lock_set(
     for field in (
         "runner_source_manifest_sha256",
         "stdout_max_line_bytes",
-        "debian_snapshot_repository",
-        "debian_release_sha256",
+        "additional_system_packages",
+        "base_image_archive_keyring_sha256",
+        "base_system_package_evidence_sha256",
+        "base_system_package_inventory",
+        "base_system_package_inventory_sha256",
+        "base_system_package_request_sha256",
         "python_distributions",
-        "system_packages",
         "stderr_read_chunk_bytes",
         "stderr_max_line_bytes",
         "stderr_ring_buffer_bytes",
@@ -634,6 +677,11 @@ def validate_oaf_lock_set(
         "max_input_audio_frames",
         "maximum input audio frames mismatch",
     )
+    for field in (
+        "checkpoint_acquisition_evidence_sha256",
+        "checkpoint_acquisition_request_sha256",
+    ):
+        _require_same(backend_payload, seal_payload, field, "checkpoint acquisition mismatch")
 
     artifact_set_sha256 = _inventory_identity(backend_payload["checkpoint_components"])
     if audit_payload["model_artifact_set_sha256"] != artifact_set_sha256:
@@ -718,6 +766,8 @@ def _validate_backend_lock(payload: dict[str, JsonValue]) -> None:
     )
     _require_positive_integer(payload["max_input_audio_frames"], "max_input_audio_frames")
     for field in (
+        "checkpoint_acquisition_evidence_sha256",
+        "checkpoint_acquisition_request_sha256",
         "host_adapter_source_manifest_sha256",
         "legacy_conversion_coverage_sha256",
         "runtime_lock_sha256",
@@ -762,7 +812,10 @@ def _validate_runtime_lock(payload: dict[str, JsonValue]) -> None:
     ):
         _require_exact_string(payload, field, expected, f"runtime {field}")
     for field in (
-        "debian_release_sha256",
+        "base_image_archive_keyring_sha256",
+        "base_system_package_evidence_sha256",
+        "base_system_package_inventory_sha256",
+        "base_system_package_request_sha256",
         "distribution_build_manifest_sha256",
         "oci_layout_manifest_sha256",
         "runner_source_manifest_sha256",
@@ -771,7 +824,6 @@ def _validate_runtime_lock(payload: dict[str, JsonValue]) -> None:
     ):
         _require_hash(payload[field], field)
     _require_digest(payload["runtime_image_manifest_digest"], "runtime image manifest")
-    _require_debian_snapshot(payload["debian_snapshot_repository"])
     _require_nonempty_string(payload["tensorflow_abi"], "TensorFlow ABI")
     _require_nonempty_string(payload["tensorflow_build"], "TensorFlow build")
     if payload["environment"] != dict(REQUIRED_ENVIRONMENT):
@@ -784,7 +836,8 @@ def _validate_runtime_lock(payload: dict[str, JsonValue]) -> None:
     ):
         _require_positive_integer(payload[field], field)
     distributions = _validate_packages(payload["python_distributions"], "Python distributions")
-    _validate_packages(payload["system_packages"], "system packages")
+    _validate_empty_additional_system_packages(payload["additional_system_packages"])
+    _validate_base_system_package_inventory(payload["base_system_package_inventory"])
     tensorflow = next(
         (distribution for distribution in distributions if distribution["name"] == "tensorflow"),
         None,
@@ -806,13 +859,22 @@ def _validate_seal_evidence(payload: dict[str, JsonValue]) -> None:
     _require_exact_string(payload, "schema", SEAL_EVIDENCE_SCHEMA, "seal evidence schema")
     for field in (
         "advisory_snapshot_sha256",
-        "debian_release_sha256",
+        "base_image_archive_keyring_sha256",
+        "base_system_package_evidence_sha256",
+        "base_system_package_inventory_sha256",
+        "base_system_package_request_sha256",
+        "calibration_measurement_evidence_sha256",
+        "calibration_measurement_request_sha256",
+        "checkpoint_acquisition_evidence_sha256",
+        "checkpoint_acquisition_request_sha256",
         "distribution_build_manifest_sha256",
         "host_adapter_source_manifest_sha256",
         "instrumentation_patch_sha256",
         "legacy_conversion_coverage_sha256",
         "oci_layout_manifest_sha256",
         "runner_source_manifest_sha256",
+        "seal_candidate_sha256",
+        "seal_profile_request_sha256",
         "security_scan_sha256",
         "smoke_audio_sha256",
         "smoke_oracle_sha256",
@@ -827,7 +889,6 @@ def _validate_seal_evidence(payload: dict[str, JsonValue]) -> None:
         "runtime_image_manifest_digest",
     ):
         _require_digest(payload[field], field)
-    _require_debian_snapshot(payload["debian_snapshot_repository"])
     _require_nonempty_string(payload["tensorflow_abi"], "TensorFlow ABI")
     _require_nonempty_string(payload["tensorflow_build"], "TensorFlow build")
     for field in (
@@ -869,7 +930,9 @@ def _validate_seal_evidence(payload: dict[str, JsonValue]) -> None:
     _validate_components(payload["checkpoint_components"])
     _validate_inventories(payload)
     _validate_packages(payload["python_distributions"], "Python distributions")
-    _validate_packages(payload["system_packages"], "system packages")
+    _validate_empty_additional_system_packages(payload["additional_system_packages"])
+    _validate_base_system_package_inventory(payload["base_system_package_inventory"])
+    _validate_reference_host_numeric_fingerprint(payload["reference_host_numeric_fingerprint"])
     _validate_archive(payload["oci_layout_archive"], fixed_identity=False)
     layers = _require_list(payload["runtime_image_layer_digests"], "runtime image layers")
     if not layers:
@@ -1084,6 +1147,41 @@ def _validate_packages(value: JsonValue, label: str) -> list[dict[str, JsonValue
     return packages
 
 
+def _validate_empty_additional_system_packages(value: JsonValue) -> None:
+    if value != []:
+        raise BackendLockError("additional system packages must be empty")
+
+
+def _validate_base_system_package_inventory(value: JsonValue) -> None:
+    values = _require_list(value, "base-system package inventory")
+    if not values:
+        raise BackendLockError("base-system package inventory must not be empty")
+    rows: list[tuple[str, str, str]] = []
+    for item in values:
+        row = _require_object(item, "base-system package inventory row")
+        _require_fields(row, _BASE_SYSTEM_PACKAGE_KEYS, "base-system package inventory row")
+        rows.append(
+            (
+                _require_nonempty_string(row["name"], "base-system package name"),
+                _require_nonempty_string(row["version"], "base-system package version"),
+                _require_nonempty_string(row["architecture"], "base-system package architecture"),
+            )
+        )
+    if len(set(rows)) != len(rows) or rows != sorted(rows):
+        raise BackendLockError("base-system package inventory must be unique and sorted")
+
+
+def _validate_reference_host_numeric_fingerprint(value: JsonValue) -> None:
+    fingerprint = _require_object(value, "reference host numeric fingerprint")
+    _require_fields(
+        fingerprint,
+        _HOST_NUMERIC_FINGERPRINT_KEYS,
+        "reference host numeric fingerprint",
+    )
+    for field in _HOST_NUMERIC_FINGERPRINT_KEYS:
+        _require_nonempty_string(fingerprint[field], f"reference host numeric fingerprint {field}")
+
+
 def _build_oaf_descriptor(
     backend_payload: Mapping[str, JsonValue],
     backend_sha256: str,
@@ -1187,22 +1285,6 @@ def _require_digest(value: JsonValue, label: str) -> str:
         raise BackendLockError(f"{label} must be a sha256 digest")
     _require_hash(value[7:], label)
     return value
-
-
-def _require_debian_snapshot(value: JsonValue) -> str:
-    """Require a calendar-valid snapshot URL, allowing only an optional trailing slash."""
-    repository = _require_nonempty_string(value, "Debian snapshot")
-    match = _DEBIAN_SNAPSHOT_PATTERN.fullmatch(repository)
-    if match is None:
-        raise BackendLockError("Debian repository must be snapshot-addressed")
-    timestamp = match.group("timestamp")
-    try:
-        parsed = datetime.strptime(timestamp, _DEBIAN_SNAPSHOT_TIMESTAMP_FORMAT)
-    except ValueError:
-        raise BackendLockError("Debian repository must be snapshot-addressed") from None
-    if parsed.strftime(_DEBIAN_SNAPSHOT_TIMESTAMP_FORMAT) != timestamp:
-        raise BackendLockError("Debian repository must be snapshot-addressed")
-    return repository
 
 
 def _require_exact_string(
