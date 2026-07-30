@@ -352,6 +352,13 @@ def test_transcribe_and_score_cli_runs_and_reports_chart_count(tmp_path: Path, m
     assert "1 chart" in result.output
 
 
+def test_transcribe_and_score_help_has_no_backend_option() -> None:
+    result = CliRunner().invoke(main, ["benchmark", "transcribe-and-score", "--help"])
+
+    assert result.exit_code == 0
+    assert "--backend" not in result.output
+
+
 def make_sync_outcome(
     status: OverallStatus,
     tmp_path: Path,

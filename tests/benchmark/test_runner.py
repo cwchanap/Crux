@@ -66,6 +66,33 @@ def test_transcribe_and_score_uses_injected_transcriber(tmp_path: Path):
     assert (output / "predictions" / "foo.mid").exists()
 
 
+def test_current_default_transcribe_constructs_drum_transcriber_once(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    charts = tmp_path / "charts"
+    audio = tmp_path / "audio"
+    output = tmp_path / "output"
+    charts.mkdir()
+    audio.mkdir()
+    for chart_id in ("a", "b"):
+        (charts / f"{chart_id}.dtx").write_text(
+            "#BPM: 120\n#00013: 0100\n",
+            encoding="utf-8",
+        )
+        (audio / f"{chart_id}.wav").write_bytes(b"characterization")
+
+    calls: list[Path] = []
+
+    def transcribe(path: Path) -> bytes:
+        calls.append(path)
+        return write_prediction_bytes()
+
+    run_transcribe_and_score(charts, audio, output, [50], transcribe=transcribe)
+
+    assert calls == [audio / "a.wav", audio / "b.wav"]
+
+
 def test_transcribe_and_score_skips_missing_audio(tmp_path: Path):
     """Charts with missing audio are skipped; remaining charts are still scored."""
     charts = tmp_path / "charts"
