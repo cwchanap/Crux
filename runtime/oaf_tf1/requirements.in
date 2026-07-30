@@ -1,0 +1,13 @@
+# Direct distributions imported by the frozen, reachable Magenta OaF source closure.
+attrs==21.4.0
+bokeh==2.4.3
+ipython==7.34.0
+librosa==0.8.1
+numpy==1.18.5
+pandas==1.2.5
+pretty-midi==0.2.10
+protobuf==3.20.3
+scipy==1.7.3
+six==1.16.0
+tensorflow==1.15.5
+tensorflow-probability==0.7.0

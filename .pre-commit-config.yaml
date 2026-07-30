@@ -1,3 +1,5 @@
+exclude: ^runtime/oaf_tf1/vendor/
+
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Pin to a specific tag of ruff-pre-commit

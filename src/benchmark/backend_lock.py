@@ -257,6 +257,7 @@ RUNTIME_LOCK_KEYS = frozenset(
         "base_image_manifest_digest",
         "debian_release_sha256",
         "debian_snapshot_repository",
+        "distribution_build_manifest_sha256",
         "environment",
         "oci_layout_manifest_sha256",
         "platform",
@@ -286,6 +287,7 @@ SEAL_EVIDENCE_KEYS = frozenset(
         "cpu_limit_millis",
         "debian_release_sha256",
         "debian_snapshot_repository",
+        "distribution_build_manifest_sha256",
         "host_adapter_source_manifest_sha256",
         "instrumentation_patch_sha256",
         "legacy_conversion_coverage_sha256",
@@ -591,6 +593,12 @@ def validate_oaf_lock_set(
         "OCI layout manifest evidence mismatch",
     )
     _require_same(
+        runtime_payload,
+        seal_payload,
+        "distribution_build_manifest_sha256",
+        "distribution build manifest evidence mismatch",
+    )
+    _require_same(
         backend_payload,
         runtime_payload,
         "upstream_source_manifest_sha256",
@@ -755,6 +763,7 @@ def _validate_runtime_lock(payload: dict[str, JsonValue]) -> None:
         _require_exact_string(payload, field, expected, f"runtime {field}")
     for field in (
         "debian_release_sha256",
+        "distribution_build_manifest_sha256",
         "oci_layout_manifest_sha256",
         "runner_source_manifest_sha256",
         "seal_evidence_sha256",
@@ -798,6 +807,7 @@ def _validate_seal_evidence(payload: dict[str, JsonValue]) -> None:
     for field in (
         "advisory_snapshot_sha256",
         "debian_release_sha256",
+        "distribution_build_manifest_sha256",
         "host_adapter_source_manifest_sha256",
         "instrumentation_patch_sha256",
         "legacy_conversion_coverage_sha256",

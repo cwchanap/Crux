@@ -268,6 +268,7 @@ def runtime_payload(*, seal_sha256: str = "b" * 64) -> dict[str, Any]:
         ),
         "debian_release_sha256": "8" * 64,
         "debian_snapshot_repository": "https://snapshot.debian.org/archive/debian/20240101T000000Z",
+        "distribution_build_manifest_sha256": "d" * 64,
         "environment": deepcopy(ENVIRONMENT),
         "oci_layout_manifest_sha256": "3" * 64,
         "platform": "linux/amd64",
@@ -305,6 +306,7 @@ def seal_payload(*, audit_sha256: str = "c" * 64) -> dict[str, Any]:
         "cpu_limit_millis": 2000,
         "debian_release_sha256": "8" * 64,
         "debian_snapshot_repository": "https://snapshot.debian.org/archive/debian/20240101T000000Z",
+        "distribution_build_manifest_sha256": "d" * 64,
         "host_adapter_source_manifest_sha256": "3" * 64,
         "instrumentation_patch_sha256": "b" * 64,
         "legacy_conversion_coverage_sha256": audit_sha256,
@@ -792,6 +794,64 @@ def test_oci_layout_manifest_hash_is_required_by_runtime_and_seal(tmp_path: Path
     del seal["oci_layout_manifest_sha256"]
     with pytest.raises(BackendLockError, match="seal evidence fields"):
         load_seal_evidence(write_json(tmp_path / "seal.json", seal))
+
+
+def test_distribution_build_manifest_hash_is_required_by_runtime_and_seal(
+    tmp_path: Path,
+) -> None:
+    runtime = runtime_payload()
+    del runtime["distribution_build_manifest_sha256"]
+    with pytest.raises(BackendLockError, match="runtime lock fields"):
+        load_runtime_lock(write_json(tmp_path / "runtime.json", runtime))
+
+    seal = seal_payload()
+    del seal["distribution_build_manifest_sha256"]
+    with pytest.raises(BackendLockError, match="seal evidence fields"):
+        load_seal_evidence(write_json(tmp_path / "seal.json", seal))
+
+
+@pytest.mark.parametrize("payload_factory", [runtime_payload, seal_payload])
+def test_distribution_build_manifest_hash_must_be_lowercase_sha256(
+    tmp_path: Path,
+    payload_factory: Any,
+) -> None:
+    payload = payload_factory()
+    payload["distribution_build_manifest_sha256"] = "D" * 64
+
+    with pytest.raises(BackendLockError, match="lowercase SHA-256"):
+        (
+            load_runtime_lock
+            if payload["schema"] == "crux.transcription-runtime-lock/v1"
+            else load_seal_evidence
+        )(write_json(tmp_path / "invalid-build-manifest.json", payload))
+
+
+def test_lock_set_rejects_distribution_build_manifest_cross_reference_drift(
+    tmp_path: Path,
+) -> None:
+    audit = load_conversion_audit(write_json(tmp_path / "audit.json", audit_payload()))
+    seal_data = seal_payload(audit_sha256=audit.sha256)
+    seal_data["distribution_build_manifest_sha256"] = "e" * 64
+    seal = load_seal_evidence(write_json(tmp_path / "seal.json", seal_data))
+    runtime = load_runtime_lock(
+        write_json(tmp_path / "runtime.json", runtime_payload(seal_sha256=seal.sha256))
+    )
+    backend = load_backend_lock(
+        write_json(
+            tmp_path / "backend.json",
+            backend_payload(
+                runtime_sha256=runtime.sha256,
+                seal_sha256=seal.sha256,
+                audit_sha256=audit.sha256,
+            ),
+        )
+    )
+
+    with pytest.raises(
+        BackendLockError,
+        match="distribution build manifest evidence mismatch",
+    ):
+        validate_oaf_lock_set(backend, runtime, seal, audit)
 
 
 def test_seal_evidence_accepts_reviewed_oci_layout_manifest_hash(tmp_path: Path) -> None:
