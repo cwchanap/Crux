@@ -102,6 +102,77 @@ def prepare_backend_command(
         ctx.exit(outcome.exit_code)
 
 
+def _validate_verification_backend_id(
+    _ctx: click.Context,
+    _parameter: click.Parameter,
+    value: str,
+) -> str:
+    supported = {
+        "magenta-egmd-tf1-94529798-8hit-v1",
+        "heuristic-onset-v1",
+    }
+    if value not in supported:
+        raise click.BadParameter("must select a supported verification backend")
+    return value
+
+
+@benchmark.command("verify-backend")
+@click.option(
+    "--backend",
+    type=str,
+    default="magenta-egmd-tf1-94529798-8hit-v1",
+    show_default=True,
+    callback=_validate_verification_backend_id,
+)
+@click.option(
+    "--reports-root",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=Path("artifacts/benchmark/backends"),
+    show_default=True,
+)
+@click.option("--allow-emulated-diagnostics", is_flag=True)
+@click.pass_context
+def verify_backend_command(
+    ctx: click.Context,
+    backend: str,
+    reports_root: Path,
+    allow_emulated_diagnostics: bool,
+) -> None:
+    """Verify a frozen transcription backend and publish its sealed evidence."""
+    from src.benchmark.backend_identity import canonical_json_bytes
+    from src.benchmark.backend_registry import default_backend_registry
+    from src.benchmark.backend_reports import OperationalReportPublicationError
+    from src.benchmark.transcription import VerifyBackendRequest, run_verify_backend
+
+    try:
+        outcome = run_verify_backend(
+            VerifyBackendRequest(
+                backend_id=backend,
+                reports_root=reports_root,
+                allow_emulated_diagnostics=allow_emulated_diagnostics,
+            ),
+            registry=default_backend_registry(),
+        )
+    except OperationalReportPublicationError:
+        click.echo(
+            "report_publication_failed: Operational report could not be published.",
+            err=True,
+        )
+        ctx.exit(2)
+
+    summary = {
+        "exit_code": outcome.exit_code,
+        "report_path": str(outcome.report_artifact.path),
+        "report_sha256": outcome.report_artifact.sha256,
+        "status": outcome.status,
+    }
+    standard_output = click.get_binary_stream("stdout")
+    standard_output.write(canonical_json_bytes(summary, trailing_newline=True))
+    standard_output.flush()
+    if outcome.exit_code:
+        ctx.exit(outcome.exit_code)
+
+
 def _validate_transcribe_one_provenance(
     source_audio_id: str | None,
     input_view_id: str | None,

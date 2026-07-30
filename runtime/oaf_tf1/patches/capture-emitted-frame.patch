@@ -1,0 +1,87 @@
+diff --git a/magenta/models/onsets_frames_transcription/infer_util.py b/magenta/models/onsets_frames_transcription/infer_util.py
+--- a/magenta/models/onsets_frames_transcription/infer_util.py
++++ b/magenta/models/onsets_frames_transcription/infer_util.py
+@@ -89,6 +89,7 @@ def predict_sequence(frame_probs,
+                      min_pitch,
+                      hparams,
+-                     onsets_only=False):
++                     onsets_only=False,
++                     capture_emitted_frames=False):
+   """Predict sequence given model output."""
+   if not hparams.predict_onset_threshold:
+     onset_predictions = None
+@@ -107,6 +108,9 @@ def predict_sequence(frame_probs,
+         velocity_values=velocity_values,
+         velocity_scale=hparams.velocity_scale,
+-        velocity_bias=hparams.velocity_bias)
++        velocity_bias=hparams.velocity_bias,
++        capture_emitted_frames=capture_emitted_frames)
+   else:
++    if capture_emitted_frames:
++      raise ValueError('Frame capture is supported only for onset-only output.')
+     if hparams.viterbi_decoding:
+       pianoroll = probs_to_pianoroll_viterbi(
+@@ -138,6 +142,19 @@ def predict_sequence(frame_probs,
+   return sequence_prediction
+ 
+ 
++def pair_emitted_frame_confidence(emitted_frames, onset_probs, min_pitch):
++  """Pair captured emission metadata with its selected onset activation."""
++  paired = []
++  for start_frame, native_midi_note, raw_velocity in emitted_frames:
++    pitch = native_midi_note - min_pitch
++    paired.append((
++        start_frame,
++        native_midi_note,
++        raw_velocity,
++        onset_probs[start_frame, pitch]))
++  return tuple(paired)
++
++
+ def labels_to_features_wrapper(data_fn):
+   """Add wrapper to data_fn that add labels to features."""
+   def wrapper(params, *args, **kwargs):
+diff --git a/magenta/music/sequences_lib.py b/magenta/music/sequences_lib.py
+--- a/magenta/music/sequences_lib.py
++++ b/magenta/music/sequences_lib.py
+@@ -2062,6 +2062,7 @@ def pianoroll_onsets_to_note_sequence(onsets,
+                                       velocity_values=None,
+                                       velocity_scale=80,
+-                                      velocity_bias=10):
++                                      velocity_bias=10,
++                                      capture_emitted_frames=False):
+   """Convert onsets to a NoteSequence.
+ 
+   This converts an matrix of onsets into a NoteSequence. Every active onset
+@@ -2082,6 +2083,8 @@ def pianoroll_onsets_to_note_sequence(onsets,
+     velocity_values: Numpy array of floats representing velocities.
+     velocity_scale: Scale to use for conversion to MIDI velocity.
+     velocity_bias: Bias to use for conversion to MIDI velocity.
++    capture_emitted_frames: Whether to return ordered frame, pitch, and raw
++      velocity metadata with the unmodified NoteSequence.
+ 
+   Returns:
+     Generated NoteSequence proto.
+@@ -2091,6 +2094,7 @@ def pianoroll_onsets_to_note_sequence(onsets,
+   sequence = music_pb2.NoteSequence()
+   sequence.tempos.add().qpm = qpm
+   sequence.ticks_per_quarter = constants.STANDARD_PPQ
++  emitted_frames = []
+ 
+   if velocity_values is None:
+     velocity_values = velocity * np.ones_like(onsets, dtype=np.int32)
+@@ -2108,6 +2112,8 @@ def pianoroll_onsets_to_note_sequence(onsets,
+         scale=velocity_scale,
+         bias=velocity_bias)
+     note.instrument = instrument
++    emitted_frames.append(
++        (int(frame), int(note.pitch), velocity_values[frame, pitch]))
+     note.program = program
+ 
+   sequence.total_time = (
+@@ -2116,3 +2122,5 @@ def pianoroll_onsets_to_note_sequence(onsets,
+     assert sequence.total_time >= sequence.notes[-1].end_time
+ 
++  if capture_emitted_frames:
++    return sequence, tuple(emitted_frames)
+   return sequence

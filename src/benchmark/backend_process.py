@@ -73,6 +73,7 @@ _SENSITIVE_TOKEN_CHARACTER = rb"A-Za-z0-9_.:/-"
 _CONTAINER_PATHS = (
     "/run/crux/backend-lock.json",
     "/run/crux/runtime-lock.json",
+    "/run/crux/seal-evidence.json",
     "/model",
     "/input",
 )
@@ -245,6 +246,7 @@ class RunnerLaunchProfile:
     image_manifest_digest: str
     backend_lock_path: Path
     runtime_lock_path: Path
+    seal_evidence_path: Path
     model_cache_path: Path
     input_root: Path
     environment: Mapping[str, str]
@@ -301,6 +303,7 @@ class RunnerLaunchProfile:
         for name, expected_kind in (
             ("backend_lock_path", "file"),
             ("runtime_lock_path", "file"),
+            ("seal_evidence_path", "file"),
             ("model_cache_path", "directory"),
             ("input_root", "directory"),
         ):
@@ -350,6 +353,7 @@ def _verify_mounts(profile: RunnerLaunchProfile) -> None:
     for name, expected_kind in (
         ("backend_lock_path", "file"),
         ("runtime_lock_path", "file"),
+        ("seal_evidence_path", "file"),
         ("model_cache_path", "directory"),
         ("input_root", "directory"),
     ):
@@ -385,8 +389,9 @@ def build_docker_command(profile: RunnerLaunchProfile) -> list[str]:
     mounts = (
         (profile.backend_lock_path, _CONTAINER_PATHS[0]),
         (profile.runtime_lock_path, _CONTAINER_PATHS[1]),
-        (profile.model_cache_path, _CONTAINER_PATHS[2]),
-        (profile.input_root, _CONTAINER_PATHS[3]),
+        (profile.seal_evidence_path, _CONTAINER_PATHS[2]),
+        (profile.model_cache_path, _CONTAINER_PATHS[3]),
+        (profile.input_root, _CONTAINER_PATHS[4]),
     )
     command.extend(
         f"--mount=type=bind,src={source},dst={destination},readonly"
@@ -454,6 +459,7 @@ class RunnerProcess:
             for path in (
                 profile.backend_lock_path,
                 profile.runtime_lock_path,
+                profile.seal_evidence_path,
                 profile.model_cache_path,
                 profile.input_root,
             )

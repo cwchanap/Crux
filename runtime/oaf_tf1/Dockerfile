@@ -31,15 +31,35 @@ RUN python -m venv /opt/crux/venv; \
       --find-links=/opt/crux/wheelhouse \
       --requirement /opt/crux/requirements.lock
 
+FROM runtime-build AS instrumented-source
+
+COPY runtime/oaf_tf1/ /opt/crux/runtime/
+COPY runtime/oaf_tf1/vendor/magenta/ /opt/crux/upstream/magenta/
+RUN python /opt/crux/runtime/apply_instrumentation_patch.py \
+      --source /opt/crux/upstream \
+      --destination /opt/crux/vendor \
+      --patch /opt/crux/runtime/patches/capture-emitted-frame.patch \
+      --manifest /opt/crux/runtime/instrumented-source-manifest.json
+
 FROM runtime-build AS test
+
+ENV PYTEST_ADDOPTS="-p no:cacheprovider"
 
 COPY runtime/oaf_tf1/requirements-test.lock /opt/crux/requirements-test.lock
 COPY runtime/oaf_tf1/wheelhouse/test/ /opt/crux/test-wheelhouse/
 RUN /opt/crux/venv/bin/pip install --no-index --require-hashes --only-binary=:all: \
       --find-links=/opt/crux/test-wheelhouse \
       --requirement /opt/crux/requirements-test.lock
-COPY runtime/oaf_tf1/vendor/magenta/ /opt/crux/vendor/magenta/
-COPY runtime/oaf_tf1/ /opt/crux/runtime/
+COPY --from=instrumented-source /opt/crux/vendor/ /opt/crux/vendor/
+COPY --from=instrumented-source /opt/crux/upstream/ /opt/crux/upstream/
+COPY --from=instrumented-source /opt/crux/runtime/instrumented-source-manifest.json \
+  /opt/crux/runtime/instrumented-source-manifest.json
+COPY runtime/oaf_tf1/source-manifest.json /opt/crux/vendor/source-manifest.json
+COPY runtime/oaf_tf1/*.py /opt/crux/runtime/oaf_tf1/
+COPY runtime/oaf_tf1/patches/ /opt/crux/runtime/oaf_tf1/patches/
+COPY runtime/oaf_tf1/tests/ /opt/crux/runtime/tests/
+COPY runtime/oaf_tf1/runner-source-manifest.json /opt/crux/runtime/runner-source-manifest.json
+COPY tools/hpa320/generate_runner_source_manifest.py /opt/crux/tools/hpa320/generate_runner_source_manifest.py
 WORKDIR /opt/crux
 USER "${RUNTIME_UID}:${RUNTIME_GID}"
 
@@ -88,10 +108,14 @@ RUN python /opt/crux/tools/oaf_system_packages.py \
 FROM system-runtime-base AS runtime
 
 COPY --from=runtime-build /opt/crux/venv /opt/crux/venv
-COPY runtime/oaf_tf1/vendor/magenta/ /opt/crux/vendor/magenta/
+COPY --from=instrumented-source /opt/crux/vendor/ /opt/crux/vendor/
+COPY --from=instrumented-source /opt/crux/upstream/ /opt/crux/upstream/
+COPY --from=instrumented-source /opt/crux/runtime/instrumented-source-manifest.json \
+  /opt/crux/runtime/instrumented-source-manifest.json
+COPY runtime/oaf_tf1/source-manifest.json /opt/crux/vendor/source-manifest.json
 COPY runtime/oaf_tf1/*.py /opt/crux/runtime/
 COPY runtime/oaf_tf1/patches/ /opt/crux/runtime/patches/
 COPY runtime/oaf_tf1/runner-source-manifest.json /opt/crux/runtime/runner-source-manifest.json
 WORKDIR /opt/crux
 USER "${RUNTIME_UID}:${RUNTIME_GID}"
-ENTRYPOINT ["/opt/crux/venv/bin/python", "-I", "/opt/crux/runtime/entrypoint.py"]
+ENTRYPOINT ["/usr/bin/env", "-i", "CUDA_VISIBLE_DEVICES=-1", "MKL_NUM_THREADS=1", "OMP_NUM_THREADS=1", "OPENBLAS_NUM_THREADS=1", "PYTHONHASHSEED=0", "PYTHONCOERCECLOCALE=0", "TF_NUM_INTEROP_THREADS=1", "TF_NUM_INTRAOP_THREADS=1", "/opt/crux/venv/bin/python", "-s", "/opt/crux/runtime/entrypoint.py"]

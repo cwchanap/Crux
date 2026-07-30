@@ -840,8 +840,11 @@ rtk git commit -m "build: pin frozen OaF runtime inputs"
 - Create: `runtime/oaf_tf1/entrypoint.py`
 - Create: `runtime/oaf_tf1/protocol.py`
 - Create: `runtime/oaf_tf1/oaf_backend.py`
+- Create: `runtime/oaf_tf1/apply_instrumentation_patch.py`
 - Create: `runtime/oaf_tf1/patches/capture-emitted-frame.patch`
 - Generate: `runtime/oaf_tf1/runner-source-manifest.json`
+- Create: `tools/hpa320/generate_runner_source_manifest.py`
+- Modify: `runtime/oaf_tf1/Dockerfile`
 - Create: `runtime/oaf_tf1/tests/test_protocol.py`
 - Create: `runtime/oaf_tf1/tests/test_instrumentation.py`
 - Create: `runtime/oaf_tf1/tests/test_tensor_coverage.py`
@@ -880,11 +883,17 @@ Expected: collection FAIL because the runner and patch modules do not exist.
 
 - [ ] **Step 2: Apply and test the instrumentation patch**
 
-Patch only the vendored call path around
+Keep the checked-in vendored upstream tree byte-identical to its Task 5 manifest.
+Patch only an image-build copy of the vendored call path around
 `pianoroll_to_note_sequence` so it returns the unmodified `NoteSequence` plus ordered
 metadata `(start_frame, pitch, raw_velocity)` from the same note-emission loop.
 `infer_util` pairs confidence from `onset_probs[start_frame, pitch]`. It never
 reconstructs a frame from `start_time`.
+
+The pure-Python patch applier verifies the exact upstream preimage and fixed patch
+identity before changing the image-build copy. The runner-source manifest covers the
+applier, patch, runner modules, and Dockerfile; the upstream source manifest remains
+unchanged.
 
 The parity test feeds fixed onset/frame/offset/velocity arrays into patched and
 unmodified conversion, serializes both `NoteSequence` values, and requires byte
@@ -976,8 +985,11 @@ rtk git add \
   runtime/oaf_tf1/entrypoint.py \
   runtime/oaf_tf1/protocol.py \
   runtime/oaf_tf1/oaf_backend.py \
+  runtime/oaf_tf1/apply_instrumentation_patch.py \
   runtime/oaf_tf1/patches/capture-emitted-frame.patch \
   runtime/oaf_tf1/runner-source-manifest.json \
+  runtime/oaf_tf1/Dockerfile \
+  tools/hpa320/generate_runner_source_manifest.py \
   runtime/oaf_tf1/tests/test_protocol.py \
   runtime/oaf_tf1/tests/test_instrumentation.py \
   runtime/oaf_tf1/tests/test_tensor_coverage.py

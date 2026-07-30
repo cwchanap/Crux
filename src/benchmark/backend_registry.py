@@ -36,7 +36,12 @@ class BackendRegistry:
     default_backend_id: str
     factories: Mapping[str, Callable[[], TranscriptionBackend]]
 
-    def create(self, backend_id: str | None) -> TranscriptionBackend:
+    def create(
+        self,
+        backend_id: str | None,
+        *,
+        allow_emulated_diagnostics: bool = False,
+    ) -> TranscriptionBackend:
         selected = self.default_backend_id if backend_id is None else backend_id
         factory = self.factories.get(selected)
         if factory is None:
@@ -46,6 +51,8 @@ class BackendRegistry:
                 unknown_backend=True,
             )
         try:
+            if allow_emulated_diagnostics:
+                return factory(allow_emulated_diagnostics=True)  # type: ignore[call-arg]
             return factory()
         except (ImportError, BackendLockUnavailable):
             raise BackendUnavailable(
@@ -55,19 +62,32 @@ class BackendRegistry:
             ) from None
 
 
-def _create_official_backend() -> TranscriptionBackend:
+def _create_official_backend(
+    *,
+    allow_emulated_diagnostics: bool = False,
+) -> TranscriptionBackend:
     from src.benchmark.backends.oaf_tf1 import create_backend
 
+    if allow_emulated_diagnostics:
+        return create_backend(allow_emulated_diagnostics=True)
     return create_backend()
 
 
-def _create_heuristic_backend() -> TranscriptionBackend:
+def _create_heuristic_backend(
+    *,
+    allow_emulated_diagnostics: bool = False,
+) -> TranscriptionBackend:
+    del allow_emulated_diagnostics
     from src.benchmark.backends.heuristic import create_backend
 
     return create_backend()
 
 
-def _reject_legacy_tf2_backend() -> TranscriptionBackend:
+def _reject_legacy_tf2_backend(
+    *,
+    allow_emulated_diagnostics: bool = False,
+) -> TranscriptionBackend:
+    del allow_emulated_diagnostics
     raise BackendUnavailable(
         "legacy TF2 backend is not a transcription backend",
         report_backend_id=LEGACY_TF2_BACKEND_ID,
