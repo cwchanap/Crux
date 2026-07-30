@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Exact key-set fixtures intentionally mirror the external prediction schema.
+# pylint: disable=duplicate-code
 import builtins
 import hashlib
 import importlib
@@ -20,6 +22,7 @@ from src.benchmark.backends import CanonicalAudio, NativeEvent, NativePrediction
 from src.benchmark.prediction_artifact import (
     OAF_GROUP_IDS,
     PredictionArtifactError,
+    publish_prediction_artifact,
     read_prediction_artifact,
     render_prediction_artifact,
 )
@@ -755,3 +758,29 @@ def test_generic_reader_does_not_import_oaf_or_mapping_modules(
     module = importlib.reload(sys.modules["src.benchmark.prediction_artifact"])
 
     assert module.read_prediction_artifact(EXPECTED_ARTIFACT).event_count == 1
+
+
+def test_publish_prediction_artifact_returns_strict_read_immutable_bytes(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "requested" / "prediction.jsonl"
+
+    published = publish_prediction_artifact(destination, make_oaf_prediction())
+
+    assert published.role == "prediction"
+    assert published.path == destination
+    assert published.sha256 == hashlib.sha256(EXPECTED_ARTIFACT).hexdigest()
+    assert destination.read_bytes() == EXPECTED_ARTIFACT
+    assert read_prediction_artifact(destination.read_bytes()).content == EXPECTED_ARTIFACT
+
+
+def test_publish_prediction_artifact_preserves_prior_valid_prediction_on_collision(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "prediction.jsonl"
+    destination.write_bytes(EXPECTED_ARTIFACT)
+
+    with pytest.raises(Exception):
+        publish_prediction_artifact(destination, make_oaf_prediction(events=()))
+
+    assert destination.read_bytes() == EXPECTED_ARTIFACT

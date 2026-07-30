@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# Schema validation uses exact integer checks to reject booleans and necessarily
+# branches across the fixed header/event/terminal record variants.
+# pylint: disable=too-many-branches,unidiomatic-typecheck
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -16,7 +19,8 @@ from src.benchmark.backend_identity import (
     sha256_hex,
     strict_json_loads,
 )
-from src.benchmark.backends import CanonicalAudio, NativeEvent, NativePrediction
+from src.benchmark.backend_publication import publish_immutable_bytes, read_regular_file_no_follow
+from src.benchmark.backends import CanonicalAudio, NativeEvent, NativePrediction, PublishedArtifact
 
 PREDICTION_SCHEMA = "crux.drum-prediction-events/v1"
 OAF_METADATA_SCHEMA = "magenta-oaf-native-metadata-v1"
@@ -149,6 +153,25 @@ def read_prediction_artifact(content: bytes) -> PredictionArtifact:
         raise
     except (StrictJsonError, TypeError, ValueError) as error:
         raise PredictionArtifactError(str(error)) from None
+
+
+def publish_prediction_artifact(
+    path: Path,
+    prediction: NativePrediction,
+) -> PublishedArtifact:
+    content = render_prediction_artifact(prediction)
+    expected_sha256 = sha256_hex(content)
+    published = publish_immutable_bytes(
+        path,
+        content,
+        expected_sha256,
+        role="prediction",
+    )
+    persisted = read_regular_file_no_follow(path)
+    artifact = read_prediction_artifact(persisted)
+    if artifact.content != content or artifact.artifact_sha256 != expected_sha256:
+        raise PredictionArtifactError("published prediction bytes changed")
+    return published
 
 
 def _read_prediction_artifact(content: bytes) -> PredictionArtifact:
