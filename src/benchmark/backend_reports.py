@@ -40,6 +40,8 @@ _ITEM_ID_SCHEMA = "crux.backend-execution-item-id/v1"
 _OAF_BACKEND_ID = "magenta-egmd-tf1-94529798-8hit-v1"
 _HEURISTIC_BACKEND_ID = "heuristic-onset-v1"
 _LEGACY_BACKEND_ID = "legacy-tf2-h5-v0"
+UNAVAILABLE_BACKEND_REPORT_ID = "backend-unavailable"
+_UNAVAILABLE_NAMESPACE_ERROR = "unavailable backend requires exact unavailable execution failure"
 _OAF_DESCRIPTOR_SCHEMA = "crux.transcription-backend-descriptor/v1"
 _HEURISTIC_DESCRIPTOR_SCHEMA = "crux.heuristic-backend-descriptor/v1"
 _TIMESTAMP_PATTERN = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z\Z")
@@ -764,7 +766,6 @@ def _validate_complete_execution(payload: dict[str, JsonValue]) -> None:
         "descriptor",
         "descriptor_sha256",
         "execution_attestation",
-        "verification_report",
     ):
         if payload[field] is None:
             raise ReportValidationError(f"complete execution requires {field}")
@@ -944,6 +945,12 @@ def _validate_publication_namespace(
     report: OperationalReport,
     snapshot: dict[str, JsonValue],
 ) -> None:
+    if backend_id == UNAVAILABLE_BACKEND_REPORT_ID:
+        _validate_unavailable_execution_report(report, snapshot)
+        return
+    if backend_id == _LEGACY_BACKEND_ID and not isinstance(report, LegacyScoreReport):
+        _validate_unavailable_execution_report(report, snapshot)
+        return
     if isinstance(report, LegacyScoreReport):
         declared_backend_id = snapshot["backend_id"]
     else:
@@ -956,6 +963,36 @@ def _validate_publication_namespace(
             raise ReportValidationError("report namespace backend_id is unknown")
     if declared_backend_id is not None and backend_id != declared_backend_id:
         raise ReportValidationError("report backend_id does not match publication namespace")
+
+
+def _validate_unavailable_execution_report(
+    report: OperationalReport,
+    snapshot: dict[str, JsonValue],
+) -> None:
+    expected_error: list[JsonValue] = [
+        {
+            "code": "backend_unavailable",
+            "message": "Backend is unavailable.",
+        }
+    ]
+    nullable_identity_fields = (
+        "descriptor",
+        "descriptor_sha256",
+        "backend_lock_sha256",
+        "runtime_lock_sha256",
+        "parameter_lock_sha256",
+        "seal_evidence_sha256",
+        "execution_attestation",
+        "verification_report",
+    )
+    invalid = not isinstance(report, ExecutionReport)
+    invalid = invalid or snapshot["status"] != "failed"
+    invalid = invalid or snapshot["exit_code"] != 2
+    invalid = invalid or snapshot["items"] != []
+    invalid = invalid or snapshot["errors"] != expected_error
+    invalid = invalid or any(snapshot[field] is not None for field in nullable_identity_fields)
+    if invalid:
+        raise ReportValidationError(_UNAVAILABLE_NAMESPACE_ERROR)
 
 
 @contextmanager

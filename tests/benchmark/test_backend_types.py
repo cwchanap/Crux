@@ -6,6 +6,8 @@ import pytest
 from src.benchmark.backend_identity import BackendDescriptor
 from src.benchmark.backends import (
     BackendError,
+    BackendFatalFailure,
+    BackendItemFailure,
     BackendVerification,
     CanonicalAudio,
     MidiDerivative,
@@ -115,3 +117,37 @@ def test_backend_records_preserve_complete_domain_data() -> None:
     ]:
         with pytest.raises(FrozenInstanceError):
             setattr(record, field, "changed")
+
+
+@pytest.mark.parametrize("failure_type", [BackendItemFailure, BackendFatalFailure])
+def test_backend_failures_preserve_one_validated_stable_error(
+    failure_type: type[BackendItemFailure] | type[BackendFatalFailure],
+) -> None:
+    error = BackendError(
+        code="backend_process_failed",
+        message="The backend process failed.",
+    )
+
+    failure = failure_type(error)
+
+    assert failure.error == error
+    assert str(failure) == "backend_process_failed"
+
+
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        ("BackendFailed", "The backend failed."),
+        ("backend-failed", "The backend failed."),
+        ("", "The backend failed."),
+        ("backend_failed", ""),
+        ("backend_failed", "unsafe\nmessage"),
+        ("backend_failed", "\ud800"),
+    ],
+)
+def test_backend_error_rejects_unstable_codes_and_unsanitized_messages(
+    code: str,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match="backend error"):
+        BackendError(code=code, message=message)
