@@ -417,6 +417,195 @@ def test_transcribe_one_help_lists_exact_options_and_reports_default() -> None:
     assert "--tolerance-ms" not in result.stdout
 
 
+def test_prepare_backend_help_lists_setup_only_options() -> None:
+    result = runner.invoke(main, ["benchmark", "prepare-backend", "--help"])
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert [line.strip() for line in result.stdout.splitlines() if line.startswith("  --")] == [
+        "--backend TEXT          [required]",
+        "--download",
+        "--archive FILE",
+        "--cache-root DIRECTORY  [required]",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "exit_code"),
+    [("ready", 0), ("acquisition_failed", 1), ("integrity_failed", 2)],
+)
+def test_prepare_backend_emits_exact_canonical_summary_without_reports_or_launch(
+    status: str,
+    exit_code: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.benchmark.backend_prepare import PrepareBackendOutcome
+
+    reports_root = tmp_path / "artifacts" / "benchmark" / "backends"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "src.benchmark.backend_lock.load_backend_lock",
+        lambda path: object(),
+    )
+    monkeypatch.setattr(
+        "src.benchmark.backend_prepare.prepare_oaf_backend",
+        lambda request, *, backend_lock: PrepareBackendOutcome(
+            status=status,  # type: ignore[arg-type]
+            exit_code=exit_code,  # type: ignore[arg-type]
+            model_cache_path=tmp_path / "cache" if exit_code == 0 else None,
+        ),
+    )
+    monkeypatch.setattr(
+        "src.benchmark.backend_registry.BackendRegistry.create",
+        lambda *args, **kwargs: pytest.fail("prepare-backend launched a backend"),
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "prepare-backend",
+            "--backend",
+            OFFICIAL_BACKEND_ID,
+            "--cache-root",
+            str(tmp_path / "cache"),
+        ],
+    )
+
+    expected = (
+        f'{{"exit_code":{exit_code},"report_path":null,"report_sha256":null,"status":"{status}"}}\n'
+    ).encode("utf-8")
+    assert result.exit_code == exit_code
+    assert result.stdout_bytes == expected
+    assert result.stderr_bytes == b""
+    assert not reports_root.exists()
+
+
+def test_prepare_backend_rejects_mutually_exclusive_modes_as_click_usage(
+    tmp_path: Path,
+) -> None:
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "prepare-backend",
+            "--backend",
+            OFFICIAL_BACKEND_ID,
+            "--download",
+            "--archive",
+            str(tmp_path / "checkpoint.zip"),
+            "--cache-root",
+            str(tmp_path / "cache"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert "Usage:" in result.stderr
+    assert "mutually exclusive" in result.stderr
+
+
+def test_prepare_backend_unknown_backend_emits_integrity_summary_after_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.benchmark.backend_lock.load_backend_lock",
+        lambda path: pytest.fail("unknown backend must not load the official lock"),
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "prepare-backend",
+            "--backend",
+            "unknown",
+            "--cache-root",
+            str(tmp_path / "cache"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert result.stdout_bytes == (
+        b'{"exit_code":2,"report_path":null,"report_sha256":null,"status":"integrity_failed"}\n'
+    )
+    assert "backend_selection_invalid" in result.stderr
+    assert str(tmp_path).encode() not in result.stderr_bytes
+
+
+def test_prepare_backend_invalid_lock_emits_integrity_summary_without_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.benchmark.backend_lock.load_backend_lock",
+        lambda path: (_ for _ in ()).throw(ValueError(f"secret path: {tmp_path}")),
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "prepare-backend",
+            "--backend",
+            OFFICIAL_BACKEND_ID,
+            "--cache-root",
+            str(tmp_path / "cache"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert result.stdout_bytes == (
+        b'{"exit_code":2,"report_path":null,"report_sha256":null,"status":"integrity_failed"}\n'
+    )
+    assert result.stderr == "backend_lock_invalid\n"
+    assert "Traceback" not in result.stderr
+
+
+def test_prepare_backend_malformed_loaded_lock_emits_one_integrity_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.benchmark.backend_lock import LoadedBackendLock
+
+    malformed = LoadedBackendLock(
+        path=tmp_path / "backend-lock.json",
+        payload=None,  # type: ignore[arg-type]
+        sha256=None,  # type: ignore[arg-type]
+        descriptor=None,  # type: ignore[arg-type]
+        max_input_audio_frames=None,  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(
+        "src.benchmark.backend_lock.load_backend_lock",
+        lambda path: malformed,
+    )
+    monkeypatch.setattr(
+        "src.benchmark.backend_prepare._open_directory_chain",
+        lambda *args, **kwargs: pytest.fail("malformed lock reached the filesystem"),
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "prepare-backend",
+            "--backend",
+            OFFICIAL_BACKEND_ID,
+            "--cache-root",
+            str(tmp_path / "cache"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert result.stdout_bytes == (
+        b'{"exit_code":2,"report_path":null,"report_sha256":null,"status":"integrity_failed"}\n'
+    )
+    assert result.stderr_bytes == b""
+    assert not (tmp_path / "cache").exists()
+
+
 def test_transcribe_one_direct_mode_builds_complete_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

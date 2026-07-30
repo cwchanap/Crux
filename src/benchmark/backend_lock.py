@@ -445,6 +445,50 @@ def load_backend_lock(path: Path) -> LoadedBackendLock:
     )
 
 
+def revalidate_loaded_backend_lock(backend_lock: LoadedBackendLock) -> LoadedBackendLock:
+    """Reproduce a loaded backend lock from its immutable in-memory payload."""
+    if not isinstance(backend_lock, LoadedBackendLock):
+        raise BackendLockError("backend lock was not strictly loaded")
+    lock_fields_valid = (
+        isinstance(backend_lock.path, Path)
+        and isinstance(backend_lock.payload, Mapping)
+        and isinstance(backend_lock.sha256, str)
+    )
+    descriptor_fields_valid = isinstance(backend_lock.descriptor, BackendDescriptor) and (
+        isinstance(backend_lock.descriptor.payload, Mapping)
+        and isinstance(backend_lock.descriptor.sha256, str)
+    )
+    frame_bound_valid = isinstance(backend_lock.max_input_audio_frames, int) and not isinstance(
+        backend_lock.max_input_audio_frames, bool
+    )
+    if not (lock_fields_valid and descriptor_fields_valid and frame_bound_valid):
+        raise BackendLockError("loaded backend lock field types are invalid")
+    try:
+        payload = _mutable_payload(backend_lock.payload)
+        _validate_backend_lock(payload)
+        _reproduce_loaded_hash(payload, backend_lock.sha256, "backend lock")
+        descriptor = _build_oaf_descriptor(payload, backend_lock.sha256)
+        if (
+            dict(descriptor.payload) != dict(backend_lock.descriptor.payload)
+            or descriptor.sha256 != backend_lock.descriptor.sha256
+        ):
+            raise BackendLockError("backend descriptor reproduction mismatch")
+        max_input_audio_frames = cast(int, payload["max_input_audio_frames"])
+        if backend_lock.max_input_audio_frames != max_input_audio_frames:
+            raise BackendLockError("backend audio frame bound reproduction mismatch")
+    except BackendLockError:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise BackendLockError("loaded backend lock shape is invalid") from None
+    return LoadedBackendLock(
+        path=backend_lock.path,
+        payload=_immutable_payload(payload),
+        sha256=backend_lock.sha256,
+        descriptor=descriptor,
+        max_input_audio_frames=max_input_audio_frames,
+    )
+
+
 def load_runtime_lock(path: Path) -> LoadedRuntimeLock:
     payload, digest = _load_canonical_object(path, "runtime lock")
     _validate_runtime_lock(payload)
