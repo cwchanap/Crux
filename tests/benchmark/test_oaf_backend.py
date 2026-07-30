@@ -542,6 +542,33 @@ def _harness(
     )
 
 
+def test_verify_model_cache_passes_the_final_lock_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_path = tmp_path / "config" / f"{BACKEND_ID}.backend-lock.json"
+    backend_lock = LoadedBackendLock(
+        path=lock_path,
+        payload={},
+        sha256=BACKEND_SHA256,
+        descriptor=_descriptor(),
+        max_input_audio_frames=441000,
+    )
+    cache_root = tmp_path / "model-cache" / "sha256" / ("7" * 64)
+    captured: list[object] = []
+
+    def prepare(request: object, *, backend_lock: object) -> object:
+        captured.extend((request, backend_lock))
+        return type("Outcome", (), {"status": "ready", "model_cache_path": cache_root})()
+
+    monkeypatch.setattr(oaf_tf1, "prepare_oaf_backend", prepare)
+
+    oaf_tf1._verify_model_cache(backend_lock, cache_root, lock_path)
+
+    request = captured[0]
+    assert getattr(request, "backend_lock_path") == lock_path
+
+
 def test_verify_backend_accepts_only_matching_handshake_and_smoke(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

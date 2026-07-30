@@ -63,49 +63,7 @@ COPY tools/hpa320/generate_runner_source_manifest.py /opt/crux/tools/hpa320/gene
 WORKDIR /opt/crux
 USER "${RUNTIME_UID}:${RUNTIME_GID}"
 
-FROM runtime-base AS system-runtime-base
-
-ARG DEBIAN_SNAPSHOT_URL
-ARG DEBIAN_INRELEASE_SHA256
-ARG DEBIAN_ARCHIVE_KEYRING_SHA256
-ARG DEBIAN_SIGNING_FINGERPRINT
-ARG DEBIAN_CODENAME
-ARG DEBIAN_ARCHITECTURE
-ARG SYSTEM_PACKAGE_MANIFEST_SHA256
-ARG SYSTEM_PACKAGE_INVENTORY_SHA256
-
-RUN set -eu; \
-    case "${DEBIAN_SNAPSHOT_URL}" in ""|unset|none|sentinel) exit 64;; esac; \
-    case "${DEBIAN_SIGNING_FINGERPRINT}" in \
-      ""|*[!0-9A-F]*) exit 64;; \
-    esac; \
-    case "${#DEBIAN_SIGNING_FINGERPRINT}" in 40|64) :;; *) exit 64;; esac; \
-    case "${DEBIAN_CODENAME}" in ""|*[!a-z0-9-]*) exit 64;; esac; \
-    test "${DEBIAN_ARCHITECTURE}" = "amd64"; \
-    for value in \
-      "${DEBIAN_INRELEASE_SHA256}" \
-      "${DEBIAN_ARCHIVE_KEYRING_SHA256}" \
-      "${SYSTEM_PACKAGE_MANIFEST_SHA256}" \
-      "${SYSTEM_PACKAGE_INVENTORY_SHA256}"; do \
-        case "${value}" in ""|unset|none|sentinel|*[!0-9a-f]*) exit 64;; esac; \
-        test "${#value}" -eq 64; \
-    done
-COPY tools/hpa320/oaf_system_packages.py /opt/crux/tools/oaf_system_packages.py
-COPY runtime/oaf_tf1/system-packages/ /opt/crux/system-packages/
-RUN python /opt/crux/tools/oaf_system_packages.py \
-      --bundle /opt/crux/system-packages \
-      --snapshot-url "${DEBIAN_SNAPSHOT_URL}" \
-      --manifest-sha256 "${SYSTEM_PACKAGE_MANIFEST_SHA256}" \
-      --inrelease-sha256 "${DEBIAN_INRELEASE_SHA256}" \
-      --keyring-sha256 "${DEBIAN_ARCHIVE_KEYRING_SHA256}" \
-      --inventory-sha256 "${SYSTEM_PACKAGE_INVENTORY_SHA256}" \
-      --signing-fingerprint "${DEBIAN_SIGNING_FINGERPRINT}" \
-      --codename "${DEBIAN_CODENAME}" \
-      --architecture "${DEBIAN_ARCHITECTURE}" \
-      --install; \
-    rm -rf /opt/crux/system-packages /opt/crux/tools
-
-FROM system-runtime-base AS runtime
+FROM runtime-build AS runtime
 
 COPY --from=runtime-build /opt/crux/venv /opt/crux/venv
 COPY --from=instrumented-source /opt/crux/vendor/ /opt/crux/vendor/

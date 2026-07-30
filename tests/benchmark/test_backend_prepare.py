@@ -26,6 +26,11 @@ from src.benchmark.backend_prepare import (
     prepare_oaf_backend as _public_prepare_oaf_backend,
 )
 from src.benchmark.backend_registry import OFFICIAL_BACKEND_ID
+from src.benchmark.checkpoint_acquisition import (
+    ArchiveMemberIdentity,
+    CheckpointAcquisitionRequest,
+    CheckpointIdentity,
+)
 
 CHECKPOINT_URL = (
     "https://storage.googleapis.com/magentadata/models/"
@@ -36,6 +41,9 @@ COMPONENT_BYTES = {
     "model.ckpt-569400.index": b"frozen index",
     "model.ckpt-569400.meta": b"frozen meta",
 }
+POINTER_BYTES = (
+    b'model_checkpoint_path: "model.ckpt-569400"\nall_model_checkpoint_paths: "model.ckpt-569400"\n'
+)
 
 
 def _artifact_set_sha256(component_rows: list[dict[str, object]]) -> str:
@@ -62,6 +70,36 @@ def _zip_bytes(
 
 def _valid_archive_bytes() -> bytes:
     return _zip_bytes(list(COMPONENT_BYTES.items()))
+
+
+def _preseal_request(archive_bytes: bytes) -> CheckpointAcquisitionRequest:
+    pointer = ArchiveMemberIdentity(
+        name="checkpoint",
+        sha256=hashlib.sha256(POINTER_BYTES).hexdigest(),
+        size=len(POINTER_BYTES),
+        role="pointer",
+    )
+    components = tuple(
+        ArchiveMemberIdentity(
+            name=name,
+            sha256=hashlib.sha256(content).hexdigest(),
+            size=len(content),
+            role="published_component",
+        )
+        for name, content in COMPONENT_BYTES.items()
+    )
+    return CheckpointAcquisitionRequest(
+        backend_id=OFFICIAL_BACKEND_ID,
+        checkpoint_url=CHECKPOINT_URL,
+        archive=CheckpointIdentity(
+            name="e-gmd_checkpoint.zip",
+            sha256=hashlib.sha256(archive_bytes).hexdigest(),
+            size=len(archive_bytes),
+        ),
+        archive_members=(pointer, *components),
+        published_component_names=tuple(component.name for component in components),
+        sha256="a" * 64,
+    )
 
 
 class _NonSeekableBytesIO(io.BytesIO):
@@ -228,6 +266,88 @@ def _install_directory(path: Path, contents: dict[str, bytes]) -> None:
     path.mkdir(parents=True)
     for name, content in contents.items():
         (path / name).write_bytes(content)
+
+
+def test_preseal_cache_verification_does_not_require_a_final_backend_lock(
+    tmp_path: Path,
+) -> None:
+    request_path = (
+        Path(__file__).parents[2]
+        / "config"
+        / "benchmark"
+        / "backends"
+        / f"{OFFICIAL_BACKEND_ID}.checkpoint-acquisition-request.json"
+    )
+
+    outcome = _public_prepare_oaf_backend(
+        PrepareBackendRequest(
+            backend_id=OFFICIAL_BACKEND_ID,
+            cache_root=tmp_path / "cache",
+            archive_path=None,
+            download=False,
+            acquisition_request_path=request_path,
+            evidence_output_path=tmp_path / "evidence.json",
+            backend_lock_path=None,
+        ),
+    )
+
+    assert (outcome.status, outcome.exit_code, outcome.model_cache_path) == (
+        "acquisition_failed",
+        1,
+        None,
+    )
+    assert not (tmp_path / "cache").exists()
+    assert not (tmp_path / "evidence.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("pointer_bytes", "status", "exit_code"),
+    [
+        (POINTER_BYTES, "ready", 0),
+        (POINTER_BYTES.replace(b"569400", b"569401"), "integrity_failed", 2),
+    ],
+    ids=("exact_pointer", "altered_pointer"),
+)
+def test_preseal_public_prepare_authenticates_the_checkpoint_pointer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pointer_bytes: bytes,
+    status: str,
+    exit_code: int,
+) -> None:
+    archive_bytes = _zip_bytes([("checkpoint", pointer_bytes), *COMPONENT_BYTES.items()])
+    acquisition_request = _preseal_request(archive_bytes)
+    monkeypatch.setattr(
+        backend_prepare,
+        "load_checkpoint_acquisition_request",
+        lambda path: acquisition_request,
+    )
+    failures: list[str] = []
+    real_failure = backend_prepare._failure
+
+    def capture_failure(error: object) -> backend_prepare.PrepareBackendOutcome:
+        failures.append(str(error))
+        return real_failure(error)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(backend_prepare, "_failure", capture_failure)
+    monkeypatch.chdir(tmp_path)
+
+    outcome = _public_prepare_oaf_backend(
+        PrepareBackendRequest(
+            backend_id=OFFICIAL_BACKEND_ID,
+            cache_root=Path("artifacts/model-cache"),
+            archive_path=_write_archive(tmp_path, archive_bytes),
+            download=False,
+            acquisition_request_path=Path("request.json"),
+            evidence_output_path=Path("artifacts/evidence.json"),
+            backend_lock_path=None,
+        )
+    )
+
+    if status == "ready":
+        assert failures == []
+    assert (outcome.status, outcome.exit_code) == (status, exit_code)
+    assert (tmp_path / "artifacts" / "evidence.json").exists() is (status == "ready")
 
 
 def test_archive_installs_only_after_every_hash_matches(tmp_path: Path) -> None:

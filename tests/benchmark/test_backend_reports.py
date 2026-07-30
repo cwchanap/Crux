@@ -482,6 +482,80 @@ def test_failed_reports_require_errors(
 
 
 @pytest.mark.parametrize(
+    ("record_type", "payload"),
+    [
+        (
+            VerificationReport,
+            make_verification_payload(
+                status="failed",
+                exit_code=2,
+                errors=[{"code": "backend_not_sealed", "message": "Backend is not sealed."}],
+            ),
+        ),
+        (
+            VerificationReport,
+            make_verification_payload(
+                status="verified",
+                exit_code=0,
+                errors=[{"code": "backend_not_sealed", "message": "Backend is not sealed."}],
+            ),
+        ),
+        (
+            VerificationReport,
+            make_verification_payload(
+                status="environment_unsupported",
+                exit_code=1,
+                errors=[{"code": "backend_not_sealed", "message": "Backend is not sealed."}],
+            ),
+        ),
+        (
+            ExecutionReport,
+            make_execution_payload(
+                status="failed",
+                exit_code=2,
+                items=[],
+                errors=[{"code": "backend_not_sealed", "message": "Backend is not sealed."}],
+            ),
+        ),
+        (
+            ExecutionReport,
+            make_execution_payload(
+                status="complete",
+                exit_code=0,
+                errors=[{"code": "backend_not_sealed", "message": "Backend is not sealed."}],
+            ),
+        ),
+        (
+            ExecutionReport,
+            make_execution_payload(
+                status="partial",
+                exit_code=1,
+                errors=[{"code": "backend_not_sealed", "message": "Backend is not sealed."}],
+            ),
+        ),
+        (
+            ExecutionReport,
+            make_execution_payload(
+                status="environment_unsupported",
+                exit_code=1,
+                items=[],
+                errors=[{"code": "backend_not_sealed", "message": "Backend is not sealed."}],
+            ),
+        ),
+    ],
+)
+def test_backend_not_sealed_requires_failed_exit_one(
+    record_type: type,
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(
+        ReportValidationError,
+        match="backend_not_sealed requires failed exit one",
+    ):
+        record_type(payload)
+
+
+@pytest.mark.parametrize(
     "item",
     [
         make_execution_item(

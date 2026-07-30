@@ -14,15 +14,24 @@ import zipfile
 import zlib
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, replace
+from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Literal, Protocol, cast
 from urllib.parse import urlsplit
 
+from src.benchmark.backend_identity import canonical_json_bytes, sha256_hex
 from src.benchmark.backend_lock import (
     BackendLockError,
     LoadedBackendLock,
     revalidate_loaded_backend_lock,
+)
+from src.benchmark.backend_publication import ArtifactPublicationError, publish_immutable_bytes
+from src.benchmark.backends import PublishedArtifact
+from src.benchmark.checkpoint_acquisition import (
+    CheckpointAcquisitionError,
+    CheckpointAcquisitionRequest,
+    load_checkpoint_acquisition_request,
+    render_checkpoint_acquisition_evidence,
 )
 
 # The ZIP32 validation code is intentionally colocated with the publication
@@ -58,6 +67,9 @@ class PrepareBackendRequest:
     cache_root: Path
     archive_path: Path | None
     download: bool
+    acquisition_request_path: Path | None = None
+    evidence_output_path: Path | None = None
+    backend_lock_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +77,7 @@ class PrepareBackendOutcome:
     status: PrepareStatus
     exit_code: PrepareExitCode
     model_cache_path: Path | None
+    evidence_artifact: PublishedArtifact | None = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +94,8 @@ class _LockContract:
     checkpoint_url: str
     components: tuple[_Component, ...]
     model_artifact_set_sha256: str
+    archive_members: tuple[_Component, ...] = ()
+    pointer: _Component | None = None
 
 
 @dataclass(frozen=True)
@@ -141,9 +156,11 @@ class _RejectRedirects(urllib.request.HTTPRedirectHandler):
 def prepare_oaf_backend(
     request: PrepareBackendRequest,
     *,
-    backend_lock: LoadedBackendLock,
+    backend_lock: LoadedBackendLock | None = None,
 ) -> PrepareBackendOutcome:
     """Acquire or verify the immutable released OaF checkpoint component set."""
+    if backend_lock is None:
+        return _prepare_preseal_oaf_backend(request)
     try:
         validated_lock = revalidate_loaded_backend_lock(backend_lock)
     except BackendLockError:
@@ -151,7 +168,57 @@ def prepare_oaf_backend(
     contract = _contract_from_validated_lock(request, validated_lock)
     if isinstance(contract, _PrepareError):
         return _failure(contract)
+    if request.backend_lock_path is not None:
+        try:
+            acquisition_path = request.acquisition_request_path or (
+                validated_lock.path.parent
+                / f"{request.backend_id}.checkpoint-acquisition-request.json"
+            )
+            acquisition_request = load_checkpoint_acquisition_request(acquisition_path)
+            acquisition_contract = _contract_from_acquisition_request(request, acquisition_request)
+            if _contract_identity(acquisition_contract) != _contract_identity(contract):
+                return _failure(
+                    _IntegrityError("checkpoint request contradicts the final backend lock")
+                )
+        except CheckpointAcquisitionError:
+            return _failure(_IntegrityError("checkpoint acquisition request is invalid"))
     return _prepare_oaf_contract(request, contract)
+
+
+def _prepare_preseal_oaf_backend(request: PrepareBackendRequest) -> PrepareBackendOutcome:
+    if request.acquisition_request_path is None or request.evidence_output_path is None:
+        return _failure(_IntegrityError("pre-seal acquisition authority is incomplete"))
+    try:
+        acquisition_request = load_checkpoint_acquisition_request(request.acquisition_request_path)
+        contract = _contract_from_acquisition_request(request, acquisition_request)
+    except CheckpointAcquisitionError:
+        return _failure(_IntegrityError("checkpoint acquisition request is invalid"))
+    outcome = _prepare_oaf_contract(request, contract)
+    if outcome.status != "ready" or outcome.model_cache_path is None:
+        return outcome
+    try:
+        cache_path = PurePosixPath(
+            outcome.model_cache_path.resolve().relative_to(Path.cwd().resolve()).as_posix()
+        )
+        evidence, content = render_checkpoint_acquisition_evidence(
+            acquisition_request,
+            acquisition_mode=(
+                "download"
+                if request.download
+                else "archive" if request.archive_path is not None else "cache_verify"
+            ),
+            model_artifact_set_sha256=contract.model_artifact_set_sha256,
+            cache_path=cache_path,
+        )
+        published = publish_immutable_bytes(
+            request.evidence_output_path,
+            content,
+            evidence.sha256,
+            role="checkpoint_acquisition_evidence",
+        )
+    except (ArtifactPublicationError, CheckpointAcquisitionError, ValueError):
+        return _failure(_IntegrityError("checkpoint acquisition evidence could not be published"))
+    return replace(outcome, evidence_artifact=published)
 
 
 def _prepare_oaf_contract(
@@ -343,6 +410,55 @@ def _contract_from_validated_lock(
             str,
             backend_lock.descriptor.payload["model_artifact_set_sha256"],
         ),
+    )
+
+
+def _contract_from_acquisition_request(
+    request: PrepareBackendRequest,
+    acquisition_request: CheckpointAcquisitionRequest,
+) -> _LockContract:
+    if acquisition_request.backend_id != request.backend_id:
+        raise CheckpointAcquisitionError("checkpoint acquisition backend does not match selection")
+    components = tuple(
+        _Component(member.name, member.size, member.sha256)
+        for member in acquisition_request.archive_members
+        if member.role == "published_component"
+    )
+    model_artifact_set_sha256 = sha256_hex(
+        canonical_json_bytes(
+            [
+                {"name": component.name, "sha256": component.sha256, "size": component.size}
+                for component in components
+            ]
+        )
+    )
+    return _LockContract(
+        archive_size=acquisition_request.archive.size,
+        archive_sha256=acquisition_request.archive.sha256,
+        checkpoint_url=acquisition_request.checkpoint_url,
+        components=components,
+        model_artifact_set_sha256=model_artifact_set_sha256,
+        archive_members=tuple(
+            _Component(member.name, member.size, member.sha256)
+            for member in acquisition_request.archive_members
+        ),
+        pointer=next(
+            _Component(member.name, member.size, member.sha256)
+            for member in acquisition_request.archive_members
+            if member.role == "pointer"
+        ),
+    )
+
+
+def _contract_identity(contract: _LockContract) -> tuple[object, ...]:
+    return (
+        contract.archive_size,
+        contract.archive_sha256,
+        contract.checkpoint_url,
+        tuple(
+            (component.name, component.sha256, component.size) for component in contract.components
+        ),
+        contract.model_artifact_set_sha256,
     )
 
 
@@ -653,6 +769,8 @@ def _extract_archive(
     contract: _LockContract,
 ) -> None:
     members = _parse_zip_members(archive_fd, contract)
+    if contract.pointer is not None:
+        _verify_pointer_member(archive_fd, members[contract.pointer.name], contract.pointer)
     for component in contract.components:
         _extract_component(
             archive_fd,
@@ -669,7 +787,8 @@ def _parse_zip_members(
     contract: _LockContract,
 ) -> dict[str, _ZipMember]:
     central_offset, central_size, member_count = _parse_eocd(archive_fd, contract.archive_size)
-    expected = {component.name: component for component in contract.components}
+    expected_members = contract.archive_members or contract.components
+    expected = {component.name: component for component in expected_members}
     if member_count != len(expected):
         raise _IntegrityError("checkpoint archive member set is incomplete")
 
@@ -750,6 +869,36 @@ def _parse_zip_members(
     if any(end > next_start for (_, end), (next_start, _) in zip(regions, regions[1:])):
         raise _IntegrityError("checkpoint archive member regions overlap")
     return members
+
+
+def _verify_pointer_member(
+    archive_fd: int,
+    member: _ZipMember,
+    pointer: _Component,
+) -> None:
+    try:
+        compressed = _read_archive_bytes(archive_fd, member.data_offset, member.compressed_size)
+        if member.compression == zipfile.ZIP_DEFLATED:
+            decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+            content = decompressor.decompress(compressed, pointer.size + 1)
+            content += decompressor.flush(pointer.size + 1 - len(content))
+            if not decompressor.eof or decompressor.unused_data or decompressor.unconsumed_tail:
+                raise _IntegrityError("checkpoint pointer stream is invalid")
+        else:
+            content = compressed
+    except zlib.error:
+        raise _IntegrityError("checkpoint pointer stream is invalid") from None
+    expected = (
+        b'model_checkpoint_path: "model.ckpt-569400"\n'
+        b'all_model_checkpoint_paths: "model.ckpt-569400"\n'
+    )
+    if (
+        content != expected
+        or len(content) != pointer.size
+        or hashlib.sha256(content).hexdigest() != pointer.sha256
+        or zlib.crc32(content) != member.crc32
+    ):
+        raise _IntegrityError("checkpoint pointer payload contradicts the request")
 
 
 # EOCD search keeps candidate and validated metadata separate.

@@ -10,16 +10,19 @@ permissions:
   contents: read
 
 jobs:
-  native-host-evidence:
-    name: native-host-evidence
+  observe-native-host:
+    name: observe-native-host
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    outputs:
+      observation: ${{ steps.observe.outputs.observation }}
 
     steps:
       - name: Check out evidence validator
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Assert native host and write observation
+        id: observe
         shell: bash
         run: |
           set -euo pipefail
@@ -29,6 +32,8 @@ jobs:
           import re
           import subprocess
           from pathlib import Path
+
+          from tools.hpa320.github_host_evidence import collect_host_numeric_fingerprint
 
 
           def required_environment(name: str) -> str:
@@ -100,6 +105,7 @@ jobs:
               ),
               "github_sha": github_sha,
               "github_workflow_ref": github_workflow_ref,
+              "host_numeric_fingerprint": collect_host_numeric_fingerprint().as_json(),
               "runner_arch": runner_arch,
               "runner_os": runner_os,
               "uname_architecture": uname_architecture,
@@ -112,97 +118,135 @@ jobs:
               sort_keys=True,
           ).encode() + b"\n"
           Path("native-host-observation.json").write_bytes(content)
+          with Path(required_environment("GITHUB_OUTPUT")).open("a", encoding="utf-8") as output:
+              output.write(f"observation={content.decode().strip()}\n")
           PY
+
+  native-host-evidence:
+    name: native-host-evidence
+    needs: observe-native-host
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out evidence validator
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Derive and validate completed job evidence
         env:
           GH_TOKEN: ${{ github.token }}
+          NATIVE_HOST_OBSERVATION: ${{ needs.observe-native-host.outputs.observation }}
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import hashlib
           import json
           import os
           import urllib.request
           from pathlib import Path
 
-
-          JOB_ID = 90329445692
-          RUN_ID = 30375338017
-          WORKFLOW_COMMIT = "7a8e7c10849fccfc230f02c074fa49ba5c3b5217"
-          RUN_URL = (
-              "https://github.com/cwchanap/Crux/actions/runs/"
-              f"{RUN_ID}/job/{JOB_ID}"
-          )
-          API_URL = (
-              "https://api.github.com/repos/cwchanap/Crux/actions/jobs/"
-              f"{JOB_ID}"
-          )
+          from src.benchmark.backend_attestation import parse_host_numeric_fingerprint
+          from src.benchmark.backend_identity import canonical_json_bytes, strict_json_loads
+          from tools.hpa320.github_host_evidence import build_github_hosted_evidence
 
 
-          token = os.environ.get("GH_TOKEN")
-          if not token:
-              raise SystemExit("GH_TOKEN is missing")
-          request = urllib.request.Request(
-              API_URL,
-              headers={
-                  "Accept": "application/vnd.github+json",
-                  "Authorization": f"Bearer {token}",
-                  "X-GitHub-Api-Version": "2022-11-28",
-              },
+          def required_environment(name: str) -> str:
+              value = os.environ.get(name)
+              if not value:
+                  raise SystemExit(f"{name} is missing")
+              return value
+
+
+          token = required_environment("GH_TOKEN")
+          repository = required_environment("GITHUB_REPOSITORY")
+          run_id = required_environment("GITHUB_RUN_ID")
+          api_headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+          jobs_request = urllib.request.Request(
+              (
+                  f"https://api.github.com/repos/{repository}/actions/runs/"
+                  f"{run_id}/jobs?filter=latest&per_page=100"
+              ),
+              headers=api_headers,
           )
-          with urllib.request.urlopen(request, timeout=30) as response:
+          with urllib.request.urlopen(jobs_request, timeout=30) as response:
+              jobs_record = json.loads(response.read())
+          matches = [
+              job
+              for job in jobs_record.get("jobs", [])
+              if job.get("name") == "observe-native-host"
+          ]
+          if len(matches) != 1:
+              raise SystemExit("completed observation job is not unique")
+          observed_job_id = matches[0].get("id")
+          if (
+              not isinstance(observed_job_id, int)
+              or isinstance(observed_job_id, bool)
+              or observed_job_id < 1
+          ):
+              raise SystemExit("completed observation job ID is invalid")
+
+          api_request = urllib.request.Request(
+              f"https://api.github.com/repos/{repository}/actions/jobs/{observed_job_id}",
+              headers=api_headers,
+          )
+          with urllib.request.urlopen(api_request, timeout=30) as response:
               api_record_bytes = response.read()
           api_record = json.loads(api_record_bytes)
-
           expected = {
               "conclusion": "success",
-              "head_branch": "hpa-320-native-seal-evidence",
-              "head_sha": WORKFLOW_COMMIT,
-              "html_url": RUN_URL,
-              "id": JOB_ID,
-              "name": "native-host-evidence",
-              "run_id": RUN_ID,
+              "head_sha": required_environment("GITHUB_SHA"),
+              "id": observed_job_id,
+              "name": "observe-native-host",
+              "run_id": int(run_id),
               "status": "completed",
           }
           for field, value in expected.items():
               if api_record.get(field) != value:
-                  raise SystemExit(f"unexpected completed job {field}")
+                  raise SystemExit(f"unexpected completed observation job {field}")
           if api_record.get("labels") != ["ubuntu-24.04"]:
-              raise SystemExit("unexpected completed job labels")
+              raise SystemExit("unexpected completed observation job labels")
 
-          Path("github-job-api-record.json").write_bytes(api_record_bytes)
-          payload = {
-              "api_record_sha256": hashlib.sha256(api_record_bytes).hexdigest(),
-              "approved_labels": ["Linux", "X64"],
-              "job_id": JOB_ID,
-              "run_url": RUN_URL,
+          observation_content = required_environment("NATIVE_HOST_OBSERVATION").encode()
+          observation = strict_json_loads(observation_content, require_canonical=True)
+          if not isinstance(observation, dict):
+              raise SystemExit("native host observation must be an object")
+          expected_observation = {
+              "github_repository": repository,
+              "github_run_id": int(run_id),
+              "github_sha": required_environment("GITHUB_SHA"),
               "runner_arch": "X64",
               "runner_os": "Linux",
-              "workflow_commit": WORKFLOW_COMMIT,
+              "uname_architecture": "x86_64",
           }
-          payload_bytes = json.dumps(
-              payload,
-              allow_nan=False,
-              ensure_ascii=False,
-              separators=(",", ":"),
-              sort_keys=True,
-          ).encode()
-          evidence = {
-              "kind": "github_hosted",
-              "official_execution_allowed": True,
-              "payload": payload,
-              "sha256": hashlib.sha256(payload_bytes).hexdigest(),
-          }
-          evidence_bytes = json.dumps(
-              evidence,
-              allow_nan=False,
-              ensure_ascii=False,
-              separators=(",", ":"),
-              sort_keys=True,
-          ).encode() + b"\n"
-          Path("native-host-evidence.json").write_bytes(evidence_bytes)
+          for field, value in expected_observation.items():
+              if observation.get(field) != value:
+                  raise SystemExit(f"unexpected native host observation {field}")
+          run_url = api_record.get("html_url")
+          if (
+              not isinstance(run_url, str)
+              or not run_url.startswith(f"{observation['github_run_url']}/job/")
+          ):
+              raise SystemExit("completed observation job URL is invalid")
+
+          fingerprint = parse_host_numeric_fingerprint(
+              observation.get("host_numeric_fingerprint")
+          )
+          evidence = build_github_hosted_evidence(
+              api_record_bytes=api_record_bytes,
+              host_numeric_fingerprint=fingerprint,
+              job_id=observed_job_id,
+              run_url=run_url,
+              workflow_commit=observation["github_sha"],
+          )
+          Path("github-job-api-record.json").write_bytes(api_record_bytes)
+          Path("native-host-observation.json").write_bytes(observation_content + b"\n")
+          Path("native-host-evidence.json").write_bytes(
+              canonical_json_bytes(evidence) + b"\n"
+          )
           PY
           python3 -m tools.hpa320.seal_oaf_backend \
             validate-host \

@@ -1346,3 +1346,42 @@ def test_public_prepare_normalizes_malformed_loaded_lock_before_side_effects(
     assert outcome.status == "integrity_failed"
     assert outcome.exit_code == 2
     assert not (tmp_path / "cache").exists()
+
+
+def test_sealed_prepare_rejects_a_request_that_contradicts_the_final_lock_before_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_path = write_json(tmp_path / "backend-lock.json", backend_payload())
+    backend_lock = load_backend_lock(lock_path)
+    request_path = (
+        Path(__file__).parents[2]
+        / "config"
+        / "benchmark"
+        / "backends"
+        / f"{OFFICIAL_BACKEND_ID}.checkpoint-acquisition-request.json"
+    )
+    monkeypatch.setattr(
+        backend_prepare_module,
+        "_open_directory_chain",
+        lambda *args, **kwargs: pytest.fail("contradictory request reached the cache"),
+    )
+
+    outcome = prepare_oaf_backend(
+        PrepareBackendRequest(
+            backend_id=OFFICIAL_BACKEND_ID,
+            cache_root=tmp_path / "cache",
+            archive_path=None,
+            download=False,
+            acquisition_request_path=request_path,
+            evidence_output_path=None,
+            backend_lock_path=lock_path,
+        ),
+        backend_lock=backend_lock,
+    )
+
+    assert (outcome.status, outcome.exit_code, outcome.model_cache_path) == (
+        "integrity_failed",
+        2,
+        None,
+    )

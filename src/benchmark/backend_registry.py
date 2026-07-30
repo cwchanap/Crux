@@ -51,11 +51,20 @@ class BackendRegistration:
     seal_state: SealState
     factory: Callable[..., TranscriptionBackend]
 
+    def __post_init__(self) -> None:
+        if self.seal_state not in ("preseal", "sealed"):
+            raise ValueError("seal_state must be preseal or sealed")
+
 
 @dataclass(frozen=True)
 class BackendRegistry:
     default_backend_id: str
     registrations: Mapping[str, BackendRegistration]
+
+    def __post_init__(self) -> None:
+        for backend_id, registration in self.registrations.items():
+            if backend_id != registration.backend_id:
+                raise ValueError("registration key must match registration backend_id")
 
     def create(
         self,

@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 import platform
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 from types import ModuleType
@@ -483,6 +484,240 @@ def test_unspecified_native_producers_fail_closed_without_outputs(
         == 1
     )
     assert not candidate.exists()
+
+
+def _base_system_request_payload(
+    *, additional_system_packages: list[str] | None = None
+) -> dict[str, object]:
+    return {
+        "additional_system_packages": (
+            [] if additional_system_packages is None else additional_system_packages
+        ),
+        "base_image": "python:3.7.17-slim-bullseye",
+        "base_image_archive_keyring_sha256": "a" * 64,
+        "base_image_manifest_digest": (
+            "sha256:ea8897698c0955ba96144bd2b7310ef7884ccce4db7a1f97ffc21fb8b89d1673"
+        ),
+        "platform": "linux/amd64",
+        "required_probes": [
+            "base_python_version",
+            "runtime_python_version",
+            "runtime_tensorflow_version",
+            "runtime_smoke",
+        ],
+        "schema": "crux.oaf-base-system-package-request/v1",
+    }
+
+
+def _base_system_evidence_payload(
+    request_sha256: str,
+    *,
+    inventory: list[dict[str, str]] | None = None,
+    probes: list[dict[str, str]] | None = None,
+    manifest_digest: str = "sha256:ea8897698c0955ba96144bd2b7310ef7884ccce4db7a1f97ffc21fb8b89d1673",
+) -> dict[str, object]:
+    package_inventory = (
+        [{"architecture": "amd64", "name": "base-files", "version": "11.1+deb11u11"}]
+        if inventory is None
+        else inventory
+    )
+    probe_rows = (
+        [
+            {"name": "base_python_version", "value": "Python 3.7.17"},
+            {"name": "runtime_python_version", "value": "Python 3.7.17"},
+            {"name": "runtime_tensorflow_version", "value": "1.15.5"},
+            {"name": "runtime_smoke", "value": "passed"},
+        ]
+        if probes is None
+        else probes
+    )
+    return {
+        "additional_system_packages": [],
+        "base_image_archive_keyring_sha256": "a" * 64,
+        "base_image_manifest_digest": manifest_digest,
+        "native_host_evidence": _native_host_record(),
+        "package_inventory": package_inventory,
+        "package_inventory_sha256": "0" * 64,
+        "probes": probe_rows,
+        "request_sha256": request_sha256,
+        "schema": "crux.oaf-base-system-package-evidence/v1",
+    }
+
+
+def test_base_system_request_rejects_additional_packages_and_unapproved_probes(
+    tmp_path: Path,
+) -> None:
+    system_packages = importlib.import_module("tools.hpa320.oaf_system_packages")
+    request = _base_system_request_payload(additional_system_packages=["libgomp1"])
+    request_path = _write_json(tmp_path / "request.json", request)
+
+    with pytest.raises(system_packages.SystemPackageError, match="additional system packages"):
+        system_packages.load_base_system_package_request(request_path)
+
+    request = _base_system_request_payload()
+    request["required_probes"] = ["runtime_shell"]
+    request_path = _write_json(tmp_path / "unapproved-request.json", request)
+    with pytest.raises(system_packages.SystemPackageError, match="required probe"):
+        system_packages.load_base_system_package_request(request_path)
+
+
+@pytest.mark.parametrize(
+    ("inventory", "probes", "manifest_digest", "error"),
+    [
+        (
+            [
+                {"architecture": "amd64", "name": "zlib1g", "version": "1"},
+                {"architecture": "amd64", "name": "base-files", "version": "1"},
+            ],
+            None,
+            "sha256:ea8897698c0955ba96144bd2b7310ef7884ccce4db7a1f97ffc21fb8b89d1673",
+            "sorted",
+        ),
+        (
+            [
+                {"architecture": "amd64", "name": "base-files", "version": "1"},
+                {"architecture": "amd64", "name": "base-files", "version": "1"},
+            ],
+            None,
+            "sha256:ea8897698c0955ba96144bd2b7310ef7884ccce4db7a1f97ffc21fb8b89d1673",
+            "duplicate",
+        ),
+        (
+            None,
+            [{"name": "runtime_shell", "value": "passed"}],
+            "sha256:ea8897698c0955ba96144bd2b7310ef7884ccce4db7a1f97ffc21fb8b89d1673",
+            "probes",
+        ),
+        (None, None, "sha256:" + "b" * 64, "base image manifest"),
+    ],
+)
+def test_base_system_evidence_rejects_untrusted_rows(
+    tmp_path: Path,
+    inventory: list[dict[str, str]] | None,
+    probes: list[dict[str, str]] | None,
+    manifest_digest: str,
+    error: str,
+) -> None:
+    system_packages = importlib.import_module("tools.hpa320.oaf_system_packages")
+    request_path = _write_json(tmp_path / "request.json", _base_system_request_payload())
+    request = system_packages.load_base_system_package_request(request_path)
+    evidence = _base_system_evidence_payload(
+        request.sha256,
+        inventory=inventory,
+        probes=probes,
+        manifest_digest=manifest_digest,
+    )
+    if error not in {"duplicate", "sorted"}:
+        evidence["package_inventory_sha256"] = system_packages.inventory_sha256(
+            evidence["package_inventory"]
+        )
+    evidence_path = _write_json(tmp_path / "evidence.json", evidence)
+
+    with pytest.raises(system_packages.SystemPackageError, match=error):
+        system_packages.load_base_system_package_evidence(evidence_path, request=request)
+
+
+def test_base_system_evidence_reproduces_exact_inventory(tmp_path: Path) -> None:
+    system_packages = importlib.import_module("tools.hpa320.oaf_system_packages")
+    request_path = _write_json(tmp_path / "request.json", _base_system_request_payload())
+    request = system_packages.load_base_system_package_request(request_path)
+    evidence = _base_system_evidence_payload(request.sha256)
+    evidence["package_inventory_sha256"] = system_packages.inventory_sha256(
+        evidence["package_inventory"]
+    )
+    evidence_path = _write_json(tmp_path / "evidence.json", evidence)
+
+    loaded = system_packages.load_base_system_package_evidence(evidence_path, request=request)
+
+    assert loaded.request_sha256 == request.sha256
+    assert loaded.base_image_manifest_digest == request.base_image_manifest_digest
+    assert loaded.package_inventory_sha256 == system_packages.inventory_sha256(
+        loaded.package_inventory
+    )
+    assert request.additional_system_packages == ()
+
+
+def _mock_base_system_attestation(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(command: tuple[str, ...], **_: object) -> subprocess.CompletedProcess[bytes]:
+        rendered = " ".join(command)
+        if "image inspect" in rendered:
+            output = (
+                b"python:3.7.17-slim-bullseye@sha256:"
+                b"ea8897698c0955ba96144bd2b7310ef7884ccce4db7a1f97ffc21fb8b89d1673\n"
+            )
+        elif "dpkg-query" in rendered:
+            output = b"base-files\t11.1+deb11u11\tamd64\n"
+        elif "sha256sum" in rendered:
+            output = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  keyring\n"
+        elif "tensorflow" in rendered:
+            output = b"1.15.5\n"
+        elif "entrypoint" in rendered:
+            output = b"passed\n"
+        else:
+            output = b"Python 3.7.17\n"
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr=b"")
+
+    monkeypatch.setattr(seal_module.subprocess, "run", fake_run)
+
+
+def test_attest_base_system_publishes_immutable_native_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_native_host(monkeypatch)
+    request_path = _write_json(tmp_path / "request.json", _base_system_request_payload())
+    host_path = _write_json(tmp_path / "native-host-evidence.json", _native_host_record())
+    output_path = tmp_path / "base-system-package-evidence.json"
+    _mock_base_system_attestation(monkeypatch)
+
+    published = seal_module.attest_base_system(
+        request_path=request_path,
+        host_evidence_path=host_path,
+        image="crux-oaf-tf1:hpa320-seal",
+        output_path=output_path,
+    )
+    request = importlib.import_module(
+        "tools.hpa320.oaf_system_packages"
+    ).load_base_system_package_request(request_path)
+    evidence = importlib.import_module(
+        "tools.hpa320.oaf_system_packages"
+    ).load_base_system_package_evidence(output_path, request=request)
+
+    assert published.path == output_path
+    assert published.sha256 == evidence.sha256
+    assert evidence.request_sha256 == request.sha256
+    assert evidence.package_inventory[0].name == "base-files"
+    rerun = seal_module.attest_base_system(
+        request_path=request_path,
+        host_evidence_path=host_path,
+        image="crux-oaf-tf1:hpa320-seal",
+        output_path=output_path,
+    )
+
+    assert rerun == published
+
+
+def test_attest_base_system_rejects_different_existing_evidence_without_overwriting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_native_host(monkeypatch)
+    request_path = _write_json(tmp_path / "request.json", _base_system_request_payload())
+    host_path = _write_json(tmp_path / "native-host-evidence.json", _native_host_record())
+    output_path = tmp_path / "base-system-package-evidence.json"
+    _mock_base_system_attestation(monkeypatch)
+    output_path.write_bytes(b"different immutable evidence\n")
+    original = output_path.read_bytes()
+
+    with pytest.raises(SealError, match="publication failed"):
+        seal_module.attest_base_system(
+            request_path=request_path,
+            host_evidence_path=host_path,
+            image="crux-oaf-tf1:hpa320-seal",
+            output_path=output_path,
+        )
+
+    assert output_path.read_bytes() == original
 
 
 @pytest.mark.parametrize(
