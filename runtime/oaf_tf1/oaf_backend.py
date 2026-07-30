@@ -227,12 +227,163 @@ DESCRIPTOR_FIELDS = (
 )
 
 
+def _safe_relative_source_path(value):
+    if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+        return False
+    parts = value.split("/")
+    return not value.startswith("/") and all(part not in {"", ".", ".."} for part in parts)
+
+
+def _source_manifest_path_is_covered(path, roots):
+    """Accept selected roots, top-level support files, and required package ancestors."""
+    if "/" not in path:
+        return True
+    if any(path == root or path.startswith(root + "/") for root in roots):
+        return True
+    parent = path.rsplit("/", 1)[0]
+    return any(root.startswith(parent + "/") for root in roots)
+
+
+def _validate_mounted_source_manifest(payload, source_root):
+    roots = payload.get("covered_roots")
+    files = payload.get("files")
+    if not isinstance(roots, list) or not roots or not isinstance(files, list) or not files:
+        raise ProtocolFailure(
+            "mounted_identity_invalid", "Mounted source manifest is invalid.", fatal=True
+        )
+    if len(set(roots)) != len(roots) or not all(_safe_relative_source_path(root) for root in roots):
+        raise ProtocolFailure(
+            "mounted_identity_invalid", "Mounted source roots are invalid.", fatal=True
+        )
+    for root in roots:
+        try:
+            metadata = (Path(source_root) / root).lstat()
+        except OSError:
+            raise ProtocolFailure(
+                "mounted_identity_invalid", "Mounted source root is missing.", fatal=True
+            ) from None
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise ProtocolFailure(
+                "mounted_identity_invalid", "Mounted source root is invalid.", fatal=True
+            )
+    paths = []
+    for row in files:
+        if not isinstance(row, Mapping) or not {"path", "sha256"}.issubset(row):
+            raise ProtocolFailure(
+                "mounted_identity_invalid", "Mounted source row is invalid.", fatal=True
+            )
+        path = row["path"]
+        digest = row["sha256"]
+        if (
+            not _safe_relative_source_path(path)
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+            or not _source_manifest_path_is_covered(path, roots)
+        ):
+            raise ProtocolFailure(
+                "mounted_identity_invalid", "Mounted source row is invalid.", fatal=True
+            )
+        try:
+            content = (Path(source_root) / path).read_bytes()
+        except OSError:
+            raise ProtocolFailure(
+                "mounted_identity_invalid", "Mounted source file is missing.", fatal=True
+            ) from None
+        if hashlib.sha256(content).hexdigest() != digest:
+            raise ProtocolFailure(
+                "mounted_identity_invalid", "Mounted source hash differs.", fatal=True
+            )
+        paths.append(path)
+    if paths != sorted(paths) or len(set(paths)) != len(paths):
+        raise ProtocolFailure(
+            "mounted_identity_invalid", "Mounted source rows are invalid.", fatal=True
+        )
+
+
 def validate_schema_golden(schema, content):
-    """Check the runner-side exact keys for isolated lock-schema drift fixtures."""
+    """Validate runner fixtures with the shared production lock authority."""
+    if schema in {
+        "crux.transcription-backend-lock/v1",
+        "crux.transcription-runtime-lock/v1",
+        "crux.backend-seal-evidence/v1",
+        "crux.legacy-tf2-conversion-coverage/v1",
+    }:
+        try:
+            from src.benchmark.backend_lock import validate_schema_golden as validate_host_golden
+
+            validate_host_golden(schema, content)
+            return
+        except (ImportError, ValueError) as error:
+            raise ValueError("runner schema golden is invalid") from error
+
+    """Check runner-native exact schemas for isolated drift fixtures."""
+    if schema in {"crux.oaf-smoke-oracle/v1", "crux.oaf-tensor-coverage/v1"}:
+        try:
+            from tools.hpa320 import seal_oaf_backend as seal
+
+            value = json.loads(content[:-1].decode("utf-8"))
+            if schema == "crux.oaf-tensor-coverage/v1":
+                if set(value) != {
+                    "active_predict_dropout",
+                    "checkpoint_inventory",
+                    "non_inference_inventory",
+                    "note_sequence_byte_parity",
+                    "required_inference_inventory",
+                    "schema",
+                    "uninitialized_required",
+                }:
+                    raise ValueError("schema golden tensor keys are invalid")
+                if value["schema"] != "crux.oaf-tensor-coverage/v1":
+                    raise ValueError("schema golden tensor schema is invalid")
+                evidence = seal.LoadedSealEvidence(
+                    Path("golden-seal.json"),
+                    {
+                        field: value[field]
+                        for field in (
+                            "checkpoint_inventory",
+                            "required_inference_inventory",
+                            "non_inference_inventory",
+                        )
+                    },
+                    "0" * 64,
+                )
+                seal._validate_tensor_coverage(value, evidence)
+                return
+            if set(value) != SMOKE_ORACLE_KEYS:
+                raise ValueError("schema golden smoke keys are invalid")
+            if value["input_view_id"] != "fixture":
+                raise ValueError("schema golden input view differs")
+            audio = b"schema-golden-audio\n"
+            prediction = b"schema-golden-prediction\n"
+            if value["input_audio_sha256"] != hashlib.sha256(audio).hexdigest():
+                raise ValueError("schema golden smoke audio hash is invalid")
+            if (
+                not isinstance(value["source_audio_sha256"], str)
+                or len(value["source_audio_sha256"]) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in value["source_audio_sha256"]
+                )
+            ):
+                raise ValueError("schema golden source audio hash is invalid")
+            with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+                root = Path(directory)
+                (root / seal.SMOKE_AUDIO_NAME).write_bytes(audio)
+                (root / seal.SMOKE_PREDICTION_NAME).write_bytes(prediction)
+                evidence = seal.LoadedSealEvidence(
+                    root / "seal.json",
+                    {
+                        "smoke_audio_sha256": value["input_audio_sha256"],
+                        "smoke_prediction_sha256": hashlib.sha256(prediction).hexdigest(),
+                    },
+                    "0" * 64,
+                )
+                seal._validate_smoke(value, root, evidence)
+            return
+        except (ImportError, OSError, ValueError) as error:
+            raise ValueError("runner schema golden is invalid") from error
     expected_by_schema = {
-        "crux.transcription-backend-lock/v1": BACKEND_LOCK_KEYS,
-        "crux.transcription-runtime-lock/v1": RUNTIME_LOCK_KEYS,
-        "crux.backend-seal-evidence/v1": SEAL_EVIDENCE_KEYS,
         "crux.oaf-upstream-source-manifest/v1": UPSTREAM_MANIFEST_KEYS,
         "crux.oaf-runner-source-manifest/v1": RUNNER_MANIFEST_KEYS,
         "crux.oaf-smoke-oracle/v1": SMOKE_ORACLE_KEYS,
@@ -263,14 +414,79 @@ def validate_schema_golden(schema, content):
             raise ValueError("schema golden architecture is invalid")
         if "covered_roots" in expected and not isinstance(value["covered_roots"], list):
             raise ValueError("schema golden roots are invalid")
+        if "covered_roots" in expected:
+            roots = value["covered_roots"]
+            files = value["files"]
+            if (
+                not roots
+                or not all(_safe_relative_source_path(root) for root in roots)
+                or roots != sorted(roots)
+                or len(set(roots)) != len(roots)
+                or not isinstance(files, list)
+                or any(
+                    not isinstance(row, dict)
+                    or set(row) != {"path", "sha256"}
+                    or not _safe_relative_source_path(row["path"])
+                    or not isinstance(row["sha256"], str)
+                    or len(row["sha256"]) != 64
+                    or any(character not in "0123456789abcdef" for character in row["sha256"])
+                    for row in files
+                )
+                or [row["path"] for row in files] != sorted(row["path"] for row in files)
+                or len({row["path"] for row in files}) != len(files)
+                or any(not _source_manifest_path_is_covered(row["path"], roots) for row in files)
+            ):
+                raise ValueError("schema golden source manifest is invalid")
+            fixture_root = Path(__file__).parents[2] / "tests/benchmark/schema_goldens"
+            for row in files:
+                relative = Path(row["path"])
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError("schema golden source path is unsafe")
+                source = fixture_root / relative
+                if (
+                    not source.is_file()
+                    or hashlib.sha256(source.read_bytes()).hexdigest() != row["sha256"]
+                ):
+                    raise ValueError("schema golden source hash differs")
+        if "upstream_commit" in expected and value["upstream_commit"] != "a" * 40:
+            raise ValueError("schema golden upstream authority differs")
         if "input_audio_frame_count" in expected and (
             not isinstance(value["input_audio_frame_count"], int)
             or isinstance(value["input_audio_frame_count"], bool)
             or value["input_audio_frame_count"] <= 0
         ):
             raise ValueError("schema golden frame count is invalid")
+        if "input_audio_frame_count" in expected and (
+            not isinstance(value["input_audio_sha256"], str)
+            or not isinstance(value["source_audio_sha256"], str)
+            or any(
+                len(value[field]) != 64
+                or any(character not in "0123456789abcdef" for character in value[field])
+                for field in ("input_audio_sha256", "source_audio_sha256")
+            )
+            or not all(
+                isinstance(value[field], str) and value[field]
+                for field in ("input_view_id", "source_audio_id")
+            )
+            or not isinstance(value["native_events"], list)
+            or not value["native_events"]
+        ):
+            raise ValueError("schema golden smoke oracle is invalid")
         if "active_predict_dropout" in expected and value["active_predict_dropout"] is not False:
             raise ValueError("schema golden tensor coverage is invalid")
+        if "active_predict_dropout" in expected and (
+            value["uninitialized_required"] != []
+            or value["note_sequence_byte_parity"] is not True
+            or any(
+                not isinstance(value[field], list)
+                for field in (
+                    "checkpoint_inventory",
+                    "required_inference_inventory",
+                    "non_inference_inventory",
+                )
+            )
+        ):
+            raise ValueError("schema golden tensor coverage inventories are invalid")
     except (UnicodeDecodeError, ValueError, TypeError):
         raise ValueError("runner schema golden is invalid") from None
 
@@ -1093,6 +1309,10 @@ def authenticate_startup(
         expected_schema="crux.oaf-upstream-source-manifest/v1",
         expected_sha256=runtime.payload["upstream_source_manifest_sha256"],
     )
+    runner_source_root = Path(runner_source_manifest_path).parents[1]
+    upstream_source_root = Path(upstream_source_manifest_path).parents[1] / "upstream"
+    _validate_mounted_source_manifest(runner_manifest.payload, runner_source_root)
+    _validate_mounted_source_manifest(upstream_manifest.payload, upstream_source_root)
     smoke_oracle = load_authenticated_object(
         smoke_oracle_path,
         label="smoke_oracle",

@@ -1,1 +1,1 @@
-{"covered_roots":["fixture"],"files":[],"schema":"crux.oaf-host-adapter-source-manifest/v1"}
+{"covered_roots":["fixtures/host.txt"],"files":[{"path":"fixtures/host.txt","sha256":"865d788a882cfecbb3f75921a67802a1bbc38a9610067ca4b7634911f2e484f0"}],"schema":"crux.oaf-host-adapter-source-manifest/v1"}

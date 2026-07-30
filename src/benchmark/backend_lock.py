@@ -536,30 +536,22 @@ def load_conversion_audit(path: Path) -> LoadedConversionAudit:
 
 
 def validate_schema_golden(schema: str, content: bytes) -> None:
-    """Validate an isolated Phase A schema fixture without treating it as a lock authority."""
-    expected_by_schema = {
-        BACKEND_LOCK_SCHEMA: BACKEND_LOCK_KEYS,
-        RUNTIME_LOCK_SCHEMA: RUNTIME_LOCK_KEYS,
-        SEAL_EVIDENCE_SCHEMA: SEAL_EVIDENCE_KEYS,
-        CONVERSION_AUDIT_SCHEMA: CONVERSION_AUDIT_KEYS,
+    """Run a complete isolated fixture through its production lock loader."""
+    loaders = {
+        BACKEND_LOCK_SCHEMA: load_backend_lock,
+        RUNTIME_LOCK_SCHEMA: load_runtime_lock,
+        SEAL_EVIDENCE_SCHEMA: load_seal_evidence,
+        CONVERSION_AUDIT_SCHEMA: load_conversion_audit,
     }
     try:
-        expected = expected_by_schema[schema]
-        if not content.endswith(b"\n") or content.endswith(b"\n\n"):
-            raise BackendLockError("schema golden must have exactly one final newline")
-        payload = strict_json_loads(content[:-1], require_canonical=True)
-        if not isinstance(payload, dict):
-            raise BackendLockError("schema golden must be an object")
-        _require_fields(payload, expected, "schema golden")
-        _require_exact_string(payload, "schema", schema, "schema golden schema")
-        first_key = min(expected)
-        if first_key == "additional_system_packages" and not isinstance(payload[first_key], list):
-            raise BackendLockError("schema golden additional system packages must be an array")
-        if first_key == "architecture_id":
-            _require_nonempty_string(payload[first_key], "schema golden architecture")
-        if first_key == "candidate_matches" and not isinstance(payload[first_key], list):
-            raise BackendLockError("schema golden candidate matches must be an array")
-    except (KeyError, StrictJsonError, BackendLockError) as error:
+        loader = loaders[schema]
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            path = Path(directory) / "golden.json"
+            path.write_bytes(content)
+            loader(path)
+    except (KeyError, OSError, BackendLockError) as error:
         raise ValueError(str(error)) from None
 
 

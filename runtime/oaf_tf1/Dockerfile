@@ -35,6 +35,7 @@ FROM runtime-build AS instrumented-source
 
 COPY runtime/oaf_tf1/ /opt/crux/runtime/
 COPY runtime/oaf_tf1/vendor/magenta/ /opt/crux/upstream/magenta/
+COPY runtime/oaf_tf1/vendor/LICENSE /opt/crux/upstream/LICENSE
 RUN python /opt/crux/runtime/apply_instrumentation_patch.py \
       --source /opt/crux/upstream \
       --destination /opt/crux/vendor \
@@ -74,6 +75,10 @@ COPY runtime/oaf_tf1/source-manifest.json /opt/crux/vendor/source-manifest.json
 COPY runtime/oaf_tf1/*.py /opt/crux/runtime/
 COPY runtime/oaf_tf1/patches/ /opt/crux/runtime/patches/
 COPY runtime/oaf_tf1/runner-source-manifest.json /opt/crux/runtime/runner-source-manifest.json
+# Preserve the manifest-addressed repository layout solely for fail-closed source attestation.
+COPY runtime/oaf_tf1/ /opt/crux/runtime/oaf_tf1/
+COPY tools/hpa320/generate_runner_source_manifest.py /opt/crux/tools/hpa320/generate_runner_source_manifest.py
+COPY tools/hpa320/oaf_system_packages.py /opt/crux/tools/hpa320/oaf_system_packages.py
 WORKDIR /opt/crux
 USER "${RUNTIME_UID}:${RUNTIME_GID}"
 ENTRYPOINT ["/usr/bin/env", "-i", "CUDA_VISIBLE_DEVICES=-1", "MKL_NUM_THREADS=1", "OMP_NUM_THREADS=1", "OPENBLAS_NUM_THREADS=1", "PYTHONHASHSEED=0", "PYTHONCOERCECLOCALE=0", "TF_NUM_INTEROP_THREADS=1", "TF_NUM_INTRAOP_THREADS=1", "/opt/crux/venv/bin/python", "-s", "/opt/crux/runtime/entrypoint.py"]

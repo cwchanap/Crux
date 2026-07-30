@@ -814,7 +814,10 @@ def test_provisional_dockerfile_has_clean_test_and_fail_closed_runtime_inputs() 
         "SYSTEM_PACKAGE_INVENTORY_SHA256",
     ):
         assert f"ARG {argument}" not in dockerfile
-    assert "oaf_system_packages.py" not in dockerfile
+    assert (
+        "COPY tools/hpa320/oaf_system_packages.py "
+        "/opt/crux/tools/hpa320/oaf_system_packages.py" in dockerfile
+    )
     assert 'USER "${RUNTIME_UID}:${RUNTIME_GID}"' in dockerfile
     assert "backend-lock.json" not in dockerfile
     assert "runtime-lock.json" not in dockerfile
