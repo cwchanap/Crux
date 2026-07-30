@@ -340,11 +340,13 @@ def build_host_adapter_source_manifest(repository_root: Path) -> dict[str, JsonV
     for relative in HOST_ADAPTER_SOURCE_PATHS:
         content = _read_regular(repository / relative, f"host adapter source {relative}")
         rows.append({"path": relative, "sha256": sha256_hex(content)})
-    return {
+    manifest: dict[str, JsonValue] = {
         "covered_roots": list(HOST_ADAPTER_SOURCE_PATHS),
         "files": rows,
         "schema": HOST_ADAPTER_SCHEMA,
     }
+    _validate_source_manifest_payload(manifest, HOST_ADAPTER_SCHEMA)
+    return manifest
 
 
 def materialize_system_packages(
@@ -661,9 +663,40 @@ def validate_schema_golden(schema: str, content: bytes) -> None:
     }
     try:
         if schema not in loaders:
-            expected = {
-                CALIBRATION_MEASUREMENT_EVIDENCE_SCHEMA: _MEASUREMENT_EVIDENCE_KEYS,
-                SEAL_CANDIDATE_SCHEMA: {
+            payload, _ = _read_canonical_object_from_content(content, "schema golden")
+            root = Path(__file__).parents[2]
+            if schema == CALIBRATION_MEASUREMENT_EVIDENCE_SCHEMA:
+                for field in (
+                    "base_system_package_evidence_sha256",
+                    "checkpoint_acquisition_evidence_sha256",
+                ):
+                    _require_sha256_value(payload[field], f"schema golden {field}")
+                if not isinstance(payload["image_manifest_digest"], str) or not payload[
+                    "image_manifest_digest"
+                ].startswith("sha256:"):
+                    raise SealError("schema golden image manifest is invalid")
+                host = payload["native_host_evidence"]
+                if not isinstance(host, dict) or set(host) != {
+                    "kind",
+                    "official_execution_allowed",
+                    "payload",
+                    "sha256",
+                }:
+                    raise SealError("schema golden native host evidence is invalid")
+                NativeHostEvidence(
+                    kind=cast(Any, host["kind"]),
+                    payload=cast(Mapping[str, JsonValue], host["payload"]),
+                    sha256=cast(str, host["sha256"]),
+                    official_execution_allowed=cast(bool, host["official_execution_allowed"]),
+                )
+                request = CalibrationMeasurementRequest((1,), 1, "a" * 64, {})
+                with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+                    path = Path(directory) / "golden.json"
+                    path.write_bytes(content)
+                    _load_measurement_evidence(path, request)
+                return
+            if schema == SEAL_CANDIDATE_SCHEMA:
+                if set(payload) != {
                     "calibration_measurement_evidence_sha256",
                     "checkpoint_components",
                     "checkpoint_prefix",
@@ -671,30 +704,83 @@ def validate_schema_golden(schema: str, content: bytes) -> None:
                     "required_inference_inventory_sha256",
                     "schema",
                     "seal_profile_request_sha256",
-                },
-                "crux.oaf-oci-layout-manifest/v1": _OCI_LAYOUT_KEYS,
-                HOST_ADAPTER_SCHEMA: {"covered_roots", "files", "schema"},
-            }[schema]
-            payload, _ = _read_canonical_object_from_content(content, "schema golden")
-            if set(payload) != expected or payload["schema"] != schema:
-                raise SealError("schema golden fields are invalid")
-            first = min(expected)
-            if first == "archive" and not isinstance(payload[first], dict):
-                raise SealError("schema golden archive is invalid")
-            if first == "calibration_measurement_evidence_sha256" and not _is_sha256(
-                payload[first]
-            ):
-                raise SealError("schema golden hash is invalid")
-            if first == "covered_roots" and not isinstance(payload[first], list):
-                raise SealError("schema golden roots are invalid")
-            if first == "base_system_package_evidence_sha256" and not _is_sha256(payload[first]):
-                raise SealError("schema golden measurement evidence hash is invalid")
-            return
+                }:
+                    raise SealError("schema golden candidate fields are invalid")
+                for field in (
+                    "calibration_measurement_evidence_sha256",
+                    "model_artifact_set_sha256",
+                    "required_inference_inventory_sha256",
+                    "seal_profile_request_sha256",
+                ):
+                    _require_sha256_value(payload[field], f"schema golden {field}")
+                if payload["seal_profile_request_sha256"] != "b" * 64:
+                    raise SealError("schema golden profile authority differs")
+                backend = load_backend_lock(
+                    root / "tests/benchmark/schema_goldens/crux.transcription-backend-lock-v1.json"
+                )
+                with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+                    path = Path(directory) / "golden.json"
+                    manifest = {key: payload[key] for key in _CANDIDATE_MANIFEST_KEYS}
+                    path.write_bytes(canonical_json_bytes(manifest, trailing_newline=True))
+                    _validate_candidate_manifest(path, backend)
+                return
+            if schema == "crux.oaf-oci-layout-manifest/v1":
+                if set(payload) != _OCI_LAYOUT_KEYS:
+                    raise SealError("schema golden OCI fields are invalid")
+                archive = payload["archive"]
+                if not isinstance(archive, dict) or set(archive) != _ARCHIVE_KEYS:
+                    raise SealError("schema golden OCI archive is invalid")
+                for field in ("config_digest", "image_manifest_digest"):
+                    value = payload[field]
+                    if (
+                        not isinstance(value, str)
+                        or not value.startswith("sha256:")
+                        or len(value) != 71
+                    ):
+                        raise SealError("schema golden OCI digest is invalid")
+                if payload["layer_digests"] != ["sha256:" + "a" * 64]:
+                    raise SealError("schema golden OCI layer authority differs")
+                with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+                    directory_path = Path(directory)
+                    archive_path = directory_path / cast(str, archive["name"])
+                    archive_path.write_bytes(b"schema-golden-oci\n")
+                    seal = LoadedSealEvidence(
+                        directory_path / "seal.json",
+                        {
+                            "oci_layout_archive": archive,
+                            "runtime_image_config_digest": payload["config_digest"],
+                            "runtime_image_layer_digests": payload["layer_digests"],
+                            "runtime_image_manifest_digest": payload["image_manifest_digest"],
+                        },
+                        "0" * 64,
+                    )
+                    _validate_oci_layout(payload, directory_path, seal)
+                return
+            if schema == HOST_ADAPTER_SCHEMA:
+                _validate_source_manifest_payload(payload, HOST_ADAPTER_SCHEMA)
+                fixture_root = Path(__file__).parents[2] / "tests/benchmark/schema_goldens"
+                for row in cast(list[dict[str, JsonValue]], payload["files"]):
+                    path = fixture_root / cast(str, row["path"])
+                    if sha256_hex(_read_regular(path, "schema golden source")) != row["sha256"]:
+                        raise SealError("schema golden source hash differs")
+                return
+            raise SealError("schema golden is unsupported")
         loader = loaders[schema]
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             path = Path(directory) / "golden.json"
             path.write_bytes(content)
-            loader(path)
+            loaded = loader(path)
+            if schema == SEAL_PROFILE_REQUEST_SCHEMA:
+                for field in (
+                    "base_system_package_evidence_sha256",
+                    "base_system_package_request_sha256",
+                    "calibration_measurement_evidence_sha256",
+                    "calibration_measurement_request_sha256",
+                    "checkpoint_acquisition_evidence_sha256",
+                    "checkpoint_acquisition_request_sha256",
+                ):
+                    if loaded.payload[field] != "a" * 64:
+                        raise SealError("schema golden profile authority differs")
     except (KeyError, OSError, SealError) as error:
         raise ValueError(str(error)) from None
 
@@ -708,6 +794,57 @@ def _read_canonical_object_from_content(
     if not isinstance(value, dict):
         raise SealError(f"{label} must be an object")
     return value, content
+
+
+def _validate_source_manifest_payload(payload: Mapping[str, JsonValue], schema: str) -> None:
+    """Validate the source-manifest shape before its hashes bind selected source files."""
+    if set(payload) != {"covered_roots", "files", "schema"} or payload["schema"] != schema:
+        raise SealError("source manifest fields are invalid")
+    roots = payload["covered_roots"]
+    files = payload["files"]
+    if (
+        not isinstance(roots, list)
+        or not roots
+        or roots != sorted(roots)
+        or len(set(roots)) != len(roots)
+        or any(not _safe_relative_source_path(root) for root in roots)
+        or not isinstance(files, list)
+    ):
+        raise SealError("source manifest roots are invalid")
+    paths: list[str] = []
+    for row in files:
+        if not isinstance(row, dict) or set(row) != {"path", "sha256"}:
+            raise SealError("source manifest file row is invalid")
+        path = row["path"]
+        if not _safe_relative_source_path(path):
+            raise SealError("source manifest file path is invalid")
+        if not _source_manifest_path_is_covered(path, roots):
+            raise SealError("source manifest file is outside covered roots")
+        _require_sha256_value(row["sha256"], "source manifest file hash")
+        paths.append(path)
+    if paths != sorted(paths) or len(set(paths)) != len(paths):
+        raise SealError("source manifest files are not uniquely sorted")
+
+
+def _safe_relative_source_path(value: object) -> bool:
+    if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+        return False
+    path = PurePosixPath(value)
+    return (
+        not path.is_absolute()
+        and str(path) == value
+        and all(part not in {"", ".", ".."} for part in path.parts)
+    )
+
+
+def _source_manifest_path_is_covered(path: str, roots: list[JsonValue]) -> bool:
+    """Allow covered files, top-level support files, and package ancestors only."""
+    if "/" not in path:
+        return True
+    if any(path == root or path.startswith(f"{root}/") for root in roots):
+        return True
+    parent = path.rsplit("/", 1)[0]
+    return any(isinstance(root, str) and root.startswith(f"{parent}/") for root in roots)
 
 
 def _measurement_row_from_value(value: MeasurementRow | Mapping[str, object]) -> MeasurementRow:

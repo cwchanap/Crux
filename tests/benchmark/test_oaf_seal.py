@@ -64,6 +64,31 @@ def _content_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def test_source_manifest_validator_allows_package_ancestors_only() -> None:
+    payload = {
+        "covered_roots": ["magenta/models/deep"],
+        "files": [
+            {"path": "LICENSE", "sha256": "a" * 64},
+            {"path": "magenta/__init__.py", "sha256": "b" * 64},
+            {"path": "magenta/models/__init__.py", "sha256": "c" * 64},
+            {"path": "magenta/models/deep/model.py", "sha256": "d" * 64},
+        ],
+        "schema": "crux.oaf-host-adapter-source-manifest/v1",
+    }
+
+    seal_module._validate_source_manifest_payload(
+        payload,
+        "crux.oaf-host-adapter-source-manifest/v1",
+    )
+
+    payload["files"][2]["path"] = "magenta/unrelated/source.py"
+    with pytest.raises(SealError, match="outside covered roots"):
+        seal_module._validate_source_manifest_payload(
+            payload,
+            "crux.oaf-host-adapter-source-manifest/v1",
+        )
+
+
 def _native_host_payload() -> dict[str, object]:
     return {
         "api_record_sha256": "a" * 64,

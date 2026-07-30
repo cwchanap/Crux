@@ -231,26 +231,20 @@ def load_base_system_package_evidence(
 
 
 def validate_schema_golden(schema: str, content: bytes) -> None:
-    """Run the isolated request fixture through the production request loader."""
-    if schema == BASE_SYSTEM_PACKAGE_EVIDENCE_SCHEMA:
-        try:
-            payload = _strict_json_loads(content[:-1])
-            if not isinstance(payload, dict) or set(payload) != _BASE_SYSTEM_EVIDENCE_KEYS:
-                raise ValueError("base-system evidence schema golden fields are invalid")
-            if payload["schema"] != schema or not isinstance(
-                payload["additional_system_packages"], list
-            ):
-                raise ValueError("base-system evidence schema golden is invalid")
-            return
-        except (SystemPackageError, ValueError):
-            raise ValueError("base-system evidence schema golden is invalid") from None
-    if schema != BASE_SYSTEM_PACKAGE_REQUEST_SCHEMA:
+    """Run isolated reviewed-authority fixtures through production loaders."""
+    loaders = {
+        BASE_SYSTEM_PACKAGE_REQUEST_SCHEMA: load_base_system_package_request,
+        BASE_SYSTEM_PACKAGE_EVIDENCE_SCHEMA: load_base_system_package_evidence,
+    }
+    if schema not in loaders:
         raise ValueError("base-system schema golden is unsupported")
     try:
         with TemporaryDirectory(dir=Path.cwd()) as directory:
             path = Path(directory) / "golden.json"
             path.write_bytes(content)
-            load_base_system_package_request(path)
+            loaded = loaders[schema](path)
+            if schema == BASE_SYSTEM_PACKAGE_EVIDENCE_SCHEMA and loaded.request_sha256 != "a" * 64:
+                raise SystemPackageError("base-system golden request authority differs")
     except (OSError, SystemPackageError) as error:
         raise ValueError(str(error)) from None
 

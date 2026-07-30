@@ -196,3 +196,86 @@ def test_phase_b_schema_golden_validators_reject_structural_mutations(
             validator = getattr(importlib.import_module(module_name), "validate_schema_golden")
             with pytest.raises(ValueError):
                 validator(entry.schema, mutated)
+
+
+@pytest.mark.parametrize(
+    ("schema", "field"),
+    [
+        ("crux.transcription-backend-lock/v1", "checkpoint_acquisition_request_sha256"),
+        ("crux.transcription-runtime-lock/v1", "base_system_package_evidence_sha256"),
+    ],
+)
+def test_phase_a_schema_golden_validators_reject_important_hash_type_drift(
+    repository_root: Path,
+    schema: str,
+    field: str,
+) -> None:
+    entry = next(
+        candidate
+        for candidate in load_schema_golden_manifest(repository_root)
+        if candidate.schema == schema
+    )
+    payload = json.loads(
+        (repository_root / entry.golden_path).read_bytes(),
+        parse_float=Decimal,
+    )
+    payload[field] = 0
+    mutated = canonical_json_bytes(payload, trailing_newline=True)
+
+    for module_name in entry.validator_modules:
+        validator = getattr(importlib.import_module(module_name), "validate_schema_golden")
+        with pytest.raises(ValueError):
+            validator(entry.schema, mutated)
+
+
+@pytest.mark.parametrize(
+    ("schema", "field"),
+    [
+        ("crux.oaf-calibration-measurement-evidence/v1", "base_system_package_evidence_sha256"),
+        ("crux.oaf-seal-candidate/v1", "seal_profile_request_sha256"),
+        ("crux.oaf-oci-layout-manifest/v1", "config_digest"),
+        ("crux.oaf-smoke-oracle/v1", "source_audio_sha256"),
+    ],
+)
+def test_phase_a_schema_goldens_reject_nonfirst_critical_field_drift(
+    repository_root: Path, schema: str, field: str
+) -> None:
+    entry = next(
+        item for item in load_schema_golden_manifest(repository_root) if item.schema == schema
+    )
+    payload = json.loads((repository_root / entry.golden_path).read_bytes(), parse_float=Decimal)
+    payload[field] = 0
+    mutated = canonical_json_bytes(payload, trailing_newline=True)
+    for module_name in entry.validator_modules:
+        validator = getattr(importlib.import_module(module_name), "validate_schema_golden")
+        with pytest.raises(ValueError):
+            validator(entry.schema, mutated)
+
+
+@pytest.mark.parametrize(
+    "audio_path",
+    [
+        "/absolute.wav",
+        "../escape.wav",
+        "./dot.wav",
+        "dir\\escape.wav",
+        "audio.mp3",
+        "bad\x00.wav",
+        "e\u0301.wav",
+    ],
+)
+def test_host_and_runner_reject_the_same_invalid_audio_paths(
+    repository_root: Path, audio_path: str
+) -> None:
+    entry = next(
+        item
+        for item in load_schema_golden_manifest(repository_root)
+        if item.schema == "crux.transcription-runner/v1"
+    )
+    payload = json.loads((repository_root / entry.golden_path).read_bytes())
+    payload["audio_path"] = audio_path
+    content = canonical_json_bytes(payload, trailing_newline=True)
+    for module_name in entry.validator_modules:
+        validator = getattr(importlib.import_module(module_name), "validate_schema_golden")
+        with pytest.raises(ValueError):
+            validator(entry.schema, content)

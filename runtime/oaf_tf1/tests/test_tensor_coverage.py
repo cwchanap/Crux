@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -39,6 +40,167 @@ def _inventories():
     ]
     graph = required
     return checkpoint, required, non_inference, graph
+
+
+def _final_stage_copy_mappings(repository: Path) -> list[tuple[str, str]]:
+    dockerfile = (repository / "runtime/oaf_tf1/Dockerfile").read_text()
+    marker = "FROM runtime-build AS runtime\n"
+    assert marker in dockerfile
+    final_stage = dockerfile.split(marker, maxsplit=1)[1]
+    mappings: list[tuple[str, str]] = []
+    instruction = ""
+    for line in final_stage.splitlines():
+        instruction += line.strip().removesuffix("\\")
+        if line.rstrip().endswith("\\"):
+            instruction += " "
+            continue
+        fields = instruction.split()
+        instruction = ""
+        if not fields or fields[0] != "COPY" or fields[1].startswith("--from="):
+            continue
+        assert len(fields) == 3
+        mappings.append((fields[1], fields[2]))
+    assert not instruction
+    return mappings
+
+
+def _final_stage_destinations(mappings: list[tuple[str, str]], source_path: str) -> set[str]:
+    destinations = set()
+    for copied_source, destination in mappings:
+        if source_path == copied_source:
+            destinations.add(
+                destination + source_path.rsplit("/", maxsplit=1)[-1]
+                if destination.endswith("/")
+                else destination
+            )
+        if copied_source.endswith("/") and source_path.startswith(copied_source):
+            destinations.add(destination + source_path.removeprefix(copied_source))
+    return destinations
+
+
+def _stage_final_image_file(
+    *,
+    repository: Path,
+    staged_root: Path,
+    mappings: list[tuple[str, str]],
+    source_path: str,
+    destination: str | None = None,
+) -> Path:
+    final_destination = destination or f"/opt/crux/{source_path}"
+    assert final_destination in _final_stage_destinations(mappings, source_path)
+    staged = staged_root / final_destination.removeprefix("/opt/crux/")
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_bytes((repository / source_path).read_bytes())
+    return staged
+
+
+def test_mounted_source_manifest_accepts_roots_top_level_and_package_ancestors(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "magenta" / "music").mkdir(parents=True)
+    (tmp_path / "magenta" / "common").mkdir()
+    (tmp_path / "magenta" / "models" / "deep").mkdir(parents=True)
+    (tmp_path / "LICENSE").write_bytes(b"license\n")
+    source = tmp_path / "magenta" / "music" / "source.py"
+    source.write_bytes(b"source\n")
+    package = tmp_path / "magenta" / "__init__.py"
+    package.write_bytes(b"package\n")
+    models_package = tmp_path / "magenta" / "models" / "__init__.py"
+    models_package.write_bytes(b"models package\n")
+    oaf_backend._validate_mounted_source_manifest(
+        {
+            "covered_roots": ["magenta/models/deep", "magenta/music", "magenta/common"],
+            "files": [
+                {"path": "LICENSE", "sha256": hashlib.sha256(b"license\n").hexdigest()},
+                {
+                    "path": "magenta/__init__.py",
+                    "sha256": hashlib.sha256(b"package\n").hexdigest(),
+                },
+                {
+                    "path": "magenta/models/__init__.py",
+                    "sha256": hashlib.sha256(b"models package\n").hexdigest(),
+                },
+                {
+                    "path": "magenta/music/source.py",
+                    "sha256": hashlib.sha256(b"source\n").hexdigest(),
+                },
+            ],
+        },
+        tmp_path,
+    )
+
+
+def test_mounted_source_manifest_rejects_out_of_contract_sibling(tmp_path: Path) -> None:
+    (tmp_path / "magenta" / "models" / "deep").mkdir(parents=True)
+    sibling = tmp_path / "magenta" / "unrelated" / "source.py"
+    sibling.parent.mkdir()
+    sibling.write_bytes(b"sibling\n")
+
+    with pytest.raises(ProtocolFailure, match="Mounted source row is invalid"):
+        oaf_backend._validate_mounted_source_manifest(
+            {
+                "covered_roots": ["magenta/models/deep"],
+                "files": [
+                    {
+                        "path": "magenta/unrelated/source.py",
+                        "sha256": hashlib.sha256(b"sibling\n").hexdigest(),
+                    }
+                ],
+            },
+            tmp_path,
+        )
+
+
+def test_mounted_source_manifest_accepts_checked_in_upstream_vendor_tree() -> None:
+    repository = Path(__file__).parents[3]
+    manifest = json.loads((repository / "runtime/oaf_tf1/source-manifest.json").read_text())
+
+    oaf_backend._validate_mounted_source_manifest(
+        manifest,
+        repository / "runtime/oaf_tf1/vendor",
+    )
+
+
+@pytest.mark.parametrize("mutation", ["empty", "missing", "hash", "outside"])
+def test_mounted_source_manifest_fails_closed(tmp_path: Path, mutation: str) -> None:
+    (tmp_path / "root").mkdir()
+    (tmp_path / "root" / "source.py").write_bytes(b"source\n")
+    payload = {
+        "covered_roots": ["root"],
+        "files": [{"path": "root/source.py", "sha256": hashlib.sha256(b"source\n").hexdigest()}],
+    }
+    if mutation == "empty":
+        payload["files"] = []
+    if mutation == "missing":
+        payload["files"][0]["path"] = "root/missing.py"
+    if mutation == "hash":
+        payload["files"][0]["sha256"] = "0" * 64
+    if mutation == "outside":
+        payload["files"][0]["path"] = "other/source.py"
+    with pytest.raises(ProtocolFailure):
+        oaf_backend._validate_mounted_source_manifest(payload, tmp_path)
+
+
+def test_mounted_source_manifest_requires_each_declared_root(tmp_path: Path) -> None:
+    (tmp_path / "present").mkdir()
+    source = tmp_path / "present" / "source.py"
+    source.write_bytes(b"source\n")
+    payload = {
+        "covered_roots": ["missing", "present"],
+        "files": [{"path": "present/source.py", "sha256": hashlib.sha256(b"source\n").hexdigest()}],
+    }
+    with pytest.raises(ProtocolFailure, match="root is missing"):
+        oaf_backend._validate_mounted_source_manifest(payload, tmp_path)
+
+
+def test_final_image_preserves_every_runner_manifest_path() -> None:
+    repository = Path(__file__).parents[3]
+    manifest = json.loads((repository / "runtime/oaf_tf1/runner-source-manifest.json").read_text())
+    mappings = _final_stage_copy_mappings(repository)
+    for row in manifest["files"]:
+        source_path = row["path"]
+        assert (repository / source_path).is_file()
+        assert f"/opt/crux/{source_path}" in _final_stage_destinations(mappings, source_path)
 
 
 def test_tensor_coverage_accepts_exact_130_78_52_partition() -> None:
@@ -137,7 +299,46 @@ def test_tensor_coverage_rejects_uninitialized_required_variable() -> None:
 
 def test_ready_carries_authenticated_smoke_prediction_identity(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
+    repository = Path(__file__).parents[3]
+    staged_root = tmp_path / "crux"
+    mappings = _final_stage_copy_mappings(repository)
+    runner_manifest_content = (
+        repository / "runtime/oaf_tf1/runner-source-manifest.json"
+    ).read_bytes()
+    runner_manifest_payload = json.loads(runner_manifest_content)
+    runner_manifest = _stage_final_image_file(
+        repository=repository,
+        staged_root=staged_root,
+        mappings=mappings,
+        source_path="runtime/oaf_tf1/runner-source-manifest.json",
+        destination="/opt/crux/runtime/runner-source-manifest.json",
+    )
+    for row in runner_manifest_payload["files"]:
+        staged = _stage_final_image_file(
+            repository=repository,
+            staged_root=staged_root,
+            mappings=mappings,
+            source_path=row["path"],
+        )
+        assert staged == staged_root / row["path"]
+    upstream_manifest_content = (repository / "runtime/oaf_tf1/source-manifest.json").read_bytes()
+    upstream_manifest_payload = json.loads(upstream_manifest_content)
+    upstream_manifest = _stage_final_image_file(
+        repository=repository,
+        staged_root=staged_root,
+        mappings=mappings,
+        source_path="runtime/oaf_tf1/source-manifest.json",
+        destination="/opt/crux/vendor/source-manifest.json",
+    )
+    for row in upstream_manifest_payload["files"]:
+        source = repository / "runtime/oaf_tf1/vendor" / row["path"]
+        destination = staged_root / "upstream" / row["path"]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes())
+    runner_manifest_sha256 = hashlib.sha256(runner_manifest_content).hexdigest()
+    upstream_manifest_sha256 = hashlib.sha256(upstream_manifest_content).hexdigest()
     descriptor_fields = {
         "architecture_id": "magenta-oaf-model-tpu-drums-v1",
         "backend_id": "magenta-egmd-tf1-94529798-8hit-v1",
@@ -164,18 +365,18 @@ def test_ready_carries_authenticated_smoke_prediction_identity(
                 "seal_evidence_sha256": "c" * 64,
                 "smoke_audio_sha256": "5" * 64,
                 "smoke_oracle_sha256": "6" * 64,
-                "upstream_source_manifest_sha256": "7" * 64,
+                "upstream_source_manifest_sha256": upstream_manifest_sha256,
             },
             sha256="a" * 64,
         ),
         "runtime_lock": AuthenticatedObject(
             payload={
-                "runner_source_manifest_sha256": "8" * 64,
+                "runner_source_manifest_sha256": runner_manifest_sha256,
                 "runtime_image_manifest_digest": f"sha256:{'4' * 64}",
                 "stdout_max_line_bytes": 4096,
                 "tensorflow_abi": "cp37-cp37m-manylinux2010_x86_64",
                 "tensorflow_build": "v1.15.5",
-                "upstream_source_manifest_sha256": "7" * 64,
+                "upstream_source_manifest_sha256": upstream_manifest_sha256,
             },
             sha256="b" * 64,
         ),
@@ -185,25 +386,28 @@ def test_ready_carries_authenticated_smoke_prediction_identity(
                 "checkpoint_inventory": [],
                 "non_inference_inventory": [],
                 "required_inference_inventory": [],
-                "runner_source_manifest_sha256": "8" * 64,
+                "runner_source_manifest_sha256": runner_manifest_sha256,
                 "smoke_audio_sha256": "5" * 64,
                 "smoke_oracle_sha256": "6" * 64,
                 "smoke_prediction_sha256": "d" * 64,
             },
             sha256="c" * 64,
         ),
-        "runner_source_manifest": AuthenticatedObject(payload={}, sha256="8" * 64),
-        "upstream_source_manifest": AuthenticatedObject(payload={}, sha256="7" * 64),
         "smoke_oracle": AuthenticatedObject(
             payload={"native_events": [{"native_class_id": "midi_36"}]},
             sha256="6" * 64,
         ),
     }
-    monkeypatch.setattr(
-        oaf_backend,
-        "load_authenticated_object",
-        lambda _path, *, label, **_kwargs: objects[label],
-    )
+    load_authenticated_object = oaf_backend.load_authenticated_object
+
+    def load_fixture_or_source_manifest(
+        path: Path, *, label: str, **kwargs: object
+    ) -> AuthenticatedObject:
+        if label in {"runner_source_manifest", "upstream_source_manifest"}:
+            return load_authenticated_object(path, label=label, **kwargs)
+        return objects[label]
+
+    monkeypatch.setattr(oaf_backend, "load_authenticated_object", load_fixture_or_source_manifest)
     monkeypatch.setattr(
         oaf_backend,
         "build_and_restore_model",
@@ -234,10 +438,14 @@ def test_ready_carries_authenticated_smoke_prediction_identity(
         "transcribe_canonical_wav",
         lambda *_args, **_kwargs: [{"native_class_id": "midi_36"}],
     )
-
-    startup = oaf_backend.authenticate_startup()
+    startup = oaf_backend.authenticate_startup(
+        runner_source_manifest_path=runner_manifest,
+        upstream_source_manifest_path=upstream_manifest,
+    )
 
     assert startup.ready_payload["smoke_prediction_sha256"] == "d" * 64
+    assert startup.ready_payload["runner_source_manifest_sha256"] == runner_manifest_sha256
+    assert startup.ready_payload["upstream_source_manifest_sha256"] == upstream_manifest_sha256
 
 
 class _Operation:
