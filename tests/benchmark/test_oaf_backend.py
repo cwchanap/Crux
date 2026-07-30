@@ -365,6 +365,7 @@ def _harness(
             dict(REQUIRED_ENVIRONMENT) if runtime_environment is None else dict(runtime_environment)
         ),
         "python_version": "3.7.17",
+        "runtime_image_config_digest": f"sha256:{'5' * 64}",
         "runner_source_manifest_sha256": sha256_hex(runner_manifest.read_bytes()),
         "stderr_max_line_bytes": 8192,
         "stderr_read_chunk_bytes": 4096,
@@ -1229,7 +1230,7 @@ def test_verify_backend_launch_and_attestation_use_exact_sealed_profile(
     assert harness.backend.verify().status == "verified"
 
     profile = harness.captured_profiles[0]
-    assert profile.image_manifest_digest == f"sha256:{'4' * 64}"
+    assert profile.image_config_digest == f"sha256:{'5' * 64}"
     assert profile.uid == 10001
     assert profile.gid == 10002
     assert profile.cpu_limit == "2.5"

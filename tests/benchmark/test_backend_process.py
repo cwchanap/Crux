@@ -60,7 +60,7 @@ def _write_mounts(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
 def profile(tmp_path: Path, **changes: object) -> RunnerLaunchProfile:
     backend, runtime, seal, model, inputs = _write_mounts(tmp_path)
     values: dict[str, object] = {
-        "image_manifest_digest": f"sha256:{'4' * 64}",
+        "image_config_digest": f"sha256:{'4' * 64}",
         "backend_lock_path": backend,
         "runtime_lock_path": runtime,
         "seal_evidence_path": seal,
@@ -138,7 +138,7 @@ def test_docker_command_contains_exact_hardening_and_fresh_environment(tmp_path:
     assert env_args == [
         f"--env={key}={REQUIRED_ENVIRONMENT[key]}" for key in sorted(REQUIRED_ENVIRONMENT)
     ]
-    assert command[-1] == launch.image_manifest_digest
+    assert command[-1] == launch.image_config_digest
     expected_mounts = {
         launch.backend_lock_path: "/run/crux/backend-lock.json",
         launch.runtime_lock_path: "/run/crux/runtime-lock.json",
