@@ -34,6 +34,22 @@ HPA-320 therefore freezes the original TensorFlow 1 inference behavior in an iso
 runtime. A future native TensorFlow 2 implementation is a different backend identity
 until an explicit parity suite proves otherwise.
 
+## Sealed-Value Authority
+
+The freeze is intentionally staged:
+
+1. Before sealing, the checked-in acquisition, base-system, calibration-measurement,
+   and seal-profile request records are the only authorities for intended inputs.
+2. Producer commands emit immutable evidence, but measurement output is diagnostic
+   and cannot choose or publish sealed values.
+3. Review makes one explicit seal-profile request authoritative by binding every
+   accepted value to the exact measurement and evidence hashes it reviewed.
+4. Backend and runtime locks are published last and reference the accepted requests,
+   evidence, profile, image, checkpoint, and smoke-oracle identities.
+
+Code defaults, sentinel values, mutable reports, guessed resource numbers, and prose
+such as `auto` or `unlimited` are never sealed-value authorities.
+
 ## Audit Evidence
 
 The implementation must preserve the following audited evidence in the checked-in
@@ -58,12 +74,13 @@ unsupported index state are rejected.
 
 ### Released checkpoint
 
-| Artifact | SHA-256 |
-| --- | --- |
-| `e-gmd_checkpoint.zip` | `09765ae0ff19c7d769a3c20e158eba3b9cd279429b02e498b1e911d16f82e2c0` |
-| `model.ckpt-569400.index` | `475ca21993e102d52e2e6c7066b598b9b9e9a097bfb2fa6b770d40eedaa6139a` |
-| `model.ckpt-569400.data-00000-of-00001` | `6312cd6f8e29ee6f21f4a763822d554f46393e0e336812ba4a8cb324d2e8b0b5` |
-| `model.ckpt-569400.meta` | `e36105b27c17f2367292682df825b8ad16eb887ccad465bbb5ddf955ef75d422` |
+| Artifact | Role | Byte length | SHA-256 |
+| --- | --- | ---: | --- |
+| `e-gmd_checkpoint.zip` | Archive | 25,658,703 | `09765ae0ff19c7d769a3c20e158eba3b9cd279429b02e498b1e911d16f82e2c0` |
+| `checkpoint` | TensorFlow pointer | 91 | `c4afc7e992f63a290fc9b061bc36582eb08db5f4c10f8b79971982217f039a2b` |
+| `model.ckpt-569400.index` | Published component | 2,713 | `475ca21993e102d52e2e6c7066b598b9b9e9a097bfb2fa6b770d40eedaa6139a` |
+| `model.ckpt-569400.data-00000-of-00001` | Published component | 27,793,012 | `6312cd6f8e29ee6f21f4a763822d554f46393e0e336812ba4a8cb324d2e8b0b5` |
+| `model.ckpt-569400.meta` | Published component | 3,640,417 | `e36105b27c17f2367292682df825b8ad16eb887ccad465bbb5ddf955ef75d422` |
 
 The informational acquisition URL is:
 
@@ -76,23 +93,62 @@ weights. A separate explicit setup step may acquire the archive, verify the arch
 hash, extract it to a temporary directory, verify every component, and only then
 install the components in a content-addressed model cache.
 
+The checked-in pre-seal authority is:
+
+```text
+config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.checkpoint-acquisition-request.json
+```
+
+under schema `crux.oaf-checkpoint-acquisition-request/v1`. It records the backend ID,
+the exact URL, the archive identity, all four archive-member identities and roles,
+and the exact three published component names. Archive and member byte lengths are
+deterministic properties of the already frozen upstream bytes, not native resource
+measurements. The request therefore records them before the final backend lock
+exists. Its SHA-256 becomes a seal dependency.
+
 The only network-capable model setup interface is explicit:
 
 ```bash
 uv run crux benchmark prepare-backend \
   --backend magenta-egmd-tf1-94529798-8hit-v1 \
+  --acquisition-request \
+    config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.checkpoint-acquisition-request.json \
+  --evidence-output \
+    artifacts/benchmark/backends/hpa320-bootstrap/checkpoint-acquisition-evidence.json \
   --download
 
 uv run crux benchmark prepare-backend \
   --backend magenta-egmd-tf1-94529798-8hit-v1 \
+  --acquisition-request \
+    config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.checkpoint-acquisition-request.json \
+  --evidence-output \
+    artifacts/benchmark/backends/hpa320-bootstrap/checkpoint-acquisition-evidence.json \
   --archive /operator/staging/e-gmd_checkpoint.zip
 ```
 
 `--download` and `--archive` are mutually exclusive. With neither option, the command
-only verifies an existing cache. The download form may use only the informational URL
-in the checked-in lock. All forms stage outside the final cache, verify the archive
-when present, reject archive path traversal, require exactly the three locked
-components, and atomically publish only a fully verified component set at:
+only verifies an existing cache. Before the final backend lock exists, both
+`--acquisition-request` and `--evidence-output` are required. After sealing, omitting
+those options loads the fixed request beside the final lock and exact-compares the
+request, final lock, and cache. The download form may use only the informational URL
+in the checked-in request. With neither `--download` nor `--archive`, a missing cache
+is `model_cache_missing`, exit `1`, and summary status `acquisition_failed`; this form
+never opens a network connection.
+
+All forms stage outside the final cache, verify the archive when present, reject
+archive path traversal, require exactly the four requested members, and validate the
+pointer payload as:
+
+```text
+model_checkpoint_path: "model.ckpt-569400"
+all_model_checkpoint_paths: "model.ckpt-569400"
+```
+
+Only the three members marked `published_component` enter the cache. The pointer is
+verified and recorded in acquisition evidence but is not an inference component.
+Any extra, missing, duplicate, renamed, overlapping, unsafe, differently encoded, or
+hash-mismatched member is an integrity failure. The command atomically publishes
+only a fully verified component set at:
 
 ```text
 artifacts/benchmark/model-cache/sha256/<model-artifact-set-sha256>/
@@ -100,21 +156,28 @@ artifacts/benchmark/model-cache/sha256/<model-artifact-set-sha256>/
 
 Exit `0` means the exact component set is installed and reverified, exit `1` means
 acquisition or local staging could not complete and the cache was left unchanged, and
-exit `2` means supplied or cached bytes contradict the lock, the lock is invalid, or
-atomic cache publication failed. The command never substitutes another URL or
-checkpoint. Inference commands are always offline and only read this cache.
+exit `2` means supplied or cached bytes contradict the request or final lock, a
+request or lock is invalid, or atomic cache publication failed. The command never
+substitutes another URL or checkpoint. Inference commands are always offline and
+only read this cache.
 
 `prepare-backend` is a setup-only reporting exception: it does not launch a backend
 and does not write a verification, execution, or legacy-score report. After Click
 parsing succeeds, it writes exactly one canonical one-line JSON summary with
 `status`, `exit_code`, `report_path`, and `report_sha256`; both report fields are
-null. Status is `ready` for exit `0`, `acquisition_failed` for exit `1`, or
-`integrity_failed` for exit `2`. Progress and sanitized diagnostics use standard
-error. A Click usage error occurs before this summary exists.
+null unless `--evidence-output` was supplied. In that pre-seal mode they identify the
+immutable `crux.oaf-checkpoint-acquisition-evidence/v1` record, which reproduces the
+request hash, archive identity, all four member identities, the three-component
+artifact-set hash, acquisition mode, and cache location. This setup evidence is not
+a backend verification report and cannot make a prediction or seal eligible. Status
+is `ready` for exit `0`, `acquisition_failed` for exit `1`, or `integrity_failed` for
+exit `2`. Progress and sanitized diagnostics use standard error. A Click usage error
+occurs before this summary exists.
 
-During the design audit, a fresh download from the upstream URL matched the existing
-three cached checkpoint components byte-for-byte. The checked-in lock preserves the
-component hashes above rather than trusting that observation indefinitely.
+During the design audit, a fresh download from the upstream URL matched the frozen
+archive SHA-256, all four exact member identities above, and the three existing
+cached checkpoint components byte-for-byte. The checked-in request and final lock
+preserve those identities rather than trusting that observation indefinitely.
 
 The official checkpoint contains 130 TensorFlow variables. The frozen inference graph
 requires 78 model-state tensors. The other 52 entries are optimizer, training-step, or
@@ -132,7 +195,10 @@ d36ced8b2ee241bc37ad6fbb918ba38e95d666350dd4888bca59a1243bf4d10e
 
 This hash is audit evidence only. The HDF5 file is not part of the frozen backend,
 must not appear in its lock, and is rejected when benchmark mode requests the frozen
-OaF backend.
+OaF backend. Enforcement occurs at the authenticated model-cache boundary: the host
+accepts only the exact three-component content-addressed cache and mounts only that
+directory read-only. The isolated runner validates that mounted set and does not scan
+unrelated host filesystem locations for an HDF5 filename.
 
 ### Legacy conversion coverage audit
 
@@ -247,26 +313,38 @@ dependency invalid rather than inheriting host values.
 
 Checked locks are materialized into ignored wheelhouses by a deterministic command
 which verifies every filename, byte length, and hash, rejects extras and symlinks,
-and supports an explicit offline cache for locally built allowlisted wheels. System
-packages are installed only from a materialized snapshot bundle using schema
-`crux.oaf-system-package-bundle/v2`. The digest-pinned base image's fixed
-`/usr/share/keyrings/debian-archive-keyring.gpg` is the only trust anchor; no bundle
-keyring is accepted. The bundle contains exact `InRelease`, every selected signed
-`Packages`/`Packages.xz` index at its Release path, every local `.deb`, a canonical
-manifest, and the expected complete `Package<TAB>Version<TAB>Architecture` `dpkg`
-inventory. The build verifies the base keyring hash, `InRelease` hash and signature,
-requires exactly one reviewed `VALIDSIG` fingerprint plus the reviewed codename and
-`amd64` architecture, and exact-compares every selected index path/size/SHA-256 to
-the signed `InRelease` SHA256 section. It bounded-decompresses and strict-parses the
-selected indexes, then binds every local `.deb` to authenticated
-`Package`/`Version`/`Architecture`/`Filename`/`Size`/`SHA256` fields before installing
-only that closure without a repository fetch and comparing the final inventory
-byte-for-byte. Missing, extra, duplicate, traversal, ambiguous, or unsigned
-manifest-only inputs fail closed. These
-system inputs and all final build arguments remain a native Task 8 output; the
-provisional test target requires only explicit diagnostic UID/GID values.
-The built image is referenced by its `linux/amd64` OCI
-manifest digest, never by a mutable tag.
+and supports an explicit offline cache for locally built allowlisted wheels.
+
+The provisional image already imports TensorFlow 1.15.5 and passes its runtime tests
+without installing an additional Debian package. Task 8 therefore does not
+reconstruct or mutate the base image's package set. The checked-in request:
+
+```text
+runtime/oaf_tf1/base-system-package-request.json
+```
+
+uses schema `crux.oaf-base-system-package-request/v1` and records the exact base image
+manifest, `linux/amd64`, the fixed archive-keyring path, required Python/TensorFlow
+and smoke probes, and exactly `additional_packages: []`. On the accepted native host,
+`seal_oaf_backend.py attest-base-system` runs the pinned base and provisional images,
+records the complete sorted
+`Package<TAB>Version<TAB>Architecture` `dpkg` inventory, its SHA-256, the base
+archive-keyring SHA-256, Python 3.7.17, TensorFlow 1.15.5, and the probe outcomes
+under schema `crux.oaf-base-system-package-evidence/v1`. The base and provisional
+inventories must be byte-identical, proving that the build did not mutate the package
+set.
+
+The base manifest authenticates the complete base filesystem, including those
+package bytes. Reconstructing a separate mutable Debian snapshot would add a second
+supply-chain path without changing the runtime and is forbidden for this seal. The
+final Dockerfile has no snapshot-fetch or local-`.deb` installation stage. If a
+native smoke run proves that another package is required, Task 8 stops for design
+review; the producer cannot add it opportunistically. Any nonempty
+`additional_packages` request requires a new backend identity, an explicit
+authenticated package-acquisition design, and a new seal.
+
+The built image is referenced by its `linux/amd64` OCI manifest digest, never by a
+mutable tag.
 
 The runtime lock records:
 
@@ -274,10 +352,11 @@ The runtime lock records:
 - every Python distribution name, version, filename, and SHA-256;
 - the Python distribution-build-manifest SHA-256, including any exceptional sdist,
   pinned build toolchain, recipe/environment, and reproduced wheel identity;
-- the snapshot-addressed Debian repository URL, base-image archive-keyring SHA-256,
-  reviewed signing fingerprint/codename/architecture, signed Release-file SHA-256,
-  selected signed package-index identities, and every installed system package
-  version, architecture, authenticated repository filename, size, and SHA-256;
+- the base-system-package-request and evidence SHA-256 values;
+- the base-image archive-keyring SHA-256;
+- the complete sorted base-image `Package<TAB>Version<TAB>Architecture` inventory and
+  its SHA-256;
+- exactly `additional_system_packages: []`;
 - the vendored upstream source-manifest SHA-256;
 - the runner source-manifest SHA-256;
 - the exact deterministic process environment listed below;
@@ -286,14 +365,34 @@ The runtime lock records:
 - TensorFlow build and ABI information reported at startup; and
 - the final runner image manifest digest.
 
+The runtime-lock and seal-evidence schemas remove the unused
+`debian_snapshot_repository`, `debian_release_sha256`, and legacy package-distribution
+records. They add exact
+`base_system_package_request_sha256`,
+`base_system_package_evidence_sha256`,
+`base_system_package_inventory`,
+`base_system_package_inventory_sha256`, and
+`additional_system_packages` fields. Each inventory row has exactly `name`,
+`version`, and `architecture`; rows are unique and sorted by UTF-8 byte order.
+The backend lock adds
+`checkpoint_acquisition_request_sha256` and
+`checkpoint_acquisition_evidence_sha256`. Seal validation independently reproduces
+those hashes and exact-compares the three final checkpoint components with the
+four-member request/evidence pair.
+
 The image build context excludes the final runtime lock, avoiding a self-referential
 image digest. The lock can therefore attest to the image it describes.
 
-The host/container launcher constructs a fresh environment containing exactly these
-lock-recorded values and supplies it to the Python interpreter before `exec`. In
-particular, `PYTHONHASHSEED` must be present before CPython starts; assigning it to
-`os.environ` inside the runner is forbidden because that does not reseed the running
-interpreter:
+The container entrypoint uses `/usr/bin/env -i` to discard every OCI- or
+Docker-injected variable, including `PATH`, `HOSTNAME`, and `HOME`, then supplies a
+fresh interpreter-start environment containing exactly these lock-recorded values
+plus the bootstrap-only control defined below. The image-baked entrypoint constant is
+the execution authority for this earliest pre-import check because the mounted
+runtime lock cannot be parsed before Python starts. The mounted runtime lock is the
+sealed record. The host launcher, image entrypoint, and runner copies must
+exact-match; a disagreement is fatal and none overrides another. In particular,
+`PYTHONHASHSEED` must be present before CPython starts; assigning it to `os.environ`
+inside the runner is forbidden because that does not reseed the running interpreter:
 
 | Environment variable | Frozen value |
 | --- | --- |
@@ -305,9 +404,18 @@ interpreter:
 | `TF_NUM_INTRAOP_THREADS` | `1` |
 | `TF_NUM_INTEROP_THREADS` | `1` |
 
+CPython 3.7 is additionally launched with `PYTHONCOERCECLOCALE=0`. This is an exact,
+bootstrap-only interpreter control, not a runtime-lock environment field. Before
+validating the lock-recorded allowlist, the entrypoint requires that the control is
+present with value `0` and removes it. A missing or mismatched value is a backend-fatal
+startup failure. This prevents CPython locale coercion from injecting environment
+state while keeping the post-bootstrap runner environment equal to the locked
+seven-variable allowlist.
+
 As its first startup step, before importing TensorFlow or any numeric library, the
-runner validates the complete environment allowlist and fails the handshake on a
-missing, extra, or mismatched value. It then calls `random.seed(0)`,
+runner validates the bootstrap control as described above, then validates the complete
+lock-recorded environment allowlist and fails the handshake on a missing, extra, or
+mismatched value. It then calls `random.seed(0)`,
 `numpy.random.seed(0)`, and `tf.set_random_seed(0)`, and does not enable mixed
 precision or runtime graph rewrites outside TensorFlow 1.15.5 defaults. A conflicting
 inherited value cannot override the locked environment.
@@ -336,6 +444,18 @@ evidence. Accepted evidence is exactly one of:
 - an approved native seal-host record that combines host-side `linux/x86_64`
   evidence with container-daemon or worker metadata.
 
+Each accepted evidence form also contains `host_numeric_fingerprint`, a diagnostic
+object with exactly `architecture`, `cpu_vendor_id`, `cpu_family`, `cpu_model`, and
+`cpu_stepping`. All logical CPUs visible to the worker must report one identical
+vendor/family/model/stepping tuple. Mutable `cpu_microcode` and `kernel_release`
+values remain permitted in sanitized host diagnostics but are not members of this
+stable comparison object. The fingerprint that generates the smoke oracle is copied
+exactly into seal-evidence field
+`reference_host_numeric_fingerprint`; every official verification or execution
+records its current object in execution-attestation field
+`host_numeric_fingerprint`. The object is evidence for investigating a mismatch, not
+an acceptance partition and not part of prediction identity.
+
 A bare local host may run diagnostics, but it cannot seal a lock or publish an
 official verification unless it is registered and attested through the third form.
 Apple Silicon or other emulated execution is diagnostic only. When
@@ -347,12 +467,22 @@ returns the same unsupported status before launching the image. A genuine lock,
 checkpoint, or protocol integrity failure observed during diagnostics still returns
 `failed` with exit `2`.
 
+A native `linux/amd64` fingerprint different from the reference is not rejected by
+name alone. After all authenticated image, lock, package, checkpoint, and tensor
+checks pass, it is eligible for official execution only if its smoke artifact is
+byte-identical to the sealed oracle. Every authenticated smoke mismatch is a backend
+regression: it produces `failed` with exit `2` and publishes no prediction,
+regardless of whether the diagnostic fingerprint equals the reference.
+`environment_unsupported` is reserved for platform or host-evidence preflight
+failure before inference starts; it can never classify a completed smoke comparison.
+
 Every runner launch uses:
 
 - `--network=none`;
 - a read-only root filesystem;
 - read-only backend-lock, runtime-lock, model-cache, and input mounts;
-- a fresh process environment containing only the lock-enumerated allowlist;
+- a fresh process environment containing only the lock-enumerated allowlist plus the
+  required bootstrap-only `PYTHONCOERCECLOCALE=0` control;
 - all Linux capabilities dropped and `no-new-privileges`;
 - bounded, execution-profile-locked `tmpfs` mounts for `/tmp` and `/dev/shm`;
 - locked CPU, memory, and PID limits; and
@@ -361,8 +491,8 @@ Every runner launch uses:
 If the provisional image cannot pass the complete native smoke and coverage suite
 under the proposed non-root UID/GID, sealing stops for design review; it does not
 silently run as root. Exact tmpfs sizes, resource limits, UID/GID, startup deadline,
-request deadline, `max_input_audio_frames`, Debian snapshot, and installed
-system-package set are seal-required values with no code defaults.
+request deadline, `max_input_audio_frames`, base-system-package evidence, and the
+empty additional-system-package set are seal-required values with no code defaults.
 
 ### Native-amd64 calibration and sealing prerequisite
 
@@ -375,16 +505,24 @@ config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.seal-evidence.json
 ```
 
 under schema `crux.backend-seal-evidence/v1`. It records which accepted native-host
-evidence form was used and its immutable reference/signature, base-manifest
-verification, Debian snapshot and package hashes, wheel filenames and hashes,
-distribution-build-manifest and exceptional sdist/toolchain/reproduction evidence,
-numeric UID/GID, tmpfs sizes, CPU/memory/PID limits, standard-error drain bounds, the
-standard-output protocol-line bound, startup and request deadlines, the proposed
-positive integer `max_input_audio_frames`,
-measurements at that exact bound, tensor inventories, smoke generation inputs and
-outputs, the security scan/advisory snapshot, the preserved OCI-layout archive and
-manifest/config/layer hashes, and hashes of every reviewed evidence artifact.
-Missing values, sentinel values, and prose such as "auto" or "unlimited" are invalid.
+evidence form was used, its immutable reference/signature, the exact reference host
+numeric fingerprint, base-manifest verification, the checkpoint-acquisition request
+and evidence hashes, base-system request/evidence and exact package-inventory hashes,
+wheel filenames and hashes, distribution-build-manifest and exceptional
+sdist/toolchain/reproduction evidence, numeric UID/GID, tmpfs sizes,
+CPU/memory/PID limits, standard-error drain bounds, the standard-output protocol-line
+bound, startup and request deadlines, the proposed positive integer
+`max_input_audio_frames`, measurements at that exact bound, tensor inventories, smoke
+generation inputs and outputs, the security scan/advisory snapshot, the preserved
+OCI-layout archive and manifest/config/layer hashes, and hashes of every reviewed
+evidence artifact. Missing values, sentinel values, and prose such as `auto` or
+`unlimited` are invalid.
+
+The existing `.github/hpa320-native-evidence/` material is explicitly scratch
+evidence from before this fingerprint and request/evidence contract. It is not a
+candidate final seal artifact and must not be merged into final authority merely by
+copying it. The final native job and its producer regenerate authenticated host
+evidence with the exact schema above; until then the status remains blocked.
 
 Like the smoke oracle, seal evidence excludes final backend-lock and runtime-lock
 hashes so the final locks can reference its SHA-256 without a content cycle.
@@ -393,27 +531,133 @@ This pass is a disposable design/calibration spike, not production implementatio
 only reviewed evidence, the oracle, and sealed values may flow into the final OaF
 locks and inference-relevant runner implementation.
 
+Task 8 has four checked-in request authorities and two calibration stages,
+`measure` and `calibrate`:
+
+1. The checkpoint-acquisition request freezes the released archive and four-member
+   layout independently of the not-yet-published backend lock.
+2. The base-system-package request freezes the base manifest, native probes, and
+   empty additional-package set independently of the not-yet-published runtime lock.
+3. A `crux.oaf-calibration-measurement-request/v1` record freezes the canonical
+   fixture set, a nonempty strictly increasing list of positive frame counts,
+   repetition count, required metrics, container restrictions, and exact output
+   schemas. `seal_oaf_backend.py measure` may emit diagnostic measurements only.
+4. After human review, a `crux.oaf-seal-profile-request/v1` record references the
+   measurement request and evidence hashes and supplies every proposed numeric
+   UID/GID, CPU/memory/PID/tmpfs bound, startup/request deadline, standard-output and
+   standard-error bound, and `max_input_audio_frames`. No field has a code default.
+5. `seal_oaf_backend.py calibrate` exact-compares those request/evidence links, reruns
+   bound-minus-one, exact-bound, and over-bound inputs, performs two requests in one
+   process and one in a fresh process, and only then may publish a complete
+   `crux.oaf-seal-candidate/v1` directory.
+
+The measurement evidence is diagnostic and cannot be consumed by `seal`, inference,
+or a scorer. The profile request's chosen frame bound must be one measured frame
+count. Each proposed resource limit and deadline must be strictly greater than the
+corresponding observed in-bound peak, and the request records the exact reviewed
+headroom rather than applying a hidden percentage. An over-bound input must be
+rejected before inference; it is not an allowed process or allocator failure.
+
+Every measurement row records the input frame count, repetition and process-instance
+IDs, peak CPU millicores, peak RSS bytes, peak `/tmp` and `/dev/shm` bytes, peak PID
+count, startup and request milliseconds, maximum physical standard-output and
+logical standard-error line bytes, exit/signal/OOM state, and prediction SHA-256.
+Rows are sorted by frame count, process instance, and repetition. The profile gate
+requires `cpu_limit_millis` to exceed `peak_cpu_millis` and applies the same
+strictly-greater rule to memory, PID, tmpfs, and deadline measurements after exact
+unit conversion.
+
 The bootstrap sequence is:
 
-1. Build a provisional image from the pinned source, base manifest, package
-   distributions, and runner manifests without either final lock in the image. Resolve
-   the mutable base tag only to inspect it, prove that its `linux/amd64` manifest is
-   the pinned
+1. Strict-load the checkpoint-acquisition request, acquire or import the exact
+   four-member archive, publish only the three authenticated inference components,
+   and preserve immutable acquisition evidence.
+2. Build a provisional image from the pinned source, base manifest, Python
+   distributions, and runner manifests without either final lock in the image.
+   Resolve the mutable base tag only to inspect it, prove that its `linux/amd64`
+   manifest is the pinned
    `sha256:ea8897698c0955ba96144bd2b7310ef7884ccce4db7a1f97ffc21fb8b89d1673`,
    and build `FROM` that digest. A registry mirror is acceptable only when it supplies
    the same manifest and layer bytes.
-2. On native `linux/amd64`, construct the exact prediction graph, generate the tensor
-   coverage report, calibrate and test the complete resource/input profile, and
-   generate the smoke oracle without lock hashes.
-3. Review the coverage report, oracle, deterministic artifact bytes, resource
-   measurements, and seal-evidence record. Final OaF lock publication and
-   inference-relevant runner integration remain blocked until this review accepts
-   every exact value; host-side planning and fake-runner implementation need not
-   wait.
-4. Seal the backend and runtime locks, referencing the reviewed evidence hash and the
+3. On native `linux/amd64`, attest the exact base package inventory and empty
+   additional-package set, reproduce the locked Python wheels, and run the required
+   Python, TensorFlow, and smoke probes.
+4. Run the measurement request, review its exact evidence, check in the explicit
+   seal-profile request, then run calibration. Construct the exact prediction graph,
+   generate the tensor coverage report, test the complete resource/input profile,
+   and generate the smoke oracle without final-lock hashes.
+5. Review the acquisition, base-system, coverage, oracle, deterministic artifact,
+   resource, and seal-evidence records. Final OaF lock publication remains blocked
+   until this review accepts every exact value.
+6. Seal the backend and runtime locks, referencing the reviewed evidence hash and the
    already-built image manifest digest.
-5. Mount the final locks into that image and rerun the complete native verification
-   flow twice in-process and once in a fresh process.
+7. Mount the final locks into that image and rerun the complete native verification
+   flow: one startup raw-oracle check in each of two processes, then two post-ready
+   artifact requests in the persistent process and one in the fresh process.
+
+The native producer commands are explicit:
+
+```bash
+uv run python -m tools.hpa320.seal_oaf_backend \
+  attest-base-system \
+  --request runtime/oaf_tf1/base-system-package-request.json \
+  --host-evidence /workspace/hpa320/native-host-evidence.json \
+  --image crux-oaf-tf1:hpa320-seal \
+  --output \
+    artifacts/benchmark/backends/hpa320-bootstrap/base-system-package-evidence.json
+
+uv run python -m tools.hpa320.seal_oaf_backend \
+  measure \
+  --request \
+    config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.calibration-measurement-request.json \
+  --host-evidence /workspace/hpa320/native-host-evidence.json \
+  --image crux-oaf-tf1:hpa320-seal \
+  --model-cache artifacts/benchmark/model-cache \
+  --checkpoint-evidence \
+    artifacts/benchmark/backends/hpa320-bootstrap/checkpoint-acquisition-evidence.json \
+  --base-system-evidence \
+    artifacts/benchmark/backends/hpa320-bootstrap/base-system-package-evidence.json \
+  --output artifacts/benchmark/backends/hpa320-bootstrap/calibration-measurements.json
+
+uv run python -m tools.hpa320.seal_oaf_backend \
+  calibrate \
+  --request \
+    config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.seal-profile-request.json \
+  --measurement-evidence \
+    artifacts/benchmark/backends/hpa320-bootstrap/calibration-measurements.json \
+  --host-evidence /workspace/hpa320/native-host-evidence.json \
+  --image crux-oaf-tf1:hpa320-seal \
+  --model-cache artifacts/benchmark/model-cache \
+  --checkpoint-evidence \
+    artifacts/benchmark/backends/hpa320-bootstrap/checkpoint-acquisition-evidence.json \
+  --base-system-evidence \
+    artifacts/benchmark/backends/hpa320-bootstrap/base-system-package-evidence.json \
+  --output artifacts/benchmark/backends/hpa320-seal-candidate
+```
+
+Each producer strict-validates every input and request/evidence link before creating
+its destination. It stages on the destination filesystem, rejects symlinks and
+special files, flushes and fsyncs complete bytes, and publishes by immutable atomic
+rename. Existing identical bytes are idempotent; existing different bytes are an
+integrity failure and are never replaced. A failed producer leaves no authoritative
+output. Diagnostics are sanitized and cannot include secrets, environment values,
+absolute operator paths, or unbounded tracebacks.
+
+`prepare-backend` and every `seal_oaf_backend` producer use one exit convention:
+
+- exit `0` only after complete immutable success;
+- exit `1` for operational inability, including unavailable acquisition,
+  unsupported or unattested environment, failed probe, failed measurement, or an
+  inability to construct a candidate without contradictory authenticated bytes; and
+- exit `2` for integrity, authentication, immutable-publication contradiction, or
+  invalid request/evidence relationships.
+
+After argument parsing succeeds, each command emits exactly one canonical typed
+one-line JSON summary containing `status`, `exit_code`, `report_path`, and
+`report_sha256`. The command-specific status distinguishes operational inability
+from integrity failure. Argument-parser usage errors retain exit `2`, occur before
+any output artifact or typed summary exists, and are therefore distinguishable from
+integrity failures.
 
 Any change to an inference-relevant sealed value, including the graph, hparams,
 checkpoint set, package bytes, postprocessing, `max_input_audio_frames`, or
@@ -441,6 +685,10 @@ and the disposable calibration spike, but it cannot finalize locks, merge its
 real-checkpoint integration, or claim sealed behavior until the native seal evidence
 and generated oracle are accepted. Cross-phase integration and overall HPA-320
 completion remain gated on Phase A.
+
+Paths named in this design that are absent from the current checkout are required
+implementation deliverables, not claims that final lock, request, evidence, or
+configuration artifacts already exist.
 
 ### Host-side backend interface
 
@@ -512,6 +760,16 @@ legacy-tf2-h5-v0
 That compatibility ID labels an existing unvalidated workflow; it is not a frozen
 `TranscriptionBackend` descriptor and cannot pass backend-lock verification.
 
+The checked-in backend registry gives the OaF entry an explicit `seal_state` whose
+only values are `preseal` and `sealed`. Before the final locks exist, the entry is
+`preseal`; any frozen inference command selecting it returns
+`backend_not_sealed`, exit `1`, and publishes no prediction. Once a `sealed` entry is
+selected, a missing, malformed, or contradictory backend lock, runtime lock, seal
+evidence record, or referenced identity is an integrity failure with exit `2`; it is
+never downgraded to `backend_unavailable`. The registry changes to `sealed` in the
+same commit that publishes both final locks, so no checked-in state advertises a
+sealed backend without its complete authorities.
+
 No descriptor field may be inferred from a filename or directory name. The host loads
 the lock, starts the runner, and compares every handshake field against the lock before
 accepting the backend.
@@ -550,8 +808,14 @@ requires a new heuristic backend ID.
 
 The heuristic executes in a small content-addressed virtual environment keyed by the
 parameter-lock SHA-256, separate from Crux's main Python environment. Its lock also
-records the exact Python implementation/version and platform-compatible distribution
-set. Routine Crux dependency upgrades therefore do not alter or retire the historical
+records exact `python_implementation`, `python_version`, `python_abi`, and
+`platform: "linux/amd64"` values plus the complete compatible distribution set and
+wheel tags. Official `heuristic-onset-v1` verification and prediction publication are
+native-`linux/amd64` only. macOS, `arm64`, and other platforms are diagnostic-only,
+return `environment_unsupported`, and cannot publish an official heuristic
+prediction. Supporting another platform or distribution set requires a new heuristic
+backend ID rather than placing platform-dependent bytes behind the existing identity.
+Routine Crux dependency upgrades therefore do not alter or retire the historical
 `heuristic-onset-v1` environment. A changed locked interpreter, algorithm, adapter,
 or distribution byte still requires a new backend ID; version-only matching is never
 accepted as a substitute for package-byte identity.
@@ -692,10 +956,11 @@ frame_length_seconds = 1.0 / frames_per_second
 time_sec_raw = frame_index * frame_length_seconds
 ```
 
-The runner passes `time_sec_raw` to the artifact quantizer without recomputing it as
-an alternative algebraic expression. Confidence is the selected TensorFlow
-float32 onset activation converted directly to a host binary float before the same
-artifact quantizer.
+The runner preserves the resulting `time_sec_raw` binary64 bit pattern without
+recomputing it as an alternative algebraic expression. Confidence is the selected
+TensorFlow float32 onset activation converted directly to binary64. The wire encoding
+below transports both exact bit patterns; the host reconstructs those values and
+passes them once to the artifact quantizer.
 
 For an emitted onset, velocity uses the upstream `_unscale_velocity` order:
 
@@ -707,12 +972,12 @@ velocity_midi = int(unscaled)
 ```
 
 `int` truncates toward zero; the implementation must not round. A nonfinite raw
-velocity is a per-item validation failure before clamping, rather than inheriting a
-library-specific NaN result. This is an intentional adapter safety divergence from
-the frozen upstream helper, which converts a NaN intermediate to velocity zero. The
-divergence is named in the backend lock, covered by a focused test, and included in
-the runner source manifest and seal evidence; it must not be described as exact
-upstream behavior.
+velocity is a per-item validation failure before clamping. The frozen upstream helper
+would produce MIDI velocity `127` for `+inf`, `0` for `-inf`, and `0` for `NaN`;
+HPA-320 deliberately rejects all three instead. This is an intentional adapter
+safety divergence. It is named in the backend lock, covered by focused tests, and
+included in the runner source manifest and seal evidence; it must not be described as
+exact upstream behavior.
 
 Upstream `infer_util.predict_sequence` returns a serialized `NoteSequence`, while
 `magenta.music.sequences_lib.pianoroll_to_note_sequence` selects onset frames
@@ -857,6 +1122,11 @@ The v1 runner accepts canonical audio only:
 the strict reader's `wave.getnframes()` result. It is not a spectrogram-frame count.
 The number of spectrogram frames is separately derived by the frozen preprocessing
 pipeline and is never used as this input-bound unit.
+
+The bound is conservatively part of backend identity because it changes the accepted
+input domain and resource proof. Raising it therefore creates a new backend identity,
+even though prediction artifacts for identical inputs at or below the old bound
+remain scientifically comparable when all other descriptor fields match.
 
 The host validates the audio sample-frame bound and hashes the exact WAV bytes before
 submitting the item to a runner. It sends both the relative staged path and expected
@@ -1006,9 +1276,26 @@ prediction artifact.
 ### Response
 
 A successful response contains the request ID, verified audio SHA-256, backend
-descriptor SHA-256, and native events. A domain failure returns a typed error with a
-stable machine code and sanitized message. Tracebacks, local absolute paths,
-environment values, and checkpoint URLs never appear on standard output.
+descriptor SHA-256, and native events. Each OaF native-event protocol object contains
+exactly `frame_index`, `time_sec_binary64`, `native_class_id`, `model_output_bin`,
+`native_midi_note`, `upstream_8hit_group_id`, `confidence_binary64`, and
+`velocity_midi`.
+
+`time_sec_binary64` and `confidence_binary64` are strings containing exactly 16
+lowercase hexadecimal digits: the big-endian IEEE-754 binary64 bytes produced by
+`struct.pack(">d", value).hex()`, without a prefix. The runner rejects a nonfinite
+value before encoding. Raw time and confidence are never JSON numbers, decimal
+strings, or pre-quantized fixed-point values on the wire. The host requires the exact
+string form, reconstructs the binary64 value with
+`struct.unpack(">d", bytes.fromhex(value))[0]`, rejects nonfinite or out-of-range
+values, and performs the specified `Decimal.from_float` artifact quantization exactly
+once. It independently evaluates the locked frame-time expression from `frame_index`
+and requires the reconstructed time bit pattern to match, but never substitutes the
+recomputed value in the artifact.
+
+A domain failure returns a typed error with a stable machine code and sanitized
+message. Tracebacks, local absolute paths, environment values, and checkpoint URLs
+never appear on standard output.
 
 Standard error may contain stable error codes, tensor names and counts, bounded timing
 diagnostics, and source-relative sanitized tracebacks. It must redact credentials and
@@ -1061,6 +1348,9 @@ For OaF, every model/upstream/backend/runtime/training-map field is non-null and
 `parameter_lock_sha256` is null. For the heuristic, `parameter_lock_sha256` is
 non-null; the model-artifact-set, upstream source, backend-lock, runtime-lock, and
 training-data-map fields are null. Other nullability combinations are invalid.
+Every header field duplicated inside `backend_descriptor` must exact-match the
+embedded descriptor, including nullable values. A disagreement invalidates the
+artifact; neither the flattened header field nor the descriptor wins.
 
 It contains no timestamp, hostname, process ID, absolute path, request ID, or Git dirty
 state.
@@ -1179,7 +1469,8 @@ published and that item returns exit `1`.
 
 `verify-backend` performs the following steps in order:
 
-1. Strictly parse and hash the backend and runtime locks.
+1. Strictly parse and hash the checkpoint-acquisition request, backend lock, and
+   runtime lock, and exact-compare their checkpoint identities.
 2. Locate the three checkpoint components without network access.
 3. Verify exact filenames, sizes, and component hashes.
 4. Verify the runner image platform and OCI manifest digest.
@@ -1327,10 +1618,14 @@ with `schema: "crux.backend-execution-item-id/v1"`. The payload uses
 lexicographically sorted keys, UTF-8, no insignificant whitespace, and no trailing
 newline. Repeated execution of the same source/input-view bytes therefore produces
 the same item identity regardless of run ID, output path, or backend.
+Cross-backend correlation must use `(descriptor_sha256, item_id)` and must never use
+`item_id` alone; HPA-326 run manifests and reports inherit that composite key.
 
 Every error in the verification or execution schema has exactly `code` and sanitized
 `message`; errors are sorted first by the UTF-8 bytes of `code` and then of
-`message`. Artifact entries are sorted first by `role` and then by `path`.
+`message`. The array is a canonical set of normalized failure facts, not a causal
+event log; causal order and detailed sequence belong in bounded sanitized
+diagnostics. Artifact entries are sorted first by `role` and then by `path`.
 
 Identity, attestation, and artifact fields may be null only when a typed failure
 occurred before that identity or artifact could be established. A `verified` report
@@ -1390,7 +1685,7 @@ Frozen backend mode never:
 The following stop the attempt immediately, publish no new prediction for the active
 item, and return exit `2`:
 
-- lock parse or identity failure;
+- request, evidence, lock, or cross-identity failure;
 - missing, extra, renamed, or hash-mismatched checkpoint components;
 - runtime platform or image-digest mismatch;
 - missing or extra required graph variables;
@@ -1429,12 +1724,13 @@ The complete command/status mapping is:
 | Verification succeeds or every requested item completes | `0` | verification `verified` or execution `complete` |
 | One or more items fail while the backend remains valid | `1` | execution `partial` plus item `failed` |
 | Requested MIDI derivation fails after valid JSONL publication | `1` | execution `partial`, item `incomplete`, error `midi_derivation_failed` |
-| Official execution is attempted on an unsupported host | `1` | verification/execution `environment_unsupported` |
+| Platform or authenticated host-evidence preflight fails before inference | `1` | verification/execution `environment_unsupported` |
+| A pre-seal registry entry is selected for frozen inference | `1` | verification/execution `failed`, error `backend_not_sealed` |
 | Legacy scoring cannot run or complete | `1` | legacy-score `failed` |
 | Frozen OaF is requested through the legacy scorer before mapping | `1` | legacy-score `canonical_mapping_required` |
-| `prepare-backend` cannot acquire or stage bytes | `1` | setup summary `acquisition_failed` |
-| Backend integrity, startup, smoke, process, timeout, or protocol fails | `2` | verification/execution `failed` with stable error code |
-| `prepare-backend` detects lock, byte, cache, or publication integrity failure | `2` | setup summary `integrity_failed` |
+| `prepare-backend` cannot acquire or stage bytes, or its verify-only form finds no cache | `1` | setup summary `acquisition_failed` |
+| Backend integrity, startup, any authenticated smoke comparison, process, timeout, or protocol fails | `2` | verification/execution `failed` with stable error code |
+| `prepare-backend` detects request, evidence, lock, byte, cache, or publication integrity failure | `2` | setup summary `integrity_failed` |
 | Click rejects command syntax or options | `2` | no report or command summary exists |
 
 After Click has successfully parsed a backend command, a backend-fatal exit `2` must
@@ -1471,25 +1767,503 @@ the actual artifact byte-for-byte. A generated expected JSONL may be uploaded as
 evidence, but it is not a separate source of truth that can drift from the locked
 oracle.
 
-Verification runs the fixture:
+Each of the two runner processes first performs one raw-oracle startup check before
+emitting `ready`. After readiness, verification runs the fixture:
 
 1. twice in one persistent runner; and
 2. once in a fresh runner.
 
-All three prediction artifacts must be byte-identical; request-local fields are already
-excluded by the artifact schema. The artifact must be finite and nonempty. Backend
-identity fields must match the lock. Native classes, event count, rounded times, MIDI
-notes, confidence values, velocity integers, and the complete serialized event
-payload must match the smoke oracle exactly after the specified six-decimal
-quantization. There is no numeric acceptance tolerance. A verifier may calculate and
-report raw pre-quantization confidence deltas only after an exact-match failure for
-diagnosis; those diagnostics can never turn a mismatched artifact into a pass.
+The full verification therefore performs exactly five inference calls: two startup
+raw-oracle checks, one per process, plus three post-ready artifact requests. Startup
+checks are handshake evidence and are not among the three published or directly
+compared prediction artifacts.
+
+All three post-ready prediction artifacts must be byte-identical; request-local
+fields are already excluded by the artifact schema. The artifact must be finite and
+nonempty. Backend identity fields must match the lock. Native classes, event count,
+rounded times, MIDI notes, confidence values, velocity integers, and the complete
+serialized event payload must match the smoke oracle exactly after the specified
+six-decimal quantization. There is no numeric acceptance tolerance. A verifier may
+calculate and report raw pre-quantization confidence deltas only after an exact-match
+failure for diagnosis; those diagnostics can never turn a mismatched artifact into a
+pass.
 
 The smoke oracle and deterministically generated artifact are regression evidence for
 execution parity, not accuracy claims. Adjusting the model, hparams, thresholds, or
 postprocessor to make the fixture look musically better is forbidden.
 
+## Normative Schema Key Reference
+
+This appendix, not an implementation constant or a representative golden, is the
+normative key-set authority for HPA-320 v1. Every object has exactly the keys listed
+for its schema or named shape. A key is still present when its value is nullable.
+Arrays contain only the named element shape. Unknown, duplicate, or omitted keys are
+invalid. Types, value domains, ordering, nullability, and cross-field rules remain as
+specified in the preceding sections.
+
+### Shared nested shapes
+
+```text
+hash_ref:
+  path, sha256
+artifact_ref:
+  role, path, sha256
+error:
+  code, message
+checkpoint_identity:
+  name, sha256, size
+archive_member:
+  name, role, sha256, size
+variable:
+  dtype, name, shape
+non_inference_variable:
+  dtype, name, reason, shape
+python_distribution:
+  filename, name, sha256, version
+system_package:
+  architecture, name, version
+source_file:
+  byte_length, path, sha256
+licensed_source_file:
+  license, path, sha256
+native_output_bin:
+  model_output_bin, native_class_id, native_midi_note
+training_group:
+  base_midi, group_id, member_pitches, output_bin
+native_metadata_field:
+  name, nullable, type
+serialization:
+  encoding, final_newline, key_order, whitespace
+host_numeric_fingerprint:
+  architecture, cpu_family, cpu_model, cpu_stepping, cpu_vendor_id
+changed_file:
+  path, sha256, status
+probe:
+  name, value
+measurement_row:
+  exit_code, input_frame_count, oom_killed, peak_cpu_millis, peak_pid_count,
+  peak_rss_bytes, peak_shm_bytes, peak_tmp_bytes, prediction_sha256,
+  process_instance_id, repetition, request_millis, signal,
+  startup_millis, stderr_max_line_bytes, stdout_max_line_bytes
+```
+
+`native_host_evidence` has exactly `kind`, `official_execution_allowed`, `payload`,
+and `sha256`. Its `payload` is discriminated by `kind` and has exactly one of:
+
+```text
+github_hosted_runner:
+  api_record_sha256, host_numeric_fingerprint, job_id, runner_arch,
+  runner_os, run_url, workflow_commit
+orchestrator_attestation:
+  attestation_sha256, host_numeric_fingerprint, issuer, key_id,
+  worker_architecture
+native_seal_host:
+  daemon_architecture, evidence_sha256, host_architecture,
+  host_numeric_fingerprint
+```
+
+The OaF metadata object under schema `magenta-oaf-native-metadata-v1` has exactly
+`upstream_8hit_group_id`. The heuristic metadata object under schema
+`crux-empty-native-metadata-v1` has no keys. Accordingly, the OaF backend lock's
+`native_metadata_fields` contains exactly one `native_metadata_field` row:
+`name: "upstream_8hit_group_id"`, `nullable: true`, and `type: "string"`.
+
+The backend lock's `hparams` object has exactly:
+
+```text
+acoustic_rnn_dropout_keep_prob, bidirectional,
+combined_lstm_dropout_keep_prob, combined_lstm_units,
+conv_dropout_keep_amts, conv_filters, drum_data_map, drum_note_duration,
+drum_prediction_map, drums_only, fc_dropout_keep_amt, fc_size,
+frame_lstm_units, frame_threshold, hop_length, log_amplitude, min_gap,
+num_pitches, offset_lstm_units, offset_network, offset_threshold,
+onset_length, onset_lstm_units, onset_threshold, peak_picking,
+sample_rate, share_conv_features, spec_fmin, spec_hop_length, spec_htk,
+spec_mel_bins, spec_type, transform_audio, use_librosa, velocity_bias,
+velocity_lstm_units, velocity_scale, viterbi_decoding
+```
+
+### Descriptor, lock, and seal schemas
+
+`crux.transcription-backend-descriptor/v1`:
+
+```text
+architecture_id, backend_id, backend_lock_sha256, descriptor_schema,
+model_artifact_set_sha256, model_id, native_metadata_schema_id,
+native_output_space_id, prediction_schema, protocol_schema,
+runtime_image_manifest_digest, runtime_lock_sha256, training_data_map_id,
+upstream_source_commit
+```
+
+`crux.heuristic-backend-descriptor/v1`:
+
+```text
+adapter_source_manifest_sha256, architecture_id, backend_id,
+descriptor_schema, model_id, native_metadata_schema_id,
+native_output_space_id, parameter_lock_sha256, prediction_schema
+```
+
+`crux.transcription-backend-lock/v1`:
+
+```text
+architecture_id, backend_id, checkpoint_acquisition_evidence_sha256,
+checkpoint_acquisition_request_sha256, checkpoint_archive,
+checkpoint_components, checkpoint_inventory, checkpoint_url,
+descriptor_schema, drum_prediction_map, execution_report_schema,
+host_adapter_source_manifest_sha256, hparams, hparams_source,
+legacy_conversion_coverage_sha256, legacy_score_report_schema,
+max_input_audio_frames, model_id, native_metadata_fields,
+native_metadata_schema_id, native_output_bins, native_output_space_id,
+non_inference_inventory, prediction_schema, protocol_schema,
+required_inference_inventory, runtime_image_manifest_digest,
+runtime_lock_sha256, schema, seal_evidence_sha256, serialization,
+smoke_audio_sha256, smoke_oracle_sha256, training_data_map_id,
+training_groups, upstream_repository, upstream_source_commit,
+upstream_source_manifest_sha256, verification_report_schema
+```
+
+Here `checkpoint_archive` and every `checkpoint_components` row use
+`checkpoint_identity`; checkpoint and required inventories use `variable`;
+non-inference inventory uses `non_inference_variable`; output bins, groups, metadata
+fields, and serialization use the shared shapes above.
+
+`crux.transcription-runtime-lock/v1`:
+
+```text
+additional_system_packages, base_image, base_image_archive_keyring_sha256,
+base_image_manifest_digest, base_system_package_evidence_sha256,
+base_system_package_inventory, base_system_package_inventory_sha256,
+base_system_package_request_sha256, distribution_build_manifest_sha256,
+environment, oci_layout_manifest_sha256, platform, python_distributions,
+python_version, runner_source_manifest_sha256, runtime_image_manifest_digest,
+schema, seal_evidence_sha256, stderr_max_line_bytes,
+stderr_read_chunk_bytes, stderr_ring_buffer_bytes, stdout_max_line_bytes,
+tensorflow_abi, tensorflow_build, upstream_source_manifest_sha256
+```
+
+`environment` has exactly the seven variable names in the deterministic-runtime
+table. Package and distribution arrays use their shared shapes.
+
+`crux.backend-seal-evidence/v1`:
+
+```text
+additional_system_packages, advisory_snapshot_sha256,
+base_image_archive_keyring_sha256, base_image_manifest_digest,
+base_system_package_evidence_sha256, base_system_package_inventory,
+base_system_package_inventory_sha256, base_system_package_request_sha256,
+calibration_measurement_evidence_sha256,
+calibration_measurement_request_sha256, checkpoint_acquisition_evidence_sha256,
+checkpoint_acquisition_request_sha256, checkpoint_archive,
+checkpoint_components, checkpoint_inventory, cpu_limit_millis,
+distribution_build_manifest_sha256, host_adapter_source_manifest_sha256,
+instrumentation_patch_sha256, legacy_conversion_coverage_sha256,
+max_input_audio_frames, measurements, memory_limit_bytes,
+native_host_evidence, non_inference_inventory, oci_layout_archive,
+oci_layout_manifest_sha256, pid_limit, python_distributions,
+reference_host_numeric_fingerprint, request_deadline_seconds,
+required_inference_inventory, runner_source_manifest_sha256, runtime_gid,
+runtime_image_config_digest, runtime_image_layer_digests,
+runtime_image_manifest_digest, runtime_uid, schema, seal_candidate_sha256,
+seal_profile_request_sha256, security_scan_sha256, shm_bytes,
+smoke_audio_sha256, smoke_oracle_sha256, smoke_prediction_sha256,
+startup_deadline_seconds, stderr_max_line_bytes, stderr_read_chunk_bytes,
+stderr_ring_buffer_bytes, stdout_max_line_bytes, tensor_coverage_sha256,
+tensorflow_abi, tensorflow_build, tmp_bytes,
+upstream_source_manifest_sha256
+```
+
+`measurements` contains `measurement_row`; archive, component, inventory,
+distribution, package, host-evidence, and fingerprint values use the shared shapes.
+
+`crux.heuristic-parameter-lock/v1`:
+
+```text
+adapter_source_manifest_sha256, algorithm, backend_id, distributions,
+platform, python_abi, python_implementation, python_version, schema,
+serialization, wheel_tags
+```
+
+Its `algorithm` has exactly `classifier_branches`, `fixed_native_midi_notes`,
+`fixed_velocity_midi`, `hop_length`, `librosa_calls`, and `sample_rate`. Every
+`librosa_calls` row has exactly `arguments` and `call`; every `arguments` row has
+exactly `name` and `value`, so resolved defaults are data rather than open object
+keys. Every classifier-branch row has exactly `condition`, `native_midi_note`, and
+`velocity_midi`. The two fixed-value fields are arrays of integers.
+
+### Bootstrap request and evidence schemas
+
+`crux.oaf-checkpoint-acquisition-request/v1`:
+
+```text
+archive, archive_members, backend_id, checkpoint_url,
+published_component_names, schema
+```
+
+`crux.oaf-checkpoint-acquisition-evidence/v1`:
+
+```text
+acquisition_mode, archive, archive_members, cache_path,
+model_artifact_set_sha256, published_components, request_sha256, schema
+```
+
+The request/evidence `archive` uses `checkpoint_identity`; `archive_members` use
+`archive_member`; `published_components` use `checkpoint_identity`.
+
+`crux.oaf-base-system-package-request/v1`:
+
+```text
+additional_system_packages, base_image, base_image_archive_keyring_sha256,
+base_image_manifest_digest, platform, required_probes, schema
+```
+
+`crux.oaf-base-system-package-evidence/v1`:
+
+```text
+additional_system_packages, base_image_archive_keyring_sha256,
+base_image_manifest_digest, native_host_evidence, package_inventory,
+package_inventory_sha256, probes, request_sha256, schema
+```
+
+`required_probes` is an array of names; `probes` use `probe`; package arrays use
+`system_package`.
+
+`crux.oaf-calibration-measurement-request/v1`:
+
+```text
+backend_id, container_restrictions, fixtures, frame_counts,
+output_schemas, repetition_count, required_metrics, schema
+```
+
+Each fixture has exactly `input_audio_sha256`, `input_view_id`, `source_audio_id`,
+and `source_audio_sha256`. `container_restrictions` has exactly `drop_capabilities`,
+`network`, `no_new_privileges`, `platform`, and `read_only_root`.
+`required_metrics` and `output_schemas` are arrays of exact string identifiers, not
+open objects.
+
+The corresponding immutable measurement evidence uses schema
+`crux.oaf-calibration-measurement-evidence/v1` and exactly:
+
+```text
+base_system_package_evidence_sha256,
+checkpoint_acquisition_evidence_sha256, image_manifest_digest,
+measurement_rows, native_host_evidence, request_sha256, schema
+```
+
+`measurement_rows` contains `measurement_row`.
+
+`crux.oaf-seal-profile-request/v1`:
+
+```text
+base_system_package_evidence_sha256,
+base_system_package_request_sha256,
+calibration_measurement_evidence_sha256,
+calibration_measurement_request_sha256,
+checkpoint_acquisition_evidence_sha256,
+checkpoint_acquisition_request_sha256, cpu_limit_millis,
+max_input_audio_frames, memory_limit_bytes, pid_limit,
+request_deadline_seconds, runtime_gid, runtime_uid, schema, shm_bytes,
+startup_deadline_seconds, stderr_max_line_bytes, stderr_read_chunk_bytes,
+stderr_ring_buffer_bytes, stdout_max_line_bytes, tmp_bytes
+```
+
+`crux.oaf-seal-candidate/v1`:
+
+```text
+calibration_measurement_evidence_sha256, checkpoint_components,
+checkpoint_prefix, model_artifact_set_sha256,
+required_inference_inventory_sha256, schema, seal_profile_request_sha256
+```
+
+### Protocol and prediction schemas
+
+`crux.transcription-runner/v1` request:
+
+```text
+audio_path, audio_sha256, backend_descriptor_sha256, request_id, type
+```
+
+Ready response:
+
+```text
+backend_descriptor, backend_descriptor_sha256, backend_lock_sha256,
+checkpoint_inventory_sha256, non_inference_count,
+non_inference_inventory_sha256, protocol_schema, python_version,
+required_inference_count, required_inference_inventory_sha256,
+restored_inference_count, runner_source_manifest_sha256,
+runtime_lock_sha256, smoke_audio_sha256, smoke_oracle_sha256,
+smoke_prediction_sha256, smoke_status, tensorflow_abi, tensorflow_build,
+type, upstream_source_manifest_sha256
+```
+
+Successful result:
+
+```text
+audio_sha256, backend_descriptor_sha256, native_events, request_id, type
+```
+
+Error response:
+
+```text
+code, message, type
+```
+
+Each runner `native_events` row has exactly:
+
+```text
+confidence_binary64, frame_index, model_output_bin, native_class_id,
+native_midi_note, time_sec_binary64, upstream_8hit_group_id, velocity_midi
+```
+
+`crux.drum-prediction-events/v1` header:
+
+```text
+architecture_id, artifact_role, audio_frame_count, backend_descriptor,
+backend_descriptor_sha256, backend_lock_sha256, byte_length, channel_count,
+input_audio_sha256, input_view_id, model_artifact_set_sha256, model_id,
+native_metadata_schema_id, native_output_space_id, parameter_lock_sha256,
+record_type, runtime_lock_sha256, sample_rate, sample_width_bytes, schema,
+source_audio_id, source_audio_sha256, training_data_map_id,
+upstream_source_commit
+```
+
+Event:
+
+```text
+canonical_class, confidence, event_index, mapping_status, model_output_bin,
+native_class_id, native_metadata, native_midi_note, prediction_map_version,
+record_type, time_sec, velocity_midi
+```
+
+Terminal:
+
+```text
+event_count, prefix_sha256, record_type
+```
+
+`crux.oaf-smoke-oracle/v1`:
+
+```text
+input_audio_frame_count, input_audio_sha256, input_view_id, native_events,
+schema, source_audio_id, source_audio_sha256
+```
+
+Its `native_events` rows use the runner native-event key set above.
+
+### Provenance and report schemas
+
+`crux.input-view-manifest/v1`:
+
+```text
+input_audio_path, input_audio_sha256, input_view_id, schema,
+source_audio_id, source_audio_sha256, source_path
+```
+
+`crux.backend-execution-item-id/v1`:
+
+```text
+input_audio_sha256, input_view_id, schema, source_audio_id,
+source_audio_sha256
+```
+
+`crux.backend-execution-attestation/v1`:
+
+```text
+backend_id, changed_files_manifest, checkout_dirty, cpu_limit,
+descriptor_sha256, git_commit, host_numeric_fingerprint, memory_bytes,
+pid_limit, request_deadline_seconds, schema, shm_bytes,
+startup_deadline_seconds, strict_mode, tmp_bytes
+```
+
+`changed_files_manifest` is `hash_ref` or null for a clean checkout. The referenced
+canonical JSON array contains `changed_file` rows.
+
+`crux.backend-verification-report/v1`:
+
+```text
+artifacts, backend_lock_sha256, descriptor, descriptor_sha256, errors,
+execution_attestation, exit_code, finished_at, parameter_lock_sha256,
+report_type, run_id, runtime_lock_sha256, schema, seal_evidence_sha256,
+smoke, started_at, status, tensor_coverage
+```
+
+Its `tensor_coverage` has exactly `non_inference_count`,
+`non_inference_inventory_sha256`, `report_path`, `report_sha256`,
+`required_count`, `required_inventory_sha256`, `restored_count`, and `status`.
+Its `smoke` has exactly `audio_sha256`, `oracle_sha256`, `prediction_path`,
+`prediction_sha256`, and `status`. `artifacts` use `artifact_ref`; `errors` use
+`error`; execution attestation uses `hash_ref`.
+
+`crux.backend-execution-report/v1`:
+
+```text
+backend_lock_sha256, descriptor, descriptor_sha256, errors,
+execution_attestation, exit_code, finished_at, items,
+parameter_lock_sha256, report_type, run_id, runtime_lock_sha256, schema,
+seal_evidence_sha256, started_at, status, verification_report
+```
+
+Each item has exactly `errors`, `input_audio_sha256`, `input_view_id`, `item_id`,
+`midi`, `prediction`, `source_audio_id`, `source_audio_sha256`, and `status`.
+`prediction`, `midi`, `execution_attestation`, and `verification_report` use
+`hash_ref`; errors use `error`.
+
+`crux.legacy-score-report/v1`:
+
+```text
+backend_id, backend_validation_status, errors, exit_code, finished_at,
+report_type, run_id, schema, score_report, started_at, status, workflow_mode
+```
+
+`score_report` uses `hash_ref`; errors use `error`.
+
+`crux.legacy-tf2-conversion-coverage/v1`:
+
+```text
+candidate_matches, converter_source_manifest_sha256, matching_algorithm,
+matching_algorithm_version, model_artifact_set_sha256,
+observed_hdf5_sha256, required_inference_inventory_sha256,
+restored_required, restored_required_count, schema,
+tf2_model_source_manifest_sha256, unmatched_required
+```
+
+`restored_required` and `unmatched_required` use `variable`. Each candidate match has
+exactly `assigned`, `candidate_name`, `dtype_compatible`, `match_kind`,
+`required_name`, and `shape_compatible`.
+
+Supporting HPA-320 evidence schemas are equally strict:
+
+```text
+crux.oaf-tensor-coverage/v1:
+  active_predict_dropout, checkpoint_inventory, non_inference_inventory,
+  note_sequence_byte_parity, required_inference_inventory, schema,
+  uninitialized_required
+crux.oaf-oci-layout-manifest/v1:
+  archive, config_digest, image_manifest_digest, layer_digests, schema
+crux.oaf-upstream-source-manifest/v1:
+  covered_roots, files, schema, upstream_commit, upstream_repository
+crux.oaf-runner-source-manifest/v1:
+  covered_roots, files, schema
+crux.oaf-host-adapter-source-manifest/v1:
+  covered_roots, files, schema
+```
+
+The tensor inventories use the shared variable shapes; the OCI `archive` uses
+`checkpoint_identity`; upstream manifest files use `licensed_source_file`; runner and
+host-adapter manifest files use `source_file`.
+
 ## Test Strategy
+
+Every versioned schema introduced by HPA-320, including the `crux.*/v1` schemas and
+`magenta-oaf-native-metadata-v1`, is listed in
+`tests/benchmark/schema_goldens/manifest.json`. Each manifest entry contains exactly
+`schema`, `validator_modules`, and `golden_path`. Its `validator_modules` list contains
+unique importable module paths sorted by UTF-8 bytes; schemas deliberately enforced
+on both sides of the isolation boundary list both validators. Each golden is checked
+in as canonical bytes, must pass every listed validator, and has unknown-key,
+missing-key, duplicate-key, and wrong-type rejection tests. This test manifest is a
+drift detector against the normative key reference above, not an inference identity,
+and is not referenced by a backend or runtime lock. A golden cannot add, remove, or
+reinterpret a key from that reference.
 
 ### Unit tests
 
@@ -1504,11 +2278,14 @@ postprocessor to make the fixture look musically better is forbidden.
   `duplicate_native_event`, and
   `Decimal.from_float(...).quantize(...)` half-even boundary cases, including
   trailing-zero and negative-zero normalization.
-- Exact binary64 frame-time evaluation order and upstream velocity clamp/scale/truncate
-  behavior, including the explicitly divergent rejection of nonfinite raw velocity.
+- Exact binary64 frame-time evaluation order; 16-digit big-endian wire round-trip for
+  time and confidence; proof that artifact quantization occurs exactly once; and
+  upstream velocity clamp/scale/truncate behavior, including the explicitly divergent
+  rejection of nonfinite raw velocity.
 - Instrumented onset-frame, pitch, velocity, and confidence pairing without
   reconstructing a frame from `NoteSequence.start_time`.
 - Exact `crux.backend-execution-item-id/v1` canonical payload and hash derivation.
+- Cross-backend correlation requires the descriptor/item composite key.
 - Exact descriptor canonical bytes and proof that operational fields and a trailing
   newline change neither its schema nor its accepted hash.
 - Header, empty-result, event, and terminal validation.
@@ -1521,7 +2298,10 @@ postprocessor to make the fixture look musically better is forbidden.
 - Manifest-defined dirty-checkout scope and canonical changed-file hashing.
 - Verification/execution report strict schemas, canonical bytes, stable default paths,
   final CLI summaries, and atomic latest-report updates.
-- Execution-attestation CPU, memory, PID, and deadline fields.
+- Execution-attestation host numeric fingerprint, CPU, memory, PID, and deadline
+  fields; every authenticated smoke mismatch is backend-fatal irrespective of
+  diagnostic fingerprint, while `environment_unsupported` is limited to pre-inference
+  platform/evidence failure.
 - A backend-agnostic consumer can read OaF events without importing an OaF module and
   rejects `mapping_status: "not_applied"` through a generic error.
 - Atomic publication and preservation of an existing valid artifact on failure.
@@ -1529,7 +2309,8 @@ postprocessor to make the fixture look musically better is forbidden.
   heuristic.
 - Heuristic descriptor and parameter-lock coverage, including all resolved Librosa
   defaults, classifier branch ordering, fixed pitch/velocity outputs, and isolation
-  from Crux's main dependency environment.
+  from Crux's main dependency environment, plus rejection of official publication
+  outside native `linux/amd64`.
 - Sanitized errors and logs.
 
 ### Protocol and failure tests
@@ -1540,6 +2321,7 @@ A fake runner covers:
 - wrong backend, mounted-lock hash, runtime, metadata-schema, and mapping identities;
 - missing, duplicate, and extra handshake fields;
 - corrupt JSON and unexpected standard-output text;
+- malformed, noncanonical, nonfinite, and bit-mismatched binary64 event fields;
 - runner crash before and after readiness;
 - in-bound out-of-memory/process failure as backend-fatal;
 - startup and request timeouts;
@@ -1554,10 +2336,13 @@ environment allowlisting, dropped capabilities, `no-new-privileges`, numeric
 non-root UID/GID, tmpfs bounds, and CPU/memory/PID limits. An emulated host can run
 diagnostics only and must produce `environment_unsupported` without publishing an
 official prediction. Launcher tests prove that `PYTHONHASHSEED` and the full
-allowlist are present before Python starts, that startup rejects any mismatch before
-TensorFlow import, and that explicit `ConfigProto` thread counts remain `1`. Host
-evidence tests accept only the three enumerated evidence forms and keep an unattested
-bare local host diagnostic-only.
+allowlist are present before Python starts, that `PYTHONCOERCECLOCALE=0` is required
+and removed before exact allowlist validation, that startup rejects any mismatch
+before TensorFlow import, and that explicit `ConfigProto` thread counts remain `1`.
+Host evidence tests accept only the three enumerated evidence forms and keep an
+unattested bare local host diagnostic-only. Cross-CPU tests require exact smoke
+identity on a different fingerprint before official publication and classify every
+completed mismatch as backend-fatal `failed`, exit `2`.
 
 Log tests prove that standard output remains protocol-only and that standard error
 retains allowed diagnostics while redacting secrets, environment values, absolute
@@ -1579,7 +2364,8 @@ The pinned runtime must:
 - prove that the prediction graph contains no active stochastic dropout;
 - require byte-identical serialized `NoteSequence` output from patched and
   unmodified postprocessing while proving the patch reports the selected onset frame;
-- run the smoke fixture twice in-process and once in a fresh process;
+- perform the two startup raw-oracle checks and three post-ready artifact requests,
+  for exactly five fixture inferences across two processes;
 - generate the expected native artifact from the locked oracle, mounted locks, and
   descriptor and reproduce it byte-for-byte;
 - round-trip the JSONL through the host reader without information loss;
@@ -1591,8 +2377,17 @@ The pinned runtime must:
 
 CLI tests prove:
 
-- `prepare-backend` emits only the documented setup summary and never a backend
-  report;
+- `prepare-backend` boots from the exact request without a final lock, verifies the
+  real four-member archive, publishes only three components, emits only the
+  documented setup summary, and never writes a backend report;
+- post-seal `prepare-backend` rejects any request/evidence/final-lock disagreement;
+- `attest-base-system` accepts only the pinned base manifest, exact native inventory,
+  required probes, and empty additional-package set;
+- `measure` cannot publish a seal candidate, and `calibrate` rejects a missing,
+  unrelated, sentinel-bearing, or underprovisioned seal-profile request;
+- a `preseal` OaF registry entry returns `backend_not_sealed`, exit `1`, without
+  opening prediction output, while a `sealed` entry with missing or corrupt locks
+  returns integrity failure, exit `2`;
 - `verify-backend` returns the documented reports and exit codes;
 - frozen benchmark commands preflight before opening item outputs;
 - `transcribe-one` writes atomically;
@@ -1622,17 +2417,28 @@ A dedicated native Linux `amd64` integration job runs when backend locks, runner
 vendored upstream source, smoke fixtures, or prediction schemas change. It also runs
 on a scheduled cadence and through manual dispatch. The job:
 
-1. downloads the locked archive as an explicit CI preparation step;
-2. verifies its exact locked byte length and SHA-256 before extraction;
-3. verifies all three component hashes;
+1. strict-loads the checkpoint-acquisition request and downloads the requested
+   archive as an explicit CI preparation step;
+2. verifies the exact archive and four-member identities before publishing the three
+   inference components;
+3. attests the pinned base-image package inventory, empty additional-package set,
+   and required native probes;
 4. builds or pulls the pinned runner by immutable digest;
-5. runs `verify-backend`;
-6. runs the real-checkpoint integration tests; and
-7. uploads the verification report, tensor coverage report, and smoke artifacts.
+5. reruns the checked-in measurement and seal-profile requests;
+6. runs `verify-backend`;
+7. runs the real-checkpoint integration tests; and
+8. uploads acquisition, base-system, calibration, verification, tensor-coverage,
+   and smoke evidence.
 
 The benchmark command itself remains offline. A network or acquisition failure in CI
 fails the dedicated job; it is not converted into a skipped parity result.
 An emulated `amd64` job cannot satisfy this required check.
+
+The dedicated job passes only when `verify-backend` returns exit `0` and its strict
+typed report has `status: "verified"`, every required real-checkpoint test ran, and
+all required evidence reports were published and uploaded. An
+`environment_unsupported` report, skipped parity test, acquisition failure, or
+missing report or upload fails the required job. Exit status alone is insufficient.
 
 The dedicated job is required before merging an inference-relevant change. Unrelated
 host-only changes may reuse a recent successful scheduled result only if repository
@@ -1647,12 +2453,13 @@ Implementation planning should preserve these ownership boundaries:
 - `src/benchmark/backend_lock.py` owns strict locks and identity derivation.
 - `src/benchmark/prediction_artifact.py` owns the common JSONL schema, validation,
   backend-agnostic reading, and atomic publication.
-- `runtime/oaf_tf1/` owns the pinned runner, container definition, package lock, source
-  manifests, and protocol implementation.
+- `runtime/oaf_tf1/` owns the pinned runner, container definition, package lock,
+  source manifests, base-system-package request, and protocol implementation.
 - `runtime/heuristic_onset/` owns the content-addressed heuristic environment lock and
   reproducible environment builder.
-- `config/benchmark/backends/` owns reviewed backend, runtime, and heuristic-parameter
-  locks plus the native seal-evidence record.
+- `config/benchmark/backends/` owns reviewed checkpoint-acquisition, calibration, and
+  seal-profile requests; backend, runtime, and heuristic-parameter locks; and the
+  native seal-evidence record.
 - `docs/superpowers/evidence/hpa-320/` owns immutable design-audit evidence, including
   the legacy TF2 conversion coverage report.
 - `tests/fixtures/oaf_tf1_smoke/` owns the procedural generator and parameters,
@@ -1703,18 +2510,22 @@ HPA-320 is complete when:
 1. The official source, checkpoint, runtime, hparams, 88-bin native output space,
    native-metadata schema, upstream 8-hit training map, exact upstream invocation, and
    maximum input-audio-frame bound are represented by strict checked-in locks with the
-   identities in this design, backed by an accepted native-`amd64` seal-evidence
-   record containing every exact resource, deadline, package, and platform value
-   required above.
+   identities in this design. The locks cross-reference strict checkpoint,
+   base-system, measurement, and seal-profile request/evidence hashes and are backed
+   by an accepted native-`amd64` seal-evidence record containing every exact resource,
+   deadline, package, reference host numeric fingerprint, and platform value required
+   above.
 2. The released checkpoint is verified offline and all 78 required inference tensors
-   are restored; the 52 non-inference entries are explicitly classified, and the
-   zero-of-78 legacy conversion conclusion is preserved in its hashed audit artifact.
+   are restored; the four-member archive and three-component cache are exact; the 52
+   non-inference entries are explicitly classified; and the zero-of-78 legacy
+   conversion conclusion is preserved in its hashed audit artifact.
 3. The launcher supplies the exact environment before CPython starts, and the
    isolated TensorFlow 1.15.5 runner completes an identity-checked handshake with
    bounded concurrent standard-error draining.
 4. The procedural fixture reproduces byte-identical, finite, nonempty native
    prediction artifacts across repeated and fresh processes with no numeric
-   acceptance tolerance.
+   acceptance tolerance; every authenticated mismatch is backend-fatal irrespective
+   of diagnostic host fingerprint.
 5. Structured native predictions preserve independently verified source-audio and
    input-view identity, time, output bin, MIDI pitch, native class, schema-governed
    upstream group, selected onset-frame confidence, velocity, and explicit canonical
@@ -1733,10 +2544,10 @@ HPA-320 is complete when:
    lock self-referential.
 10. The FastAPI transcription path, shared canonical taxonomy, scoring semantics, and
    full-corpus orchestration remain outside the HPA-320 change.
-11. A lightweight `heuristic-onset-v1` adapter and content-addressed isolated
-    environment preserve the current heuristic only through explicit selection; the
-    legacy HDF5 path remains combined-score-only and cannot claim a frozen
-    descriptor.
+11. A lightweight native-`linux/amd64` `heuristic-onset-v1` adapter and
+    content-addressed isolated environment preserve the current heuristic only
+    through explicit selection; other platforms are diagnostic-only, and the legacy
+    HDF5 path remains combined-score-only and cannot claim a frozen descriptor.
 12. `docs/drumery-dtx-midi-benchmarking-reference.md`,
     `tests/test_cli_benchmark.py`, and `tests/benchmark/test_runner.py` document and
     test the backend matrix, new defaults, reports, exit semantics, and migration.
@@ -1751,12 +2562,12 @@ frozen container still starts and reproduces the fixture. It accepts no
 operator-supplied GraphDef or checkpoint; the only graph source and model components
 are hash-locked, and the audio boundary uses the strict canonical WAV contract.
 
-The Python 3.7/Bullseye snapshot may contain known vulnerabilities. HPA-320 accepts
-that residual risk only inside the locked non-root, network-disabled, read-only,
-capabilities-dropped boundary and records a security scan/advisory snapshot with the
-seal evidence. It does not claim that EOL packages are patched. A vulnerability that
-invalidates the isolation boundary retires official execution pending a reviewed new
-runtime identity.
+The Python 3.7/Bullseye base image may contain known vulnerabilities. HPA-320 accepts
+that residual risk only inside the digest-pinned, inventory-attested, non-root,
+network-disabled, read-only, capabilities-dropped boundary and records a security
+scan/advisory snapshot with the seal evidence. It does not claim that EOL packages
+are patched. A vulnerability that invalidates the isolation boundary retires
+official execution pending a reviewed new runtime identity.
 
 ### Apple Silicon development hosts differ from CI
 
@@ -1766,6 +2577,17 @@ building a separate ARM image, but it reports `environment_unsupported`, cannot 
 locks or publish official predictions, and cannot satisfy the dedicated native
 parity check.
 
+### Native amd64 does not guarantee numerical identity
+
+The seal preserves the reference host numeric fingerprint, and every official
+execution records its current diagnostic fingerprint. A different native-amd64 CPU
+is accepted only after reproducing the sealed smoke artifact byte-for-byte. Every
+completed mismatch is a backend regression with `failed`, exit `2`; a fingerprint
+difference may explain the failure but cannot reclassify it as unsupported.
+Supporting an execution environment that produces different bytes requires a
+reviewed new runtime/backend identity. New evidence alone cannot waive the exact-match
+rule.
+
 ### Whole-file inference has bounded resource use
 
 The backend lock has no implicit or unlimited input length: it freezes
@@ -1774,7 +2596,9 @@ PID, tmpfs, and deadline limits are recorded in the execution attestation. Direc
 verification/transcription uses the sealed reference profile; HPA-326 freezes its
 profile in the run configuration. A supported input that exhausts those resources
 fails loudly as a backend-fatal condition; a longer-input or chunked policy requires
-a new locked identity.
+a new locked identity. That identity change is conservative domain versioning:
+artifacts for identical inputs below the prior bound remain scientifically comparable
+when their remaining descriptor fields agree.
 
 ### Heuristic dependency upgrades could erase historical comparability
 
@@ -1811,10 +2635,14 @@ The checkpoint archive and image are identified by content digest. The seal proc
 also exports the complete built runner image as a content-addressed OCI layout,
 records its manifest/config/layer digests and archive SHA-256 in seal evidence, and
 copies it plus the checkpoint archive to approved durable storage. Authorized
-registries, Debian snapshot mirrors, or artifact mirrors may supply the same bytes
-without changing backend identity. A new byte sequence, even from the same URL or
-tag, is rejected. Preservation of the exact OCI bytes avoids making a future registry
-or `snapshot.debian.org` outage an unrecoverable rebuild dependency.
+registries or artifact mirrors may supply the same bytes without changing backend
+identity. A new byte sequence, even from the same URL or tag, is rejected.
+Preservation of the exact OCI and checkpoint bytes avoids making a future registry or
+upstream-storage outage an immediate rebuild dependency. HPA-320 does not promise
+that the exact image can be reproducibly rebuilt forever from surviving source and
+package references. If every approved preserved copy of the OCI bytes is lost, that
+runtime identity is unrecoverable and must be retired rather than rebuilt under the
+same digest claim.
 
 ## Alternatives Rejected
 
