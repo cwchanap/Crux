@@ -266,6 +266,7 @@ RUNTIME_LOCK_KEYS = frozenset(
         "runtime_image_manifest_digest",
         "schema",
         "seal_evidence_sha256",
+        "stdout_max_line_bytes",
         "stderr_max_line_bytes",
         "stderr_read_chunk_bytes",
         "stderr_ring_buffer_bytes",
@@ -312,6 +313,7 @@ SEAL_EVIDENCE_KEYS = frozenset(
         "smoke_oracle_sha256",
         "smoke_prediction_sha256",
         "startup_deadline_seconds",
+        "stdout_max_line_bytes",
         "stderr_max_line_bytes",
         "stderr_read_chunk_bytes",
         "stderr_ring_buffer_bytes",
@@ -608,6 +610,7 @@ def validate_oaf_lock_set(
     )
     for field in (
         "runner_source_manifest_sha256",
+        "stdout_max_line_bytes",
         "debian_snapshot_repository",
         "debian_release_sha256",
         "python_distributions",
@@ -765,6 +768,7 @@ def _validate_runtime_lock(payload: dict[str, JsonValue]) -> None:
     if payload["environment"] != dict(REQUIRED_ENVIRONMENT):
         raise BackendLockError("runtime environment does not match the frozen allowlist")
     for field in (
+        "stdout_max_line_bytes",
         "stderr_max_line_bytes",
         "stderr_read_chunk_bytes",
         "stderr_ring_buffer_bytes",
@@ -826,6 +830,7 @@ def _validate_seal_evidence(payload: dict[str, JsonValue]) -> None:
         "runtime_uid",
         "shm_bytes",
         "startup_deadline_seconds",
+        "stdout_max_line_bytes",
         "stderr_max_line_bytes",
         "stderr_read_chunk_bytes",
         "stderr_ring_buffer_bytes",

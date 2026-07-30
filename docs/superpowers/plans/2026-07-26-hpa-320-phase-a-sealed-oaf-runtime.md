@@ -612,6 +612,7 @@ class RunnerLaunchProfile:
     shm_bytes: int
     startup_deadline_seconds: int
     request_deadline_seconds: int
+    stdout_max_line_bytes: int
     stderr_read_chunk_bytes: int
     stderr_max_line_bytes: int
     stderr_ring_buffer_bytes: int
@@ -627,9 +628,11 @@ match one of the three accepted forms; in-container `uname` is never sufficient.
 and no inherited environment. Start a daemon stderr reader before reading the
 handshake or writing a request. The reader consumes fixed chunks continuously,
 sanitizes bounded logical lines, retains only the newest ring bytes, and records total
-bytes/truncation. A lock enforces one in-flight request. Stdout accepts exactly one
-UTF-8 JSON object per line and matches request IDs. Timeout/process/protocol failures
-kill the process and raise stable backend-fatal codes.
+bytes/truncation. A lock enforces one in-flight request. Stdout is read in bounded
+chunks, rejects a physical line before exceeding the exact seal-required
+`stdout_max_line_bytes`, accepts exactly one newline-terminated UTF-8 JSON object per
+line, and matches request IDs. Timeout/process/protocol failures kill the process and
+raise stable backend-fatal codes.
 
 - [ ] **Step 5: Run process tests and commit**
 
