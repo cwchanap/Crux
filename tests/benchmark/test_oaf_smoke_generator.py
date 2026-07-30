@@ -717,6 +717,21 @@ def test_exceptional_distribution_build_rejects_nonreproducible_wheels(
         require_reproducible_wheels(first, second)
 
 
+def test_reproducible_wheels_reject_ordered_zip_metadata_drift(tmp_path: Path) -> None:
+    first = tmp_path / "first.whl"
+    second = tmp_path / "second.whl"
+    _write_pure_wheel(first)
+    _rewrite_wheel_timestamp(first, second, (2000, 1, 1, 0, 0, 0))
+
+    with zipfile.ZipFile(first) as first_archive, zipfile.ZipFile(second) as second_archive:
+        assert [first_archive.read(info) for info in first_archive.infolist()] == [
+            second_archive.read(info) for info in second_archive.infolist()
+        ]
+
+    with pytest.raises(DistributionBuildError, match="ZIP member metadata"):
+        require_reproducible_wheels(first, second)
+
+
 def test_exceptional_distribution_rejects_native_wheel_member(tmp_path: Path) -> None:
     wheel = tmp_path / "pretty_midi-0.2.10-py3-none-any.whl"
     _write_pure_wheel(wheel, extra_member="pretty_midi/native.so")
@@ -725,9 +740,48 @@ def test_exceptional_distribution_rejects_native_wheel_member(tmp_path: Path) ->
         validate_built_pure_wheel(wheel)
 
 
+def test_exceptional_distribution_rejects_bytecode_member(tmp_path: Path) -> None:
+    wheel = tmp_path / "pretty_midi-0.2.10-py3-none-any.whl"
+    _write_pure_wheel(
+        wheel,
+        extra_member="pretty_midi/__pycache__/module.cpython-37.pyc",
+    )
+
+    with pytest.raises(DistributionBuildError, match="bytecode"):
+        validate_built_pure_wheel(wheel)
+
+
+def test_exceptional_distribution_rejects_stable_build_root(tmp_path: Path) -> None:
+    wheel = tmp_path / "pretty_midi-0.2.10-py3-none-any.whl"
+    _write_pure_wheel(
+        wheel,
+        extra_member="pretty_midi/build-path.txt",
+        extra_member_content=b"/work/pretty_midi-0.2.10",
+    )
+
+    with pytest.raises(DistributionBuildError, match="build root"):
+        validate_built_pure_wheel(wheel)
+
+
 def test_exceptional_distribution_requires_complete_record(tmp_path: Path) -> None:
     wheel = tmp_path / "pretty_midi-0.2.10-py3-none-any.whl"
     _write_pure_wheel(wheel, omit_package_record=True)
+
+    with pytest.raises(DistributionBuildError, match="RECORD"):
+        validate_built_pure_wheel(wheel)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ("duplicate", "reordered", "unhashed", "incorrectly-hashed", "extra"),
+)
+def test_exceptional_distribution_rejects_noncanonical_record_rows(
+    tmp_path: Path,
+    variant: str,
+) -> None:
+    wheel = tmp_path / "pretty_midi-0.2.10-py3-none-any.whl"
+    _write_pure_wheel(wheel)
+    _rewrite_wheel_record(wheel, variant)
 
     with pytest.raises(DistributionBuildError, match="RECORD"):
         validate_built_pure_wheel(wheel)
@@ -1200,6 +1254,7 @@ def _write_pure_wheel(
     path: Path,
     *,
     extra_member: str | None = None,
+    extra_member_content: bytes = b"native",
     omit_package_record: bool = False,
 ) -> None:
     _write_package_wheel(
@@ -1208,6 +1263,7 @@ def _write_pure_wheel(
         version="0.2.10",
         package_path="pretty_midi",
         extra_member=extra_member,
+        extra_member_content=extra_member_content,
         omit_package_record=omit_package_record,
     )
 
@@ -1219,6 +1275,7 @@ def _write_package_wheel(
     version: str,
     package_path: str | None = None,
     extra_member: str | None = None,
+    extra_member_content: bytes = b"native",
     omit_package_record: bool = False,
 ) -> None:
     import base64
@@ -1235,7 +1292,7 @@ def _write_package_wheel(
         ),
     }
     if extra_member is not None:
-        members[extra_member] = b"native"
+        members[extra_member] = extra_member_content
     record_path = f"{dist_info}/RECORD"
     rows = []
     for name, content in sorted(members.items()):
@@ -1248,6 +1305,52 @@ def _write_package_wheel(
     with zipfile.ZipFile(path, "w") as archive:
         for name, content in members.items():
             archive.writestr(name, content)
+
+
+def _rewrite_wheel_timestamp(
+    source: Path,
+    target: Path,
+    timestamp: tuple[int, int, int, int, int, int],
+) -> None:
+    with zipfile.ZipFile(source) as archive:
+        members = [(info, archive.read(info)) for info in archive.infolist()]
+    with zipfile.ZipFile(target, "w") as archive:
+        for info, content in members:
+            rewritten = zipfile.ZipInfo(info.filename, timestamp)
+            rewritten.compress_type = info.compress_type
+            rewritten.external_attr = info.external_attr
+            rewritten.create_system = info.create_system
+            archive.writestr(rewritten, content)
+
+
+def _rewrite_wheel_record(path: Path, variant: str) -> None:
+    with zipfile.ZipFile(path) as archive:
+        members = [(info, archive.read(info)) for info in archive.infolist()]
+    record_index = next(
+        index
+        for index, (info, _content) in enumerate(members)
+        if info.filename.endswith(".dist-info/RECORD")
+    )
+    record_info, record_content = members[record_index]
+    rows = record_content.decode("utf-8").splitlines()
+    if variant == "duplicate":
+        rows.insert(1, rows[0])
+    elif variant == "reordered":
+        rows[0], rows[1] = rows[1], rows[0]
+    elif variant == "unhashed":
+        name, _digest, _size = rows[0].split(",")
+        rows[0] = f"{name},,"
+    elif variant == "incorrectly-hashed":
+        name, _digest, size = rows[0].split(",")
+        rows[0] = f"{name},sha256={'A' * 43},{size}"
+    elif variant == "extra":
+        rows.insert(-1, "pretty_midi/ghost.py,,")
+    else:
+        raise AssertionError(f"unsupported RECORD mutation: {variant}")
+    members[record_index] = (record_info, ("\n".join(rows) + "\n").encode())
+    with zipfile.ZipFile(path, "w") as archive:
+        for info, content in members:
+            archive.writestr(info, content)
 
 
 def _render_complete_test_build_manifest(tmp_path: Path) -> tuple[bytes, Path]:

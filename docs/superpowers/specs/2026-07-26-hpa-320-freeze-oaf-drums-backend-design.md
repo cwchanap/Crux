@@ -1,8 +1,9 @@
 # HPA-320: Frozen OaF Drums Transcription Backend Design
 
-**Status:** Review amendments applied; phased implementation planning may proceed,
-while final OaF sealing and integration remain blocked on accepted native-`amd64`
-evidence
+**Status:** Review amendments applied; remaining implementation is specified by
+`docs/superpowers/plans/2026-07-29-hpa-320-deterministic-oci-seal-closure.md`, while
+final OaF sealing and integration remain blocked on accepted native-`amd64`
+calibration evidence
 
 **Issue:** [HPA-320](https://linear.app/cwchanap/issue/HPA-320/validate-and-freeze-the-existing-oaf-drums-transcription-backend)
 
@@ -38,14 +39,19 @@ until an explicit parity suite proves otherwise.
 
 The freeze is intentionally staged:
 
-1. Before sealing, the checked-in acquisition, base-system, calibration-measurement,
-   and seal-profile request records are the only authorities for intended inputs.
-2. Producer commands emit immutable evidence, but measurement output is diagnostic
-   and cannot choose or publish sealed values.
+1. Before sealing, the checked-in acquisition, base-system,
+   calibration-bootstrap, calibration-measurement, and seal-profile request records
+   are the only authorities for intended inputs.
+2. Producer commands emit immutable acquisition, base-system, bootstrap, and
+   measurement evidence, but measurement output is diagnostic and cannot choose or
+   publish sealed values.
 3. Review makes one explicit seal-profile request authoritative by binding every
-   accepted value to the exact measurement and evidence hashes it reviewed.
-4. Backend and runtime locks are published last and reference the accepted requests,
-   evidence, profile, image, checkpoint, and smoke-oracle identities.
+   accepted value to the exact request, measurement, and evidence hashes it reviewed.
+4. Calibration generates and validates one complete candidate without publishing
+   final locks or changing the registry.
+5. Seal dependencies, runtime lock, and backend lock are published in that acyclic
+   order and reference the accepted requests, evidence, profile, image, checkpoint,
+   and smoke-oracle identities.
 
 Code defaults, sentinel values, mutable reports, guessed resource numbers, and prose
 such as `auto` or `unlimited` are never sealed-value authorities.
@@ -304,12 +310,24 @@ exact PyPI release, including filename, package type, Python/tag identity, yanke
 state, immutable URL, byte length, and SHA-256. Online generation re-fetches and
 exact-compares the complete release; offline verification independently counts
 target-compatible wheel tags and derives every `required_by` edge from direct pins
-and selected wheel metadata. Two fresh builds must reproduce the wheel byte-for-byte, and Task 8 must
+and selected wheel metadata. Two fresh builds must reproduce the wheel byte-for-byte,
+and Task 8 must
 repeat that build on native `linux/amd64`; a version match is not a substitute for
 reproducing the locked wheel hash. Requirement markers use a complete frozen
 CPython-3.7.17/Linux/x86_64 environment independent of the resolver host;
 `platform_release` and `platform_version` are not frozen and therefore make a
 dependency invalid rather than inheriting host values.
+
+The exceptional-wheel validator reports the reproducibility hazards independently
+of the final whole-wheel hash. Each build uses the exact allowlisted sdist, pinned
+base manifest, CPython and build-tool wheels, a network-disabled container, a stable
+absolute source root, a fresh empty output directory, and the sdist's recorded
+`SOURCE_DATE_EPOCH`. It rejects `.pyc` members, absolute build-root bytes in any
+uncompressed member, noncanonical or duplicate paths, and native or executable
+members. It exact-compares the ordered ZIP member metadata, including member name,
+timestamp, compression method, external attributes, CRC, and sizes, and validates
+the ordered `RECORD` rows and their complete hashes before accepting the two
+byte-identical outputs.
 
 Checked locks are materialized into ignored wheelhouses by a deterministic command
 which verifies every filename, byte length, and hash, rejects extras and symlinks,
@@ -325,7 +343,8 @@ runtime/oaf_tf1/base-system-package-request.json
 
 uses schema `crux.oaf-base-system-package-request/v1` and records the exact base image
 manifest, `linux/amd64`, the fixed archive-keyring path, required Python/TensorFlow
-and smoke probes, and exactly `additional_packages: []`. On the accepted native host,
+and smoke probes, and exactly `additional_system_packages: []`. On the accepted
+native host,
 `seal_oaf_backend.py attest-base-system` runs the pinned base and provisional images,
 records the complete sorted
 `Package<TAB>Version<TAB>Architecture` `dpkg` inventory, its SHA-256, the base
@@ -340,18 +359,86 @@ supply-chain path without changing the runtime and is forbidden for this seal. T
 final Dockerfile has no snapshot-fetch or local-`.deb` installation stage. If a
 native smoke run proves that another package is required, Task 8 stops for design
 review; the producer cannot add it opportunistically. Any nonempty
-`additional_packages` request requires a new backend identity, an explicit
+`additional_system_packages` request requires a new backend identity, an explicit
 authenticated package-acquisition design, and a new seal.
 
-The built image is referenced by its `linux/amd64` OCI manifest digest, never by a
-mutable tag.
+The built image is identified by its `linux/amd64` OCI manifest digest, never by a
+mutable tag. The preserved OCI layout also authenticates the selected manifest's
+config digest and ordered layer digests. After importing that layout into the local
+Docker content store, the host launches the image by the authenticated config digest,
+which is Docker's local immutable image locator. Before every launch, the host
+re-inspects that config digest and exact-compares it with the config selected by the
+sealed manifest. The manifest digest remains the descriptor and runtime-lock identity;
+the config digest is a separately recorded launch locator and is never substituted
+for the manifest identity.
+
+The calibration-bootstrap request is also the sole image-build recipe authority. Its
+strict `image_build` object supplies an immutable Dockerfile frontend reference,
+immutable BuildKit worker-image reference, exact Buildx and BuildKit versions, and
+all exporter controls. Mutable frontend or worker tags, version ranges, a bundled
+unspecified frontend, and host-default exporter behavior are invalid. The Dockerfile
+starts with the exact request-authorized `# syntax=<name>@sha256:<digest>` directive;
+that directive, the manual native bootstrap workflow source, and the canonical OCI
+packer are covered by the runner source manifest.
+
+The repository root is never passed to BuildKit as its local context. A checked-in,
+request-hashed `crux.oaf-build-context-manifest/v1` record enumerates every regular
+file admitted to the build by repository-relative path, exact byte length, and
+SHA-256. Its source-manifest-covered materializer creates a fresh context containing
+exactly those files plus the manifest itself, writes every directory as mode `0755`
+and every file as mode `0644`, sets every staged mtime to epoch zero, and rejects
+symlinks, hard links, special files, missing files, extra files, and byte drift. The
+staged context contains no
+`.dockerignore` or Dockerfile-specific ignore file, so repository ignore rules and
+unlisted checkout files cannot affect transmitted bytes. Buildx runs with that fresh
+directory as its working directory and `.` as its context. The manifest itself is
+excluded from its own file array to avoid a content cycle; the bootstrap request
+authenticates its exact bytes separately through
+`build_context_manifest_sha256`.
+
+The request fixes image `source_date_epoch: 0`. BuildKit receives that value through
+`SOURCE_DATE_EPOCH`, enables deterministic multi-platform output and
+`rewrite_timestamp`, exports one `linux/amd64` OCI-layout directory with OCI media
+types and gzip compression at level `6`. `force_compression` is disabled so the
+exporter does not gratuitously recompress already-compressed base layers. It emits no
+provenance, SBOM, inline cache, or operator-supplied annotations. The deterministic
+`org.opencontainers.image.created` index annotation, selected image config's
+top-level `created` value, and every newly generated history `created` value encode
+`1970-01-01T00:00:00Z`. The pinned base manifest is the sole source-policy authority;
+before either build, the producer authenticates its raw manifest and config bytes and
+derives their ordered layer digests and DiffIDs. BuildKit v0.31.2 deliberately leaves
+an unchanged inherited base-layer prefix untouched when those DiffIDs match. The
+output must therefore begin with the exact pinned base layer-digest and DiffID
+prefix; those inherited blobs retain their original member timestamps and are exempt
+from epoch normalization. Every layer after that exact prefix is generated or
+rewritten by the frozen recipe and every one of its tar members must use epoch zero.
+An inherited-prefix mismatch, unexpected rewrite, non-epoch generated member, or
+compressed/uncompressed digest mismatch fails both builds.
+
+BuildKit does not produce the preserved archive directly. It exports a directory,
+which the source-manifest-covered packer validates and serializes as an uncompressed
+POSIX ustar archive containing only regular files in UTF-8 byte-sorted path order.
+Every header uses mode `0644`, UID/GID `0`, empty owner/group names, and mtime `0`;
+there are no PAX headers or explicit directory members, and the archive ends with
+exactly two zero blocks. The inspector strict-parses each OCI JSON document from its
+original bytes with duplicate-key, type, descriptor-size, and descriptor-digest
+checks, but it never requires Crux canonical-JSON formatting and never reserializes
+OCI JSON. Every identity hashes the exact BuildKit-emitted bytes. The packer hashes
+the exact archive bytes and independently hashes every OCI JSON document and blob
+before import. Two fresh native builds must produce identical index, manifest,
+config, compressed layers, uncompressed layer DiffIDs, canonical archive, and
+archive SHA-256. A mismatch fails before calibration or sealing.
 
 The runtime lock records:
 
-- base image name, platform manifest digest, and Python version;
+- base image name, platform manifest/config digests, ordered inherited layer digests
+  and DiffIDs, and Python version;
 - every Python distribution name, version, filename, and SHA-256;
 - the Python distribution-build-manifest SHA-256, including any exceptional sdist,
   pinned build toolchain, recipe/environment, and reproduced wheel identity;
+- the exact build-context-manifest SHA-256 and its normalized file/directory modes;
+- the calibration-bootstrap request and evidence SHA-256 values and their exact
+  `image_build` object;
 - the base-system-package-request and evidence SHA-256 values;
 - the base-image archive-keyring SHA-256;
 - the complete sorted base-image `Package<TAB>Version<TAB>Architecture` inventory and
@@ -363,13 +450,20 @@ The runtime lock records:
 - exact standard-error drain ring-buffer, read-chunk, and logical-line byte bounds;
 - the exact maximum physical standard-output protocol-line byte length;
 - TensorFlow build and ABI information reported at startup; and
-- the final runner image manifest digest.
+- the final runner image manifest digest and authenticated config digest.
 
 The runtime-lock and seal-evidence schemas remove the unused
 `debian_snapshot_repository`, `debian_release_sha256`, and legacy package-distribution
 records. They add exact
 `base_system_package_request_sha256`,
 `base_system_package_evidence_sha256`,
+`calibration_bootstrap_request_sha256`,
+`calibration_bootstrap_evidence_sha256`,
+`build_context_manifest_sha256`,
+`base_image_config_digest`,
+`base_image_layer_digests`,
+`base_image_layer_diff_ids`,
+`image_build`,
 `base_system_package_inventory`,
 `base_system_package_inventory_sha256`, and
 `additional_system_packages` fields. Each inventory row has exactly `name`,
@@ -380,8 +474,10 @@ The backend lock adds
 those hashes and exact-compares the three final checkpoint components with the
 four-member request/evidence pair.
 
-The image build context excludes the final runtime lock, avoiding a self-referential
-image digest. The lock can therefore attest to the image it describes.
+The exact build-context manifest excludes the final runtime lock, and the manifest
+excludes its own bytes, avoiding both image-digest and manifest cycles. The bootstrap
+request separately hashes that manifest, so the final lock can attest to the image
+and exact staged context it describes.
 
 The container entrypoint uses `/usr/bin/env -i` to discard every OCI- or
 Docker-injected variable, including `PATH`, `HOSTNAME`, and `HOME`, then supplies a
@@ -488,11 +584,23 @@ Every runner launch uses:
 - locked CPU, memory, and PID limits; and
 - the numeric non-root UID/GID proven by the native seal pass.
 
-If the provisional image cannot pass the complete native smoke and coverage suite
-under the proposed non-root UID/GID, sealing stops for design review; it does not
-silently run as root. Exact tmpfs sizes, resource limits, UID/GID, startup deadline,
-request deadline, `max_input_audio_frames`, base-system-package evidence, and the
-empty additional-system-package set are seal-required values with no code defaults.
+Official runner launches use the image's default production entrypoint and mount the
+final backend lock, runtime lock, and seal evidence read-only. Calibration launches
+override the entrypoint with the separately source-addressed calibration entrypoint
+and mount only the calibration-bootstrap request, acquisition/base-system evidence,
+source manifests, model cache, and canonical inputs. The production entrypoint
+rejects calibration inputs; the calibration entrypoint rejects final locks and
+ordinary transcription requests. There is no shared mode flag.
+
+The calibration-bootstrap request chooses numeric UID/GID `65532:65532` before the
+image is built. Native base-system attestation must prove that neither identifier is
+already assigned in the pinned base image. The reviewed seal profile repeats those
+same identifiers exactly; it cannot choose replacements after measurement. If the
+provisional image cannot pass calibration, smoke, and coverage under those
+identifiers, sealing stops for design review and never runs as root. Exact tmpfs
+sizes, resource limits, UID/GID, startup deadline, request deadline,
+`max_input_audio_frames`, base-system-package evidence, and the empty
+additional-system-package set are seal-required values with no code defaults.
 
 ### Native-amd64 calibration and sealing prerequisite
 
@@ -511,98 +619,320 @@ and evidence hashes, base-system request/evidence and exact package-inventory ha
 wheel filenames and hashes, distribution-build-manifest and exceptional
 sdist/toolchain/reproduction evidence, numeric UID/GID, tmpfs sizes,
 CPU/memory/PID limits, standard-error drain bounds, the standard-output protocol-line
-bound, startup and request deadlines, the proposed positive integer
-`max_input_audio_frames`, measurements at that exact bound, tensor inventories, smoke
-generation inputs and outputs, the security scan/advisory snapshot, the preserved
-OCI-layout archive and manifest/config/layer hashes, and hashes of every reviewed
-evidence artifact. Missing values, sentinel values, and prose such as `auto` or
-`unlimited` are invalid.
+bound, startup and request deadlines, exactly
+`max_input_audio_frames: 26214378`, measurements at that exact bound, tensor
+inventories, smoke generation inputs and outputs, the security scan/advisory
+snapshot, the exact build-context-manifest hash, pinned base config and ordered
+layer/DiffID prefix, the preserved OCI-layout archive and raw
+manifest/config/layer hashes, the candidate host-attestation-bundle hash, and hashes
+of every reviewed evidence artifact. Missing values, sentinel values, and prose such
+as `auto` or `unlimited` are invalid.
 
-The existing `.github/hpa320-native-evidence/` material is explicitly scratch
-evidence from before this fingerprint and request/evidence contract. It is not a
-candidate final seal artifact and must not be merged into final authority merely by
-copying it. The final native job and its producer regenerate authenticated host
-evidence with the exact schema above; until then the status remains blocked.
+Pre-contract material formerly stored under `.github/hpa320-native-evidence/` is
+scratch evidence and cannot become final authority by copying it. A post-contract
+host-observation record proves only the host-attestation path described below. The
+final native job and its producer must still regenerate authenticated host evidence
+at the exact calibration commit.
 
 Like the smoke oracle, seal evidence excludes final backend-lock and runtime-lock
 hashes so the final locks can reference its SHA-256 without a content cycle.
 
-This pass is a disposable design/calibration spike, not production implementation:
-only reviewed evidence, the oracle, and sealed values may flow into the final OaF
-locks and inference-relevant runner implementation.
+The accepted host-observation material under
+`.github/hpa320-native-evidence/job-90511044879/` proves that the authenticated
+GitHub-hosted Linux X64 producer path exists. Its native-host-evidence payload
+SHA-256 is
+`f0631c1d7be27b40fecbabae50b39c056564c4c3db8cf2f80c50e23b3f779c8d`.
+It is bootstrap evidence only, not seal evidence. The final calibration job must
+regenerate native-host evidence at the exact calibration commit; neither this record
+nor any earlier scratch job may be copied into final seal authority.
 
-Task 8 has four checked-in request authorities and two calibration stages,
-`measure` and `calibrate`:
+Every newly accepted bootstrap, measurement, and candidate execution preserves its
+own `crux.oaf-native-host-attestation-bundle/v1`. A bundle contains the exact raw
+GitHub job API response encoded as canonical lowercase hexadecimal, the canonical
+host observation, the canonical `native_host_evidence` record, and a canonical
+manifest that hashes those three files. Validation decodes the API record, reproduces
+the nested `api_record_sha256`, and proves that the observation, completed API job,
+workflow commit, phase-specific checked-in workflow reference, job ID, run URL,
+runner labels, and numeric fingerprint agree. Relabeling another phase's three files
+therefore fails even if the manifest's `phase` string is changed. The bootstrap,
+measurement, or seal evidence produced by that execution records the bundle-manifest
+SHA-256. Workflow artifacts alone are not durable authority: the accepted bundles
+are checked in with their owning evidence, and the candidate bundle is published by
+`seal` in the final seal commit.
+
+These three HPA-320 seal-production workflows deliberately use the GitHub-hosted
+evidence form, so their bundle schema can preserve and revalidate the raw GitHub job
+record. The orchestrator-signed and approved-native-host forms remain valid for
+post-seal official verification and prediction under the general execution contract,
+but they cannot replace the accepted bootstrap, measurement, or candidate bundle for
+this seal.
+
+Task 8 has five checked-in request authorities and the following acyclic production
+chain:
 
 1. The checkpoint-acquisition request freezes the released archive and four-member
    layout independently of the not-yet-published backend lock.
 2. The base-system-package request freezes the base manifest, native probes, and
    empty additional-package set independently of the not-yet-published runtime lock.
-3. A `crux.oaf-calibration-measurement-request/v1` record freezes the canonical
-   fixture set, a nonempty strictly increasing list of positive frame counts,
-   repetition count, required metrics, container restrictions, and exact output
-   schemas. `seal_oaf_backend.py measure` may emit diagnostic measurements only.
-4. After human review, a `crux.oaf-seal-profile-request/v1` record references the
-   measurement request and evidence hashes and supplies every proposed numeric
-   UID/GID, CPU/memory/PID/tmpfs bound, startup/request deadline, standard-output and
+3. A `crux.oaf-calibration-bootstrap-request/v1` record freezes the provisional
+   image inputs, exact build-context manifest, calibration entrypoint, non-root
+   identity, process environment, container restrictions, diagnostic resource
+   ceilings, and metric sampling interval. `bootstrap-image` publishes an
+   authenticated OCI layout and `crux.oaf-calibration-bootstrap-evidence/v1`; it
+   publishes no final lock.
+4. A `crux.oaf-calibration-measurement-request/v1` record freezes the deterministic
+   fixture derivation, every exact frame count and derived WAV hash, repetition
+   count, required metrics, and output schemas. `measure` publishes diagnostic
+   measurement evidence only.
+5. After human review, a `crux.oaf-seal-profile-request/v1` record references every
+   preceding request/evidence hash, repeats the approved UID/GID, and supplies every
+   final CPU/memory/PID/tmpfs bound, startup/request deadline, standard-output and
    standard-error bound, and `max_input_audio_frames`. No field has a code default.
-5. `seal_oaf_backend.py calibrate` exact-compares those request/evidence links, reruns
-   bound-minus-one, exact-bound, and over-bound inputs, performs two requests in one
-   process and one in a fresh process, and only then may publish a complete
-   `crux.oaf-seal-candidate/v1` directory.
+6. `calibrate` exact-compares the complete authority chain, reruns boundary and
+   process-identity probes, generates all candidate evidence, validates it in
+   memory, and immutably publishes a complete `crux.oaf-seal-candidate/v1`
+   directory. It consumes no externally assembled candidate input.
+7. After human review, `seal` strict-loads that candidate and publishes its exact
+   repository-relative artifact allowlist in dependency order. It cannot regenerate,
+   reinterpret, or replace candidate bytes.
 
-The measurement evidence is diagnostic and cannot be consumed by `seal`, inference,
-or a scorer. The profile request's chosen frame bound must be one measured frame
-count. Each proposed resource limit and deadline must be strictly greater than the
-corresponding observed in-bound peak, and the request records the exact reviewed
-headroom rather than applying a hidden percentage. An over-bound input must be
-rejected before inference; it is not an allowed process or allocator failure.
+### Calibration-bootstrap authority
 
-Every measurement row records the input frame count, repetition and process-instance
-IDs, peak CPU millicores, peak RSS bytes, peak `/tmp` and `/dev/shm` bytes, peak PID
-count, startup and request milliseconds, maximum physical standard-output and
-logical standard-error line bytes, exit/signal/OOM state, and prediction SHA-256.
-Rows are sorted by frame count, process instance, and repetition. The profile gate
-requires `cpu_limit_millis` to exceed `peak_cpu_millis` and applies the same
-strictly-greater rule to memory, PID, tmpfs, and deadline measurements after exact
-unit conversion.
+The calibration-bootstrap request fixes these diagnostic ceilings:
+
+| Field | Exact value |
+| --- | ---: |
+| `runtime_uid` | `65532` |
+| `runtime_gid` | `65532` |
+| `cpu_limit_millis` | `2000` |
+| `memory_limit_bytes` | `4294967296` |
+| `pid_limit` | `256` |
+| `tmp_bytes` | `1073741824` |
+| `shm_bytes` | `1073741824` |
+| `startup_deadline_seconds` | `300` |
+| `request_deadline_seconds` | `1800` |
+| `stdout_max_line_bytes` | `134217728` |
+| `stderr_read_chunk_bytes` | `65536` |
+| `stderr_max_line_bytes` | `65536` |
+| `stderr_ring_buffer_bytes` | `1048576` |
+| `monitor_interval_millis` | `10` |
+
+These are safety ceilings for diagnostic execution, not automatically selected
+final values. Reaching a ceiling, deadline, OOM state, signal, output bound, or
+monitor failure is an operational failure. The producer publishes no partial
+measurement and never raises a value automatically. A different ceiling requires a
+reviewed request revision and a new bootstrap-evidence hash.
+
+The provisional image contains two source-manifest-covered entrypoints. The default
+production entrypoint accepts only final locks and
+`crux.transcription-runner/v1`. The explicitly overridden calibration entrypoint
+accepts only the bootstrap request/evidence chain and
+`crux.oaf-calibration-runner/v1`. Before importing TensorFlow, it authenticates the
+bootstrap request, checkpoint request/evidence and cache, base-system
+request/evidence, runner/upstream source manifests, image config digest, and exact
+process environment. It rejects final locks and ordinary transcription requests.
+The production entrypoint rejects every calibration mount or request. Neither
+entrypoint has a mode switch.
+
+`bootstrap-image` materializes two fresh copies of the exact request-authenticated
+build context and performs one `linux/amd64` build from each. Before building, it
+authenticates the pinned base manifest/config bytes and derives their ordered
+inherited layer digest/DiffID prefix. It canonical-packs both OCI-layout directories
+and exact-compares their raw index, selected manifest, config, layers, DiffIDs, and
+archive bytes. It also proves that both outputs begin with the exact inherited base
+prefix and that every member in every later layer has epoch-zero mtime. It publishes
+one authenticated archive and evidence only after those comparisons, then imports
+the archive into Docker. Calibration launches use the imported config digest as the
+immutable local locator. Bootstrap evidence records the build-context hash, base
+config and layer-prefix identities, final config digest, and owning manifest, layers,
+and DiffIDs; a mutable tag is invalid.
+
+### Exact diagnostic fixture matrix
+
+The sole seed is
+`tests/fixtures/oaf_tf1_smoke/canonical.wav`, SHA-256
+`8ec2aed65945b7002e17b51818495ca754a519c39940f739cdcd1403eb661673`.
+Fixture derivation copies its 44-byte canonical PCM header, repeats the signed
+16-bit mono PCM sample bytes cyclically, truncates them to exactly
+`audio_frame_count * 2` bytes, and rewrites only the RIFF and data byte-length
+fields. The input-view ID includes the derivation-schema ID and frame count.
+Implementations must regenerate and exact-compare these rows before inference:
+
+| Frames | Duration | WAV bytes | SHA-256 |
+| ---: | ---: | ---: | --- |
+| `44100` | 1 second | `88244` | `8ec2aed65945b7002e17b51818495ca754a519c39940f739cdcd1403eb661673` |
+| `441000` | 10 seconds | `882044` | `17a326ecfd1789bf2757dd82646326ffaaff9781574fe41077e804ab8cbb555b` |
+| `2646000` | 1 minute | `5292044` | `a230a22dc261c19577ec2b8854e59bef4794b9a86c2802180b515cb10b88d5cb` |
+| `13230000` | 5 minutes | `26460044` | `8d5061666f280264699633d3368ba800ae4ac7280c2411d3ec36d12938fee0d5` |
+| `26214378` | 50 MiB maximum | `52428800` | `0edebae8b719b0ac6778c588572a795d400a0b2730b4ce6ef33e240766c2b94d` |
+
+The repetition count is exactly `3`. Each of the 15 measurement rows uses a fresh
+container and therefore a unique Docker container ID as `process_instance_id`.
+Rows are sorted by frame count, process ID, and repetition. Every measurement request
+sets protocol field `max_input_audio_frames` to the matrix maximum, exactly
+`26214378`; the smaller fixtures do not redefine the bound.
+
+The native monitor requires cgroup v2. It samples `cpu.stat` at the locked 10 ms
+interval. For each adjacent sample it computes
+`ceil(1000 * delta_usage_usec / delta_elapsed_usec)` from `cpu.stat` and
+`time.monotonic_ns()` and records the largest result as `peak_cpu_millis`. It records
+cgroup `memory.peak` as the historically named `peak_rss_bytes` field and
+`pids.peak` as `peak_pid_count`; a missing required cgroup file fails measurement. A
+calibration-only monitor thread samples allocated bytes beneath `/tmp` and
+`/dev/shm` at the same interval; its overhead is intentionally included. Host
+readers record the maximum physical standard-output and logical standard-error line
+lengths. Startup and request durations use `time.monotonic_ns()` and round upward to
+whole milliseconds. Docker inspection supplies exit code, signal, and OOM state.
+The runner supplies the canonical prediction SHA-256 and inference-call counters.
+
+Every healthy in-bound measurement performs exactly one inference call. Each row
+records input audio identity, frame count, repetition, process ID, inference-call
+counters, peak CPU/RSS/tmpfs/PID values, startup/request duration, output bounds,
+exit/signal/OOM state, and prediction SHA-256. The profile gate requires each final
+limit to be strictly greater than the corresponding observed in-bound peak after
+exact unit conversion and no greater than its bootstrap ceiling.
+
+### Calibration, candidate publication, and seal
+
+The measurement evidence is diagnostic and cannot by itself be consumed by `seal`,
+inference, or a scorer. Only a separately reviewed profile and complete calibrated
+candidate can authorize publication. The profile request fixes
+`max_input_audio_frames: 26214378`, exactly the measured 50 MiB fixture, and repeats
+`runtime_uid: 65532` and `runtime_gid: 65532`. It records explicit reviewed headroom;
+no percentage, rounding rule, or code default selects a final limit.
+
+`calibrate` first validates the complete request/evidence/image chain and all 15
+measurement rows. It then performs these four probes:
+
+1. `26214377` frames in a persistent process;
+2. `26214378` frames in that same process;
+3. `26214379` frames in that same process; and
+4. `26214378` frames in a fresh process.
+
+The first, second, and fourth probes must each increment the authenticated
+inference-call counter by exactly one and succeed. The third must return a typed
+over-bound result before inference, leave the counter unchanged, keep the persistent
+process healthy, and have no prediction SHA-256. OOM, signal, allocator failure,
+process restart, or post-inference rejection is not boundary proof.
+
+After those probes, `calibrate` generates exact 130/78/52 tensor coverage,
+uninitialized-variable evidence, active-dropout evidence, patched/unmodified
+`NoteSequence` parity, the nonempty raw smoke oracle and calibration-native event
+payload, security/advisory evidence, OCI archive/manifest/config/layer evidence,
+candidate runtime/backend/seal payloads, and a manifest of every candidate artifact.
+It validates the complete directory and absence of final-lock hash cycles in memory,
+then publishes the directory by no-replace atomic rename. The calibration-native
+event payload excludes final-lock and descriptor fields and cannot be published as
+an official prediction. The calibration entrypoint cannot publish official
+predictions, locks, or a registry change.
+
+`seal` consumes only that complete candidate. It publishes immutable evidence,
+oracle, source/OCI manifests, and other dependencies first, the runtime lock second,
+and the backend lock last. Existing different bytes are integrity failure and are
+never overwritten. The registry remains `preseal` until the exact sealed image and
+locks pass the real-checkpoint test and five-call production verification.
 
 The bootstrap sequence is:
 
-1. Strict-load the checkpoint-acquisition request, acquire or import the exact
-   four-member archive, publish only the three authenticated inference components,
-   and preserve immutable acquisition evidence.
-2. Build a provisional image from the pinned source, base manifest, Python
-   distributions, and runner manifests without either final lock in the image.
-   Resolve the mutable base tag only to inspect it, prove that its `linux/amd64`
-   manifest is the pinned
-   `sha256:ea8897698c0955ba96144bd2b7310ef7884ccce4db7a1f97ffc21fb8b89d1673`,
-   and build `FROM` that digest. A registry mirror is acceptable only when it supplies
-   the same manifest and layer bytes.
-3. On native `linux/amd64`, attest the exact base package inventory and empty
-   additional-package set, reproduce the locked Python wheels, and run the required
-   Python, TensorFlow, and smoke probes.
-4. Run the measurement request, review its exact evidence, check in the explicit
-   seal-profile request, then run calibration. Construct the exact prediction graph,
-   generate the tensor coverage report, test the complete resource/input profile,
-   and generate the smoke oracle without final-lock hashes.
-5. Review the acquisition, base-system, coverage, oracle, deterministic artifact,
-   resource, and seal-evidence records. Final OaF lock publication remains blocked
-   until this review accepts every exact value.
-6. Seal the backend and runtime locks, referencing the reviewed evidence hash and the
-   already-built image manifest digest.
-7. Mount the final locks into that image and rerun the complete native verification
-   flow: one startup raw-oracle check in each of two processes, then two post-ready
-   artifact requests in the persistent process and one in the fresh process.
+1. Regenerate native-host evidence at the exact manual-bootstrap commit.
+2. Acquire the exact checkpoint and publish acquisition evidence.
+3. Build and authenticate the provisional OCI image from the bootstrap request.
+4. Attest the base/provisional package identity and native probes.
+5. Review and commit the acquisition, bootstrap, and base-system evidence.
+6. Commit a separate measurement request that binds the accepted bootstrap
+   request/evidence hashes; the later measurement evidence binds the accepted
+   checkpoint-acquisition and base-system evidence it consumed.
+7. Regenerate native-host evidence at the exact measurement-request commit, generate
+   the five exact fixtures, and publish all 15 measurements.
+8. Review and commit the measurement evidence, then separately commit the
+   seal-profile request.
+9. Regenerate native-host evidence at that exact profile/calibration commit, run
+   calibration, and review the complete candidate.
+10. Seal dependencies, runtime lock, and backend lock in acyclic order.
+11. Mount the final locks into the unchanged image and run exactly five production
+   inference calls: one startup raw-oracle check in each of two processes, two
+   post-ready artifact requests in the persistent process, and one in the fresh
+   process.
 
-The native producer commands are explicit:
+After the manual bootstrap run is reviewed, its exact accepted evidence bytes are
+checked in together at:
+
+```text
+docs/superpowers/evidence/hpa-320/native/checkpoint-acquisition-evidence.json
+docs/superpowers/evidence/hpa-320/native/base-system-package-evidence.json
+docs/superpowers/evidence/hpa-320/native/calibration-bootstrap-evidence.json
+docs/superpowers/evidence/hpa-320/native/bootstrap-host-attestation/attestation-bundle.json
+docs/superpowers/evidence/hpa-320/native/bootstrap-host-attestation/github-job-api-record.json.hex
+docs/superpowers/evidence/hpa-320/native/bootstrap-host-attestation/native-host-evidence.json
+docs/superpowers/evidence/hpa-320/native/bootstrap-host-attestation/native-host-observation.json
+```
+
+Only then can the checked-in calibration-measurement request bind the accepted
+bootstrap request/evidence identity. The later measurement evidence also binds the
+accepted checkpoint-acquisition and base-system evidence it consumed. After the
+separate manual measurement run is reviewed, its exact accepted evidence bytes are
+checked in at:
+
+```text
+docs/superpowers/evidence/hpa-320/native/calibration-measurement-evidence.json
+docs/superpowers/evidence/hpa-320/native/measurement-host-attestation/attestation-bundle.json
+docs/superpowers/evidence/hpa-320/native/measurement-host-attestation/github-job-api-record.json.hex
+docs/superpowers/evidence/hpa-320/native/measurement-host-attestation/native-host-evidence.json
+docs/superpowers/evidence/hpa-320/native/measurement-host-attestation/native-host-observation.json
+```
+
+The candidate host-attestation bundle is reviewed with the candidate and published
+by `seal` to:
+
+```text
+docs/superpowers/evidence/hpa-320/native/candidate-host-attestation/attestation-bundle.json
+docs/superpowers/evidence/hpa-320/native/candidate-host-attestation/github-job-api-record.json.hex
+docs/superpowers/evidence/hpa-320/native/candidate-host-attestation/native-host-evidence.json
+docs/superpowers/evidence/hpa-320/native/candidate-host-attestation/native-host-observation.json
+```
+
+It cannot be substituted by bootstrap or measurement evidence. The candidate's
+artifact allowlist contains all four files, and its
+`native_host_attestation_bundle_sha256` exact-matches both the bundle manifest and the
+seal-evidence field. The staging files and checked-in files must be byte-identical.
+The OCI archive named by bootstrap evidence is too large for the source tree; the
+workflow preserves and uploads it by the exact `oci_layout_archive` identity, and
+every later candidate or integration run either downloads those exact bytes or
+rebuilds and exact-compares the same manifest/config/layer identities.
+
+The host evidence nested in bootstrap evidence identifies the manual-bootstrap
+commit and job. The host evidence nested in measurement evidence identifies the
+later measurement-request commit and job. Each producer receives both
+`--host-attestation-bundle` and the bundle-named `--host-evidence`, and rejects any
+byte or identity mismatch. The candidate-phase pair supplied to `calibrate`
+identifies the exact profile/candidate commit and job, becomes the seal evidence's
+`native_host_evidence` and reference numeric fingerprint, and must itself be an
+accepted native form. Each record's matching durable bundle-manifest hash is part of
+its owning bootstrap, measurement, or seal evidence. The job IDs need not match. The
+producer instead exact-compares the immutable request, evidence, image, checkpoint,
+source, and profile hashes and reruns the final-profile probes on the candidate host.
+
+The native producer commands are:
 
 ```bash
 uv run python -m tools.hpa320.seal_oaf_backend \
+  bootstrap-image \
+  --request \
+    config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.calibration-bootstrap-request.json \
+  --host-attestation-bundle /workspace/hpa320/attestation-bundle.json \
+  --host-evidence /workspace/hpa320/native-host-evidence.json \
+  --output artifacts/benchmark/backends/hpa320-bootstrap/calibration-image \
+  --repository-root .
+
+uv run python -m tools.hpa320.seal_oaf_backend \
   attest-base-system \
   --request runtime/oaf_tf1/base-system-package-request.json \
+  --bootstrap-request \
+    config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.calibration-bootstrap-request.json \
+  --bootstrap-evidence \
+    artifacts/benchmark/backends/hpa320-bootstrap/calibration-image/calibration-bootstrap-evidence.json \
+  --host-attestation-bundle /workspace/hpa320/attestation-bundle.json \
   --host-evidence /workspace/hpa320/native-host-evidence.json \
-  --image crux-oaf-tf1:hpa320-seal \
   --output \
     artifacts/benchmark/backends/hpa320-bootstrap/base-system-package-evidence.json
 
@@ -610,8 +940,12 @@ uv run python -m tools.hpa320.seal_oaf_backend \
   measure \
   --request \
     config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.calibration-measurement-request.json \
+  --bootstrap-request \
+    config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.calibration-bootstrap-request.json \
+  --bootstrap-evidence \
+    artifacts/benchmark/backends/hpa320-bootstrap/calibration-image/calibration-bootstrap-evidence.json \
+  --host-attestation-bundle /workspace/hpa320/attestation-bundle.json \
   --host-evidence /workspace/hpa320/native-host-evidence.json \
-  --image crux-oaf-tf1:hpa320-seal \
   --model-cache artifacts/benchmark/model-cache \
   --checkpoint-evidence \
     artifacts/benchmark/backends/hpa320-bootstrap/checkpoint-acquisition-evidence.json \
@@ -624,15 +958,24 @@ uv run python -m tools.hpa320.seal_oaf_backend \
   --request \
     config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.seal-profile-request.json \
   --measurement-evidence \
-    artifacts/benchmark/backends/hpa320-bootstrap/calibration-measurements.json \
+    docs/superpowers/evidence/hpa-320/native/calibration-measurement-evidence.json \
+  --bootstrap-request \
+    config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.calibration-bootstrap-request.json \
+  --bootstrap-evidence \
+    docs/superpowers/evidence/hpa-320/native/calibration-bootstrap-evidence.json \
+  --host-attestation-bundle /workspace/hpa320/attestation-bundle.json \
   --host-evidence /workspace/hpa320/native-host-evidence.json \
-  --image crux-oaf-tf1:hpa320-seal \
   --model-cache artifacts/benchmark/model-cache \
   --checkpoint-evidence \
-    artifacts/benchmark/backends/hpa320-bootstrap/checkpoint-acquisition-evidence.json \
+    docs/superpowers/evidence/hpa-320/native/checkpoint-acquisition-evidence.json \
   --base-system-evidence \
-    artifacts/benchmark/backends/hpa320-bootstrap/base-system-package-evidence.json \
+    docs/superpowers/evidence/hpa-320/native/base-system-package-evidence.json \
   --output artifacts/benchmark/backends/hpa320-seal-candidate
+
+uv run python -m tools.hpa320.seal_oaf_backend \
+  seal \
+  --candidate artifacts/benchmark/backends/hpa320-seal-candidate \
+  --repository-root .
 ```
 
 Each producer strict-validates every input and request/evidence link before creating
@@ -643,14 +986,25 @@ integrity failure and are never replaced. A failed producer leaves no authoritat
 output. Diagnostics are sanitized and cannot include secrets, environment values,
 absolute operator paths, or unbounded tracebacks.
 
+The candidate `artifacts` array is an exact role/path/hash allowlist. `seal` rejects
+an unknown, missing, duplicate, absolute, escaping, symlinked, or noncanonical path.
+It publishes dependencies first, the runtime lock second, and the backend lock last;
+it never changes the registry. The reviewed final commit may include the registry
+change only after native final verification succeeds against those exact bytes; the
+sealed integration workflow repeats that verification on the commit.
+
 `prepare-backend` and every `seal_oaf_backend` producer use one exit convention:
 
 - exit `0` only after complete immutable success;
 - exit `1` for operational inability, including unavailable acquisition,
-  unsupported or unattested environment, failed probe, failed measurement, or an
-  inability to construct a candidate without contradictory authenticated bytes; and
+  unsupported or unattested environment, unavailable cgroup v2 metrics, diagnostic
+  ceiling or deadline reached, failed probe, unhealthy measurement, insufficient
+  reviewed headroom, or inability to construct a candidate without contradictory
+  authenticated bytes; and
 - exit `2` for integrity, authentication, immutable-publication contradiction, or
-  invalid request/evidence relationships.
+  invalid request/evidence relationships, including a mutable image reference,
+  incomplete measurement matrix, process-identity contradiction, inference-counter
+  contradiction, or failure to reject over-bound input before inference.
 
 After argument parsing succeeds, each command emits exactly one canonical typed
 one-line JSON summary containing `status`, `exit_code`, `report_path`, and
@@ -1064,7 +1418,8 @@ Its canonical JSON contains:
 - native-metadata schema ID and the exact allowed metadata keys, types, and
   nullability;
 - the explicitly disabled inference prediction-map setting;
-- a required positive `max_input_audio_frames` bound with no implicit default;
+- exact `max_input_audio_frames: 26214378`, matching the existing 50 MiB canonical
+  PCM upload domain, with no implicit default;
 - protocol, prediction-artifact, verification-report, execution-report, and
   legacy-score-report schema versions;
 - runtime-lock hash and final image manifest digest;
@@ -1115,7 +1470,7 @@ The v1 runner accepts canonical audio only:
 - exactly `44100` Hz;
 - a positive PCM sample-frame count and nonempty sample bytes;
 - an audio sample-frame count no greater than the backend lock's
-  `max_input_audio_frames`; and
+  `max_input_audio_frames`, which is exactly `26214378` for this backend; and
 - no trailing non-audio chunks that the strict WAV reader does not recognize.
 
 `max_input_audio_frames` is measured only in mono PCM sample frames, equivalent to
@@ -1123,10 +1478,26 @@ the strict reader's `wave.getnframes()` result. It is not a spectrogram-frame co
 The number of spectrogram frames is separately derived by the frozen preprocessing
 pipeline and is never used as this input-bound unit.
 
+At two bytes per mono PCM frame plus the required 44-byte canonical WAV header,
+`26214378` frames produce exactly `52428800` bytes, the existing 50 MiB upload
+ceiling. The resulting duration is approximately 594.43 seconds. A file with
+`26214379` frames is over-bound even if it reaches the backend through a local
+benchmark command rather than the HTTP upload surface.
+
 The bound is conservatively part of backend identity because it changes the accepted
 input domain and resource proof. Raising it therefore creates a new backend identity,
 even though prediction artifacts for identical inputs at or below the old bound
 remain scientifically comparable when all other descriptor fields match.
+
+HPA-321 cannot establish corpus fit because it inventories object metadata and does
+not select or decode benchmark audio. HPA-322 must record the canonical mono PCM
+frame count for every selected benchmark item. Before HPA-326 can declare a corpus
+run eligible, it must exact-compare every selected frame count with this backend
+bound and explicitly enumerate any excluded over-bound items. An over-bound item is
+either excluded under a reviewed corpus policy or requires a separately identified
+backend with a newly sealed input domain; hidden chunking is never permitted.
+HPA-320 sealing is not conditional on that later corpus-fit result because the
+canonical benchmark item set is outside HPA-320.
 
 The host validates the audio sample-frame bound and hashes the exact WAV bytes before
 submitting the item to a runner. It sends both the relative staged path and expected
@@ -1840,11 +2211,23 @@ changed_file:
   path, sha256, status
 probe:
   name, value
+calibration_fixture:
+  audio_frame_count, input_audio_sha256, input_view_id, source_audio_id,
+  source_audio_sha256, wav_byte_length
+calibration_resource_ceiling:
+  cpu_limit_millis, memory_limit_bytes, monitor_interval_millis, pid_limit,
+  request_deadline_seconds, shm_bytes, startup_deadline_seconds,
+  stderr_max_line_bytes, stderr_read_chunk_bytes, stderr_ring_buffer_bytes,
+  stdout_max_line_bytes, tmp_bytes
+calibration_probe:
+  inference_call_count_after, inference_call_count_before, persistent,
+  rejected_before_inference, request_ordinal, row
 measurement_row:
-  exit_code, input_frame_count, oom_killed, peak_cpu_millis, peak_pid_count,
-  peak_rss_bytes, peak_shm_bytes, peak_tmp_bytes, prediction_sha256,
-  process_instance_id, repetition, request_millis, signal,
-  startup_millis, stderr_max_line_bytes, stdout_max_line_bytes
+  exit_code, inference_call_count_after, inference_call_count_before,
+  input_audio_sha256, input_frame_count, oom_killed, peak_cpu_millis,
+  peak_pid_count, peak_rss_bytes, peak_shm_bytes, peak_tmp_bytes,
+  prediction_sha256, process_instance_id, repetition, request_millis,
+  signal, startup_millis, stderr_max_line_bytes, stdout_max_line_bytes
 ```
 
 `native_host_evidence` has exactly `kind`, `official_execution_allowed`, `payload`,
@@ -1931,40 +2314,50 @@ fields, and serialization use the shared shapes above.
 
 ```text
 additional_system_packages, base_image, base_image_archive_keyring_sha256,
+base_image_config_digest, base_image_layer_diff_ids, base_image_layer_digests,
 base_image_manifest_digest, base_system_package_evidence_sha256,
 base_system_package_inventory, base_system_package_inventory_sha256,
-base_system_package_request_sha256, distribution_build_manifest_sha256,
-environment, oci_layout_manifest_sha256, platform, python_distributions,
-python_version, runner_source_manifest_sha256, runtime_image_manifest_digest,
-schema, seal_evidence_sha256, stderr_max_line_bytes,
-stderr_read_chunk_bytes, stderr_ring_buffer_bytes, stdout_max_line_bytes,
-tensorflow_abi, tensorflow_build, upstream_source_manifest_sha256
+base_system_package_request_sha256, build_context_manifest_sha256,
+calibration_bootstrap_evidence_sha256, calibration_bootstrap_request_sha256,
+distribution_build_manifest_sha256, environment, image_build,
+oci_layout_manifest_sha256, platform, python_distributions, python_version,
+runner_source_manifest_sha256, runtime_image_config_digest,
+runtime_image_manifest_digest, schema, seal_evidence_sha256,
+stderr_max_line_bytes, stderr_read_chunk_bytes, stderr_ring_buffer_bytes,
+stdout_max_line_bytes, tensorflow_abi, tensorflow_build,
+upstream_source_manifest_sha256
 ```
 
 `environment` has exactly the seven variable names in the deterministic-runtime
-table. Package and distribution arrays use their shared shapes.
+table. `image_build` is the exact calibration-bootstrap request object described
+below. Package and distribution arrays use their shared shapes.
 
 `crux.backend-seal-evidence/v1`:
 
 ```text
 additional_system_packages, advisory_snapshot_sha256,
-base_image_archive_keyring_sha256, base_image_manifest_digest,
+base_image_archive_keyring_sha256, base_image_config_digest,
+base_image_layer_diff_ids, base_image_layer_digests, base_image_manifest_digest,
 base_system_package_evidence_sha256, base_system_package_inventory,
 base_system_package_inventory_sha256, base_system_package_request_sha256,
-calibration_measurement_evidence_sha256,
+boundary_probes, build_context_manifest_sha256,
+calibration_bootstrap_evidence_sha256,
+calibration_bootstrap_request_sha256, calibration_measurement_evidence_sha256,
 calibration_measurement_request_sha256, checkpoint_acquisition_evidence_sha256,
 checkpoint_acquisition_request_sha256, checkpoint_archive,
 checkpoint_components, checkpoint_inventory, cpu_limit_millis,
 distribution_build_manifest_sha256, host_adapter_source_manifest_sha256,
 instrumentation_patch_sha256, legacy_conversion_coverage_sha256,
 max_input_audio_frames, measurements, memory_limit_bytes,
-native_host_evidence, non_inference_inventory, oci_layout_archive,
+native_host_attestation_bundle_sha256, native_host_evidence,
+non_inference_inventory, oci_layout_archive,
 oci_layout_manifest_sha256, pid_limit, python_distributions,
 reference_host_numeric_fingerprint, request_deadline_seconds,
 required_inference_inventory, runner_source_manifest_sha256, runtime_gid,
-runtime_image_config_digest, runtime_image_layer_digests,
-runtime_image_manifest_digest, runtime_uid, schema, seal_candidate_sha256,
-seal_profile_request_sha256, security_scan_sha256, shm_bytes,
+runtime_image_config_digest, runtime_image_index_digest,
+runtime_image_layer_diff_ids, runtime_image_layer_digests,
+runtime_image_manifest_digest, runtime_uid, schema, seal_profile_request_sha256,
+security_scan_sha256, shm_bytes,
 smoke_audio_sha256, smoke_oracle_sha256, smoke_prediction_sha256,
 startup_deadline_seconds, stderr_max_line_bytes, stderr_read_chunk_bytes,
 stderr_ring_buffer_bytes, stdout_max_line_bytes, tensor_coverage_sha256,
@@ -1972,8 +2365,14 @@ tensorflow_abi, tensorflow_build, tmp_bytes,
 upstream_source_manifest_sha256
 ```
 
-`measurements` contains `measurement_row`; archive, component, inventory,
-distribution, package, host-evidence, and fingerprint values use the shared shapes.
+`measurements` contains `measurement_row`; `boundary_probes` contains
+`calibration_probe`, whose `row` uses `measurement_row`; archive, component,
+inventory, distribution, package, host-evidence, and fingerprint values use the
+shared shapes. The candidate manifest is a review envelope and is deliberately not
+referenced from seal evidence; this keeps the candidate-to-payload graph acyclic.
+`smoke_prediction_sha256` addresses the calibration protocol's canonical native-event
+array described below, not a `crux.drum-prediction-events/v1` artifact containing
+final lock identities.
 
 `crux.heuristic-parameter-lock/v1`:
 
@@ -2025,37 +2424,144 @@ package_inventory_sha256, probes, request_sha256, schema
 ```
 
 `required_probes` is an array of names; `probes` use `probe`; package arrays use
-`system_package`.
+`system_package`. The evidence's `native_host_evidence` bytes must equal the file
+authenticated by the same bootstrap-phase bundle named by calibration-bootstrap
+evidence; base-system attestation cannot introduce a second unaudited host record.
+
+`crux.oaf-calibration-bootstrap-request/v1`:
+
+```text
+backend_id, base_image_manifest_digest, base_system_package_request_sha256,
+build_context_manifest_sha256, checkpoint_acquisition_request_sha256,
+container_restrictions,
+distribution_build_manifest_sha256, environment, image_build,
+instrumentation_patch_sha256, python_coerce_c_locale, resource_ceiling,
+runner_source_manifest_sha256, runtime_gid, runtime_uid, schema,
+upstream_source_manifest_sha256
+```
+
+Its `container_restrictions` has exactly:
+
+```text
+drop_capabilities, network, no_new_privileges, platform, read_only_root
+```
+
+Its `resource_ceiling` uses `calibration_resource_ceiling`. Its `environment` has
+exactly the seven deterministic-runtime variable names, and
+`python_coerce_c_locale` is exactly the bootstrap-only
+`PYTHONCOERCECLOCALE=0` control.
+
+Its `image_build` has exactly:
+
+```text
+annotations, buildkit_image, buildkit_version, buildx_binary_sha256,
+buildx_binary_size, buildx_binary_url, buildx_version, compression,
+compression_level, dockerfile_frontend, dockerfile_frontend_version,
+exporter, exporter_tar, force_compression, inline_cache,
+multi_platform_deterministic, oci_archive, oci_media_types, platform,
+provenance, rewrite_timestamp, sbom, source_date_epoch
+```
+
+The exact toolchain values are:
+
+```text
+buildkit_image:
+  moby/buildkit@sha256:63db51c9b30208a7c2b1c40392c7ebb9ce2f85ba238a18a85420f8f5ea2d4684
+buildkit_version: v0.31.2
+buildx_binary_sha256:
+  d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda
+buildx_binary_size: 65265826
+buildx_binary_url:
+  https://github.com/docker/buildx/releases/download/v0.35.0/buildx-v0.35.0.linux-amd64
+buildx_version: v0.35.0
+dockerfile_frontend:
+  docker/dockerfile-upstream@sha256:3d6d54b33351b396a910d33248754b86b1d7dd838b4eeb9575d8903a209f6516
+dockerfile_frontend_version: 1.25.0
+```
+
+The two image references are exact `linux/amd64` manifest references. Both version
+fields are exact releases, not ranges, and the downloaded Buildx binary must
+exact-match both its byte length and SHA-256 before execution. `annotations` is
+exactly `[]` and means no operator-supplied annotations; `compression` is `gzip`;
+`compression_level` is `6`; `exporter` is `oci`; `exporter_tar` and
+`force_compression` are `false`; `multi_platform_deterministic`,
+`oci_media_types`, and `rewrite_timestamp` are `true`; `inline_cache`,
+`provenance`, and `sbom` are `false`; `platform` is `linux/amd64`; and
+`source_date_epoch` is `0`.
+
+Its `oci_archive` has exactly:
+
+```text
+compression, final_zero_blocks, format, gid, gname, member_mode,
+member_types, mtime, path_order, uid, uname
+```
+
+Those values are exactly `none`, `2`, `posix-ustar`, `0`, `""`, `420`,
+`regular-files-only`, `0`, `utf8-byte`, `0`, and `""`, respectively.
+
+`crux.oaf-calibration-bootstrap-evidence/v1`:
+
+```text
+base_image_config_digest, base_image_layer_diff_ids, base_image_layer_digests,
+build_context_manifest_sha256, calibration_bootstrap_request_sha256,
+image_build, native_host_attestation_bundle_sha256, native_host_evidence,
+oci_layout_archive, oci_layout_manifest_sha256,
+runtime_image_config_digest, runtime_image_index_digest,
+runtime_image_layer_diff_ids, runtime_image_layer_digests,
+runtime_image_manifest_digest, schema
+```
+
+`oci_layout_archive` uses `checkpoint_identity`; `native_host_evidence` uses its
+shared discriminated shape. The evidence `image_build` must exact-match the request
+object after the producer independently observes both tool versions and immutable
+image references. The config digest is the immutable Docker launch locator after
+importing the authenticated OCI archive; the manifest digest remains the sealed
+image identity. Its context and base fields exact-match the request-authenticated
+manifest, independently authenticated base bytes, and OCI-layout manifest. Its
+bundle hash addresses the accepted bootstrap-phase bundle manifest.
 
 `crux.oaf-calibration-measurement-request/v1`:
 
 ```text
-backend_id, container_restrictions, fixtures, frame_counts,
+backend_id, calibration_bootstrap_evidence_sha256,
+calibration_bootstrap_request_sha256, fixture_derivation, fixtures,
 output_schemas, repetition_count, required_metrics, schema
 ```
 
-Each fixture has exactly `input_audio_sha256`, `input_view_id`, `source_audio_id`,
-and `source_audio_sha256`. `container_restrictions` has exactly `drop_capabilities`,
-`network`, `no_new_privileges`, `platform`, and `read_only_root`.
-`required_metrics` and `output_schemas` are arrays of exact string identifiers, not
-open objects.
+`fixture_derivation` has exactly:
+
+```text
+algorithm, canonical_header_bytes, channel_count, sample_rate,
+sample_width_bytes, source_path, source_sha256
+```
+
+Each `fixtures` row uses `calibration_fixture`. The five rows are exactly the frame
+counts, WAV lengths, and hashes in the diagnostic fixture matrix, and
+`repetition_count` is exactly `3`. `required_metrics` and `output_schemas` are
+arrays of exact string identifiers, not open objects.
 
 The corresponding immutable measurement evidence uses schema
 `crux.oaf-calibration-measurement-evidence/v1` and exactly:
 
 ```text
 base_system_package_evidence_sha256,
-checkpoint_acquisition_evidence_sha256, image_manifest_digest,
-measurement_rows, native_host_evidence, request_sha256, schema
+calibration_bootstrap_evidence_sha256,
+checkpoint_acquisition_evidence_sha256, measurement_rows,
+native_host_attestation_bundle_sha256, native_host_evidence, request_sha256,
+runtime_image_config_digest, runtime_image_manifest_digest, schema
 ```
 
-`measurement_rows` contains `measurement_row`.
+`measurement_rows` contains `measurement_row`. The bundle hash addresses the
+accepted measurement-phase bundle manifest; relabeling bootstrap or candidate files
+cannot satisfy its phase-specific workflow-reference checks.
 
 `crux.oaf-seal-profile-request/v1`:
 
 ```text
 base_system_package_evidence_sha256,
 base_system_package_request_sha256,
+calibration_bootstrap_evidence_sha256,
+calibration_bootstrap_request_sha256,
 calibration_measurement_evidence_sha256,
 calibration_measurement_request_sha256,
 checkpoint_acquisition_evidence_sha256,
@@ -2069,12 +2575,61 @@ stderr_ring_buffer_bytes, stdout_max_line_bytes, tmp_bytes
 `crux.oaf-seal-candidate/v1`:
 
 ```text
+artifacts, backend_lock_payload_sha256,
+calibration_bootstrap_evidence_sha256,
 calibration_measurement_evidence_sha256, checkpoint_components,
 checkpoint_prefix, model_artifact_set_sha256,
-required_inference_inventory_sha256, schema, seal_profile_request_sha256
+native_host_attestation_bundle_sha256, required_inference_inventory_sha256,
+runtime_lock_payload_sha256, schema, seal_evidence_payload_sha256,
+seal_profile_request_sha256
 ```
 
+`artifacts` uses `artifact_ref`; `checkpoint_components` uses
+`checkpoint_identity`. The three `*_payload_sha256` fields address candidate bytes
+before immutable publication. No final payload references the candidate manifest
+hash. The candidate bundle hash addresses the candidate-phase bundle manifest, whose
+four files must all appear in `artifacts`.
+
 ### Protocol and prediction schemas
+
+`crux.oaf-calibration-runner/v1` request:
+
+```text
+audio_frame_count, audio_path, audio_sha256, max_input_audio_frames,
+request_id, type
+```
+
+Ready response:
+
+```text
+base_system_package_evidence_sha256,
+calibration_bootstrap_request_sha256,
+checkpoint_acquisition_evidence_sha256, checkpoint_inventory_sha256,
+non_inference_count, non_inference_inventory_sha256, process_instance_id,
+protocol_schema, required_inference_count,
+required_inference_inventory_sha256, restored_inference_count,
+runner_source_manifest_sha256, runtime_image_config_digest, tensorflow_abi,
+tensorflow_build, type, upstream_source_manifest_sha256
+```
+
+Measurement or boundary-probe response:
+
+```text
+audio_sha256, inference_call_count_after, inference_call_count_before,
+native_events, prediction_sha256, rejected_before_inference, request_id, type
+```
+
+The request `type` is exactly `measure` or `calibration_probe`; the response echoes
+that exact type, and the readiness response uses `ready`. An over-bound probe has an
+empty `native_events` array, null `prediction_sha256`,
+`rejected_before_inference: true`, and identical before/after inference counters.
+For an accepted inference, `prediction_sha256` is the SHA-256 of `native_events`
+serialized alone as canonical UTF-8 JSON with lexicographically sorted object keys,
+no insignificant whitespace, and no trailing newline. It is calibration-native
+evidence, contains no final lock or descriptor identity, and is never published as a
+benchmark prediction.
+The calibration entrypoint alone accepts this protocol. The production entrypoint
+rejects it before TensorFlow import.
 
 `crux.transcription-runner/v1` request:
 
@@ -2237,8 +2792,14 @@ crux.oaf-tensor-coverage/v1:
   active_predict_dropout, checkpoint_inventory, non_inference_inventory,
   note_sequence_byte_parity, required_inference_inventory, schema,
   uninitialized_required
+crux.oaf-build-context-manifest/v1:
+  directory_mode, file_mode, files, manifest_path, schema
+crux.oaf-native-host-attestation-bundle/v1:
+  api_record, native_host_evidence, native_host_observation, phase, schema
 crux.oaf-oci-layout-manifest/v1:
-  archive, config_digest, image_manifest_digest, layer_digests, schema
+  archive, base_image_config_digest, base_image_layer_diff_ids,
+  base_image_layer_digests, config_digest, image_manifest_digest,
+  index_digest, layer_diff_ids, layer_digests, schema
 crux.oaf-upstream-source-manifest/v1:
   covered_roots, files, schema, upstream_commit, upstream_repository
 crux.oaf-runner-source-manifest/v1:
@@ -2247,9 +2808,26 @@ crux.oaf-host-adapter-source-manifest/v1:
   covered_roots, files, schema
 ```
 
-The tensor inventories use the shared variable shapes; the OCI `archive` uses
-`checkpoint_identity`; upstream manifest files use `licensed_source_file`; runner and
-host-adapter manifest files use `source_file`.
+The tensor inventories use the shared variable shapes. The build-context manifest
+uses `source_file`; its `directory_mode` and `file_mode` values are the decimal
+integers `493` and `420`, and `manifest_path` is exactly
+`runtime/oaf_tf1/build-context-manifest.json`. Its `files` array is UTF-8 byte-sorted
+and excludes that self-named manifest while enumerating every other context file. The
+bootstrap request separately authenticates the manifest's exact bytes.
+
+The host-attestation bundle's `phase` is exactly one of `bootstrap`, `measurement`, or
+`candidate`. Its other three keys use `checkpoint_identity`; their `name` values are
+exactly `github-job-api-record.json.hex`, `native-host-evidence.json`, and
+`native-host-observation.json`, respectively. The hexadecimal record contains only
+lowercase ASCII hexadecimal plus one final LF; removing the final LF and decoding
+pairs yields the exact raw GitHub API response bytes hashed by the nested
+`api_record_sha256`. The bundle manifest does not hash itself.
+
+The OCI `archive` uses `checkpoint_identity`. OCI JSON is strict-parsed directly from
+the original BuildKit-emitted bytes, and its descriptors are cross-checked against
+those exact bytes; the documents need not use Crux canonical-JSON serialization and
+must not be reserialized before hashing or comparison. Upstream manifest files use
+`licensed_source_file`; runner and host-adapter manifest files use `source_file`.
 
 ## Test Strategy
 
@@ -2268,6 +2846,27 @@ reinterpret a key from that reference.
 ### Unit tests
 
 - Strict backend-lock and runtime-lock schema validation.
+- Strict bootstrap-request/evidence, measurement-request/evidence, seal-profile,
+  seal-evidence, seal-candidate, build-context-manifest, OCI-layout-manifest, and
+  native-host-attestation-bundle schemas; canonical Crux-record hashes; and complete
+  cross-authority linkage.
+- Build-context manifest strictness and fresh exact materialization, including
+  normalized modes and rejection of ignored, extra, missing, linked, special, or
+  byte-drifted inputs.
+- OCI index selection; strict parsing without canonicalizing the raw JSON bytes;
+  manifest/config/layer verification; pinned-base manifest/config and inherited
+  digest/DiffID-prefix authentication; epoch-zero enforcement only after that prefix;
+  immutable config-digest import and launch; and mutable-tag rejection.
+- Exact five-row fixture derivation from the canonical WAV, including all frame
+  counts, byte lengths, and SHA-256 values.
+- Cgroup-v2 metric parsing and unit conversion, monotonic duration rounding,
+  10-millisecond sampling, output-line accounting, and unavailable-metric failure.
+- Exact 15-row measurement-matrix completeness, fresh-process uniqueness,
+  inference-counter increments, stable row ordering, and no partial publication.
+- Persistent/fresh boundary-probe ordering and counters, including proof that the
+  over-bound request is rejected before inference.
+- Calibration exit `0`/`1`/`2` classification, immutable no-replace publication,
+  and proof that failure leaves no authoritative output.
 - Strict legacy-conversion coverage schema validation and cross-checking of its HDF5,
   source-manifest, required-inventory, and seal-evidence hashes.
 - Canonical model-artifact-set and descriptor identity derivation.
@@ -2339,10 +2938,17 @@ official prediction. Launcher tests prove that `PYTHONHASHSEED` and the full
 allowlist are present before Python starts, that `PYTHONCOERCECLOCALE=0` is required
 and removed before exact allowlist validation, that startup rejects any mismatch
 before TensorFlow import, and that explicit `ConfigProto` thread counts remain `1`.
+Container tests also prove that the production and calibration entrypoints are
+distinct source-manifest-covered files, reject each other's mounts and protocols,
+and authenticate every calibration request/evidence/source/image identity before
+TensorFlow import.
 Host evidence tests accept only the three enumerated evidence forms and keep an
-unattested bare local host diagnostic-only. Cross-CPU tests require exact smoke
-identity on a different fingerprint before official publication and classify every
-completed mismatch as backend-fatal `failed`, exit `2`.
+unattested bare local host diagnostic-only. Per-phase bundle tests decode the
+lowercase-hex API record, authenticate all three files, cross-check the completed job
+and observation fields, reject phase substitution, and require the owning evidence
+and candidate allowlist hashes. Cross-CPU tests require exact smoke identity on a
+different fingerprint before official publication and classify every completed
+mismatch as backend-fatal `failed`, exit `2`.
 
 Log tests prove that standard output remains protocol-only and that standard error
 retains allowed diagnostics while redacting secrets, environment values, absolute
@@ -2383,8 +2989,14 @@ CLI tests prove:
 - post-seal `prepare-backend` rejects any request/evidence/final-lock disagreement;
 - `attest-base-system` accepts only the pinned base manifest, exact native inventory,
   required probes, and empty additional-package set;
-- `measure` cannot publish a seal candidate, and `calibrate` rejects a missing,
-  unrelated, sentinel-bearing, or underprovisioned seal-profile request;
+- `bootstrap-image` refuses mutable launch references, repository-root contexts,
+  context-manifest or host-bundle drift, and base-prefix drift, and publishes only an
+  authenticated OCI layout plus bootstrap evidence;
+- `measure` requires the exact five-by-three fresh-container matrix and cannot
+  publish a seal candidate;
+- `calibrate` constructs its own candidate, rejects a missing, unrelated,
+  sentinel-bearing, or underprovisioned seal-profile request, and leaves no
+  authoritative output on any operational or integrity failure;
 - a `preseal` OaF registry entry returns `backend_not_sealed`, exit `1`, without
   opening prediction output, while a `sealed` entry with missing or corrupt locks
   returns integrity failure, exit `2`;
@@ -2411,38 +3023,106 @@ CLI tests prove:
 ## Continuous Integration
 
 The normal Python suite uses the fake runner and does not install TensorFlow 1 or
-require Docker. It validates host logic on every pull request.
+require Docker. It validates schemas, identities, host logic, entrypoint separation
+with test doubles, matrix and boundary orchestration, failure semantics, and atomic
+publication on every pull request.
 
-A dedicated native Linux `amd64` integration job runs when backend locks, runner code,
-vendored upstream source, smoke fixtures, or prediction schemas change. It also runs
-on a scheduled cadence and through manual dispatch. The job:
+A manual native Linux `amd64` bootstrap workflow accepts one exact commit SHA,
+checks out that commit, and records it in regenerated authenticated native-host
+evidence. It then:
 
-1. strict-loads the checkpoint-acquisition request and downloads the requested
-   archive as an explicit CI preparation step;
-2. verifies the exact archive and four-member identities before publishing the three
-   inference components;
-3. attests the pinned base-image package inventory, empty additional-package set,
-   and required native probes;
-4. builds or pulls the pinned runner by immutable digest;
-5. reruns the checked-in measurement and seal-profile requests;
-6. runs `verify-backend`;
-7. runs the real-checkpoint integration tests; and
-8. uploads acquisition, base-system, calibration, verification, tensor-coverage,
-   and smoke evidence.
+1. acquires and verifies the exact checkpoint request;
+2. materializes the request-authenticated minimal build context, authenticates the
+   pinned base manifest/config and inherited layer prefix, builds the provisional OCI
+   archive from the calibration-bootstrap request, authenticates its raw
+   manifest/config/layer bytes, and imports it by config digest;
+3. attests the pinned base/provisional package inventory, unused UID/GID, empty
+   additional-package set, and required native probes; and
+4. uploads a canonical artifact manifest plus the complete bootstrap
+   host-attestation bundle and every acquisition, bootstrap, base-system, OCI, and
+   sanitized diagnostic artifact needed for review.
 
-The benchmark command itself remains offline. A network or acquisition failure in CI
-fails the dedicated job; it is not converted into a skipped parity result.
-An emulated `amd64` job cannot satisfy this required check.
+Acquisition, bootstrap, and base-system evidence are committed together only after
+human review of the uploaded bootstrap run. The accepted bootstrap host-attestation
+bundle is committed in that same evidence commit and its manifest hash exact-matches
+bootstrap evidence. A separate calibration-measurement request then binds the
+accepted bootstrap request/evidence hashes in its own commit; the measurement
+evidence records the accepted acquisition and base-system evidence hashes it
+consumed.
 
-The dedicated job passes only when `verify-backend` returns exit `0` and its strict
-typed report has `status: "verified"`, every required real-checkpoint test ran, and
-all required evidence reports were published and uploaded. An
-`environment_unsupported` report, skipped parity test, acquisition failure, or
-missing report or upload fails the required job. Exit status alone is insufficient.
+A manual native Linux `amd64` measurement workflow accepts that exact
+measurement-request commit, regenerates authenticated native-host evidence, obtains
+the exact accepted OCI archive or rebuilds and exact-compares it, regenerates and
+exact-compares all five fixture rows, runs exactly three fresh-container repetitions
+per row, validates the exact 15 healthy measurement rows, and uploads a canonical
+artifact manifest plus the complete measurement host-attestation bundle and every
+measurement and sanitized diagnostic artifact needed for review.
 
-The dedicated job is required before merging an inference-relevant change. Unrelated
-host-only changes may reuse a recent successful scheduled result only if repository
-branch protection explicitly permits it.
+Neither bootstrap nor measurement invokes `calibrate` or `seal`. Measurement
+evidence and its accepted host-attestation bundle are committed only after human
+review and exact hash comparison. The seal-profile request is then reviewed and
+committed in a separate commit, so measured facts and the chosen headroom cannot
+enter history as one opaque decision.
+
+A separate manual candidate phase accepts that exact profile commit, regenerates
+native-host evidence for it, strict-validates the committed evidence/profile chain,
+runs `calibrate`, and uploads the complete candidate, its host-attestation bundle,
+and a canonical artifact manifest for review. The candidate binds the bundle-manifest
+hash and includes all four bundle files in its exact artifact allowlist. No manual
+pre-seal phase invokes `seal`, writes final locks, or changes the registry, and no
+evidence commit triggers automatic sealing.
+
+Every native workflow upload manifest is canonical UTF-8 JSON consisting of one
+array of `artifact_ref` rows, sorted first by `role` and then by repository-relative
+POSIX `path`, with lexicographically ordered object keys, no insignificant
+whitespace, and one final newline. It includes itself only through the workflow
+provider's external artifact digest, never as an array row. The manifest is
+operational CI evidence and is not a lock identity input. Each manifest includes the
+phase's three host-attestation inputs and bundle manifest as ordinary authenticated
+rows; omission of any of the four is fatal.
+
+The sealed native integration workflow is introduced in the same final-seal commit
+as the immutable seal dependencies, runtime lock, backend lock, smoke oracle, sealed
+registry entry, and workflow configuration. It runs on changes to any request,
+evidence, lock, runner or calibration source, vendored upstream source, fixture,
+prediction schema, or native workflow; it also runs on a schedule and by manual
+dispatch. On a native Linux `amd64` worker it strict-validates the checked-in
+authority chain, rederives the candidate payloads in memory, rebuilds the image and
+exact-compares the authenticated minimal context, pinned base manifest/config and
+inherited layer prefix, and deterministic output manifest/config/layer identities,
+reacquires the checkpoint, and reruns the measurement request as fresh operational
+evidence. Fresh host, process, and timing fields are expected to differ; the workflow
+validates their schemas, identities, exact 15-row shape, health, and compliance with
+both bootstrap ceilings and the reviewed final profile instead of byte-comparing
+them with the accepted measurement record. It then reruns boundary/process probes,
+exact-compares every deterministic sealed artifact, runs the real-checkpoint tests
+without skips, and runs the five-call production verification against the final
+locks.
+
+This rebuild is a mandatory contemporary regression check for the exact pinned build
+recipe, not a promise that the supporting registry, runner, or build toolchain will
+remain available forever. A non-identical rebuild fails the workflow and cannot be
+substituted for preserved bytes. A passing rebuild proves only that every recorded
+deterministic byte was reproduced by an accepted native execution of the supported
+recipe at that time.
+
+Every native workflow fails on a network/acquisition failure in a phase that requires
+acquisition, unavailable required Docker or cgroup-v2 metrics, an emulated worker, a
+missing upload, or a skipped required native test. Measurement and sealed integration
+also fail on a non-exact 15-row matrix or an unhealthy row. Candidate and sealed
+integration also fail on coverage other than exact 130/78/52, a process/counter
+contradiction, or a boundary request not rejected before inference. Any
+non-identical deterministic image or sealed byte fails every phase that reproduces
+it. The sealed workflow passes only when all three published post-ready smoke
+artifacts are byte-identical,
+`verify-backend` exits `0` with strict status `verified`, every required native test
+ran, and the canonical artifact manifest authenticates every required report and
+upload. Exit status alone is insufficient.
+
+The sealed workflow is required before merging an inference-relevant change.
+Unrelated host-only changes may reuse a recent successful scheduled result only if
+repository branch protection explicitly permits it. The benchmark command itself
+remains offline.
 
 ## Repository Boundaries
 
@@ -2454,14 +3134,30 @@ Implementation planning should preserve these ownership boundaries:
 - `src/benchmark/prediction_artifact.py` owns the common JSONL schema, validation,
   backend-agnostic reading, and atomic publication.
 - `runtime/oaf_tf1/` owns the pinned runner, container definition, package lock,
-  source manifests, base-system-package request, and protocol implementation.
+  source manifests, minimal build-context manifest, base-system-package request, and
+  protocol implementation.
+- `runtime/oaf_tf1/calibration_entrypoint.py` owns only the authenticated
+  `crux.oaf-calibration-runner/v1` protocol. The production entrypoint remains a
+  separate file and owns only `crux.transcription-runner/v1`.
+- `tools/hpa320/oaf_build_context.py` owns only exact build-context-manifest
+  generation/validation and fresh normalized staging.
+- `tools/hpa320/oaf_host_attestation.py` owns phase-bundle validation and durable raw
+  GitHub API byte recovery.
+- `tools/hpa320/oaf_oci.py` owns strict parsing of raw OCI JSON and blobs, pinned-base
+  prefix validation, and canonical archive packing.
+- `tools/hpa320/oaf_native_calibration.py` owns OCI archive selection/import,
+  immutable Docker launch, cgroup-v2 monitoring, fixture-matrix execution, boundary
+  probes, and in-memory candidate assembly.
 - `runtime/heuristic_onset/` owns the content-addressed heuristic environment lock and
   reproducible environment builder.
-- `config/benchmark/backends/` owns reviewed checkpoint-acquisition, calibration, and
-  seal-profile requests; backend, runtime, and heuristic-parameter locks; and the
-  native seal-evidence record.
-- `docs/superpowers/evidence/hpa-320/` owns immutable design-audit evidence, including
-  the legacy TF2 conversion coverage report.
+- `config/benchmark/backends/` owns reviewed checkpoint-acquisition,
+  calibration-bootstrap, calibration-measurement, and seal-profile requests;
+  backend, runtime, and heuristic-parameter locks; and the native seal-evidence
+  record.
+- `docs/superpowers/evidence/hpa-320/` owns immutable design-audit and accepted
+  native-calibration evidence, including the legacy TF2 conversion coverage report,
+  the four reviewed files directly under `native/`, and each phase's complete durable
+  host-attestation bundle.
 - `tests/fixtures/oaf_tf1_smoke/` owns the procedural generator and parameters,
   canonical WAV, and sole checked-in smoke oracle.
 - `src/cli/benchmark.py` owns command wiring and exit-code presentation only.
@@ -2510,21 +3206,26 @@ HPA-320 is complete when:
 1. The official source, checkpoint, runtime, hparams, 88-bin native output space,
    native-metadata schema, upstream 8-hit training map, exact upstream invocation, and
    maximum input-audio-frame bound are represented by strict checked-in locks with the
-   identities in this design. The locks cross-reference strict checkpoint,
-   base-system, measurement, and seal-profile request/evidence hashes and are backed
-   by an accepted native-`amd64` seal-evidence record containing every exact resource,
-   deadline, package, reference host numeric fingerprint, and platform value required
-   above.
+   identities in this design. Through the accepted native-`amd64` seal-evidence
+   record, the locks cross-reference strict checkpoint, base-system,
+   calibration-bootstrap, measurement, and seal-profile request/evidence hashes and
+   every exact build-context manifest, pinned-base manifest/config and inherited
+   layer prefix, resource, deadline, package, reference host numeric fingerprint, and
+   platform value required above.
 2. The released checkpoint is verified offline and all 78 required inference tensors
    are restored; the four-member archive and three-component cache are exact; the 52
    non-inference entries are explicitly classified; and the zero-of-78 legacy
    conversion conclusion is preserved in its hashed audit artifact.
-3. The launcher supplies the exact environment before CPython starts, and the
-   isolated TensorFlow 1.15.5 runner completes an identity-checked handshake with
-   bounded concurrent standard-error draining.
-4. The procedural fixture reproduces byte-identical, finite, nonempty native
-   prediction artifacts across repeated and fresh processes with no numeric
-   acceptance tolerance; every authenticated mismatch is backend-fatal irrespective
+3. The production and calibration entrypoints are distinct and reject each other's
+   authorities and protocols; each launcher supplies its exact environment before
+   CPython starts, and the isolated TensorFlow 1.15.5 runner authenticates every
+   mounted identity before TensorFlow import and completes an identity-checked
+   handshake with bounded concurrent standard-error draining.
+4. The five exact diagnostic fixtures produce 15 healthy fresh-container measurement
+   rows; persistent/fresh boundary probes prove the exact input bound and
+   pre-inference over-bound rejection; and the smoke fixture reproduces three
+   byte-identical, finite, nonempty published prediction artifacts with no numeric
+   acceptance tolerance. Every authenticated mismatch is backend-fatal irrespective
    of diagnostic host fingerprint.
 5. Structured native predictions preserve independently verified source-audio and
    input-view identity, time, output bin, MIDI pitch, native class, schema-governed
@@ -2537,8 +3238,15 @@ HPA-320 is complete when:
    HDF5 path unvalidated.
 7. Missing or corrupt model state, runtime drift, smoke mismatch, runner failure, and
    protocol errors fail without fallback and produce the documented exit code.
-8. Host tests pass without TensorFlow 1, and the dedicated real-checkpoint CI job
-   publishes auditable verification and coverage artifacts.
+8. Host tests pass without TensorFlow 1; the manual bootstrap, measurement, and
+   candidate workflows publish reviewable evidence but cannot seal; bootstrap
+   evidence and its durable host-attestation bundle, its dependent measurement
+   request, measurement evidence and its durable host-attestation bundle, and the
+   reviewed seal-profile request enter the required separate commits; the candidate
+   bundle is published only from the reviewed candidate by `seal`; and the sealed
+   native integration workflow runs every real-checkpoint test without skips and
+   publishes auditable exact 130/78/52 coverage, boundary, verification, raw OCI, and
+   smoke artifacts.
 9. Every execution records the Crux Git commit, manifest-defined clean or dirty source
    state, resource limits, and deadlines without making the static backend or runtime
    lock self-referential.
@@ -2638,11 +3346,15 @@ copies it plus the checkpoint archive to approved durable storage. Authorized
 registries or artifact mirrors may supply the same bytes without changing backend
 identity. A new byte sequence, even from the same URL or tag, is rejected.
 Preservation of the exact OCI and checkpoint bytes avoids making a future registry or
-upstream-storage outage an immediate rebuild dependency. HPA-320 does not promise
-that the exact image can be reproducibly rebuilt forever from surviving source and
-package references. If every approved preserved copy of the OCI bytes is lost, that
-runtime identity is unrecoverable and must be retired rather than rebuilt under the
-same digest claim.
+upstream-storage outage an immediate rebuild dependency and is the authoritative
+long-term availability path. HPA-320 does not promise that the exact image can be
+reproducibly rebuilt forever from surviving source and package references. If every
+approved preserved copy is lost, a rebuild may restore availability only when an
+accepted native execution reproduces every recorded index, manifest, config, layer,
+DiffID, canonical archive byte, and digest and passes the complete sealed workflow.
+A version-equivalent or semantically equivalent image is never recovery. If exact
+reproduction is no longer possible, that runtime identity is operationally
+unrecoverable and must be retired.
 
 ## Alternatives Rejected
 
