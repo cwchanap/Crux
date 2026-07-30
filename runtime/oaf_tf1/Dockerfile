@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile-upstream@sha256:3d6d54b33351b396a910d33248754b86b1d7dd838b4eeb9575d8903a209f6516
 # check=skip=InvalidBaseImagePlatform
 # The backend is intentionally frozen to the linux/amd64 base-image manifest.
 FROM python@sha256:ea8897698c0955ba96144bd2b7310ef7884ccce4db7a1f97ffc21fb8b89d1673 AS runtime-base
@@ -60,7 +61,10 @@ COPY runtime/oaf_tf1/*.py /opt/crux/runtime/oaf_tf1/
 COPY runtime/oaf_tf1/patches/ /opt/crux/runtime/oaf_tf1/patches/
 COPY runtime/oaf_tf1/tests/ /opt/crux/runtime/tests/
 COPY runtime/oaf_tf1/runner-source-manifest.json /opt/crux/runtime/runner-source-manifest.json
-COPY tools/hpa320/generate_runner_source_manifest.py /opt/crux/tools/hpa320/generate_runner_source_manifest.py
+# Preserve the manifest-addressed repository layout in the test image too.
+COPY runtime/oaf_tf1/ /opt/crux/runtime/oaf_tf1/
+COPY .github/workflows/hpa320-native-bootstrap.yml /opt/crux/.github/workflows/hpa320-native-bootstrap.yml
+COPY tools/hpa320/ /opt/crux/tools/hpa320/
 WORKDIR /opt/crux
 USER "${RUNTIME_UID}:${RUNTIME_GID}"
 
@@ -77,8 +81,8 @@ COPY runtime/oaf_tf1/patches/ /opt/crux/runtime/patches/
 COPY runtime/oaf_tf1/runner-source-manifest.json /opt/crux/runtime/runner-source-manifest.json
 # Preserve the manifest-addressed repository layout solely for fail-closed source attestation.
 COPY runtime/oaf_tf1/ /opt/crux/runtime/oaf_tf1/
-COPY tools/hpa320/generate_runner_source_manifest.py /opt/crux/tools/hpa320/generate_runner_source_manifest.py
-COPY tools/hpa320/oaf_system_packages.py /opt/crux/tools/hpa320/oaf_system_packages.py
+COPY .github/workflows/hpa320-native-bootstrap.yml /opt/crux/.github/workflows/hpa320-native-bootstrap.yml
+COPY tools/hpa320/ /opt/crux/tools/hpa320/
 WORKDIR /opt/crux
 USER "${RUNTIME_UID}:${RUNTIME_GID}"
 ENTRYPOINT ["/usr/bin/env", "-i", "CUDA_VISIBLE_DEVICES=-1", "MKL_NUM_THREADS=1", "OMP_NUM_THREADS=1", "OPENBLAS_NUM_THREADS=1", "PYTHONHASHSEED=0", "PYTHONCOERCECLOCALE=0", "TF_NUM_INTEROP_THREADS=1", "TF_NUM_INTRAOP_THREADS=1", "/opt/crux/venv/bin/python", "-s", "/opt/crux/runtime/entrypoint.py"]

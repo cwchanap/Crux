@@ -868,9 +868,10 @@ def test_provisional_dockerfile_has_clean_test_and_fail_closed_runtime_inputs() 
         "SYSTEM_PACKAGE_INVENTORY_SHA256",
     ):
         assert f"ARG {argument}" not in dockerfile
+    assert "COPY tools/hpa320/ /opt/crux/tools/hpa320/" in dockerfile
     assert (
-        "COPY tools/hpa320/oaf_system_packages.py "
-        "/opt/crux/tools/hpa320/oaf_system_packages.py" in dockerfile
+        "COPY .github/workflows/hpa320-native-bootstrap.yml "
+        "/opt/crux/.github/workflows/hpa320-native-bootstrap.yml" in dockerfile
     )
     assert 'USER "${RUNTIME_UID}:${RUNTIME_GID}"' in dockerfile
     assert "backend-lock.json" not in dockerfile
@@ -884,6 +885,34 @@ def test_provisional_dockerfile_test_stage_runs_as_explicit_nonroot_user() -> No
     )[0]
 
     assert 'USER "${RUNTIME_UID}:${RUNTIME_GID}"' in test_stage
+
+
+def test_runner_source_manifest_covers_native_bootstrap_authority() -> None:
+    payload = json.loads(Path("runtime/oaf_tf1/runner-source-manifest.json").read_bytes())
+    paths = {row["path"] for row in payload["files"]}
+    assert {
+        ".github/workflows/hpa320-native-bootstrap.yml",
+        "runtime/oaf_tf1/Dockerfile",
+        "runtime/oaf_tf1/calibration_entrypoint.py",
+        "runtime/oaf_tf1/calibration_protocol.py",
+        "runtime/oaf_tf1/oaf_backend.py",
+        "runtime/oaf_tf1/protocol.py",
+        "tools/hpa320/audit_legacy_tf2_conversion.py",
+        "tools/hpa320/generate_runner_source_manifest.py",
+        "tools/hpa320/github_host_evidence.py",
+        "tools/hpa320/oaf_build_context.py",
+        "tools/hpa320/oaf_candidate_builder.py",
+        "tools/hpa320/oaf_host_attestation.py",
+        "tools/hpa320/oaf_native_calibration.py",
+        "tools/hpa320/oaf_native_runner.py",
+        "tools/hpa320/oaf_oci.py",
+        "tools/hpa320/seal_oaf_backend.py",
+    }.issubset(paths)
+    assert payload["covered_roots"] == [
+        ".github/workflows",
+        "runtime/oaf_tf1",
+        "tools/hpa320",
+    ]
 
 
 _TEST_DEBIAN_FINGERPRINT = "0123456789ABCDEF0123456789ABCDEF01234567"

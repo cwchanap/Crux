@@ -205,7 +205,9 @@ def _prepare_preseal_oaf_backend(request: PrepareBackendRequest) -> PrepareBacke
             acquisition_mode=(
                 "download"
                 if request.download
-                else "archive" if request.archive_path is not None else "cache_verify"
+                else "archive"
+                if request.archive_path is not None
+                else "cache_verify"
             ),
             model_artifact_set_sha256=contract.model_artifact_set_sha256,
             cache_path=cache_path,

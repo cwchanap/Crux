@@ -47,6 +47,46 @@ CHECKPOINT_COUNT = 130
 REQUIRED_INFERENCE_COUNT = 78
 NON_INFERENCE_COUNT = 52
 MIN_MIDI_PITCH = 21
+CALIBRATION_TRAINING_GROUPS = (
+    {"base_midi": 36, "group_id": "kick", "member_pitches": [36], "output_bin": 15},
+    {
+        "base_midi": 38,
+        "group_id": "snare",
+        "member_pitches": [38, 40, 37, 39],
+        "output_bin": 17,
+    },
+    {
+        "base_midi": 48,
+        "group_id": "toms",
+        "member_pitches": [48, 50, 45, 47, 43, 58, 64],
+        "output_bin": 27,
+    },
+    {
+        "base_midi": 46,
+        "group_id": "hihat",
+        "member_pitches": [46, 26, 42, 22, 44, 54, 70],
+        "output_bin": 25,
+    },
+    {
+        "base_midi": 51,
+        "group_id": "ride",
+        "member_pitches": [51, 59],
+        "output_bin": 30,
+    },
+    {
+        "base_midi": 53,
+        "group_id": "ride_bell",
+        "member_pitches": [53, 56],
+        "output_bin": 32,
+    },
+    {
+        "base_midi": 49,
+        "group_id": "crash",
+        "member_pitches": [49, 55, 57, 52],
+        "output_bin": 28,
+    },
+    {"base_midi": 75, "group_id": "sticks", "member_pitches": [75], "output_bin": 54},
+)
 MODEL_SCRATCH_DIRECTORY = "/tmp/crux-oaf-model"
 PRIVATE_CHECKPOINT_DIRECTORY = Path("/tmp/crux-oaf-checkpoint")
 UNINSTRUMENTED_SEQUENCES_PATH = Path("/opt/crux/upstream/magenta/music/sequences_lib.py")
@@ -108,18 +148,26 @@ RUNTIME_LOCK_KEYS = frozenset(
         "additional_system_packages",
         "base_image",
         "base_image_archive_keyring_sha256",
+        "base_image_config_digest",
+        "base_image_layer_diff_ids",
+        "base_image_layer_digests",
         "base_image_manifest_digest",
         "base_system_package_evidence_sha256",
         "base_system_package_inventory",
         "base_system_package_inventory_sha256",
         "base_system_package_request_sha256",
+        "build_context_manifest_sha256",
+        "calibration_bootstrap_evidence_sha256",
+        "calibration_bootstrap_request_sha256",
         "distribution_build_manifest_sha256",
         "environment",
+        "image_build",
         "oci_layout_manifest_sha256",
         "platform",
         "python_distributions",
         "python_version",
         "runner_source_manifest_sha256",
+        "runtime_image_config_digest",
         "runtime_image_manifest_digest",
         "schema",
         "seal_evidence_sha256",
@@ -137,11 +185,18 @@ SEAL_EVIDENCE_KEYS = frozenset(
         "additional_system_packages",
         "advisory_snapshot_sha256",
         "base_image_archive_keyring_sha256",
+        "base_image_config_digest",
+        "base_image_layer_diff_ids",
+        "base_image_layer_digests",
         "base_image_manifest_digest",
         "base_system_package_evidence_sha256",
         "base_system_package_inventory",
         "base_system_package_inventory_sha256",
         "base_system_package_request_sha256",
+        "boundary_probes",
+        "build_context_manifest_sha256",
+        "calibration_bootstrap_evidence_sha256",
+        "calibration_bootstrap_request_sha256",
         "calibration_measurement_evidence_sha256",
         "calibration_measurement_request_sha256",
         "checkpoint_acquisition_evidence_sha256",
@@ -157,6 +212,7 @@ SEAL_EVIDENCE_KEYS = frozenset(
         "max_input_audio_frames",
         "measurements",
         "memory_limit_bytes",
+        "native_host_attestation_bundle_sha256",
         "native_host_evidence",
         "non_inference_inventory",
         "oci_layout_archive",
@@ -169,11 +225,12 @@ SEAL_EVIDENCE_KEYS = frozenset(
         "runner_source_manifest_sha256",
         "runtime_gid",
         "runtime_image_config_digest",
+        "runtime_image_index_digest",
+        "runtime_image_layer_diff_ids",
         "runtime_image_layer_digests",
         "runtime_image_manifest_digest",
         "runtime_uid",
         "schema",
-        "seal_candidate_sha256",
         "seal_profile_request_sha256",
         "security_scan_sha256",
         "shm_bytes",
@@ -328,7 +385,7 @@ def validate_schema_golden(schema, content):
         except (ImportError, ValueError) as error:
             raise ValueError("runner schema golden is invalid") from error
 
-    """Check runner-native exact schemas for isolated drift fixtures."""
+    # Check runner-native exact schemas for isolated drift fixtures.
     if schema in {"crux.oaf-smoke-oracle/v1", "crux.oaf-tensor-coverage/v1"}:
         try:
             from tools.hpa320 import seal_oaf_backend as seal
@@ -380,8 +437,12 @@ def validate_schema_golden(schema, content):
                 raise ValueError("schema golden source audio hash is invalid")
             with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
                 root = Path(directory)
-                (root / seal.SMOKE_AUDIO_NAME).write_bytes(audio)
-                (root / seal.SMOKE_PREDICTION_NAME).write_bytes(prediction)
+                audio_path = root / seal._CANDIDATE_ARTIFACT_PATHS["smoke_audio"]
+                prediction_path = root / seal._CANDIDATE_ARTIFACT_PATHS["smoke_prediction"]
+                audio_path.parent.mkdir(parents=True)
+                prediction_path.parent.mkdir(parents=True)
+                audio_path.write_bytes(audio)
+                prediction_path.write_bytes(prediction)
                 evidence = seal.LoadedSealEvidence(
                     root / "seal.json",
                     {
@@ -557,6 +618,16 @@ class ModelHandle:
     coverage: TensorCoverage
     training_groups: Sequence[Mapping[str, Any]]
     uninstrumented_sequences_module: Any
+
+
+@dataclass(frozen=True)
+class CalibrationModel:
+    """A restored model plus the exact inventories derived during calibration."""
+
+    handle: ModelHandle
+    checkpoint_inventory: Sequence[Mapping[str, Any]]
+    required_inference_inventory: Sequence[Mapping[str, Any]]
+    non_inference_inventory: Sequence[Mapping[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -1152,6 +1223,83 @@ def build_and_restore_model(
     )
 
 
+def build_calibration_model(
+    checkpoint_components: Sequence[Mapping[str, Any]],
+    model_cache_root: Path = MODEL_CACHE_ROOT,
+) -> CalibrationModel:
+    """Derive and verify the exact inference partition before candidate locks exist."""
+
+    import tensorflow.compat.v1 as tf
+    from magenta.models.onsets_frames_transcription import configs, train_util
+
+    config = configs.CONFIG_MAP["drums"]
+    hparams = copy.deepcopy(config.hparams)
+    hparams.batch_size = 1
+    hparams.truncated_length_secs = 0
+    hparams.drum_prediction_map = ""
+    checkpoint_prefix = materialize_authenticated_checkpoint(
+        Path(model_cache_root), checkpoint_components
+    )
+    graph, variables, predictions = _build_coverage_graph(tf, config, hparams)
+    graph_inventory = _tensorflow_graph_inventory(variables)
+    checkpoint_inventory = _tensorflow_checkpoint_inventory(tf, checkpoint_prefix)
+    required_names = {entry["name"] for entry in graph_inventory}
+    non_inference_inventory = tuple(
+        {**entry, "reason": "not_in_prediction_graph"}
+        for entry in checkpoint_inventory
+        if entry["name"] not in required_names
+    )
+    required_variables = {variable.op.name: variable for variable in variables}
+    with graph.as_default():
+        required_saver = tf.train.Saver(var_list=required_variables)
+        required_uninitialized = tf.report_uninitialized_variables(
+            var_list=list(required_variables.values())
+        )
+    with tf.Session(
+        graph=graph,
+        config=tf.ConfigProto(
+            inter_op_parallelism_threads=1,
+            intra_op_parallelism_threads=1,
+        ),
+    ) as session:
+        required_saver.restore(session, checkpoint_prefix)
+        uninitialized_raw = session.run(required_uninitialized)
+        uninitialized = tuple(
+            value.decode("utf-8", errors="strict") if isinstance(value, bytes) else str(value)
+            for value in uninitialized_raw
+        )
+        assert_no_reachable_stochastic_ops(_flatten_prediction_operations(predictions))
+    coverage = validate_tensor_coverage(
+        checkpoint_inventory=checkpoint_inventory,
+        required_inventory=graph_inventory,
+        non_inference_inventory=non_inference_inventory,
+        graph_inventory=graph_inventory,
+        uninitialized_required=uninitialized,
+    )
+    estimator = configure_prediction_estimator_session(
+        train_util.create_estimator(
+            config.model_fn,
+            MODEL_SCRATCH_DIRECTORY,
+            hparams,
+        ),
+        tf,
+    )
+    handle = ModelHandle(
+        estimator=estimator,
+        hparams=hparams,
+        checkpoint_prefix=checkpoint_prefix,
+        coverage=coverage,
+        training_groups=CALIBRATION_TRAINING_GROUPS,
+        uninstrumented_sequences_module=load_uninstrumented_sequences_module(),
+    )
+    return CalibrationModel(
+        handle=handle,
+        checkpoint_inventory=checkpoint_inventory,
+        required_inference_inventory=graph_inventory,
+        non_inference_inventory=non_inference_inventory,
+    )
+
+
 def _serialized_example(verified_wav: VerifiedWav) -> bytes:
     import six
     from magenta.models.onsets_frames_transcription import audio_label_data_utils
@@ -1375,11 +1523,49 @@ def authenticate_startup(
         "checkpoint_components",
         "required_inference_inventory",
         "non_inference_inventory",
+        "checkpoint_acquisition_evidence_sha256",
+        "checkpoint_acquisition_request_sha256",
+        "host_adapter_source_manifest_sha256",
+        "max_input_audio_frames",
         "smoke_audio_sha256",
         "smoke_oracle_sha256",
     ):
         _require_same(backend.payload, seal.payload, field)
-    _require_same(runtime.payload, seal.payload, "runner_source_manifest_sha256")
+    for field in (
+        "additional_system_packages",
+        "base_image_archive_keyring_sha256",
+        "base_image_config_digest",
+        "base_image_layer_diff_ids",
+        "base_image_layer_digests",
+        "base_image_manifest_digest",
+        "base_system_package_evidence_sha256",
+        "base_system_package_inventory",
+        "base_system_package_inventory_sha256",
+        "base_system_package_request_sha256",
+        "build_context_manifest_sha256",
+        "calibration_bootstrap_evidence_sha256",
+        "calibration_bootstrap_request_sha256",
+        "distribution_build_manifest_sha256",
+        "oci_layout_manifest_sha256",
+        "python_distributions",
+        "runner_source_manifest_sha256",
+        "runtime_image_config_digest",
+        "runtime_image_manifest_digest",
+        "stderr_max_line_bytes",
+        "stderr_read_chunk_bytes",
+        "stderr_ring_buffer_bytes",
+        "stdout_max_line_bytes",
+        "tensorflow_abi",
+        "tensorflow_build",
+        "upstream_source_manifest_sha256",
+    ):
+        _require_same(runtime.payload, seal.payload, field)
+    if runtime.payload["seal_evidence_sha256"] != seal.sha256:
+        raise ProtocolFailure(
+            "mounted_identity_invalid",
+            "Mounted runner identities do not agree.",
+            fatal=True,
+        )
     descriptor, descriptor_sha256 = _descriptor(backend)
     model = build_and_restore_model(backend.payload, model_cache_root)
     maximum_frames = backend.payload["max_input_audio_frames"]
