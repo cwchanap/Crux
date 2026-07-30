@@ -11,7 +11,7 @@ import platform
 import subprocess
 from copy import deepcopy
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any, Callable
 
 import pytest
@@ -127,6 +127,31 @@ def _set_native_host(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(platform, "machine", lambda: "x86_64")
     monkeypatch.setenv("RUNNER_OS", "Linux")
     monkeypatch.setenv("RUNNER_ARCH", "X64")
+
+
+def test_seal_host_binding_requires_its_authenticated_reference_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_native_host(monkeypatch)
+    host_record = _native_host_record()
+    host_path = _write_json(tmp_path / "native-host-evidence.json", host_record)
+    host = seal_module.load_native_host_evidence(host_path)
+    seal = SimpleNamespace(
+        payload={
+            "native_host_evidence": {
+                "form": "github_hosted_linux_x64",
+                "sha256": host.sha256,
+            },
+            "reference_host_numeric_fingerprint": host.host_numeric_fingerprint.as_json(),
+        }
+    )
+
+    seal_module._validate_host_binding(host, seal)
+
+    seal.payload["reference_host_numeric_fingerprint"]["cpu_model"] = "999"
+    with pytest.raises(SealError, match="reference host numeric fingerprint"):
+        seal_module._validate_host_binding(host, seal)
 
 
 def _host_manifest_payload(repository: Path) -> dict[str, object]:
@@ -277,14 +302,14 @@ def _build_candidate(
             "input_view_id": "oaf-smoke-canonical-v1",
             "native_events": [
                 {
-                    "confidence_raw": "0.75",
+                    "confidence_binary64": "3fe8000000000000",
                     "frame_index": 12,
                     "model_output_bin": 15,
                     "native_class_id": "midi_36",
                     "native_midi_note": 36,
-                    "time_sec_raw": "0.139319",
-                    "upstream_group_id": "kick",
-                    "velocity": 100,
+                    "time_sec_binary64": "3fc1d53a957d7519",
+                    "upstream_8hit_group_id": "kick",
+                    "velocity_midi": 100,
                 }
             ],
             "schema": "crux.oaf-smoke-oracle/v1",

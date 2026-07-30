@@ -28,6 +28,7 @@ try:
         ProtocolFailure,
         VerifiedWav,
         canonical_json_bytes,
+        encode_binary64,
         load_authenticated_object,
         read_verified_canonical_wav,
     )
@@ -37,6 +38,7 @@ except (ImportError, ValueError):
         ProtocolFailure,
         VerifiedWav,
         canonical_json_bytes,
+        encode_binary64,
         load_authenticated_object,
         read_verified_canonical_wav,
     )
@@ -225,6 +227,15 @@ DESCRIPTOR_FIELDS = (
     "training_data_map_id",
     "upstream_source_commit",
 )
+EXPECTED_ENVIRONMENT = {
+    "CUDA_VISIBLE_DEVICES": "-1",
+    "MKL_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "PYTHONHASHSEED": "0",
+    "TF_NUM_INTEROP_THREADS": "1",
+    "TF_NUM_INTRAOP_THREADS": "1",
+}
 
 
 def _safe_relative_source_path(value):
@@ -625,14 +636,14 @@ def native_event_from_capture(
         )
     output_bin = native_midi_note - MIN_MIDI_PITCH
     return {
-        "confidence_raw": confidence,
+        "confidence_binary64": encode_binary64(confidence),
         "frame_index": start_frame,
         "model_output_bin": output_bin,
         "native_class_id": "midi_" + str(native_midi_note),
         "native_midi_note": native_midi_note,
-        "time_sec_raw": frame_time_seconds(start_frame),
-        "upstream_group_id": _group_for_pitch(native_midi_note, training_groups),
-        "velocity": velocity_to_midi(raw_velocity),
+        "time_sec_binary64": encode_binary64(frame_time_seconds(start_frame)),
+        "upstream_8hit_group_id": _group_for_pitch(native_midi_note, training_groups),
+        "velocity_midi": velocity_to_midi(raw_velocity),
     }
 
 
@@ -1264,6 +1275,39 @@ def _require_same(left: Mapping[str, Any], right: Mapping[str, Any], field: str)
         )
 
 
+def validate_runtime_environment(environment: Any) -> None:
+    """Reject a mounted runtime lock that differs from the sealed image environment."""
+    if not isinstance(environment, Mapping) or dict(environment) != EXPECTED_ENVIRONMENT:
+        raise ProtocolFailure(
+            "runtime_environment_mismatch",
+            "Mounted runtime environment does not match the sealed image.",
+            fatal=True,
+        )
+
+
+def authenticate_runtime_environment(
+    *,
+    backend_lock_path: Path = BACKEND_LOCK_PATH,
+    runtime_lock_path: Path = RUNTIME_LOCK_PATH,
+) -> AuthenticatedObject:
+    """Authenticate runtime environment identity before numeric imports."""
+    backend = load_authenticated_object(
+        backend_lock_path,
+        label="backend_lock",
+        exact_keys=BACKEND_LOCK_KEYS,
+        expected_schema="crux.transcription-backend-lock/v1",
+    )
+    runtime = load_authenticated_object(
+        runtime_lock_path,
+        label="runtime_lock",
+        exact_keys=RUNTIME_LOCK_KEYS,
+        expected_schema="crux.transcription-runtime-lock/v1",
+        expected_sha256=backend.payload["runtime_lock_sha256"],
+    )
+    validate_runtime_environment(runtime.payload["environment"])
+    return runtime
+
+
 def authenticate_startup(
     *,
     backend_lock_path: Path = BACKEND_LOCK_PATH,
@@ -1288,6 +1332,7 @@ def authenticate_startup(
         expected_schema="crux.transcription-runtime-lock/v1",
         expected_sha256=backend.payload["runtime_lock_sha256"],
     )
+    validate_runtime_environment(runtime.payload["environment"])
     seal = load_authenticated_object(
         seal_evidence_path,
         label="seal_evidence",

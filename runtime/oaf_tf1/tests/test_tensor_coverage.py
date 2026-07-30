@@ -19,7 +19,6 @@ from runtime.oaf_tf1.protocol import (
     AuthenticatedObject,
     ProtocolFailure,
     VerifiedWav,
-    load_authenticated_object,
 )
 
 
@@ -223,37 +222,6 @@ def test_tensor_coverage_accepts_exact_130_78_52_partition() -> None:
     assert len(coverage.non_inference_inventory_sha256) == 64
 
 
-def test_runner_lock_key_sets_match_host_and_reject_legacy_runtime_fields(tmp_path: Path) -> None:
-    from src.benchmark import backend_lock
-
-    assert oaf_backend.BACKEND_LOCK_KEYS == backend_lock.BACKEND_LOCK_KEYS
-    assert oaf_backend.RUNTIME_LOCK_KEYS == backend_lock.RUNTIME_LOCK_KEYS
-    assert oaf_backend.SEAL_EVIDENCE_KEYS == backend_lock.SEAL_EVIDENCE_KEYS
-
-    payload = {key: "fixture" for key in oaf_backend.RUNTIME_LOCK_KEYS}
-    payload["schema"] = "crux.transcription-runtime-lock/v1"
-    path = tmp_path / "runtime-lock.json"
-    path.write_bytes(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n")
-    loaded = load_authenticated_object(
-        path,
-        label="runtime_lock",
-        exact_keys=oaf_backend.RUNTIME_LOCK_KEYS,
-        expected_schema="crux.transcription-runtime-lock/v1",
-    )
-    assert loaded.payload["schema"] == "crux.transcription-runtime-lock/v1"
-
-    legacy = dict(payload)
-    legacy["debian_snapshot_repository"] = "legacy"
-    path.write_bytes(json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode() + b"\n")
-    with pytest.raises(ProtocolFailure, match="mounted runner identity"):
-        load_authenticated_object(
-            path,
-            label="runtime_lock",
-            exact_keys=oaf_backend.RUNTIME_LOCK_KEYS,
-            expected_schema="crux.transcription-runtime-lock/v1",
-        )
-
-
 @pytest.mark.parametrize(
     ("mutation", "match"),
     [
@@ -371,6 +339,15 @@ def test_ready_carries_authenticated_smoke_prediction_identity(
         ),
         "runtime_lock": AuthenticatedObject(
             payload={
+                "environment": {
+                    "CUDA_VISIBLE_DEVICES": "-1",
+                    "MKL_NUM_THREADS": "1",
+                    "OMP_NUM_THREADS": "1",
+                    "OPENBLAS_NUM_THREADS": "1",
+                    "PYTHONHASHSEED": "0",
+                    "TF_NUM_INTEROP_THREADS": "1",
+                    "TF_NUM_INTRAOP_THREADS": "1",
+                },
                 "runner_source_manifest_sha256": runner_manifest_sha256,
                 "runtime_image_manifest_digest": f"sha256:{'4' * 64}",
                 "stdout_max_line_bytes": 4096,

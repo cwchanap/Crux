@@ -3,8 +3,7 @@ from __future__ import annotations
 import struct
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass
-from decimal import Decimal
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -64,7 +63,7 @@ def _wav_bytes(sample_frames: int = 4) -> bytes:
     )
 
 
-def _host_evidence() -> NativeHostEvidence:
+def _host_evidence(*, cpu_model: str = "143") -> NativeHostEvidence:
     payload = {
         "api_record_sha256": "a" * 64,
         "approved_labels": ["Linux", "X64"],
@@ -77,7 +76,7 @@ def _host_evidence() -> NativeHostEvidence:
             "architecture": "x86_64",
             "cpu_vendor_id": "GenuineIntel",
             "cpu_family": "6",
-            "cpu_model": "143",
+            "cpu_model": cpu_model,
             "cpu_stepping": "8",
         },
     }
@@ -122,26 +121,26 @@ def _inventories() -> tuple[Inventory, Inventory, Inventory]:
 def _runner_event() -> dict[str, object]:
     frame_index = 64
     return {
-        "confidence_raw": Decimal("0.75"),
+        "confidence_binary64": "3fe8000000000000",
         "frame_index": frame_index,
         "model_output_bin": 15,
         "native_class_id": "midi_36",
         "native_midi_note": 36,
-        "time_sec_raw": Decimal(frame_index) * Decimal(512) / Decimal(44100),
-        "upstream_group_id": "kick",
-        "velocity": 100,
+        "time_sec_binary64": "3fe7c6f8c751f177",
+        "upstream_8hit_group_id": "kick",
+        "velocity_midi": 100,
     }
 
 
 def _native_event() -> NativeEvent:
     event = _runner_event()
     return NativeEvent(
-        time_sec=float(event["time_sec_raw"]),  # type: ignore[arg-type]
+        time_sec=struct.unpack(">d", bytes.fromhex(event["time_sec_binary64"]))[0],  # type: ignore[arg-type]
         native_class_id="midi_36",
         model_output_bin=15,
         native_midi_note=36,
         native_metadata={"upstream_8hit_group_id": "kick"},
-        confidence=0.75,
+        confidence=struct.unpack(">d", bytes.fromhex(event["confidence_binary64"]))[0],  # type: ignore[arg-type]
         velocity_midi=100,
     )
 
@@ -173,7 +172,7 @@ class FakeProcess:
         self.requests.append(request)
         if self.request_hook is not None:
             self.request_hook(request, self.request_count)
-        if self.request_error is not None and self.request_count > 1:
+        if self.request_error is not None and self.request_count > 2:
             raise BackendFatalFailure(
                 BackendError(
                     code=self.request_error,
@@ -188,12 +187,12 @@ class FakeProcess:
         }
         if self.response_changes:
             response.update(self.response_changes)
-        if self.request_count > 1 and self.after_smoke_changes:
+        if self.request_count > 2 and self.after_smoke_changes:
             if self.after_smoke_changes.get("type") == "transcription_error":
                 response = dict(self.after_smoke_changes)
             else:
                 response.update(self.after_smoke_changes)
-        if self.request_count > 1 and self.after_smoke_event:
+        if self.request_count > 2 and self.after_smoke_event:
             response["native_events"] = [self.after_smoke_event]
         envelope = {
             "payload": response,
@@ -209,6 +208,36 @@ class FakeProcess:
 
     def close(self) -> None:
         self.close_count += 1
+
+
+@dataclass
+class RecordingRunnerFactory:
+    """Records process-ready handshakes and real post-ready request behavior."""
+
+    handshake: dict[str, object]
+    response_changes: dict[str, object] | None = None
+    processes: list[FakeProcess] = field(default_factory=list)
+
+    def __call__(self, _profile: RunnerLaunchProfile) -> FakeProcess:
+        process = FakeProcess(
+            handshake=dict(self.handshake),
+            response_changes=self.response_changes,
+        )
+        self.processes.append(process)
+        return process
+
+    @property
+    def process_count(self) -> int:
+        return len(self.processes)
+
+    @property
+    def startup_smoke_calls(self) -> list[int]:
+        """Every ready handshake is produced after one runner raw-oracle inference."""
+        return [1 for _ in self.processes]
+
+    @property
+    def post_ready_calls(self) -> list[int]:
+        return [process.request_count for process in self.processes]
 
 
 @dataclass
@@ -238,6 +267,8 @@ def _harness(
     strict_checkout: bool = True,
     changed_files: tuple[dict[str, object], ...] = (),
     native_evidence_matches: bool = True,
+    native_cpu_model: str = "143",
+    runtime_environment: dict[str, str] | None = None,
 ) -> Harness:
     repository = tmp_path / "repository"
     (repository / ".git").mkdir(parents=True)
@@ -303,7 +334,7 @@ def _harness(
     }
     oracle_path = _canonical_file(input_root / "smoke" / "smoke-oracle.json", oracle_payload)
 
-    evidence = _host_evidence()
+    evidence = _host_evidence(cpu_model=native_cpu_model)
     descriptor = _descriptor()
     checkpoint, required, non_inference = _inventories()
     backend_payload = {
@@ -326,7 +357,9 @@ def _harness(
         ],
     }
     runtime_payload = {
-        "environment": dict(REQUIRED_ENVIRONMENT),
+        "environment": (
+            dict(REQUIRED_ENVIRONMENT) if runtime_environment is None else dict(runtime_environment)
+        ),
         "python_version": "3.7.17",
         "runner_source_manifest_sha256": sha256_hex(runner_manifest.read_bytes()),
         "stderr_max_line_bytes": 8192,
@@ -442,7 +475,16 @@ def _harness(
 
     def process_factory(profile: RunnerLaunchProfile) -> FakeProcess:
         captured_profiles.append(profile)
-        return process
+        if len(captured_profiles) == 1:
+            return process
+        return FakeProcess(
+            handshake=dict(handshake),
+            request_error=request_error,
+            response_changes=response_changes,
+            after_smoke_changes=after_smoke_changes,
+            event=event,
+            after_smoke_event=after_smoke_event,
+        )
 
     lock_by_path = {
         backend_lock.path: backend_lock,
@@ -592,8 +634,98 @@ def test_verify_backend_accepts_only_matching_handshake_and_smoke(
     assert verification.tensor_coverage.required_count == 78
     assert verification.tensor_coverage.restored_count == 78
     assert verification.tensor_coverage.non_inference_count == 52
-    assert harness.process.request_count == 1
+    assert harness.process.request_count == 2
     assert harness.captured_profiles[0].seal_evidence_path == harness.config.seal_evidence_path
+
+
+def test_verify_backend_performs_two_startup_and_three_post_ready_smoke_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _harness(tmp_path, monkeypatch)
+    runner_factory = RecordingRunnerFactory(harness.process.handshake)
+    harness.backend = oaf_tf1.OafTf1Backend(harness.config, process_factory=runner_factory)
+
+    verification = harness.backend.verify()
+
+    assert verification.status == "verified"
+    assert runner_factory.process_count == 2
+    assert runner_factory.startup_smoke_calls == [1, 1]
+    assert runner_factory.post_ready_calls == [2, 1]
+    artifacts = harness.backend.smoke_verification_artifacts
+    assert artifacts is not None
+    assert len(artifacts.artifacts) == 3
+    expected = render_prediction_artifact(
+        NativePrediction(
+            audio=harness.smoke_audio,
+            descriptor=harness.descriptor,
+            events=(_native_event(),),
+            backend_lock_sha256=BACKEND_SHA256,
+            runtime_lock_sha256=RUNTIME_SHA256,
+            parameter_lock_sha256=None,
+            model_artifact_set_sha256="7" * 64,
+            upstream_source_commit="94529798dfbbb14c27ddfd76f23027dc8e2ce185",
+            training_data_map_id="magenta-egmd-data-8hit-94529798-v1",
+        )
+    )
+    assert [artifact.path.read_bytes() for artifact in artifacts.artifacts] == [
+        expected,
+        expected,
+        expected,
+    ]
+
+
+@pytest.mark.parametrize("native_cpu_model", ("143", "144"))
+def test_verify_backend_classifies_completed_smoke_mismatch_as_fatal_on_every_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    native_cpu_model: str,
+) -> None:
+    harness = _harness(
+        tmp_path,
+        monkeypatch,
+        native_cpu_model=native_cpu_model,
+        response_changes={"native_events": []},
+    )
+
+    verification = harness.backend.verify()
+
+    assert verification.status == "failed"
+    assert verification.errors[0].code == "smoke_mismatch"
+    assert verification.smoke.prediction is None
+    assert not (
+        tmp_path
+        / "repository"
+        / "artifacts"
+        / "benchmark"
+        / "backends"
+        / BACKEND_ID
+        / "verification"
+        / "smoke"
+    ).exists()
+
+
+def test_later_smoke_failure_never_deletes_prior_immutable_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _harness(tmp_path, monkeypatch)
+    assert harness.backend.verify().status == "verified"
+    published = harness.backend.smoke_verification_artifacts
+    assert published is not None
+    original_bytes = {artifact.path: artifact.path.read_bytes() for artifact in published.artifacts}
+
+    mismatch_factory = RecordingRunnerFactory(
+        harness.process.handshake,
+        response_changes={"native_events": []},
+    )
+    failed_backend = oaf_tf1.OafTf1Backend(harness.config, process_factory=mismatch_factory)
+
+    failed = failed_backend.verify()
+
+    assert failed.status == "failed"
+    assert failed.errors[0].code == "smoke_mismatch"
+    assert {path: path.read_bytes() for path in original_bytes} == original_bytes
 
 
 def _item_audio(harness: Harness, *, beneath_root: bool = True) -> CanonicalAudio:
@@ -734,8 +866,8 @@ def test_verify_backend_rejects_post_ready_smoke_artifact_mismatch(
     verification = harness.backend.verify()
 
     assert verification.status == "failed"
-    assert verification.errors[0].code == "smoke_prediction_mismatch"
-    assert harness.process.request_count == 1
+    assert verification.errors[0].code == "smoke_mismatch"
+    assert harness.process.request_count == 2
 
 
 @pytest.mark.parametrize(
@@ -758,7 +890,7 @@ def test_verify_backend_rejects_response_identity_mismatch_without_fallback(
         harness.backend.transcribe(_item_audio(harness))
 
     assert captured.value.error.code == expected_code
-    assert harness.process.request_count == 2
+    assert harness.process.request_count == 3
 
 
 def test_verify_backend_preserves_typed_item_error_from_real_inner_payload(
@@ -780,7 +912,7 @@ def test_verify_backend_preserves_typed_item_error_from_real_inner_payload(
         harness.backend.transcribe(_item_audio(harness, beneath_root=False))
 
     assert captured.value.error.code == "input_wav_invalid"
-    assert harness.process.request_count == 2
+    assert harness.process.request_count == 3
 
 
 def test_verify_backend_snapshots_private_host_input_beneath_mounted_root(
@@ -794,7 +926,7 @@ def test_verify_backend_snapshots_private_host_input_beneath_mounted_root(
     captured_snapshot: list[Path] = []
 
     def inspect_request(payload: dict[str, object], request_count: int) -> None:
-        if request_count == 1:
+        if request_count <= 2:
             return
         relative_path = Path(payload["audio_path"])  # type: ignore[arg-type]
         assert not relative_path.is_absolute()
@@ -807,7 +939,7 @@ def test_verify_backend_snapshots_private_host_input_beneath_mounted_root(
     prediction = harness.backend.transcribe(audio)
 
     assert prediction.audio == audio
-    assert harness.process.request_count == 2
+    assert harness.process.request_count == 3
     assert len(captured_snapshot) == 1
     assert not captured_snapshot[0].exists()
     assert not captured_snapshot[0].parent.exists()
@@ -826,7 +958,7 @@ def test_verify_backend_rejects_private_host_input_hash_drift_before_runner(
         harness.backend.transcribe(audio)
 
     assert captured.value.error.code == "input_hash_mismatch"
-    assert harness.process.request_count == 1
+    assert harness.process.request_count == 2
 
 
 def test_verify_backend_rejects_private_host_input_symlink_swap_before_runner(
@@ -845,7 +977,7 @@ def test_verify_backend_rejects_private_host_input_symlink_swap_before_runner(
         harness.backend.transcribe(audio)
 
     assert captured.value.error.code == "input_path_invalid"
-    assert harness.process.request_count == 1
+    assert harness.process.request_count == 2
 
 
 def test_verify_backend_rejects_generated_snapshot_path_escape_before_runner(
@@ -875,7 +1007,7 @@ def test_verify_backend_rejects_generated_snapshot_path_escape_before_runner(
         harness.backend.transcribe(audio)
 
     assert captured.value.error.code == "backend_input_snapshot_invalid"
-    assert harness.process.request_count == 1
+    assert harness.process.request_count == 2
 
 
 def test_verify_backend_detects_request_snapshot_swap_and_cleans_it(
@@ -888,7 +1020,7 @@ def test_verify_backend_detects_request_snapshot_swap_and_cleans_it(
     captured_snapshot: list[Path] = []
 
     def replace_snapshot(payload: dict[str, object], request_count: int) -> None:
-        if request_count == 1:
+        if request_count <= 2:
             return
         snapshot_path = harness.config.input_root / str(payload["audio_path"])
         captured_snapshot.append(snapshot_path)
@@ -902,7 +1034,7 @@ def test_verify_backend_detects_request_snapshot_swap_and_cleans_it(
         harness.backend.transcribe(audio)
 
     assert captured.value.error.code == "backend_input_snapshot_changed"
-    assert harness.process.request_count == 2
+    assert harness.process.request_count == 3
     assert len(captured_snapshot) == 1
     assert not captured_snapshot[0].exists()
     assert not captured_snapshot[0].parent.exists()
@@ -929,13 +1061,13 @@ def test_verify_backend_treats_request_snapshot_cleanup_failure_as_fatal(
         harness.backend.transcribe(audio)
 
     assert captured.value.error.code == "backend_input_snapshot_changed"
-    assert harness.process.request_count == 2
+    assert harness.process.request_count == 3
 
 
 @pytest.mark.parametrize(
     "event",
     (
-        {**_runner_event(), "velocity": float("inf")},
+        {**_runner_event(), "velocity_midi": float("inf")},
         {**_runner_event(), "native_midi_note": 37},
         {**_runner_event(), "unexpected": "field"},
     ),
@@ -952,7 +1084,7 @@ def test_verify_backend_rejects_malformed_or_nonfinite_native_event_as_item_erro
         harness.backend.transcribe(_item_audio(harness))
 
     assert captured.value.error.code == "native_event_invalid"
-    assert harness.process.request_count == 2
+    assert harness.process.request_count == 3
 
 
 @pytest.mark.parametrize(
@@ -971,7 +1103,7 @@ def test_verify_backend_timeout_death_and_oom_are_fatal_without_fallback(
         harness.backend.transcribe(_item_audio(harness))
 
     assert captured.value.error.code == failure_code
-    assert harness.process.request_count == 2
+    assert harness.process.request_count == 3
 
 
 def test_verify_backend_emulated_environment_does_not_launch_by_default(
@@ -1000,7 +1132,34 @@ def test_verify_backend_rejects_native_evidence_mismatch_before_launch(
     assert harness.captured_profiles == []
 
 
-def test_verify_backend_emulated_diagnostics_runs_strongest_check_without_prediction(
+@pytest.mark.parametrize(
+    "runtime_environment",
+    (
+        {key: value for key, value in REQUIRED_ENVIRONMENT.items() if key != "OMP_NUM_THREADS"},
+        {**REQUIRED_ENVIRONMENT, "UNLOCKED_RUNTIME_VALUE": "1"},
+        {**REQUIRED_ENVIRONMENT, "OMP_NUM_THREADS": "2"},
+    ),
+)
+def test_verify_backend_rejects_runtime_environment_drift_before_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_environment: dict[str, str],
+) -> None:
+    harness = _harness(
+        tmp_path,
+        monkeypatch,
+        runtime_environment=runtime_environment,
+    )
+
+    verification = harness.backend.verify()
+
+    assert verification.status == "failed"
+    assert verification.errors[0].code == "runtime_environment_mismatch"
+    assert harness.captured_profiles == []
+    assert harness.process.request_count == 0
+
+
+def test_verify_backend_emulated_diagnostics_stops_before_runner_inference(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1014,11 +1173,12 @@ def test_verify_backend_emulated_diagnostics_runs_strongest_check_without_predic
     verification = harness.backend.verify()
 
     assert verification.status == "environment_unsupported"
-    assert verification.tensor_coverage.status == "passed"
-    assert verification.smoke.status == "passed"
+    assert verification.tensor_coverage.status == "not_run"
+    assert verification.smoke.status == "not_run"
     assert verification.smoke.prediction is None
-    assert harness.process.request_count == 1
-    assert harness.process.close_count == 1
+    assert harness.captured_profiles == []
+    assert harness.process.request_count == 0
+    assert harness.process.close_count == 0
 
 
 def test_verify_backend_strict_checkout_rejects_inference_relevant_change_before_launch(

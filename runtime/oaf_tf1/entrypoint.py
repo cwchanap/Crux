@@ -37,6 +37,47 @@ def validate_process_environment(expected_environment):
         raise SystemExit(2)
 
 
+def _protocol_failure_type():
+    try:
+        from protocol import ProtocolFailure
+    except ImportError:
+        from runtime.oaf_tf1.protocol import ProtocolFailure
+    return ProtocolFailure
+
+
+def _authenticate_runtime_environment() -> None:
+    try:
+        from oaf_backend import authenticate_runtime_environment
+    except ImportError:
+        from runtime.oaf_tf1.oaf_backend import authenticate_runtime_environment
+    authenticate_runtime_environment()
+
+
+def _import_numeric_modules():
+    import random
+
+    import numpy as np
+    import tensorflow.compat.v1 as tf
+
+    try:
+        from oaf_backend import FrozenOafBackend, authenticate_startup
+    except ImportError:
+        from runtime.oaf_tf1.oaf_backend import FrozenOafBackend, authenticate_startup
+    try:
+        from protocol import canonical_json_line, serve_requests
+    except ImportError:
+        from runtime.oaf_tf1.protocol import canonical_json_line, serve_requests
+    return (
+        random,
+        np,
+        tf,
+        FrozenOafBackend,
+        authenticate_startup,
+        canonical_json_line,
+        serve_requests,
+    )
+
+
 def main() -> int:
     discard_interpreter_bootstrap_environment()
     validate_process_environment(EXPECTED_ENVIRONMENT)
@@ -45,22 +86,28 @@ def main() -> int:
         sys.path.insert(0, vendor_root)
 
     try:
-        import random
-
-        import numpy as np
-        import tensorflow.compat.v1 as tf
-
-        random.seed(0)
-        np.random.seed(0)
-        tf.set_random_seed(0)
-
-        from oaf_backend import FrozenOafBackend, authenticate_startup
-        from protocol import ProtocolFailure, canonical_json_line, serve_requests
+        protocol_failure = _protocol_failure_type()
+        _authenticate_runtime_environment()
+    except protocol_failure as error:
+        os.write(2, ("code=" + error.code + " count=1\n").encode("ascii", errors="strict"))
+        return 2
     except BaseException:  # pylint: disable=broad-exception-caught
         os.write(2, b"code=runner_dependency_import_failed count=1\n")
         return 2
 
     try:
+        (
+            random,
+            np,
+            tf,
+            FrozenOafBackend,
+            authenticate_startup,
+            canonical_json_line,
+            serve_requests,
+        ) = _import_numeric_modules()
+        random.seed(0)
+        np.random.seed(0)
+        tf.set_random_seed(0)
         startup = authenticate_startup()
         backend = FrozenOafBackend.from_startup(startup)
         sys.stdout.buffer.write(
@@ -77,7 +124,7 @@ def main() -> int:
             stdout_max_line_bytes=startup.stdout_max_line_bytes,
         )
         return 0
-    except ProtocolFailure as error:
+    except protocol_failure as error:
         os.write(2, ("code=" + error.code + " count=1\n").encode("ascii", errors="strict"))
         return 2
     except BaseException:  # pylint: disable=broad-exception-caught

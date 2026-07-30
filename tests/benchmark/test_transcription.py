@@ -1241,6 +1241,38 @@ def test_verification_finishes_before_prediction_or_midi_output_creation(
     assert backend.close_calls == 1
 
 
+def test_completed_smoke_mismatch_exits_two_without_prediction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    verification = replace(
+        oaf_verification(),
+        status="failed",
+        errors=(
+            BackendError(
+                code="smoke_mismatch",
+                message="The post-ready smoke prediction did not match the frozen oracle.",
+            ),
+        ),
+    )
+    backend = FakeBackend(verification, prediction_factory=oaf_prediction)
+    request = direct_request(tmp_path, backend_id=OFFICIAL_BACKEND_ID)
+
+    outcome = run_transcribe_one(
+        request,
+        registry=registry_for(backend, backend_id=OFFICIAL_BACKEND_ID),
+        now=FIXED_UTC,
+        run_id=FIXED_UUID,
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.exit_code == 2
+    assert report_payload(outcome)["errors"][0]["code"] == "smoke_mismatch"  # type: ignore[index]
+    assert not request.output_path.exists()
+    assert backend.transcribe_calls == 0
+
+
 def test_environment_exception_during_verification_is_backend_fatal(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

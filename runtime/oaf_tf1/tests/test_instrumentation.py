@@ -275,14 +275,14 @@ def test_native_event_preserves_frame_bin_pitch_group_confidence_and_velocity() 
     )
 
     assert event == {
-        "confidence_raw": 0.625,
+        "confidence_binary64": "3fe4000000000000",
         "frame_index": 15,
         "model_output_bin": 17,
         "native_class_id": "midi_38",
         "native_midi_note": 38,
-        "time_sec_raw": frame_time_seconds(15),
-        "upstream_group_id": "snare",
-        "velocity": 63,
+        "time_sec_binary64": "3fc64a893adcd260",
+        "upstream_8hit_group_id": "snare",
+        "velocity_midi": 63,
     }
 
 

@@ -1533,6 +1533,11 @@ def _validate_host_binding(
         or host.official_execution_allowed is not True
     ):
         raise SealError("native host evidence does not match the proposed seal")
+    if (
+        seal.payload["reference_host_numeric_fingerprint"]
+        != host.host_numeric_fingerprint.as_json()
+    ):
+        raise SealError("reference host numeric fingerprint does not match native host evidence")
 
 
 def _validate_repository_inputs(

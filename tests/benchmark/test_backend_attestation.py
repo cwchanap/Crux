@@ -47,7 +47,7 @@ HOST_NUMERIC_FINGERPRINT = {
 }
 
 
-def _attestation_payload(*, fingerprint: object = HOST_NUMERIC_FINGERPRINT) -> dict[str, object]:
+def _attestation_payload(*, fingerprint: object | None = None) -> dict[str, object]:
     return {
         "backend_id": "magenta-egmd-tf1-94529798-8hit-v1",
         "changed_files_manifest": None,
@@ -55,7 +55,9 @@ def _attestation_payload(*, fingerprint: object = HOST_NUMERIC_FINGERPRINT) -> d
         "cpu_limit": "2",
         "descriptor_sha256": "a" * 64,
         "git_commit": "b" * 40,
-        "host_numeric_fingerprint": fingerprint,
+        "host_numeric_fingerprint": (
+            HOST_NUMERIC_FINGERPRINT if fingerprint is None else fingerprint
+        ),
         "memory_bytes": 4_294_967_296,
         "pid_limit": 128,
         "request_deadline_seconds": 300,
@@ -90,6 +92,72 @@ def test_execution_attestation_rejects_mutable_fingerprint_fields(forbidden_key:
             ),
             expected_backend_id="magenta-egmd-tf1-94529798-8hit-v1",
             expected_descriptor_sha256="a" * 64,
+        )
+
+
+def test_linux_cpuinfo_parser_accepts_irrelevant_empty_value() -> None:
+    # pylint: disable-next=protected-access
+    records = backend_attestation._linux_cpuinfo_records("""processor\t: 0
+vendor_id\t: GenuineIntel
+cpu family\t: 6
+model\t\t: 143
+model name\t: Intel(R) Xeon(R)
+stepping\t: 8
+power management\t:
+""")
+
+    assert records == (
+        {
+            "processor": "0",
+            "vendor_id": "GenuineIntel",
+            "cpu family": "6",
+            "model": "143",
+            "model name": "Intel(R) Xeon(R)",
+            "stepping": "8",
+            "power management": "",
+        },
+    )
+
+
+def test_linux_host_fingerprint_ignores_irrelevant_empty_cpuinfo_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cpuinfo = """processor\t: 0
+vendor_id\t: GenuineIntel
+cpu family\t: 6
+model\t\t: 143
+stepping\t: 8
+power management\t:
+"""
+    monkeypatch.setattr(
+        backend_attestation.Path,
+        "read_text",
+        lambda _path, **_kwargs: cpuinfo,
+    )
+    monkeypatch.setattr(backend_attestation.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(backend_attestation, "_visible_linux_cpu_ids", lambda: frozenset({"0"}))
+
+    # pylint: disable-next=protected-access
+    assert backend_attestation._linux_host_numeric_fingerprints() == (HOST_NUMERIC_FINGERPRINT,)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["processor", "vendor_id", "cpu family", "model", "stepping"],
+)
+def test_linux_cpuinfo_parser_rejects_empty_required_fingerprint_fields(field: str) -> None:
+    with pytest.raises(AttestationError, match="host CPU facts are malformed"):
+        # pylint: disable-next=protected-access
+        backend_attestation._linux_cpuinfo_records(
+            "\n".join(
+                [
+                    "processor\t: 0" if field != "processor" else "processor\t:",
+                    "vendor_id\t: GenuineIntel" if field != "vendor_id" else "vendor_id\t:",
+                    "cpu family\t: 6" if field != "cpu family" else "cpu family\t:",
+                    "model\t\t: 143" if field != "model" else "model\t\t:",
+                    "stepping\t: 8" if field != "stepping" else "stepping\t:",
+                ]
+            )
         )
 
 
