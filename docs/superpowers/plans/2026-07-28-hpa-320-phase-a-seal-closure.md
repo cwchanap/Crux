@@ -1,5 +1,6 @@
 # HPA-320 Phase A Seal Closure Implementation Plan
 
+> **Historical snapshot:** This plan captures the design intent at the time of writing. Checkbox states and version references reflect the original plan, not the current repository state.
 > **Status:** Tasks 1-7 were implemented through commit `78b2424`. The remaining
 > native image-bootstrap, calibration, and final-seal work is superseded by
 > [the deterministic OCI seal-closure plan](2026-07-29-hpa-320-deterministic-oci-seal-closure.md).
