@@ -49,7 +49,8 @@ def _final_stage_copy_mappings(repository: Path) -> list[tuple[str, str]]:
     mappings: list[tuple[str, str]] = []
     instruction = ""
     for line in final_stage.splitlines():
-        instruction += line.strip().removesuffix("\\")
+        stripped = line.strip()
+        instruction += stripped[:-1] if stripped.endswith("\\") else stripped
         if line.rstrip().endswith("\\"):
             instruction += " "
             continue
@@ -73,7 +74,7 @@ def _final_stage_destinations(mappings: list[tuple[str, str]], source_path: str)
                 else destination
             )
         if copied_source.endswith("/") and source_path.startswith(copied_source):
-            destinations.add(destination + source_path.removeprefix(copied_source))
+            destinations.add(destination + source_path[len(copied_source) :])
     return destinations
 
 
@@ -87,7 +88,9 @@ def _stage_final_image_file(
 ) -> Path:
     final_destination = destination or f"/opt/crux/{source_path}"
     assert final_destination in _final_stage_destinations(mappings, source_path)
-    staged = staged_root / final_destination.removeprefix("/opt/crux/")
+    prefix = "/opt/crux/"
+    assert final_destination.startswith(prefix)
+    staged = staged_root / final_destination[len(prefix) :]
     staged.parent.mkdir(parents=True, exist_ok=True)
     staged.write_bytes((repository / source_path).read_bytes())
     return staged

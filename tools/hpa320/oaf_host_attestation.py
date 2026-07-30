@@ -180,6 +180,10 @@ def observe_github_host(*, output_path: Path, github_output_path: Path) -> bytes
     run_id = _positive_environment_integer("GITHUB_RUN_ID")
     run_attempt = _positive_environment_integer("GITHUB_RUN_ATTEMPT")
     server_url = _required_environment("GITHUB_SERVER_URL").rstrip("/")
+    if server_url != "https://github.com":
+        raise HostAttestationError(
+            "GITHUB_SERVER_URL must be the canonical https://github.com value"
+        )
     observation: JsonValue = {
         "docker_architecture": docker_architecture,
         "docker_os_type": docker_os_type,
@@ -214,6 +218,8 @@ def finalize_github_host_attestation(
         raise HostAttestationError("native-host attestation phase is invalid")
     token = _required_environment("GH_TOKEN")
     repository = _required_environment("GITHUB_REPOSITORY")
+    if not _GITHUB_REPOSITORY.fullmatch(repository):
+        raise HostAttestationError("GITHUB_REPOSITORY is not a canonical owner/name value")
     run_id = _positive_environment_integer("GITHUB_RUN_ID")
     commit = _required_environment("COMMIT_SHA")
     observation_content = _read_file(Path(observation_path), "native host observation")

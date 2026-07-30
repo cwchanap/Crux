@@ -200,6 +200,7 @@ class _CalibrationContainer:
                 bootstrap_request.payload["resource_ceiling"]["stderr_ring_buffer_bytes"],
             )
         )
+        self._stdout_line_buffer = b""
         self._container_name = "hpa320-calibration-" + uuid4().hex
         self._runtime_digest_file = input_root.parent / (
             self._container_name + "-runtime-digest.txt"
@@ -424,28 +425,37 @@ class _CalibrationContainer:
 
     def _read_object(self, deadline_seconds: int) -> Mapping[str, Any]:
         deadline = time.monotonic() + deadline_seconds
-        stdout = cast(Any, self._process.stdout)
+        stdout_fd = cast(Any, self._process.stdout).fileno()
         while True:
+            newline_index = self._stdout_line_buffer.find(b"\n")
+            if newline_index >= 0:
+                content = self._stdout_line_buffer[: newline_index + 1]
+                self._stdout_line_buffer = self._stdout_line_buffer[newline_index + 1 :]
+                if len(content) > self._stdout_maximum:
+                    raise SealError("calibration protocol line is oversized")
+                if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+                    raise SealError("calibration protocol line framing is invalid")
+                try:
+                    value = strict_json_loads(content[:-1], require_canonical=True)
+                except ValueError:
+                    raise SealError("calibration protocol response is invalid") from None
+                if not isinstance(value, Mapping):
+                    raise SealError("calibration protocol response is not an object")
+                return value
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise SealError("calibration protocol deadline expired")
-            readable, _, _ = select.select([stdout], [], [], min(remaining, 1.0))
+            if len(self._stdout_line_buffer) > self._stdout_maximum:
+                raise SealError("calibration protocol line is oversized")
+            readable, _, _ = select.select([stdout_fd], [], [], min(remaining, 1.0))
             if not readable:
                 if self._process.poll() is not None:
                     raise SealError("calibration container exited before its response")
                 continue
-            content = stdout.readline(self._stdout_maximum + 1)
-            if not content or len(content) > self._stdout_maximum:
-                raise SealError("calibration protocol line is missing or oversized")
-            if not content.endswith(b"\n") or content.endswith(b"\n\n"):
-                raise SealError("calibration protocol line framing is invalid")
-            try:
-                value = strict_json_loads(content[:-1], require_canonical=True)
-            except ValueError:
-                raise SealError("calibration protocol response is invalid") from None
-            if not isinstance(value, Mapping):
-                raise SealError("calibration protocol response is not an object")
-            return value
+            chunk = os.read(stdout_fd, self._stdout_maximum + 1)
+            if not chunk:
+                raise SealError("calibration protocol stream closed before its response")
+            self._stdout_line_buffer += chunk
 
     def _drain_stderr(self) -> None:
         stderr = cast(Any, self._process.stderr)

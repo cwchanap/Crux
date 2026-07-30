@@ -105,6 +105,10 @@ def main() -> int:
 
     try:
         protocol_failure = _protocol_failure_type()
+    except BaseException:  # pylint: disable=broad-exception-caught
+        os.write(2, b"code=runner_dependency_import_failed count=1\n")
+        return 2
+    try:
         _authenticate_runtime_environment()
     except protocol_failure as error:
         os.write(2, ("code=" + error.code + " count=1\n").encode("ascii", errors="strict"))

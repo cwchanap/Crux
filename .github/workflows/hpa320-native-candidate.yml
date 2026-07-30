@@ -77,6 +77,16 @@ jobs:
           set -euo pipefail
           [[ "${COMMIT_SHA}" =~ ^[0-9a-f]{40}$ ]]
           [[ "$(git rev-parse HEAD)" == "${COMMIT_SHA}" ]]
+          for f in \
+            config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.checkpoint-acquisition-request.json \
+            config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.calibration-bootstrap-request.json \
+            config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.seal-profile-request.json \
+            docs/superpowers/evidence/hpa-320/native/calibration-bootstrap-evidence.json \
+            docs/superpowers/evidence/hpa-320/native/calibration-measurement-evidence.json \
+            docs/superpowers/evidence/hpa-320/native/checkpoint-acquisition-evidence.json \
+            docs/superpowers/evidence/hpa-320/native/base-system-package-evidence.json; do
+            [[ -f "$f" ]] || { echo "missing required input: $f" >&2; exit 1; }
+          done
           printf '%s\n' "${NATIVE_HOST_OBSERVATION}" > native-host-observation.json
           uv run python -m tools.hpa320.oaf_host_attestation finalize-github \
             --phase candidate \

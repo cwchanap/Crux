@@ -739,17 +739,13 @@ def _validate_native_evidence(
     evidence: NativeHostEvidence,
 ) -> None:
     record = seal.payload.get("native_host_evidence")
-    expected_form = {
-        "github_hosted": "github_hosted_linux_x64",
-        "orchestrator_signed": "orchestrator_signed",
-        "approved_local": "native_seal_host",
-    }[evidence.kind]
     if (
         not isinstance(record, Mapping)
-        or set(record) != {"form", "sha256"}
-        or record.get("form") != expected_form
+        or set(record) != {"kind", "official_execution_allowed", "payload", "sha256"}
+        or record.get("kind") != evidence.kind
+        or record.get("official_execution_allowed") != evidence.official_execution_allowed
         or record.get("sha256") != evidence.sha256
-        or not evidence.official_execution_allowed
+        or sha256_hex(canonical_json_bytes(record.get("payload"))) != evidence.sha256
     ):
         raise _fatal(
             "native_host_evidence_mismatch",
