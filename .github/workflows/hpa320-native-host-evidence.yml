@@ -1,0 +1,220 @@
+name: HPA-320 Native Host Evidence
+
+on:
+  push:
+    branches:
+      - hpa-320-native-seal-evidence
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  native-host-evidence:
+    name: native-host-evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out evidence validator
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Assert native host and write observation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+
+          def required_environment(name: str) -> str:
+              value = os.environ.get(name)
+              if not value:
+                  raise SystemExit(f"{name} is missing")
+              return value
+
+
+          def docker_info(field: str) -> str:
+              result = subprocess.run(
+                  ["docker", "info", "--format", f"{{{{.{field}}}}}"],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+              value = result.stdout.strip()
+              if not value:
+                  raise SystemExit(f"Docker {field} is missing")
+              return value
+
+
+          runner_os = required_environment("RUNNER_OS")
+          runner_arch = required_environment("RUNNER_ARCH")
+          uname_architecture = subprocess.run(
+              ["uname", "-m"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout.strip()
+          docker_os_type = docker_info("OSType")
+          docker_architecture = docker_info("Architecture")
+          docker_server_version = docker_info("ServerVersion")
+
+          if runner_os != "Linux":
+              raise SystemExit(f"unexpected RUNNER_OS: {runner_os}")
+          if runner_arch != "X64":
+              raise SystemExit(f"unexpected RUNNER_ARCH: {runner_arch}")
+          if uname_architecture != "x86_64":
+              raise SystemExit(f"unexpected uname architecture: {uname_architecture}")
+          if docker_os_type != "linux":
+              raise SystemExit(f"unexpected Docker OSType: {docker_os_type}")
+          if docker_architecture not in {"x86_64", "amd64"}:
+              raise SystemExit(f"unexpected Docker architecture: {docker_architecture}")
+
+          github_sha = required_environment("GITHUB_SHA")
+          github_run_id = required_environment("GITHUB_RUN_ID")
+          github_run_attempt = required_environment("GITHUB_RUN_ATTEMPT")
+          github_repository = required_environment("GITHUB_REPOSITORY")
+          github_workflow_ref = required_environment("GITHUB_WORKFLOW_REF")
+          github_server_url = required_environment("GITHUB_SERVER_URL").rstrip("/")
+
+          if not re.fullmatch(r"[0-9a-f]{40}", github_sha):
+              raise SystemExit("GITHUB_SHA is not a full lowercase Git object ID")
+          if not github_run_id.isdecimal() or int(github_run_id) < 1:
+              raise SystemExit("GITHUB_RUN_ID is not a positive integer")
+          if not github_run_attempt.isdecimal() or int(github_run_attempt) < 1:
+              raise SystemExit("GITHUB_RUN_ATTEMPT is not a positive integer")
+
+          observation = {
+              "docker_architecture": docker_architecture,
+              "docker_os_type": docker_os_type,
+              "docker_server_version": docker_server_version,
+              "github_repository": github_repository,
+              "github_run_attempt": int(github_run_attempt),
+              "github_run_id": int(github_run_id),
+              "github_run_url": (
+                  f"{github_server_url}/{github_repository}/actions/runs/{github_run_id}"
+              ),
+              "github_sha": github_sha,
+              "github_workflow_ref": github_workflow_ref,
+              "runner_arch": runner_arch,
+              "runner_os": runner_os,
+              "uname_architecture": uname_architecture,
+          }
+          content = json.dumps(
+              observation,
+              allow_nan=False,
+              ensure_ascii=False,
+              separators=(",", ":"),
+              sort_keys=True,
+          ).encode() + b"\n"
+          Path("native-host-observation.json").write_bytes(content)
+          PY
+
+      - name: Derive and validate completed job evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import urllib.request
+          from pathlib import Path
+
+
+          JOB_ID = 90329445692
+          RUN_ID = 30375338017
+          WORKFLOW_COMMIT = "7a8e7c10849fccfc230f02c074fa49ba5c3b5217"
+          RUN_URL = (
+              "https://github.com/cwchanap/Crux/actions/runs/"
+              f"{RUN_ID}/job/{JOB_ID}"
+          )
+          API_URL = (
+              "https://api.github.com/repos/cwchanap/Crux/actions/jobs/"
+              f"{JOB_ID}"
+          )
+
+
+          token = os.environ.get("GH_TOKEN")
+          if not token:
+              raise SystemExit("GH_TOKEN is missing")
+          request = urllib.request.Request(
+              API_URL,
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {token}",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              api_record_bytes = response.read()
+          api_record = json.loads(api_record_bytes)
+
+          expected = {
+              "conclusion": "success",
+              "head_branch": "hpa-320-native-seal-evidence",
+              "head_sha": WORKFLOW_COMMIT,
+              "html_url": RUN_URL,
+              "id": JOB_ID,
+              "name": "native-host-evidence",
+              "run_id": RUN_ID,
+              "status": "completed",
+          }
+          for field, value in expected.items():
+              if api_record.get(field) != value:
+                  raise SystemExit(f"unexpected completed job {field}")
+          if api_record.get("labels") != ["ubuntu-24.04"]:
+              raise SystemExit("unexpected completed job labels")
+
+          Path("github-job-api-record.json").write_bytes(api_record_bytes)
+          payload = {
+              "api_record_sha256": hashlib.sha256(api_record_bytes).hexdigest(),
+              "approved_labels": ["Linux", "X64"],
+              "job_id": JOB_ID,
+              "run_url": RUN_URL,
+              "runner_arch": "X64",
+              "runner_os": "Linux",
+              "workflow_commit": WORKFLOW_COMMIT,
+          }
+          payload_bytes = json.dumps(
+              payload,
+              allow_nan=False,
+              ensure_ascii=False,
+              separators=(",", ":"),
+              sort_keys=True,
+          ).encode()
+          evidence = {
+              "kind": "github_hosted",
+              "official_execution_allowed": True,
+              "payload": payload,
+              "sha256": hashlib.sha256(payload_bytes).hexdigest(),
+          }
+          evidence_bytes = json.dumps(
+              evidence,
+              allow_nan=False,
+              ensure_ascii=False,
+              separators=(",", ":"),
+              sort_keys=True,
+          ).encode() + b"\n"
+          Path("native-host-evidence.json").write_bytes(evidence_bytes)
+          PY
+          python3 -m tools.hpa320.seal_oaf_backend \
+            validate-host \
+            --evidence native-host-evidence.json
+
+      - name: Upload native host evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: hpa320-native-host-observation
+          path: |
+            github-job-api-record.json
+            native-host-evidence.json
+            native-host-observation.json
+          if-no-files-found: error
+          retention-days: 7
