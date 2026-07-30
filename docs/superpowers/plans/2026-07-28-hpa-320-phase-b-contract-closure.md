@@ -1,5 +1,6 @@
 # HPA-320 Phase B Contract Closure Implementation Plan
 
+> **Historical snapshot:** This plan captures the design intent at the time of writing. Checkbox states and version references reflect the original plan, not the current repository state.
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development (recommended) or
 > superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox
