@@ -109,6 +109,12 @@ BUILD_MOUNTS = (
     {"container_path": "/inputs/build", "input": "build_tool_wheelhouse", "mode": "ro"},
     {"container_path": "/output", "input": "fresh_output_directory", "mode": "rw"},
 )
+_EXCEPTIONAL_BUILD_ROOTS = (
+    b"/inputs/build",
+    b"/inputs/sdist",
+    b"/output",
+    b"/work/",
+)
 BUILD_TOOL_DISTRIBUTIONS = (
     {
         "byte_length": 1_093_916,
@@ -274,6 +280,17 @@ class SdistExceptionSpec:
 class SdistBuildRecord:
     spec: SdistExceptionSpec
     wheel: DistributionRecord
+
+
+@dataclass(frozen=True)
+class _WheelMemberFingerprint:
+    name: str
+    timestamp: tuple[int, int, int, int, int, int]
+    compression_method: int
+    external_attributes: int
+    crc32: int
+    compressed_size: int
+    uncompressed_size: int
 
 
 SDIST_ALLOWLIST = (
@@ -515,6 +532,19 @@ def require_reproducible_wheels(first: Path, second: Path) -> tuple[int, str]:
         second_content, _ = _read_stable_file(Path(second))
     except ResolutionError:
         raise DistributionBuildError("exceptional build wheels are unreadable") from None
+    first_inspection = _try_inspect_exceptional_wheel(first_content)
+    second_inspection = _try_inspect_exceptional_wheel(second_content)
+    if first_inspection is not None and second_inspection is not None:
+        first_fingerprints, _first_members, first_record_rows = first_inspection
+        second_fingerprints, _second_members, second_record_rows = second_inspection
+        if first_fingerprints != second_fingerprints:
+            raise DistributionBuildError(
+                "fresh exceptional builds have different ordered ZIP member metadata"
+            )
+        if first_record_rows != second_record_rows:
+            raise DistributionBuildError(
+                "fresh exceptional builds have different ordered canonical RECORD rows"
+            )
     if first_content != second_content:
         raise DistributionBuildError("fresh exceptional builds must be byte-identical")
     return len(first_content), hashlib.sha256(first_content).hexdigest()
@@ -541,37 +571,16 @@ def validate_built_pure_wheel(
     if record.name != spec.name or record.version != spec.version:
         raise DistributionBuildError("built wheel name/version is not approved")
     try:
-        with zipfile.ZipFile(wheel_path) as archive:
-            infos = archive.infolist()
-            if len(infos) != len({info.filename for info in infos}):
-                raise DistributionBuildError("built wheel contains duplicate paths")
-            members = {info.filename: archive.read(info) for info in infos if not info.is_dir()}
-    except (OSError, KeyError, zipfile.BadZipFile):
+        content, _ = _read_stable_file(wheel_path)
+    except ResolutionError:
         raise DistributionBuildError("built wheel is unreadable") from None
-    record_paths = [name for name in members if name.endswith(".dist-info/RECORD")]
-    if len(record_paths) != 1:
-        raise DistributionBuildError("built wheel has no complete RECORD")
-    record_path = record_paths[0]
+    _fingerprints, members, _record_rows = _inspect_exceptional_wheel(content)
     wheel_metadata_paths = [name for name in members if name.endswith(".dist-info/WHEEL")]
     if len(wheel_metadata_paths) != 1:
         raise DistributionBuildError("built wheel has ambiguous WHEEL metadata")
     wheel_message = email.parser.BytesParser().parsebytes(members[wheel_metadata_paths[0]])
     if wheel_message.get("Root-Is-Purelib") != "true":
         raise DistributionBuildError("built wheel is not Root-Is-Purelib: true")
-    for info in infos:
-        name = info.filename
-        if (
-            name.startswith("/")
-            or "\\" in name
-            or any(part in {"", ".", ".."} for part in name.rstrip("/").split("/"))
-        ):
-            raise DistributionBuildError("built wheel contains a noncanonical path")
-        if not info.is_dir() and (
-            name.lower().endswith((".so", ".dylib", ".dll", ".pyd", ".exe"))
-            or ((info.external_attr >> 16) & 0o111)
-        ):
-            raise DistributionBuildError("built wheel contains a native or executable file")
-    _validate_wheel_record(members, record_path)
     return record
 
 
@@ -1670,7 +1679,96 @@ def _stable_stat_identity(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _validate_wheel_record(members: dict[str, bytes], record_path: str) -> None:
+def _try_inspect_exceptional_wheel(
+    content: bytes,
+) -> (
+    tuple[
+        tuple[_WheelMemberFingerprint, ...],
+        dict[str, bytes],
+        tuple[tuple[str, str, str], ...],
+    ]
+    | None
+):
+    try:
+        return _inspect_exceptional_wheel(content)
+    except DistributionBuildError:
+        return None
+
+
+def _inspect_exceptional_wheel(
+    content: bytes,
+) -> tuple[
+    tuple[_WheelMemberFingerprint, ...],
+    dict[str, bytes],
+    tuple[tuple[str, str, str], ...],
+]:
+    fingerprints: list[_WheelMemberFingerprint] = []
+    members: dict[str, bytes] = {}
+    logical_paths: dict[str, bool] = {}
+    seen_names: set[str] = set()
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            infos = archive.infolist()
+            for info in infos:
+                name = info.filename
+                if name in seen_names:
+                    raise DistributionBuildError("built wheel contains duplicate paths")
+                seen_names.add(name)
+                is_directory = info.is_dir()
+                logical_path = name[:-1] if is_directory else name
+                parts = logical_path.split("/")
+                if (
+                    not logical_path
+                    or name.startswith("/")
+                    or "\\" in name
+                    or any(part in {"", ".", ".."} for part in parts)
+                ):
+                    raise DistributionBuildError("built wheel contains a noncanonical path")
+                if logical_path in logical_paths:
+                    raise DistributionBuildError("built wheel contains ambiguous directory paths")
+                logical_paths[logical_path] = is_directory
+                fingerprints.append(
+                    _WheelMemberFingerprint(
+                        name=name,
+                        timestamp=info.date_time,
+                        compression_method=info.compress_type,
+                        external_attributes=info.external_attr,
+                        crc32=info.CRC,
+                        compressed_size=info.compress_size,
+                        uncompressed_size=info.file_size,
+                    )
+                )
+                if is_directory:
+                    continue
+                if name.lower().endswith(".pyc"):
+                    raise DistributionBuildError("built wheel contains a bytecode file")
+                if name.lower().endswith((".so", ".dylib", ".dll", ".pyd", ".exe")) or (
+                    (info.external_attr >> 16) & 0o111
+                ):
+                    raise DistributionBuildError("built wheel contains a native or executable file")
+                member = archive.read(info)
+                if any(root in member for root in _EXCEPTIONAL_BUILD_ROOTS):
+                    raise DistributionBuildError("built wheel contains a stable build root")
+                members[name] = member
+    except (OSError, KeyError, RuntimeError, zipfile.BadZipFile):
+        raise DistributionBuildError("built wheel is unreadable") from None
+    for logical_path in logical_paths:
+        parts = logical_path.split("/")
+        for length in range(1, len(parts)):
+            parent = "/".join(parts[:length])
+            if parent in logical_paths and not logical_paths[parent]:
+                raise DistributionBuildError("built wheel contains ambiguous directory paths")
+    record_paths = [name for name in members if name.endswith(".dist-info/RECORD")]
+    if len(record_paths) != 1:
+        raise DistributionBuildError("built wheel has no complete RECORD")
+    record_rows = _validate_wheel_record(members, record_paths[0])
+    return tuple(fingerprints), members, record_rows
+
+
+def _validate_wheel_record(
+    members: dict[str, bytes],
+    record_path: str,
+) -> tuple[tuple[str, str, str], ...]:
     try:
         text = members[record_path].decode("utf-8")
         rows = list(csv.reader(io.StringIO(text, newline="")))
@@ -1685,6 +1783,14 @@ def _validate_wheel_record(members: dict[str, bytes], record_path: str) -> None:
         records[name] = (digest, size)
     if set(records) != set(members):
         raise DistributionBuildError("built wheel RECORD is incomplete")
+    expected_names = tuple(
+        sorted(
+            (name for name in members if name != record_path),
+            key=lambda value: value.encode("utf-8"),
+        )
+    ) + (record_path,)
+    if tuple(records) != expected_names:
+        raise DistributionBuildError("built wheel RECORD rows are not in canonical order")
     for name, content in members.items():
         digest, size = records[name]
         if name == record_path:
@@ -1694,6 +1800,7 @@ def _validate_wheel_record(members: dict[str, bytes], record_path: str) -> None:
         encoded = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=").decode()
         if digest != f"sha256={encoded}" or size != str(len(content)):
             raise DistributionBuildError("built wheel RECORD hash or size mismatch")
+    return tuple((name, *records[name]) for name in expected_names)
 
 
 def _load_direct_requirements(path: Path) -> tuple[Requirement, ...]:

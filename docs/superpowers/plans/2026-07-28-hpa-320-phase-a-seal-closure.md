@@ -1,5 +1,11 @@
 # HPA-320 Phase A Seal Closure Implementation Plan
 
+> **Status:** Tasks 1-7 were implemented through commit `78b2424`. The remaining
+> native image-bootstrap, calibration, and final-seal work is superseded by
+> [the deterministic OCI seal-closure plan](2026-07-29-hpa-320-deterministic-oci-seal-closure.md).
+> Keep this document as the historical implementation record; do not execute its
+> Tasks 8-9 against the amended design.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development (recommended) or
 > superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox
