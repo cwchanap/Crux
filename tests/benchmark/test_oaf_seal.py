@@ -72,6 +72,13 @@ def _native_host_payload() -> dict[str, object]:
         "runner_arch": "X64",
         "runner_os": "Linux",
         "workflow_commit": "b" * 40,
+        "host_numeric_fingerprint": {
+            "architecture": "x86_64",
+            "cpu_vendor_id": "GenuineIntel",
+            "cpu_family": "6",
+            "cpu_model": "143",
+            "cpu_stepping": "8",
+        },
     }
 
 

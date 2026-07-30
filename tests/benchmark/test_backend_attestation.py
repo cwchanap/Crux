@@ -19,6 +19,7 @@ from src.benchmark.backend_attestation import (
     ExecutionConditions,
     build_changed_file_manifest,
     publish_execution_attestation,
+    validate_execution_attestation,
 )
 from src.benchmark.backend_identity import (
     canonical_json_bytes,
@@ -37,6 +38,59 @@ OAF_CONDITIONS = ExecutionConditions(
     startup_deadline_seconds=120,
     request_deadline_seconds=300,
 )
+HOST_NUMERIC_FINGERPRINT = {
+    "architecture": "x86_64",
+    "cpu_family": "6",
+    "cpu_model": "143",
+    "cpu_stepping": "8",
+    "cpu_vendor_id": "GenuineIntel",
+}
+
+
+def _attestation_payload(*, fingerprint: object = HOST_NUMERIC_FINGERPRINT) -> dict[str, object]:
+    return {
+        "backend_id": "magenta-egmd-tf1-94529798-8hit-v1",
+        "changed_files_manifest": None,
+        "checkout_dirty": False,
+        "cpu_limit": "2",
+        "descriptor_sha256": "a" * 64,
+        "git_commit": "b" * 40,
+        "host_numeric_fingerprint": fingerprint,
+        "memory_bytes": 4_294_967_296,
+        "pid_limit": 128,
+        "request_deadline_seconds": 300,
+        "schema": "crux.backend-execution-attestation/v1",
+        "shm_bytes": 67_108_864,
+        "startup_deadline_seconds": 120,
+        "strict_mode": True,
+        "tmp_bytes": 1_073_741_824,
+    }
+
+
+def test_execution_attestation_loads_typed_exact_diagnostic_fingerprint() -> None:
+    loaded = validate_execution_attestation(
+        canonical_json_bytes(_attestation_payload(), trailing_newline=True),
+        expected_backend_id="magenta-egmd-tf1-94529798-8hit-v1",
+        expected_descriptor_sha256="a" * 64,
+    )
+
+    assert loaded.host_numeric_fingerprint is not None
+    assert loaded.host_numeric_fingerprint.cpu_model == "143"
+
+
+@pytest.mark.parametrize("forbidden_key", ["cpu_microcode", "kernel_release"])
+def test_execution_attestation_rejects_mutable_fingerprint_fields(forbidden_key: str) -> None:
+    fingerprint = {**HOST_NUMERIC_FINGERPRINT, forbidden_key: "mutable"}
+
+    with pytest.raises(AttestationError, match="fingerprint"):
+        validate_execution_attestation(
+            canonical_json_bytes(
+                _attestation_payload(fingerprint=fingerprint),
+                trailing_newline=True,
+            ),
+            expected_backend_id="magenta-egmd-tf1-94529798-8hit-v1",
+            expected_descriptor_sha256="a" * 64,
+        )
 
 
 def git(repository: Path, *arguments: str) -> bytes:
@@ -515,6 +569,92 @@ def test_attestation_tracks_whole_checkout_dirty_but_null_relevant_manifest(
     assert payload["changed_files_manifest"] is None
 
 
+def test_attestation_publishes_verified_identical_logical_cpu_facts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = create_repository(tmp_path)
+    manifest = write_source_manifest(repository)
+    monkeypatch.setattr(
+        backend_attestation,
+        "_collect_host_numeric_fingerprints",
+        lambda: (dict(HOST_NUMERIC_FINGERPRINT), dict(HOST_NUMERIC_FINGERPRINT)),
+        raising=False,
+    )
+
+    published = publish_execution_attestation(
+        repository,
+        repository / "artifacts" / "backend",
+        backend_id="magenta-egmd-tf1-94529798-8hit-v1",
+        descriptor_sha256="a" * 64,
+        source_manifests=(manifest,),
+        strict_mode=True,
+        conditions=OAF_CONDITIONS,
+        now=FIXED_UTC,
+        run_id=FIXED_UUID,
+    )
+
+    payload = strict_json_loads(published.path.read_bytes()[:-1], require_canonical=True)
+
+    assert isinstance(payload, dict)
+    assert payload["host_numeric_fingerprint"] == HOST_NUMERIC_FINGERPRINT
+
+
+def test_attestation_rejects_inconsistent_logical_cpu_facts_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = create_repository(tmp_path)
+    manifest = write_source_manifest(repository)
+    inconsistent = {**HOST_NUMERIC_FINGERPRINT, "cpu_stepping": "9"}
+    monkeypatch.setattr(
+        backend_attestation,
+        "_collect_host_numeric_fingerprints",
+        lambda: (dict(HOST_NUMERIC_FINGERPRINT), inconsistent),
+        raising=False,
+    )
+
+    with pytest.raises(AttestationError, match="logical CPU"):
+        publish_execution_attestation(
+            repository,
+            repository / "artifacts" / "backend",
+            backend_id="magenta-egmd-tf1-94529798-8hit-v1",
+            descriptor_sha256="a" * 64,
+            source_manifests=(manifest,),
+            strict_mode=True,
+            conditions=OAF_CONDITIONS,
+            now=FIXED_UTC,
+            run_id=FIXED_UUID,
+        )
+
+    assert not (repository / "artifacts").exists()
+
+
+def test_invalid_host_cpu_facts_publish_no_changed_file_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = create_repository(tmp_path)
+    manifest = write_source_manifest(repository)
+    (repository / "src" / "inference" / "model.py").write_text("MODEL = 2\n", encoding="utf-8")
+    monkeypatch.setattr(backend_attestation, "_collect_host_numeric_fingerprints", lambda: ())
+
+    with pytest.raises(AttestationError, match="requires visible logical CPUs"):
+        publish_execution_attestation(
+            repository,
+            repository / "artifacts" / "backend",
+            backend_id="magenta-egmd-tf1-94529798-8hit-v1",
+            descriptor_sha256="a" * 64,
+            source_manifests=(manifest,),
+            strict_mode=False,
+            conditions=OAF_CONDITIONS,
+            now=FIXED_UTC,
+            run_id=FIXED_UUID,
+        )
+
+    assert not (repository / "artifacts").exists()
+
+
 def test_changed_file_and_attestation_are_both_immutable_canonical_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -570,6 +710,7 @@ def test_changed_file_and_attestation_are_both_immutable_canonical_artifacts(
         "backend_id",
         "descriptor_sha256",
         "git_commit",
+        "host_numeric_fingerprint",
         "checkout_dirty",
         "strict_mode",
         "changed_files_manifest",

@@ -20,6 +20,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, cast
 
+from src.benchmark.backend_attestation import (
+    AttestationError,
+    HostNumericFingerprint,
+    parse_host_numeric_fingerprint,
+)
 from src.benchmark.backend_identity import (
     JsonValue,
     StrictJsonError,
@@ -124,6 +129,7 @@ class NativeHostEvidence:
     payload: Mapping[str, JsonValue]
     sha256: str
     official_execution_allowed: bool
+    host_numeric_fingerprint: HostNumericFingerprint = field(init=False)
 
     def __post_init__(self) -> None:
         plain = _plain_json(self.payload)
@@ -138,6 +144,10 @@ class NativeHostEvidence:
         else:
             raise ValueError("native host evidence kind is unsupported")
         try:
+            fingerprint = parse_host_numeric_fingerprint(plain["host_numeric_fingerprint"])
+        except AttestationError as error:
+            raise ValueError(str(error)) from None
+        try:
             require_sha256(self.sha256, "native host evidence SHA-256")
         except StrictJsonError as error:
             raise ValueError(str(error)) from None
@@ -146,6 +156,7 @@ class NativeHostEvidence:
         if self.official_execution_allowed is not True:
             raise ValueError("accepted native evidence must allow official execution")
         object.__setattr__(self, "payload", cast(Mapping[str, JsonValue], _deep_freeze(plain)))
+        object.__setattr__(self, "host_numeric_fingerprint", fingerprint)
 
 
 def _validate_github_hosted(payload: dict[str, JsonValue]) -> None:
@@ -159,6 +170,7 @@ def _validate_github_hosted(payload: dict[str, JsonValue]) -> None:
             "runner_arch",
             "runner_os",
             "workflow_commit",
+            "host_numeric_fingerprint",
         },
         "GitHub-hosted evidence",
     )
@@ -179,7 +191,13 @@ def _validate_github_hosted(payload: dict[str, JsonValue]) -> None:
 def _validate_orchestrator(payload: dict[str, JsonValue]) -> None:
     _require_exact_keys(
         payload,
-        {"attestation_sha256", "physical_architecture", "signature", "worker_id"},
+        {
+            "attestation_sha256",
+            "host_numeric_fingerprint",
+            "physical_architecture",
+            "signature",
+            "worker_id",
+        },
         "orchestrator evidence",
     )
     if payload["physical_architecture"] != "linux/amd64":
@@ -192,7 +210,14 @@ def _validate_orchestrator(payload: dict[str, JsonValue]) -> None:
 def _validate_approved_local(payload: dict[str, JsonValue]) -> None:
     _require_exact_keys(
         payload,
-        {"approval_sha256", "daemon_id", "host_architecture", "host_os", "worker_id"},
+        {
+            "approval_sha256",
+            "daemon_id",
+            "host_architecture",
+            "host_numeric_fingerprint",
+            "host_os",
+            "worker_id",
+        },
         "approved local evidence",
     )
     if payload["host_os"] != "Linux" or payload["host_architecture"] != "x86_64":

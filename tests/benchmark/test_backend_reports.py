@@ -343,7 +343,28 @@ def test_report_statuses_require_exact_exit_codes(
         record_type(payload)
 
 
-def test_errors_and_verification_artifacts_are_sorted_canonically() -> None:
+def test_errors_are_normalized_unordered_facts_not_causal_sequence() -> None:
+    """The deterministic order supports hashing; bounded stderr remains causal evidence."""
+    report = VerificationReport(
+        make_verification_payload(
+            status="failed",
+            exit_code=2,
+            errors=[
+                {"code": "z_error", "message": "first"},
+                {"code": "a_error", "message": "z message"},
+                {"code": "a_error", "message": "a message"},
+            ],
+        )
+    )
+
+    assert report.payload["errors"] == [
+        {"code": "a_error", "message": "a message"},
+        {"code": "a_error", "message": "z message"},
+        {"code": "z_error", "message": "first"},
+    ]
+
+
+def test_verification_artifacts_are_sorted_canonically() -> None:
     report = VerificationReport(
         make_verification_payload(
             status="failed",
@@ -353,11 +374,7 @@ def test_errors_and_verification_artifacts_are_sorted_canonically() -> None:
                 {"role": "a", "path": "z.json", "sha256": "c" * 64},
                 {"role": "a", "path": "a.json", "sha256": "d" * 64},
             ],
-            errors=[
-                {"code": "z_error", "message": "first"},
-                {"code": "a_error", "message": "z message"},
-                {"code": "a_error", "message": "a message"},
-            ],
+            errors=[{"code": "backend_failed", "message": "Backend failed."}],
         )
     )
 
@@ -365,11 +382,6 @@ def test_errors_and_verification_artifacts_are_sorted_canonically() -> None:
         {"role": "a", "path": "a.json", "sha256": "d" * 64},
         {"role": "a", "path": "z.json", "sha256": "c" * 64},
         {"role": "z", "path": "b.json", "sha256": "b" * 64},
-    ]
-    assert report.payload["errors"] == [
-        {"code": "a_error", "message": "a message"},
-        {"code": "a_error", "message": "z message"},
-        {"code": "z_error", "message": "first"},
     ]
 
 

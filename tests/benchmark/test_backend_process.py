@@ -26,6 +26,13 @@ from src.benchmark.backend_process import (
 from src.benchmark.backends.base import BackendFatalFailure
 
 FAKE_RUNNER = Path(__file__).parents[1] / "fixtures" / "fake_oaf_runner.py"
+HOST_NUMERIC_FINGERPRINT = {
+    "architecture": "x86_64",
+    "cpu_vendor_id": "GenuineIntel",
+    "cpu_family": "6",
+    "cpu_model": "143",
+    "cpu_stepping": "8",
+}
 
 
 def _canonical_sha256(payload: dict[str, object]) -> str:
@@ -199,6 +206,7 @@ def test_launch_profile_is_frozen_and_rechecks_mount_identity(tmp_path: Path) ->
                 "runner_arch": "X64",
                 "runner_os": "Linux",
                 "workflow_commit": "b" * 40,
+                "host_numeric_fingerprint": HOST_NUMERIC_FINGERPRINT,
             },
         ),
         (
@@ -208,6 +216,7 @@ def test_launch_profile_is_frozen_and_rechecks_mount_identity(tmp_path: Path) ->
                 "physical_architecture": "linux/amd64",
                 "signature": "ed25519:abc",
                 "worker_id": "worker-01",
+                "host_numeric_fingerprint": HOST_NUMERIC_FINGERPRINT,
             },
         ),
         (
@@ -218,6 +227,7 @@ def test_launch_profile_is_frozen_and_rechecks_mount_identity(tmp_path: Path) ->
                 "host_architecture": "x86_64",
                 "host_os": "Linux",
                 "worker_id": "seal-host-01",
+                "host_numeric_fingerprint": HOST_NUMERIC_FINGERPRINT,
             },
         ),
     ],
@@ -240,6 +250,43 @@ def test_native_host_evidence_accepts_only_exact_official_forms(
             evidence.payload["approved_labels"].append("ARM64")  # type: ignore[union-attr]
 
 
+def test_native_host_evidence_requires_the_exact_stable_fingerprint() -> None:
+    payload = {
+        "api_record_sha256": "a" * 64,
+        "approved_labels": ["Linux", "X64"],
+        "job_id": 123,
+        "run_url": "https://github.com/acme/crux/actions/runs/456/job/123",
+        "runner_arch": "X64",
+        "runner_os": "Linux",
+        "workflow_commit": "b" * 40,
+    }
+
+    with pytest.raises(ValueError, match="exact schema"):
+        NativeHostEvidence(
+            kind="github_hosted",
+            payload=payload,
+            sha256=_canonical_sha256(payload),
+            official_execution_allowed=True,
+        )
+
+    fingerprint = {
+        "architecture": "x86_64",
+        "cpu_vendor_id": "GenuineIntel",
+        "cpu_family": "6",
+        "cpu_model": "143",
+        "cpu_stepping": "8",
+    }
+    evidence_payload = {**payload, "host_numeric_fingerprint": fingerprint}
+    evidence = NativeHostEvidence(
+        kind="github_hosted",
+        payload=evidence_payload,
+        sha256=_canonical_sha256(evidence_payload),
+        official_execution_allowed=True,
+    )
+
+    assert evidence.payload["host_numeric_fingerprint"] == fingerprint
+
+
 def test_native_evidence_rejects_hash_shape_and_policy_drift() -> None:
     payload = {
         "api_record_sha256": "a" * 64,
@@ -249,6 +296,7 @@ def test_native_evidence_rejects_hash_shape_and_policy_drift() -> None:
         "runner_arch": "X64",
         "runner_os": "Linux",
         "workflow_commit": "b" * 40,
+        "host_numeric_fingerprint": HOST_NUMERIC_FINGERPRINT,
     }
     for changed in [
         {**payload, "runner_arch": "ARM64"},

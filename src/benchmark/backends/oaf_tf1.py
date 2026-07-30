@@ -355,6 +355,9 @@ class OafTf1Backend:
             source_manifests=source_manifests,
             strict_mode=self._config.strict_checkout,
             conditions=conditions,
+            expected_host_numeric_fingerprint=(
+                self._config.native_host_evidence.host_numeric_fingerprint
+            ),
         )
         return BackendVerification(
             status="verified",
@@ -373,6 +376,7 @@ class OafTf1Backend:
                 prediction=smoke_artifact,
             ),
             errors=(),
+            host_numeric_fingerprint=self._config.native_host_evidence.host_numeric_fingerprint,
         )
 
     def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
@@ -579,6 +583,7 @@ class OafTf1Backend:
             tensor_coverage=_empty_tensor_check(),
             smoke=_empty_smoke_check(),
             errors=(error,),
+            host_numeric_fingerprint=None,
         )
 
     def _unsupported_verification(
@@ -617,6 +622,7 @@ class OafTf1Backend:
                     message="Official OaF execution requires a native Linux AMD64 worker.",
                 ),
             ),
+            host_numeric_fingerprint=self._config.native_host_evidence.host_numeric_fingerprint,
         )
 
 

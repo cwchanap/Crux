@@ -651,9 +651,9 @@ def test_validate_placement_sample_rates_caches_sf_info_calls(tmp_path: Path):
         result = render_audio._validate_placement_sample_rates(placements)
 
     assert result is None
-    assert call_count == 1, (
-        f"Expected 1 sf.info call for 5 placements of same sample, got {call_count}"
-    )
+    assert (
+        call_count == 1
+    ), f"Expected 1 sf.info call for 5 placements of same sample, got {call_count}"
 
 
 def test_plan_render_song_resolves_windows_backslash_sample_paths(tmp_path: Path):

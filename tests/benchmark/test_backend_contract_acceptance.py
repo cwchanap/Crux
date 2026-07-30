@@ -11,6 +11,7 @@ from uuid import UUID
 
 import pytest
 
+from src.benchmark.backend_attestation import HostNumericFingerprint
 from src.benchmark.backend_identity import (
     BackendDescriptor,
     JsonValue,
@@ -25,6 +26,8 @@ from src.benchmark.backend_publication import (
 from src.benchmark.backend_registry import (
     HEURISTIC_BACKEND_ID,
     OFFICIAL_BACKEND_ID,
+    BackendLockUnavailable,
+    BackendRegistration,
     BackendRegistry,
 )
 from src.benchmark.backends import (
@@ -55,6 +58,13 @@ SECOND_TIME = datetime(2026, 7, 27, 4, 5, 6, 789012, tzinfo=UTC)
 OAF_TIME = datetime(2026, 7, 27, 7, 8, 9, 123456, tzinfo=UTC)
 SOURCE_AUDIO_ID = "曲・🥁-é"
 INPUT_VIEW_ID = "正規化-44k1"
+HOST_NUMERIC_FINGERPRINT = HostNumericFingerprint(
+    architecture="x86_64",
+    cpu_vendor_id="GenuineIntel",
+    cpu_family="6",
+    cpu_model="143",
+    cpu_stepping="8",
+)
 
 PCM_BYTES = b"\x00\x00" * 4
 WAV_BYTES = (
@@ -312,6 +322,7 @@ class DeterministicFakeBackend:
                 prediction=self._support.smoke_prediction,
             ),
             errors=(),
+            host_numeric_fingerprint=HOST_NUMERIC_FINGERPRINT,
         )
 
     def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
@@ -369,6 +380,13 @@ def _support_artifacts(root: Path, descriptor: BackendDescriptor) -> SupportArti
             "cpu_limit": "1" if container else None,
             "descriptor_sha256": descriptor.sha256,
             "git_commit": "a" * 40,
+            "host_numeric_fingerprint": {
+                "architecture": "x86_64",
+                "cpu_family": "6",
+                "cpu_model": "143",
+                "cpu_stepping": "8",
+                "cpu_vendor_id": "GenuineIntel",
+            },
             "memory_bytes": 1024 if container else None,
             "pid_limit": 16 if container else None,
             "request_deadline_seconds": 60,
@@ -463,6 +481,14 @@ def _request(
     )
 
 
+def _read_report(outcome: TranscribeOneOutcome) -> dict[str, JsonValue]:
+    content = read_regular_file_no_follow(outcome.report_artifact.path)
+    assert content.endswith(b"\n")
+    report = strict_json_loads(content[:-1], require_canonical=True)
+    assert isinstance(report, dict)
+    return cast(dict[str, JsonValue], report)
+
+
 def _run_fake_transcription(
     root: Path,
     *,
@@ -482,7 +508,13 @@ def _run_fake_transcription(
 
     registry = BackendRegistry(
         default_backend_id=backend_id,
-        factories={backend_id: create_backend},
+        registrations={
+            backend_id: BackendRegistration(
+                backend_id=backend_id,
+                seal_state="sealed",
+                factory=create_backend,
+            )
+        },
     )
     request = _request(root, provenance)
     outcome = run_transcribe_one(
@@ -505,10 +537,7 @@ def _run_fake_transcription(
     assert render_prediction_artifact(prediction.prediction) == prediction_bytes
 
     report_bytes = read_regular_file_no_follow(outcome.report_artifact.path)
-    assert report_bytes.endswith(b"\n")
-    report_value = strict_json_loads(report_bytes[:-1], require_canonical=True)
-    assert isinstance(report_value, dict)
-    report = cast(dict[str, JsonValue], report_value)
+    report = _read_report(outcome)
     items = report["items"]
     assert isinstance(items, list) and len(items) == 1
     item = items[0]
@@ -668,3 +697,86 @@ def test_fake_backend_repeats_byte_identical_prediction(
         / "reports"
         / f"20260727T040506789012Z-{SECOND_UUID}.json"
     )
+
+
+def test_default_oaf_sealed_integrity_failure_does_not_publish_prediction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Catch sealed-lock failures being downgraded or opening a prediction output."""
+
+    monkeypatch.chdir(tmp_path)
+
+    def missing_lock() -> DeterministicFakeBackend:
+        raise BackendLockUnavailable("missing lock")
+
+    request = _request(tmp_path, "direct")
+    outcome = run_transcribe_one(
+        request,
+        registry=BackendRegistry(
+            default_backend_id=OFFICIAL_BACKEND_ID,
+            registrations={
+                OFFICIAL_BACKEND_ID: BackendRegistration(
+                    backend_id=OFFICIAL_BACKEND_ID,
+                    seal_state="sealed",
+                    factory=missing_lock,
+                )
+            },
+        ),
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.exit_code == 2
+    assert not request.output_path.exists()
+    assert outcome.report_artifact.path.parent.parent.name == OFFICIAL_BACKEND_ID
+    report = _read_report(outcome)
+    assert report["items"] == []
+    assert report["errors"] == [
+        {
+            "code": "backend_integrity_unavailable",
+            "message": "Backend integrity is unavailable.",
+        }
+    ]
+
+
+def test_default_oaf_preseal_failure_does_not_publish_prediction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Catch default OaF pre-seal entries being allowed to publish predictions."""
+
+    monkeypatch.chdir(tmp_path)
+
+    def preseal_backend() -> DeterministicFakeBackend:
+        return DeterministicFakeBackend(
+            OAF_DESCRIPTOR,
+            _support_artifacts(tmp_path, OAF_DESCRIPTOR),
+        )
+
+    request = _request(tmp_path, "direct")
+    outcome = run_transcribe_one(
+        request,
+        registry=BackendRegistry(
+            default_backend_id=OFFICIAL_BACKEND_ID,
+            registrations={
+                OFFICIAL_BACKEND_ID: BackendRegistration(
+                    backend_id=OFFICIAL_BACKEND_ID,
+                    seal_state="preseal",
+                    factory=preseal_backend,
+                )
+            },
+        ),
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.exit_code == 1
+    assert not request.output_path.exists()
+    assert outcome.report_artifact.path.parent.parent.name == OFFICIAL_BACKEND_ID
+    report = _read_report(outcome)
+    assert report["items"] == []
+    assert report["errors"] == [
+        {
+            "code": "backend_not_sealed",
+            "message": "Backend is not sealed.",
+        }
+    ]

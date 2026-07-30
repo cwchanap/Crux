@@ -16,6 +16,7 @@ from uuid import UUID
 import pytest
 
 from src.benchmark import transcription as transcription_module
+from src.benchmark.backend_attestation import HostNumericFingerprint
 from src.benchmark.backend_identity import (
     BackendDescriptor,
     JsonValue,
@@ -28,6 +29,7 @@ from src.benchmark.backend_registry import (
     LEGACY_TF2_BACKEND_ID,
     OFFICIAL_BACKEND_ID,
     BackendLockUnavailable,
+    BackendRegistration,
     BackendRegistry,
     default_backend_registry,
 )
@@ -62,6 +64,13 @@ from src.benchmark.transcription import (
 
 FIXED_UTC = datetime(2026, 7, 27, 1, 2, 3, 456789, tzinfo=UTC)
 FIXED_UUID = UUID("12345678-1234-4678-9234-567812345678")
+HOST_NUMERIC_FINGERPRINT = HostNumericFingerprint(
+    architecture="x86_64",
+    cpu_vendor_id="GenuineIntel",
+    cpu_family="6",
+    cpu_model="143",
+    cpu_stepping="8",
+)
 HEURISTIC_DESCRIPTOR_PAYLOAD = {
     "adapter_source_manifest_sha256": "7" * 64,
     "architecture_id": "librosa-onset-centroid-zcr-v1",
@@ -204,6 +213,13 @@ def execution_attestation_content(backend_id: str, descriptor_sha256: str) -> by
             "cpu_limit": "1" if container else None,
             "descriptor_sha256": descriptor_sha256,
             "git_commit": "a" * 40,
+            "host_numeric_fingerprint": {
+                "architecture": "x86_64",
+                "cpu_family": "6",
+                "cpu_model": "143",
+                "cpu_stepping": "8",
+                "cpu_vendor_id": "GenuineIntel",
+            },
             "memory_bytes": 1024 if container else None,
             "pid_limit": 16 if container else None,
             "request_deadline_seconds": 60,
@@ -260,6 +276,7 @@ def heuristic_verification(
             prediction=None,
         ),
         errors=errors,
+        host_numeric_fingerprint=HOST_NUMERIC_FINGERPRINT,
     )
 
 
@@ -335,6 +352,7 @@ def oaf_verification(
             ),
         ),
         errors=errors,
+        host_numeric_fingerprint=HOST_NUMERIC_FINGERPRINT,
     )
 
 
@@ -494,7 +512,77 @@ def registry_for(
             phases.append("create")
         return backend
 
-    return BackendRegistry(default_backend_id=backend_id, factories={backend_id: factory})
+    return BackendRegistry(
+        default_backend_id=backend_id,
+        registrations={
+            backend_id: BackendRegistration(
+                backend_id=backend_id,
+                seal_state="sealed",
+                factory=factory,
+            )
+        },
+    )
+
+
+def test_preseal_backend_fails_before_output_resolution_or_heuristic_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    official_factory_calls = 0
+    heuristic_factory_calls = 0
+
+    def unexpected_official_factory() -> FakeBackend:
+        nonlocal official_factory_calls
+        official_factory_calls += 1
+        return FakeBackend(heuristic_verification())
+
+    def unexpected_heuristic_factory() -> FakeBackend:
+        nonlocal heuristic_factory_calls
+        heuristic_factory_calls += 1
+        return FakeBackend(heuristic_verification())
+
+    real_resolve_output_path = transcription_module._resolve_output_path
+
+    def resolve_output_path_after_preseal(*args: object, **kwargs: object) -> Path:
+        assert official_factory_calls == 0
+        assert heuristic_factory_calls == 0
+        return real_resolve_output_path(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        transcription_module, "_resolve_output_path", resolve_output_path_after_preseal
+    )
+    request = direct_request(tmp_path, backend_id=None)
+    outcome = run_transcribe_one(
+        request,
+        registry=BackendRegistry(
+            default_backend_id=OFFICIAL_BACKEND_ID,
+            registrations={
+                OFFICIAL_BACKEND_ID: BackendRegistration(
+                    backend_id=OFFICIAL_BACKEND_ID,
+                    seal_state="preseal",
+                    factory=unexpected_official_factory,
+                ),
+                HEURISTIC_BACKEND_ID: BackendRegistration(
+                    backend_id=HEURISTIC_BACKEND_ID,
+                    seal_state="sealed",
+                    factory=unexpected_heuristic_factory,
+                ),
+            },
+        ),
+        now=FIXED_UTC,
+        run_id=FIXED_UUID,
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.exit_code == 1
+    assert not request.output_path.exists()
+    assert report_payload(outcome)["items"] == []
+    assert report_payload(outcome)["errors"] == [
+        {"code": "backend_not_sealed", "message": "Backend is not sealed."}
+    ]
+    assert official_factory_calls == 0
+    assert heuristic_factory_calls == 0
 
 
 def report_payload(outcome: TranscribeOneOutcome) -> dict[str, JsonValue]:
@@ -1268,6 +1356,30 @@ def test_locked_backend_requires_positive_integer_audio_frame_bound(
     assert backend.close_calls == 1
 
 
+def test_verified_oaf_rejects_fingerprint_that_disagrees_with_its_attestation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    verification = replace(
+        oaf_verification(),
+        host_numeric_fingerprint=replace(HOST_NUMERIC_FINGERPRINT, cpu_model="144"),
+    )
+    backend = FakeBackend(verification, prediction_factory=oaf_prediction)
+
+    outcome = run_transcribe_one(
+        direct_request(tmp_path, backend_id=OFFICIAL_BACKEND_ID),
+        registry=registry_for(backend, backend_id=OFFICIAL_BACKEND_ID),
+        now=FIXED_UTC,
+        run_id=FIXED_UUID,
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.exit_code == 2
+    assert report_payload(outcome)["errors"][0]["code"] == "invalid_backend_verification"  # type: ignore[index]
+    assert backend.transcribe_calls == 0
+
+
 def test_locked_backend_applies_positive_audio_frame_bound(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1796,7 +1908,7 @@ def test_unknown_backend_publishes_typed_failure_in_report_only_namespace(
     request = direct_request(tmp_path, backend_id="../../unknown")
     registry = BackendRegistry(
         default_backend_id=OFFICIAL_BACKEND_ID,
-        factories={},
+        registrations={},
     )
 
     outcome = run_transcribe_one(
@@ -1858,9 +1970,17 @@ def test_unexpected_registered_factory_exception_fails_closed_without_fallback(
 
     registry = BackendRegistry(
         default_backend_id=OFFICIAL_BACKEND_ID,
-        factories={
-            OFFICIAL_BACKEND_ID: unexpected,
-            HEURISTIC_BACKEND_ID: fallback,
+        registrations={
+            OFFICIAL_BACKEND_ID: BackendRegistration(
+                backend_id=OFFICIAL_BACKEND_ID,
+                seal_state="sealed",
+                factory=unexpected,
+            ),
+            HEURISTIC_BACKEND_ID: BackendRegistration(
+                backend_id=HEURISTIC_BACKEND_ID,
+                seal_state="sealed",
+                factory=fallback,
+            ),
         },
     )
     request = direct_request(tmp_path, backend_id=None)
@@ -1885,13 +2005,17 @@ def test_unexpected_registered_factory_exception_fails_closed_without_fallback(
 
 
 @pytest.mark.parametrize(
-    "factory_error",
-    [ImportError("missing"), BackendLockUnavailable("lock")],
+    ("factory_error", "expected_code"),
+    [
+        (ImportError("missing"), "backend_unavailable"),
+        (BackendLockUnavailable("lock"), "backend_integrity_unavailable"),
+    ],
 )
-def test_known_unavailable_factory_publishes_failed_report_without_fallback(
+def test_sealed_integrity_failure_publishes_failed_report_without_fallback(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     factory_error: BaseException,
+    expected_code: str,
 ) -> None:
     monkeypatch.chdir(tmp_path)
     fallback_calls = 0
@@ -1906,9 +2030,17 @@ def test_known_unavailable_factory_publishes_failed_report_without_fallback(
 
     registry = BackendRegistry(
         default_backend_id=OFFICIAL_BACKEND_ID,
-        factories={
-            OFFICIAL_BACKEND_ID: unavailable,
-            HEURISTIC_BACKEND_ID: fallback,
+        registrations={
+            OFFICIAL_BACKEND_ID: BackendRegistration(
+                backend_id=OFFICIAL_BACKEND_ID,
+                seal_state="sealed",
+                factory=unavailable,
+            ),
+            HEURISTIC_BACKEND_ID: BackendRegistration(
+                backend_id=HEURISTIC_BACKEND_ID,
+                seal_state="sealed",
+                factory=fallback,
+            ),
         },
     )
     request = direct_request(tmp_path, backend_id=None)
@@ -1923,7 +2055,7 @@ def test_known_unavailable_factory_publishes_failed_report_without_fallback(
     assert outcome.status == "failed"
     assert outcome.exit_code == 2
     assert outcome.report_artifact.path.parent.parent.name == OFFICIAL_BACKEND_ID
-    assert report_payload(outcome)["errors"][0]["code"] == "backend_unavailable"  # type: ignore[index]
+    assert report_payload(outcome)["errors"][0]["code"] == expected_code  # type: ignore[index]
     assert fallback_calls == 0
 
 
@@ -2430,7 +2562,13 @@ def test_repository_root_is_captured_before_callbacks_can_change_cwd(
             request,
             registry=BackendRegistry(
                 default_backend_id=HEURISTIC_BACKEND_ID,
-                factories={HEURISTIC_BACKEND_ID: factory},
+                registrations={
+                    HEURISTIC_BACKEND_ID: BackendRegistration(
+                        backend_id=HEURISTIC_BACKEND_ID,
+                        seal_state="sealed",
+                        factory=factory,
+                    )
+                },
             ),
             now=FIXED_UTC,
             run_id=FIXED_UUID,
@@ -2802,7 +2940,13 @@ def test_unclassified_factory_file_not_found_is_backend_failure(
         request,
         registry=BackendRegistry(
             default_backend_id=OFFICIAL_BACKEND_ID,
-            factories={OFFICIAL_BACKEND_ID: missing_unrelated_file},
+            registrations={
+                OFFICIAL_BACKEND_ID: BackendRegistration(
+                    backend_id=OFFICIAL_BACKEND_ID,
+                    seal_state="sealed",
+                    factory=missing_unrelated_file,
+                )
+            },
         ),
         now=FIXED_UTC,
         run_id=FIXED_UUID,

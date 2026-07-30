@@ -221,6 +221,42 @@ def derive_item_id(
     return f"sha256:{sha256_hex(canonical_json_bytes(payload))}"
 
 
+def validate_schema_golden(schema: str, content: bytes) -> None:
+    if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+        raise ReportValidationError("schema golden must have one final newline")
+    value = strict_json_loads(content[:-1], require_canonical=True)
+    if not isinstance(value, dict):
+        raise ReportValidationError("report schema golden must be an object")
+    if schema == _VERIFICATION_SCHEMA:
+        VerificationReport(value)
+        return
+    if schema == _EXECUTION_SCHEMA:
+        ExecutionReport(value)
+        return
+    if schema == _LEGACY_SCHEMA:
+        LegacyScoreReport(value)
+        return
+    if schema == _ITEM_ID_SCHEMA:
+        if set(value) != {
+            "input_audio_sha256",
+            "input_view_id",
+            "schema",
+            "source_audio_id",
+            "source_audio_sha256",
+        }:
+            raise ReportValidationError("execution item identity must contain the exact key set")
+        if value["schema"] != _ITEM_ID_SCHEMA:
+            raise ReportValidationError("execution item identity schema is invalid")
+        derive_item_id(
+            source_audio_id=value["source_audio_id"],  # type: ignore[arg-type]
+            source_audio_sha256=value["source_audio_sha256"],  # type: ignore[arg-type]
+            input_view_id=value["input_view_id"],  # type: ignore[arg-type]
+            input_audio_sha256=value["input_audio_sha256"],  # type: ignore[arg-type]
+        )
+        return
+    raise ValueError("unsupported schema golden")
+
+
 # The optional retained root anchor is part of the security boundary.
 # pylint: disable-next=too-many-arguments
 def publish_operational_report(
@@ -294,7 +330,7 @@ def _normalize_verification(payload: Mapping[str, object]) -> dict[str, JsonValu
         normalized,
         {
             "verified": 0,
-            "failed": 2,
+            "failed": (1, 2),
             "environment_unsupported": 1,
         },
     )
@@ -307,6 +343,7 @@ def _normalize_verification(payload: Mapping[str, object]) -> dict[str, JsonValu
     normalized["smoke"] = _normalize_smoke(normalized["smoke"])
     normalized["artifacts"] = _normalize_artifacts(normalized["artifacts"])
     normalized["errors"] = _normalize_errors(normalized["errors"])
+    _require_preseal_exit_code(normalized)
     if normalized["status"] == "verified":
         if normalized["errors"]:
             raise ReportValidationError("complete verification cannot carry errors")
@@ -329,7 +366,7 @@ def _normalize_execution(payload: Mapping[str, object]) -> dict[str, JsonValue]:
         {
             "complete": 0,
             "partial": 1,
-            "failed": 2,
+            "failed": (1, 2),
             "environment_unsupported": 1,
         },
     )
@@ -350,6 +387,7 @@ def _normalize_execution(payload: Mapping[str, object]) -> dict[str, JsonValue]:
         for item in items
     ]
     normalized["errors"] = _normalize_errors(normalized["errors"])
+    _require_preseal_exit_code(normalized)
     if normalized["status"] == "complete":
         if normalized["errors"]:
             raise ReportValidationError("complete execution cannot carry errors")
@@ -504,11 +542,20 @@ def _require_matching_identity(
 
 def _require_status_exit_code(
     payload: dict[str, object],
-    expected_codes: dict[str, int],
+    expected_codes: dict[str, int | tuple[int, ...]],
 ) -> None:
     status = cast(str, payload["status"])
-    if payload["exit_code"] != expected_codes[status]:
+    expected = expected_codes[status]
+    if payload["exit_code"] not in (expected if isinstance(expected, tuple) else (expected,)):
         raise ReportValidationError(f"{status} status has an invalid exit_code")
+
+
+def _require_preseal_exit_code(payload: dict[str, JsonValue]) -> None:
+    if payload["status"] != "failed" or payload["exit_code"] != 1:
+        return
+    errors = cast(list[dict[str, JsonValue]], payload["errors"])
+    if [error["code"] for error in errors] != ["backend_not_sealed"]:
+        raise ReportValidationError("failed exit one requires backend_not_sealed")
 
 
 def _normalize_tensor_coverage(value: object) -> dict[str, JsonValue]:
@@ -612,6 +659,7 @@ def _normalize_artifacts(value: object) -> list[JsonValue]:
 
 
 def _normalize_errors(value: object) -> list[JsonValue]:
+    """Normalize errors as unordered facts; bounded stderr preserves causal diagnostics."""
     if not isinstance(value, (list, tuple)):
         raise ReportValidationError("errors must be an array")
     errors: list[dict[str, JsonValue]] = []
