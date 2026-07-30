@@ -268,7 +268,7 @@ _MountIdentity = tuple[int, int, int]
 # pylint: disable=too-many-instance-attributes
 @dataclass(frozen=True)
 class RunnerLaunchProfile:
-    image_manifest_digest: str
+    image_config_digest: str
     backend_lock_path: Path
     runtime_lock_path: Path
     seal_evidence_path: Path
@@ -291,10 +291,10 @@ class RunnerLaunchProfile:
     _mount_identities: Mapping[str, _MountIdentity] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.image_manifest_digest, str) or not _DIGEST.fullmatch(
-            self.image_manifest_digest
+        if not isinstance(self.image_config_digest, str) or not _DIGEST.fullmatch(
+            self.image_config_digest
         ):
-            raise ValueError("image manifest digest must be immutable sha256")
+            raise ValueError("image config digest must be immutable sha256")
         uid = _positive_integer(self.uid, "runtime UID")
         gid = _positive_integer(self.gid, "runtime GID")
         if uid == 0 or gid == 0:
@@ -423,7 +423,7 @@ def build_docker_command(profile: RunnerLaunchProfile) -> list[str]:
         for source, destination in mounts
     )
     command.extend(f"--env={key}={profile.environment[key]}" for key in sorted(profile.environment))
-    command.append(profile.image_manifest_digest)
+    command.append(profile.image_config_digest)
     return command
 
 

@@ -801,9 +801,9 @@ def _launch_profile(config: OafBackendConfig, locks: _Locks) -> RunnerLaunchProf
     seal = locks.seal.payload
     runtime = locks.runtime.payload
     return RunnerLaunchProfile(
-        image_manifest_digest=cast(
+        image_config_digest=cast(
             str,
-            locks.backend.descriptor.payload["runtime_image_manifest_digest"],
+            runtime["runtime_image_config_digest"],
         ),
         backend_lock_path=config.backend_lock_path.resolve(strict=True),
         runtime_lock_path=config.runtime_lock_path.resolve(strict=True),
