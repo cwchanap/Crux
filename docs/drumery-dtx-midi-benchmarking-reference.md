@@ -477,6 +477,104 @@ A real credentialed smoke run is required before acceptance: first dry-run a sma
 then perform and rerun the matching real sync to verify cache reuse and the immutable manifest.
 Never include credentials in repository files or smoke-test reports.
 
+### Common native transcription contract
+
+`crux benchmark transcribe-one` exposes the Phase B contract for one canonical audio input. Its
+`--output` is native, canonical UTF-8 JSONL with schema
+`crux.drum-prediction-events/v1`. It is the authoritative prediction artifact. An optional MIDI
+output is only a derivative for inspection or compatibility and must never replace the JSONL as
+the input to a later mapping or scoring stage.
+
+Every prediction artifact has this physical record order:
+
+1. One `header` record identifies the backend descriptor, native output space, audio hashes, and
+   input provenance.
+2. Zero or more `event` records follow. Events are sorted by time, native class id, model output
+   bin, native MIDI note, velocity, then confidence; null optional values sort before populated
+   values. `event_index` is contiguous from zero.
+3. One `terminal` record closes the artifact with `event_count` and the SHA-256 of every preceding
+   physical line.
+
+This Phase B artifact deliberately preserves the backend's native prediction. The header has
+`artifact_role: "native"`. Every event has `mapping_status: "not_applied"`,
+`prediction_map_version: null`, and `canonical_class: null`; `native_class_id`,
+`model_output_bin`, `native_midi_note`, and `native_metadata` retain the backend-native identity.
+Canonical-class mapping is a later explicit operation, not an inference made while serializing
+the prediction.
+
+The command accepts exactly one provenance mode. Direct mode supplies both ids on the command
+line:
+
+```bash
+uv run crux benchmark transcribe-one \
+  --audio artifacts/benchmark/input/song-a.wav \
+  --source-audio-id song-a-source-v1 \
+  --input-view-id canonical-44k1-mono-v1 \
+  --output artifacts/benchmark/predictions/song-a.jsonl
+```
+
+Manifest-derived mode omits both direct ids and supplies the frozen input-view manifest:
+
+```bash
+uv run crux benchmark transcribe-one \
+  --audio artifacts/benchmark/input/song-a.wav \
+  --input-view-manifest artifacts/benchmark/input/song-a-input-view.json \
+  --output artifacts/benchmark/predictions/song-a.jsonl
+```
+
+The manifest must use `crux.input-view-manifest/v1` and bind the source and canonical input paths,
+ids, and SHA-256 values. In either mode, `--audio` is the canonical mono, 44.1 kHz, 16-bit PCM WAV
+consumed by the backend. Supplying neither mode, incomplete direct ids, or mixing the modes is a
+Click usage error with exit `2`; inference is not attempted and no report or machine summary is
+claimed.
+
+If `--backend` is omitted, the registry selects the official
+`magenta-egmd-tf1-94529798-8hit-v1` backend. Select the heuristic contract explicitly with:
+
+```bash
+uv run crux benchmark transcribe-one \
+  --backend heuristic-onset-v1 \
+  --audio artifacts/benchmark/input/song-a.wav \
+  --source-audio-id song-a-source-v1 \
+  --input-view-id canonical-44k1-mono-v1 \
+  --output artifacts/benchmark/predictions/song-a-heuristic.jsonl
+```
+
+The official OaF adapter lands in Phase A. The heuristic adapter and optional MIDI writer land in
+Phase C. Until those implementations are installed, selecting either known id produces a typed
+`backend_unavailable` execution report instead of an import traceback. An unknown text id also
+passes command parsing, but produces the same typed failure in the reserved `backend-unavailable`
+report namespace; it never becomes a filesystem path.
+
+The current approved contract anchors publication to the repository root, defined as the
+command's current working directory. `--output`, optional `--midi-output`, and `--reports-root`
+must resolve to descendants of that root. Run the command from the repository root and keep those
+destinations inside it. The default reports root is `artifacts/benchmark/backends`, with immutable
+execution reports at:
+
+```text
+artifacts/benchmark/backends/<backend-id>/reports/<timestamp>-<run-id>.json
+artifacts/benchmark/backends/<backend-id>/latest-execution.json
+```
+
+Known-but-unavailable backends use their selected backend id. Unknown ids use
+`artifacts/benchmark/backends/backend-unavailable/`. The one-line canonical JSON object on stdout
+contains exactly `status`, `exit_code`, `report_path`, and `report_sha256`; progress and
+diagnostics belong only on stderr.
+
+Exit handling is:
+
+- `0`: complete; the native JSONL and execution report were published.
+- `1`: partial or `environment_unsupported`; inspect the published report before using artifacts.
+- `2`: failed; inspect the published typed report when stdout contains a summary.
+- Click usage exit `2`: no summary and no report, because orchestration did not start.
+- `report_publication_failed` exit `2`: no summary; sanitized stderr states that no report could
+  be published.
+
+Automation should parse stdout only when it is non-empty, verify the report SHA-256, and then use
+the report's typed status and errors. A MIDI derivative, when Phase C provides it, does not change
+the JSONL authority or the later requirement for an explicit canonical mapping.
+
 ### Raw corpus assumptions for `prepare-corpus`
 
 `crux benchmark prepare-corpus` scans a raw song-folder corpus and selects one benchmark item per
