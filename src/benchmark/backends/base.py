@@ -3,9 +3,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from src.benchmark.backend_identity import BackendDescriptor
+
+if TYPE_CHECKING:
+    from src.benchmark.backend_attestation import HostNumericFingerprint
 
 
 @dataclass(frozen=True)
@@ -143,6 +146,7 @@ class BackendVerification:
     tensor_coverage: TensorCoverageCheck
     smoke: SmokeCheck
     errors: tuple[BackendError, ...]
+    host_numeric_fingerprint: HostNumericFingerprint | None = None
 
 
 # pylint: enable=too-many-instance-attributes

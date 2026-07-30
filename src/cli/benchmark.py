@@ -8,6 +8,7 @@ from pathlib import Path
 
 import click
 
+from src.benchmark.backend_identity import canonical_json_bytes
 from src.benchmark.r2_corpus_models import MAX_SIMFILE_ID, SyncOutcome, SyncRequest
 from src.benchmark.r2_corpus_sync import ProgressEvent, sync_r2_corpus
 from src.cli.options import (
@@ -26,6 +27,25 @@ from src.cli.options import (
 @click.group()
 def benchmark() -> None:
     """Benchmark drum transcription against DTX ground truth."""
+
+
+def _emit_backend_summary(
+    *,
+    status: str,
+    exit_code: int,
+    report_path: Path | None,
+    report_sha256: str | None,
+) -> None:
+    """Write the sole machine-readable result after a backend command has parsed."""
+    payload = {
+        "exit_code": exit_code,
+        "report_path": None if report_path is None else str(report_path),
+        "report_sha256": report_sha256,
+        "status": status,
+    }
+    standard_output = click.get_binary_stream("stdout")
+    standard_output.write(canonical_json_bytes(payload, trailing_newline=True))
+    standard_output.flush()
 
 
 @benchmark.command("prepare-backend")
@@ -54,7 +74,6 @@ def prepare_backend_command(
         raise click.UsageError("--download and --archive are mutually exclusive.")
 
     from src.benchmark import backend_prepare
-    from src.benchmark.backend_identity import canonical_json_bytes
     from src.benchmark.backend_lock import load_backend_lock
     from src.benchmark.backend_registry import OFFICIAL_BACKEND_ID
 
@@ -89,15 +108,12 @@ def prepare_backend_command(
                 backend_lock=backend_lock,
             )
 
-    summary = {
-        "exit_code": outcome.exit_code,
-        "report_path": None,
-        "report_sha256": None,
-        "status": outcome.status,
-    }
-    standard_output = click.get_binary_stream("stdout")
-    standard_output.write(canonical_json_bytes(summary, trailing_newline=True))
-    standard_output.flush()
+    _emit_backend_summary(
+        status=outcome.status,
+        exit_code=outcome.exit_code,
+        report_path=None,
+        report_sha256=None,
+    )
     if outcome.exit_code:
         ctx.exit(outcome.exit_code)
 
@@ -139,7 +155,6 @@ def verify_backend_command(
     allow_emulated_diagnostics: bool,
 ) -> None:
     """Verify a frozen transcription backend and publish its sealed evidence."""
-    from src.benchmark.backend_identity import canonical_json_bytes
     from src.benchmark.backend_registry import default_backend_registry
     from src.benchmark.backend_reports import OperationalReportPublicationError
     from src.benchmark.transcription import VerifyBackendRequest, run_verify_backend
@@ -160,15 +175,12 @@ def verify_backend_command(
         )
         ctx.exit(2)
 
-    summary = {
-        "exit_code": outcome.exit_code,
-        "report_path": str(outcome.report_artifact.path),
-        "report_sha256": outcome.report_artifact.sha256,
-        "status": outcome.status,
-    }
-    standard_output = click.get_binary_stream("stdout")
-    standard_output.write(canonical_json_bytes(summary, trailing_newline=True))
-    standard_output.flush()
+    _emit_backend_summary(
+        status=outcome.status,
+        exit_code=outcome.exit_code,
+        report_path=outcome.report_artifact.path,
+        report_sha256=outcome.report_artifact.sha256,
+    )
     if outcome.exit_code:
         ctx.exit(outcome.exit_code)
 
@@ -242,7 +254,6 @@ def transcribe_one(
         input_view_manifest,
     )
 
-    from src.benchmark.backend_identity import canonical_json_bytes
     from src.benchmark.backend_registry import default_backend_registry
     from src.benchmark.backend_reports import OperationalReportPublicationError
     from src.benchmark.transcription import TranscribeOneRequest, run_transcribe_one
@@ -266,15 +277,12 @@ def transcribe_one(
         )
         ctx.exit(2)
 
-    summary = {
-        "status": outcome.status,
-        "exit_code": outcome.exit_code,
-        "report_path": str(outcome.report_artifact.path),
-        "report_sha256": outcome.report_artifact.sha256,
-    }
-    standard_output = click.get_binary_stream("stdout")
-    standard_output.write(canonical_json_bytes(summary, trailing_newline=True))
-    standard_output.flush()
+    _emit_backend_summary(
+        status=outcome.status,
+        exit_code=outcome.exit_code,
+        report_path=outcome.report_artifact.path,
+        report_sha256=outcome.report_artifact.sha256,
+    )
     if outcome.exit_code:
         ctx.exit(outcome.exit_code)
 

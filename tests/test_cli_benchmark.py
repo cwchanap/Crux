@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import subprocess
@@ -16,6 +17,7 @@ from src.benchmark.backend_registry import (
     HEURISTIC_BACKEND_ID,
     LEGACY_TF2_BACKEND_ID,
     OFFICIAL_BACKEND_ID,
+    BackendRegistration,
     BackendRegistry,
 )
 from src.benchmark.backend_reports import OperationalReportPublicationError
@@ -46,6 +48,26 @@ from src.cli import benchmark as benchmark_cli
 from src.cli.main import main
 
 runner = CliRunner()
+
+
+def test_emit_backend_summary_renders_the_exact_four_key_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output = io.BytesIO()
+    monkeypatch.setattr(benchmark_cli.click, "get_binary_stream", lambda _: output)
+
+    benchmark_cli._emit_backend_summary(
+        status="failed",
+        exit_code=2,
+        report_path=tmp_path / "report.json",
+        report_sha256="a" * 64,
+    )
+
+    assert output.getvalue() == (
+        f'{{"exit_code":2,"report_path":"{tmp_path / "report.json"}",'
+        f'"report_sha256":"{"a" * 64}","status":"failed"}}\n'
+    ).encode("utf-8")
 
 
 def test_verify_backend_help_lists_exact_options_and_defaults() -> None:
@@ -251,7 +273,13 @@ def test_verify_backend_publishes_exact_phase_b_report_and_closes_once(
     backend = FakeBackend()
     registry = BackendRegistry(
         default_backend_id=OFFICIAL_BACKEND_ID,
-        factories={OFFICIAL_BACKEND_ID: lambda **_kwargs: backend},  # type: ignore[dict-item]
+        registrations={
+            OFFICIAL_BACKEND_ID: BackendRegistration(
+                backend_id=OFFICIAL_BACKEND_ID,
+                seal_state="sealed",
+                factory=lambda **_kwargs: backend,
+            )
+        },
     )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
@@ -281,7 +309,7 @@ def test_verify_backend_publishes_exact_phase_b_report_and_closes_once(
     assert backend.close_count == 1
 
 
-@pytest.mark.parametrize("backend_id", (OFFICIAL_BACKEND_ID, HEURISTIC_BACKEND_ID))
+@pytest.mark.parametrize("backend_id", (HEURISTIC_BACKEND_ID,))
 def test_verify_backend_known_unavailable_factory_publishes_typed_failure_namespace(
     backend_id: str,
     tmp_path: Path,
@@ -307,6 +335,24 @@ def test_verify_backend_known_unavailable_factory_publishes_typed_failure_namesp
             "message": "Backend is unavailable.",
         }
     ]
+
+
+def test_verify_backend_default_preseal_publishes_not_sealed_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(main, ["benchmark", "verify-backend"])
+
+    assert result.exit_code == 1
+    assert result.stderr == ""
+    summary = json.loads(result.stdout)
+    report = json.loads(Path(summary["report_path"]).read_text(encoding="utf-8"))
+    assert summary["status"] == "failed"
+    assert report["status"] == "failed"
+    assert report["exit_code"] == 1
+    assert report["errors"] == [{"code": "backend_not_sealed", "message": "Backend is not sealed."}]
 
 
 def write_prediction(path: Path):
@@ -1155,7 +1201,7 @@ def test_transcribe_one_unknown_backend_publishes_typed_failure_after_click_pars
     ]
 
 
-@pytest.mark.parametrize("backend_args", [[], ["--backend", HEURISTIC_BACKEND_ID]])
+@pytest.mark.parametrize("backend_args", [["--backend", HEURISTIC_BACKEND_ID]])
 def test_transcribe_one_known_unavailable_backend_publishes_typed_failure(
     backend_args: list[str],
     tmp_path: Path,
@@ -1171,14 +1217,32 @@ def test_transcribe_one_known_unavailable_backend_publishes_typed_failure(
         ],
     )
 
-    expected_backend = OFFICIAL_BACKEND_ID if not backend_args else HEURISTIC_BACKEND_ID
     assert result.exit_code == 2
     assert result.stderr == ""
     summary = json.loads(result.stdout)
     assert summary["status"] == "failed"
-    assert expected_backend in Path(summary["report_path"]).parts
+    assert HEURISTIC_BACKEND_ID in Path(summary["report_path"]).parts
     report = json.loads(Path(summary["report_path"]).read_text(encoding="utf-8"))
     assert report["errors"][0]["code"] == "backend_unavailable"
+
+
+def test_transcribe_one_default_preseal_publishes_not_sealed_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(main, [*direct_transcribe_one_args(Path("."))])
+
+    assert result.exit_code == 1
+    assert result.stderr == ""
+    summary = json.loads(result.stdout)
+    report = json.loads(Path(summary["report_path"]).read_text(encoding="utf-8"))
+    assert summary["status"] == "failed"
+    assert report["status"] == "failed"
+    assert report["exit_code"] == 1
+    assert report["items"] == []
+    assert report["errors"] == [{"code": "backend_not_sealed", "message": "Backend is not sealed."}]
 
 
 def test_installed_transcribe_one_help_is_silent_and_avoids_backend_runtime_imports(

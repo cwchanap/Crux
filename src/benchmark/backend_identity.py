@@ -196,6 +196,19 @@ def normalize_known_backend_descriptor(value: Mapping[str, object]) -> dict[str,
     return descriptor
 
 
+def validate_schema_golden(schema: str, content: bytes) -> None:
+    if schema not in {OAF_DESCRIPTOR_SCHEMA, HEURISTIC_DESCRIPTOR_SCHEMA}:
+        raise ValueError("unsupported schema golden")
+    if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+        raise StrictJsonError("schema golden must have one final newline")
+    value = strict_json_loads(content[:-1], require_canonical=True)
+    if not isinstance(value, dict):
+        raise StrictJsonError("descriptor schema golden must be an object")
+    descriptor = normalize_known_backend_descriptor(value)
+    if descriptor["descriptor_schema"] != schema:
+        raise StrictJsonError("descriptor schema golden does not match requested schema")
+
+
 # The closed JSON union is clearest as one return per supported value kind.
 # pylint: disable-next=too-many-return-statements
 def _render_json(value: object) -> str:

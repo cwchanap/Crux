@@ -5,6 +5,7 @@ from __future__ import annotations
 # pylint: disable=too-many-instance-attributes,too-many-arguments
 # pylint: disable=too-many-locals,too-many-branches,unidiomatic-typecheck
 import os
+import platform
 import stat
 import subprocess
 import unicodedata
@@ -28,6 +29,9 @@ from src.benchmark.backend_publication import publish_immutable_bytes
 from src.benchmark.backends import PublishedArtifact
 
 _ATTESTATION_SCHEMA = "crux.backend-execution-attestation/v1"
+_HOST_NUMERIC_FINGERPRINT_KEYS = frozenset(
+    {"architecture", "cpu_family", "cpu_model", "cpu_stepping", "cpu_vendor_id"}
+)
 _SOURCE_MANIFEST_KEYS = frozenset({"schema", "covered_roots", "files"})
 _SOURCE_FILE_KEYS = frozenset({"path", "sha256", "license"})
 _CHANGED_FILE_KEYS = frozenset({"path", "sha256", "status"})
@@ -40,6 +44,7 @@ _ATTESTATION_KEYS = frozenset(
         "cpu_limit",
         "descriptor_sha256",
         "git_commit",
+        "host_numeric_fingerprint",
         "memory_bytes",
         "pid_limit",
         "request_deadline_seconds",
@@ -54,6 +59,36 @@ _ATTESTATION_KEYS = frozenset(
 
 class AttestationError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class HostNumericFingerprint:
+    architecture: str
+    cpu_vendor_id: str
+    cpu_family: str
+    cpu_model: str
+    cpu_stepping: str
+
+    def __post_init__(self) -> None:
+        for field in _HOST_NUMERIC_FINGERPRINT_KEYS:
+            _require_nonempty_string(getattr(self, field), f"host numeric fingerprint {field}")
+
+    def as_json(self) -> dict[str, str]:
+        return {
+            "architecture": self.architecture,
+            "cpu_vendor_id": self.cpu_vendor_id,
+            "cpu_family": self.cpu_family,
+            "cpu_model": self.cpu_model,
+            "cpu_stepping": self.cpu_stepping,
+        }
+
+
+def parse_host_numeric_fingerprint(value: object) -> HostNumericFingerprint:
+    if not isinstance(value, dict) or set(value) != _HOST_NUMERIC_FINGERPRINT_KEYS:
+        raise AttestationError("host numeric fingerprint must contain the exact key set")
+    if any(not isinstance(field_value, str) for field_value in value.values()):
+        raise AttestationError("host numeric fingerprint fields must be strings")
+    return HostNumericFingerprint(**cast(dict[str, str], value))
 
 
 @dataclass(frozen=True)
@@ -114,6 +149,7 @@ class ExecutionAttestation:
     checkout_dirty: bool
     strict_mode: bool
     changed_files_manifest: PublishedArtifact | None
+    host_numeric_fingerprint: HostNumericFingerprint | None
     conditions: ExecutionConditions
 
 
@@ -149,6 +185,10 @@ def validate_execution_attestation(
         strict_mode = value["strict_mode"]
         if type(checkout_dirty) is not bool or type(strict_mode) is not bool:
             raise AttestationError("attestation boolean fields must be boolean")
+        fingerprint_value = value["host_numeric_fingerprint"]
+        host_numeric_fingerprint = (
+            None if fingerprint_value is None else parse_host_numeric_fingerprint(fingerprint_value)
+        )
         changed = value["changed_files_manifest"]
         changed_artifact: PublishedArtifact | None = None
         if changed is not None:
@@ -190,6 +230,7 @@ def validate_execution_attestation(
             checkout_dirty=checkout_dirty,
             strict_mode=strict_mode,
             changed_files_manifest=changed_artifact,
+            host_numeric_fingerprint=host_numeric_fingerprint,
             conditions=conditions,
         )
     except AttestationError:
@@ -275,6 +316,7 @@ def publish_execution_attestation(
     source_manifests: Collection[Path],
     strict_mode: bool,
     conditions: ExecutionConditions,
+    expected_host_numeric_fingerprint: HostNumericFingerprint | None = None,
     now: datetime | None = None,
     run_id: UUID | None = None,
 ) -> PublishedArtifact:
@@ -284,6 +326,12 @@ def publish_execution_attestation(
         if type(strict_mode) is not bool:
             raise AttestationError("strict_mode must be boolean")
         _validate_backend_conditions(backend_id, conditions)
+        host_numeric_fingerprint = _host_numeric_fingerprint()
+        if (
+            expected_host_numeric_fingerprint is not None
+            and host_numeric_fingerprint != expected_host_numeric_fingerprint
+        ):
+            raise AttestationError("measured host numeric fingerprint disagrees with evidence")
         effective_now = datetime.now(UTC) if now is None else now
         effective_run_id = uuid4() if run_id is None else run_id
         timestamp = _filename_timestamp(effective_now)
@@ -314,6 +362,7 @@ def publish_execution_attestation(
             checkout_dirty=bool(status_output),
             strict_mode=strict_mode,
             changed_files_manifest=changed_artifact,
+            host_numeric_fingerprint=host_numeric_fingerprint,
             conditions=conditions,
         )
         payload = _attestation_payload(attestation, repository_root)
@@ -615,6 +664,11 @@ def _attestation_payload(
         "cpu_limit": attestation.conditions.cpu_limit,
         "descriptor_sha256": attestation.descriptor_sha256,
         "git_commit": attestation.git_commit,
+        "host_numeric_fingerprint": (
+            None
+            if attestation.host_numeric_fingerprint is None
+            else attestation.host_numeric_fingerprint.as_json()
+        ),
         "memory_bytes": attestation.conditions.memory_bytes,
         "pid_limit": attestation.conditions.pid_limit,
         "request_deadline_seconds": attestation.conditions.request_deadline_seconds,
@@ -647,6 +701,155 @@ def _validate_backend_conditions(
     for field in ("cpu_limit", "memory_bytes", "pid_limit", "tmp_bytes", "shm_bytes"):
         if getattr(conditions, field) is None:
             raise AttestationError(f"{field} is required for container execution")
+
+
+def _host_numeric_fingerprint() -> HostNumericFingerprint:
+    fingerprints = _collect_host_numeric_fingerprints()
+    if not fingerprints:
+        raise AttestationError("host numeric fingerprint requires visible logical CPUs")
+    normalized = tuple(parse_host_numeric_fingerprint(value) for value in fingerprints)
+    if any(value != normalized[0] for value in normalized[1:]):
+        raise AttestationError("logical CPU fingerprints are inconsistent")
+    return normalized[0]
+
+
+def _collect_host_numeric_fingerprints() -> tuple[dict[str, str], ...]:
+    system = platform.system()
+    if system == "Linux":
+        return _linux_host_numeric_fingerprints()
+    if system == "Darwin":
+        return _darwin_host_numeric_fingerprints()
+    raise AttestationError(f"host numeric fingerprint is unsupported on {system or 'unknown'}")
+
+
+def _linux_host_numeric_fingerprints() -> tuple[dict[str, str], ...]:
+    try:
+        content = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="strict")
+    except OSError:
+        raise AttestationError("host CPU facts are unreadable") from None
+    architecture = platform.machine()
+    _require_nonempty_string(architecture, "host architecture")
+    records = _linux_cpuinfo_records(content)
+    visible_cpu_ids = _visible_linux_cpu_ids()
+    fingerprints: list[dict[str, str]] = []
+    for record in records:
+        processor = record.get("processor")
+        if processor is None or (visible_cpu_ids is not None and processor not in visible_cpu_ids):
+            continue
+        try:
+            fingerprints.append(
+                {
+                    "architecture": architecture,
+                    "cpu_family": record["cpu family"],
+                    "cpu_model": record["model"],
+                    "cpu_stepping": record["stepping"],
+                    "cpu_vendor_id": record["vendor_id"],
+                }
+            )
+        except KeyError:
+            raise AttestationError("host CPU facts are incomplete") from None
+    if not fingerprints:
+        raise AttestationError("host CPU facts contain no visible logical CPUs")
+    return tuple(fingerprints)
+
+
+def _linux_cpuinfo_records(content: str) -> tuple[dict[str, str], ...]:
+    records: list[dict[str, str]] = []
+    record: dict[str, str] = {}
+    for line in content.splitlines():
+        if not line.strip():
+            if record:
+                records.append(record)
+                record = {}
+            continue
+        if ":" not in line:
+            raise AttestationError("host CPU facts are malformed")
+        key, value = line.split(":", maxsplit=1)
+        key = key.strip()
+        value = value.strip()
+        if not key or not value or key in record:
+            raise AttestationError("host CPU facts are malformed")
+        record[key] = value
+    if record:
+        records.append(record)
+    return tuple(records)
+
+
+def _visible_linux_cpu_ids() -> frozenset[str] | None:
+    get_affinity = getattr(os, "sched_getaffinity", None)
+    if not callable(get_affinity):
+        return None
+    try:
+        # Pylint cannot retain the preceding callable narrowing through getattr.
+        # pylint: disable-next=not-callable
+        cpu_ids = get_affinity(0)
+        return frozenset(str(cpu_id) for cpu_id in cpu_ids)
+    except OSError:
+        return None
+
+
+def _darwin_host_numeric_fingerprints() -> tuple[dict[str, str], ...]:
+    architecture = _sysctl_text("hw.machine")
+    try:
+        fingerprint = {
+            "architecture": architecture,
+            "cpu_family": _sysctl_text("machdep.cpu.family"),
+            "cpu_model": _sysctl_text("machdep.cpu.model"),
+            "cpu_stepping": _sysctl_text("machdep.cpu.stepping"),
+            "cpu_vendor_id": _sysctl_text("machdep.cpu.vendor"),
+        }
+    except AttestationError:
+        if architecture not in {"arm64", "arm64e"}:
+            raise
+        fingerprint = {
+            "architecture": architecture,
+            "cpu_family": _sysctl_text("hw.cpufamily"),
+            "cpu_model": _sysctl_text("hw.model"),
+            "cpu_stepping": _sysctl_text("hw.cpusubtype"),
+            "cpu_vendor_id": "Apple",
+        }
+    logical_cpu_count = _sysctl_text("hw.ncpu")
+    try:
+        count = int(logical_cpu_count)
+    except ValueError:
+        raise AttestationError("host logical CPU count is invalid") from None
+    if count <= 0:
+        raise AttestationError("host logical CPU count is invalid")
+    return tuple(dict(fingerprint) for _ in range(count))
+
+
+def _sysctl_text(name: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["sysctl", "-n", name],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        value = completed.stdout.decode("utf-8", errors="strict").strip()
+    except (OSError, subprocess.CalledProcessError, UnicodeDecodeError):
+        raise AttestationError(f"host CPU fact {name} is unavailable") from None
+    _require_nonempty_string(value, f"host CPU fact {name}")
+    return value
+
+
+def validate_schema_golden(schema: str, content: bytes) -> None:
+    if schema != _ATTESTATION_SCHEMA:
+        raise ValueError("unsupported schema golden")
+    if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+        raise AttestationError("schema golden must have one final newline")
+    value = strict_json_loads(content[:-1], require_canonical=True)
+    if not isinstance(value, dict):
+        raise AttestationError("execution attestation schema golden must be an object")
+    backend_id = value.get("backend_id")
+    descriptor_sha256 = value.get("descriptor_sha256")
+    if not isinstance(backend_id, str) or not isinstance(descriptor_sha256, str):
+        raise AttestationError("execution attestation schema golden lacks identity")
+    validate_execution_attestation(
+        content,
+        expected_backend_id=backend_id,
+        expected_descriptor_sha256=descriptor_sha256,
+    )
 
 
 def _validate_repository_path(path: str) -> None:

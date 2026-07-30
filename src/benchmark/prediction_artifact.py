@@ -165,6 +165,13 @@ def read_prediction_artifact(content: bytes) -> PredictionArtifact:
         raise PredictionArtifactError(str(error)) from None
 
 
+def validate_schema_golden(schema: str, content: bytes) -> None:
+    if schema == PREDICTION_SCHEMA:
+        read_prediction_artifact(content)
+        return
+    raise ValueError("unsupported schema golden")
+
+
 def publish_prediction_artifact(
     path: Path,
     prediction: NativePrediction,

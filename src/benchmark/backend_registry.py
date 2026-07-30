@@ -5,6 +5,7 @@ from __future__ import annotations
 # pylint: disable=import-outside-toplevel,import-error,no-name-in-module
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from typing import Literal
 
 from src.benchmark.backend_reports import UNAVAILABLE_BACKEND_REPORT_ID
 from src.benchmark.backends import TranscriptionBackend
@@ -12,6 +13,7 @@ from src.benchmark.backends import TranscriptionBackend
 OFFICIAL_BACKEND_ID = "magenta-egmd-tf1-94529798-8hit-v1"
 HEURISTIC_BACKEND_ID = "heuristic-onset-v1"
 LEGACY_TF2_BACKEND_ID = "legacy-tf2-h5-v0"
+SealState = Literal["preseal", "sealed"]
 
 
 class BackendUnavailable(RuntimeError):
@@ -31,10 +33,29 @@ class BackendLockUnavailable(RuntimeError):
     """A factory cannot start because a required backend lock is absent."""
 
 
+class BackendNotSealed(RuntimeError):
+    def __init__(self, backend_id: str) -> None:
+        self.backend_id = backend_id
+        super().__init__("backend is not sealed")
+
+
+class BackendIntegrityUnavailable(RuntimeError):
+    def __init__(self, backend_id: str) -> None:
+        self.backend_id = backend_id
+        super().__init__("backend integrity is unavailable")
+
+
+@dataclass(frozen=True)
+class BackendRegistration:
+    backend_id: str
+    seal_state: SealState
+    factory: Callable[..., TranscriptionBackend]
+
+
 @dataclass(frozen=True)
 class BackendRegistry:
     default_backend_id: str
-    factories: Mapping[str, Callable[[], TranscriptionBackend]]
+    registrations: Mapping[str, BackendRegistration]
 
     def create(
         self,
@@ -43,21 +64,25 @@ class BackendRegistry:
         allow_emulated_diagnostics: bool = False,
     ) -> TranscriptionBackend:
         selected = self.default_backend_id if backend_id is None else backend_id
-        factory = self.factories.get(selected)
-        if factory is None:
+        registration = self.registrations.get(selected)
+        if registration is None:
             raise BackendUnavailable(
                 "unknown backend",
                 report_backend_id=UNAVAILABLE_BACKEND_REPORT_ID,
                 unknown_backend=True,
             )
+        if registration.seal_state == "preseal":
+            raise BackendNotSealed(registration.backend_id)
         try:
             if allow_emulated_diagnostics:
-                return factory(allow_emulated_diagnostics=True)  # type: ignore[call-arg]
-            return factory()
-        except (ImportError, BackendLockUnavailable):
+                return registration.factory(allow_emulated_diagnostics=True)
+            return registration.factory()
+        except BackendLockUnavailable:
+            raise BackendIntegrityUnavailable(registration.backend_id) from None
+        except ImportError:
             raise BackendUnavailable(
                 "backend implementation is unavailable",
-                report_backend_id=selected,
+                report_backend_id=registration.backend_id,
                 unknown_backend=False,
             ) from None
 
@@ -98,9 +123,21 @@ def _reject_legacy_tf2_backend(
 def default_backend_registry() -> BackendRegistry:
     return BackendRegistry(
         default_backend_id=OFFICIAL_BACKEND_ID,
-        factories={
-            OFFICIAL_BACKEND_ID: _create_official_backend,
-            HEURISTIC_BACKEND_ID: _create_heuristic_backend,
-            LEGACY_TF2_BACKEND_ID: _reject_legacy_tf2_backend,
+        registrations={
+            OFFICIAL_BACKEND_ID: BackendRegistration(
+                backend_id=OFFICIAL_BACKEND_ID,
+                seal_state="preseal",
+                factory=_create_official_backend,
+            ),
+            HEURISTIC_BACKEND_ID: BackendRegistration(
+                backend_id=HEURISTIC_BACKEND_ID,
+                seal_state="sealed",
+                factory=_create_heuristic_backend,
+            ),
+            LEGACY_TF2_BACKEND_ID: BackendRegistration(
+                backend_id=LEGACY_TF2_BACKEND_ID,
+                seal_state="sealed",
+                factory=_reject_legacy_tf2_backend,
+            ),
         },
     )

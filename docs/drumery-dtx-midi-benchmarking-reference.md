@@ -477,6 +477,22 @@ A real credentialed smoke run is required before acceptance: first dry-run a sma
 then perform and rerun the matching real sync to verify cache reuse and the immutable manifest.
 Never include credentials in repository files or smoke-test reports.
 
+### Backend lock lifecycle and machine summaries
+
+The official OaF registry entry has two explicit lifecycle states. `preseal` means the backend has
+not passed the Phase A native `linux/amd64` seal gate: verification or transcription produces the
+typed `backend_not_sealed` result with exit `1`, and transcription does not open prediction output.
+`sealed` means the required locks and native evidence are available and must validate before any
+prediction can be published. Current `main` remains `preseal` until that Phase A native gate
+succeeds.
+
+After successful Click parsing, `prepare-backend`, `verify-backend`, and `transcribe-one` each
+write exactly one canonical JSON summary to stdout with exactly these four keys: `exit_code`,
+`report_path`, `report_sha256`, and `status`. `prepare-backend` has no operational report, so both
+report fields are `null`. A present summary discriminates a typed operational result (including an
+exit `2` backend failure) from a Click usage error or a report-publication failure, both of which
+emit no summary. The latter has only its sanitized stderr diagnostic.
+
 ### Common native transcription contract
 
 `crux benchmark transcribe-one` exposes the Phase B contract for one canonical audio input. Its
@@ -501,6 +517,13 @@ This Phase B artifact deliberately preserves the backend's native prediction. Th
 `model_output_bin`, `native_midi_note`, and `native_metadata` retain the backend-native identity.
 Canonical-class mapping is a later explicit operation, not an inference made while serializing
 the prediction.
+
+The header's duplicated descriptor identity fields must agree exactly with the nested
+`backend_descriptor`: `architecture_id`, `model_id`, `native_metadata_schema_id`,
+`native_output_space_id`, and every present frozen identity field (`backend_lock_sha256`,
+`runtime_lock_sha256`, `model_artifact_set_sha256`, `upstream_source_commit`, and
+`training_data_map_id`). A mismatched header is rejected even if its JSONL terminal digest is
+otherwise valid.
 
 The command accepts exactly one provenance mode. Direct mode supplies both ids on the command
 line:

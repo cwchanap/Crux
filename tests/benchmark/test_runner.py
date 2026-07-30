@@ -348,9 +348,9 @@ def test_run_score_midi_warns_on_unmapped_prediction_events(tmp_path: Path, capl
     with caplog.at_level(logging.WARNING, logger="src.benchmark.runner"):
         reports = run_score_midi(charts, predictions, output, tolerance_ms=[50], align=False)
 
-    assert any("unmapped prediction events" in msg for msg in caplog.messages), (
-        f"Expected unmapped prediction warning, got: {caplog.messages}"
-    )
+    assert any(
+        "unmapped prediction events" in msg for msg in caplog.messages
+    ), f"Expected unmapped prediction warning, got: {caplog.messages}"
     # Scoring should still complete (the unmapped prediction is dropped, ground truth is present)
     assert len(reports) == 1
 
@@ -370,9 +370,9 @@ def test_run_score_midi_warns_on_unmapped_ground_truth_events(tmp_path: Path, ca
     with caplog.at_level(logging.WARNING, logger="src.benchmark.runner"):
         reports = run_score_midi(charts, predictions, output, tolerance_ms=[50], align=False)
 
-    assert any("unmapped ground-truth events" in msg for msg in caplog.messages), (
-        f"Expected unmapped ground-truth warning, got: {caplog.messages}"
-    )
+    assert any(
+        "unmapped ground-truth events" in msg for msg in caplog.messages
+    ), f"Expected unmapped ground-truth warning, got: {caplog.messages}"
     assert len(reports) == 1
 
 
@@ -388,6 +388,6 @@ def test_export_reference_midis_warns_on_unmapped_events(tmp_path: Path, caplog)
         count = export_reference_midis(charts, output)
 
     assert count == 1
-    assert any("unmapped ground-truth events" in msg for msg in caplog.messages), (
-        f"Expected unmapped ground-truth warning, got: {caplog.messages}"
-    )
+    assert any(
+        "unmapped ground-truth events" in msg for msg in caplog.messages
+    ), f"Expected unmapped ground-truth warning, got: {caplog.messages}"

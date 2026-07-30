@@ -311,6 +311,15 @@ def parse_input_view_manifest(content: bytes) -> InputViewManifest:
     )
 
 
+def validate_schema_golden(schema: str, content: bytes) -> None:
+    if schema != _MANIFEST_SCHEMA:
+        raise ValueError("unsupported schema golden")
+    if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+        raise ValueError("schema golden must have one final newline")
+    strict_json_loads(content[:-1], require_canonical=True)
+    parse_input_view_manifest(content)
+
+
 def input_view_artifact_paths(
     manifest_path: Path,
     manifest: InputViewManifest,

@@ -269,6 +269,13 @@ def canonical_records_with_prefix(records: list[dict[str, object]]) -> bytes:
     return prefix + canonical_json_bytes(records[-1], trailing_newline=True)
 
 
+def replace_jsonl_header(content: bytes, field: str, replacement: str) -> bytes:
+    """Change one canonical header value while retaining a valid terminal digest."""
+    records = parsed_records(content)
+    records[0][field] = replacement
+    return canonical_records_with_prefix(records)
+
+
 def test_prediction_has_exact_canonical_records_and_hashes() -> None:
     content = render_prediction_artifact(make_oaf_prediction())
     artifact = read_prediction_artifact(content)
@@ -807,6 +814,29 @@ def test_reader_binds_every_oaf_header_identity_to_frozen_descriptor(
 
     with pytest.raises(PredictionArtifactError, match=header_field):
         read_prediction_artifact(canonical_records_with_prefix(records))
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("model_id", "other-model"),
+        ("architecture_id", "other-architecture"),
+        ("backend_lock_sha256", "f" * 64),
+        ("runtime_lock_sha256", "e" * 64),
+        ("native_output_space_id", "other-space"),
+    ],
+)
+def test_prediction_header_rejects_descriptor_disagreement(
+    field: str,
+    replacement: str,
+) -> None:
+    valid_prediction_bytes = render_prediction_artifact(
+        make_oaf_prediction(descriptor=FROZEN_OAF_DESCRIPTOR)
+    )
+    mutated = replace_jsonl_header(valid_prediction_bytes, field, replacement)
+
+    with pytest.raises(PredictionArtifactError, match="descriptor"):
+        read_prediction_artifact(mutated)
 
 
 @pytest.mark.parametrize(

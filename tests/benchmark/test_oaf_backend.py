@@ -73,6 +73,13 @@ def _host_evidence() -> NativeHostEvidence:
         "runner_arch": "X64",
         "runner_os": "Linux",
         "workflow_commit": "f" * 40,
+        "host_numeric_fingerprint": {
+            "architecture": "x86_64",
+            "cpu_vendor_id": "GenuineIntel",
+            "cpu_family": "6",
+            "cpu_model": "143",
+            "cpu_stepping": "8",
+        },
     }
     return NativeHostEvidence(
         kind="github_hosted",
@@ -488,6 +495,7 @@ def _harness(
                 "cpu_limit": kwargs["conditions"].cpu_limit,
                 "descriptor_sha256": descriptor.sha256,
                 "git_commit": "f" * 40,
+                "host_numeric_fingerprint": kwargs["expected_host_numeric_fingerprint"].as_json(),
                 "memory_bytes": kwargs["conditions"].memory_bytes,
                 "pid_limit": kwargs["conditions"].pid_limit,
                 "request_deadline_seconds": kwargs["conditions"].request_deadline_seconds,
@@ -544,6 +552,14 @@ def test_verify_backend_accepts_only_matching_handshake_and_smoke(
 
     assert verification.status == "verified"
     assert verification.max_input_audio_frames == 441000
+    assert (
+        verification.host_numeric_fingerprint
+        == harness.config.native_host_evidence.host_numeric_fingerprint
+    )
+    assert (
+        harness.captured_attestations[0]["expected_host_numeric_fingerprint"]
+        == verification.host_numeric_fingerprint
+    )
     assert verification.smoke.prediction is not None
     assert verification.smoke.prediction.sha256 == harness.expected_smoke_sha256
     assert verification.tensor_coverage.required_count == 78

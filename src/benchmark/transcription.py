@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # The orchestration is intentionally branch-oriented: each phase has a distinct
 # typed failure mapping and publication boundary.
-# pylint: disable=too-many-arguments,too-many-branches,too-many-instance-attributes
+# pylint: disable=too-many-arguments,too-many-branches,too-many-instance-attributes,too-many-statements
 # pylint: disable=too-many-locals,too-many-return-statements,broad-exception-caught
 # pylint: disable=too-many-lines,unidiomatic-typecheck
 import os
@@ -16,6 +16,7 @@ from typing import Literal, cast
 from uuid import UUID, uuid4
 
 from src.benchmark.backend_attestation import (
+    HostNumericFingerprint,
     validate_changed_file_manifest,
     validate_execution_attestation,
 )
@@ -33,6 +34,8 @@ from src.benchmark.backend_publication import (
 from src.benchmark.backend_registry import (
     HEURISTIC_BACKEND_ID,
     OFFICIAL_BACKEND_ID,
+    BackendIntegrityUnavailable,
+    BackendNotSealed,
     BackendRegistry,
     BackendUnavailable,
 )
@@ -75,6 +78,14 @@ from src.benchmark.prediction_artifact import (
 _BACKEND_UNAVAILABLE = BackendError(
     code="backend_unavailable",
     message="Backend is unavailable.",
+)
+_BACKEND_NOT_SEALED = BackendError(
+    code="backend_not_sealed",
+    message="Backend is not sealed.",
+)
+_BACKEND_INTEGRITY_UNAVAILABLE = BackendError(
+    code="backend_integrity_unavailable",
+    message="Backend integrity is unavailable.",
 )
 _BACKEND_FAILURE = BackendError(
     code="backend_failure",
@@ -182,15 +193,77 @@ def run_transcribe_one(
         raise OperationalReportPublicationError("operational_report_publication_failed") from None
     try:
         with open_directory_anchor(repository_root) as repository_anchor:
-            return _run_transcribe_one_anchored(
-                request,
-                registry=registry,
-                now=now,
-                run_id=run_id,
-                midi_writer=midi_writer,
-                repository_root=repository_root,
-                repository_anchor=repository_anchor,
+            effective_now = datetime.now(UTC) if now is None else now
+            effective_run_id = uuid4() if run_id is None else run_id
+            selected_backend_id = (
+                registry.default_backend_id if request.backend_id is None else request.backend_id
             )
+            try:
+                backend = registry.create(request.backend_id)
+            except BackendNotSealed as error:
+                anchored_request = _anchor_request(request, repository_root)
+                return _publish_registry_failure(
+                    anchored_request,
+                    backend_id=error.backend_id,
+                    error=_BACKEND_NOT_SEALED,
+                    exit_code=1,
+                    now=effective_now,
+                    run_id=effective_run_id,
+                    repository_root=repository_root,
+                    repository_anchor=repository_anchor,
+                )
+            except BackendIntegrityUnavailable as error:
+                anchored_request = _anchor_request(request, repository_root)
+                return _publish_registry_failure(
+                    anchored_request,
+                    backend_id=error.backend_id,
+                    error=_BACKEND_INTEGRITY_UNAVAILABLE,
+                    exit_code=2,
+                    now=effective_now,
+                    run_id=effective_run_id,
+                    repository_root=repository_root,
+                    repository_anchor=repository_anchor,
+                )
+            except BackendUnavailable as error:
+                anchored_request = _anchor_request(request, repository_root)
+                return _publish_registry_failure(
+                    anchored_request,
+                    backend_id=error.report_backend_id,
+                    error=_BACKEND_UNAVAILABLE,
+                    exit_code=2,
+                    now=effective_now,
+                    run_id=effective_run_id,
+                    repository_root=repository_root,
+                    repository_anchor=repository_anchor,
+                )
+            except Exception:
+                anchored_request = _anchor_request(request, repository_root)
+                return _publish_registry_failure(
+                    anchored_request,
+                    backend_id=selected_backend_id,
+                    error=_BACKEND_FAILURE,
+                    exit_code=2,
+                    now=effective_now,
+                    run_id=effective_run_id,
+                    repository_root=repository_root,
+                    repository_anchor=repository_anchor,
+                )
+            try:
+                return _run_transcribe_one_anchored(
+                    request,
+                    backend=backend,
+                    backend_id=selected_backend_id,
+                    now=effective_now,
+                    run_id=effective_run_id,
+                    midi_writer=midi_writer,
+                    repository_root=repository_root,
+                    repository_anchor=repository_anchor,
+                )
+            finally:
+                try:
+                    backend.close()
+                except BaseException:
+                    pass
     except OperationalReportPublicationError:
         raise
     except (OSError, RuntimeError, TypeError, ValueError):
@@ -217,11 +290,20 @@ def run_verify_backend(
             registry.default_backend_id if request.backend_id is None else request.backend_id
         )
         with open_directory_anchor(repository_root) as repository_anchor:
+            registry_exit_code: Literal[1, 2] | None = None
             try:
                 backend = registry.create(
                     request.backend_id,
                     allow_emulated_diagnostics=request.allow_emulated_diagnostics,
                 )
+            except BackendNotSealed as error:
+                selected_backend_id = error.backend_id
+                verification = _failed_backend_verification(_BACKEND_NOT_SEALED)
+                registry_exit_code = 1
+            except BackendIntegrityUnavailable as error:
+                selected_backend_id = error.backend_id
+                verification = _failed_backend_verification(_BACKEND_INTEGRITY_UNAVAILABLE)
+                registry_exit_code = 2
             except BackendUnavailable as error:
                 selected_backend_id = error.report_backend_id
                 verification = _failed_backend_verification(_BACKEND_UNAVAILABLE)
@@ -247,6 +329,7 @@ def run_verify_backend(
                     repository_anchor=repository_anchor,
                     now=effective_now,
                     run_id=effective_run_id,
+                    exit_code=registry_exit_code,
                 )
             except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
                 verification = _failed_backend_verification(_INVALID_VERIFICATION)
@@ -257,6 +340,7 @@ def run_verify_backend(
                     repository_anchor=repository_anchor,
                     now=effective_now,
                     run_id=effective_run_id,
+                    exit_code=registry_exit_code,
                 )
             artifact = publish_operational_report(
                 reports_root,
@@ -270,11 +354,14 @@ def run_verify_backend(
         raise
     except (OSError, RuntimeError, TypeError, ValueError):
         raise OperationalReportPublicationError("operational_report_publication_failed") from None
-    exit_code = {
-        "verified": 0,
-        "environment_unsupported": 1,
-        "failed": 2,
-    }[verification.status]
+    exit_code = (
+        registry_exit_code
+        or {
+            "verified": 0,
+            "environment_unsupported": 1,
+            "failed": 2,
+        }[verification.status]
+    )
     return VerifyBackendOutcome(
         status=verification.status,
         exit_code=cast(Literal[0, 1, 2], exit_code),
@@ -311,10 +398,37 @@ def _failed_backend_verification(error: BackendError) -> BackendVerification:
     )
 
 
+def _publish_registry_failure(
+    request: TranscribeOneRequest,
+    *,
+    backend_id: str,
+    error: BackendError,
+    exit_code: Literal[1, 2],
+    now: datetime,
+    run_id: UUID,
+    repository_root: Path,
+    repository_anchor: DirectoryAnchor,
+) -> TranscribeOneOutcome:
+    return _publish_outcome(
+        request,
+        backend_id=backend_id,
+        verification=None,
+        status="failed",
+        exit_code=exit_code,
+        items=(),
+        errors=(error,),
+        now=now,
+        run_id=run_id,
+        repository_root=repository_root,
+        repository_anchor=repository_anchor,
+    )
+
+
 def _run_transcribe_one_anchored(
     request: TranscribeOneRequest,
     *,
-    registry: BackendRegistry,
+    backend: object,
+    backend_id: str,
     now: datetime | None,
     run_id: UUID | None,
     midi_writer: Callable[[PredictionArtifact, Path], MidiDerivative] | None,
@@ -335,7 +449,8 @@ def _run_transcribe_one_anchored(
             input_capture_failed = True
         return _run_transcribe_one_prepared(
             anchored_request,
-            registry=registry,
+            backend=backend,
+            backend_id=backend_id,
             now=now,
             run_id=run_id,
             midi_writer=midi_writer,
@@ -349,7 +464,8 @@ def _run_transcribe_one_anchored(
 def _run_transcribe_one_prepared(
     request: TranscribeOneRequest,
     *,
-    registry: BackendRegistry,
+    backend: object,
+    backend_id: str,
     now: datetime | None,
     run_id: UUID | None,
     midi_writer: Callable[[PredictionArtifact, Path], MidiDerivative] | None,
@@ -360,64 +476,18 @@ def _run_transcribe_one_prepared(
 ) -> TranscribeOneOutcome:
     effective_now = datetime.now(UTC) if now is None else now
     effective_run_id = uuid4() if run_id is None else run_id
-    selected_backend_id = (
-        registry.default_backend_id if request.backend_id is None else request.backend_id
+    return _run_with_backend(
+        request,
+        backend_id=backend_id,
+        backend=backend,
+        now=effective_now,
+        run_id=effective_run_id,
+        midi_writer=midi_writer,
+        repository_root=repository_root,
+        repository_anchor=repository_anchor,
+        captured_input=captured_input,
+        input_capture_failed=input_capture_failed,
     )
-    try:
-        backend = registry.create(request.backend_id)
-    except BackendUnavailable as error:
-        return _publish_outcome(
-            request,
-            backend_id=error.report_backend_id,
-            verification=None,
-            status="failed",
-            exit_code=2,
-            items=(),
-            errors=(_BACKEND_UNAVAILABLE,),
-            now=effective_now,
-            run_id=effective_run_id,
-            repository_root=repository_root,
-            repository_anchor=repository_anchor,
-        )
-    except Exception:
-        return _publish_outcome(
-            request,
-            backend_id=selected_backend_id,
-            verification=None,
-            status="failed",
-            exit_code=2,
-            items=(),
-            errors=(_BACKEND_FAILURE,),
-            now=effective_now,
-            run_id=effective_run_id,
-            repository_root=repository_root,
-            repository_anchor=repository_anchor,
-        )
-
-    try:
-        outcome = _run_with_backend(
-            request,
-            backend_id=selected_backend_id,
-            backend=backend,
-            now=effective_now,
-            run_id=effective_run_id,
-            midi_writer=midi_writer,
-            repository_root=repository_root,
-            repository_anchor=repository_anchor,
-            captured_input=captured_input,
-            input_capture_failed=input_capture_failed,
-        )
-    except BaseException:
-        try:
-            backend.close()
-        except BaseException:
-            pass
-        raise
-    try:
-        backend.close()
-    except BaseException:
-        pass
-    return outcome
 
 
 def _run_with_backend(
@@ -895,6 +965,7 @@ def _validate_verification(
     repository_anchor: DirectoryAnchor,
     now: datetime,
     run_id: UUID,
+    exit_code: Literal[1, 2] | None = None,
 ) -> VerificationReport:
     if not isinstance(verification, BackendVerification):
         raise TypeError("verify must return BackendVerification")
@@ -904,6 +975,11 @@ def _validate_verification(
         not isinstance(error, BackendError) for error in verification.errors
     ):
         raise TypeError("verification errors must be typed")
+    if verification.host_numeric_fingerprint is not None and not isinstance(
+        verification.host_numeric_fingerprint,
+        HostNumericFingerprint,
+    ):
+        raise TypeError("verification host numeric fingerprint must be typed")
     if (verification.status == "verified") != (not verification.errors):
         raise ValueError("verification status and errors disagree")
 
@@ -956,8 +1032,9 @@ def _validate_verification(
         ):
             raise ValueError("official tensor counts are inconsistent")
 
+    attestation_fingerprint: HostNumericFingerprint | None = None
     if verification.status == "verified":
-        _validate_supporting_artifact(
+        attestation_fingerprint = _validate_supporting_artifact(
             verification.execution_attestation,
             repository_root,
             expected_role="execution_attestation",
@@ -977,6 +1054,11 @@ def _validate_verification(
             expected_role="prediction",
             repository_anchor=repository_anchor,
         )
+        if backend_id == OFFICIAL_BACKEND_ID:
+            if verification.host_numeric_fingerprint is None:
+                raise ValueError("official verification requires host numeric fingerprint")
+            if attestation_fingerprint != verification.host_numeric_fingerprint:
+                raise ValueError("official verification fingerprint disagrees with attestation")
 
     tensor_report = _optional_relative_artifact(
         tensor.report,
@@ -1009,11 +1091,15 @@ def _validate_verification(
             "started_at": _report_timestamp(now),
             "finished_at": _report_timestamp(now),
             "status": verification.status,
-            "exit_code": {
-                "verified": 0,
-                "failed": 2,
-                "environment_unsupported": 1,
-            }[verification.status],
+            "exit_code": (
+                exit_code
+                if exit_code is not None
+                else {
+                    "verified": 0,
+                    "failed": 2,
+                    "environment_unsupported": 1,
+                }[verification.status]
+            ),
             "descriptor": None if descriptor is None else descriptor.payload,
             "descriptor_sha256": None if descriptor is None else descriptor.sha256,
             "backend_lock_sha256": verification.backend_lock_sha256,
@@ -1072,9 +1158,9 @@ def _validate_supporting_artifact(
     descriptor_sha256: str | None = None,
     backend_id: str | None = None,
     repository_anchor: DirectoryAnchor,
-) -> None:
+) -> HostNumericFingerprint | None:
     if artifact is None:
-        return
+        return None
     if not isinstance(artifact, PublishedArtifact) or artifact.role != expected_role:
         raise ValueError("supporting artifact role is invalid")
     require_sha256(artifact.sha256, "supporting artifact sha256")
@@ -1108,10 +1194,12 @@ def _validate_supporting_artifact(
             if sha256_hex(changed_content) != changed_manifest.sha256:
                 raise ValueError("changed-file manifest hash mismatch")
             validate_changed_file_manifest(changed_content)
+        return attestation.host_numeric_fingerprint
     elif expected_role == "tensor_coverage":
         _validate_schema_bearing_json_artifact(content)
     elif expected_role == "prediction":
         read_prediction_artifact(content)
+    return None
 
 
 def _validate_schema_bearing_json_artifact(content: bytes) -> None:
