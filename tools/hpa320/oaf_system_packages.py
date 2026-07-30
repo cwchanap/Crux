@@ -11,6 +11,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
@@ -984,7 +985,7 @@ def main() -> int:
         if args.install:
             install_system_package_bundle(bundle=args.bundle, payload=payload)
     except (OSError, SystemPackageError) as error:
-        print(f"OaF system package verification failed: {error}")
+        print(f"OaF system package verification failed: {error}", file=sys.stderr)
         return 1
     print("OaF system package verification passed")
     return 0
