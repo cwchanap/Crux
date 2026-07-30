@@ -7,19 +7,29 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
+from types import MappingProxyType
 from typing import cast
 
 from src.benchmark.backend_identity import (
+    HEURISTIC_BACKEND_ID,
+    HEURISTIC_DESCRIPTOR_SCHEMA,
+    OAF_BACKEND_ID,
+    OAF_DESCRIPTOR_SCHEMA,
     BackendDescriptor,
     JsonValue,
     StrictJsonError,
     canonical_json_bytes,
+    normalize_known_backend_descriptor,
     quantize_six,
     require_sha256,
     sha256_hex,
     strict_json_loads,
 )
-from src.benchmark.backend_publication import publish_immutable_bytes, read_regular_file_no_follow
+from src.benchmark.backend_publication import (
+    DirectoryAnchor,
+    publish_immutable_bytes,
+    read_regular_file_no_follow,
+)
 from src.benchmark.backends import CanonicalAudio, NativeEvent, NativePrediction, PublishedArtifact
 
 PREDICTION_SCHEMA = "crux.drum-prediction-events/v1"
@@ -158,6 +168,8 @@ def read_prediction_artifact(content: bytes) -> PredictionArtifact:
 def publish_prediction_artifact(
     path: Path,
     prediction: NativePrediction,
+    *,
+    anchor: DirectoryAnchor | None = None,
 ) -> PublishedArtifact:
     content = render_prediction_artifact(prediction)
     expected_sha256 = sha256_hex(content)
@@ -166,8 +178,9 @@ def publish_prediction_artifact(
         content,
         expected_sha256,
         role="prediction",
+        anchor=anchor,
     )
-    persisted = read_regular_file_no_follow(path)
+    persisted = read_regular_file_no_follow(path, anchor=anchor)
     artifact = read_prediction_artifact(persisted)
     if artifact.content != content or artifact.artifact_sha256 != expected_sha256:
         raise PredictionArtifactError("published prediction bytes changed")
@@ -248,6 +261,7 @@ def _build_header(prediction: NativePrediction) -> dict[str, JsonValue]:
     require_sha256(descriptor.sha256, "backend_descriptor_sha256")
     if descriptor.sha256 != calculated_descriptor_sha256:
         raise PredictionArtifactError("backend_descriptor_sha256 mismatch")
+    _validate_known_descriptor_if_frozen(descriptor_payload)
 
     required_descriptor_ids = {
         "prediction_schema",
@@ -279,6 +293,7 @@ def _build_header(prediction: NativePrediction) -> dict[str, JsonValue]:
         "audio_frame_count",
     ):
         _require_positive_int(getattr(audio, field), field)
+    _validate_canonical_audio(audio)
 
     _validate_header_nullability(prediction, metadata_schema)
     for field in (
@@ -291,7 +306,7 @@ def _build_header(prediction: NativePrediction) -> dict[str, JsonValue]:
         if value is not None:
             require_sha256(value, field)
 
-    return {
+    header: dict[str, JsonValue] = {
         "architecture_id": descriptor_payload["architecture_id"],
         "artifact_role": "native",
         "audio_frame_count": audio.audio_frame_count,
@@ -317,6 +332,8 @@ def _build_header(prediction: NativePrediction) -> dict[str, JsonValue]:
         "training_data_map_id": prediction.training_data_map_id,
         "upstream_source_commit": prediction.upstream_source_commit,
     }
+    _require_native_header_fields(header)
+    return header
 
 
 def _validate_header_nullability(
@@ -470,7 +487,7 @@ def _prediction_from_records(
         audio_frame_count=cast(int, header["audio_frame_count"]),
     )
     descriptor = BackendDescriptor(
-        payload=cast(dict[str, str], descriptor_payload_value),
+        payload=MappingProxyType(dict(cast(dict[str, str], descriptor_payload_value))),
         sha256=descriptor_sha256,
     )
     native_events = tuple(_native_event_from_record(event) for event in events)
@@ -532,6 +549,7 @@ def _require_native_header_fields(header: dict[str, JsonValue]) -> None:
 
     descriptor = header["backend_descriptor"]
     if isinstance(descriptor, dict):
+        _validate_known_descriptor_if_frozen(descriptor)
         for field in (
             "architecture_id",
             "model_id",
@@ -540,6 +558,16 @@ def _require_native_header_fields(header: dict[str, JsonValue]) -> None:
         ):
             if descriptor.get(field) != header[field]:
                 raise PredictionArtifactError(f"{field} must match backend_descriptor")
+        for field in (
+            "backend_lock_sha256",
+            "runtime_lock_sha256",
+            "model_artifact_set_sha256",
+            "upstream_source_commit",
+            "training_data_map_id",
+        ):
+            if field in descriptor and descriptor[field] != header[field]:
+                raise PredictionArtifactError(f"{field} must match backend_descriptor")
+    _validate_canonical_audio_header(header)
 
 
 def _native_event_from_record(event: dict[str, JsonValue]) -> NativeEvent:
@@ -565,7 +593,7 @@ def _native_event_from_record(event: dict[str, JsonValue]) -> NativeEvent:
         native_class_id=native_class_id,
         model_output_bin=_json_optional_int(event["model_output_bin"], "model_output_bin"),
         native_midi_note=_json_optional_int(event["native_midi_note"], "native_midi_note"),
-        native_metadata=cast(dict[str, str | None], metadata),
+        native_metadata=MappingProxyType(dict(cast(dict[str, str | None], metadata))),
         confidence=confidence,
         velocity_midi=_json_optional_int(event["velocity_midi"], "velocity_midi"),
     )
@@ -625,3 +653,44 @@ def _require_optional_int_range(
         return
     if type(value) is not int or not minimum <= value <= maximum:
         raise PredictionArtifactError(f"{field} must be an integer in {minimum}..{maximum}")
+
+
+def _validate_known_descriptor_if_frozen(descriptor: Mapping[str, object]) -> None:
+    schema = descriptor.get("descriptor_schema")
+    backend_id = descriptor.get("backend_id")
+    if schema not in {OAF_DESCRIPTOR_SCHEMA, HEURISTIC_DESCRIPTOR_SCHEMA} and backend_id not in {
+        OAF_BACKEND_ID,
+        HEURISTIC_BACKEND_ID,
+    }:
+        return
+    try:
+        normalize_known_backend_descriptor(descriptor)
+    except StrictJsonError as error:
+        raise PredictionArtifactError(str(error)) from None
+
+
+def _validate_canonical_audio(audio: CanonicalAudio) -> None:
+    if audio.sample_rate != 44100:
+        raise PredictionArtifactError("sample_rate must be 44100")
+    if audio.channel_count != 1:
+        raise PredictionArtifactError("channel_count must be 1")
+    if audio.sample_width_bytes != 2:
+        raise PredictionArtifactError("sample_width_bytes must be 2")
+    if audio.audio_frame_count <= 0:
+        raise PredictionArtifactError("audio_frame_count must be positive")
+    if audio.byte_length != 44 + audio.audio_frame_count * audio.sample_width_bytes:
+        raise PredictionArtifactError("byte_length must match canonical WAV frame data")
+
+
+def _validate_canonical_audio_header(header: dict[str, JsonValue]) -> None:
+    if header["sample_rate"] != 44100:
+        raise PredictionArtifactError("sample_rate must be 44100")
+    if header["channel_count"] != 1:
+        raise PredictionArtifactError("channel_count must be 1")
+    if header["sample_width_bytes"] != 2:
+        raise PredictionArtifactError("sample_width_bytes must be 2")
+    frame_count = header["audio_frame_count"]
+    if type(frame_count) is not int or frame_count <= 0:
+        raise PredictionArtifactError("audio_frame_count must be positive")
+    if header["byte_length"] != 44 + frame_count * 2:
+        raise PredictionArtifactError("byte_length must match canonical WAV frame data")

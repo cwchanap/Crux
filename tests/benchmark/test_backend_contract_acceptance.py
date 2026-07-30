@@ -15,6 +15,7 @@ from src.benchmark.backend_identity import (
     BackendDescriptor,
     JsonValue,
     build_descriptor,
+    canonical_json_bytes,
     strict_json_loads,
 )
 from src.benchmark.backend_publication import (
@@ -357,15 +358,61 @@ def _publish_support_artifact(
     )
 
 
-def _support_artifacts(root: Path, backend_id: str) -> SupportArtifacts:
+def _support_artifacts(root: Path, descriptor: BackendDescriptor) -> SupportArtifacts:
+    backend_id = descriptor.payload["backend_id"]
+    container = backend_id == OFFICIAL_BACKEND_ID
+    attestation_content = canonical_json_bytes(
+        {
+            "backend_id": backend_id,
+            "changed_files_manifest": None,
+            "checkout_dirty": False,
+            "cpu_limit": "1" if container else None,
+            "descriptor_sha256": descriptor.sha256,
+            "git_commit": "a" * 40,
+            "memory_bytes": 1024 if container else None,
+            "pid_limit": 16 if container else None,
+            "request_deadline_seconds": 60,
+            "schema": "crux.backend-execution-attestation/v1",
+            "shm_bytes": 1024 if container else None,
+            "startup_deadline_seconds": 30,
+            "strict_mode": True,
+            "tmp_bytes": 1024 if container else None,
+        },
+        trailing_newline=True,
+    )
     attestation = _publish_support_artifact(
         root,
         "execution-attestation.json",
         "execution_attestation",
-        b'{"backend":"deterministic-fake","schema":"crux.test-attestation/v1"}\n',
+        attestation_content,
     )
     if backend_id == HEURISTIC_BACKEND_ID:
         return SupportArtifacts(attestation, None, None)
+    smoke_audio = CanonicalAudio(
+        path=Path(),
+        source_audio_id="smoke-source",
+        source_audio_sha256="a" * 64,
+        input_view_id="smoke-view",
+        input_audio_sha256="b" * 64,
+        byte_length=46,
+        sample_rate=44100,
+        channel_count=1,
+        sample_width_bytes=2,
+        audio_frame_count=1,
+    )
+    smoke_content = render_prediction_artifact(
+        NativePrediction(
+            audio=smoke_audio,
+            descriptor=descriptor,
+            events=OAF_EVENTS,
+            backend_lock_sha256="b" * 64,
+            runtime_lock_sha256="c" * 64,
+            parameter_lock_sha256=None,
+            model_artifact_set_sha256="7" * 64,
+            upstream_source_commit="9" * 40,
+            training_data_map_id="magenta-egmd-data-8hit-94529798-v1",
+        )
+    )
     return SupportArtifacts(
         attestation,
         _publish_support_artifact(
@@ -378,7 +425,7 @@ def _support_artifacts(root: Path, backend_id: str) -> SupportArtifacts:
             root,
             "smoke-prediction.jsonl",
             "prediction",
-            b'{"schema":"crux.test-smoke-prediction/v1"}\n',
+            smoke_content,
         ),
     )
 
@@ -425,7 +472,7 @@ def _run_fake_transcription(
     run_id: UUID,
 ) -> FakeRun:
     backend_id = descriptor.payload["backend_id"]
-    support = _support_artifacts(root, backend_id)
+    support = _support_artifacts(root, descriptor)
     created: list[DeterministicFakeBackend] = []
 
     def create_backend() -> DeterministicFakeBackend:

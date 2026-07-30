@@ -12,6 +12,61 @@ from typing import TypeAlias
 JsonScalar: TypeAlias = None | bool | int | str | Decimal
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 SIX_PLACES = Decimal("0.000001")
+OAF_BACKEND_ID = "magenta-egmd-tf1-94529798-8hit-v1"
+HEURISTIC_BACKEND_ID = "heuristic-onset-v1"
+OAF_DESCRIPTOR_SCHEMA = "crux.transcription-backend-descriptor/v1"
+HEURISTIC_DESCRIPTOR_SCHEMA = "crux.heuristic-backend-descriptor/v1"
+OAF_DESCRIPTOR_KEYS = frozenset(
+    {
+        "architecture_id",
+        "backend_id",
+        "backend_lock_sha256",
+        "descriptor_schema",
+        "model_artifact_set_sha256",
+        "model_id",
+        "native_metadata_schema_id",
+        "native_output_space_id",
+        "prediction_schema",
+        "protocol_schema",
+        "runtime_image_manifest_digest",
+        "runtime_lock_sha256",
+        "training_data_map_id",
+        "upstream_source_commit",
+    }
+)
+HEURISTIC_DESCRIPTOR_KEYS = frozenset(
+    {
+        "adapter_source_manifest_sha256",
+        "architecture_id",
+        "backend_id",
+        "descriptor_schema",
+        "model_id",
+        "native_metadata_schema_id",
+        "native_output_space_id",
+        "parameter_lock_sha256",
+        "prediction_schema",
+    }
+)
+OAF_DESCRIPTOR_IDENTITIES = {
+    "architecture_id": "magenta-oaf-model-tpu-drums-v1",
+    "backend_id": OAF_BACKEND_ID,
+    "descriptor_schema": OAF_DESCRIPTOR_SCHEMA,
+    "model_id": "magenta-egmd-ckpt-569400-v1",
+    "native_metadata_schema_id": "magenta-oaf-native-metadata-v1",
+    "native_output_space_id": "magenta-oaf-midi88-a0-v1",
+    "prediction_schema": "crux.drum-prediction-events/v1",
+    "protocol_schema": "crux.transcription-runner/v1",
+    "training_data_map_id": "magenta-egmd-data-8hit-94529798-v1",
+}
+HEURISTIC_DESCRIPTOR_IDENTITIES = {
+    "architecture_id": "librosa-onset-centroid-zcr-v1",
+    "backend_id": HEURISTIC_BACKEND_ID,
+    "descriptor_schema": HEURISTIC_DESCRIPTOR_SCHEMA,
+    "model_id": "crux-heuristic-onset-nonmodel-v1",
+    "native_metadata_schema_id": "crux-empty-native-metadata-v1",
+    "native_output_space_id": "crux-heuristic-midi7-v1",
+    "prediction_schema": "crux.drum-prediction-events/v1",
+}
 
 
 class StrictJsonError(ValueError):
@@ -89,6 +144,56 @@ def build_descriptor(
         payload=MappingProxyType(descriptor_payload),
         sha256=sha256_hex(content),
     )
+
+
+# The two frozen descriptor shapes keep all identity checks in one shared validator.
+# pylint: disable-next=too-many-branches
+def normalize_known_backend_descriptor(value: Mapping[str, object]) -> dict[str, str]:
+    backend_id = value.get("backend_id")
+    if backend_id == OAF_BACKEND_ID:
+        expected_schema = OAF_DESCRIPTOR_SCHEMA
+        expected_keys = OAF_DESCRIPTOR_KEYS
+        expected_identities = OAF_DESCRIPTOR_IDENTITIES
+    elif backend_id == HEURISTIC_BACKEND_ID:
+        expected_schema = HEURISTIC_DESCRIPTOR_SCHEMA
+        expected_keys = HEURISTIC_DESCRIPTOR_KEYS
+        expected_identities = HEURISTIC_DESCRIPTOR_IDENTITIES
+    else:
+        raise StrictJsonError("descriptor backend_id is unknown")
+    if set(value) != set(expected_keys):
+        raise StrictJsonError("descriptor must contain the exact key set")
+    if value.get("descriptor_schema") != expected_schema:
+        raise StrictJsonError(f"descriptor_schema must be {expected_schema}")
+    descriptor: dict[str, str] = {}
+    for field, field_value in value.items():
+        if not isinstance(field_value, str) or not field_value:
+            raise StrictJsonError(f"descriptor {field} must be a nonempty string")
+        descriptor[field] = field_value
+    for field, expected in expected_identities.items():
+        if descriptor[field] != expected:
+            raise StrictJsonError(f"descriptor {field} does not match frozen identity")
+    if backend_id == OAF_BACKEND_ID:
+        for field in (
+            "backend_lock_sha256",
+            "model_artifact_set_sha256",
+            "runtime_lock_sha256",
+        ):
+            require_sha256(descriptor[field], f"descriptor {field}")
+        commit = descriptor["upstream_source_commit"]
+        if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
+            raise StrictJsonError(
+                "descriptor upstream_source_commit must be lowercase Git identity"
+            )
+        image_digest = descriptor["runtime_image_manifest_digest"]
+        if not image_digest.startswith("sha256:") or len(image_digest) != 71:
+            raise StrictJsonError(
+                "descriptor runtime_image_manifest_digest must be sha256 identity"
+            )
+        require_sha256(image_digest[7:], "descriptor runtime_image_manifest_digest")
+    else:
+        for field in ("adapter_source_manifest_sha256", "parameter_lock_sha256"):
+            require_sha256(descriptor[field], f"descriptor {field}")
+    return descriptor
 
 
 # The closed JSON union is clearest as one return per supported value kind.

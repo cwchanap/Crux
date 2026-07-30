@@ -5,9 +5,7 @@ from __future__ import annotations
 # pylint: disable=too-many-instance-attributes,too-many-locals,too-many-branches,too-many-lines
 # pylint: disable=unidiomatic-typecheck,broad-exception-caught,duplicate-code
 import fcntl
-import os
 import re
-import stat
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -19,83 +17,38 @@ from typing import Iterator, Literal, cast
 from uuid import UUID, uuid4
 
 from src.benchmark.backend_identity import (
+    HEURISTIC_BACKEND_ID as _HEURISTIC_BACKEND_ID,
+)
+from src.benchmark.backend_identity import (
+    OAF_BACKEND_ID as _OAF_BACKEND_ID,
+)
+from src.benchmark.backend_identity import (
     JsonValue,
+    StrictJsonError,
     canonical_json_bytes,
+    normalize_known_backend_descriptor,
     require_sha256,
     sha256_hex,
     strict_json_loads,
 )
 from src.benchmark.backend_publication import (
+    DirectoryAnchor,
     atomic_replace_bytes,
+    open_lock_file_no_follow,
     publish_immutable_bytes,
     read_regular_file_no_follow,
+    unlink_regular_file_no_follow,
 )
 from src.benchmark.backends import BackendError, PublishedArtifact
-from src.benchmark.durability import fsync_directory
 
 _VERIFICATION_SCHEMA = "crux.backend-verification-report/v1"
 _EXECUTION_SCHEMA = "crux.backend-execution-report/v1"
 _LEGACY_SCHEMA = "crux.legacy-score-report/v1"
 _ITEM_ID_SCHEMA = "crux.backend-execution-item-id/v1"
-_OAF_BACKEND_ID = "magenta-egmd-tf1-94529798-8hit-v1"
-_HEURISTIC_BACKEND_ID = "heuristic-onset-v1"
 _LEGACY_BACKEND_ID = "legacy-tf2-h5-v0"
 UNAVAILABLE_BACKEND_REPORT_ID = "backend-unavailable"
 _UNAVAILABLE_NAMESPACE_ERROR = "unavailable backend requires exact unavailable execution failure"
-_OAF_DESCRIPTOR_SCHEMA = "crux.transcription-backend-descriptor/v1"
-_HEURISTIC_DESCRIPTOR_SCHEMA = "crux.heuristic-backend-descriptor/v1"
 _TIMESTAMP_PATTERN = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z\Z")
-_OAF_DESCRIPTOR_KEYS = frozenset(
-    {
-        "architecture_id",
-        "backend_id",
-        "backend_lock_sha256",
-        "descriptor_schema",
-        "model_artifact_set_sha256",
-        "model_id",
-        "native_metadata_schema_id",
-        "native_output_space_id",
-        "prediction_schema",
-        "protocol_schema",
-        "runtime_image_manifest_digest",
-        "runtime_lock_sha256",
-        "training_data_map_id",
-        "upstream_source_commit",
-    }
-)
-_HEURISTIC_DESCRIPTOR_KEYS = frozenset(
-    {
-        "adapter_source_manifest_sha256",
-        "architecture_id",
-        "backend_id",
-        "descriptor_schema",
-        "model_id",
-        "native_metadata_schema_id",
-        "native_output_space_id",
-        "parameter_lock_sha256",
-        "prediction_schema",
-    }
-)
-_OAF_DESCRIPTOR_IDENTITIES = {
-    "architecture_id": "magenta-oaf-model-tpu-drums-v1",
-    "backend_id": _OAF_BACKEND_ID,
-    "descriptor_schema": _OAF_DESCRIPTOR_SCHEMA,
-    "model_id": "magenta-egmd-ckpt-569400-v1",
-    "native_metadata_schema_id": "magenta-oaf-native-metadata-v1",
-    "native_output_space_id": "magenta-oaf-midi88-a0-v1",
-    "prediction_schema": "crux.drum-prediction-events/v1",
-    "protocol_schema": "crux.transcription-runner/v1",
-    "training_data_map_id": "magenta-egmd-data-8hit-94529798-v1",
-}
-_HEURISTIC_DESCRIPTOR_IDENTITIES = {
-    "architecture_id": "librosa-onset-centroid-zcr-v1",
-    "backend_id": _HEURISTIC_BACKEND_ID,
-    "descriptor_schema": _HEURISTIC_DESCRIPTOR_SCHEMA,
-    "model_id": "crux-heuristic-onset-nonmodel-v1",
-    "native_metadata_schema_id": "crux-empty-native-metadata-v1",
-    "native_output_space_id": "crux-heuristic-midi7-v1",
-    "prediction_schema": "crux.drum-prediction-events/v1",
-}
 _LATEST_UNKNOWN = object()
 _LATEST_ABSENT = object()
 _VERIFICATION_KEYS = frozenset(
@@ -268,6 +221,8 @@ def derive_item_id(
     return f"sha256:{sha256_hex(canonical_json_bytes(payload))}"
 
 
+# The optional retained root anchor is part of the security boundary.
+# pylint: disable-next=too-many-arguments
 def publish_operational_report(
     reports_root: Path,
     *,
@@ -275,6 +230,7 @@ def publish_operational_report(
     report: OperationalReport,
     now: datetime | None = None,
     run_id: UUID | None = None,
+    anchor: DirectoryAnchor | None = None,
 ) -> PublishedArtifact:
     try:
         _validate_backend_id(backend_id)
@@ -296,25 +252,28 @@ def publish_operational_report(
             content,
             digest,
             role=role,
+            anchor=anchor,
         )
     except Exception:
         raise OperationalReportPublicationError("operational_report_publication_failed") from None
 
     latest_path = backend_root / latest_name
     try:
-        with _latest_namespace_lock(backend_root):
+        with _latest_namespace_lock(backend_root, anchor=anchor):
             previous_state: bytes | object = _LATEST_UNKNOWN
             replacement_may_have_happened = False
             try:
-                previous_content = _read_optional_regular_file(latest_path)
+                previous_content = _read_optional_regular_file(latest_path, anchor=anchor)
                 previous_state = _LATEST_ABSENT if previous_content is None else previous_content
                 replacement_may_have_happened = True
-                atomic_replace_bytes(latest_path, content)
-                fsync_directory(backend_root)
+                if anchor is None:
+                    atomic_replace_bytes(latest_path, content)
+                else:
+                    atomic_replace_bytes(latest_path, content, anchor=anchor)
             except Exception:
                 if replacement_may_have_happened and previous_state is not _LATEST_UNKNOWN:
                     try:
-                        _restore_latest(latest_path, previous_state)
+                        _restore_latest(latest_path, previous_state, anchor=anchor)
                     except Exception:
                         pass
                 raise
@@ -349,7 +308,11 @@ def _normalize_verification(payload: Mapping[str, object]) -> dict[str, JsonValu
     normalized["artifacts"] = _normalize_artifacts(normalized["artifacts"])
     normalized["errors"] = _normalize_errors(normalized["errors"])
     if normalized["status"] == "verified":
+        if normalized["errors"]:
+            raise ReportValidationError("complete verification cannot carry errors")
         _validate_verified_report(normalized)
+    elif not normalized["errors"]:
+        raise ReportValidationError(f"{normalized['status']} report requires errors")
     return _canonical_payload(normalized)
 
 
@@ -388,6 +351,8 @@ def _normalize_execution(payload: Mapping[str, object]) -> dict[str, JsonValue]:
     ]
     normalized["errors"] = _normalize_errors(normalized["errors"])
     if normalized["status"] == "complete":
+        if normalized["errors"]:
+            raise ReportValidationError("complete execution cannot carry errors")
         if normalized["exit_code"] != 0:
             raise ReportValidationError("complete execution exit_code must be zero")
         if any(
@@ -396,6 +361,16 @@ def _normalize_execution(payload: Mapping[str, object]) -> dict[str, JsonValue]:
         ):
             raise ReportValidationError("complete execution requires complete items")
         _validate_complete_execution(normalized)
+    elif normalized["status"] in {"failed", "environment_unsupported"}:
+        if not normalized["errors"]:
+            raise ReportValidationError(f"{normalized['status']} report requires errors")
+        if normalized["items"]:
+            raise ReportValidationError(f"{normalized['status']} execution cannot carry items")
+    elif not normalized["errors"] and all(
+        item["status"] == "complete"
+        for item in cast(list[dict[str, JsonValue]], normalized["items"])
+    ):
+        raise ReportValidationError("partial execution requires failure evidence")
     return _canonical_payload(normalized)
 
 
@@ -439,9 +414,18 @@ def _normalize_legacy(payload: Mapping[str, object]) -> dict[str, JsonValue]:
             raise ReportValidationError(
                 "canonical mapping status requires exit one and null score_report"
             )
+        if not normalized["errors"]:
+            raise ReportValidationError("canonical mapping status requires errors")
     if normalized["status"] == "complete":
+        if normalized["errors"]:
+            raise ReportValidationError("complete legacy report cannot carry errors")
         if normalized["exit_code"] != 0 or normalized["score_report"] is None:
             raise ReportValidationError("complete legacy score requires a score report")
+    elif normalized["status"] == "failed":
+        if not normalized["errors"]:
+            raise ReportValidationError("failed report requires errors")
+        if normalized["score_report"] is not None:
+            raise ReportValidationError("failed legacy report cannot carry score_report")
     return _canonical_payload(normalized)
 
 
@@ -502,56 +486,11 @@ def _normalize_identity_fields(payload: dict[str, object]) -> None:
 def _normalize_descriptor(value: object) -> dict[str, JsonValue]:
     if not isinstance(value, Mapping):
         raise ReportValidationError("descriptor must be an object or null")
-    backend_id = value.get("backend_id")
-    descriptor_schema = value.get("descriptor_schema")
-    if backend_id == _OAF_BACKEND_ID:
-        expected_schema = _OAF_DESCRIPTOR_SCHEMA
-        expected_keys = _OAF_DESCRIPTOR_KEYS
-        expected_identities = _OAF_DESCRIPTOR_IDENTITIES
-    elif backend_id == _HEURISTIC_BACKEND_ID:
-        expected_schema = _HEURISTIC_DESCRIPTOR_SCHEMA
-        expected_keys = _HEURISTIC_DESCRIPTOR_KEYS
-        expected_identities = _HEURISTIC_DESCRIPTOR_IDENTITIES
-    else:
-        raise ReportValidationError("descriptor backend_id is unknown")
-    descriptor = _copy_exact_mapping(value, expected_keys, "descriptor")
-    if descriptor_schema != expected_schema:
-        raise ReportValidationError(f"descriptor_schema must be {expected_schema}")
-    for field, field_value in descriptor.items():
-        _require_string(field_value, f"descriptor {field}")
-    for field, expected in expected_identities.items():
-        if descriptor[field] != expected:
-            raise ReportValidationError(f"descriptor {field} does not match frozen identity")
-    if backend_id == _OAF_BACKEND_ID:
-        for field in (
-            "backend_lock_sha256",
-            "model_artifact_set_sha256",
-            "runtime_lock_sha256",
-        ):
-            _require_hash(descriptor[field], f"descriptor {field}")
-        commit = descriptor["upstream_source_commit"]
-        if (
-            not isinstance(commit, str)
-            or len(commit) != 40
-            or any(character not in "0123456789abcdef" for character in commit)
-        ):
-            raise ReportValidationError(
-                "descriptor upstream_source_commit must be lowercase Git identity"
-            )
-        image_digest = descriptor["runtime_image_manifest_digest"]
-        if (
-            not isinstance(image_digest, str)
-            or not image_digest.startswith("sha256:")
-            or len(image_digest) != 71
-        ):
-            raise ReportValidationError(
-                "descriptor runtime_image_manifest_digest must be sha256 identity"
-            )
-        _require_hash(image_digest[7:], "descriptor runtime_image_manifest_digest")
-    else:
-        for field in ("adapter_source_manifest_sha256", "parameter_lock_sha256"):
-            _require_hash(descriptor[field], f"descriptor {field}")
-    return _canonical_payload(descriptor)
+    try:
+        descriptor = normalize_known_backend_descriptor(value)
+    except StrictJsonError as error:
+        raise ReportValidationError(str(error)) from None
+    return _canonical_payload(cast(dict[str, object], descriptor))
 
 
 def _require_matching_identity(
@@ -616,8 +555,23 @@ def _normalize_item(value: object) -> dict[str, JsonValue]:
     item["prediction"] = _normalize_reference(item["prediction"], "prediction")
     item["midi"] = _normalize_reference(item["midi"], "midi")
     item["errors"] = _normalize_errors(item["errors"])
-    if item["status"] in {"complete", "incomplete"} and item["prediction"] is None:
-        raise ReportValidationError(f"{item['status']} item requires prediction")
+    if item["status"] == "complete":
+        if item["prediction"] is None:
+            raise ReportValidationError("complete item requires prediction")
+        if item["errors"]:
+            raise ReportValidationError("complete item cannot carry errors")
+    elif item["status"] == "incomplete":
+        if item["prediction"] is None:
+            raise ReportValidationError("incomplete item requires prediction")
+        if item["midi"] is not None:
+            raise ReportValidationError("incomplete item cannot carry MIDI")
+        if not item["errors"]:
+            raise ReportValidationError("incomplete item requires errors")
+    else:
+        if item["prediction"] is not None or item["midi"] is not None:
+            raise ReportValidationError("failed item cannot carry success artifacts")
+        if not item["errors"]:
+            raise ReportValidationError("failed item requires errors")
     return _canonical_payload(item)
 
 
@@ -667,10 +621,21 @@ def _normalize_errors(value: object) -> list[JsonValue]:
         error = _copy_exact_mapping(entry, {"code", "message"}, "error")
         _require_string(error["code"], "error code")
         _require_string(error["message"], "error message")
-        message = cast(str, error["message"])
-        if any(ord(character) < 32 or ord(character) == 127 for character in message):
-            raise ReportValidationError("error message must be sanitized")
-        errors.append(_canonical_payload(error))
+        try:
+            validated = BackendError(
+                code=cast(str, error["code"]),
+                message=cast(str, error["message"]),
+            )
+        except (TypeError, ValueError) as failure:
+            raise ReportValidationError(str(failure)) from None
+        errors.append(
+            _canonical_payload(
+                {
+                    "code": validated.code,
+                    "message": validated.message,
+                }
+            )
+        )
     return sorted(
         errors,
         key=lambda error: (
@@ -996,45 +961,48 @@ def _validate_unavailable_execution_report(
 
 
 @contextmanager
-def _latest_namespace_lock(backend_root: Path) -> Iterator[None]:
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    if no_follow is None:
-        raise OSError("no-follow namespace locks are unavailable")
-    flags = os.O_RDWR | os.O_CREAT | no_follow
-    descriptor = os.open(backend_root / ".latest-report.lock", flags, 0o600)
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise OSError("latest namespace lock is not a regular file")
+def _latest_namespace_lock(
+    backend_root: Path,
+    *,
+    anchor: DirectoryAnchor | None,
+) -> Iterator[None]:
+    with open_lock_file_no_follow(
+        backend_root / ".latest-report.lock",
+        anchor=anchor,
+    ) as descriptor:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
-    finally:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            yield
         finally:
-            os.close(descriptor)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
-def _read_optional_regular_file(path: Path) -> bytes | None:
+def _read_optional_regular_file(
+    path: Path,
+    *,
+    anchor: DirectoryAnchor | None,
+) -> bytes | None:
     try:
-        path.lstat()
+        return read_regular_file_no_follow(path, anchor=anchor)
     except FileNotFoundError:
         return None
-    return read_regular_file_no_follow(path)
 
 
-def _restore_latest(path: Path, previous_state: bytes | object) -> None:
+def _restore_latest(
+    path: Path,
+    previous_state: bytes | object,
+    *,
+    anchor: DirectoryAnchor | None,
+) -> None:
     if isinstance(previous_state, bytes):
-        atomic_replace_bytes(path, previous_state)
-        fsync_directory(path.parent)
+        if anchor is None:
+            atomic_replace_bytes(path, previous_state)
+        else:
+            atomic_replace_bytes(path, previous_state, anchor=anchor)
         return
     if previous_state is not _LATEST_ABSENT:
         raise OSError("latest report rollback state is unknown")
     try:
-        metadata = path.lstat()
+        unlink_regular_file_no_follow(path, anchor=anchor)
     except FileNotFoundError:
         return
-    if not stat.S_ISREG(metadata.st_mode):
-        raise OSError("latest report is unavailable")
-    path.unlink()
-    fsync_directory(path.parent)

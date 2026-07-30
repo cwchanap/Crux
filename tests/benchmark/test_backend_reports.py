@@ -346,6 +346,8 @@ def test_report_statuses_require_exact_exit_codes(
 def test_errors_and_verification_artifacts_are_sorted_canonically() -> None:
     report = VerificationReport(
         make_verification_payload(
+            status="failed",
+            exit_code=2,
             artifacts=[
                 {"role": "z", "path": "b.json", "sha256": "b" * 64},
                 {"role": "a", "path": "z.json", "sha256": "c" * 64},
@@ -369,6 +371,159 @@ def test_errors_and_verification_artifacts_are_sorted_canonically() -> None:
         {"code": "a_error", "message": "z message"},
         {"code": "z_error", "message": "first"},
     ]
+
+
+@pytest.mark.parametrize("code", ["BadCode", "bad-code", "_bad", "bad code"])
+def test_mapping_form_errors_use_backend_error_code_contract(code: str) -> None:
+    with pytest.raises(ReportValidationError, match="stable lowercase snake case"):
+        ExecutionReport(
+            make_execution_payload(
+                status="failed",
+                exit_code=2,
+                items=[],
+                errors=[{"code": code, "message": "Failure."}],
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("record_type", "payload"),
+    [
+        (
+            VerificationReport,
+            make_verification_payload(errors=[{"code": "unexpected_error", "message": "Failure."}]),
+        ),
+        (
+            ExecutionReport,
+            make_execution_payload(errors=[{"code": "unexpected_error", "message": "Failure."}]),
+        ),
+        (
+            LegacyScoreReport,
+            make_legacy_payload(errors=[{"code": "unexpected_error", "message": "Failure."}]),
+        ),
+    ],
+)
+def test_complete_reports_cannot_carry_errors(
+    record_type: type,
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ReportValidationError, match="complete.*errors"):
+        record_type(payload)
+
+
+@pytest.mark.parametrize(
+    ("record_type", "payload"),
+    [
+        (
+            VerificationReport,
+            make_verification_payload(status="failed", exit_code=2, errors=[]),
+        ),
+        (
+            VerificationReport,
+            make_verification_payload(
+                status="environment_unsupported",
+                exit_code=1,
+                errors=[],
+            ),
+        ),
+        (
+            ExecutionReport,
+            make_execution_payload(status="failed", exit_code=2, items=[], errors=[]),
+        ),
+        (
+            ExecutionReport,
+            make_execution_payload(
+                status="environment_unsupported",
+                exit_code=1,
+                items=[],
+                errors=[],
+            ),
+        ),
+        (
+            LegacyScoreReport,
+            make_legacy_payload(
+                status="failed",
+                exit_code=1,
+                score_report=None,
+                errors=[],
+            ),
+        ),
+        (
+            LegacyScoreReport,
+            make_legacy_payload(
+                backend_id=OAF_BACKEND_ID,
+                backend_validation_status="not_checked",
+                status="canonical_mapping_required",
+                exit_code=1,
+                score_report=None,
+                errors=[],
+            ),
+        ),
+    ],
+)
+def test_failed_reports_require_errors(
+    record_type: type,
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ReportValidationError, match="requires errors"):
+        record_type(payload)
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        make_execution_item(
+            "complete-error",
+            errors=[{"code": "unexpected_error", "message": "Failure."}],
+        ),
+        make_execution_item(
+            "incomplete-no-error",
+            status="incomplete",
+            prediction=artifact_reference("predictions/incomplete.jsonl"),
+            errors=[],
+        ),
+        make_execution_item(
+            "incomplete-midi",
+            status="incomplete",
+            prediction=artifact_reference("predictions/incomplete.jsonl"),
+            midi=artifact_reference("predictions/incomplete.mid"),
+            errors=[{"code": "midi_derivation_failed", "message": "MIDI was not produced."}],
+        ),
+        make_execution_item(
+            "failed-prediction",
+            status="failed",
+            prediction=artifact_reference("predictions/failed.jsonl"),
+            errors=[{"code": "inference_failed", "message": "Inference failed."}],
+        ),
+        make_execution_item(
+            "failed-midi",
+            status="failed",
+            midi=artifact_reference("predictions/failed.mid"),
+            errors=[{"code": "inference_failed", "message": "Inference failed."}],
+        ),
+        make_execution_item("failed-no-error", status="failed", errors=[]),
+    ],
+)
+def test_execution_item_status_error_artifact_matrix(item: dict[str, object]) -> None:
+    with pytest.raises(ReportValidationError):
+        ExecutionReport(
+            make_execution_payload(
+                status="partial",
+                exit_code=1,
+                items=[item],
+            )
+        )
+
+
+def test_partial_execution_requires_item_or_report_failure_evidence() -> None:
+    with pytest.raises(ReportValidationError, match="partial.*failure"):
+        ExecutionReport(
+            make_execution_payload(
+                status="partial",
+                exit_code=1,
+                items=[make_execution_item("complete")],
+            )
+        )
 
 
 def test_failure_before_identity_establishment_allows_nullable_fields() -> None:
@@ -659,7 +814,15 @@ def test_report_only_unavailable_namespace_accepts_exact_typed_failure(
     [
         {"status": "partial", "exit_code": 1},
         {"backend_lock_sha256": "b" * 64},
-        {"items": [make_execution_item("failed", status="failed")]},
+        {
+            "items": [
+                make_execution_item(
+                    "failed",
+                    status="failed",
+                    errors=[{"code": "inference_failed", "message": "Inference failed."}],
+                )
+            ]
+        },
         {
             "errors": [
                 {
@@ -682,10 +845,7 @@ def test_report_only_unavailable_namespace_rejects_nonexact_execution_failure(
     tmp_path: Path,
     changes: dict[str, object],
 ) -> None:
-    with pytest.raises(
-        OperationalReportPublicationError,
-        match="operational_report_publication_failed",
-    ):
+    with pytest.raises((OperationalReportPublicationError, ReportValidationError)):
         publish_operational_report(
             tmp_path,
             backend_id=UNAVAILABLE_BACKEND_REPORT_ID,
@@ -941,6 +1101,7 @@ def test_report_publication_rejects_symlink_latest_destination(
 ) -> None:
     backend_root = tmp_path / OAF_BACKEND_ID
     backend_root.mkdir()
+    (backend_root / "reports").mkdir()
     target = tmp_path / "outside.json"
     target.write_bytes(b"outside")
     (backend_root / latest_name).symlink_to(target)
@@ -968,6 +1129,7 @@ def test_report_latest_replace_failure_rolls_back_previous_latest(
 ) -> None:
     backend_root = tmp_path / OAF_BACKEND_ID
     backend_root.mkdir()
+    (backend_root / "reports").mkdir()
     latest = backend_root / "latest-execution.json"
     latest.write_bytes(b"prior valid latest\n")
 
@@ -1023,13 +1185,14 @@ def test_failed_older_latest_publish_cannot_roll_back_newer_success(
     # pylint: disable=too-many-locals
     backend_root = tmp_path / OAF_BACKEND_ID
     backend_root.mkdir()
+    (backend_root / "reports").mkdir()
     latest = backend_root / "latest-execution.json"
     latest.write_bytes(b"original latest\n")
     newer_run_id = UUID("87654321-4321-4765-8765-432187654321")
     older_report = ExecutionReport(make_execution_payload())
     newer_report = ExecutionReport(make_execution_payload(run_id=str(newer_run_id)))
     real_replace = backend_reports.atomic_replace_bytes
-    real_fsync_directory = backend_reports.fsync_directory
+    real_fsync = backend_publication.os.fsync
     newer_started = threading.Event()
     newer_replaced = threading.Event()
     older_at_fsync = threading.Event()
@@ -1042,11 +1205,14 @@ def test_failed_older_latest_publish_cannot_roll_back_newer_success(
         if threading.current_thread().name == "newer" and path == latest:
             newer_replaced.set()
 
-    def fail_older_after_replace(path: Path) -> None:
+    def fail_older_after_replace(descriptor: int) -> None:
         nonlocal older_failed_once
+        descriptor_stat = backend_publication.os.fstat(descriptor)
+        backend_stat = backend_root.stat()
         if (
             threading.current_thread().name == "older"
-            and path == backend_root
+            and (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            == (backend_stat.st_dev, backend_stat.st_ino)
             and not older_failed_once
         ):
             older_failed_once = True
@@ -1054,7 +1220,7 @@ def test_failed_older_latest_publish_cannot_roll_back_newer_success(
             assert newer_started.wait(timeout=2)
             newer_replaced.wait(timeout=0.25)
             raise OSError("older durability failure")
-        real_fsync_directory(path)
+        real_fsync(descriptor)
 
     def publish_older() -> None:
         try:
@@ -1081,7 +1247,7 @@ def test_failed_older_latest_publish_cannot_roll_back_newer_success(
         )
 
     monkeypatch.setattr(backend_reports, "atomic_replace_bytes", observe_replace)
-    monkeypatch.setattr(backend_reports, "fsync_directory", fail_older_after_replace)
+    monkeypatch.setattr(backend_publication.os, "fsync", fail_older_after_replace)
     older = threading.Thread(target=publish_older, name="older")
     newer = threading.Thread(target=publish_newer, name="newer")
     older.start()
@@ -1109,19 +1275,25 @@ def test_report_latest_directory_fsync_failure_rolls_back_previous_latest(
 ) -> None:
     backend_root = tmp_path / OAF_BACKEND_ID
     backend_root.mkdir()
+    (backend_root / "reports").mkdir()
     latest = backend_root / "latest-execution.json"
     latest.write_bytes(b"prior valid latest\n")
-    real_fsync_directory = backend_reports.fsync_directory
+    real_fsync = backend_publication.os.fsync
     failed_once = False
 
-    def fail_after_latest_replace(path: Path) -> None:
+    def fail_after_latest_replace(descriptor: int) -> None:
         nonlocal failed_once
-        if path == backend_root and not failed_once:
+        descriptor_stat = backend_publication.os.fstat(descriptor)
+        backend_stat = backend_root.stat()
+        if (descriptor_stat.st_dev, descriptor_stat.st_ino) == (
+            backend_stat.st_dev,
+            backend_stat.st_ino,
+        ) and not failed_once:
             failed_once = True
             raise OSError("directory fsync failed")
-        real_fsync_directory(path)
+        real_fsync(descriptor)
 
-    monkeypatch.setattr(backend_reports, "fsync_directory", fail_after_latest_replace)
+    monkeypatch.setattr(backend_publication.os, "fsync", fail_after_latest_replace)
 
     with pytest.raises(OperationalReportPublicationError):
         publish_operational_report(
@@ -1168,6 +1340,12 @@ def test_legacy_canonical_mapping_required_has_null_score_and_exit_one() -> None
             status="canonical_mapping_required",
             exit_code=1,
             score_report=None,
+            errors=[
+                {
+                    "code": "canonical_mapping_required",
+                    "message": "Canonical mapping is required before scoring.",
+                }
+            ],
         )
     )
 

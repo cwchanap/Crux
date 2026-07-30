@@ -3,7 +3,9 @@ from __future__ import annotations
 # End-to-end fixtures intentionally construct the complete frozen report identities.
 # pylint: disable=duplicate-code,too-many-lines
 import os
+import stat
 import struct
+import tempfile
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -173,11 +175,62 @@ def derived_request(
     )
 
 
+def external_input_request(
+    repository_root: Path,
+    external_root: Path,
+    *,
+    mode: str,
+) -> TranscribeOneRequest:
+    if mode == "direct":
+        external_root.mkdir()
+        audio_path = external_root / "input.wav"
+        audio_path.write_bytes(canonical_wav())
+        return replace(direct_request(repository_root), audio_path=audio_path)
+    request = derived_request(external_root)
+    return replace(
+        request,
+        output_path=repository_root / "predictions" / "external-derived.jsonl",
+        reports_root=repository_root / "artifacts" / "benchmark" / "backends",
+    )
+
+
+def execution_attestation_content(backend_id: str, descriptor_sha256: str) -> bytes:
+    container = backend_id == OFFICIAL_BACKEND_ID
+    return canonical_json_bytes(
+        {
+            "backend_id": backend_id,
+            "changed_files_manifest": None,
+            "checkout_dirty": False,
+            "cpu_limit": "1" if container else None,
+            "descriptor_sha256": descriptor_sha256,
+            "git_commit": "a" * 40,
+            "memory_bytes": 1024 if container else None,
+            "pid_limit": 16 if container else None,
+            "request_deadline_seconds": 60,
+            "schema": "crux.backend-execution-attestation/v1",
+            "shm_bytes": 1024 if container else None,
+            "startup_deadline_seconds": 30,
+            "strict_mode": True,
+            "tmp_bytes": 1024 if container else None,
+        },
+        trailing_newline=True,
+    )
+
+
 def heuristic_verification(
     *,
     status: str = "verified",
     errors: tuple[BackendError, ...] = (),
+    materialize_support: bool = True,
 ) -> BackendVerification:
+    attestation_path = Path("artifacts/benchmark/backends/heuristic/attestation.json")
+    attestation_content = execution_attestation_content(
+        HEURISTIC_BACKEND_ID,
+        HEURISTIC_DESCRIPTOR.sha256,
+    )
+    if materialize_support and status == "verified":
+        attestation_path.parent.mkdir(parents=True, exist_ok=True)
+        attestation_path.write_bytes(attestation_content)
     return BackendVerification(
         status=cast(object, status),  # type: ignore[arg-type]
         descriptor=HEURISTIC_DESCRIPTOR,
@@ -188,8 +241,8 @@ def heuristic_verification(
         seal_evidence_sha256=None,
         execution_attestation=PublishedArtifact(
             role="execution_attestation",
-            path=Path("artifacts/benchmark/backends/heuristic/attestation.json"),
-            sha256="e" * 64,
+            path=attestation_path,
+            sha256=sha256_hex(attestation_content),
         ),
         tensor_coverage=TensorCoverageCheck(
             status="not_applicable",
@@ -216,6 +269,35 @@ def oaf_verification(
     status: str = "verified",
     errors: tuple[BackendError, ...] = (),
 ) -> BackendVerification:
+    attestation_path = Path("artifacts/benchmark/backends/oaf/attestation.json")
+    attestation_content = execution_attestation_content(
+        OFFICIAL_BACKEND_ID,
+        OAF_DESCRIPTOR.sha256,
+    )
+    tensor_path = Path("artifacts/benchmark/backends/oaf/tensor.json")
+    tensor_content = b'{"coverage":"complete","schema":"crux.test-tensor-coverage/v1"}\n'
+    smoke_path = Path("artifacts/benchmark/backends/oaf/smoke.jsonl")
+    smoke_audio = CanonicalAudio(
+        path=Path(),
+        source_audio_id="smoke",
+        source_audio_sha256="a" * 64,
+        input_view_id="canonical-smoke",
+        input_audio_sha256="b" * 64,
+        byte_length=46,
+        sample_rate=44100,
+        channel_count=1,
+        sample_width_bytes=2,
+        audio_frame_count=1,
+    )
+    smoke_content = transcription_module.render_prediction_artifact(oaf_prediction(smoke_audio))
+    if status == "verified":
+        for path, content in (
+            (attestation_path, attestation_content),
+            (tensor_path, tensor_content),
+            (smoke_path, smoke_content),
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
     return BackendVerification(
         status=cast(object, status),  # type: ignore[arg-type]
         descriptor=OAF_DESCRIPTOR,
@@ -226,8 +308,8 @@ def oaf_verification(
         seal_evidence_sha256="d" * 64,
         execution_attestation=PublishedArtifact(
             role="execution_attestation",
-            path=Path("artifacts/benchmark/backends/oaf/attestation.json"),
-            sha256="e" * 64,
+            path=attestation_path,
+            sha256=sha256_hex(attestation_content),
         ),
         tensor_coverage=TensorCoverageCheck(
             status="passed",
@@ -238,8 +320,8 @@ def oaf_verification(
             non_inference_inventory_sha256="1" * 64,
             report=PublishedArtifact(
                 role="tensor_coverage",
-                path=Path("artifacts/benchmark/backends/oaf/tensor.json"),
-                sha256="2" * 64,
+                path=tensor_path,
+                sha256=sha256_hex(tensor_content),
             ),
         ),
         smoke=SmokeCheck(
@@ -248,8 +330,8 @@ def oaf_verification(
             oracle_sha256="4" * 64,
             prediction=PublishedArtifact(
                 role="prediction",
-                path=Path("artifacts/benchmark/backends/oaf/smoke.jsonl"),
-                sha256="5" * 64,
+                path=smoke_path,
+                sha256=sha256_hex(smoke_content),
             ),
         ),
         errors=errors,
@@ -431,7 +513,7 @@ def test_transcribe_one_uses_real_common_components_in_exact_phase_order(
     phases: list[str] = []
     backend = FakeBackend(heuristic_verification(), phases=phases)
     request = direct_request(tmp_path)
-    real_load = transcription_module.load_direct_audio
+    real_load = transcription_module.load_direct_audio_bytes
     real_render = transcription_module.render_prediction_artifact
     real_read = transcription_module.read_prediction_artifact
     real_publish_prediction = transcription_module.publish_prediction_artifact
@@ -452,15 +534,16 @@ def test_transcribe_one_uses_real_common_components_in_exact_phase_order(
     def record_publish_prediction(
         path: Path,
         prediction: NativePrediction,
+        **kwargs: object,
     ) -> PublishedArtifact:
         phases.append("publish_prediction")
-        return real_publish_prediction(path, prediction)
+        return real_publish_prediction(path, prediction, **kwargs)  # type: ignore[arg-type]
 
     def record_publish_report(*args: object, **kwargs: object) -> PublishedArtifact:
         phases.append("publish_report")
         return real_publish_report(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(transcription_module, "load_direct_audio", record_load)
+    monkeypatch.setattr(transcription_module, "load_direct_audio_bytes", record_load)
     monkeypatch.setattr(transcription_module, "render_prediction_artifact", record_render)
     monkeypatch.setattr(transcription_module, "read_prediction_artifact", record_read)
     monkeypatch.setattr(
@@ -494,9 +577,521 @@ def test_transcribe_one_uses_real_common_components_in_exact_phase_order(
         "publish_report",
         "close",
     ]
+
+
+def test_backend_callback_cannot_redirect_prediction_through_ancestor_symlink_swap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    output_root = tmp_path / "trusted-output"
+    original = tmp_path / "trusted-output-original"
+    attacker = tmp_path / "attacker"
+    output_root.mkdir()
+    attacker.mkdir()
+    request = direct_request(
+        tmp_path,
+        output_path=output_root / "prediction.jsonl",
+    )
+
+    def swap_then_predict(audio: CanonicalAudio) -> NativePrediction:
+        output_root.rename(original)
+        output_root.symlink_to(attacker, target_is_directory=True)
+        return heuristic_prediction(audio)
+
+    outcome = run_transcribe_one(
+        request,
+        registry=registry_for(
+            FakeBackend(
+                heuristic_verification(),
+                prediction_factory=swap_then_predict,
+            )
+        ),
+        now=FIXED_UTC,
+        run_id=FIXED_UUID,
+    )
+
+    assert outcome.status == "partial"
+    assert outcome.exit_code == 1
+    assert not (attacker / "prediction.jsonl").exists()
+    assert report_payload(outcome)["items"][0]["errors"][0]["code"] == (  # type: ignore[index]
+        "prediction_publication_failed"
+    )
+
+
+@pytest.mark.parametrize("swap_phase", ["verify", "transcribe"])
+def test_repository_inode_is_retained_across_backend_callback_root_swap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    swap_phase: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    original = tmp_path.with_name(f"{tmp_path.name}-original")
+    attacker = tmp_path.with_name(f"{tmp_path.name}-attacker")
+    attacker.mkdir()
+    request = direct_request(tmp_path)
+    swapped = False
+
+    def swap_repository_root() -> None:
+        nonlocal swapped
+        if swapped:
+            return
+        swapped = True
+        tmp_path.rename(original)
+        tmp_path.symlink_to(attacker, target_is_directory=True)
+
+    def prediction_factory(audio: CanonicalAudio) -> NativePrediction:
+        if swap_phase == "transcribe":
+            swap_repository_root()
+        return heuristic_prediction(audio)
+
+    backend = FakeBackend(
+        heuristic_verification(),
+        verify_hook=swap_repository_root if swap_phase == "verify" else None,
+        prediction_factory=prediction_factory,
+    )
+
+    try:
+        outcome = run_transcribe_one(
+            request,
+            registry=registry_for(backend),
+            now=FIXED_UTC,
+            run_id=FIXED_UUID,
+        )
+        assert outcome.status == "complete"
+        assert (original / "predictions" / "result.jsonl").exists()
+        assert (
+            original
+            / "artifacts"
+            / "benchmark"
+            / "backends"
+            / HEURISTIC_BACKEND_ID
+            / "latest-execution.json"
+        ).exists()
+        assert list(attacker.rglob("*")) == []
+    finally:
+        os.chdir(tmp_path.parent)
+        if tmp_path.is_symlink():
+            tmp_path.unlink()
+        if original.exists():
+            original.rename(tmp_path)
+        os.chdir(tmp_path)
+
+
+@pytest.mark.parametrize("mode", ["direct", "derived"])
+def test_absolute_external_input_workflows_publish_repository_owned_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    external_root = tmp_path.parent / f"{tmp_path.name}-external-{mode}"
+    request = external_input_request(tmp_path, external_root, mode=mode)
+    backend = FakeBackend(heuristic_verification())
+
+    outcome = run_transcribe_one(
+        request,
+        registry=registry_for(backend),
+        now=FIXED_UTC,
+        run_id=FIXED_UUID,
+    )
+
+    assert outcome.status == "complete"
+    assert outcome.exit_code == 0
+    assert request.output_path.is_relative_to(tmp_path)
+    assert request.output_path.exists()
+    assert outcome.report_artifact.path.is_relative_to(tmp_path)
+    assert backend.transcribe_calls == 1
+    assert backend.close_calls == 1
+
+
+@pytest.mark.parametrize("mode", ["direct", "derived"])
+@pytest.mark.parametrize("swap_phase", ["verify", "transcribe"])
+@pytest.mark.parametrize("ownership", ["repository", "absolute_external"])
+def test_backend_reads_stable_snapshot_across_original_input_path_swap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mode: str,
+    swap_phase: str,
+    ownership: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    if ownership == "repository":
+        request = direct_request(tmp_path) if mode == "direct" else derived_request(tmp_path)
+    else:
+        external_root = tmp_path.parent / f"{tmp_path.name}-external-swap-{mode}"
+        request = external_input_request(tmp_path, external_root, mode=mode)
+    trusted_root = request.audio_path.parent
+    original_root = trusted_root.with_name(f"{trusted_root.name}-original")
+    attacker_root = trusted_root.with_name(f"{trusted_root.name}-attacker")
+    if mode == "direct":
+        expected_source = request.audio_path.read_bytes()
+    else:
+        expected_source = (trusted_root / "source.raw").read_bytes()
+    expected_input = request.audio_path.read_bytes()
+
+    attacker_root.mkdir()
+    if mode == "direct":
+        (attacker_root / "input.wav").write_bytes(canonical_wav(frame_count=3))
+    else:
+        attacker_source = attacker_root / "source.raw"
+        attacker_input = attacker_root / "input.wav"
+        attacker_source.write_bytes(b"attacker-source")
+        attacker_input.write_bytes(canonical_wav(frame_count=3))
+        (attacker_root / "manifest.json").write_bytes(
+            canonical_json_bytes(
+                {
+                    "input_audio_path": "input.wav",
+                    "input_audio_sha256": sha256_hex(attacker_input.read_bytes()),
+                    "input_view_id": "canonical-44k1-mono",
+                    "schema": "crux.input-view-manifest/v1",
+                    "source_audio_id": "attacker-derived",
+                    "source_audio_sha256": sha256_hex(attacker_source.read_bytes()),
+                    "source_path": "source.raw",
+                },
+                trailing_newline=True,
+            )
+        )
+    attacker_snapshot = {
+        path.relative_to(attacker_root).as_posix(): path.read_bytes()
+        for path in attacker_root.rglob("*")
+        if path.is_file()
+    }
+    backend_paths: list[Path] = []
+    backend_reads: list[bytes] = []
+    backend_modes: list[tuple[int, int]] = []
+    backend_frame_counts: list[int] = []
+
+    def swap_input_root() -> None:
+        trusted_root.rename(original_root)
+        trusted_root.symlink_to(attacker_root, target_is_directory=True)
+
+    def prediction_factory(audio: CanonicalAudio) -> NativePrediction:
+        if swap_phase == "transcribe":
+            swap_input_root()
+        backend_paths.append(audio.path)
+        backend_reads.append(audio.path.read_bytes())
+        backend_frame_counts.append(audio.audio_frame_count)
+        backend_modes.append(
+            (
+                stat.S_IMODE(audio.path.stat().st_mode),
+                stat.S_IMODE(audio.path.parent.stat().st_mode),
+            )
+        )
+        return heuristic_prediction(audio)
+
+    backend = FakeBackend(
+        heuristic_verification(),
+        verify_hook=swap_input_root if swap_phase == "verify" else None,
+        prediction_factory=prediction_factory,
+    )
+    try:
+        outcome = run_transcribe_one(
+            request,
+            registry=registry_for(backend),
+            now=FIXED_UTC,
+            run_id=FIXED_UUID,
+        )
+
+        header = strict_json_loads(
+            request.output_path.read_bytes().splitlines()[0],
+            require_canonical=True,
+        )
+        assert isinstance(header, dict)
+        assert outcome.status == "complete"
+        assert header["source_audio_sha256"] == sha256_hex(expected_source)
+        assert header["input_audio_sha256"] == sha256_hex(expected_input)
+        assert backend_reads == [expected_input]
+        assert backend_frame_counts == [2]
+        assert backend_modes == [(0o400, 0o500)]
+        assert backend_paths[0] != request.audio_path
+        assert not backend_paths[0].exists()
+        assert not backend_paths[0].parent.exists()
+        assert {
+            path.relative_to(attacker_root).as_posix(): path.read_bytes()
+            for path in attacker_root.rglob("*")
+            if path.is_file()
+        } == attacker_snapshot
+        assert not any(
+            path.name.endswith((".jsonl", "-execution.json")) for path in attacker_root.rglob("*")
+        )
+        assert backend.close_calls == 1
+    finally:
+        if trusted_root.is_symlink():
+            trusted_root.unlink()
+        if original_root.exists():
+            original_root.rename(trusted_root)
+
+
+@pytest.mark.parametrize("mode", ["direct", "derived"])
+def test_relative_external_input_paths_are_lexically_normalized_and_snapshotted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    external_root = tmp_path.parent / f"{tmp_path.name}-relative-external-{mode}"
+    absolute_request = external_input_request(tmp_path, external_root, mode=mode)
+    if mode == "direct":
+        relative_audio = Path("..") / external_root.name / "input.wav"
+        request = replace(absolute_request, audio_path=relative_audio)
+        expected_source = absolute_request.audio_path.read_bytes()
+    else:
+        relative_view = Path("..") / external_root.name / "derived"
+        request = replace(
+            absolute_request,
+            audio_path=relative_view / "input.wav",
+            input_view_manifest=relative_view / "manifest.json",
+        )
+        expected_source = (external_root / "derived" / "source.raw").read_bytes()
+    expected_input = absolute_request.audio_path.read_bytes()
+    backend_paths: list[Path] = []
+    backend_reads: list[bytes] = []
+
+    def prediction_factory(audio: CanonicalAudio) -> NativePrediction:
+        backend_paths.append(audio.path)
+        backend_reads.append(audio.path.read_bytes())
+        return heuristic_prediction(audio)
+
+    outcome = run_transcribe_one(
+        request,
+        registry=registry_for(
+            FakeBackend(
+                heuristic_verification(),
+                prediction_factory=prediction_factory,
+            )
+        ),
+        now=FIXED_UTC,
+        run_id=FIXED_UUID,
+    )
+
+    header = strict_json_loads(
+        request.output_path.read_bytes().splitlines()[0],
+        require_canonical=True,
+    )
+    assert isinstance(header, dict)
+    assert outcome.status == "complete"
+    assert outcome.exit_code == 0
+    assert header["source_audio_sha256"] == sha256_hex(expected_source)
+    assert header["input_audio_sha256"] == sha256_hex(expected_input)
+    assert backend_reads == [expected_input]
+    assert backend_paths[0].is_absolute()
+    assert backend_paths[0] != request.audio_path
+    assert not backend_paths[0].exists()
+    assert not backend_paths[0].parent.exists()
+    assert request.output_path.is_relative_to(tmp_path)
+    assert outcome.report_artifact.path.is_relative_to(tmp_path)
+
+
+@pytest.mark.parametrize("mutation", ["overwrite", "replace"])
+def test_backend_snapshot_mutation_is_fatal_protocol_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    request = direct_request(tmp_path)
+    snapshot_paths: list[Path] = []
+
+    def prediction_factory(audio: CanonicalAudio) -> NativePrediction:
+        snapshot_paths.append(audio.path)
+        if mutation == "overwrite":
+            audio.path.chmod(0o600)
+            audio.path.write_bytes(canonical_wav(frame_count=3))
+        else:
+            audio.path.parent.chmod(0o700)
+            audio.path.unlink()
+            audio.path.write_bytes(canonical_wav(frame_count=3))
+        return heuristic_prediction(audio)
+
+    outcome = run_transcribe_one(
+        request,
+        registry=registry_for(
+            FakeBackend(
+                heuristic_verification(),
+                prediction_factory=prediction_factory,
+            )
+        ),
+        now=FIXED_UTC,
+        run_id=FIXED_UUID,
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.exit_code == 2
+    assert report_payload(outcome)["errors"][0]["code"] == "backend_protocol_failed"  # type: ignore[index]
+    assert not request.output_path.exists()
+    assert snapshot_paths[0] != request.audio_path
+    assert not snapshot_paths[0].exists()
+    assert not snapshot_paths[0].parent.exists()
+    assert request.audio_path.read_bytes() == canonical_wav()
+
+
+@pytest.mark.parametrize("replacement_is_empty", [True, False])
+def test_backend_snapshot_directory_replacement_is_protocol_failure_and_cleans(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    replacement_is_empty: bool,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    request = direct_request(tmp_path)
+    original_paths: list[Path] = []
+    renamed_paths: list[Path] = []
+    marker_paths: list[Path] = []
+
+    def prediction_factory(audio: CanonicalAudio) -> NativePrediction:
+        original_path = audio.path.parent
+        renamed_path = original_path.with_name(f"{original_path.name}-renamed")
+        original_paths.append(original_path)
+        renamed_paths.append(renamed_path)
+        original_path.rename(renamed_path)
+        original_path.mkdir()
+        if not replacement_is_empty:
+            marker_path = original_path / "unrelated.txt"
+            marker_path.write_bytes(b"must survive")
+            marker_paths.append(marker_path)
+        return heuristic_prediction(audio)
+
+    try:
+        outcome = run_transcribe_one(
+            request,
+            registry=registry_for(
+                FakeBackend(
+                    heuristic_verification(),
+                    prediction_factory=prediction_factory,
+                )
+            ),
+            now=FIXED_UTC,
+            run_id=FIXED_UUID,
+        )
+
+        assert outcome.status == "failed"
+        assert outcome.exit_code == 2
+        assert report_payload(outcome)["errors"][0]["code"] == (  # type: ignore[index]
+            "backend_protocol_failed"
+        )
+        assert not request.output_path.exists()
+        assert not renamed_paths[0].exists()
+        if replacement_is_empty:
+            assert not original_paths[0].exists()
+        else:
+            assert marker_paths[0].read_bytes() == b"must survive"
+            assert original_paths[0].is_dir()
+    finally:
+        for marker_path in marker_paths:
+            if marker_path.exists():
+                marker_path.unlink()
+        for original_path in original_paths:
+            if original_path.exists():
+                original_path.rmdir()
+        for renamed_path in renamed_paths:
+            if renamed_path.exists():
+                snapshot_file = renamed_path / "input.wav"
+                if snapshot_file.exists():
+                    snapshot_file.unlink()
+                renamed_path.rmdir()
+
+
+def test_transcription_supports_symlinked_system_temp_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    resolved_root = tmp_path / "resolved-temp"
+    resolved_root.mkdir()
+    configured_alias = tmp_path / "configured-temp"
+    configured_alias.symlink_to(resolved_root, target_is_directory=True)
+    monkeypatch.setenv("TMPDIR", str(configured_alias))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    request = direct_request(tmp_path)
+    backend_paths: list[Path] = []
+
+    def prediction_factory(audio: CanonicalAudio) -> NativePrediction:
+        backend_paths.append(audio.path)
+        return heuristic_prediction(audio)
+
+    assert Path(tempfile.gettempdir()) == configured_alias
+    outcome = run_transcribe_one(
+        request,
+        registry=registry_for(
+            FakeBackend(
+                heuristic_verification(),
+                prediction_factory=prediction_factory,
+            )
+        ),
+        now=FIXED_UTC,
+        run_id=FIXED_UUID,
+    )
+
+    assert outcome.status == "complete"
+    assert outcome.exit_code == 0
+    assert backend_paths[0].parent.parent == resolved_root
+    assert not backend_paths[0].exists()
+    assert list(resolved_root.iterdir()) == []
+    assert request.output_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_status", "expected_code"),
+    [
+        ("item", "partial", "inference_failed"),
+        ("fatal", "failed", "runner_process_died"),
+        ("unexpected", "failed", "backend_failure"),
+    ],
+)
+def test_private_snapshot_cleans_on_every_backend_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure_kind: str,
+    expected_status: str,
+    expected_code: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    request = direct_request(tmp_path)
+    snapshot_paths: list[Path] = []
+
+    def prediction_factory(audio: CanonicalAudio) -> NativePrediction:
+        snapshot_paths.append(audio.path)
+        if failure_kind == "item":
+            raise BackendItemFailure(
+                BackendError(
+                    code="inference_failed",
+                    message="Inference failed for this item.",
+                )
+            )
+        if failure_kind == "fatal":
+            raise BackendFatalFailure(
+                BackendError(
+                    code="runner_process_died",
+                    message="The backend runner stopped.",
+                )
+            )
+        raise RuntimeError("unexpected backend failure")
+
+    outcome = run_transcribe_one(
+        request,
+        registry=registry_for(
+            FakeBackend(
+                heuristic_verification(),
+                prediction_factory=prediction_factory,
+            )
+        ),
+        now=FIXED_UTC,
+        run_id=FIXED_UUID,
+    )
+
     payload = report_payload(outcome)
-    assert payload["verification_report"] is None
-    assert payload["items"][0]["prediction"]["path"] == "predictions/result.jsonl"  # type: ignore[index]
+    actual_code = (
+        payload["items"][0]["errors"][0]["code"]  # type: ignore[index]
+        if failure_kind == "item"
+        else payload["errors"][0]["code"]  # type: ignore[index]
+    )
+    assert outcome.status == expected_status
+    assert actual_code == expected_code
+    assert snapshot_paths[0] != request.audio_path
+    assert not snapshot_paths[0].exists()
+    assert not snapshot_paths[0].parent.exists()
+    assert request.audio_path.exists()
+    assert not request.output_path.exists()
 
 
 @pytest.mark.parametrize(
@@ -1494,6 +2089,182 @@ def test_malformed_verification_fails_closed_before_input_or_output(
     assert backend.close_calls == 1
 
 
+@pytest.mark.parametrize("case", ["missing", "digest_mismatch", "malformed_attestation"])
+def test_verified_backend_requires_real_hash_bound_strict_supporting_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    case: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    verification = heuristic_verification(materialize_support=False)
+    attestation = cast(PublishedArtifact, verification.execution_attestation)
+    attestation_path = tmp_path / attestation.path
+    if case == "digest_mismatch":
+        attestation_path.parent.mkdir(parents=True, exist_ok=True)
+        attestation_path.write_bytes(b"mismatched")
+    elif case == "malformed_attestation":
+        content = canonical_json_bytes({}, trailing_newline=True)
+        attestation_path.parent.mkdir(parents=True, exist_ok=True)
+        attestation_path.write_bytes(content)
+        verification = replace(
+            verification,
+            execution_attestation=replace(attestation, sha256=sha256_hex(content)),
+        )
+
+    backend = FakeBackend(verification)
+    request = direct_request(tmp_path)
+    outcome = run_transcribe_one(
+        request,
+        registry=registry_for(backend),
+        now=FIXED_UTC,
+        run_id=FIXED_UUID,
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.exit_code == 2
+    assert not request.output_path.exists()
+    assert report_payload(outcome)["errors"] == [
+        {
+            "code": "invalid_backend_verification",
+            "message": "Backend verification did not satisfy the contract.",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "missing",
+        "digest_mismatch",
+        "malformed",
+        "invalid_schema",
+        "strict_with_changes",
+        "clean_with_changes",
+    ],
+)
+def test_execution_attestation_validates_nested_changed_file_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    case: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    verification = heuristic_verification(materialize_support=False)
+    attestation = cast(PublishedArtifact, verification.execution_attestation)
+    changed_path = Path("artifacts/benchmark/backends/heuristic/changed-files/sha256/changed.json")
+    changed_content = canonical_json_bytes(
+        [
+            {
+                "path": "src/benchmark/backend.py",
+                "sha256": "1" * 64,
+                "status": "modified",
+            }
+        ],
+        trailing_newline=True,
+    )
+    if case == "malformed":
+        changed_content = b"{not-json}\n"
+    elif case == "invalid_schema":
+        changed_content = canonical_json_bytes(
+            [
+                {
+                    "extra": "not-allowed",
+                    "path": "src/benchmark/backend.py",
+                    "sha256": "1" * 64,
+                    "status": "modified",
+                }
+            ],
+            trailing_newline=True,
+        )
+
+    if case != "missing":
+        changed_absolute = tmp_path / changed_path
+        changed_absolute.parent.mkdir(parents=True, exist_ok=True)
+        changed_absolute.write_bytes(changed_content)
+
+    attestation_payload = strict_json_loads(
+        execution_attestation_content(
+            HEURISTIC_BACKEND_ID,
+            HEURISTIC_DESCRIPTOR.sha256,
+        )[:-1],
+        require_canonical=True,
+    )
+    assert isinstance(attestation_payload, dict)
+    attestation_payload["changed_files_manifest"] = {
+        "path": changed_path.as_posix(),
+        "sha256": ("2" * 64 if case == "digest_mismatch" else sha256_hex(changed_content)),
+    }
+    attestation_payload["checkout_dirty"] = case != "clean_with_changes"
+    attestation_payload["strict_mode"] = case == "strict_with_changes"
+    attestation_content = canonical_json_bytes(
+        attestation_payload,
+        trailing_newline=True,
+    )
+    attestation_absolute = tmp_path / attestation.path
+    attestation_absolute.parent.mkdir(parents=True, exist_ok=True)
+    attestation_absolute.write_bytes(attestation_content)
+    verification = replace(
+        verification,
+        execution_attestation=replace(
+            attestation,
+            sha256=sha256_hex(attestation_content),
+        ),
+    )
+
+    backend = FakeBackend(verification)
+    request = direct_request(tmp_path)
+    outcome = run_transcribe_one(
+        request,
+        registry=registry_for(backend),
+        now=FIXED_UTC,
+        run_id=FIXED_UUID,
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.exit_code == 2
+    assert not request.output_path.exists()
+    assert report_payload(outcome)["errors"] == [
+        {
+            "code": "invalid_backend_verification",
+            "message": "Backend verification did not satisfy the contract.",
+        }
+    ]
+    assert backend.transcribe_calls == 0
+
+
+def test_verified_oaf_requires_schema_bearing_tensor_coverage_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    verification = oaf_verification()
+    tensor_artifact = cast(PublishedArtifact, verification.tensor_coverage.report)
+    content = b'{"coverage":"complete"}\n'
+    (tmp_path / tensor_artifact.path).write_bytes(content)
+    tensor = replace(
+        verification.tensor_coverage,
+        report=replace(tensor_artifact, sha256=sha256_hex(content)),
+    )
+    backend = FakeBackend(replace(verification, tensor_coverage=tensor))
+    request = direct_request(tmp_path, backend_id=OFFICIAL_BACKEND_ID)
+
+    outcome = run_transcribe_one(
+        request,
+        registry=registry_for(backend, backend_id=OFFICIAL_BACKEND_ID),
+        now=FIXED_UTC,
+        run_id=FIXED_UUID,
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.exit_code == 2
+    assert not request.output_path.exists()
+    assert report_payload(outcome)["errors"] == [
+        {
+            "code": "invalid_backend_verification",
+            "message": "Backend verification did not satisfy the contract.",
+        }
+    ]
+
+
 @pytest.mark.parametrize(
     "case",
     [
@@ -1691,7 +2462,7 @@ def test_invalid_initial_path_type_is_typed_operational_failure(
     ):
         run_transcribe_one(
             request,
-            registry=registry_for(FakeBackend(heuristic_verification())),
+            registry=registry_for(FakeBackend(heuristic_verification(materialize_support=False))),
             now=FIXED_UTC,
             run_id=FIXED_UUID,
         )
@@ -1721,7 +2492,7 @@ def test_initial_report_root_resolution_failure_is_typed_without_reroot(
     ):
         run_transcribe_one(
             request,
-            registry=registry_for(FakeBackend(heuristic_verification())),
+            registry=registry_for(FakeBackend(heuristic_verification(materialize_support=False))),
             now=FIXED_UTC,
             run_id=FIXED_UUID,
         )
