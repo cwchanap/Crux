@@ -277,6 +277,7 @@ def runtime_payload(*, seal_sha256: str = "b" * 64) -> dict[str, Any]:
         "runtime_image_manifest_digest": f"sha256:{'4' * 64}",
         "schema": "crux.transcription-runtime-lock/v1",
         "seal_evidence_sha256": seal_sha256,
+        "stdout_max_line_bytes": 262144,
         "stderr_max_line_bytes": 8192,
         "stderr_read_chunk_bytes": 4096,
         "stderr_ring_buffer_bytes": 65536,
@@ -339,6 +340,7 @@ def seal_payload(*, audit_sha256: str = "c" * 64) -> dict[str, Any]:
         "smoke_oracle_sha256": "6" * 64,
         "smoke_prediction_sha256": "1" * 64,
         "startup_deadline_seconds": 120,
+        "stdout_max_line_bytes": 262144,
         "stderr_max_line_bytes": 8192,
         "stderr_read_chunk_bytes": 4096,
         "stderr_ring_buffer_bytes": 65536,
@@ -586,7 +588,9 @@ def test_backend_lock_requires_exact_bins_groups_and_metadata_schema(tmp_path: P
     [
         (load_backend_lock, backend_payload, "max_input_audio_frames"),
         (load_runtime_lock, runtime_payload, "stderr_read_chunk_bytes"),
+        (load_runtime_lock, runtime_payload, "stdout_max_line_bytes"),
         (load_seal_evidence, seal_payload, "runtime_uid"),
+        (load_seal_evidence, seal_payload, "stdout_max_line_bytes"),
         (load_seal_evidence, seal_payload, "cpu_limit_millis"),
         (load_seal_evidence, seal_payload, "request_deadline_seconds"),
     ],
@@ -614,6 +618,29 @@ def test_seal_evidence_rejects_sentinels_and_final_lock_hashes(tmp_path: Path) -
     payload["native_host_evidence"]["backend_lock_sha256"] = "a" * 64
     with pytest.raises(BackendLockError, match="final lock hashes"):
         load_seal_evidence(write_json(tmp_path / "cycle.json", payload))
+
+
+def test_lock_set_rejects_stdout_protocol_line_bound_drift(tmp_path: Path) -> None:
+    audit = load_conversion_audit(write_json(tmp_path / "audit.json", audit_payload()))
+    seal_data = seal_payload(audit_sha256=audit.sha256)
+    seal_data["stdout_max_line_bytes"] += 1
+    seal = load_seal_evidence(write_json(tmp_path / "seal.json", seal_data))
+    runtime = load_runtime_lock(
+        write_json(tmp_path / "runtime.json", runtime_payload(seal_sha256=seal.sha256))
+    )
+    backend = load_backend_lock(
+        write_json(
+            tmp_path / "backend.json",
+            backend_payload(
+                runtime_sha256=runtime.sha256,
+                seal_sha256=seal.sha256,
+                audit_sha256=audit.sha256,
+            ),
+        )
+    )
+
+    with pytest.raises(BackendLockError, match="runtime evidence mismatch"):
+        validate_oaf_lock_set(backend, runtime, seal, audit)
 
 
 @pytest.mark.parametrize(

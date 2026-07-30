@@ -239,6 +239,7 @@ The runtime lock records:
 - the runner source-manifest SHA-256;
 - the exact deterministic process environment listed below;
 - exact standard-error drain ring-buffer, read-chunk, and logical-line byte bounds;
+- the exact maximum physical standard-output protocol-line byte length;
 - TensorFlow build and ABI information reported at startup; and
 - the final runner image manifest digest.
 
@@ -333,8 +334,9 @@ config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.seal-evidence.json
 under schema `crux.backend-seal-evidence/v1`. It records which accepted native-host
 evidence form was used and its immutable reference/signature, base-manifest
 verification, Debian snapshot and package hashes, wheel filenames and hashes, numeric
-UID/GID, tmpfs sizes, CPU/memory/PID limits, standard-error drain bounds, startup and
-request deadlines, the proposed positive integer `max_input_audio_frames`,
+UID/GID, tmpfs sizes, CPU/memory/PID limits, standard-error drain bounds, the
+standard-output protocol-line bound, startup and request deadlines, the proposed
+positive integer `max_input_audio_frames`,
 measurements at that exact bound, tensor inventories, smoke generation inputs and
 outputs, the security scan/advisory snapshot, the preserved OCI-layout archive and
 manifest/config/layer hashes, and hashes of every reviewed evidence artifact.
@@ -902,6 +904,13 @@ The host and isolated process communicate with newline-delimited UTF-8 JSON:
 - one physical line is one JSON object;
 - standard output contains protocol objects only; and
 - diagnostic logs use sanitized standard error.
+
+The runtime lock supplies a positive exact `stdout_max_line_bytes`. The host reads
+standard output in bounded chunks under the active startup or request deadline and
+rejects a physical line before buffering more than that locked byte count. EOF before
+the terminating newline, an oversized line, invalid UTF-8, or malformed JSON is
+backend-fatal. The bound is operational and seal-required; it has no code default and
+does not enter prediction identity.
 
 Before sending the first request, the host starts a dedicated concurrent
 standard-error drain and keeps it running through process exit. It consumes bounded
