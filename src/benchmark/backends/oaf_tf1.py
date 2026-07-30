@@ -296,7 +296,11 @@ class OafTf1Backend:
                 "Strict verification rejects inference-relevant source changes.",
             )
 
-        _verify_model_cache(locks.backend, self._config.model_cache_root)
+        _verify_model_cache(
+            locks.backend,
+            self._config.model_cache_root,
+            self._config.backend_lock_path,
+        )
         profile = _launch_profile(self._config, locks)
         try:
             process = self._process_factory(profile)
@@ -708,7 +712,11 @@ def _is_native_environment() -> bool:
     }
 
 
-def _verify_model_cache(backend_lock: LoadedBackendLock, model_cache_root: Path) -> None:
+def _verify_model_cache(
+    backend_lock: LoadedBackendLock,
+    model_cache_root: Path,
+    backend_lock_path: Path,
+) -> None:
     model_identity = backend_lock.descriptor.payload["model_artifact_set_sha256"]
     if model_cache_root.name != model_identity or model_cache_root.parent.name != "sha256":
         raise _fatal(
@@ -722,6 +730,7 @@ def _verify_model_cache(backend_lock: LoadedBackendLock, model_cache_root: Path)
             cache_root=cache_root,
             archive_path=None,
             download=False,
+            backend_lock_path=backend_lock_path,
         ),
         backend_lock=backend_lock,
     )

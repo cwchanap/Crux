@@ -551,11 +551,13 @@ def _require_status_exit_code(
 
 
 def _require_preseal_exit_code(payload: dict[str, JsonValue]) -> None:
-    if payload["status"] != "failed" or payload["exit_code"] != 1:
-        return
     errors = cast(list[dict[str, JsonValue]], payload["errors"])
-    if [error["code"] for error in errors] != ["backend_not_sealed"]:
+    error_codes = [error["code"] for error in errors]
+    is_preseal_failure = payload["status"] == "failed" and payload["exit_code"] == 1
+    if is_preseal_failure and error_codes != ["backend_not_sealed"]:
         raise ReportValidationError("failed exit one requires backend_not_sealed")
+    if "backend_not_sealed" in error_codes and not is_preseal_failure:
+        raise ReportValidationError("backend_not_sealed requires failed exit one")
 
 
 def _normalize_tensor_coverage(value: object) -> dict[str, JsonValue]:

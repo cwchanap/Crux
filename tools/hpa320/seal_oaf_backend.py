@@ -10,6 +10,7 @@ import argparse
 import os
 import platform
 import stat
+import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -45,6 +46,13 @@ from src.benchmark.backends import PublishedArtifact
 from tools.hpa320.audit_legacy_tf2_conversion import (
     CANDIDATE_MANIFEST_NAME,
     CANDIDATE_MANIFEST_SCHEMA,
+)
+from tools.hpa320.oaf_system_packages import (
+    ProbeResult,
+    SystemPackage,
+    inventory_sha256,
+    load_base_system_package_evidence,
+    load_base_system_package_request,
 )
 
 HOST_EVIDENCE_NAME = "native-host-evidence.json"
@@ -208,6 +216,191 @@ def materialize_system_packages(
     raise SealError(
         "native system-package acquisition inputs are not specified; no output was written"
     )
+
+
+def attest_base_system(
+    *,
+    request_path: Path,
+    host_evidence_path: Path,
+    image: str,
+    output_path: Path,
+) -> PublishedArtifact:
+    """Publish immutable base-system evidence after exact native probes."""
+
+    request = load_base_system_package_request(Path(request_path))
+    host = load_native_host_evidence(Path(host_evidence_path))
+    if (
+        not isinstance(image, str)
+        or not image
+        or image.strip().lower() in {"auto", "none", "sentinel", "unlimited", "unset"}
+    ):
+        raise SealError("base-system image identity is invalid")
+    base_image = f"{request.base_image}@{request.base_image_manifest_digest}"
+    observed_manifest = (
+        _docker_capture(
+            ("docker", "image", "inspect", "--format", "{{index .RepoDigests 0}}", base_image),
+            "pinned base image manifest",
+        )
+        .decode("ascii", errors="strict")
+        .strip()
+    )
+    if observed_manifest != base_image:
+        raise SealError("pinned base image manifest does not match the request")
+
+    base_inventory_bytes = _docker_run(
+        base_image, _DPKG_INVENTORY_COMMAND, "base package inventory"
+    )
+    runtime_inventory_bytes = _docker_run(
+        image, _DPKG_INVENTORY_COMMAND, "runtime package inventory"
+    )
+    if base_inventory_bytes != runtime_inventory_bytes:
+        raise SealError("runtime package inventory differs from the pinned base image")
+    inventory = _parse_dpkg_inventory(base_inventory_bytes)
+
+    base_keyring = _parse_keyring_sha256(
+        _docker_run(base_image, _KEYRING_SHA256_COMMAND, "base archive keyring")
+    )
+    runtime_keyring = _parse_keyring_sha256(
+        _docker_run(image, _KEYRING_SHA256_COMMAND, "runtime archive keyring")
+    )
+    if base_keyring != request.base_image_archive_keyring_sha256 or runtime_keyring != base_keyring:
+        raise SealError("base-image archive keyring hash does not match the request")
+
+    probes = tuple(
+        ProbeResult(name=name, value=_run_base_system_probe(name, base_image, image))
+        for name in request.required_probes
+    )
+    payload: JsonValue = {
+        "additional_system_packages": [],
+        "base_image_archive_keyring_sha256": request.base_image_archive_keyring_sha256,
+        "base_image_manifest_digest": request.base_image_manifest_digest,
+        "native_host_evidence": {
+            "kind": host.kind,
+            "official_execution_allowed": host.official_execution_allowed,
+            "payload": _plain_json(host.payload),
+            "sha256": host.sha256,
+        },
+        "package_inventory": [
+            {
+                "architecture": package.architecture,
+                "name": package.name,
+                "version": package.version,
+            }
+            for package in inventory
+        ],
+        "package_inventory_sha256": inventory_sha256(inventory),
+        "probes": [{"name": probe.name, "value": probe.value} for probe in probes],
+        "request_sha256": request.sha256,
+        "schema": "crux.oaf-base-system-package-evidence/v1",
+    }
+    content = canonical_json_bytes(payload, trailing_newline=True)
+    try:
+        published = publish_immutable_bytes(
+            Path(output_path),
+            content,
+            sha256_hex(content),
+            role="base_system_package_evidence",
+        )
+    except ArtifactPublicationError:
+        raise SealError("base-system evidence publication failed") from None
+    try:
+        load_base_system_package_evidence(Path(output_path), request=request)
+    except (OSError, ValueError) as error:
+        raise SealError(f"published base-system evidence is invalid: {error}") from None
+    return published
+
+
+_DPKG_INVENTORY_COMMAND = "dpkg-query -W -f='${Package}\\t${Version}\\t${Architecture}\\n'"
+_KEYRING_SHA256_COMMAND = "sha256sum /usr/share/keyrings/debian-archive-keyring.gpg"
+_BASE_SYSTEM_PROBE_COMMANDS = {
+    "base_python_version": ("base", "python --version"),
+    "runtime_python_version": ("runtime", "/opt/crux/venv/bin/python --version"),
+    "runtime_tensorflow_version": (
+        "runtime",
+        "/opt/crux/venv/bin/python -c 'import tensorflow as tf; print(tf.__version__)'",
+    ),
+    "runtime_smoke": (
+        "runtime",
+        "/opt/crux/venv/bin/python -s /opt/crux/runtime/entrypoint.py --help",
+    ),
+}
+
+
+def _docker_capture(command: tuple[str, ...], label: str) -> bytes:
+    result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        raise SealError(f"{label} command failed")
+    if not isinstance(result.stdout, bytes) or not result.stdout:
+        raise SealError(f"{label} command produced no output")
+    return result.stdout
+
+
+def _docker_run(image: str, command: str, label: str) -> bytes:
+    return _docker_capture(
+        (
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--platform",
+            "linux/amd64",
+            "--entrypoint",
+            "/bin/sh",
+            image,
+            "-c",
+            command,
+        ),
+        label,
+    )
+
+
+def _parse_dpkg_inventory(content: bytes) -> tuple[SystemPackage, ...]:
+    try:
+        lines = content.decode("utf-8", errors="strict").splitlines()
+    except UnicodeDecodeError:
+        raise SealError("base package inventory is not UTF-8") from None
+    if not lines or content != ("\n".join(lines) + "\n").encode("utf-8"):
+        raise SealError("base package inventory is not canonical")
+    inventory: list[SystemPackage] = []
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) != 3 or not all(fields):
+            raise SealError("base package inventory row is invalid")
+        inventory.append(SystemPackage(name=fields[0], version=fields[1], architecture=fields[2]))
+    try:
+        inventory_sha256(tuple(inventory))
+    except ValueError as error:
+        raise SealError(str(error)) from None
+    return tuple(inventory)
+
+
+def _parse_keyring_sha256(content: bytes) -> str:
+    try:
+        line = content.decode("ascii", errors="strict")
+    except UnicodeDecodeError:
+        raise SealError("base-image archive keyring hash is not ASCII") from None
+    if not line.endswith("\n") or line.endswith("\n\n"):
+        raise SealError("base-image archive keyring hash is not canonical")
+    digest, separator, _ = line[:-1].partition("  ")
+    if not separator or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise SealError("base-image archive keyring hash is invalid")
+    return digest
+
+
+def _run_base_system_probe(name: str, base_image: str, runtime_image: str) -> str:
+    try:
+        target, command = _BASE_SYSTEM_PROBE_COMMANDS[name]
+    except KeyError:
+        raise SealError("base-system request contains an unapproved probe") from None
+    output = _docker_run(base_image if target == "base" else runtime_image, command, name)
+    try:
+        value = output.decode("utf-8", errors="strict").strip()
+    except UnicodeDecodeError:
+        raise SealError(f"{name} probe output is not UTF-8") from None
+    if not value:
+        raise SealError(f"{name} probe produced no result")
+    return value
 
 
 def calibrate(
@@ -698,6 +891,12 @@ def _parser() -> argparse.ArgumentParser:
     packages.add_argument("--bundle", type=Path, required=True)
     packages.add_argument("--build-args-output", type=Path, required=True)
 
+    base_system = commands.add_parser("attest-base-system")
+    base_system.add_argument("--request", type=Path, required=True)
+    base_system.add_argument("--host-evidence", type=Path, required=True)
+    base_system.add_argument("--image", required=True)
+    base_system.add_argument("--output", type=Path, required=True)
+
     calibration = commands.add_parser("calibrate")
     calibration.add_argument("--image", required=True)
     calibration.add_argument("--host-evidence", type=Path, required=True)
@@ -738,6 +937,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 bundle=arguments.bundle,
                 build_args_output=arguments.build_args_output,
             )
+            return 0
+        if arguments.command == "attest-base-system":
+            published = attest_base_system(
+                request_path=arguments.request,
+                host_evidence_path=arguments.host_evidence,
+                image=arguments.image,
+                output_path=arguments.output,
+            )
+            summary = {
+                "exit_code": 0,
+                "report_path": os.fspath(published.path),
+                "status": "attested",
+            }
+            sys.stdout.buffer.write(canonical_json_bytes(summary, trailing_newline=True))
             return 0
         if arguments.command == "calibrate":
             calibrate(

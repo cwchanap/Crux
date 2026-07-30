@@ -11,7 +11,11 @@ import os
 import re
 import stat
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any, cast
+
+from src.benchmark.backend_process import NativeHostEvidence
 
 SYSTEM_PACKAGE_BUNDLE_SCHEMA = "crux.oaf-system-package-bundle/v2"
 BASE_IMAGE_ARCHIVE_KEYRING = Path("/usr/share/keyrings/debian-archive-keyring.gpg")
@@ -46,10 +50,276 @@ _EXPECTED_ROOT_ENTRIES = frozenset(
 _REQUIRED_PACKAGE_FIELDS = frozenset(
     {"Architecture", "Filename", "Package", "SHA256", "Size", "Version"}
 )
+BASE_SYSTEM_PACKAGE_REQUEST_SCHEMA = "crux.oaf-base-system-package-request/v1"
+BASE_SYSTEM_PACKAGE_EVIDENCE_SCHEMA = "crux.oaf-base-system-package-evidence/v1"
+BASE_IMAGE_NAME = "python:3.7.17-slim-bullseye"
+BASE_IMAGE_PLATFORM = "linux/amd64"
+_BASE_SYSTEM_REQUEST_KEYS = frozenset(
+    {
+        "additional_system_packages",
+        "base_image",
+        "base_image_archive_keyring_sha256",
+        "base_image_manifest_digest",
+        "platform",
+        "required_probes",
+        "schema",
+    }
+)
+_BASE_SYSTEM_EVIDENCE_KEYS = frozenset(
+    {
+        "additional_system_packages",
+        "base_image_archive_keyring_sha256",
+        "base_image_manifest_digest",
+        "native_host_evidence",
+        "package_inventory",
+        "package_inventory_sha256",
+        "probes",
+        "request_sha256",
+        "schema",
+    }
+)
+_NATIVE_HOST_EVIDENCE_KEYS = frozenset({"kind", "official_execution_allowed", "payload", "sha256"})
+_SYSTEM_PACKAGE_KEYS = frozenset({"architecture", "name", "version"})
+_PROBE_KEYS = frozenset({"name", "value"})
+_REQUIRED_BASE_SYSTEM_PROBES = (
+    "base_python_version",
+    "runtime_python_version",
+    "runtime_tensorflow_version",
+    "runtime_smoke",
+)
 
 
 class SystemPackageError(ValueError):
     """The offline Debian input bundle is invalid or cannot be installed exactly."""
+
+
+@dataclass(frozen=True)
+class SystemPackage:
+    """One installed base-image package identified by dpkg's full identity."""
+
+    name: str
+    version: str
+    architecture: str
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    """One reviewed base-system probe result."""
+
+    name: str
+    value: str
+
+
+@dataclass(frozen=True)
+class BaseSystemPackageRequest:
+    """The checked-in authority for an unchanged pinned base filesystem."""
+
+    base_image: str
+    base_image_manifest_digest: str
+    base_image_archive_keyring_sha256: str
+    platform: str
+    required_probes: tuple[str, ...]
+    additional_system_packages: tuple[()]
+    sha256: str
+
+
+@dataclass(frozen=True)
+class BaseSystemPackageEvidence:
+    """Immutable native observation of the pinned base system."""
+
+    request_sha256: str
+    base_image_manifest_digest: str
+    package_inventory: tuple[SystemPackage, ...]
+    package_inventory_sha256: str
+    probes: tuple[ProbeResult, ...]
+    native_host_evidence: NativeHostEvidence
+    sha256: str
+
+
+def inventory_sha256(inventory: object) -> str:
+    """Hash the canonical complete inventory without accepting loose package rows."""
+
+    packages = _parse_package_inventory(inventory)
+    return hashlib.sha256(
+        _canonical_json_bytes(
+            [
+                {
+                    "architecture": package.architecture,
+                    "name": package.name,
+                    "version": package.version,
+                }
+                for package in packages
+            ]
+        )
+    ).hexdigest()
+
+
+def load_base_system_package_request(path: Path) -> BaseSystemPackageRequest:
+    """Strict-load the checked-in, no-additional-packages base-system request."""
+
+    payload, content = _read_canonical_base_system_object(path, "base-system request")
+    if set(payload) != _BASE_SYSTEM_REQUEST_KEYS or payload.get("schema") != (
+        BASE_SYSTEM_PACKAGE_REQUEST_SCHEMA
+    ):
+        raise SystemPackageError("base-system request fields are invalid")
+    if payload["base_image"] != BASE_IMAGE_NAME:
+        raise SystemPackageError("base image is not the reviewed pinned base")
+    manifest = _require_manifest_digest(payload["base_image_manifest_digest"])
+    keyring = _require_hash(
+        payload["base_image_archive_keyring_sha256"], "base-image archive keyring hash"
+    )
+    if payload["platform"] != BASE_IMAGE_PLATFORM:
+        raise SystemPackageError("base-system request platform is invalid")
+    probes = _parse_required_probes(payload["required_probes"])
+    if payload["additional_system_packages"] != []:
+        raise SystemPackageError("additional system packages are forbidden")
+    return BaseSystemPackageRequest(
+        base_image=BASE_IMAGE_NAME,
+        base_image_manifest_digest=manifest,
+        base_image_archive_keyring_sha256=keyring,
+        platform=BASE_IMAGE_PLATFORM,
+        required_probes=probes,
+        additional_system_packages=(),
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
+
+
+def load_base_system_package_evidence(
+    path: Path,
+    *,
+    request: BaseSystemPackageRequest | None = None,
+) -> BaseSystemPackageEvidence:
+    """Strict-load native base-system evidence and bind it to its request when supplied."""
+
+    payload, content = _read_canonical_base_system_object(path, "base-system evidence")
+    if set(payload) != _BASE_SYSTEM_EVIDENCE_KEYS or payload.get("schema") != (
+        BASE_SYSTEM_PACKAGE_EVIDENCE_SCHEMA
+    ):
+        raise SystemPackageError("base-system evidence fields are invalid")
+    if payload["additional_system_packages"] != []:
+        raise SystemPackageError("additional system packages are forbidden")
+    manifest = _require_manifest_digest(payload["base_image_manifest_digest"])
+    keyring = _require_hash(
+        payload["base_image_archive_keyring_sha256"], "base-image archive keyring hash"
+    )
+    request_sha256 = _require_hash(payload["request_sha256"], "base-system request hash")
+    inventory = _parse_package_inventory(payload["package_inventory"])
+    inventory_digest = _require_hash(payload["package_inventory_sha256"], "package inventory hash")
+    if inventory_digest != inventory_sha256(inventory):
+        raise SystemPackageError("package inventory hash does not match the exact inventory")
+    probes = _parse_probe_results(payload["probes"])
+    host = _parse_native_host_evidence(payload["native_host_evidence"])
+    if request is not None:
+        if request_sha256 != request.sha256:
+            raise SystemPackageError("base-system evidence request hash does not match")
+        if manifest != request.base_image_manifest_digest:
+            raise SystemPackageError("base image manifest does not match the request")
+        if keyring != request.base_image_archive_keyring_sha256:
+            raise SystemPackageError("base-image archive keyring does not match the request")
+        if tuple(probe.name for probe in probes) != request.required_probes:
+            raise SystemPackageError("base-system evidence probes do not match the request")
+    return BaseSystemPackageEvidence(
+        request_sha256=request_sha256,
+        base_image_manifest_digest=manifest,
+        package_inventory=inventory,
+        package_inventory_sha256=inventory_digest,
+        probes=probes,
+        native_host_evidence=host,
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
+
+
+def _read_canonical_base_system_object(path: Path, label: str) -> tuple[dict[str, object], bytes]:
+    content = _read_stable_file(Path(path))
+    if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+        raise SystemPackageError(f"{label} must be canonical JSON with one final newline")
+    value = _strict_json_loads(content[:-1])
+    if not isinstance(value, dict) or _canonical_json_bytes(value) != content:
+        raise SystemPackageError(f"{label} is not canonical JSON")
+    return value, content
+
+
+def _require_manifest_digest(value: object) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+        raise SystemPackageError("base image manifest digest must be a lowercase SHA-256")
+    return value
+
+
+def _parse_required_probes(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or tuple(value) != _REQUIRED_BASE_SYSTEM_PROBES:
+        raise SystemPackageError("required probe names must match the reviewed base-system probes")
+    return _REQUIRED_BASE_SYSTEM_PROBES
+
+
+def _parse_package_inventory(value: object) -> tuple[SystemPackage, ...]:
+    if isinstance(value, tuple) and all(isinstance(item, SystemPackage) for item in value):
+        packages = value
+    elif isinstance(value, list):
+        packages = tuple(_parse_system_package(item) for item in value)
+    else:
+        raise SystemPackageError("package inventory must be an array")
+    ordering = tuple(
+        (item.name.encode("utf-8"), item.version.encode("utf-8"), item.architecture.encode("utf-8"))
+        for item in packages
+    )
+    if len(set(ordering)) != len(ordering):
+        raise SystemPackageError("package inventory has duplicate name/version/architecture rows")
+    if ordering != tuple(sorted(ordering)):
+        raise SystemPackageError(
+            "package inventory rows must be sorted by name/version/architecture"
+        )
+    return packages
+
+
+def _parse_system_package(value: object) -> SystemPackage:
+    if not isinstance(value, dict) or set(value) != _SYSTEM_PACKAGE_KEYS:
+        raise SystemPackageError("system package row fields are invalid")
+    fields = (value["name"], value["version"], value["architecture"])
+    if not all(
+        isinstance(field, str) and field and "\t" not in field and "\n" not in field
+        for field in fields
+    ):
+        raise SystemPackageError("system package row values are invalid")
+    return SystemPackage(
+        name=cast(str, value["name"]),
+        version=cast(str, value["version"]),
+        architecture=cast(str, value["architecture"]),
+    )
+
+
+def _parse_probe_results(value: object) -> tuple[ProbeResult, ...]:
+    if not isinstance(value, list):
+        raise SystemPackageError("base-system evidence probes must be an array")
+    probes: list[ProbeResult] = []
+    for row in value:
+        if not isinstance(row, dict) or set(row) != _PROBE_KEYS:
+            raise SystemPackageError("base-system evidence probes are invalid")
+        name, probe_value = row["name"], row["value"]
+        if (
+            not isinstance(name, str)
+            or not isinstance(probe_value, str)
+            or name not in _REQUIRED_BASE_SYSTEM_PROBES
+            or not probe_value
+        ):
+            raise SystemPackageError("base-system evidence probes are invalid")
+        probes.append(ProbeResult(name=name, value=probe_value))
+    if tuple(probe.name for probe in probes) != _REQUIRED_BASE_SYSTEM_PROBES:
+        raise SystemPackageError("base-system evidence probes are incomplete or unapproved")
+    return tuple(probes)
+
+
+def _parse_native_host_evidence(value: object) -> NativeHostEvidence:
+    if not isinstance(value, dict) or set(value) != _NATIVE_HOST_EVIDENCE_KEYS:
+        raise SystemPackageError("native host evidence fields are invalid")
+    try:
+        return NativeHostEvidence(
+            kind=cast(Any, value["kind"]),
+            payload=cast(dict[str, Any], value["payload"]),
+            sha256=cast(str, value["sha256"]),
+            official_execution_allowed=cast(bool, value["official_execution_allowed"]),
+        )
+    except (TypeError, ValueError) as error:
+        raise SystemPackageError(f"native host evidence is invalid: {error}") from None
 
 
 def _strict_json_loads(content: bytes) -> object:

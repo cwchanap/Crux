@@ -83,6 +83,33 @@ def test_sealed_backend_invokes_its_registered_factory() -> None:
     assert factory.calls == 1
 
 
+def test_registration_rejects_unknown_seal_state_at_runtime() -> None:
+    factory = CountingFactory(DescriptorBackend(OFFICIAL_BACKEND_ID))
+
+    with pytest.raises(ValueError, match="seal_state"):
+        BackendRegistration(
+            backend_id=OFFICIAL_BACKEND_ID,
+            seal_state="sealedd",  # type: ignore[arg-type]
+            factory=factory,
+        )
+
+    assert factory.calls == 0
+
+
+def test_registry_rejects_registration_key_backend_id_mismatch() -> None:
+    registration = BackendRegistration(
+        backend_id=OFFICIAL_BACKEND_ID,
+        seal_state="sealed",
+        factory=CountingFactory(DescriptorBackend(OFFICIAL_BACKEND_ID)),
+    )
+
+    with pytest.raises(ValueError, match="registration key"):
+        BackendRegistry(
+            default_backend_id=OFFICIAL_BACKEND_ID,
+            registrations={HEURISTIC_BACKEND_ID: registration},
+        )
+
+
 def test_sealed_missing_lock_returns_typed_integrity_unavailable() -> None:
     factory = CountingFactory(BackendLockUnavailable("missing lock"))
     registry = BackendRegistry(

@@ -802,7 +802,7 @@ def test_provisional_dockerfile_has_clean_test_and_fail_closed_runtime_inputs() 
     assert "DEBIAN_INRELEASE_SHA256" not in test_stage
     assert "COPY runtime/oaf_tf1/vendor/magenta/" in dockerfile
     assert "COPY runtime/oaf_tf1/ /opt/crux/runtime/" in dockerfile
-    assert "COPY runtime/oaf_tf1/system-packages/" in dockerfile
+    assert "COPY runtime/oaf_tf1/system-packages/" not in dockerfile
     for argument in (
         "DEBIAN_SNAPSHOT_URL",
         "DEBIAN_INRELEASE_SHA256",
@@ -813,8 +813,8 @@ def test_provisional_dockerfile_has_clean_test_and_fail_closed_runtime_inputs() 
         "SYSTEM_PACKAGE_MANIFEST_SHA256",
         "SYSTEM_PACKAGE_INVENTORY_SHA256",
     ):
-        assert f"ARG {argument}\n" in dockerfile
-        assert f"ARG {argument}=" not in dockerfile
+        assert f"ARG {argument}" not in dockerfile
+    assert "oaf_system_packages.py" not in dockerfile
     assert 'USER "${RUNTIME_UID}:${RUNTIME_GID}"' in dockerfile
     assert "backend-lock.json" not in dockerfile
     assert "runtime-lock.json" not in dockerfile
@@ -823,7 +823,7 @@ def test_provisional_dockerfile_has_clean_test_and_fail_closed_runtime_inputs() 
 def test_provisional_dockerfile_test_stage_runs_as_explicit_nonroot_user() -> None:
     dockerfile = Path("runtime/oaf_tf1/Dockerfile").read_text(encoding="utf-8")
     test_stage = dockerfile.split("FROM runtime-build AS test", 1)[1].split(
-        "FROM runtime-base AS system-runtime-base", 1
+        "FROM runtime-build AS runtime", 1
     )[0]
 
     assert 'USER "${RUNTIME_UID}:${RUNTIME_GID}"' in test_stage
@@ -980,6 +980,19 @@ def test_system_package_bundle_anchors_gpgv_to_base_image_keyring(
     assert str(base_keyring) in arguments
     assert "/nonexistent" in arguments
     assert not (bundle / "debian-archive-keyring.gpg").exists()
+
+
+def test_system_package_bundle_rejects_a_copied_archive_keyring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    system_packages = importlib.import_module("tools.hpa320.oaf_system_packages")
+    bundle, base_keyring, _, _, expected = _write_authenticated_system_package_bundle(tmp_path)
+    (bundle / "debian-archive-keyring.gpg").write_bytes(base_keyring.read_bytes())
+
+    with pytest.raises(system_packages.SystemPackageError, match="keyring|root entries"):
+        _verify_authenticated_test_bundle(
+            monkeypatch, system_packages, bundle, base_keyring, expected
+        )
 
 
 def test_signed_release_cannot_authenticate_arbitrary_manifest_only_deb(

@@ -61,6 +61,21 @@ def _emit_backend_summary(
     type=click.Path(path_type=Path, file_okay=False),
     required=True,
 )
+@click.option(
+    "--acquisition-request",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+)
+@click.option(
+    "--evidence-output",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+)
+@click.option(
+    "--backend-lock",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+)
 @click.pass_context
 def prepare_backend_command(
     ctx: click.Context,
@@ -68,6 +83,9 @@ def prepare_backend_command(
     download: bool,
     archive: Path | None,
     cache_root: Path,
+    acquisition_request: Path | None,
+    evidence_output: Path | None,
+    backend_lock: Path | None,
 ) -> None:
     """Acquire or verify the immutable frozen OaF checkpoint cache."""
     if download and archive is not None:
@@ -85,18 +103,30 @@ def prepare_backend_command(
             model_cache_path=None,
         )
     else:
-        lock_path = (
-            Path("config") / "benchmark" / "backends" / f"{OFFICIAL_BACKEND_ID}.backend-lock.json"
-        )
-        try:
-            backend_lock = load_backend_lock(lock_path)
-        except (OSError, ValueError):
-            click.echo("backend_lock_invalid", err=True)
-            outcome = backend_prepare.PrepareBackendOutcome(
-                status="integrity_failed",
-                exit_code=2,
-                model_cache_path=None,
-            )
+        loaded_lock = None
+        if backend_lock is not None:
+            try:
+                loaded_lock = load_backend_lock(backend_lock)
+            except (OSError, ValueError):
+                click.echo("backend_lock_invalid", err=True)
+                outcome = backend_prepare.PrepareBackendOutcome(
+                    status="integrity_failed",
+                    exit_code=2,
+                    model_cache_path=None,
+                )
+            else:
+                outcome = backend_prepare.prepare_oaf_backend(
+                    backend_prepare.PrepareBackendRequest(
+                        backend_id=backend,
+                        cache_root=cache_root,
+                        archive_path=archive,
+                        download=download,
+                        acquisition_request_path=acquisition_request,
+                        evidence_output_path=evidence_output,
+                        backend_lock_path=backend_lock,
+                    ),
+                    backend_lock=loaded_lock,
+                )
         else:
             outcome = backend_prepare.prepare_oaf_backend(
                 backend_prepare.PrepareBackendRequest(
@@ -104,15 +134,19 @@ def prepare_backend_command(
                     cache_root=cache_root,
                     archive_path=archive,
                     download=download,
+                    acquisition_request_path=acquisition_request,
+                    evidence_output_path=evidence_output,
+                    backend_lock_path=None,
                 ),
-                backend_lock=backend_lock,
             )
 
     _emit_backend_summary(
         status=outcome.status,
         exit_code=outcome.exit_code,
-        report_path=None,
-        report_sha256=None,
+        report_path=(None if outcome.evidence_artifact is None else outcome.evidence_artifact.path),
+        report_sha256=(
+            None if outcome.evidence_artifact is None else outcome.evidence_artifact.sha256
+        ),
     )
     if outcome.exit_code:
         ctx.exit(outcome.exit_code)

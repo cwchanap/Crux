@@ -746,10 +746,13 @@ def test_prepare_backend_help_lists_setup_only_options() -> None:
     assert result.exit_code == 0
     assert result.stderr == ""
     assert [line.strip() for line in result.stdout.splitlines() if line.startswith("  --")] == [
-        "--backend TEXT          [required]",
+        "--backend TEXT              [required]",
         "--download",
         "--archive FILE",
-        "--cache-root DIRECTORY  [required]",
+        "--cache-root DIRECTORY      [required]",
+        "--acquisition-request FILE",
+        "--evidence-output FILE",
+        "--backend-lock FILE",
     ]
 
 
@@ -793,6 +796,8 @@ def test_prepare_backend_emits_exact_canonical_summary_without_reports_or_launch
             OFFICIAL_BACKEND_ID,
             "--cache-root",
             str(tmp_path / "cache"),
+            "--backend-lock",
+            str(tmp_path / "backend-lock.json"),
         ],
     )
 
@@ -820,6 +825,8 @@ def test_prepare_backend_rejects_mutually_exclusive_modes_as_click_usage(
             str(tmp_path / "checkpoint.zip"),
             "--cache-root",
             str(tmp_path / "cache"),
+            "--backend-lock",
+            str(tmp_path / "backend-lock.json"),
         ],
     )
 
@@ -876,6 +883,8 @@ def test_prepare_backend_invalid_lock_emits_integrity_summary_without_traceback(
             OFFICIAL_BACKEND_ID,
             "--cache-root",
             str(tmp_path / "cache"),
+            "--backend-lock",
+            str(tmp_path / "backend-lock.json"),
         ],
     )
 
