@@ -13,3 +13,9 @@ web_model*/
 runtime/oaf_tf1/system-packages/
 runtime/oaf_tf1/wheelhouse/
 .claude/settings.local.json
+
+# Tool working directories (kept self-contained vs. global gitignore)
+.codegraph/
+.superpowers/
+.pytest_cache/
+.ruff_cache/
