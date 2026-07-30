@@ -22,8 +22,10 @@ from pathlib import Path
 from typing import Any, BinaryIO, FrozenSet, Mapping, Optional, Sequence, Tuple
 
 PROTOCOL_SCHEMA = "crux.transcription-runner/v1"
+_PROTOCOL_RESPONSE_GOLDEN_SCHEMA = "crux.transcription-runner-response/v1"
 _OPAQUE_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_BINARY64 = re.compile(r"[0-9a-f]{16}\Z")
 _SAFE_DIAGNOSTIC = re.compile(
     rb"code=[a-z][a-z0-9_]*"
     rb"(?: tensor=[A-Za-z0-9_.:/-]+)?"
@@ -53,6 +55,20 @@ _REQUEST_KEYS = frozenset(
         "type",
     }
 )
+_RESPONSE_KEYS = frozenset({"payload", "request_id", "type"})
+_RESULT_KEYS = frozenset({"audio_sha256", "backend_descriptor_sha256", "native_events", "type"})
+_NATIVE_EVENT_KEYS = frozenset(
+    {
+        "confidence_binary64",
+        "frame_index",
+        "model_output_bin",
+        "native_class_id",
+        "native_midi_note",
+        "time_sec_binary64",
+        "upstream_8hit_group_id",
+        "velocity_midi",
+    }
+)
 
 
 class ProtocolFailure(Exception):
@@ -63,6 +79,23 @@ class ProtocolFailure(Exception):
         self.code = code
         self.message = message
         self.fatal = fatal
+
+
+def encode_binary64(value: float) -> str:
+    """Encode one finite IEEE-754 binary64 as sixteen canonical hex digits."""
+    if not math.isfinite(value):
+        raise ProtocolFailure("nonfinite_event", "Event value is nonfinite.", fatal=False)
+    return struct.pack(">d", value).hex()
+
+
+def decode_binary64(value: object, field: str) -> float:
+    """Require sixteen lowercase hexadecimal digits for one finite binary64 value."""
+    if not isinstance(value, str) or not _BINARY64.fullmatch(value):
+        raise ProtocolFailure("event_invalid", f"The {field} is invalid.", fatal=False)
+    decoded = struct.unpack(">d", bytes.fromhex(value))[0]
+    if not math.isfinite(decoded):
+        raise ProtocolFailure("nonfinite_event", f"The {field} is nonfinite.", fatal=False)
+    return decoded
 
 
 @dataclass(frozen=True)
@@ -85,6 +118,18 @@ class VerifiedWav:
     content: bytes
     sha256: str
     audio_frame_count: int
+
+
+@dataclass(frozen=True)
+class NativeProtocolEvent:
+    frame_index: int
+    time_sec: float
+    native_class_id: str
+    model_output_bin: int
+    native_midi_note: int
+    upstream_8hit_group_id: str | None
+    confidence: float
+    velocity_midi: int
 
 
 def _pairs_object(pairs: Sequence[Tuple[str, Any]]) -> Mapping[str, Any]:
@@ -278,9 +323,76 @@ def _validate_relative_path(value: Any) -> str:
     return value
 
 
+def decode_native_event(value: object) -> NativeProtocolEvent:
+    if not isinstance(value, Mapping) or set(value) != _NATIVE_EVENT_KEYS:
+        raise ProtocolFailure("event_invalid", "The runner event is invalid.", fatal=False)
+    if type(value["frame_index"]) is not int or value["frame_index"] < 0:
+        raise ProtocolFailure("event_invalid", "The runner event frame is invalid.", fatal=False)
+    if type(value["model_output_bin"]) is not int or not 0 <= value["model_output_bin"] <= 87:
+        raise ProtocolFailure(
+            "event_invalid", "The runner event output bin is invalid.", fatal=False
+        )
+    if type(value["native_midi_note"]) is not int or not 21 <= value["native_midi_note"] <= 108:
+        raise ProtocolFailure("event_invalid", "The runner event note is invalid.", fatal=False)
+    if type(value["velocity_midi"]) is not int or not 0 <= value["velocity_midi"] <= 127:
+        raise ProtocolFailure("event_invalid", "The runner event velocity is invalid.", fatal=False)
+    if value["native_midi_note"] != value["model_output_bin"] + 21:
+        raise ProtocolFailure("event_invalid", "The runner event identity is invalid.", fatal=False)
+    if value["native_class_id"] != "midi_" + str(value["native_midi_note"]):
+        raise ProtocolFailure("event_invalid", "The runner event class is invalid.", fatal=False)
+    group = value["upstream_8hit_group_id"]
+    if group is not None and (not isinstance(group, str) or not group):
+        raise ProtocolFailure("event_invalid", "The runner event group is invalid.", fatal=False)
+    time_sec = decode_binary64(value["time_sec_binary64"], "event time")
+    frames_per_second = 44100 / 512
+    frame_length_seconds = 1.0 / frames_per_second
+    expected_time = value["frame_index"] * frame_length_seconds
+    if struct.pack(">d", time_sec) != struct.pack(">d", expected_time):
+        raise ProtocolFailure("event_invalid", "The runner event time is invalid.", fatal=False)
+    confidence = decode_binary64(value["confidence_binary64"], "event confidence")
+    if not 0 <= confidence <= 1:
+        raise ProtocolFailure(
+            "event_invalid", "The runner event confidence is invalid.", fatal=False
+        )
+    return NativeProtocolEvent(
+        frame_index=value["frame_index"],
+        time_sec=time_sec,
+        native_class_id=value["native_class_id"],
+        model_output_bin=value["model_output_bin"],
+        native_midi_note=value["native_midi_note"],
+        upstream_8hit_group_id=group,
+        confidence=confidence,
+        velocity_midi=value["velocity_midi"],
+    )
+
+
+def validate_transcription_response(value: object) -> tuple[NativeProtocolEvent, ...]:
+    if not isinstance(value, Mapping) or set(value) != _RESPONSE_KEYS:
+        raise ProtocolFailure("event_invalid", "The runner response is invalid.", fatal=False)
+    request_id = value.get("request_id")
+    if (
+        value.get("type") != "response"
+        or not isinstance(request_id, str)
+        or not _OPAQUE_ID.fullmatch(request_id)
+    ):
+        raise ProtocolFailure(
+            "event_invalid", "The runner response envelope is invalid.", fatal=False
+        )
+    payload = value["payload"]
+    if not isinstance(payload, Mapping) or set(payload) != _RESULT_KEYS:
+        raise ProtocolFailure("event_invalid", "The runner result is invalid.", fatal=False)
+    if payload.get("type") != "transcription_result":
+        raise ProtocolFailure("event_invalid", "The runner result type is invalid.", fatal=False)
+    _require_sha256(payload.get("audio_sha256"), "event_invalid")
+    _require_sha256(payload.get("backend_descriptor_sha256"), "event_invalid")
+    if not isinstance(payload["native_events"], list):
+        raise ProtocolFailure("event_invalid", "The runner events are invalid.", fatal=False)
+    return tuple(decode_native_event(event) for event in payload["native_events"])
+
+
 def validate_schema_golden(schema: str, content: bytes) -> None:
-    """Validate the runner request fixture through the production request parser."""
-    if schema != PROTOCOL_SCHEMA:
+    """Validate canonical request and response fixtures at the runner boundary."""
+    if schema not in {PROTOCOL_SCHEMA, _PROTOCOL_RESPONSE_GOLDEN_SCHEMA}:
         raise ValueError("runner protocol schema golden is unsupported")
     try:
         if not content.endswith(b"\n") or content.endswith(b"\n\n"):
@@ -288,12 +400,10 @@ def validate_schema_golden(schema: str, content: bytes) -> None:
         payload = _strict_json_loads(content[:-1])
         if canonical_json_bytes(payload, trailing_newline=True) != content:
             raise ValueError("runner protocol schema golden is not canonical")
-        if not isinstance(payload, Mapping):
-            raise ValueError("runner protocol schema golden is not an object")
-        validate_transcribe_request(
-            payload,
-            expected_descriptor_sha256="a" * 64,
-        )
+        if schema == PROTOCOL_SCHEMA:
+            validate_transcribe_request(payload, expected_descriptor_sha256="a" * 64)
+        else:
+            validate_transcription_response(payload)
     except (ProtocolFailure, TypeError, ValueError):
         raise ValueError("runner protocol schema golden is invalid") from None
 

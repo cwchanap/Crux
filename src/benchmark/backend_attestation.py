@@ -32,6 +32,9 @@ _ATTESTATION_SCHEMA = "crux.backend-execution-attestation/v1"
 _HOST_NUMERIC_FINGERPRINT_KEYS = frozenset(
     {"architecture", "cpu_family", "cpu_model", "cpu_stepping", "cpu_vendor_id"}
 )
+_LINUX_CPUINFO_REQUIRED_FIELDS = frozenset(
+    {"processor", "vendor_id", "cpu family", "model", "stepping"}
+)
 _SOURCE_MANIFEST_KEYS = frozenset({"schema", "covered_roots", "files"})
 _SOURCE_FILE_KEYS = frozenset({"path", "sha256", "license"})
 _CHANGED_FILE_KEYS = frozenset({"path", "sha256", "status"})
@@ -767,7 +770,7 @@ def _linux_cpuinfo_records(content: str) -> tuple[dict[str, str], ...]:
         key, value = line.split(":", maxsplit=1)
         key = key.strip()
         value = value.strip()
-        if not key or not value or key in record:
+        if not key or key in record or (not value and key in _LINUX_CPUINFO_REQUIRED_FIELDS):
             raise AttestationError("host CPU facts are malformed")
         record[key] = value
     if record:

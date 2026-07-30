@@ -4,11 +4,13 @@ import hashlib
 import io
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -118,6 +120,99 @@ def test_entrypoint_discards_only_the_required_python_locale_bootstrap(
     assert os.environ == EXPECTED_ENVIRONMENT
 
 
+@pytest.mark.parametrize(
+    "runtime_environment",
+    (
+        {key: value for key, value in EXPECTED_ENVIRONMENT.items() if key != "OMP_NUM_THREADS"},
+        {**EXPECTED_ENVIRONMENT, "UNLOCKED_RUNTIME_VALUE": "1"},
+        {**EXPECTED_ENVIRONMENT, "OMP_NUM_THREADS": "2"},
+    ),
+)
+def test_runner_rejects_authenticated_runtime_lock_environment_drift(
+    runtime_environment: dict[str, str],
+) -> None:
+    with pytest.raises(ProtocolFailure, match="runtime environment"):
+        oaf_backend.validate_runtime_environment(runtime_environment)
+
+
+def test_runner_runtime_lock_environment_matches_image_constant() -> None:
+    assert oaf_backend.EXPECTED_ENVIRONMENT == EXPECTED_ENVIRONMENT
+    assert oaf_backend.validate_runtime_environment(dict(EXPECTED_ENVIRONMENT)) is None
+
+
+@pytest.mark.parametrize(
+    "runtime_environment",
+    (
+        {key: value for key, value in EXPECTED_ENVIRONMENT.items() if key != "OMP_NUM_THREADS"},
+        {**EXPECTED_ENVIRONMENT, "UNLOCKED_RUNTIME_VALUE": "1"},
+        {**EXPECTED_ENVIRONMENT, "OMP_NUM_THREADS": "2"},
+    ),
+)
+def test_preimport_runtime_authentication_uses_exact_locks_and_typed_environment_error(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_environment: dict[str, str],
+) -> None:
+    calls: list[tuple[str, frozenset[str], str | None]] = []
+    backend = SimpleNamespace(payload={"runtime_lock_sha256": "a" * 64})
+    runtime = SimpleNamespace(payload={"environment": runtime_environment})
+
+    def load(path: Path, *, label: str, exact_keys: frozenset[str], **kwargs: object) -> object:
+        calls.append((label, exact_keys, kwargs.get("expected_sha256")))
+        return backend if label == "backend_lock" else runtime
+
+    monkeypatch.setattr(oaf_backend, "load_authenticated_object", load)
+
+    with pytest.raises(ProtocolFailure) as error:
+        oaf_backend.authenticate_runtime_environment()
+
+    assert error.value.code == "runtime_environment_mismatch"
+    assert calls == [
+        ("backend_lock", oaf_backend.BACKEND_LOCK_KEYS, None),
+        ("runtime_lock", oaf_backend.RUNTIME_LOCK_KEYS, "a" * 64),
+    ]
+
+
+def test_entrypoint_rejects_runtime_lock_drift_before_numeric_import(
+    capfd: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import builtins
+
+    numeric_imported = False
+    real_import = builtins.__import__
+
+    def reject_numeric_import(name: str, *args: object, **kwargs: object) -> object:
+        nonlocal numeric_imported
+        if name.startswith(("numpy", "tensorflow")):
+            numeric_imported = True
+            raise AssertionError("numeric import must not run")
+        return real_import(name, *args, **kwargs)
+
+    def reject_runtime_environment() -> None:
+        raise ProtocolFailure(
+            "runtime_environment_mismatch",
+            "Mounted runtime environment does not match the sealed image.",
+            fatal=True,
+        )
+
+    monkeypatch.setattr(
+        runtime_entrypoint,
+        "_authenticate_runtime_environment",
+        reject_runtime_environment,
+        raising=False,
+    )
+    monkeypatch.setattr(builtins, "__import__", reject_numeric_import)
+    monkeypatch.setattr(
+        runtime_entrypoint.os,
+        "environ",
+        {**EXPECTED_ENVIRONMENT, "PYTHONCOERCECLOCALE": "0"},
+    )
+
+    assert runtime_entrypoint.main() == 2
+    assert numeric_imported is False
+    assert capfd.readouterr().err == "code=runtime_environment_mismatch count=1\n"
+
+
 def test_runtime_entrypoint_clears_image_environment_before_python() -> None:
     dockerfile = Path(__file__).resolve().parents[1] / "Dockerfile"
     if not dockerfile.is_file():
@@ -183,6 +278,54 @@ def test_canonical_json_line_is_compact_sorted_utf8_and_bounded() -> None:
 
     assert error.value.code == "protocol_output_oversized"
     assert error.value.fatal is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [0.0, -0.0, 1.0 / (44100.0 / 512.0), 0.625, 1.0],
+)
+def test_binary64_wire_round_trip_preserves_bits(value: float) -> None:
+    encoded = getattr(
+        __import__("runtime.oaf_tf1.protocol", fromlist=["encode_binary64"]), "encode_binary64"
+    )(value)
+
+    assert re.fullmatch(r"[0-9a-f]{16}", encoded)
+    decoded = getattr(
+        __import__("runtime.oaf_tf1.protocol", fromlist=["decode_binary64"]), "decode_binary64"
+    )(
+        encoded,
+        "value",
+    )
+    assert struct.pack(">d", decoded) == struct.pack(">d", value)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_code"),
+    [
+        ("3FE0000000000000", "event_invalid"),
+        ("0x3fe0000000000000", "event_invalid"),
+        ("3fe000000000000", "event_invalid"),
+        ("3fe00000000000000", "event_invalid"),
+        ("3fe000000000000g", "event_invalid"),
+        (0.5, "event_invalid"),
+        (1, "event_invalid"),
+        ("0.5", "event_invalid"),
+        ("7ff0000000000000", "nonfinite_event"),
+        ("fff0000000000000", "nonfinite_event"),
+        ("7ff8000000000000", "nonfinite_event"),
+    ],
+)
+def test_binary64_wire_rejects_noncanonical_or_nonfinite_values(
+    value: object, expected_code: str
+) -> None:
+    decode = getattr(
+        __import__("runtime.oaf_tf1.protocol", fromlist=["decode_binary64"]), "decode_binary64"
+    )
+
+    with pytest.raises(ProtocolFailure) as error:
+        decode(value, "value")
+
+    assert error.value.code == expected_code
 
 
 def test_smoke_match_uses_canonical_numbers_for_nonzero_frame_events() -> None:

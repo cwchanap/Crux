@@ -4,7 +4,6 @@
 # pylint: disable=duplicate-code,import-outside-toplevel
 from __future__ import annotations
 
-import math
 import os
 import platform
 from collections.abc import Callable, Mapping
@@ -30,6 +29,7 @@ from src.benchmark.backend_identity import (
     strict_json_loads,
 )
 from src.benchmark.backend_lock import (
+    REQUIRED_ENVIRONMENT,
     BackendLockError,
     LoadedBackendLock,
     LoadedConversionAudit,
@@ -80,6 +80,7 @@ OafBackendFatal = BackendFatalFailure
 OafBackendItem = BackendItemFailure
 
 _PROTOCOL_SCHEMA = "crux.transcription-runner/v1"
+_PROTOCOL_RESPONSE_GOLDEN_SCHEMA = "crux.transcription-runner-response/v1"
 _SMOKE_ORACLE_SCHEMA = "crux.oaf-smoke-oracle/v1"
 _SMOKE_ORACLE_KEYS = frozenset(
     {
@@ -126,39 +127,26 @@ _RESULT_KEYS = frozenset(
     }
 )
 _ERROR_KEYS = frozenset({"code", "message", "type"})
-_EVENT_KEYS = frozenset(
-    {
-        "confidence_raw",
-        "frame_index",
-        "model_output_bin",
-        "native_class_id",
-        "native_midi_note",
-        "time_sec_raw",
-        "upstream_group_id",
-        "velocity",
-    }
-)
 
 
 def validate_schema_golden(schema: str, content: bytes) -> None:
-    """Validate host-side emission through the exact runner request parser."""
-    if schema != _PROTOCOL_SCHEMA:
+    """Validate canonical request and response fixtures at the host boundary."""
+    if schema not in {_PROTOCOL_SCHEMA, _PROTOCOL_RESPONSE_GOLDEN_SCHEMA}:
         raise ValueError("host runner schema golden is unsupported")
-    from runtime.oaf_tf1.protocol import ProtocolFailure, validate_transcribe_request
+    from runtime.oaf_tf1.protocol import (
+        ProtocolFailure,
+        validate_transcribe_request,
+        validate_transcription_response,
+    )
 
     try:
         if not content.endswith(b"\n") or content.endswith(b"\n\n"):
             raise ValueError("host runner schema golden newline is invalid")
         payload = strict_json_loads(content[:-1], require_canonical=True)
-        if not isinstance(payload, dict) or set(payload) != {
-            "audio_path",
-            "audio_sha256",
-            "backend_descriptor_sha256",
-            "request_id",
-            "type",
-        }:
-            raise ValueError("host runner schema golden keys are invalid")
-        validate_transcribe_request(payload, expected_descriptor_sha256="a" * 64)
+        if schema == _PROTOCOL_SCHEMA:
+            validate_transcribe_request(payload, expected_descriptor_sha256="a" * 64)
+            return
+        validate_transcription_response(payload)
     except (ImportError, StrictJsonError, ProtocolFailure, TypeError, ValueError):
         raise ValueError("host runner schema golden is invalid") from None
 
@@ -221,6 +209,19 @@ class _Locks:
     audit: LoadedConversionAudit
 
 
+@dataclass(frozen=True)
+class SmokeVerificationArtifacts:
+    """The three post-ready artifacts compared during one verification run."""
+
+    persistent_first: PublishedArtifact
+    persistent_second: PublishedArtifact
+    fresh_first: PublishedArtifact
+
+    @property
+    def artifacts(self) -> tuple[PublishedArtifact, PublishedArtifact, PublishedArtifact]:
+        return self.persistent_first, self.persistent_second, self.fresh_first
+
+
 class OafTf1Backend:
     def __init__(
         self,
@@ -235,7 +236,13 @@ class OafTf1Backend:
         self._locks: _Locks | None = None
         self._process: _Runner | None = None
         self._verification: BackendVerification | None = None
+        self._smoke_verification_artifacts: SmokeVerificationArtifacts | None = None
         self._closed = False
+
+    @property
+    def smoke_verification_artifacts(self) -> SmokeVerificationArtifacts | None:
+        """Return only the three post-ready smoke artifacts, never startup handshakes."""
+        return self._smoke_verification_artifacts
 
     def descriptor(self):
         try:
@@ -271,6 +278,7 @@ class OafTf1Backend:
 
     def _verify_once(self) -> BackendVerification:
         locks = self._load_locks()
+        _validate_runtime_environment(locks.runtime)
         repository_root = _repository_root(self._config.host_adapter_source_manifest_path)
         runner_manifest = repository_root / "runtime" / "oaf_tf1" / "runner-source-manifest.json"
         upstream_manifest = repository_root / "runtime" / "oaf_tf1" / "source-manifest.json"
@@ -305,7 +313,7 @@ class OafTf1Backend:
         _validate_native_evidence(locks.seal, self._config.native_host_evidence)
 
         native_environment = _is_native_environment()
-        if not native_environment and not self._config.allow_emulated_diagnostics:
+        if not native_environment:
             return self._unsupported_verification()
 
         source_manifests = (
@@ -325,53 +333,36 @@ class OafTf1Backend:
             self._config.backend_lock_path,
         )
         profile = _launch_profile(self._config, locks)
-        try:
-            process = self._process_factory(profile)
-        except BackendFatalFailure:
-            raise
-        except (OSError, RuntimeError, TypeError, ValueError):
-            raise _fatal(
-                "backend_launch_failed",
-                "The frozen backend runner could not be launched.",
-            ) from None
-        self._process = process
-        _validate_handshake(process.handshake, locks)
-
         smoke_audio = _load_smoke_audio(self._config, locks)
-        smoke_prediction = self._request_prediction(smoke_audio)
-        smoke_content = render_prediction_artifact(smoke_prediction)
-        smoke_sha256 = sha256_hex(smoke_content)
-        expected_smoke_sha256 = _require_hash_value(
-            process.handshake["smoke_prediction_sha256"],
-            "runner smoke prediction SHA-256",
-        )
-        if smoke_sha256 != expected_smoke_sha256:
-            raise _fatal(
-                "smoke_prediction_mismatch",
-                "The post-ready smoke prediction did not match the sealed identity.",
-            )
+        persistent = self._start_verified_process(profile, locks)
+        self._process = persistent
+        fresh: _Runner | None = None
+        try:
+            persistent_first = self._request_smoke_prediction(smoke_audio, persistent)
+            persistent_second = self._request_smoke_prediction(smoke_audio, persistent)
+            fresh = self._start_verified_process(profile, locks)
+            fresh_first = self._request_smoke_prediction(smoke_audio, fresh)
+        finally:
+            if fresh is not None:
+                try:
+                    fresh.close()
+                except BaseException:
+                    pass
 
-        if not native_environment:
-            self._close_process()
-            return self._unsupported_verification(
-                tensor=tensor_artifact,
-                smoke_audio_sha256=smoke_audio.input_audio_sha256,
-                smoke_oracle_sha256=cast(
-                    str,
-                    locks.backend.payload["smoke_oracle_sha256"],
-                ),
-            )
+        expected_smoke = _expected_smoke_prediction(self._config, locks, smoke_audio)
+        _verify_smoke_prediction_bytes(
+            expected_smoke,
+            (persistent_first, persistent_second, fresh_first),
+        )
 
         backend_root = (
             repository_root / "artifacts" / "benchmark" / "backends" / OFFICIAL_BACKEND_ID
         )
-        smoke_path = backend_root / "verification" / "smoke" / "sha256" / f"{smoke_sha256}.jsonl"
-        smoke_artifact = publish_prediction_artifact(smoke_path, smoke_prediction)
-        if smoke_artifact.sha256 != expected_smoke_sha256:
-            raise _fatal(
-                "smoke_prediction_mismatch",
-                "The published smoke prediction did not match the sealed identity.",
-            )
+        smoke_artifacts = _publish_smoke_verification_artifacts(
+            backend_root,
+            (persistent_first, persistent_second, fresh_first),
+        )
+        self._smoke_verification_artifacts = smoke_artifacts
 
         conditions = _execution_conditions(locks.seal)
         attestation = publish_execution_attestation(
@@ -400,7 +391,7 @@ class OafTf1Backend:
                 status="passed",
                 audio_sha256=smoke_audio.input_audio_sha256,
                 oracle_sha256=cast(str, locks.backend.payload["smoke_oracle_sha256"]),
-                prediction=smoke_artifact,
+                prediction=smoke_artifacts.persistent_first,
             ),
             errors=(),
             host_numeric_fingerprint=self._config.native_host_evidence.host_numeric_fingerprint,
@@ -422,12 +413,17 @@ class OafTf1Backend:
             raise BackendFatalFailure(error)
         return self._request_prediction(audio)
 
-    def _request_prediction(self, audio: CanonicalAudio) -> NativePrediction:
+    def _request_prediction(
+        self,
+        audio: CanonicalAudio,
+        *,
+        process: _Runner | None = None,
+    ) -> NativePrediction:
         locks = self._load_locks()
-        process = self._process
-        if process is None:
+        active_process = self._process if process is None else process
+        if active_process is None:
             raise _fatal("backend_not_verified", "The frozen backend is not verified.")
-        response = self._request_runner(audio, locks, process)
+        response = self._request_runner(audio, locks, active_process)
         payload = dict(response.payload)
         if payload.get("type") == "transcription_error":
             if set(payload) != _ERROR_KEYS:
@@ -499,6 +495,39 @@ class OafTf1Backend:
             )
             raise _item(code, "The runner event list is malformed.") from None
         return prediction
+
+    def _start_verified_process(self, profile: RunnerLaunchProfile, locks: _Locks) -> _Runner:
+        try:
+            process = self._process_factory(profile)
+        except BackendFatalFailure:
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError):
+            raise _fatal(
+                "backend_launch_failed",
+                "The frozen backend runner could not be launched.",
+            ) from None
+        try:
+            _validate_handshake(process.handshake, locks)
+        except BaseException:
+            try:
+                process.close()
+            except BaseException:
+                pass
+            raise
+        return process
+
+    def _request_smoke_prediction(
+        self,
+        audio: CanonicalAudio,
+        process: _Runner,
+    ) -> NativePrediction:
+        try:
+            return self._request_prediction(audio, process=process)
+        except BackendItemFailure:
+            raise _fatal(
+                "smoke_mismatch",
+                "The post-ready smoke prediction did not match the frozen oracle.",
+            ) from None
 
     def _request_runner(
         self,
@@ -764,6 +793,14 @@ def _verify_model_cache(
         )
 
 
+def _validate_runtime_environment(runtime: LoadedRuntimeLock) -> None:
+    if dict(runtime.payload["environment"]) != dict(REQUIRED_ENVIRONMENT):
+        raise _fatal(
+            "runtime_environment_mismatch",
+            "Runtime environment identity does not match the image.",
+        )
+
+
 def _launch_profile(config: OafBackendConfig, locks: _Locks) -> RunnerLaunchProfile:
     seal = locks.seal.payload
     runtime = locks.runtime.payload
@@ -936,6 +973,88 @@ def _load_smoke_audio(config: OafBackendConfig, locks: _Locks) -> CanonicalAudio
     return replace(smoke, source_audio_sha256=source_sha256)
 
 
+def _expected_smoke_prediction(
+    config: OafBackendConfig,
+    locks: _Locks,
+    smoke_audio: CanonicalAudio,
+) -> NativePrediction:
+    """Build the only expected JSONL source from the mounted oracle and locks."""
+    oracle_path = config.input_root / "smoke" / "smoke-oracle.json"
+    content = _require_artifact_hash(
+        oracle_path,
+        locks.backend.payload["smoke_oracle_sha256"],
+        "smoke oracle",
+    )
+    try:
+        oracle = strict_json_loads(content[:-1], require_canonical=True)
+        if not isinstance(oracle, dict) or set(oracle) != _SMOKE_ORACLE_KEYS:
+            raise ValueError("smoke oracle schema mismatch")
+        raw_events = oracle["native_events"]
+        if not isinstance(raw_events, list) or not raw_events:
+            raise ValueError("smoke oracle events are invalid")
+        events = tuple(_native_event(event, locks.backend) for event in raw_events)
+    except (BackendItemFailure, KeyError, StrictJsonError, TypeError, ValueError):
+        raise _fatal("smoke_oracle_invalid", "The smoke oracle is malformed.") from None
+    return NativePrediction(
+        audio=smoke_audio,
+        descriptor=locks.backend.descriptor,
+        events=events,
+        backend_lock_sha256=locks.backend.sha256,
+        runtime_lock_sha256=locks.runtime.sha256,
+        parameter_lock_sha256=None,
+        model_artifact_set_sha256=cast(
+            str,
+            locks.backend.descriptor.payload["model_artifact_set_sha256"],
+        ),
+        upstream_source_commit=cast(
+            str,
+            locks.backend.descriptor.payload["upstream_source_commit"],
+        ),
+        training_data_map_id=cast(
+            str,
+            locks.backend.descriptor.payload["training_data_map_id"],
+        ),
+    )
+
+
+def _verify_smoke_prediction_bytes(
+    expected: NativePrediction,
+    predictions: tuple[NativePrediction, NativePrediction, NativePrediction],
+) -> bytes:
+    try:
+        expected_content = render_prediction_artifact(expected)
+        contents = tuple(render_prediction_artifact(prediction) for prediction in predictions)
+    except PredictionArtifactError:
+        raise _fatal(
+            "smoke_mismatch",
+            "The post-ready smoke prediction did not match the frozen oracle.",
+        ) from None
+    if any(content != expected_content for content in contents):
+        raise _fatal(
+            "smoke_mismatch",
+            "The post-ready smoke prediction did not match the frozen oracle.",
+        )
+    return expected_content
+
+
+def _publish_smoke_verification_artifacts(
+    backend_root: Path,
+    predictions: tuple[NativePrediction, NativePrediction, NativePrediction],
+) -> SmokeVerificationArtifacts:
+    labels = ("persistent-first", "persistent-second", "fresh-first")
+    artifacts: list[PublishedArtifact] = []
+    for label, prediction in zip(labels, predictions, strict=True):
+        content = render_prediction_artifact(prediction)
+        digest = sha256_hex(content)
+        artifacts.append(
+            publish_prediction_artifact(
+                backend_root / "verification" / "smoke" / label / "sha256" / f"{digest}.jsonl",
+                prediction,
+            )
+        )
+    return SmokeVerificationArtifacts(*artifacts)
+
+
 def _read_authenticated_input(audio: CanonicalAudio) -> bytes:
     try:
         content = read_regular_file_no_follow(audio.path)
@@ -981,24 +1100,13 @@ def _relative_input_path(audio_path: Path, input_root: Path) -> str:
 
 
 def _native_event(value: object, backend: LoadedBackendLock) -> NativeEvent:
-    if not isinstance(value, Mapping) or set(value) != _EVENT_KEYS:
-        raise _item("native_event_invalid", "The runner event is malformed.")
-    frame_index = _nonnegative_integer(value["frame_index"], "frame index")
-    output_bin = _integer_range(value["model_output_bin"], "model output bin", 0, 87)
-    native_note = _integer_range(value["native_midi_note"], "native MIDI note", 21, 108)
-    velocity = _integer_range(value["velocity"], "velocity", 0, 127)
-    expected_note = output_bin + 21
-    native_class_id = value["native_class_id"]
-    if native_note != expected_note or native_class_id != f"midi_{expected_note}":
-        raise _item("native_event_invalid", "The runner event identity is inconsistent.")
-    time_sec = _finite_float(value["time_sec_raw"], "event time")
-    expected_time = frame_index * (1.0 / (44100 / 512))
-    if time_sec < 0 or time_sec != expected_time:
-        raise _item("native_event_invalid", "The runner event time is inconsistent.")
-    confidence = _finite_float(value["confidence_raw"], "event confidence")
-    if confidence < 0 or confidence > 1:
-        raise _item("native_event_invalid", "The runner event confidence is invalid.")
-    group = value["upstream_group_id"]
+    from runtime.oaf_tf1.protocol import ProtocolFailure, decode_native_event
+
+    try:
+        protocol_event = decode_native_event(value)
+    except ProtocolFailure:
+        raise _item("native_event_invalid", "The runner event is malformed.") from None
+    group = protocol_event.upstream_8hit_group_id
     known_groups = {
         row.get("group_id")
         for row in cast(list[Mapping[str, object]], backend.payload["training_groups"])
@@ -1007,35 +1115,14 @@ def _native_event(value: object, backend: LoadedBackendLock) -> NativeEvent:
     if group is not None and (not isinstance(group, str) or group not in known_groups):
         raise _item("native_event_invalid", "The runner event training group is invalid.")
     return NativeEvent(
-        time_sec=time_sec,
-        native_class_id=cast(str, native_class_id),
-        model_output_bin=output_bin,
-        native_midi_note=native_note,
+        time_sec=protocol_event.time_sec,
+        native_class_id=protocol_event.native_class_id,
+        model_output_bin=protocol_event.model_output_bin,
+        native_midi_note=protocol_event.native_midi_note,
         native_metadata={"upstream_8hit_group_id": cast(str | None, group)},
-        confidence=confidence,
-        velocity_midi=velocity,
+        confidence=protocol_event.confidence,
+        velocity_midi=protocol_event.velocity_midi,
     )
-
-
-def _finite_float(value: object, label: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
-        raise _item("native_event_invalid", f"The {label} is invalid.")
-    converted = float(value)
-    if not math.isfinite(converted):
-        raise _item("native_event_invalid", f"The {label} is nonfinite.")
-    return converted
-
-
-def _nonnegative_integer(value: object, label: str) -> int:
-    if type(value) is not int or cast(int, value) < 0:
-        raise _item("native_event_invalid", f"The {label} is invalid.")
-    return cast(int, value)
-
-
-def _integer_range(value: object, label: str, minimum: int, maximum: int) -> int:
-    if type(value) is not int or not minimum <= cast(int, value) <= maximum:
-        raise _item("native_event_invalid", f"The {label} is invalid.")
-    return cast(int, value)
 
 
 def _nonempty_string(value: object, label: str) -> str:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
-from decimal import Decimal
+import struct
 from pathlib import Path
 from typing import cast
 
@@ -30,7 +30,7 @@ NATIVE_TEST_FLAG = "HPA320_RUN_NATIVE_OAF_REAL_CHECKPOINT"
 NATIVE_HOST_EVIDENCE = Path("/workspace/hpa320/native-host-evidence.json")
 
 pytestmark = pytest.mark.skipif(
-    os.environ.get(NATIVE_TEST_FLAG) != "1",
+    NATIVE_TEST_FLAG not in os.environ,
     reason=f"set {NATIVE_TEST_FLAG}=1 only on the accepted native seal worker",
 )
 
@@ -48,17 +48,19 @@ def _strict_oracle(path: Path) -> dict[str, JsonValue]:
 def _oracle_event(value: JsonValue) -> NativeEvent:
     assert isinstance(value, dict)
     return NativeEvent(
-        time_sec=float(Decimal(cast(str, value["time_sec_raw"]))),
+        time_sec=struct.unpack(">d", bytes.fromhex(cast(str, value["time_sec_binary64"])))[0],
         native_class_id=cast(str, value["native_class_id"]),
         model_output_bin=cast(int, value["model_output_bin"]),
         native_midi_note=cast(int, value["native_midi_note"]),
-        native_metadata={"upstream_8hit_group_id": cast(str | None, value["upstream_group_id"])},
-        confidence=float(Decimal(cast(str, value["confidence_raw"]))),
-        velocity_midi=cast(int, value["velocity"]),
+        native_metadata={
+            "upstream_8hit_group_id": cast(str | None, value["upstream_8hit_group_id"])
+        },
+        confidence=struct.unpack(">d", bytes.fromhex(cast(str, value["confidence_binary64"])))[0],
+        velocity_midi=cast(int, value["velocity_midi"]),
     )
 
 
-def test_real_checkpoint_is_exact_twice_in_process_and_once_fresh(
+def test_real_checkpoint_is_exact_in_two_processes_with_three_post_ready_artifacts(
     tmp_path: Path,
 ) -> None:
     repository = Path.cwd().resolve(strict=True)
@@ -123,21 +125,13 @@ def test_real_checkpoint_is_exact_twice_in_process_and_once_fresh(
         )
     )
 
-    shared = OafTf1Backend(config)
+    backend = OafTf1Backend(config)
     try:
-        assert shared.verify().status == "verified"
-        first = render_prediction_artifact(shared.transcribe(audio))
-        second = render_prediction_artifact(shared.transcribe(audio))
+        assert backend.verify().status == "verified"
+        artifacts = backend.smoke_verification_artifacts
+        assert artifacts is not None
+        actual = [artifact.path.read_bytes() for artifact in artifacts.artifacts]
     finally:
-        shared.close()
+        backend.close()
 
-    fresh = OafTf1Backend(config)
-    try:
-        assert fresh.verify().status == "verified"
-        third = render_prediction_artifact(fresh.transcribe(audio))
-    finally:
-        fresh.close()
-
-    assert first == expected
-    assert second == expected
-    assert third == expected
+    assert actual == [expected, expected, expected]

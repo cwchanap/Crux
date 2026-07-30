@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -147,6 +148,44 @@ def test_docker_command_contains_exact_hardening_and_fresh_environment(tmp_path:
     }
     for source, destination in expected_mounts.items():
         assert f"--mount=type=bind,src={source},dst={destination},readonly" in command
+
+
+def test_runtime_test_tree_does_not_import_host_src_modules() -> None:
+    runtime_tests = Path(__file__).parents[2] / "runtime" / "oaf_tf1" / "tests"
+
+    for path in runtime_tests.glob("test_*.py"):
+        content = path.read_text(encoding="utf-8")
+        assert "from src." not in content
+        assert "import src." not in content
+
+
+def test_oaf_environment_authorities_match_runtime_lock_image_and_entrypoint() -> None:
+    from runtime.oaf_tf1 import entrypoint, oaf_backend
+
+    dockerfile = Path(__file__).parents[2] / "runtime" / "oaf_tf1" / "Dockerfile"
+    command = next(
+        json.loads(line[len("ENTRYPOINT ") :])
+        for line in dockerfile.read_text(encoding="utf-8").splitlines()
+        if line.startswith("ENTRYPOINT ")
+    )
+    assert command[:2] == ["/usr/bin/env", "-i"]
+    bootstrap_environment = {
+        key: value
+        for key, value in (item.split("=", maxsplit=1) for item in command[2:] if "=" in item)
+    }
+    assert bootstrap_environment.pop("PYTHONCOERCECLOCALE") == "0"
+    assert bootstrap_environment == REQUIRED_ENVIRONMENT
+    assert entrypoint.EXPECTED_ENVIRONMENT == REQUIRED_ENVIRONMENT
+    assert oaf_backend.EXPECTED_ENVIRONMENT == REQUIRED_ENVIRONMENT
+
+
+def test_runner_lock_key_sets_match_host_authority() -> None:
+    from runtime.oaf_tf1 import oaf_backend
+    from src.benchmark import backend_lock
+
+    assert oaf_backend.BACKEND_LOCK_KEYS == backend_lock.BACKEND_LOCK_KEYS
+    assert oaf_backend.RUNTIME_LOCK_KEYS == backend_lock.RUNTIME_LOCK_KEYS
+    assert oaf_backend.SEAL_EVIDENCE_KEYS == backend_lock.SEAL_EVIDENCE_KEYS
 
 
 @pytest.mark.parametrize(

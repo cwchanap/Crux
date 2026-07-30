@@ -103,6 +103,7 @@ def test_phase_a_and_b_schema_goldens_are_complete_and_strict(repository_root: P
         "crux.oaf-calibration-measurement-request/v1",
         "crux.oaf-seal-profile-request/v1",
         "crux.transcription-runner/v1",
+        "crux.transcription-runner-response/v1",
     }.issubset(schemas)
     for entry in entries:
         validate_schema_golden_entry(entry, repository_root)
@@ -275,6 +276,79 @@ def test_host_and_runner_reject_the_same_invalid_audio_paths(
     payload = json.loads((repository_root / entry.golden_path).read_bytes())
     payload["audio_path"] = audio_path
     content = canonical_json_bytes(payload, trailing_newline=True)
+    for module_name in entry.validator_modules:
+        validator = getattr(importlib.import_module(module_name), "validate_schema_golden")
+        with pytest.raises(ValueError):
+            validator(entry.schema, content)
+
+
+def _response_golden_payload(repository_root: Path) -> tuple[SchemaGoldenEntry, dict[str, object]]:
+    entry = next(
+        item
+        for item in load_schema_golden_manifest(repository_root)
+        if item.schema == "crux.transcription-runner-response/v1"
+    )
+    payload = json.loads((repository_root / entry.golden_path).read_bytes())
+    assert isinstance(payload, dict)
+    return entry, payload
+
+
+@pytest.mark.parametrize(
+    ("label", "mutate"),
+    [
+        ("numeric-request-id", lambda value: value.__setitem__("request_id", 1)),
+        (
+            "numeric-audio-hash",
+            lambda value: value["payload"].__setitem__("audio_sha256", 1),  # type: ignore[index,union-attr]
+        ),
+        (
+            "numeric-descriptor-hash",
+            lambda value: value["payload"].__setitem__("backend_descriptor_sha256", 1),  # type: ignore[index,union-attr]
+        ),
+        (
+            "frame-time-bit-mismatch",
+            lambda value: value["payload"]["native_events"][0].__setitem__(  # type: ignore[index,union-attr]
+                "time_sec_binary64", "3fe7c6f8c751f178"
+            ),
+        ),
+        (
+            "confidence-below-range",
+            lambda value: value["payload"]["native_events"][0].__setitem__(  # type: ignore[index,union-attr]
+                "confidence_binary64", "bfe0000000000000"
+            ),
+        ),
+        (
+            "confidence-above-range",
+            lambda value: value["payload"]["native_events"][0].__setitem__(  # type: ignore[index,union-attr]
+                "confidence_binary64", "3ff8000000000000"
+            ),
+        ),
+        (
+            "nested-extra-key",
+            lambda value: value["payload"].__setitem__("unexpected", "unexpected"),  # type: ignore[index,union-attr]
+        ),
+        (
+            "nested-missing-key",
+            lambda value: value["payload"].pop("native_events"),  # type: ignore[index,union-attr]
+        ),
+        (
+            "legacy-event-field",
+            lambda value: value["payload"]["native_events"][0].__setitem__(  # type: ignore[index,union-attr]
+                "confidence_raw", "0.75"
+            ),
+        ),
+    ],
+)
+def test_host_and_runner_reject_response_golden_wire_mutations(
+    repository_root: Path,
+    label: str,
+    mutate: Callable[[dict[str, object]], None],
+) -> None:
+    del label
+    entry, payload = _response_golden_payload(repository_root)
+    mutate(payload)
+    content = canonical_json_bytes(payload, trailing_newline=True)
+
     for module_name in entry.validator_modules:
         validator = getattr(importlib.import_module(module_name), "validate_schema_golden")
         with pytest.raises(ValueError):
