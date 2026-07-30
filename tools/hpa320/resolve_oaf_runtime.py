@@ -21,6 +21,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import urllib.parse
@@ -2046,7 +2047,10 @@ def main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-retu
     args = _parse_args(argv)
     if args.materialize_wheelhouse:
         if args.lock is None or args.wheelhouse is None:
-            print("OaF wheelhouse materialization failed: --lock and --wheelhouse are required")
+            print(
+                "OaF wheelhouse materialization failed: --lock and --wheelhouse are required",
+                file=sys.stderr,
+            )
             return 1
         try:
             records = materialize_locked_wheelhouse(
@@ -2055,7 +2059,7 @@ def main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-retu
                 offline_cache=args.offline_cache,
             )
         except (OSError, ResolutionError) as error:
-            print(f"OaF wheelhouse materialization failed: {error}")
+            print(f"OaF wheelhouse materialization failed: {error}", file=sys.stderr)
             return 1
         print(
             json.dumps(
@@ -2081,7 +2085,7 @@ def main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-retu
         }
         missing = [flag for flag, value in required.items() if value is None]
         if missing:
-            print(f"OaF runtime resolution failed: missing {' '.join(missing)}")
+            print(f"OaF runtime resolution failed: missing {' '.join(missing)}", file=sys.stderr)
             return 1
         try:
             records, manifest_content = build_allowlisted_sdists(
@@ -2096,7 +2100,7 @@ def main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-retu
                 docker_executable=args.docker_executable,
             )
         except (OSError, DistributionBuildError) as error:
-            print(f"OaF exceptional distribution build failed: {error}")
+            print(f"OaF exceptional distribution build failed: {error}", file=sys.stderr)
             return 1
         print(
             json.dumps(
@@ -2112,7 +2116,10 @@ def main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-retu
         )
         return 0
     if args.requirements is None or args.wheelhouse is None or args.lock is None:
-        print("OaF runtime resolution failed: --requirements --wheelhouse and --lock are required")
+        print(
+            "OaF runtime resolution failed: --requirements --wheelhouse and --lock are required",
+            file=sys.stderr,
+        )
         return 1
     try:
         distributions = resolve_runtime(
@@ -2126,7 +2133,7 @@ def main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-retu
             distribution_build_manifest_path=args.distribution_build_manifest,
         )
     except (OSError, ResolutionError) as error:
-        print(f"OaF runtime resolution failed: {error}")
+        print(f"OaF runtime resolution failed: {error}", file=sys.stderr)
         return 1
     print(
         json.dumps(

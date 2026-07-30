@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import struct
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -257,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         parameter_hash, wav_hash = write_smoke_fixture(args.parameters, args.output)
     except (OSError, SmokeFixtureError, TypeError, ValueError) as error:
-        print(f"smoke fixture generation failed: {error}")
+        print(f"smoke fixture generation failed: {error}", file=sys.stderr)
         return 1
     print(
         json.dumps(

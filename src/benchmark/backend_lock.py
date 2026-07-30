@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
@@ -632,8 +633,6 @@ def validate_schema_golden(schema: str, content: bytes) -> None:
     }
     try:
         loader = loaders[schema]
-        import tempfile
-
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             path = Path(directory) / "golden.json"
             path.write_bytes(content)

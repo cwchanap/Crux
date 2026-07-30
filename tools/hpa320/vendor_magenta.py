@@ -13,6 +13,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unicodedata
 from collections import deque
@@ -545,7 +546,7 @@ def main(argv: list[str] | None = None) -> int:
             manifest_path=args.manifest,
         )
     except (OSError, VendoringError) as error:
-        print(f"Magenta vendoring failed: {error}")
+        print(f"Magenta vendoring failed: {error}", file=sys.stderr)
         return 1
     print(
         json.dumps(
