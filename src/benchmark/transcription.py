@@ -55,6 +55,8 @@ from src.benchmark.backends import (
     NativeEvent,
     NativePrediction,
     PublishedArtifact,
+    SmokeCheck,
+    TensorCoverageCheck,
 )
 from src.benchmark.input_view import (
     InputViewManifest,
@@ -135,6 +137,20 @@ class TranscribeOneOutcome:
 
 
 @dataclass(frozen=True)
+class VerifyBackendRequest:
+    backend_id: str | None
+    reports_root: Path
+    allow_emulated_diagnostics: bool
+
+
+@dataclass(frozen=True)
+class VerifyBackendOutcome:
+    status: Literal["verified", "failed", "environment_unsupported"]
+    exit_code: Literal[0, 1, 2]
+    report_artifact: PublishedArtifact
+
+
+@dataclass(frozen=True)
 class _CapturedInputAnchors:
     input_file: RegularFileAnchor
     manifest: InputViewManifest | None
@@ -179,6 +195,120 @@ def run_transcribe_one(
         raise
     except (OSError, RuntimeError, TypeError, ValueError):
         raise OperationalReportPublicationError("operational_report_publication_failed") from None
+
+
+def run_verify_backend(
+    request: VerifyBackendRequest,
+    *,
+    registry: BackendRegistry,
+    now: datetime | None = None,
+    run_id: UUID | None = None,
+) -> VerifyBackendOutcome:
+    try:
+        repository_root = Path.cwd().resolve(strict=True)
+        reports_root = (
+            request.reports_root
+            if request.reports_root.is_absolute()
+            else repository_root / request.reports_root
+        )
+        effective_now = datetime.now(UTC) if now is None else now
+        effective_run_id = uuid4() if run_id is None else run_id
+        selected_backend_id = (
+            registry.default_backend_id if request.backend_id is None else request.backend_id
+        )
+        with open_directory_anchor(repository_root) as repository_anchor:
+            try:
+                backend = registry.create(
+                    request.backend_id,
+                    allow_emulated_diagnostics=request.allow_emulated_diagnostics,
+                )
+            except BackendUnavailable as error:
+                selected_backend_id = error.report_backend_id
+                verification = _failed_backend_verification(_BACKEND_UNAVAILABLE)
+            except Exception:
+                verification = _failed_backend_verification(_BACKEND_FAILURE)
+            else:
+                try:
+                    verification = backend.verify()
+                except BackendFatalFailure as failure:
+                    verification = _failed_backend_verification(failure.error)
+                except Exception:
+                    verification = _failed_backend_verification(_BACKEND_FAILURE)
+                finally:
+                    try:
+                        backend.close()
+                    except BaseException:
+                        pass
+            try:
+                report = _validate_verification(
+                    verification,
+                    backend_id=selected_backend_id,
+                    repository_root=repository_root,
+                    repository_anchor=repository_anchor,
+                    now=effective_now,
+                    run_id=effective_run_id,
+                )
+            except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+                verification = _failed_backend_verification(_INVALID_VERIFICATION)
+                report = _validate_verification(
+                    verification,
+                    backend_id=selected_backend_id,
+                    repository_root=repository_root,
+                    repository_anchor=repository_anchor,
+                    now=effective_now,
+                    run_id=effective_run_id,
+                )
+            artifact = publish_operational_report(
+                reports_root,
+                backend_id=selected_backend_id,
+                report=report,
+                now=effective_now,
+                run_id=effective_run_id,
+                anchor=repository_anchor,
+            )
+    except OperationalReportPublicationError:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise OperationalReportPublicationError("operational_report_publication_failed") from None
+    exit_code = {
+        "verified": 0,
+        "environment_unsupported": 1,
+        "failed": 2,
+    }[verification.status]
+    return VerifyBackendOutcome(
+        status=verification.status,
+        exit_code=cast(Literal[0, 1, 2], exit_code),
+        report_artifact=artifact,
+    )
+
+
+def _failed_backend_verification(error: BackendError) -> BackendVerification:
+    return BackendVerification(
+        status="failed",
+        descriptor=None,
+        max_input_audio_frames=None,
+        backend_lock_sha256=None,
+        runtime_lock_sha256=None,
+        parameter_lock_sha256=None,
+        seal_evidence_sha256=None,
+        execution_attestation=None,
+        tensor_coverage=TensorCoverageCheck(
+            status="not_run",
+            required_count=0,
+            restored_count=0,
+            non_inference_count=0,
+            required_inventory_sha256=None,
+            non_inference_inventory_sha256=None,
+            report=None,
+        ),
+        smoke=SmokeCheck(
+            status="not_run",
+            audio_sha256=None,
+            oracle_sha256=None,
+            prediction=None,
+        ),
+        errors=(error,),
+    )
 
 
 def _run_transcribe_one_anchored(
@@ -765,7 +895,7 @@ def _validate_verification(
     repository_anchor: DirectoryAnchor,
     now: datetime,
     run_id: UUID,
-) -> None:
+) -> VerificationReport:
     if not isinstance(verification, BackendVerification):
         raise TypeError("verify must return BackendVerification")
     if verification.status not in {"verified", "failed", "environment_unsupported"}:
@@ -871,7 +1001,7 @@ def _validate_verification(
         for artifact in (attestation, tensor_report, smoke_prediction)
         if artifact is not None
     )
-    VerificationReport(
+    return VerificationReport(
         {
             "schema": "crux.backend-verification-report/v1",
             "report_type": "verification",

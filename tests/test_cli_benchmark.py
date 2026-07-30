@@ -12,9 +12,20 @@ import soundfile as sf
 from click.testing import CliRunner
 
 import src.benchmark.r2_corpus_sync as r2_corpus_sync
-from src.benchmark.backend_registry import HEURISTIC_BACKEND_ID, OFFICIAL_BACKEND_ID
+from src.benchmark.backend_registry import (
+    HEURISTIC_BACKEND_ID,
+    LEGACY_TF2_BACKEND_ID,
+    OFFICIAL_BACKEND_ID,
+    BackendRegistry,
+)
 from src.benchmark.backend_reports import OperationalReportPublicationError
-from src.benchmark.backends import PublishedArtifact
+from src.benchmark.backends import (
+    BackendError,
+    BackendVerification,
+    PublishedArtifact,
+    SmokeCheck,
+    TensorCoverageCheck,
+)
 from src.benchmark.r2_corpus_models import (
     MAX_SIMFILE_ID,
     OverallStatus,
@@ -25,11 +36,277 @@ from src.benchmark.r2_corpus_models import (
     SyncRequest,
 )
 from src.benchmark.r2_corpus_sync import ProgressEvent
-from src.benchmark.transcription import TranscribeOneOutcome, TranscribeOneRequest
+from src.benchmark.transcription import (
+    TranscribeOneOutcome,
+    TranscribeOneRequest,
+    VerifyBackendOutcome,
+    VerifyBackendRequest,
+)
 from src.cli import benchmark as benchmark_cli
 from src.cli.main import main
 
 runner = CliRunner()
+
+
+def test_verify_backend_help_lists_exact_options_and_defaults() -> None:
+    result = runner.invoke(main, ["benchmark", "verify-backend", "--help"])
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert [line.strip() for line in result.stdout.splitlines() if line.startswith("  --")] == [
+        f"--backend TEXT                [default: {OFFICIAL_BACKEND_ID}]",
+        "--reports-root DIRECTORY      [default: artifacts/benchmark/backends]",
+        "--allow-emulated-diagnostics",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "exit_code"),
+    (("verified", 0), ("environment_unsupported", 1), ("failed", 2)),
+)
+def test_verify_backend_emits_one_canonical_four_field_summary(
+    status: str,
+    exit_code: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[VerifyBackendRequest, object]] = []
+    artifact = PublishedArtifact(
+        role="verification_report",
+        path=tmp_path / "verification.json",
+        sha256="a" * 64,
+    )
+
+    def fake_run(
+        request: VerifyBackendRequest,
+        *,
+        registry: object,
+    ) -> VerifyBackendOutcome:
+        captured.append((request, registry))
+        return VerifyBackendOutcome(
+            status=status,  # type: ignore[arg-type]
+            exit_code=exit_code,  # type: ignore[arg-type]
+            report_artifact=artifact,
+        )
+
+    monkeypatch.setattr("src.benchmark.transcription.run_verify_backend", fake_run)
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "verify-backend",
+            "--backend",
+            OFFICIAL_BACKEND_ID,
+            "--reports-root",
+            str(tmp_path / "reports"),
+            "--allow-emulated-diagnostics",
+        ],
+    )
+
+    assert result.exit_code == exit_code
+    assert result.stderr_bytes == b""
+    assert (
+        result.stdout_bytes
+        == (
+            f'{{"exit_code":{exit_code},"report_path":"{artifact.path}",'
+            f'"report_sha256":"{"a" * 64}","status":"{status}"}}\n'
+        ).encode()
+    )
+    assert captured[0][0] == VerifyBackendRequest(
+        backend_id=OFFICIAL_BACKEND_ID,
+        reports_root=tmp_path / "reports",
+        allow_emulated_diagnostics=True,
+    )
+
+
+def test_verify_backend_click_usage_error_occurs_before_report_or_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.benchmark.transcription.run_verify_backend",
+        lambda *args, **kwargs: pytest.fail("usage error reached orchestration"),
+    )
+
+    result = runner.invoke(
+        main,
+        ["benchmark", "verify-backend", "--reports-root"],
+    )
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert "requires an argument" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "backend_id",
+    (LEGACY_TF2_BACKEND_ID, "unknown-backend"),
+)
+def test_verify_backend_rejects_legacy_and_unknown_at_click_parse_boundary(
+    backend_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.benchmark.transcription.run_verify_backend",
+        lambda *args, **kwargs: pytest.fail("invalid backend reached orchestration"),
+    )
+    reports_root = tmp_path / "reports"
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "verify-backend",
+            "--backend",
+            backend_id,
+            "--reports-root",
+            str(reports_root),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert "Invalid value for '--backend'" in result.stderr
+    assert not reports_root.exists()
+
+
+def test_verify_backend_report_publication_failure_is_sanitized_without_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unsafe = f"signed URL https://example.invalid/?token=secret path={tmp_path}"
+
+    def fail_run(*args: object, **kwargs: object) -> VerifyBackendOutcome:
+        raise OperationalReportPublicationError(unsafe)
+
+    monkeypatch.setattr("src.benchmark.transcription.run_verify_backend", fail_run)
+
+    result = runner.invoke(main, ["benchmark", "verify-backend"])
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert (
+        result.stderr == "report_publication_failed: Operational report could not be published.\n"
+    )
+    assert unsafe not in result.stderr
+    assert str(tmp_path) not in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("status", "exit_code"),
+    (("environment_unsupported", 1), ("failed", 2)),
+)
+def test_verify_backend_publishes_exact_phase_b_report_and_closes_once(
+    status: str,
+    exit_code: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verification = BackendVerification(
+        status=status,  # type: ignore[arg-type]
+        descriptor=None,
+        max_input_audio_frames=None,
+        backend_lock_sha256=None,
+        runtime_lock_sha256=None,
+        parameter_lock_sha256=None,
+        seal_evidence_sha256=None,
+        execution_attestation=None,
+        tensor_coverage=TensorCoverageCheck(
+            status="not_run",
+            required_count=0,
+            restored_count=0,
+            non_inference_count=0,
+            required_inventory_sha256=None,
+            non_inference_inventory_sha256=None,
+            report=None,
+        ),
+        smoke=SmokeCheck(
+            status="not_run",
+            audio_sha256=None,
+            oracle_sha256=None,
+            prediction=None,
+        ),
+        errors=(
+            BackendError(
+                code=(
+                    "environment_unsupported"
+                    if status == "environment_unsupported"
+                    else "backend_process_died"
+                ),
+                message="Verification did not complete.",
+            ),
+        ),
+    )
+
+    class FakeBackend:
+        close_count = 0
+
+        def verify(self) -> BackendVerification:
+            return verification
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    backend = FakeBackend()
+    registry = BackendRegistry(
+        default_backend_id=OFFICIAL_BACKEND_ID,
+        factories={OFFICIAL_BACKEND_ID: lambda **_kwargs: backend},  # type: ignore[dict-item]
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "src.benchmark.backend_registry.default_backend_registry",
+        lambda: registry,
+    )
+
+    result = runner.invoke(
+        main,
+        ["benchmark", "verify-backend", "--allow-emulated-diagnostics"],
+    )
+
+    assert result.exit_code == exit_code
+    summary = json.loads(result.stdout)
+    report_path = Path(summary["report_path"])
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["schema"] == "crux.backend-verification-report/v1"
+    assert report["report_type"] == "verification"
+    assert report["status"] == status
+    assert report["exit_code"] == exit_code
+    assert report["errors"] == [
+        {
+            "code": verification.errors[0].code,
+            "message": "Verification did not complete.",
+        }
+    ]
+    assert backend.close_count == 1
+
+
+@pytest.mark.parametrize("backend_id", (OFFICIAL_BACKEND_ID, HEURISTIC_BACKEND_ID))
+def test_verify_backend_known_unavailable_factory_publishes_typed_failure_namespace(
+    backend_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        main,
+        ["benchmark", "verify-backend", "--backend", backend_id],
+    )
+
+    assert result.exit_code == 2
+    assert result.stderr == ""
+    summary = json.loads(result.stdout)
+    report_path = Path(summary["report_path"])
+    assert backend_id in report_path.parts
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert report["errors"] == [
+        {
+            "code": "backend_unavailable",
+            "message": "Backend is unavailable.",
+        }
+    ]
 
 
 def write_prediction(path: Path):

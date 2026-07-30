@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import subprocess
 import sys
@@ -12,6 +13,8 @@ from typing import Any
 
 import pytest
 
+from runtime.oaf_tf1.protocol import serve_requests
+from src.benchmark.backend_identity import canonical_json_bytes
 from src.benchmark.backend_lock import REQUIRED_ENVIRONMENT
 from src.benchmark.backend_process import (
     DiagnosticHostEvidence,
@@ -31,25 +34,28 @@ def _canonical_sha256(payload: dict[str, object]) -> str:
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
-def _write_mounts(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+def _write_mounts(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     backend = tmp_path / "backend.json"
     runtime = tmp_path / "runtime.json"
+    seal = tmp_path / "seal-evidence.json"
     model = tmp_path / "model"
     inputs = tmp_path / "inputs"
     backend.write_bytes(b"{}\n")
     runtime.write_bytes(b"{}\n")
+    seal.write_bytes(b"{}\n")
     model.mkdir()
     inputs.mkdir()
-    return backend, runtime, model, inputs
+    return backend, runtime, seal, model, inputs
 
 
 def profile(tmp_path: Path, **changes: object) -> RunnerLaunchProfile:
-    backend, runtime, model, inputs = _write_mounts(tmp_path)
+    backend, runtime, seal, model, inputs = _write_mounts(tmp_path)
     values: dict[str, object] = {
         "image_manifest_digest": f"sha256:{'4' * 64}",
         "backend_lock_path": backend,
         "runtime_lock_path": runtime,
+        "seal_evidence_path": seal,
         "model_cache_path": model,
         "input_root": inputs,
         "environment": dict(REQUIRED_ENVIRONMENT),
@@ -125,13 +131,15 @@ def test_docker_command_contains_exact_hardening_and_fresh_environment(tmp_path:
         f"--env={key}={REQUIRED_ENVIRONMENT[key]}" for key in sorted(REQUIRED_ENVIRONMENT)
     ]
     assert command[-1] == launch.image_manifest_digest
-    for mount in [
-        launch.backend_lock_path,
-        launch.runtime_lock_path,
-        launch.model_cache_path,
-        launch.input_root,
-    ]:
-        assert any(f"src={mount}," in item and item.endswith(",readonly") for item in command)
+    expected_mounts = {
+        launch.backend_lock_path: "/run/crux/backend-lock.json",
+        launch.runtime_lock_path: "/run/crux/runtime-lock.json",
+        launch.seal_evidence_path: "/run/crux/seal-evidence.json",
+        launch.model_cache_path: "/model",
+        launch.input_root: "/input",
+    }
+    for source, destination in expected_mounts.items():
+        assert f"--mount=type=bind,src={source},dst={destination},readonly" in command
 
 
 @pytest.mark.parametrize(
@@ -306,6 +314,125 @@ def test_runner_starts_and_serves_one_correlated_request(tmp_path: Path) -> None
     assert not runner.stderr_thread_alive
     with runner._protocol_lock:  # pylint: disable=protected-access
         assert runner._protocol_failure is None  # pylint: disable=protected-access
+
+
+def test_verify_backend_runtime_protocol_envelope_matches_runner_process(
+    tmp_path: Path,
+) -> None:
+    pcm = b"\x00\x00" * 4
+    audio_content = (
+        b"RIFF"
+        + (36 + len(pcm)).to_bytes(4, "little")
+        + b"WAVEfmt "
+        + (16).to_bytes(4, "little")
+        + (1).to_bytes(2, "little")
+        + (1).to_bytes(2, "little")
+        + (44100).to_bytes(4, "little")
+        + (88200).to_bytes(4, "little")
+        + (2).to_bytes(2, "little")
+        + (16).to_bytes(2, "little")
+        + b"data"
+        + len(pcm).to_bytes(4, "little")
+        + pcm
+    )
+    input_root = profile(tmp_path / "profile").input_root
+    (input_root / "audio.wav").write_bytes(audio_content)
+    audio_sha256 = hashlib.sha256(audio_content).hexdigest()
+    request_id = "task7-integration"
+    descriptor_sha256 = "b" * 64
+    runtime_stdin = io.BytesIO(
+        canonical_json_bytes(
+            {
+                "audio_path": "audio.wav",
+                "audio_sha256": audio_sha256,
+                "backend_descriptor_sha256": descriptor_sha256,
+                "request_id": request_id,
+                "type": "transcribe",
+            },
+            trailing_newline=True,
+        )
+    )
+    runtime_stdout = io.BytesIO()
+
+    class RuntimeBackend:
+        @staticmethod
+        def transcribe(_verified: object) -> list[dict[str, object]]:
+            return [{"frame_index": 0}]
+
+    serve_requests(
+        stdin=runtime_stdin,
+        stdout=runtime_stdout,
+        backend=RuntimeBackend(),
+        input_root=input_root,
+        descriptor_sha256=descriptor_sha256,
+        max_input_audio_frames=4,
+        stdout_max_line_bytes=2048,
+    )
+    response_line = runtime_stdout.getvalue()
+    ready_line = canonical_json_bytes(
+        {
+            "protocol_schema": "crux.transcription-runner/v1",
+            "type": "ready",
+        },
+        trailing_newline=True,
+    )
+
+    def runtime_output_popen(_command: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        script = (
+            "import sys;"
+            "sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]));"
+            "sys.stdout.buffer.flush();"
+            "sys.stdin.buffer.readline();"
+            "sys.stdout.buffer.write(bytes.fromhex(sys.argv[2]));"
+            "sys.stdout.buffer.flush();"
+            "sys.stdin.buffer.read()"
+        )
+        return subprocess.Popen(  # pylint: disable=consider-using-with
+            [
+                sys.executable,
+                "-c",
+                script,
+                ready_line.hex(),
+                response_line.hex(),
+            ],
+            stdin=kwargs["stdin"],
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+            env={},
+            shell=False,
+            start_new_session=True,
+        )
+
+    runner = RunnerProcess.start(
+        profile(tmp_path / "runner"),
+        popen_factory=runtime_output_popen,
+    )
+    try:
+        response = runner.request(
+            {
+                "audio_path": "audio.wav",
+                "audio_sha256": audio_sha256,
+                "backend_descriptor_sha256": descriptor_sha256,
+                "request_id": request_id,
+                "type": "transcribe",
+            }
+        )
+    finally:
+        runner.close()
+
+    assert response.request_id == request_id
+    assert set(response.payload) == {
+        "audio_sha256",
+        "backend_descriptor_sha256",
+        "native_events",
+        "type",
+    }
+    assert response.payload["audio_sha256"] == audio_sha256
+    assert response.payload["backend_descriptor_sha256"] == descriptor_sha256
+    assert response.payload["type"] == "transcription_result"
+    assert [dict(event) for event in response.payload["native_events"]] == [  # type: ignore[union-attr]
+        {"frame_index": 0}
+    ]
 
 
 @pytest.mark.parametrize(

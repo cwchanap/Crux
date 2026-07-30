@@ -724,11 +724,13 @@ velocity from the same postprocessing loop. The runner joins confidence from
 for time evaluation; it never reconstructs the frame from the rounded or binary64
 `note.start_time`.
 
-The instrumentation patch is enumerated in the vendored-source manifest and seal
-evidence. A parity test runs patched and unmodified upstream conversion on the same
-locked tensors and requires byte-identical serialized `NoteSequence` output. Any
-instrumentation change or parity failure requires design review and a new backend
-identity.
+The upstream source manifest continues to identify the unmodified upstream bytes.
+The instrumentation patch and the exact build-time patch applier are enumerated in
+the runner-source manifest and seal evidence; the image build applies them only after
+verifying the upstream preimage. A parity test runs patched and unmodified upstream
+conversion on the same locked tensors and requires byte-identical serialized
+`NoteSequence` output. Any instrumentation change or parity failure requires design
+review and a new backend identity.
 
 ### Native output space and upstream 8-hit data map
 
