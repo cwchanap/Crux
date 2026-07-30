@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from src.benchmark.backend_identity import require_sha256, sha256_hex, strict_json_loads
+from src.benchmark.backend_publication import DirectoryAnchor, read_regular_file_no_follow
 from src.benchmark.backends import CanonicalAudio
 
 _MANIFEST_SCHEMA = "crux.input-view-manifest/v1"
@@ -132,10 +133,28 @@ def load_direct_audio(
     source_audio_id: str,
     input_view_id: str,
     max_input_audio_frames: int | None,
+    anchor: DirectoryAnchor | None = None,
+) -> CanonicalAudio:
+    content = read_regular_file_no_follow(audio_path, anchor=anchor)
+    return load_direct_audio_bytes(
+        audio_path,
+        content,
+        source_audio_id=source_audio_id,
+        input_view_id=input_view_id,
+        max_input_audio_frames=max_input_audio_frames,
+    )
+
+
+def load_direct_audio_bytes(
+    audio_path: Path,
+    content: bytes,
+    *,
+    source_audio_id: str,
+    input_view_id: str,
+    max_input_audio_frames: int | None,
 ) -> CanonicalAudio:
     _require_nonempty_id(source_audio_id, "source_audio_id")
     _require_nonempty_id(input_view_id, "input_view_id")
-    content = audio_path.read_bytes()
     wav = parse_canonical_wav(content, max_input_audio_frames)
     audio_sha256 = sha256_hex(content)
     return CanonicalAudio(
@@ -157,8 +176,24 @@ def load_derived_audio(
     manifest_path: Path,
     *,
     max_input_audio_frames: int | None,
+    anchor: DirectoryAnchor | None = None,
 ) -> CanonicalAudio:
-    manifest = _load_manifest(manifest_path)
+    manifest = _load_manifest(manifest_path, anchor=anchor)
+    if anchor is not None:
+        source_path, input_path = input_view_artifact_paths(manifest_path, manifest)
+        candidate_audio_path = audio_path if audio_path.is_absolute() else anchor.path / audio_path
+        if candidate_audio_path != input_path:
+            raise ValueError("audio_path does not match manifest input_audio_path")
+        source_content = read_regular_file_no_follow(source_path, anchor=anchor)
+        input_content = read_regular_file_no_follow(input_path, anchor=anchor)
+        return load_derived_audio_bytes(
+            input_path,
+            manifest,
+            source_content=source_content,
+            input_content=input_content,
+            max_input_audio_frames=max_input_audio_frames,
+        )
+
     manifest_root = manifest_path.parent.resolve(strict=True)
     try:
         manifest_root_fd = os.open(manifest_root, _DIRECTORY_OPEN_FLAGS)
@@ -193,15 +228,39 @@ def load_derived_audio(
             input_path.relative_to(manifest_root),
             "input_audio_path",
         )
-        if sha256_hex(source_content) != manifest.source_audio_sha256:
-            raise ValueError("source_audio_sha256 does not match source_path bytes")
-        if sha256_hex(input_content) != manifest.input_audio_sha256:
-            raise ValueError("input_audio_sha256 does not match input_audio_path bytes")
-
-        wav = parse_canonical_wav(input_content, max_input_audio_frames)
     finally:
         _close_fd(manifest_root_fd)
 
+    return load_derived_audio_bytes(
+        input_path,
+        manifest,
+        source_content=source_content,
+        input_content=input_content,
+        max_input_audio_frames=max_input_audio_frames,
+    )
+
+
+def load_derived_audio_bytes(
+    audio_path: Path,
+    manifest: InputViewManifest,
+    *,
+    source_content: bytes,
+    input_content: bytes,
+    max_input_audio_frames: int | None,
+) -> CanonicalAudio:
+    if sha256_hex(source_content) != manifest.source_audio_sha256:
+        raise ValueError("source_audio_sha256 does not match source_path bytes")
+    if sha256_hex(input_content) != manifest.input_audio_sha256:
+        raise ValueError("input_audio_sha256 does not match input_audio_path bytes")
+    wav = parse_canonical_wav(input_content, max_input_audio_frames)
+    return _canonical_audio(manifest, audio_path, wav)
+
+
+def _canonical_audio(
+    manifest: InputViewManifest,
+    input_path: Path,
+    wav: _CanonicalWavInfo,
+) -> CanonicalAudio:
     return CanonicalAudio(
         path=input_path,
         source_audio_id=manifest.source_audio_id,
@@ -216,8 +275,16 @@ def load_derived_audio(
     )
 
 
-def _load_manifest(manifest_path: Path) -> InputViewManifest:
-    value = strict_json_loads(manifest_path.read_bytes())
+def _load_manifest(
+    manifest_path: Path,
+    *,
+    anchor: DirectoryAnchor | None = None,
+) -> InputViewManifest:
+    return parse_input_view_manifest(read_regular_file_no_follow(manifest_path, anchor=anchor))
+
+
+def parse_input_view_manifest(content: bytes) -> InputViewManifest:
+    value = strict_json_loads(content)
     if not isinstance(value, dict) or set(value) != _MANIFEST_KEYS:
         raise ValueError("input-view manifest must contain the exact seven-key set")
     if any(not isinstance(field_value, str) for field_value in value.values()):
@@ -244,6 +311,25 @@ def _load_manifest(manifest_path: Path) -> InputViewManifest:
     )
 
 
+def input_view_artifact_paths(
+    manifest_path: Path,
+    manifest: InputViewManifest,
+) -> tuple[Path, Path]:
+    manifest_root = manifest_path.parent
+    return (
+        _anchored_manifest_path(
+            manifest_root,
+            manifest.source_path,
+            "source_path",
+        ),
+        _anchored_manifest_path(
+            manifest_root,
+            manifest.input_audio_path,
+            "input_audio_path",
+        ),
+    )
+
+
 def _resolve_manifest_path(root: Path, raw_path: str, field: str) -> Path:
     path = PurePosixPath(raw_path)
     if not raw_path or path.is_absolute():
@@ -258,6 +344,15 @@ def _resolve_manifest_path(root: Path, raw_path: str, field: str) -> Path:
     if not resolved.is_relative_to(root):
         raise ValueError(f"{field} symlink escapes the manifest directory")
     return resolved
+
+
+def _anchored_manifest_path(root: Path, raw_path: str, field: str) -> Path:
+    path = PurePosixPath(raw_path)
+    if not raw_path or path.is_absolute():
+        raise ValueError(f"{field} must be a nonempty POSIX relative path")
+    if any(component in {"", ".", ".."} for component in path.parts):
+        raise ValueError(f"{field} contains an invalid path component")
+    return root.joinpath(*path.parts)
 
 
 def _read_manifest_artifact(root_fd: int, relative_path: Path, field: str) -> bytes:

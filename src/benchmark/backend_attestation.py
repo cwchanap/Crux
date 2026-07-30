@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
-from typing import Iterator, Literal
+from typing import Iterator, Literal, cast
 from uuid import UUID, uuid4
 
 from src.benchmark.backend_identity import (
@@ -30,7 +30,26 @@ from src.benchmark.backends import PublishedArtifact
 _ATTESTATION_SCHEMA = "crux.backend-execution-attestation/v1"
 _SOURCE_MANIFEST_KEYS = frozenset({"schema", "covered_roots", "files"})
 _SOURCE_FILE_KEYS = frozenset({"path", "sha256", "license"})
+_CHANGED_FILE_KEYS = frozenset({"path", "sha256", "status"})
 _HEURISTIC_BACKEND_ID = "heuristic-onset-v1"
+_ATTESTATION_KEYS = frozenset(
+    {
+        "backend_id",
+        "changed_files_manifest",
+        "checkout_dirty",
+        "cpu_limit",
+        "descriptor_sha256",
+        "git_commit",
+        "memory_bytes",
+        "pid_limit",
+        "request_deadline_seconds",
+        "schema",
+        "shm_bytes",
+        "startup_deadline_seconds",
+        "strict_mode",
+        "tmp_bytes",
+    }
+)
 
 
 class AttestationError(ValueError):
@@ -96,6 +115,131 @@ class ExecutionAttestation:
     strict_mode: bool
     changed_files_manifest: PublishedArtifact | None
     conditions: ExecutionConditions
+
+
+def validate_execution_attestation(
+    content: bytes,
+    *,
+    expected_backend_id: str,
+    expected_descriptor_sha256: str,
+) -> ExecutionAttestation:
+    try:
+        _require_nonempty_string(expected_backend_id, "expected backend_id")
+        _require_hash(expected_descriptor_sha256, "expected descriptor_sha256")
+        if not isinstance(content, bytes) or not content.endswith(b"\n"):
+            raise AttestationError("execution attestation must end with newline")
+        value = strict_json_loads(content[:-1], require_canonical=True)
+        if not isinstance(value, dict) or set(value) != _ATTESTATION_KEYS:
+            raise AttestationError("execution attestation must contain the exact key set")
+        if value["schema"] != _ATTESTATION_SCHEMA:
+            raise AttestationError(f"schema must be {_ATTESTATION_SCHEMA}")
+        if value["backend_id"] != expected_backend_id:
+            raise AttestationError("execution attestation backend_id mismatch")
+        if value["descriptor_sha256"] != expected_descriptor_sha256:
+            raise AttestationError("execution attestation descriptor_sha256 mismatch")
+        _require_hash(value["descriptor_sha256"], "descriptor_sha256")  # type: ignore[arg-type]
+        git_commit = value["git_commit"]
+        if (
+            not isinstance(git_commit, str)
+            or len(git_commit) != 40
+            or any(character not in "0123456789abcdef" for character in git_commit)
+        ):
+            raise AttestationError("git_commit must be lowercase Git identity")
+        checkout_dirty = value["checkout_dirty"]
+        strict_mode = value["strict_mode"]
+        if type(checkout_dirty) is not bool or type(strict_mode) is not bool:
+            raise AttestationError("attestation boolean fields must be boolean")
+        changed = value["changed_files_manifest"]
+        changed_artifact: PublishedArtifact | None = None
+        if changed is not None:
+            if not isinstance(changed, dict) or set(changed) != {"path", "sha256"}:
+                raise AttestationError("changed_files_manifest must be an artifact reference")
+            changed_path = changed["path"]
+            changed_sha256 = changed["sha256"]
+            if not isinstance(changed_path, str) or not isinstance(changed_sha256, str):
+                raise AttestationError("changed_files_manifest fields must be strings")
+            _validate_repository_path(changed_path)
+            _require_hash(
+                changed_sha256,
+                "changed_files_manifest sha256",
+            )
+            if not checkout_dirty or strict_mode:
+                raise AttestationError(
+                    "changed_files_manifest requires a dirty non-strict checkout"
+                )
+            changed_artifact = PublishedArtifact(
+                role="changed_files_manifest",
+                path=Path(changed_path),
+                sha256=changed_sha256,
+            )
+        conditions = ExecutionConditions(
+            cpu_limit=value["cpu_limit"],  # type: ignore[arg-type]
+            memory_bytes=value["memory_bytes"],  # type: ignore[arg-type]
+            pid_limit=value["pid_limit"],  # type: ignore[arg-type]
+            tmp_bytes=value["tmp_bytes"],  # type: ignore[arg-type]
+            shm_bytes=value["shm_bytes"],  # type: ignore[arg-type]
+            startup_deadline_seconds=value["startup_deadline_seconds"],  # type: ignore[arg-type]
+            request_deadline_seconds=value["request_deadline_seconds"],  # type: ignore[arg-type]
+        )
+        _validate_backend_conditions(expected_backend_id, conditions)
+        return ExecutionAttestation(
+            schema=_ATTESTATION_SCHEMA,
+            backend_id=expected_backend_id,
+            descriptor_sha256=expected_descriptor_sha256,
+            git_commit=git_commit,
+            checkout_dirty=checkout_dirty,
+            strict_mode=strict_mode,
+            changed_files_manifest=changed_artifact,
+            conditions=conditions,
+        )
+    except AttestationError:
+        raise
+    except (KeyError, TypeError, ValueError):
+        raise AttestationError("execution attestation is invalid") from None
+
+
+def validate_changed_file_manifest(content: bytes) -> tuple[ChangedFile, ...]:
+    try:
+        if not isinstance(content, bytes) or not content.endswith(b"\n"):
+            raise AttestationError("changed-file manifest must end with newline")
+        value = strict_json_loads(content[:-1], require_canonical=True)
+        if not isinstance(value, list) or not value:
+            raise AttestationError("changed-file manifest must be a nonempty array")
+
+        changed_files: list[ChangedFile] = []
+        for row in value:
+            if not isinstance(row, dict) or set(row) != _CHANGED_FILE_KEYS:
+                raise AttestationError("changed-file row must contain the exact key set")
+            path = row["path"]
+            status = row["status"]
+            digest = row["sha256"]
+            if (
+                not isinstance(path, str)
+                or not isinstance(status, str)
+                or (digest is not None and not isinstance(digest, str))
+            ):
+                raise AttestationError("changed-file row fields have invalid types")
+            changed_files.append(
+                ChangedFile(
+                    path=path,
+                    status=cast(
+                        Literal["modified", "deleted", "untracked"],
+                        status,
+                    ),
+                    sha256=digest,
+                )
+            )
+
+        paths = [changed.path for changed in changed_files]
+        if len(set(paths)) != len(paths):
+            raise AttestationError("changed-file manifest contains duplicate paths")
+        if paths != sorted(paths, key=lambda path: path.encode("utf-8")):
+            raise AttestationError("changed-file manifest paths must be bytewise sorted")
+        return tuple(changed_files)
+    except AttestationError:
+        raise
+    except (KeyError, TypeError, ValueError):
+        raise AttestationError("changed-file manifest is invalid") from None
 
 
 def build_changed_file_manifest(

@@ -16,6 +16,7 @@ import pytest
 from src.benchmark.backend_identity import (
     BackendDescriptor,
     canonical_json_bytes,
+    sha256_hex,
     strict_json_loads,
 )
 from src.benchmark.backends import CanonicalAudio, NativeEvent, NativePrediction
@@ -35,7 +36,7 @@ EXPECTED_OAF_GROUP_IDS = frozenset(
 )
 OAF_DESCRIPTOR_PAYLOAD = {
     "architecture_id": "magenta-oaf-model-tpu-drums-v1",
-    "backend_id": "magenta-egmd-tf1-94529798-8hit-v1",
+    "backend_id": "test-oaf-envelope-v1",
     "descriptor_schema": "crux.test-oaf-backend-descriptor/v1",
     "model_id": "magenta-egmd-ckpt-569400-v1",
     "native_metadata_schema_id": OAF_METADATA_SCHEMA,
@@ -44,7 +45,7 @@ OAF_DESCRIPTOR_PAYLOAD = {
 }
 OAF_DESCRIPTOR = BackendDescriptor(
     payload=OAF_DESCRIPTOR_PAYLOAD,
-    sha256="ef2a45270b3751c9648980ce284361d6437be5b5b2a6504e0a9848e5088b6f1c",
+    sha256="0874c2cd8ad07e976007b6647e0d29b681d7e7f05c83a434d66b4cedfdc7cbbb",
 )
 HEURISTIC_DESCRIPTOR_PAYLOAD = {
     "adapter_source_manifest_sha256": "f" * 64,
@@ -60,6 +61,33 @@ HEURISTIC_DESCRIPTOR_PAYLOAD = {
 HEURISTIC_DESCRIPTOR = BackendDescriptor(
     payload=HEURISTIC_DESCRIPTOR_PAYLOAD,
     sha256="dd737f02e57202bf5c5b7b08511e9657d315b9e8e245ce50a71de61a02ae9296",
+)
+FROZEN_OAF_DESCRIPTOR_PAYLOAD = {
+    "architecture_id": "magenta-oaf-model-tpu-drums-v1",
+    "backend_id": "magenta-egmd-tf1-94529798-8hit-v1",
+    "backend_lock_sha256": "c" * 64,
+    "descriptor_schema": "crux.transcription-backend-descriptor/v1",
+    "model_artifact_set_sha256": "e" * 64,
+    "model_id": "magenta-egmd-ckpt-569400-v1",
+    "native_metadata_schema_id": OAF_METADATA_SCHEMA,
+    "native_output_space_id": "magenta-oaf-midi88-a0-v1",
+    "prediction_schema": SCHEMA,
+    "protocol_schema": "crux.transcription-runner/v1",
+    "runtime_image_manifest_digest": f"sha256:{'f' * 64}",
+    "runtime_lock_sha256": "d" * 64,
+    "training_data_map_id": "magenta-egmd-data-8hit-94529798-v1",
+    "upstream_source_commit": "94529798dfbbb14c27ddfd76f23027dc8e2ce185",
+}
+FROZEN_OAF_DESCRIPTOR = BackendDescriptor(
+    payload=FROZEN_OAF_DESCRIPTOR_PAYLOAD,
+    sha256=hashlib.sha256(
+        json.dumps(
+            FROZEN_OAF_DESCRIPTOR_PAYLOAD,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest(),
 )
 HEADER_KEYS = {
     "architecture_id",
@@ -106,12 +134,12 @@ EXPECTED_HEADER_LINE = (
     b'{"architecture_id":"magenta-oaf-model-tpu-drums-v1","artifact_role":"native",'
     b'"audio_frame_count":44100,"backend_descriptor":{"architecture_id":'
     b'"magenta-oaf-model-tpu-drums-v1","backend_id":'
-    b'"magenta-egmd-tf1-94529798-8hit-v1","descriptor_schema":'
+    b'"test-oaf-envelope-v1","descriptor_schema":'
     b'"crux.test-oaf-backend-descriptor/v1","model_id":"magenta-egmd-ckpt-569400-v1",'
     b'"native_metadata_schema_id":"magenta-oaf-native-metadata-v1",'
     b'"native_output_space_id":"magenta-oaf-midi88-a0-v1","prediction_schema":'
     b'"crux.drum-prediction-events/v1"},"backend_descriptor_sha256":'
-    b'"ef2a45270b3751c9648980ce284361d6437be5b5b2a6504e0a9848e5088b6f1c",'
+    b'"0874c2cd8ad07e976007b6647e0d29b681d7e7f05c83a434d66b4cedfdc7cbbb",'
     b'"backend_lock_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
     b'"byte_length":88244,"channel_count":1,"input_audio_sha256":'
     b'"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
@@ -136,7 +164,7 @@ EXPECTED_EVENT_LINE = (
 )
 EXPECTED_TERMINAL_LINE = (
     b'{"event_count":1,"prefix_sha256":'
-    b'"d4034ead14f0d2035ef09addbedf4204e94bf72385b3a5577bb85211d7abde76",'
+    b'"96e224e6cd6b229a894ad6fdba4527329913b83d4ab8614d81b550a453cfc8de",'
     b'"record_type":"terminal"}\n'
 )
 EXPECTED_ARTIFACT = EXPECTED_HEADER_LINE + EXPECTED_EVENT_LINE + EXPECTED_TERMINAL_LINE
@@ -233,6 +261,14 @@ def canonical_records(records: list[dict[str, object]]) -> bytes:
     return b"".join(canonical_json_bytes(record, trailing_newline=True) for record in records)
 
 
+def canonical_records_with_prefix(records: list[dict[str, object]]) -> bytes:
+    prefix = b"".join(
+        canonical_json_bytes(record, trailing_newline=True) for record in records[:-1]
+    )
+    records[-1]["prefix_sha256"] = hashlib.sha256(prefix).hexdigest()
+    return prefix + canonical_json_bytes(records[-1], trailing_newline=True)
+
+
 def test_prediction_has_exact_canonical_records_and_hashes() -> None:
     content = render_prediction_artifact(make_oaf_prediction())
     artifact = read_prediction_artifact(content)
@@ -243,10 +279,10 @@ def test_prediction_has_exact_canonical_records_and_hashes() -> None:
     assert set(records[1]) == EVENT_KEYS
     assert set(records[2]) == TERMINAL_KEYS
     assert artifact.prefix_sha256 == (
-        "d4034ead14f0d2035ef09addbedf4204e94bf72385b3a5577bb85211d7abde76"
+        "96e224e6cd6b229a894ad6fdba4527329913b83d4ab8614d81b550a453cfc8de"
     )
     assert artifact.artifact_sha256 == (
-        "6e5f6bec7b40c338230a9fe417a5d7e96fda7fa4bb05e7c671ceea142d5f6536"
+        "1c99eb5a9fa729919aa620ef05ce0eebdac8974d536f446f70c5f3462c98ce96"
     )
     assert content.endswith(b"\n")
     assert content.count(b"\n") == 3
@@ -288,7 +324,7 @@ def test_prediction_quantizes_then_sorts_and_assigns_indexes() -> None:
     )
     expected_terminal = (
         b'{"event_count":2,"prefix_sha256":'
-        b'"5e83e2e09f3006d527529f3bc4996faec8ae595ebc5b7bbe4faf358f82188c93",'
+        b'"b7df20255e2711c8856a3c58a00801981f8ca482e597115eaa78b49469570a15",'
         b'"record_type":"terminal"}\n'
     )
     assert content == EXPECTED_HEADER_LINE + expected_event_lines + expected_terminal
@@ -297,7 +333,7 @@ def test_prediction_quantizes_then_sorts_and_assigns_indexes() -> None:
     assert records[1]["time_sec"] == Decimal("0.5")
     assert records[-1]["event_count"] == 2
     assert read_prediction_artifact(content).artifact_sha256 == (
-        "84a1e87729bce786c6bc1da56ae964678701f3df600cab8cf5d4ab848537a8dc"
+        "c16a4465e5e1580853cc578a24ed714ff5034064fad82746eeefe216f47e5438"
     )
 
 
@@ -581,7 +617,7 @@ def test_zero_event_prediction_contains_only_header_and_terminal() -> None:
     assert [record["record_type"] for record in records] == ["header", "terminal"]
     assert records[-1]["event_count"] == 0
     assert records[-1]["prefix_sha256"] == (
-        "bf85c6525ff9890e3c4991f735661c048ab8b33d09c0e2c0f8db37db92eefb99"
+        "e85c2281a2f0a544cd1aa2f6e3233458972b375c44b6f3f46fa41ecb9e62663e"
     )
 
 
@@ -730,6 +766,102 @@ def test_reader_round_trip_is_byte_identical() -> None:
         ),
     )
     assert render_prediction_artifact(artifact.prediction) == EXPECTED_ARTIFACT
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("sample_rate", 48000),
+        ("channel_count", 2),
+        ("sample_width_bytes", 3),
+        ("audio_frame_count", 0),
+        ("byte_length", 88243),
+    ],
+)
+def test_reader_rejects_noncanonical_audio_contract(field: str, value: object) -> None:
+    records = parsed_records(EXPECTED_ARTIFACT)
+    records[0][field] = value
+
+    with pytest.raises(PredictionArtifactError, match=field):
+        read_prediction_artifact(canonical_records_with_prefix(records))
+
+
+@pytest.mark.parametrize(
+    ("header_field", "descriptor_field", "replacement"),
+    [
+        ("backend_lock_sha256", "backend_lock_sha256", "1" * 64),
+        ("runtime_lock_sha256", "runtime_lock_sha256", "2" * 64),
+        ("model_artifact_set_sha256", "model_artifact_set_sha256", "3" * 64),
+        ("upstream_source_commit", "upstream_source_commit", "4" * 40),
+        ("training_data_map_id", "training_data_map_id", "different-map-v1"),
+    ],
+)
+def test_reader_binds_every_oaf_header_identity_to_frozen_descriptor(
+    header_field: str,
+    descriptor_field: str,
+    replacement: str,
+) -> None:
+    content = render_prediction_artifact(make_oaf_prediction(descriptor=FROZEN_OAF_DESCRIPTOR))
+    records = parsed_records(content)
+    records[0][header_field] = replacement
+
+    with pytest.raises(PredictionArtifactError, match=header_field):
+        read_prediction_artifact(canonical_records_with_prefix(records))
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("backend_lock_sha256", "1" * 64),
+        ("runtime_lock_sha256", "2" * 64),
+        ("model_artifact_set_sha256", "3" * 64),
+        ("upstream_source_commit", "4" * 40),
+        ("training_data_map_id", "different-map-v1"),
+    ],
+)
+def test_writer_binds_every_oaf_prediction_identity_to_frozen_descriptor(
+    field: str,
+    replacement: str,
+) -> None:
+    prediction = make_oaf_prediction(
+        descriptor=FROZEN_OAF_DESCRIPTOR,
+        **{field: replacement},
+    )
+
+    with pytest.raises(PredictionArtifactError, match=field):
+        render_prediction_artifact(prediction)
+
+
+def test_frozen_oaf_writer_output_is_accepted_by_the_strict_reader() -> None:
+    content = render_prediction_artifact(make_oaf_prediction(descriptor=FROZEN_OAF_DESCRIPTOR))
+
+    assert read_prediction_artifact(content).content == content
+
+
+def test_known_oaf_backend_cannot_bypass_frozen_descriptor_rules() -> None:
+    payload = {
+        **OAF_DESCRIPTOR_PAYLOAD,
+        "backend_id": "magenta-egmd-tf1-94529798-8hit-v1",
+    }
+    descriptor = BackendDescriptor(
+        payload=payload,
+        sha256=sha256_hex(canonical_json_bytes(payload)),
+    )
+
+    with pytest.raises(PredictionArtifactError, match="descriptor"):
+        render_prediction_artifact(make_oaf_prediction(descriptor=descriptor))
+
+
+def test_reader_returns_detached_immutable_nested_identity_mappings() -> None:
+    artifact = read_prediction_artifact(EXPECTED_ARTIFACT)
+    descriptor = artifact.prediction.descriptor.payload
+    metadata = artifact.prediction.events[0].native_metadata
+
+    with pytest.raises(TypeError):
+        descriptor["model_id"] = "tampered"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        metadata["upstream_8hit_group_id"] = "snare"  # type: ignore[index]
+    assert artifact.content == EXPECTED_ARTIFACT
 
 
 def test_generic_reader_does_not_import_oaf_or_mapping_modules(
