@@ -61,6 +61,8 @@ class MidiDerivative:
     sidecar: PublishedArtifact
 
 
+# Frozen public schema fields are deliberately explicit.
+# pylint: disable=too-many-instance-attributes
 @dataclass(frozen=True)
 class CanonicalAudio:
     path: Path
@@ -75,6 +77,9 @@ class CanonicalAudio:
     audio_frame_count: int
 
 
+# pylint: enable=too-many-instance-attributes
+
+
 @dataclass(frozen=True)
 class NativeEvent:
     time_sec: float
@@ -86,6 +91,8 @@ class NativeEvent:
     velocity_midi: int | None
 
 
+# Frozen public schema fields are deliberately explicit.
+# pylint: disable=too-many-instance-attributes
 @dataclass(frozen=True)
 class NativePrediction:
     audio: CanonicalAudio
@@ -97,6 +104,9 @@ class NativePrediction:
     model_artifact_set_sha256: str | None
     upstream_source_commit: str | None
     training_data_map_id: str | None
+
+
+# pylint: enable=too-many-instance-attributes
 
 
 @dataclass(frozen=True)
@@ -118,6 +128,8 @@ class SmokeCheck:
     prediction: PublishedArtifact | None
 
 
+# Frozen public schema fields are deliberately explicit.
+# pylint: disable=too-many-instance-attributes
 @dataclass(frozen=True)
 class BackendVerification:
     status: Literal["verified", "failed", "environment_unsupported"]
@@ -131,6 +143,9 @@ class BackendVerification:
     tensor_coverage: TensorCoverageCheck
     smoke: SmokeCheck
     errors: tuple[BackendError, ...]
+
+
+# pylint: enable=too-many-instance-attributes
 
 
 class TranscriptionBackend(Protocol):

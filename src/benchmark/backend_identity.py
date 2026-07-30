@@ -62,8 +62,6 @@ def strict_json_loads(content: bytes, *, require_canonical: bool = False) -> Jso
             parse_float=Decimal,
             parse_constant=_reject_constant,
         )
-    except StrictJsonError:
-        raise
     except json.JSONDecodeError as error:
         raise StrictJsonError(f"invalid JSON: {error.msg}") from None
 
@@ -93,6 +91,8 @@ def build_descriptor(
     )
 
 
+# The closed JSON union is clearest as one return per supported value kind.
+# pylint: disable-next=too-many-return-statements
 def _render_json(value: object) -> str:
     if value is None:
         return "null"

@@ -4,6 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import click
 import numpy as np
 import pretty_midi
 import pytest
@@ -11,6 +12,9 @@ import soundfile as sf
 from click.testing import CliRunner
 
 import src.benchmark.r2_corpus_sync as r2_corpus_sync
+from src.benchmark.backend_registry import HEURISTIC_BACKEND_ID, OFFICIAL_BACKEND_ID
+from src.benchmark.backend_reports import OperationalReportPublicationError
+from src.benchmark.backends import PublishedArtifact
 from src.benchmark.r2_corpus_models import (
     MAX_SIMFILE_ID,
     OverallStatus,
@@ -21,6 +25,7 @@ from src.benchmark.r2_corpus_models import (
     SyncRequest,
 )
 from src.benchmark.r2_corpus_sync import ProgressEvent
+from src.benchmark.transcription import TranscribeOneOutcome, TranscribeOneRequest
 from src.cli import benchmark as benchmark_cli
 from src.cli.main import main
 
@@ -357,6 +362,387 @@ def test_transcribe_and_score_help_has_no_backend_option() -> None:
 
     assert result.exit_code == 0
     assert "--backend" not in result.output
+
+
+def make_transcribe_one_outcome(
+    tmp_path: Path,
+    status: str = "complete",
+    exit_code: int = 0,
+    *,
+    report_name: str = "report.json",
+) -> TranscribeOneOutcome:
+    return TranscribeOneOutcome(
+        status=status,  # type: ignore[arg-type]
+        exit_code=exit_code,  # type: ignore[arg-type]
+        report_artifact=PublishedArtifact(
+            role="execution_report",
+            path=tmp_path / report_name,
+            sha256="a" * 64,
+        ),
+    )
+
+
+def direct_transcribe_one_args(tmp_path: Path) -> list[str]:
+    return [
+        "benchmark",
+        "transcribe-one",
+        "--audio",
+        str(tmp_path / "audio.wav"),
+        "--source-audio-id",
+        "source-v1",
+        "--input-view-id",
+        "view-v1",
+        "--output",
+        str(tmp_path / "prediction.jsonl"),
+    ]
+
+
+def test_transcribe_one_help_lists_exact_options_and_reports_default() -> None:
+    result = runner.invoke(main, ["benchmark", "transcribe-one", "--help"])
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert [line.strip() for line in result.stdout.splitlines() if line.startswith("  --")] == [
+        "--backend TEXT",
+        "--audio FILE                [required]",
+        "--source-audio-id TEXT",
+        "--input-view-id TEXT",
+        "--input-view-manifest FILE",
+        "--output FILE               [required]",
+        "--midi-output FILE",
+        "--reports-root DIRECTORY    [default: artifacts/benchmark/backends]",
+    ]
+    assert "--charts-dir" not in result.stdout
+    assert "--predictions-dir" not in result.stdout
+    assert "--tolerance-ms" not in result.stdout
+
+
+def test_transcribe_one_direct_mode_builds_complete_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[TranscribeOneRequest, object]] = []
+
+    def fake_run(request: TranscribeOneRequest, *, registry: object) -> TranscribeOneOutcome:
+        captured.append((request, registry))
+        return make_transcribe_one_outcome(tmp_path)
+
+    monkeypatch.setattr("src.benchmark.transcription.run_transcribe_one", fake_run)
+    args = direct_transcribe_one_args(tmp_path)
+    args.extend(
+        [
+            "--backend",
+            HEURISTIC_BACKEND_ID,
+            "--midi-output",
+            str(tmp_path / "prediction.mid"),
+            "--reports-root",
+            str(tmp_path / "reports"),
+        ]
+    )
+
+    result = runner.invoke(main, args)
+
+    assert result.exit_code == 0
+    assert len(captured) == 1
+    request, registry = captured[0]
+    assert request == TranscribeOneRequest(
+        backend_id=HEURISTIC_BACKEND_ID,
+        audio_path=tmp_path / "audio.wav",
+        output_path=tmp_path / "prediction.jsonl",
+        source_audio_id="source-v1",
+        input_view_id="view-v1",
+        input_view_manifest=None,
+        midi_output_path=tmp_path / "prediction.mid",
+        reports_root=tmp_path / "reports",
+    )
+    assert registry.default_backend_id == OFFICIAL_BACKEND_ID
+
+
+def test_transcribe_one_derived_mode_uses_manifest_and_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[TranscribeOneRequest] = []
+
+    def fake_run(request: TranscribeOneRequest, *, registry: object) -> TranscribeOneOutcome:
+        del registry
+        captured.append(request)
+        return make_transcribe_one_outcome(tmp_path)
+
+    monkeypatch.setattr("src.benchmark.transcription.run_transcribe_one", fake_run)
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "transcribe-one",
+            "--audio",
+            str(tmp_path / "derived.wav"),
+            "--input-view-manifest",
+            str(tmp_path / "input-view.json"),
+            "--output",
+            str(tmp_path / "derived.jsonl"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured == [
+        TranscribeOneRequest(
+            backend_id=None,
+            audio_path=tmp_path / "derived.wav",
+            output_path=tmp_path / "derived.jsonl",
+            source_audio_id=None,
+            input_view_id=None,
+            input_view_manifest=tmp_path / "input-view.json",
+            midi_output_path=None,
+            reports_root=Path("artifacts/benchmark/backends"),
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "provenance_args",
+    [
+        [],
+        ["--source-audio-id", "source-v1"],
+        ["--input-view-id", "view-v1"],
+        [
+            "--source-audio-id",
+            "source-v1",
+            "--input-view-id",
+            "view-v1",
+            "--input-view-manifest",
+            "input-view.json",
+        ],
+        [
+            "--source-audio-id",
+            "source-v1",
+            "--input-view-manifest",
+            "input-view.json",
+        ],
+        [
+            "--input-view-id",
+            "view-v1",
+            "--input-view-manifest",
+            "input-view.json",
+        ],
+    ],
+)
+def test_transcribe_one_rejects_missing_or_mixed_provenance_before_orchestration(
+    provenance_args: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_run(*args: object, **kwargs: object) -> TranscribeOneOutcome:
+        raise AssertionError("usage validation must happen before orchestration")
+
+    monkeypatch.setattr("src.benchmark.transcription.run_transcribe_one", unexpected_run)
+    reports_root = tmp_path / "reports"
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "transcribe-one",
+            "--audio",
+            str(tmp_path / "audio.wav"),
+            "--output",
+            str(tmp_path / "prediction.jsonl"),
+            "--reports-root",
+            str(reports_root),
+            *provenance_args,
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert "Usage:" in result.stderr
+    assert "exactly one provenance mode" in result.stderr
+    assert not reports_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("status", "exit_code"),
+    [("complete", 0), ("partial", 1), ("failed", 2)],
+)
+def test_transcribe_one_emits_canonical_four_key_summary_for_each_outcome(
+    status: str,
+    exit_code: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_name = "報告.json"
+    outcome = make_transcribe_one_outcome(
+        tmp_path,
+        status,
+        exit_code,
+        report_name=report_name,
+    )
+    monkeypatch.setattr(
+        "src.benchmark.transcription.run_transcribe_one",
+        lambda request, *, registry: outcome,
+    )
+
+    result = runner.invoke(main, direct_transcribe_one_args(tmp_path))
+
+    report_path = tmp_path / report_name
+    expected = (
+        '{"exit_code":'
+        f'{exit_code},"report_path":"{report_path}",'
+        f'"report_sha256":"{"a" * 64}","status":"{status}"'
+        "}\n"
+    ).encode("utf-8")
+    assert result.exit_code == exit_code
+    assert result.stdout_bytes == expected
+    assert result.stderr_bytes == b""
+    assert set(json.loads(result.stdout)) == {
+        "exit_code",
+        "report_path",
+        "report_sha256",
+        "status",
+    }
+    assert result.stdout_bytes.count(b"\n") == 1
+    assert b"Traceback" not in result.stdout_bytes
+    assert b"Traceback" not in result.stderr_bytes
+
+
+def test_transcribe_one_keeps_diagnostics_on_stderr_and_summary_on_stdout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome = make_transcribe_one_outcome(tmp_path)
+
+    def fake_run(
+        request: TranscribeOneRequest,
+        *,
+        registry: object,
+    ) -> TranscribeOneOutcome:
+        del request, registry
+        click.echo("backend diagnostic", err=True)
+        return outcome
+
+    monkeypatch.setattr("src.benchmark.transcription.run_transcribe_one", fake_run)
+
+    result = runner.invoke(main, direct_transcribe_one_args(tmp_path))
+
+    assert result.exit_code == 0
+    assert result.stderr == "backend diagnostic\n"
+    assert "backend diagnostic" not in result.stdout
+    assert len(result.stdout.splitlines()) == 1
+    assert set(json.loads(result.stdout)) == {
+        "exit_code",
+        "report_path",
+        "report_sha256",
+        "status",
+    }
+
+
+def test_transcribe_one_report_publication_failure_has_only_stable_sanitized_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unsafe = "signed URL https://example.invalid/?token=secret"
+
+    def fail_run(*args: object, **kwargs: object) -> TranscribeOneOutcome:
+        raise OperationalReportPublicationError(unsafe)
+
+    monkeypatch.setattr("src.benchmark.transcription.run_transcribe_one", fail_run)
+
+    result = runner.invoke(main, direct_transcribe_one_args(tmp_path))
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert (
+        result.stderr == "report_publication_failed: Operational report could not be published.\n"
+    )
+    assert unsafe not in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_transcribe_one_unknown_backend_publishes_typed_failure_after_click_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        main,
+        [
+            *direct_transcribe_one_args(Path(".")),
+            "--backend",
+            "../../unknown",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert result.stderr == ""
+    summary = json.loads(result.stdout)
+    assert summary["status"] == "failed"
+    assert summary["exit_code"] == 2
+    assert "backend-unavailable" in Path(summary["report_path"]).parts
+    report = json.loads(Path(summary["report_path"]).read_text(encoding="utf-8"))
+    assert report["errors"] == [
+        {
+            "code": "backend_unavailable",
+            "message": "Backend is unavailable.",
+        }
+    ]
+
+
+@pytest.mark.parametrize("backend_args", [[], ["--backend", HEURISTIC_BACKEND_ID]])
+def test_transcribe_one_known_unavailable_backend_publishes_typed_failure(
+    backend_args: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        main,
+        [
+            *direct_transcribe_one_args(Path(".")),
+            *backend_args,
+        ],
+    )
+
+    expected_backend = OFFICIAL_BACKEND_ID if not backend_args else HEURISTIC_BACKEND_ID
+    assert result.exit_code == 2
+    assert result.stderr == ""
+    summary = json.loads(result.stdout)
+    assert summary["status"] == "failed"
+    assert expected_backend in Path(summary["report_path"]).parts
+    report = json.loads(Path(summary["report_path"]).read_text(encoding="utf-8"))
+    assert report["errors"][0]["code"] == "backend_unavailable"
+
+
+def test_installed_transcribe_one_help_is_silent_and_avoids_backend_runtime_imports(
+    tmp_path: Path,
+) -> None:
+    import_spies = tmp_path / "import_spies"
+    import_spies.mkdir()
+    for module_name in ("tensorflow", "librosa"):
+        (import_spies / f"{module_name}.py").write_text(
+            f'raise RuntimeError("{module_name} must not be imported for benchmark help")\n',
+            encoding="utf-8",
+        )
+
+    command = Path(sys.executable).with_name("crux")
+    for args in (
+        ["benchmark", "--help"],
+        ["benchmark", "transcribe-one", "--help"],
+    ):
+        result = subprocess.run(
+            [str(command), *args],
+            capture_output=True,
+            check=False,
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONPATH": str(import_spies)},
+            text=True,
+        )
+
+        assert result.returncode == 0
+        assert result.stderr == ""
+        assert "transcribe-one" in result.stdout
 
 
 def make_sync_outcome(

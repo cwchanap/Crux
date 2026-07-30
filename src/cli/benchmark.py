@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Commands keep optional and heavy implementation modules behind their Click boundary.
+# pylint: disable=import-outside-toplevel
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -24,6 +26,116 @@ from src.cli.options import (
 @click.group()
 def benchmark() -> None:
     """Benchmark drum transcription against DTX ground truth."""
+
+
+def _validate_transcribe_one_provenance(
+    source_audio_id: str | None,
+    input_view_id: str | None,
+    input_view_manifest: Path | None,
+) -> None:
+    direct_mode = (
+        source_audio_id is not None and input_view_id is not None and input_view_manifest is None
+    )
+    derived_mode = (
+        source_audio_id is None and input_view_id is None and input_view_manifest is not None
+    )
+    if not (direct_mode or derived_mode):
+        raise click.UsageError(
+            "Provide exactly one provenance mode: direct IDs or an input-view manifest."
+        )
+
+
+# Click owns this fixed external signature, and backend imports must remain lazy.
+# pylint: disable=too-many-arguments,too-many-positional-arguments
+# pylint: disable=too-many-locals
+@benchmark.command("transcribe-one")
+@click.option("--backend", type=str, default=None)
+@click.option(
+    "--audio",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+)
+@click.option("--source-audio-id", type=str, default=None)
+@click.option("--input-view-id", type=str, default=None)
+@click.option(
+    "--input-view-manifest",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+)
+@click.option(
+    "--output",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+)
+@click.option(
+    "--midi-output",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+)
+@click.option(
+    "--reports-root",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=Path("artifacts/benchmark/backends"),
+    show_default=True,
+)
+@click.pass_context
+def transcribe_one(
+    ctx: click.Context,
+    backend: str | None,
+    audio: Path,
+    source_audio_id: str | None,
+    input_view_id: str | None,
+    input_view_manifest: Path | None,
+    output: Path,
+    midi_output: Path | None,
+    reports_root: Path,
+) -> None:
+    """Transcribe one canonical audio input to authoritative native JSONL."""
+    _validate_transcribe_one_provenance(
+        source_audio_id,
+        input_view_id,
+        input_view_manifest,
+    )
+
+    from src.benchmark.backend_identity import canonical_json_bytes
+    from src.benchmark.backend_registry import default_backend_registry
+    from src.benchmark.backend_reports import OperationalReportPublicationError
+    from src.benchmark.transcription import TranscribeOneRequest, run_transcribe_one
+
+    request = TranscribeOneRequest(
+        backend_id=backend,
+        audio_path=audio,
+        output_path=output,
+        source_audio_id=source_audio_id,
+        input_view_id=input_view_id,
+        input_view_manifest=input_view_manifest,
+        midi_output_path=midi_output,
+        reports_root=reports_root,
+    )
+    try:
+        outcome = run_transcribe_one(request, registry=default_backend_registry())
+    except OperationalReportPublicationError:
+        click.echo(
+            "report_publication_failed: Operational report could not be published.",
+            err=True,
+        )
+        ctx.exit(2)
+
+    summary = {
+        "status": outcome.status,
+        "exit_code": outcome.exit_code,
+        "report_path": str(outcome.report_artifact.path),
+        "report_sha256": outcome.report_artifact.sha256,
+    }
+    standard_output = click.get_binary_stream("stdout")
+    standard_output.write(canonical_json_bytes(summary, trailing_newline=True))
+    standard_output.flush()
+    if outcome.exit_code:
+        ctx.exit(outcome.exit_code)
+
+
+# pylint: enable=too-many-arguments,too-many-positional-arguments
+# pylint: enable=too-many-locals
 
 
 def _emit_progress(event: ProgressEvent) -> None:

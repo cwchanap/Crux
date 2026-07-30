@@ -46,10 +46,14 @@ class _CanonicalWavInfo:
     audio_frame_count: int
 
 
+# Keep every physical WAV invariant adjacent in this audited linear parser.
+# pylint: disable-next=too-many-branches,too-many-locals,too-many-statements
 def parse_canonical_wav(
     content: bytes,
     max_input_audio_frames: int | None,
 ) -> _CanonicalWavInfo:
+    # Exact type comparison rejects bool, which isinstance(..., int) would accept.
+    # pylint: disable-next=unidiomatic-typecheck
     if max_input_audio_frames is not None and type(max_input_audio_frames) is not int:
         raise ValueError("max_input_audio_frames must be an integer or null")
     if len(content) < 12:
