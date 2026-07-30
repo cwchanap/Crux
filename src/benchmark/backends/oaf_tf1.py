@@ -140,6 +140,37 @@ _EVENT_KEYS = frozenset(
 )
 
 
+def validate_schema_golden(schema: str, content: bytes) -> None:
+    """Validate host-side emission of the isolated runner request schema fixture."""
+    if schema != _PROTOCOL_SCHEMA:
+        raise ValueError("host runner schema golden is unsupported")
+    try:
+        if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+            raise ValueError("host runner schema golden newline is invalid")
+        payload = strict_json_loads(content[:-1], require_canonical=True)
+        if not isinstance(payload, dict) or set(payload) != {
+            "audio_path",
+            "audio_sha256",
+            "backend_descriptor_sha256",
+            "request_id",
+            "type",
+        }:
+            raise ValueError("host runner schema golden keys are invalid")
+        if payload["type"] != "transcribe":
+            raise ValueError("host runner schema golden type is invalid")
+        if not isinstance(payload["audio_path"], str) or not payload["audio_path"]:
+            raise ValueError("host runner schema golden audio path is invalid")
+        if not isinstance(payload["request_id"], str) or not payload["request_id"]:
+            raise ValueError("host runner schema golden request ID is invalid")
+        require_sha256(payload["audio_sha256"], "host runner schema golden audio hash")
+        require_sha256(
+            payload["backend_descriptor_sha256"],
+            "host runner schema golden descriptor hash",
+        )
+    except (StrictJsonError, TypeError, ValueError):
+        raise ValueError("host runner schema golden is invalid") from None
+
+
 @dataclass(frozen=True)
 class OafBackendConfig:
     backend_lock_path: Path

@@ -12,10 +12,11 @@ import platform
 import stat
 import subprocess
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, cast
+from typing import Any, Callable, Literal, cast
 
 from src.benchmark.backend_identity import (
     JsonValue,
@@ -43,6 +44,11 @@ from src.benchmark.backend_publication import (
     read_regular_file_no_follow,
 )
 from src.benchmark.backends import PublishedArtifact
+from src.benchmark.checkpoint_acquisition import (
+    CheckpointAcquisitionError,
+    load_checkpoint_acquisition_evidence,
+    load_checkpoint_acquisition_request,
+)
 from tools.hpa320.audit_legacy_tf2_conversion import (
     CANDIDATE_MANIFEST_NAME,
     CANDIDATE_MANIFEST_SCHEMA,
@@ -50,6 +56,7 @@ from tools.hpa320.audit_legacy_tf2_conversion import (
 from tools.hpa320.oaf_system_packages import (
     ProbeResult,
     SystemPackage,
+    SystemPackageError,
     inventory_sha256,
     load_base_system_package_evidence,
     load_base_system_package_request,
@@ -66,6 +73,8 @@ OCI_LAYOUT_MANIFEST_NAME = "oci-layout-manifest.json"
 SMOKE_ORACLE_NAME = "smoke-oracle.json"
 SMOKE_AUDIO_NAME = "canonical.wav"
 SMOKE_PREDICTION_NAME = "smoke-prediction.jsonl"
+CALIBRATION_CANDIDATE_AUTHORITY_NAME = "calibration-candidate-authority.json"
+CONVERSION_AUDIT_NAME = "conversion-audit.json"
 
 HOST_ADAPTER_SCHEMA = "crux.oaf-host-adapter-source-manifest/v1"
 SMOKE_ORACLE_SCHEMA = "crux.oaf-smoke-oracle/v1"
@@ -114,6 +123,82 @@ _OCI_LAYOUT_KEYS = frozenset(
 )
 _ARCHIVE_KEYS = frozenset({"name", "sha256", "size"})
 _FINAL_LOCK_HASH_KEYS = frozenset({"backend_lock_sha256", "runtime_lock_sha256"})
+CALIBRATION_MEASUREMENT_REQUEST_SCHEMA = "crux.oaf-calibration-measurement-request/v1"
+CALIBRATION_MEASUREMENT_EVIDENCE_SCHEMA = "crux.oaf-calibration-measurement-evidence/v1"
+SEAL_PROFILE_REQUEST_SCHEMA = "crux.oaf-seal-profile-request/v1"
+SEAL_CANDIDATE_SCHEMA = "crux.oaf-seal-candidate/v1"
+_MEASUREMENT_REQUEST_KEYS = frozenset(
+    {
+        "backend_id",
+        "container_restrictions",
+        "fixtures",
+        "frame_counts",
+        "output_schemas",
+        "repetition_count",
+        "required_metrics",
+        "schema",
+    }
+)
+_MEASUREMENT_EVIDENCE_KEYS = frozenset(
+    {
+        "base_system_package_evidence_sha256",
+        "checkpoint_acquisition_evidence_sha256",
+        "image_manifest_digest",
+        "measurement_rows",
+        "native_host_evidence",
+        "request_sha256",
+        "schema",
+    }
+)
+_PROFILE_KEYS = frozenset(
+    {
+        "base_system_package_evidence_sha256",
+        "base_system_package_request_sha256",
+        "calibration_measurement_evidence_sha256",
+        "calibration_measurement_request_sha256",
+        "checkpoint_acquisition_evidence_sha256",
+        "checkpoint_acquisition_request_sha256",
+        "cpu_limit_millis",
+        "max_input_audio_frames",
+        "memory_limit_bytes",
+        "pid_limit",
+        "request_deadline_seconds",
+        "runtime_gid",
+        "runtime_uid",
+        "schema",
+        "shm_bytes",
+        "startup_deadline_seconds",
+        "stderr_max_line_bytes",
+        "stderr_read_chunk_bytes",
+        "stderr_ring_buffer_bytes",
+        "stdout_max_line_bytes",
+        "tmp_bytes",
+    }
+)
+_MEASUREMENT_ROW_KEYS = frozenset(
+    {
+        "exit_code",
+        "input_frame_count",
+        "oom_killed",
+        "peak_cpu_millis",
+        "peak_pid_count",
+        "peak_rss_bytes",
+        "peak_shm_bytes",
+        "peak_tmp_bytes",
+        "prediction_sha256",
+        "process_instance_id",
+        "repetition",
+        "request_millis",
+        "signal",
+        "startup_millis",
+        "stderr_max_line_bytes",
+        "stdout_max_line_bytes",
+    }
+)
+_CHECKPOINT_REQUEST_PATH = Path(
+    "config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.checkpoint-acquisition-request.json"
+)
+_BASE_SYSTEM_REQUEST_PATH = Path("runtime/oaf_tf1/base-system-package-request.json")
 _HASH_FIELDS = (
     (
         "runtime/oaf_tf1/source-manifest.json",
@@ -138,12 +223,72 @@ class SealError(ValueError):
     """The candidate cannot be accepted or atomically published."""
 
 
+class SealIntegrityError(SealError):
+    """Authenticated inputs or immutable publication contradict the requested contract."""
+
+
 @dataclass(frozen=True)
 class PublishedSeal:
     """The immutable artifacts published by one successful seal operation."""
 
     artifacts: tuple[PublishedArtifact, ...]
     publication_order: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MeasurementRow:
+    input_frame_count: int
+    repetition: int
+    process_instance_id: str
+    peak_cpu_millis: int
+    peak_rss_bytes: int
+    peak_tmp_bytes: int
+    peak_shm_bytes: int
+    peak_pid_count: int
+    startup_millis: int
+    request_millis: int
+    stdout_max_line_bytes: int
+    stderr_max_line_bytes: int
+    exit_code: int
+    signal: int | None
+    oom_killed: bool
+    prediction_sha256: str | None
+
+
+@dataclass(frozen=True)
+class CalibrationMeasurementRequest:
+    frame_counts: tuple[int, ...]
+    repetition_count: int
+    sha256: str
+    payload: Mapping[str, JsonValue]
+
+
+@dataclass(frozen=True)
+class SealProfileRequest:
+    max_input_audio_frames: int
+    sha256: str
+    payload: Mapping[str, JsonValue]
+
+
+@dataclass(frozen=True)
+class PublishedSealCandidate:
+    artifact: PublishedArtifact
+
+
+@dataclass(frozen=True)
+class ProducerOutcome:
+    status: str
+    exit_code: Literal[0, 1, 2]
+    report_path: Path | None
+    report_sha256: str | None
+
+
+@dataclass(frozen=True)
+class CalibrationProbeResult:
+    """One runner result with explicit pre-inference rejection evidence."""
+
+    row: MeasurementRow
+    rejected_before_inference: bool
 
 
 @dataclass(frozen=True)
@@ -403,25 +548,669 @@ def _run_base_system_probe(name: str, base_image: str, runtime_image: str) -> st
     return value
 
 
-def calibrate(
-    *,
-    image: str,
-    host_evidence: Path,
-    model_cache: Path,
-    output: Path,
-) -> None:
-    """Enforce calibration prerequisites without accepting an invented native report."""
+def load_calibration_measurement_request(path: Path) -> CalibrationMeasurementRequest:
+    """Strict-load the reviewed diagnostic measurement authority."""
 
-    load_native_host_evidence(host_evidence)
+    payload, content = _read_canonical_object(path, "calibration measurement request")
+    if (
+        set(payload) != _MEASUREMENT_REQUEST_KEYS
+        or payload["schema"] != CALIBRATION_MEASUREMENT_REQUEST_SCHEMA
+    ):
+        raise SealError("calibration measurement request fields are invalid")
+    if not isinstance(payload["backend_id"], str) or not payload["backend_id"]:
+        raise SealError("calibration measurement request backend is invalid")
+    counts = payload["frame_counts"]
+    repetitions = payload["repetition_count"]
+    if (
+        not isinstance(counts, list)
+        or not counts
+        or not all(
+            isinstance(item, int) and not isinstance(item, bool) and item > 0 for item in counts
+        )
+        or counts != sorted(counts)
+        or len(set(counts)) != len(counts)
+        or not isinstance(repetitions, int)
+        or isinstance(repetitions, bool)
+        or repetitions <= 0
+    ):
+        raise SealError("calibration measurement request bounds are invalid")
+    restrictions = payload["container_restrictions"]
+    if (
+        not isinstance(restrictions, dict)
+        or set(restrictions)
+        != {"drop_capabilities", "network", "no_new_privileges", "platform", "read_only_root"}
+        or restrictions
+        != {
+            "drop_capabilities": ["ALL"],
+            "network": "none",
+            "no_new_privileges": True,
+            "platform": "linux/amd64",
+            "read_only_root": True,
+        }
+    ):
+        raise SealError("calibration measurement restrictions are invalid")
+    fixtures = payload["fixtures"]
+    if not isinstance(fixtures, list) or not fixtures:
+        raise SealError("calibration measurement fixtures are invalid")
+    for fixture in fixtures:
+        if not isinstance(fixture, dict) or set(fixture) != {
+            "input_audio_sha256",
+            "input_view_id",
+            "source_audio_id",
+            "source_audio_sha256",
+        }:
+            raise SealError("calibration measurement fixture fields are invalid")
+        for field in ("input_audio_sha256", "source_audio_sha256"):
+            _require_sha256_value(fixture[field], "calibration measurement fixture hash")
+        if not all(
+            isinstance(fixture[field], str) and fixture[field]
+            for field in ("input_view_id", "source_audio_id")
+        ):
+            raise SealError("calibration measurement fixture identities are invalid")
+    if not _string_list(payload["required_metrics"]) or not _string_list(payload["output_schemas"]):
+        raise SealError("calibration measurement output contract is invalid")
+    return CalibrationMeasurementRequest(tuple(counts), repetitions, sha256_hex(content), payload)
+
+
+def load_seal_profile_request(path: Path) -> SealProfileRequest:
+    """Strict-load only a fully reviewed, non-sentinel profile authority."""
+
+    payload, content = _read_canonical_object(path, "seal profile request")
+    if set(payload) != _PROFILE_KEYS or payload["schema"] != SEAL_PROFILE_REQUEST_SCHEMA:
+        raise SealError("seal profile request fields are invalid")
+    for field in (
+        "base_system_package_evidence_sha256",
+        "base_system_package_request_sha256",
+        "calibration_measurement_evidence_sha256",
+        "calibration_measurement_request_sha256",
+        "checkpoint_acquisition_evidence_sha256",
+        "checkpoint_acquisition_request_sha256",
+    ):
+        _require_sha256_value(payload[field], f"seal profile request {field}")
+    for field in (
+        "cpu_limit_millis",
+        "max_input_audio_frames",
+        "memory_limit_bytes",
+        "pid_limit",
+        "request_deadline_seconds",
+        "runtime_gid",
+        "runtime_uid",
+        "shm_bytes",
+        "startup_deadline_seconds",
+        "stderr_max_line_bytes",
+        "stderr_read_chunk_bytes",
+        "stderr_ring_buffer_bytes",
+        "stdout_max_line_bytes",
+        "tmp_bytes",
+    ):
+        value = payload[field]
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise SealError(f"seal profile request {field} must be an explicit positive integer")
+    return SealProfileRequest(
+        max_input_audio_frames=cast(int, payload["max_input_audio_frames"]),
+        sha256=sha256_hex(content),
+        payload=payload,
+    )
+
+
+def validate_schema_golden(schema: str, content: bytes) -> None:
+    """Run isolated reviewed-authority fixtures through their production loaders."""
+    loaders = {
+        CALIBRATION_MEASUREMENT_REQUEST_SCHEMA: load_calibration_measurement_request,
+        SEAL_PROFILE_REQUEST_SCHEMA: load_seal_profile_request,
+    }
+    try:
+        if schema not in loaders:
+            expected = {
+                CALIBRATION_MEASUREMENT_EVIDENCE_SCHEMA: _MEASUREMENT_EVIDENCE_KEYS,
+                SEAL_CANDIDATE_SCHEMA: {
+                    "calibration_measurement_evidence_sha256",
+                    "checkpoint_components",
+                    "checkpoint_prefix",
+                    "model_artifact_set_sha256",
+                    "required_inference_inventory_sha256",
+                    "schema",
+                    "seal_profile_request_sha256",
+                },
+                "crux.oaf-oci-layout-manifest/v1": _OCI_LAYOUT_KEYS,
+                HOST_ADAPTER_SCHEMA: {"covered_roots", "files", "schema"},
+            }[schema]
+            payload, _ = _read_canonical_object_from_content(content, "schema golden")
+            if set(payload) != expected or payload["schema"] != schema:
+                raise SealError("schema golden fields are invalid")
+            first = min(expected)
+            if first == "archive" and not isinstance(payload[first], dict):
+                raise SealError("schema golden archive is invalid")
+            if first == "calibration_measurement_evidence_sha256" and not _is_sha256(
+                payload[first]
+            ):
+                raise SealError("schema golden hash is invalid")
+            if first == "covered_roots" and not isinstance(payload[first], list):
+                raise SealError("schema golden roots are invalid")
+            if first == "base_system_package_evidence_sha256" and not _is_sha256(payload[first]):
+                raise SealError("schema golden measurement evidence hash is invalid")
+            return
+        loader = loaders[schema]
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            path = Path(directory) / "golden.json"
+            path.write_bytes(content)
+            loader(path)
+    except (KeyError, OSError, SealError) as error:
+        raise ValueError(str(error)) from None
+
+
+def _read_canonical_object_from_content(
+    content: bytes, label: str
+) -> tuple[dict[str, JsonValue], bytes]:
+    if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+        raise SealError(f"{label} must have one final newline")
+    value = strict_json_loads(content[:-1], require_canonical=True)
+    if not isinstance(value, dict):
+        raise SealError(f"{label} must be an object")
+    return value, content
+
+
+def _measurement_row_from_value(value: MeasurementRow | Mapping[str, object]) -> MeasurementRow:
+    if isinstance(value, MeasurementRow):
+        return value
+    if not isinstance(value, Mapping) or set(value) != _MEASUREMENT_ROW_KEYS:
+        raise SealError("measurement runner returned an invalid row")
+    try:
+        row = MeasurementRow(**cast(dict[str, Any], value))
+    except TypeError:
+        raise SealError("measurement runner returned an invalid row") from None
+    _validate_measurement_row(row)
+    return row
+
+
+def _validate_measurement_row(row: MeasurementRow) -> None:
+    positive = (
+        row.input_frame_count,
+        row.repetition,
+        row.peak_cpu_millis,
+        row.peak_rss_bytes,
+        row.peak_tmp_bytes,
+        row.peak_shm_bytes,
+        row.peak_pid_count,
+        row.startup_millis,
+        row.request_millis,
+        row.stdout_max_line_bytes,
+        row.stderr_max_line_bytes,
+    )
+    if (
+        not all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in positive
+        )
+        or row.input_frame_count <= 0
+        or row.repetition <= 0
+        or not isinstance(row.process_instance_id, str)
+        or not row.process_instance_id
+        or not isinstance(row.exit_code, int)
+        or isinstance(row.exit_code, bool)
+        or (row.signal is not None and (not isinstance(row.signal, int) or row.signal <= 0))
+        or not isinstance(row.oom_killed, bool)
+        or (row.prediction_sha256 is not None and not _is_sha256(row.prediction_sha256))
+    ):
+        raise SealError("measurement row is invalid")
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _require_sha256_value(value: object, label: str) -> str:
+    if not _is_sha256(value):
+        raise SealError(f"{label} is invalid")
+    return cast(str, value)
+
+
+def _string_list(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(item, str) and item for item in value)
+        and len(set(cast(list[str], value))) == len(value)
+    )
+
+
+def _require_image(image: str, label: str) -> None:
     if (
         not isinstance(image, str)
         or not image
         or image.strip().lower() in {"auto", "none", "sentinel", "unlimited", "unset"}
     ):
-        raise SealError("calibration image identity is invalid")
+        raise SealError(f"{label} image identity is invalid")
+
+
+def _row_payload(row: MeasurementRow) -> dict[str, JsonValue]:
+    return {
+        "exit_code": row.exit_code,
+        "input_frame_count": row.input_frame_count,
+        "oom_killed": row.oom_killed,
+        "peak_cpu_millis": row.peak_cpu_millis,
+        "peak_pid_count": row.peak_pid_count,
+        "peak_rss_bytes": row.peak_rss_bytes,
+        "peak_shm_bytes": row.peak_shm_bytes,
+        "peak_tmp_bytes": row.peak_tmp_bytes,
+        "prediction_sha256": row.prediction_sha256,
+        "process_instance_id": row.process_instance_id,
+        "repetition": row.repetition,
+        "request_millis": row.request_millis,
+        "signal": row.signal,
+        "startup_millis": row.startup_millis,
+        "stderr_max_line_bytes": row.stderr_max_line_bytes,
+        "stdout_max_line_bytes": row.stdout_max_line_bytes,
+    }
+
+
+def _require_headroom(profile: SealProfileRequest, rows: Sequence[MeasurementRow]) -> None:
+    """Reject equality as well as underprovisioning after the profile's units convert."""
+
+    observed = {
+        "cpu_limit_millis": max(row.peak_cpu_millis for row in rows),
+        "memory_limit_bytes": max(row.peak_rss_bytes for row in rows),
+        "pid_limit": max(row.peak_pid_count for row in rows),
+        "tmp_bytes": max(row.peak_tmp_bytes for row in rows),
+        "shm_bytes": max(row.peak_shm_bytes for row in rows),
+        "startup_deadline_seconds": max(row.startup_millis for row in rows),
+        "request_deadline_seconds": max(row.request_millis for row in rows),
+        "stdout_max_line_bytes": max(row.stdout_max_line_bytes for row in rows),
+        "stderr_max_line_bytes": max(row.stderr_max_line_bytes for row in rows),
+        "stderr_read_chunk_bytes": max(row.stderr_max_line_bytes for row in rows),
+        "stderr_ring_buffer_bytes": max(row.stderr_max_line_bytes for row in rows),
+    }
+    for field, peak in observed.items():
+        value = cast(int, profile.payload[field])
+        comparable = value * 1000 if field.endswith("_deadline_seconds") else value
+        if comparable <= peak:
+            raise SealError(f"seal profile request {field} is not strictly above measured peak")
+
+
+def measure(
+    *,
+    request_path: Path,
+    host_evidence_path: Path,
+    image: str,
+    model_cache: Path,
+    checkpoint_evidence_path: Path,
+    base_system_evidence_path: Path,
+    output_path: Path,
+    runner: (
+        Callable[[CalibrationMeasurementRequest, int, int], MeasurementRow | Mapping[str, object]]
+        | None
+    ) = None,
+) -> PublishedArtifact:
+    """Publish diagnostic measurements only; resource choices remain outside this command."""
+
+    request = load_calibration_measurement_request(Path(request_path))
+    load_native_host_evidence(Path(host_evidence_path))
+    _require_image(image, "measurement")
     _require_directory(Path(model_cache), "model cache")
-    _require_absent(Path(output), "calibration candidate")
-    raise SealError("native calibration output contract is not specified; no output was written")
+    try:
+        checkpoint_request = load_checkpoint_acquisition_request(_CHECKPOINT_REQUEST_PATH)
+        checkpoint = load_checkpoint_acquisition_evidence(
+            Path(checkpoint_evidence_path), request=checkpoint_request
+        )
+        base_request = load_base_system_package_request(_BASE_SYSTEM_REQUEST_PATH)
+        base = load_base_system_package_evidence(
+            Path(base_system_evidence_path), request=base_request
+        )
+    except (CheckpointAcquisitionError, SystemPackageError) as error:
+        raise SealIntegrityError(f"measurement authority is invalid: {error}") from None
+    if runner is None:
+        raise SealError("measurement runner is unavailable; no output was written")
+    rows: list[MeasurementRow] = []
+    for frame_count in request.frame_counts:
+        for repetition in range(1, request.repetition_count + 1):
+            row = _measurement_row_from_value(runner(request, frame_count, repetition))
+            if row.input_frame_count != frame_count or row.repetition != repetition:
+                raise SealError("measurement runner row does not match the requested probe")
+            rows.append(row)
+    rows.sort(key=lambda row: (row.input_frame_count, row.process_instance_id, row.repetition))
+    host_payload, _ = _read_canonical_object(Path(host_evidence_path), "native host evidence")
+    payload: JsonValue = {
+        "base_system_package_evidence_sha256": base.sha256,
+        "checkpoint_acquisition_evidence_sha256": checkpoint.sha256,
+        "image_manifest_digest": image,
+        "measurement_rows": [_row_payload(row) for row in rows],
+        "native_host_evidence": host_payload,
+        "request_sha256": request.sha256,
+        "schema": CALIBRATION_MEASUREMENT_EVIDENCE_SCHEMA,
+    }
+    content = canonical_json_bytes(payload, trailing_newline=True)
+    try:
+        return publish_immutable_bytes(
+            Path(output_path), content, sha256_hex(content), role="calibration_measurement_evidence"
+        )
+    except ArtifactPublicationError:
+        raise SealError("measurement evidence publication failed") from None
+
+
+def _load_measurement_evidence(
+    path: Path, request: CalibrationMeasurementRequest
+) -> tuple[dict[str, JsonValue], tuple[MeasurementRow, ...], str]:
+    payload, content = _read_canonical_object(path, "calibration measurement evidence")
+    if (
+        set(payload) != _MEASUREMENT_EVIDENCE_KEYS
+        or payload["schema"] != CALIBRATION_MEASUREMENT_EVIDENCE_SCHEMA
+    ):
+        raise SealError("calibration measurement evidence fields are invalid")
+    if payload["request_sha256"] != request.sha256:
+        raise SealError("calibration measurement evidence request hash does not match")
+    rows_value = payload["measurement_rows"]
+    if not isinstance(rows_value, list) or not rows_value:
+        raise SealError("calibration measurement evidence rows are invalid")
+    rows = tuple(_measurement_row_from_value(cast(Mapping[str, object], row)) for row in rows_value)
+    if (
+        tuple(
+            sorted(
+                rows,
+                key=lambda row: (row.input_frame_count, row.process_instance_id, row.repetition),
+            )
+        )
+        != rows
+    ):
+        raise SealError("calibration measurement evidence rows are not sorted")
+    expected_pairs = {
+        (frame_count, repetition)
+        for frame_count in request.frame_counts
+        for repetition in range(1, request.repetition_count + 1)
+    }
+    actual_pairs = {(row.input_frame_count, row.repetition) for row in rows}
+    if actual_pairs != expected_pairs or len(rows) != len(expected_pairs):
+        raise SealIntegrityError(
+            "calibration measurement evidence matrix is incomplete or duplicated"
+        )
+    return payload, rows, sha256_hex(content)
+
+
+def _probe_result_from_value(
+    value: CalibrationProbeResult | Mapping[str, object],
+) -> CalibrationProbeResult:
+    if isinstance(value, CalibrationProbeResult):
+        _validate_measurement_row(value.row)
+        return value
+    if not isinstance(value, Mapping) or set(value) != {"row", "rejected_before_inference"}:
+        raise SealError("calibration runner returned an invalid probe result")
+    rejected = value["rejected_before_inference"]
+    if not isinstance(rejected, bool):
+        raise SealError("calibration runner rejection evidence is invalid")
+    return CalibrationProbeResult(
+        row=_measurement_row_from_value(cast(Mapping[str, object], value["row"])),
+        rejected_before_inference=rejected,
+    )
+
+
+def _load_candidate_authority(
+    directory: Path,
+    *,
+    profile: SealProfileRequest,
+    measurement_sha256: str,
+    checkpoint_artifact_set_sha256: str,
+    model_cache: Path,
+    repository_root: Path,
+) -> _Candidate:
+    """Authenticate a complete directory that can be handed directly to ``seal``."""
+
+    authority, _ = _read_canonical_object(
+        directory / CALIBRATION_CANDIDATE_AUTHORITY_NAME, "calibration candidate authority"
+    )
+    expected_keys = {
+        "candidate_manifest_sha256",
+        "calibration_measurement_evidence_sha256",
+        "schema",
+        "seal_profile_request_sha256",
+    }
+    if set(authority) != expected_keys or authority["schema"] != (
+        "crux.oaf-calibration-candidate-authority/v1"
+    ):
+        raise SealIntegrityError("calibration candidate authority schema is invalid")
+    if (
+        authority["calibration_measurement_evidence_sha256"] != measurement_sha256
+        or authority["seal_profile_request_sha256"] != profile.sha256
+    ):
+        raise SealIntegrityError("calibration candidate authority links are unrelated")
+    for field in (
+        "candidate_manifest_sha256",
+        "calibration_measurement_evidence_sha256",
+        "seal_profile_request_sha256",
+    ):
+        _require_sha256_value(authority[field], f"calibration candidate authority {field}")
+    try:
+        loaded = _load_candidate(
+            candidate=directory,
+            conversion_audit=directory / CONVERSION_AUDIT_NAME,
+            repository_root=repository_root,
+        )
+    except SealError as error:
+        raise SealIntegrityError(f"calibration candidate authority is invalid: {error}") from None
+    manifest, manifest_content = _read_canonical_object(
+        directory / CANDIDATE_MANIFEST_NAME, "candidate manifest"
+    )
+    _validate_candidate_manifest(directory / CANDIDATE_MANIFEST_NAME, loaded.backend)
+    if (
+        sha256_hex(manifest_content) != authority["candidate_manifest_sha256"]
+        or manifest["model_artifact_set_sha256"] != checkpoint_artifact_set_sha256
+    ):
+        raise SealIntegrityError("calibration candidate authority cache identity is unrelated")
+    cache = _require_directory(
+        model_cache / "sha256" / checkpoint_artifact_set_sha256,
+        "calibration candidate model cache",
+    )
+    components = loaded.backend.payload["checkpoint_components"]
+    if not isinstance(components, list):
+        raise SealIntegrityError("calibration candidate components are invalid")
+    for component in components:
+        if not isinstance(component, dict) or set(component) != {"name", "sha256", "size"}:
+            raise SealIntegrityError("calibration candidate component is invalid")
+        name, digest, size = component["name"], component["sha256"], component["size"]
+        if (
+            not isinstance(name, str)
+            or PurePosixPath(name).name != name
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size <= 0
+            or not _is_sha256(digest)
+        ):
+            raise SealIntegrityError("calibration candidate component is invalid")
+        content = read_regular_file_no_follow(cache / name)
+        if len(content) != size or sha256_hex(content) != digest:
+            raise SealIntegrityError("calibration candidate cache bytes do not match the authority")
+    return loaded
+
+
+def _publish_candidate_directory(source: Path, output: Path) -> PublishedArtifact:
+    """No-replace publish all validated candidate bytes as one directory identity."""
+
+    _require_absent(output, "calibration candidate")
+    parent = _require_directory(output.parent, "calibration candidate parent")
+    staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.stage-", dir=parent))
+    try:
+        entries = sorted(source.iterdir(), key=lambda item: item.name)
+        if not entries:
+            raise SealIntegrityError("calibration candidate authority is empty")
+        for entry in entries:
+            if not entry.is_file() or entry.is_symlink():
+                raise SealIntegrityError(
+                    "calibration candidate authority contains a non-regular entry"
+                )
+            content = read_regular_file_no_follow(entry)
+            target = staging / entry.name
+            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(descriptor, "wb", closefd=False) as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                os.close(descriptor)
+        staging_descriptor = os.open(staging, os.O_RDONLY)
+        try:
+            os.fsync(staging_descriptor)
+        finally:
+            os.close(staging_descriptor)
+        os.rename(staging, output)
+    except (OSError, SealError):
+        for entry in staging.iterdir() if staging.exists() else ():
+            entry.unlink()
+        if staging.exists():
+            staging.rmdir()
+        raise SealIntegrityError("calibration candidate publication failed") from None
+    manifest = read_regular_file_no_follow(output / CANDIDATE_MANIFEST_NAME)
+    return PublishedArtifact(role="seal_candidate", path=output, sha256=sha256_hex(manifest))
+
+
+def calibrate(
+    *,
+    request_path: Path | None = None,
+    measurement_evidence_path: Path | None = None,
+    checkpoint_evidence_path: Path | None = None,
+    base_system_evidence_path: Path | None = None,
+    image: str,
+    host_evidence: Path,
+    model_cache: Path,
+    output: Path,
+    runner: Callable[[int, bool, int], CalibrationProbeResult | Mapping[str, object]] | None = None,
+    candidate_authority_path: Path | None = None,
+    repository_root: Path | None = None,
+) -> PublishedSealCandidate:
+    """Rerun a reviewed profile with no hidden headroom or process assumptions."""
+
+    load_native_host_evidence(host_evidence)
+    _require_image(image, "calibration")
+    _require_directory(Path(model_cache), "model cache")
+    if None in (
+        request_path,
+        measurement_evidence_path,
+        checkpoint_evidence_path,
+        base_system_evidence_path,
+    ):
+        raise SealError("calibration requires reviewed request and evidence inputs")
+    try:
+        profile = load_seal_profile_request(cast(Path, request_path))
+        measurement_request_path = cast(Path, request_path).with_name(
+            cast(Path, request_path).name.replace(
+                "seal-profile-request", "calibration-measurement-request"
+            )
+        )
+        measurement_request = load_calibration_measurement_request(measurement_request_path)
+        evidence, rows, measurement_sha = _load_measurement_evidence(
+            cast(Path, measurement_evidence_path), measurement_request
+        )
+        checkpoint_request = load_checkpoint_acquisition_request(_CHECKPOINT_REQUEST_PATH)
+        checkpoint = load_checkpoint_acquisition_evidence(
+            cast(Path, checkpoint_evidence_path), request=checkpoint_request
+        )
+        base_request = load_base_system_package_request(_BASE_SYSTEM_REQUEST_PATH)
+        base = load_base_system_package_evidence(
+            cast(Path, base_system_evidence_path), request=base_request
+        )
+    except (CheckpointAcquisitionError, SystemPackageError, SealError) as error:
+        raise SealIntegrityError(f"calibration authority is invalid: {error}") from None
+    if (
+        evidence["checkpoint_acquisition_evidence_sha256"] != checkpoint.sha256
+        or evidence["base_system_package_evidence_sha256"] != base.sha256
+    ):
+        raise SealIntegrityError("measurement evidence does not match its authenticated inputs")
+    expected = {
+        "calibration_measurement_request_sha256": measurement_request.sha256,
+        "calibration_measurement_evidence_sha256": measurement_sha,
+        "checkpoint_acquisition_evidence_sha256": checkpoint.sha256,
+        "checkpoint_acquisition_request_sha256": checkpoint.request_sha256,
+        "base_system_package_evidence_sha256": base.sha256,
+        "base_system_package_request_sha256": base.request_sha256,
+    }
+    if any(profile.payload[key] != value for key, value in expected.items()):
+        raise SealIntegrityError("seal profile request is unrelated to the reviewed evidence")
+    if profile.max_input_audio_frames not in measurement_request.frame_counts:
+        raise SealIntegrityError("seal profile input bound was not measured")
+    host_payload, _ = _read_canonical_object(host_evidence, "native host evidence")
+    if (
+        evidence["native_host_evidence"] != host_payload
+        or evidence["image_manifest_digest"] != image
+    ):
+        raise SealIntegrityError("calibration evidence authority does not match this host or image")
+    in_bound = tuple(row for row in rows if row.input_frame_count <= profile.max_input_audio_frames)
+    if not in_bound or any(
+        row.exit_code != 0 or row.signal is not None or row.oom_killed for row in in_bound
+    ):
+        raise SealIntegrityError("in-bound measurement evidence is not healthy")
+    _require_headroom(profile, in_bound)
+    source: Path | None = None
+    if candidate_authority_path is not None:
+        try:
+            source = _require_directory(
+                Path(candidate_authority_path), "calibration candidate authority"
+            )
+            _load_candidate_authority(
+                source,
+                profile=profile,
+                measurement_sha256=measurement_sha,
+                checkpoint_artifact_set_sha256=checkpoint.model_artifact_set_sha256,
+                model_cache=Path(model_cache),
+                repository_root=Path.cwd() if repository_root is None else repository_root,
+            )
+        except SealError as error:
+            if isinstance(error, SealIntegrityError):
+                raise
+            raise SealIntegrityError(
+                f"calibration candidate authority is invalid: {error}"
+            ) from None
+    if runner is None:
+        raise SealError("calibration runner is unavailable; no output was written")
+    probes = (
+        (profile.max_input_audio_frames - 1, True, 1),
+        (profile.max_input_audio_frames, True, 2),
+        (profile.max_input_audio_frames + 1, True, 3),
+        (profile.max_input_audio_frames, False, 1),
+    )
+    persistent_process_ids: list[str] = []
+    fresh_process_id: str | None = None
+    for frame_count, persistent, ordinal in probes:
+        result = _probe_result_from_value(runner(frame_count, persistent, ordinal))
+        row = result.row
+        if row.input_frame_count != frame_count:
+            raise SealIntegrityError(
+                "calibration probe row does not match the requested frame count"
+            )
+        if persistent and frame_count <= profile.max_input_audio_frames:
+            persistent_process_ids.append(row.process_instance_id)
+        else:
+            fresh_process_id = row.process_instance_id
+        if frame_count > profile.max_input_audio_frames:
+            if (
+                not result.rejected_before_inference
+                or row.exit_code == 0
+                or row.signal is not None
+                or row.oom_killed
+            ):
+                raise SealError("over-bound input was not rejected before inference")
+        elif (
+            result.rejected_before_inference
+            or row.exit_code != 0
+            or row.signal is not None
+            or row.oom_killed
+        ):
+            raise SealError("in-bound calibration probe failed")
+    if (
+        len(persistent_process_ids) != 2
+        or not persistent_process_ids[0]
+        or len(set(persistent_process_ids)) != 1
+        or not fresh_process_id
+        or fresh_process_id == persistent_process_ids[0]
+    ):
+        raise SealIntegrityError(
+            "calibration probes do not prove persistent and fresh process identity"
+        )
+    if source is None:
+        raise SealError("calibration candidate authority is unavailable; no output was written")
+    artifact = _publish_candidate_directory(source, Path(output))
+    return PublishedSealCandidate(artifact)
 
 
 # All candidate records are validated before the first publication attempt.
@@ -897,10 +1686,24 @@ def _parser() -> argparse.ArgumentParser:
     base_system.add_argument("--image", required=True)
     base_system.add_argument("--output", type=Path, required=True)
 
+    measurement = commands.add_parser("measure")
+    measurement.add_argument("--request", type=Path, required=True)
+    measurement.add_argument("--host-evidence", type=Path, required=True)
+    measurement.add_argument("--image", required=True)
+    measurement.add_argument("--model-cache", type=Path, required=True)
+    measurement.add_argument("--checkpoint-evidence", type=Path, required=True)
+    measurement.add_argument("--base-system-evidence", type=Path, required=True)
+    measurement.add_argument("--output", type=Path, required=True)
+
     calibration = commands.add_parser("calibrate")
+    calibration.add_argument("--request", type=Path, required=True)
+    calibration.add_argument("--measurement-evidence", type=Path, required=True)
+    calibration.add_argument("--checkpoint-evidence", type=Path, required=True)
+    calibration.add_argument("--base-system-evidence", type=Path, required=True)
     calibration.add_argument("--image", required=True)
     calibration.add_argument("--host-evidence", type=Path, required=True)
     calibration.add_argument("--model-cache", type=Path, required=True)
+    calibration.add_argument("--candidate-authority", type=Path, required=True)
     calibration.add_argument("--output", type=Path, required=True)
 
     seal = commands.add_parser("seal")
@@ -923,13 +1726,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
         if arguments.command == "validate-host":
-            evidence = load_native_host_evidence(arguments.evidence)
-            summary = {
-                "kind": evidence.kind,
-                "official_execution_allowed": evidence.official_execution_allowed,
-                "sha256": evidence.sha256,
-            }
-            sys.stdout.buffer.write(canonical_json_bytes(summary, trailing_newline=True))
+            load_native_host_evidence(arguments.evidence)
+            _write_producer_summary(ProducerOutcome("validated", 0, None, None))
             return 0
         if arguments.command == "materialize-system-packages":
             materialize_system_packages(
@@ -937,6 +1735,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 bundle=arguments.bundle,
                 build_args_output=arguments.build_args_output,
             )
+            _write_producer_summary(ProducerOutcome("materialized", 0, None, None))
             return 0
         if arguments.command == "attest-base-system":
             published = attest_base_system(
@@ -945,19 +1744,38 @@ def main(argv: Sequence[str] | None = None) -> int:
                 image=arguments.image,
                 output_path=arguments.output,
             )
-            summary = {
-                "exit_code": 0,
-                "report_path": os.fspath(published.path),
-                "status": "attested",
-            }
-            sys.stdout.buffer.write(canonical_json_bytes(summary, trailing_newline=True))
+            _write_producer_summary(
+                ProducerOutcome("attested", 0, published.path, published.sha256)
+            )
+            return 0
+        if arguments.command == "measure":
+            published = measure(
+                request_path=arguments.request,
+                host_evidence_path=arguments.host_evidence,
+                image=arguments.image,
+                model_cache=arguments.model_cache,
+                checkpoint_evidence_path=arguments.checkpoint_evidence,
+                base_system_evidence_path=arguments.base_system_evidence,
+                output_path=arguments.output,
+            )
+            _write_producer_summary(
+                ProducerOutcome("measured", 0, published.path, published.sha256)
+            )
             return 0
         if arguments.command == "calibrate":
-            calibrate(
+            published = calibrate(
+                request_path=arguments.request,
+                measurement_evidence_path=arguments.measurement_evidence,
+                checkpoint_evidence_path=arguments.checkpoint_evidence,
+                base_system_evidence_path=arguments.base_system_evidence,
                 image=arguments.image,
                 host_evidence=arguments.host_evidence,
                 model_cache=arguments.model_cache,
                 output=arguments.output,
+                candidate_authority_path=arguments.candidate_authority,
+            )
+            _write_producer_summary(
+                ProducerOutcome("calibrated", 0, published.artifact.path, published.artifact.sha256)
             )
             return 0
         published = seal_candidate(
@@ -973,16 +1791,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             smoke_oracle=arguments.smoke_oracle,
             repository_root=Path.cwd(),
         )
-        summary = {
-            "backend_lock_sha256": published.artifacts[-1].sha256,
-            "publication_order": list(published.publication_order),
-            "status": "sealed",
-        }
-        sys.stdout.buffer.write(canonical_json_bytes(summary, trailing_newline=True))
+        _write_producer_summary(
+            ProducerOutcome(
+                "sealed", 0, published.artifacts[-1].path, published.artifacts[-1].sha256
+            )
+        )
         return 0
     except SealError as error:
+        exit_code: Literal[1, 2] = 2 if isinstance(error, SealIntegrityError) else 1
+        _write_producer_summary(ProducerOutcome("failed", exit_code, None, None))
         print(f"OaF seal failed: {error}", file=sys.stderr)
-        return 1
+        return exit_code
+
+
+def _write_producer_summary(outcome: ProducerOutcome) -> None:
+    """Emit the shared machine result only after argparse has accepted the command."""
+
+    summary: JsonValue = {
+        "exit_code": outcome.exit_code,
+        "report_path": None if outcome.report_path is None else os.fspath(outcome.report_path),
+        "report_sha256": outcome.report_sha256,
+        "status": outcome.status,
+    }
+    sys.stdout.buffer.write(canonical_json_bytes(summary, trailing_newline=True))
 
 
 if __name__ == "__main__":

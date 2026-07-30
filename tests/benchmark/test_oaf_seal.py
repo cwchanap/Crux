@@ -299,15 +299,18 @@ def _build_candidate(
 
     runtime = LOCKS.runtime_payload(seal_sha256=_content_hash(seal_path))
     for field in (
+        "additional_system_packages",
+        "base_image_archive_keyring_sha256",
         "base_image_manifest_digest",
-        "debian_release_sha256",
-        "debian_snapshot_repository",
+        "base_system_package_evidence_sha256",
+        "base_system_package_inventory",
+        "base_system_package_inventory_sha256",
+        "base_system_package_request_sha256",
         "distribution_build_manifest_sha256",
         "oci_layout_manifest_sha256",
         "python_distributions",
         "runner_source_manifest_sha256",
         "runtime_image_manifest_digest",
-        "system_packages",
         "tensorflow_abi",
         "tensorflow_build",
         "upstream_source_manifest_sha256",
@@ -378,8 +381,12 @@ def test_validate_host_strict_reads_existing_native_evidence_record(
 
     assert path.read_bytes() == original
     summary = strict_json_loads(capsys.readouterr().out.encode().rstrip(b"\n"))
-    assert summary["official_execution_allowed"] is True  # type: ignore[index]
-    assert summary["kind"] == "github_hosted"  # type: ignore[index]
+    assert summary == {
+        "exit_code": 0,
+        "report_path": None,
+        "report_sha256": None,
+        "status": "validated",
+    }
 
 
 @pytest.mark.parametrize("mutation", ["duplicate", "extra", "noncanonical"])
@@ -441,6 +448,7 @@ def test_validate_host_rejects_non_native_or_emulated_execution(
 def test_unspecified_native_producers_fail_closed_without_outputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     _set_native_host(monkeypatch)
     evidence = _write_json(tmp_path / "native-host-evidence.json", _native_host_record())
@@ -466,24 +474,348 @@ def test_unspecified_native_producers_fail_closed_without_outputs(
     )
     assert not bundle.exists()
     assert not build_args.exists()
+    capsys.readouterr()
 
     assert (
         seal_module.main(
             [
                 "calibrate",
+                "--request",
+                os.fspath(tmp_path / "seal-profile-request.json"),
+                "--measurement-evidence",
+                os.fspath(tmp_path / "measurements.json"),
+                "--checkpoint-evidence",
+                os.fspath(tmp_path / "checkpoint-evidence.json"),
+                "--base-system-evidence",
+                os.fspath(tmp_path / "base-evidence.json"),
                 "--image",
                 "crux-oaf-tf1:hpa320-seal",
                 "--host-evidence",
                 os.fspath(evidence),
                 "--model-cache",
                 os.fspath(model_cache),
+                "--candidate-authority",
+                os.fspath(tmp_path / "candidate-authority.json"),
                 "--output",
                 os.fspath(candidate),
             ]
         )
-        == 1
+        == 2
     )
     assert not candidate.exists()
+    assert json.loads(capsys.readouterr().out) == {
+        "exit_code": 2,
+        "report_path": None,
+        "report_sha256": None,
+        "status": "failed",
+    }
+
+
+def _calibration_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, Path, Path, Path, Path]:
+    """Build only explicit fake authorities; no native measurement is implied."""
+
+    _set_native_host(monkeypatch)
+    request_path = tmp_path / "calibration-measurement-request.json"
+    _write_json(
+        request_path,
+        {
+            "backend_id": "magenta-egmd-tf1-94529798-8hit-v1",
+            "container_restrictions": {
+                "drop_capabilities": ["ALL"],
+                "network": "none",
+                "no_new_privileges": True,
+                "platform": "linux/amd64",
+                "read_only_root": True,
+            },
+            "fixtures": [
+                {
+                    "input_audio_sha256": "a" * 64,
+                    "input_view_id": "fake-input-v1",
+                    "source_audio_id": "fake-source-v1",
+                    "source_audio_sha256": "b" * 64,
+                }
+            ],
+            "frame_counts": [10, 20],
+            "output_schemas": ["crux.oaf-calibration-measurement-evidence/v1"],
+            "repetition_count": 2,
+            "required_metrics": ["measurement_row"],
+            "schema": "crux.oaf-calibration-measurement-request/v1",
+        },
+    )
+    host = _write_json(tmp_path / "native-host-evidence.json", _native_host_record())
+    cache = tmp_path / "model-cache"
+    cache.mkdir()
+    acquisition = importlib.import_module("src.benchmark.checkpoint_acquisition")
+    checked_request = acquisition.load_checkpoint_acquisition_request(
+        Path(
+            "config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.checkpoint-acquisition-request.json"
+        )
+    )
+    _, checkpoint_content = acquisition.render_checkpoint_acquisition_evidence(
+        checked_request,
+        acquisition_mode="cache_verify",
+        model_artifact_set_sha256="c" * 64,
+        cache_path=acquisition.PurePosixPath("sha256", "c" * 64),
+    )
+    checkpoint = tmp_path / "checkpoint-evidence.json"
+    checkpoint.write_bytes(checkpoint_content)
+    packages = importlib.import_module("tools.hpa320.oaf_system_packages")
+    base_request_path = Path("runtime/oaf_tf1/base-system-package-request.json")
+    base_request = packages.load_base_system_package_request(base_request_path)
+    base_payload = _base_system_evidence_payload(base_request.sha256)
+    base_payload["base_image_archive_keyring_sha256"] = (
+        base_request.base_image_archive_keyring_sha256
+    )
+    base_payload["package_inventory_sha256"] = packages.inventory_sha256(
+        base_payload["package_inventory"]
+    )
+    base = _write_json(tmp_path / "base-evidence.json", base_payload)
+    return request_path, host, cache, checkpoint, base, tmp_path / "measurements.json"
+
+
+def _fake_measurement_row(
+    frame_count: int, repetition: int, process: str = "fake-a"
+) -> dict[str, object]:
+    return {
+        "exit_code": 0,
+        "input_frame_count": frame_count,
+        "oom_killed": False,
+        "peak_cpu_millis": 40,
+        "peak_pid_count": 3,
+        "peak_rss_bytes": 400,
+        "peak_shm_bytes": 40,
+        "peak_tmp_bytes": 30,
+        "prediction_sha256": "d" * 64,
+        "process_instance_id": process,
+        "repetition": repetition,
+        "request_millis": 20,
+        "signal": None,
+        "startup_millis": 10,
+        "stderr_max_line_bytes": 9,
+        "stdout_max_line_bytes": 8,
+    }
+
+
+def test_measure_publishes_only_diagnostic_evidence_with_fake_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request, host, cache, checkpoint, base, output = _calibration_inputs(tmp_path, monkeypatch)
+
+    artifact = seal_module.measure(
+        request_path=request,
+        host_evidence_path=host,
+        image="sha256:" + "e" * 64,
+        model_cache=cache,
+        checkpoint_evidence_path=checkpoint,
+        base_system_evidence_path=base,
+        output_path=output,
+        runner=lambda _request, frame, repetition: _fake_measurement_row(frame, repetition),
+    )
+
+    payload = json.loads(output.read_bytes())
+    assert artifact.path == output
+    assert payload["schema"] == "crux.oaf-calibration-measurement-evidence/v1"
+    assert not (output.parent / "candidate-manifest.json").exists()
+    assert [
+        (row["input_frame_count"], row["repetition"]) for row in payload["measurement_rows"]
+    ] == [(10, 1), (10, 2), (20, 1), (20, 2)]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda rows: rows.pop(),
+        lambda rows: rows.append(deepcopy(rows[0])),
+        lambda rows: rows.append({**deepcopy(rows[0]), "process_instance_id": "other"}),
+    ],
+)
+def test_measurement_evidence_rejects_incomplete_or_duplicate_probe_matrix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: Callable[[list[dict[str, object]]], None],
+) -> None:
+    request, host, cache, checkpoint, base, measurement = _calibration_inputs(tmp_path, monkeypatch)
+    seal_module.measure(
+        request_path=request,
+        host_evidence_path=host,
+        image="sha256:" + "e" * 64,
+        model_cache=cache,
+        checkpoint_evidence_path=checkpoint,
+        base_system_evidence_path=base,
+        output_path=measurement,
+        runner=lambda _request, frame, repetition: _fake_measurement_row(frame, repetition),
+    )
+    payload = json.loads(measurement.read_text(encoding="utf-8"))
+    mutation(payload["measurement_rows"])
+    payload["measurement_rows"].sort(
+        key=lambda row: (row["input_frame_count"], row["process_instance_id"], row["repetition"])
+    )
+    _write_json(measurement, payload)
+
+    with pytest.raises(SealError, match="matrix"):
+        seal_module._load_measurement_evidence(
+            measurement, seal_module.load_calibration_measurement_request(request)
+        )
+
+
+def _profile_payload(
+    *, measurement_request: Path, measurement_evidence: Path, checkpoint: Path, base: Path
+) -> dict[str, object]:
+    acquisition = importlib.import_module("src.benchmark.checkpoint_acquisition")
+    packages = importlib.import_module("tools.hpa320.oaf_system_packages")
+    checkpoint_request = acquisition.load_checkpoint_acquisition_request(
+        Path(
+            "config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.checkpoint-acquisition-request.json"
+        )
+    )
+    checkpoint_evidence = acquisition.load_checkpoint_acquisition_evidence(
+        checkpoint, request=checkpoint_request
+    )
+    base_request = packages.load_base_system_package_request(
+        Path("runtime/oaf_tf1/base-system-package-request.json")
+    )
+    base_evidence = packages.load_base_system_package_evidence(base, request=base_request)
+    return {
+        "base_system_package_evidence_sha256": base_evidence.sha256,
+        "base_system_package_request_sha256": base_evidence.request_sha256,
+        "calibration_measurement_evidence_sha256": _content_hash(measurement_evidence),
+        "calibration_measurement_request_sha256": _content_hash(measurement_request),
+        "checkpoint_acquisition_evidence_sha256": checkpoint_evidence.sha256,
+        "checkpoint_acquisition_request_sha256": checkpoint_evidence.request_sha256,
+        "cpu_limit_millis": 41,
+        "max_input_audio_frames": 20,
+        "memory_limit_bytes": 401,
+        "pid_limit": 4,
+        "request_deadline_seconds": 21,
+        "runtime_gid": 1,
+        "runtime_uid": 1,
+        "schema": "crux.oaf-seal-profile-request/v1",
+        "shm_bytes": 41,
+        "startup_deadline_seconds": 11,
+        "stderr_max_line_bytes": 10,
+        "stderr_read_chunk_bytes": 11,
+        "stderr_ring_buffer_bytes": 12,
+        "stdout_max_line_bytes": 9,
+        "tmp_bytes": 31,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload.pop("memory_limit_bytes"),
+        lambda payload: payload.__setitem__("memory_limit_bytes", 0),
+        lambda payload: payload.__setitem__("calibration_measurement_evidence_sha256", "f" * 64),
+        lambda payload: payload.__setitem__("memory_limit_bytes", 400),
+    ],
+)
+def test_calibrate_rejects_missing_unrelated_sentinel_or_underprovisioned_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: Callable[[dict[str, object]], None]
+) -> None:
+    request, host, cache, checkpoint, base, measurement = _calibration_inputs(tmp_path, monkeypatch)
+    seal_module.measure(
+        request_path=request,
+        host_evidence_path=host,
+        image="sha256:" + "e" * 64,
+        model_cache=cache,
+        checkpoint_evidence_path=checkpoint,
+        base_system_evidence_path=base,
+        output_path=measurement,
+        runner=lambda _request, frame, repetition: _fake_measurement_row(frame, repetition),
+    )
+    profile = _profile_payload(
+        measurement_request=request,
+        measurement_evidence=measurement,
+        checkpoint=checkpoint,
+        base=base,
+    )
+    mutation(profile)
+    profile_path = tmp_path / "seal-profile-request.json"
+    _write_json(profile_path, profile)
+
+    with pytest.raises(SealError):
+        seal_module.calibrate(
+            request_path=profile_path,
+            measurement_evidence_path=measurement,
+            checkpoint_evidence_path=checkpoint,
+            base_system_evidence_path=base,
+            image="sha256:" + "e" * 64,
+            host_evidence=host,
+            model_cache=cache,
+            output=tmp_path / "candidate",
+            runner=lambda frame, _persistent, _ordinal: (
+                _fake_measurement_row(frame, 1),
+                frame <= 20,
+            ),
+        )
+
+
+def test_calibrate_exercises_bound_process_cases_with_explicit_fake_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request, host, cache, checkpoint, base, measurement = _calibration_inputs(tmp_path, monkeypatch)
+    seal_module.measure(
+        request_path=request,
+        host_evidence_path=host,
+        image="sha256:" + "e" * 64,
+        model_cache=cache,
+        checkpoint_evidence_path=checkpoint,
+        base_system_evidence_path=base,
+        output_path=measurement,
+        runner=lambda _request, frame, repetition: _fake_measurement_row(frame, repetition),
+    )
+    profile_path = tmp_path / "seal-profile-request.json"
+    _write_json(
+        profile_path,
+        _profile_payload(
+            measurement_request=request,
+            measurement_evidence=measurement,
+            checkpoint=checkpoint,
+            base=base,
+        ),
+    )
+    calls: list[tuple[int, bool, int]] = []
+
+    def fake_runner(frame: int, persistent: bool, ordinal: int) -> dict[str, object]:
+        calls.append((frame, persistent, ordinal))
+        row = _fake_measurement_row(frame, 1, "persistent" if persistent else "fresh")
+        if frame > 20:
+            row["exit_code"] = 1
+            row["prediction_sha256"] = None
+            return {"rejected_before_inference": True, "row": row}
+        return {"rejected_before_inference": False, "row": row}
+
+    authority = tmp_path / "candidate-authority.json"
+    _write_json(
+        authority,
+        {
+            "calibration_measurement_evidence_sha256": _content_hash(measurement),
+            "checkpoint_components": [],
+            "checkpoint_prefix": "fake/checkpoint",
+            "model_artifact_set_sha256": "c" * 64,
+            "required_inference_inventory_sha256": "f" * 64,
+            "schema": "crux.oaf-seal-candidate/v1",
+            "seal_profile_request_sha256": _content_hash(profile_path),
+        },
+    )
+    with pytest.raises(SealError, match="existing directory|regular|authority"):
+        seal_module.calibrate(
+            request_path=profile_path,
+            measurement_evidence_path=measurement,
+            checkpoint_evidence_path=checkpoint,
+            base_system_evidence_path=base,
+            image="sha256:" + "e" * 64,
+            host_evidence=host,
+            model_cache=cache,
+            output=tmp_path / "candidate.json",
+            runner=fake_runner,
+            candidate_authority_path=authority,
+        )
+
+    assert calls == []
+    assert not (tmp_path / "candidate.json").exists()
 
 
 def _base_system_request_payload(

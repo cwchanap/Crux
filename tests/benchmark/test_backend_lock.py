@@ -136,8 +136,7 @@ HPARAMS = {
     "viterbi_decoding": False,
 }
 METADATA_FIELDS = [
-    {"name": "frame_index", "nullable": False, "type": "integer"},
-    {"name": "upstream_group_id", "nullable": True, "type": "string"},
+    {"name": "upstream_8hit_group_id", "nullable": True, "type": "string"},
 ]
 PYTHON_DISTRIBUTIONS = [
     {
@@ -153,12 +152,11 @@ PYTHON_DISTRIBUTIONS = [
         "version": "1.18.5",
     },
 ]
-SYSTEM_PACKAGES = [
+BASE_SYSTEM_PACKAGE_INVENTORY = [
     {
-        "filename": "libgomp1_10.2.1-6_amd64.deb",
-        "name": "libgomp1",
-        "sha256": "2" * 64,
-        "version": "10.2.1-6",
+        "architecture": "amd64",
+        "name": "libc6",
+        "version": "2.31-13+deb11u11",
     }
 ]
 
@@ -203,6 +201,8 @@ def backend_payload(
     return {
         "architecture_id": "magenta-oaf-model-tpu-drums-v1",
         "backend_id": "magenta-egmd-tf1-94529798-8hit-v1",
+        "checkpoint_acquisition_evidence_sha256": "1" * 64,
+        "checkpoint_acquisition_request_sha256": "2" * 64,
         "checkpoint_archive": {
             "name": "e-gmd_checkpoint.zip",
             "sha256": ARCHIVE_SHA256,
@@ -262,12 +262,16 @@ def backend_payload(
 
 def runtime_payload(*, seal_sha256: str = "b" * 64) -> dict[str, Any]:
     return {
+        "additional_system_packages": [],
         "base_image": "python:3.7.17-slim-bullseye",
+        "base_image_archive_keyring_sha256": "0" * 64,
         "base_image_manifest_digest": (
             "sha256:ea8897698c0955ba96144bd2b7310ef7884ccce4db7a1f97ffc21fb8b89d1673"
         ),
-        "debian_release_sha256": "8" * 64,
-        "debian_snapshot_repository": "https://snapshot.debian.org/archive/debian/20240101T000000Z",
+        "base_system_package_evidence_sha256": "8" * 64,
+        "base_system_package_inventory": deepcopy(BASE_SYSTEM_PACKAGE_INVENTORY),
+        "base_system_package_inventory_sha256": "9" * 64,
+        "base_system_package_request_sha256": "a" * 64,
         "distribution_build_manifest_sha256": "d" * 64,
         "environment": deepcopy(ENVIRONMENT),
         "oci_layout_manifest_sha256": "3" * 64,
@@ -282,7 +286,6 @@ def runtime_payload(*, seal_sha256: str = "b" * 64) -> dict[str, Any]:
         "stderr_max_line_bytes": 8192,
         "stderr_read_chunk_bytes": 4096,
         "stderr_ring_buffer_bytes": 65536,
-        "system_packages": deepcopy(SYSTEM_PACKAGES),
         "tensorflow_abi": "cp37-cp37m-manylinux2010_x86_64",
         "tensorflow_build": "v1.15.5-0-g590d6eef7e",
         "upstream_source_manifest_sha256": "7" * 64,
@@ -292,7 +295,9 @@ def runtime_payload(*, seal_sha256: str = "b" * 64) -> dict[str, Any]:
 def seal_payload(*, audit_sha256: str = "c" * 64) -> dict[str, Any]:
     checkpoint, required, non_inference = inventories()
     return {
+        "additional_system_packages": [],
         "advisory_snapshot_sha256": "a" * 64,
+        "base_image_archive_keyring_sha256": "0" * 64,
         "base_image_manifest_digest": (
             "sha256:ea8897698c0955ba96144bd2b7310ef7884ccce4db7a1f97ffc21fb8b89d1673"
         ),
@@ -304,8 +309,14 @@ def seal_payload(*, audit_sha256: str = "c" * 64) -> dict[str, Any]:
         "checkpoint_components": deepcopy(COMPONENTS),
         "checkpoint_inventory": checkpoint,
         "cpu_limit_millis": 2000,
-        "debian_release_sha256": "8" * 64,
-        "debian_snapshot_repository": "https://snapshot.debian.org/archive/debian/20240101T000000Z",
+        "base_system_package_evidence_sha256": "8" * 64,
+        "base_system_package_inventory": deepcopy(BASE_SYSTEM_PACKAGE_INVENTORY),
+        "base_system_package_inventory_sha256": "9" * 64,
+        "base_system_package_request_sha256": "a" * 64,
+        "calibration_measurement_evidence_sha256": "b" * 64,
+        "calibration_measurement_request_sha256": "c" * 64,
+        "checkpoint_acquisition_evidence_sha256": "1" * 64,
+        "checkpoint_acquisition_request_sha256": "2" * 64,
         "distribution_build_manifest_sha256": "d" * 64,
         "host_adapter_source_manifest_sha256": "3" * 64,
         "instrumentation_patch_sha256": "b" * 64,
@@ -330,12 +341,21 @@ def seal_payload(*, audit_sha256: str = "c" * 64) -> dict[str, Any]:
         "request_deadline_seconds": 60,
         "required_inference_inventory": required,
         "runner_source_manifest_sha256": "9" * 64,
+        "reference_host_numeric_fingerprint": {
+            "architecture": "x86_64",
+            "cpu_family": "6",
+            "cpu_model": "143",
+            "cpu_stepping": "8",
+            "cpu_vendor_id": "GenuineIntel",
+        },
         "runtime_gid": 10001,
         "runtime_image_config_digest": f"sha256:{'e' * 64}",
         "runtime_image_layer_digests": [f"sha256:{'f' * 64}"],
         "runtime_image_manifest_digest": f"sha256:{'4' * 64}",
         "runtime_uid": 10001,
         "schema": "crux.backend-seal-evidence/v1",
+        "seal_candidate_sha256": "d" * 64,
+        "seal_profile_request_sha256": "e" * 64,
         "security_scan_sha256": "0" * 64,
         "shm_bytes": 67108864,
         "smoke_audio_sha256": "5" * 64,
@@ -346,7 +366,6 @@ def seal_payload(*, audit_sha256: str = "c" * 64) -> dict[str, Any]:
         "stderr_max_line_bytes": 8192,
         "stderr_read_chunk_bytes": 4096,
         "stderr_ring_buffer_bytes": 65536,
-        "system_packages": deepcopy(SYSTEM_PACKAGES),
         "tensor_coverage_sha256": "2" * 64,
         "tensorflow_abi": "cp37-cp37m-manylinux2010_x86_64",
         "tensorflow_build": "v1.15.5-0-g590d6eef7e",
@@ -445,6 +464,20 @@ def test_backend_lock_rejects_missing_audio_frame_bound(tmp_path: Path) -> None:
 
     with pytest.raises(BackendLockError, match="backend lock fields"):
         load_backend_lock(write_json(tmp_path / "backend.json", payload))
+
+
+def test_backend_lock_requires_checkpoint_acquisition_request_and_evidence_hashes(
+    tmp_path: Path,
+) -> None:
+    for field in (
+        "checkpoint_acquisition_request_sha256",
+        "checkpoint_acquisition_evidence_sha256",
+    ):
+        payload = backend_payload()
+        del payload[field]
+
+        with pytest.raises(BackendLockError, match="exact schema"):
+            load_backend_lock(write_json(tmp_path / f"missing-{field}.json", payload))
 
 
 def test_backend_lock_rejects_unknown_field_and_wrong_schema(tmp_path: Path) -> None:
@@ -716,53 +749,46 @@ def test_runtime_lock_requires_exact_platform_image_environment_and_tensorflow(
         load_runtime_lock(write_json(tmp_path / "tensorflow.json", payload))
 
 
-@pytest.mark.parametrize(
-    "repository",
-    [
-        "https://deb.debian.org/debian",
-        "https://snapshot.debian.org/archive/debian/latest",
-        "https://snapshot.debian.org/archive/debian/20240101",
-        "http://snapshot.debian.org/archive/debian/20240101T000000Z",
-        "https://snapshot.debian.org/archive/debian/٢٠٢٤٠١٠١T٠٠٠٠٠٠Z",
-        "https://snapshot.debian.org/archive/debian/20241301T000000Z",
-        "https://snapshot.debian.org/archive/debian/20240230T000000Z",
-        "https://snapshot.debian.org/archive/debian/20240101T240000Z",
-        "https://snapshot.debian.org/archive/debian/20240101T006000Z",
-        "https://snapshot.debian.org/archive/debian/20240101T000060Z",
-        "https://snapshot.debian.org/archive/debian/20240101T000000Z/extra",
-        "https://snapshot.debian.org/archive/debian/20240101T000000Z?mirror=latest",
-        "https://snapshot.debian.org/archive/debian/20240101T000000Z#latest",
-    ],
-)
-def test_runtime_lock_rejects_nonimmutable_debian_repository(
-    tmp_path: Path,
-    repository: str,
-) -> None:
+def test_runtime_lock_uses_base_system_evidence_not_legacy_package_fields(tmp_path: Path) -> None:
     payload = runtime_payload()
-    payload["debian_snapshot_repository"] = repository
-
-    with pytest.raises(BackendLockError, match="snapshot-addressed"):
-        load_runtime_lock(write_json(tmp_path / "runtime.json", payload))
-
-
-@pytest.mark.parametrize(
-    "repository",
-    [
-        "https://snapshot.debian.org/archive/debian/19700101T000000Z",
-        "https://snapshot.debian.org/archive/debian/20000229T235959Z/",
-        "https://snapshot.debian.org/archive/debian/99991231T235959Z",
-    ],
-)
-def test_runtime_lock_accepts_calendar_valid_debian_snapshot_boundaries(
-    tmp_path: Path,
-    repository: str,
-) -> None:
-    payload = runtime_payload()
-    payload["debian_snapshot_repository"] = repository
 
     loaded = load_runtime_lock(write_json(tmp_path / "runtime.json", payload))
 
-    assert loaded.payload["debian_snapshot_repository"] == repository
+    assert loaded.payload["additional_system_packages"] == ()
+    for legacy_field in (
+        "debian_snapshot_repository",
+        "debian_release_sha256",
+        "system_packages",
+    ):
+        legacy = runtime_payload()
+        legacy[legacy_field] = "legacy"
+        with pytest.raises(BackendLockError, match="exact schema"):
+            load_runtime_lock(write_json(tmp_path / f"legacy-{legacy_field}.json", legacy))
+
+
+def test_seal_evidence_requires_acquisition_base_calibration_profile_and_candidate_fields(
+    tmp_path: Path,
+) -> None:
+    for field in (
+        "checkpoint_acquisition_request_sha256",
+        "checkpoint_acquisition_evidence_sha256",
+        "base_system_package_request_sha256",
+        "base_system_package_evidence_sha256",
+        "base_system_package_inventory",
+        "base_system_package_inventory_sha256",
+        "base_image_archive_keyring_sha256",
+        "additional_system_packages",
+        "reference_host_numeric_fingerprint",
+        "calibration_measurement_request_sha256",
+        "calibration_measurement_evidence_sha256",
+        "seal_profile_request_sha256",
+        "seal_candidate_sha256",
+    ):
+        payload = seal_payload()
+        del payload[field]
+
+        with pytest.raises(BackendLockError, match="exact schema"):
+            load_seal_evidence(write_json(tmp_path / f"missing-{field}.json", payload))
 
 
 def test_seal_evidence_requires_explicit_tensorflow_identity(tmp_path: Path) -> None:

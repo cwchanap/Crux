@@ -80,7 +80,7 @@ def repository_root() -> Path:
     return Path(__file__).parents[2]
 
 
-def test_phase_b_schema_goldens_are_complete_and_strict(repository_root: Path) -> None:
+def test_phase_a_and_b_schema_goldens_are_complete_and_strict(repository_root: Path) -> None:
     entries = load_schema_golden_manifest(repository_root)
     schemas = {entry.schema for entry in entries}
 
@@ -94,6 +94,15 @@ def test_phase_b_schema_goldens_are_complete_and_strict(repository_root: Path) -
         "crux.backend-execution-report/v1",
         "crux.legacy-score-report/v1",
         "crux.drum-prediction-events/v1",
+        "crux.transcription-backend-lock/v1",
+        "crux.transcription-runtime-lock/v1",
+        "crux.backend-seal-evidence/v1",
+        "crux.legacy-tf2-conversion-coverage/v1",
+        "crux.oaf-checkpoint-acquisition-request/v1",
+        "crux.oaf-base-system-package-request/v1",
+        "crux.oaf-calibration-measurement-request/v1",
+        "crux.oaf-seal-profile-request/v1",
+        "crux.transcription-runner/v1",
     }.issubset(schemas)
     for entry in entries:
         validate_schema_golden_entry(entry, repository_root)
