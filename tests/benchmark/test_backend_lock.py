@@ -5,13 +5,14 @@ import hashlib
 import json
 import os
 from copy import deepcopy
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 import src.benchmark.backend_lock as backend_lock_module
+import src.benchmark.backend_prepare as backend_prepare_module
 from src.benchmark.backend_lock import (
     BackendLockError,
     LoadedBackendLock,
@@ -24,6 +25,8 @@ from src.benchmark.backend_lock import (
     load_seal_evidence,
     validate_oaf_lock_set,
 )
+from src.benchmark.backend_prepare import PrepareBackendRequest, prepare_oaf_backend
+from src.benchmark.backend_registry import OFFICIAL_BACKEND_ID
 
 ARCHIVE_SHA256 = "09765ae0ff19c7d769a3c20e158eba3b9cd279429b02e498b1e911d16f82e2c0"
 COMPONENTS = [
@@ -1119,3 +1122,140 @@ def test_backend_lock_reads_normal_lock_with_one_open_and_read(
 
     assert loaded.payload["schema"] == "crux.transcription-backend-lock/v1"
     assert calls == {"open": 1, "read": 1}
+
+
+def test_loaded_backend_lock_revalidation_reproduces_every_identity(tmp_path: Path) -> None:
+    loaded = load_backend_lock(write_json(tmp_path / "backend-lock.json", backend_payload()))
+
+    reproduced = backend_lock_module.revalidate_loaded_backend_lock(loaded)
+
+    assert reproduced == loaded
+    assert reproduced is not loaded
+    assert reproduced.payload is not loaded.payload
+    assert reproduced.descriptor.payload["backend_lock_sha256"] == reproduced.sha256
+    assert reproduced.descriptor.sha256 == loaded.descriptor.sha256
+
+
+@pytest.mark.parametrize("forgery", ["lock_sha256", "descriptor_sha256", "payload"])
+def test_loaded_backend_lock_revalidation_rejects_forged_dataclass(
+    tmp_path: Path,
+    forgery: str,
+) -> None:
+    loaded = load_backend_lock(write_json(tmp_path / "backend-lock.json", backend_payload()))
+    if forgery == "lock_sha256":
+        forged = LoadedBackendLock(
+            path=loaded.path,
+            payload=loaded.payload,
+            sha256="f" * 64,
+            descriptor=loaded.descriptor,
+            max_input_audio_frames=loaded.max_input_audio_frames,
+        )
+    elif forgery == "descriptor_sha256":
+        forged = LoadedBackendLock(
+            path=loaded.path,
+            payload=loaded.payload,
+            sha256=loaded.sha256,
+            descriptor=type(loaded.descriptor)(
+                payload=loaded.descriptor.payload,
+                sha256="f" * 64,
+            ),
+            max_input_audio_frames=loaded.max_input_audio_frames,
+        )
+    else:
+        forged = LoadedBackendLock(
+            path=loaded.path,
+            payload={"backend_id": loaded.payload["backend_id"]},
+            sha256=loaded.sha256,
+            descriptor=loaded.descriptor,
+            max_input_audio_frames=loaded.max_input_audio_frames,
+        )
+
+    with pytest.raises(BackendLockError):
+        backend_lock_module.revalidate_loaded_backend_lock(forged)
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    [
+        "path_type",
+        "payload_type",
+        "lock_sha256_type",
+        "descriptor_type",
+        "descriptor_payload_type",
+        "descriptor_sha256_type",
+        "frame_bound_type",
+    ],
+)
+def test_loaded_backend_lock_revalidation_normalizes_malformed_runtime_types(
+    tmp_path: Path,
+    forgery: str,
+) -> None:
+    loaded = load_backend_lock(write_json(tmp_path / "backend-lock.json", backend_payload()))
+    if forgery == "descriptor_payload_type":
+        descriptor = replace(loaded.descriptor, payload=None)  # type: ignore[arg-type]
+        malformed = replace(loaded, descriptor=descriptor)
+    elif forgery == "descriptor_sha256_type":
+        descriptor = replace(loaded.descriptor, sha256=None)  # type: ignore[arg-type]
+        malformed = replace(loaded, descriptor=descriptor)
+    else:
+        replacements: dict[str, object] = {
+            "path_type": {"path": None},
+            "payload_type": {"payload": None},
+            "lock_sha256_type": {"sha256": None},
+            "descriptor_type": {"descriptor": None},
+            "frame_bound_type": {"max_input_audio_frames": True},
+        }
+        malformed = replace(loaded, **replacements[forgery])  # type: ignore[arg-type]
+
+    with pytest.raises(BackendLockError):
+        backend_lock_module.revalidate_loaded_backend_lock(malformed)
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    [
+        "path_type",
+        "payload_type",
+        "lock_sha256_type",
+        "descriptor_type",
+        "frame_bound_type",
+    ],
+)
+def test_public_prepare_normalizes_malformed_loaded_lock_before_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forgery: str,
+) -> None:
+    loaded = load_backend_lock(write_json(tmp_path / "backend-lock.json", backend_payload()))
+    replacements: dict[str, object] = {
+        "path_type": {"path": None},
+        "payload_type": {"payload": None},
+        "lock_sha256_type": {"sha256": None},
+        "descriptor_type": {"descriptor": None},
+        "frame_bound_type": {"max_input_audio_frames": True},
+    }
+    malformed = replace(loaded, **replacements[forgery])  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        backend_prepare_module,
+        "_open_directory_chain",
+        lambda *args, **kwargs: pytest.fail("malformed lock reached the filesystem"),
+    )
+    monkeypatch.setattr(
+        backend_prepare_module,
+        "_open_download_url",
+        lambda *args, **kwargs: pytest.fail("malformed lock reached the network"),
+    )
+
+    outcome = prepare_oaf_backend(
+        PrepareBackendRequest(
+            backend_id=OFFICIAL_BACKEND_ID,
+            cache_root=tmp_path / "cache",
+            archive_path=tmp_path / "checkpoint.zip",
+            download=False,
+        ),
+        backend_lock=malformed,
+    )
+
+    assert outcome.status == "integrity_failed"
+    assert outcome.exit_code == 2
+    assert not (tmp_path / "cache").exists()

@@ -28,6 +28,80 @@ def benchmark() -> None:
     """Benchmark drum transcription against DTX ground truth."""
 
 
+@benchmark.command("prepare-backend")
+@click.option("--backend", type=str, required=True)
+@click.option("--download", is_flag=True)
+@click.option(
+    "--archive",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+)
+@click.option(
+    "--cache-root",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+)
+@click.pass_context
+def prepare_backend_command(
+    ctx: click.Context,
+    backend: str,
+    download: bool,
+    archive: Path | None,
+    cache_root: Path,
+) -> None:
+    """Acquire or verify the immutable frozen OaF checkpoint cache."""
+    if download and archive is not None:
+        raise click.UsageError("--download and --archive are mutually exclusive.")
+
+    from src.benchmark import backend_prepare
+    from src.benchmark.backend_identity import canonical_json_bytes
+    from src.benchmark.backend_lock import load_backend_lock
+    from src.benchmark.backend_registry import OFFICIAL_BACKEND_ID
+
+    if backend != OFFICIAL_BACKEND_ID:
+        click.echo("backend_selection_invalid", err=True)
+        outcome = backend_prepare.PrepareBackendOutcome(
+            status="integrity_failed",
+            exit_code=2,
+            model_cache_path=None,
+        )
+    else:
+        lock_path = (
+            Path("config") / "benchmark" / "backends" / f"{OFFICIAL_BACKEND_ID}.backend-lock.json"
+        )
+        try:
+            backend_lock = load_backend_lock(lock_path)
+        except (OSError, ValueError):
+            click.echo("backend_lock_invalid", err=True)
+            outcome = backend_prepare.PrepareBackendOutcome(
+                status="integrity_failed",
+                exit_code=2,
+                model_cache_path=None,
+            )
+        else:
+            outcome = backend_prepare.prepare_oaf_backend(
+                backend_prepare.PrepareBackendRequest(
+                    backend_id=backend,
+                    cache_root=cache_root,
+                    archive_path=archive,
+                    download=download,
+                ),
+                backend_lock=backend_lock,
+            )
+
+    summary = {
+        "exit_code": outcome.exit_code,
+        "report_path": None,
+        "report_sha256": None,
+        "status": outcome.status,
+    }
+    standard_output = click.get_binary_stream("stdout")
+    standard_output.write(canonical_json_bytes(summary, trailing_newline=True))
+    standard_output.flush()
+    if outcome.exit_code:
+        ctx.exit(outcome.exit_code)
+
+
 def _validate_transcribe_one_provenance(
     source_audio_id: str | None,
     input_view_id: str | None,
