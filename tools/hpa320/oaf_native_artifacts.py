@@ -263,6 +263,7 @@ def publish_native_work_manifest(
             )
             if load_native_host_attestation_bundle(host_path, expected_phase=phase) != host:
                 raise NativeArtifactError("native-host bundle changed while payload was scanned")
+            _validate_host_bundle_reference(phase=phase, files=files, host=host)
             content = canonical_json_bytes(
                 _manifest_payload(phase=phase, files=files, host=host),
                 trailing_newline=True,
@@ -326,6 +327,7 @@ def load_native_work_manifest(
             )
             _verify_root_binding(root, anchor)
             files = _load_references(payload["files"], expected_phase)
+            _validate_host_bundle_reference(phase=expected_phase, files=files, host=host)
             _validate_host_bound_metadata(payload, host)
             return _manifest_from_payload(
                 path=manifest_path,
@@ -498,6 +500,22 @@ def _validate_host_bound_metadata(
         raise NativeArtifactError("native work manifest does not match its host attestation bundle")
 
 
+def _validate_host_bundle_reference(
+    *,
+    phase: str,
+    files: tuple[ArtifactReference, ...],
+    host: NativeHostAttestationBundle,
+) -> None:
+    expected_path = _phase_host_bundle_path(phase)
+    matching = [row for row in files if row.path == expected_path]
+    if (
+        len(matching) != 1
+        or matching[0].role != "native_host_attestation_bundle"
+        or matching[0].sha256 != host.sha256
+    ):
+        raise NativeArtifactError("native-host bundle row does not match its attestation identity")
+
+
 def _scan_phase_payload(
     *,
     phase: str,
@@ -638,6 +656,7 @@ def _hash_regular_file(
         if (
             not stat.S_ISREG(before.st_mode)
             or before.st_nlink != 1
+            or before.st_size <= 0
             or not _same_inode(expected_metadata, before)
         ):
             raise NativeArtifactError("native work payload file identity changed")

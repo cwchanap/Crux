@@ -23,6 +23,65 @@ BOOTSTRAP_FILES = {
     "calibration-image/runtime.oci.tar": "oci_layout_archive",
     "base-system-package-evidence.json": "base_system_package_evidence",
 }
+MEASUREMENT_FILES = {
+    "measurement-host-attestation/attestation-bundle.json": "native_host_attestation_bundle",
+    "measurement-host-attestation/native-host-evidence.json": "native_host_evidence",
+    "measurement-host-attestation/native-host-observation.json": "native_host_observation",
+    "operational-checkpoint-acquisition-evidence.json": "checkpoint_acquisition_evidence",
+    "operational-image/calibration-bootstrap-evidence.json": "calibration_bootstrap_evidence",
+    "operational-image/oci-layout-manifest.json": "oci_layout_manifest",
+    "operational-image/runtime.oci.tar": "oci_layout_archive",
+    "calibration-measurement-evidence.json": "calibration_measurement_evidence",
+}
+CANDIDATE_FILES = {
+    "candidate-host-attestation/attestation-bundle.json": "native_host_attestation_bundle",
+    "candidate-host-attestation/native-host-evidence.json": "native_host_evidence",
+    "candidate-host-attestation/native-host-observation.json": "native_host_observation",
+    "operational-checkpoint-acquisition-evidence.json": "checkpoint_acquisition_evidence",
+    "operational-image/calibration-bootstrap-evidence.json": "calibration_bootstrap_evidence",
+    "operational-image/oci-layout-manifest.json": "oci_layout_manifest",
+    "operational-image/runtime.oci.tar": "oci_layout_archive",
+    "seal-candidate/candidate-manifest.json": "seal_candidate_manifest",
+    "seal-candidate/docs/superpowers/evidence/hpa-320/legacy-conversion-audit.json": (
+        "conversion_audit"
+    ),
+    "seal-candidate/docs/superpowers/evidence/hpa-320/native/"
+    "candidate-host-attestation/attestation-bundle.json": "native_host_attestation_bundle",
+    "seal-candidate/docs/superpowers/evidence/hpa-320/native/"
+    "candidate-host-attestation/native-host-evidence.json": "native_host_evidence",
+    "seal-candidate/docs/superpowers/evidence/hpa-320/native/"
+    "candidate-host-attestation/native-host-observation.json": "native_host_observation",
+    "seal-candidate/runtime/oaf_tf1/host-adapter-source-manifest.json": (
+        "host_adapter_source_manifest"
+    ),
+    "seal-candidate/docs/superpowers/evidence/hpa-320/oaf-tensor-coverage.json": (
+        "tensor_coverage"
+    ),
+    "seal-candidate/docs/superpowers/evidence/hpa-320/oaf-advisory-snapshot.json": (
+        "advisory_snapshot"
+    ),
+    "seal-candidate/docs/superpowers/evidence/hpa-320/oaf-security-scan.json": "security_scan",
+    "seal-candidate/artifacts/benchmark/backends/oaf-tf1/runtime.oci.tar": "oci_layout_archive",
+    "seal-candidate/docs/superpowers/evidence/hpa-320/oaf-oci-layout-manifest.json": (
+        "oci_layout_manifest"
+    ),
+    "seal-candidate/tests/fixtures/oaf_tf1_smoke/canonical.wav": "smoke_audio",
+    "seal-candidate/docs/superpowers/evidence/hpa-320/oaf-smoke-prediction.jsonl": (
+        "smoke_prediction"
+    ),
+    "seal-candidate/tests/fixtures/oaf_tf1_smoke/smoke-oracle.json": "smoke_oracle",
+    "seal-candidate/config/benchmark/backends/"
+    "magenta-egmd-tf1-94529798-8hit-v1.seal-evidence.json": "seal_evidence",
+    "seal-candidate/config/benchmark/backends/"
+    "magenta-egmd-tf1-94529798-8hit-v1.runtime-lock.json": "runtime_lock",
+    "seal-candidate/config/benchmark/backends/"
+    "magenta-egmd-tf1-94529798-8hit-v1.backend-lock.json": "backend_lock",
+}
+PHASE_HOST_BUNDLE_PATHS = {
+    "bootstrap": "bootstrap-host-attestation/attestation-bundle.json",
+    "measurement": "measurement-host-attestation/attestation-bundle.json",
+    "candidate": "candidate-host-attestation/attestation-bundle.json",
+}
 
 
 def _set_bootstrap_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -119,19 +178,17 @@ def _rewrite_manifest(path: Path, payload: dict[str, Any]) -> None:
     path.write_bytes(canonical_json_bytes(payload, trailing_newline=True))
 
 
-def test_candidate_mapping_is_the_exact_prefixed_candidate_inventory() -> None:
-    expected_candidate_rows = {
-        "seal-candidate/candidate-manifest.json": "seal_candidate_manifest",
-        **{f"seal-candidate/{path}": role for role, path in artifacts_module.CANDIDATE_ARTIFACTS},
+def test_phase_mappings_are_the_exact_immutable_inventories() -> None:
+    assert dict(artifacts_module.BOOTSTRAP_FILES) == BOOTSTRAP_FILES
+    assert dict(artifacts_module.MEASUREMENT_FILES) == MEASUREMENT_FILES
+    assert dict(artifacts_module.CANDIDATE_FILES) == CANDIDATE_FILES
+    assert {phase: dict(files) for phase, files in artifacts_module.PHASE_FILES.items()} == {
+        "bootstrap": BOOTSTRAP_FILES,
+        "measurement": MEASUREMENT_FILES,
+        "candidate": CANDIDATE_FILES,
+        "diagnostic": {},
     }
-    actual_candidate_rows = {
-        path: role
-        for path, role in artifacts_module.CANDIDATE_FILES.items()
-        if path.startswith("seal-candidate/")
-    }
-    assert actual_candidate_rows == expected_candidate_rows
-    assert len(actual_candidate_rows) == 17
-    assert len(artifacts_module.CANDIDATE_FILES) == 24
+    assert dict(artifacts_module.PHASE_HOST_BUNDLE_PATHS) == PHASE_HOST_BUNDLE_PATHS
     assert all("github-job-api-record" not in path for path in artifacts_module.CANDIDATE_FILES)
 
 
@@ -172,6 +229,16 @@ def test_manifest_publisher_rejects_a_missing_allowlisted_file(
 
     with pytest.raises(artifacts_module.NativeArtifactError):
         _publish(bootstrap_payload)
+
+
+def test_manifest_publisher_rejects_an_empty_file_without_publishing_a_manifest(
+    bootstrap_payload: Any,
+) -> None:
+    (bootstrap_payload.root / "checkpoint-acquisition-evidence.json").write_bytes(b"")
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        _publish(bootstrap_payload)
+    assert not (bootstrap_payload.root / "artifact-manifest.json").exists()
 
 
 def test_manifest_publisher_rejects_a_symlinked_payload_file(
@@ -217,6 +284,21 @@ def test_manifest_loader_rejects_an_unknown_role(
     published = _publish(bootstrap_payload)
     payload = _manifest_payload(published.path)
     payload["files"][0]["role"] = "unknown_role"
+    _rewrite_manifest(published.path, payload)
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        artifacts_module.load_native_work_manifest(published.path, expected_phase="bootstrap")
+
+
+def test_manifest_loader_requires_the_host_bundle_row_to_match_its_top_level_digest(
+    bootstrap_payload: Any,
+) -> None:
+    published = _publish(bootstrap_payload)
+    payload = _manifest_payload(published.path)
+    host_bundle = next(
+        row for row in payload["files"] if row["role"] == "native_host_attestation_bundle"
+    )
+    host_bundle["sha256"] = "b" * 64
     _rewrite_manifest(published.path, payload)
 
     with pytest.raises(artifacts_module.NativeArtifactError):
@@ -320,6 +402,38 @@ def test_manifest_publisher_rejects_inode_drift_during_a_chunked_read(
             target.write_bytes(b"drifted\n")
 
     monkeypatch.setattr(artifacts_module, "_SCAN_CHUNK_HOOK", replace_after_first_chunk)
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        _publish(bootstrap_payload)
+    assert not (bootstrap_payload.root / "artifact-manifest.json").exists()
+
+
+def test_manifest_publisher_rejects_an_aba_host_bundle_replacement(
+    bootstrap_payload: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_bundle = read_regular_file_no_follow(bootstrap_payload.host_bundle)
+    scanned_non_host = bootstrap_payload.root / "base-system-package-evidence.json"
+    host_evidence = bootstrap_payload.root / "bootstrap-host-attestation/native-host-evidence.json"
+    alternate_bundle = b"alternate-host-bundle\n"
+    replaced = False
+    bundle_scanned = False
+
+    def replace_then_restore_host_bundle(path: Path) -> None:
+        nonlocal bundle_scanned, replaced
+        if path == scanned_non_host:
+            bootstrap_payload.host_bundle.write_bytes(alternate_bundle)
+            replaced = True
+        elif path == bootstrap_payload.host_bundle and replaced:
+            bundle_scanned = True
+        elif path == host_evidence and bundle_scanned:
+            bootstrap_payload.host_bundle.write_bytes(original_bundle)
+
+    monkeypatch.setattr(
+        artifacts_module,
+        "_SCAN_CHUNK_HOOK",
+        replace_then_restore_host_bundle,
+    )
 
     with pytest.raises(artifacts_module.NativeArtifactError):
         _publish(bootstrap_payload)
