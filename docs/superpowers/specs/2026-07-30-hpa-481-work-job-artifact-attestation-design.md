@@ -159,22 +159,41 @@ The job names remain:
 The `observe-native-host` job, `needs: observe-native-host`,
 `NATIVE_HOST_OBSERVATION`, `GH_TOKEN`, and the cross-job JSON output disappear.
 
+The dispatch operator resolves one branch or tag to the intended lowercase
+40-character commit immediately before dispatch, records that resolution, and invokes
+the workflow with both:
+
+```text
+gh workflow run hpa320-native-<phase>.yml \
+  --ref <dispatch-branch-or-tag> \
+  --raw-field commit_sha=<resolved-workflow-commit>
+```
+
+`gh workflow run --ref` is treated as a branch-or-tag selector, not as proof of an
+arbitrary commit SHA. An immutable tag is preferred. A branch is permitted only when
+its resolved commit is recorded immediately before dispatch; if it moves before
+GitHub creates the run, the in-job commit-equality preflight fails before native work.
+Passing `commit_sha` without the matching `--ref` is not a valid production dispatch.
+
 Each remaining job performs these ordered stages:
 
 1. Check out the exact lowercase 40-character dispatch commit.
 2. Install the existing pinned UV toolchain.
 3. On the observation step, export
-   `RUNNER_ENVIRONMENT: ${{ runner.environment }}` and
+   `RUNNER_ENVIRONMENT_CONTEXT: ${{ runner.environment }}`,
+   `RUNNER_OS_CONTEXT: ${{ runner.os }}`,
+   `RUNNER_ARCH_CONTEXT: ${{ runner.arch }}`, and
    `WORKFLOW_SOURCE_SHA: ${{ github.workflow_sha }}` without permitting
    caller-provided overrides.
-4. Observe and validate the current job before acquisition, Docker build, measurement,
-   or calibration.
+4. Invoke the single same-job host-bundle command and validate the current job before
+   acquisition, Docker build, measurement, or calibration.
 5. Produce the phase's existing outputs.
 6. Generate the canonical payload manifest.
 7. Pack the deterministic evidence archive.
 8. Generate one SLSA provenance attestation covering both the manifest and archive.
 9. Copy the action's local `bundle-path` output to a stable artifact filename.
-10. Upload the payload directory, manifest, archive, and local attestation bundle.
+10. In one success-artifact upload, publish the complete payload root, which already
+    contains the manifest, plus the sibling archive and local attestation bundle.
 
 The runner and workflow context values are injected only through the observation
 step's YAML `env:` mapping:
@@ -182,13 +201,21 @@ step's YAML `env:` mapping:
 ```yaml
 - name: Observe and validate the current native work job
   env:
-    RUNNER_ENVIRONMENT: ${{ runner.environment }}
+    RUNNER_ENVIRONMENT_CONTEXT: ${{ runner.environment }}
+    RUNNER_OS_CONTEXT: ${{ runner.os }}
+    RUNNER_ARCH_CONTEXT: ${{ runner.arch }}
     WORKFLOW_SOURCE_SHA: ${{ github.workflow_sha }}
 ```
 
-The workflow must not interpolate either context inside shell source or write it
-through `$GITHUB_ENV` or `$GITHUB_OUTPUT`. The caller cannot supply or override either
-step-level value.
+The custom names are deliberate. GitHub's default `RUNNER_*` variables cannot be
+overridden, so the workflow must not assign a context expression to
+`RUNNER_ENVIRONMENT`, `RUNNER_OS`, or `RUNNER_ARCH`. The host preflight independently
+reads each runner-supplied default and its corresponding `*_CONTEXT` value and requires
+them to agree before normalizing the accepted value into the observation.
+
+The workflow must not interpolate these contexts inside shell source or write them
+through `$GITHUB_ENV` or `$GITHUB_OUTPUT`. The caller cannot supply or override the
+step-level context values.
 
 The workflow grants only the permissions required for checkout and file provenance:
 
@@ -216,9 +243,34 @@ before editing the workflows. A newer tag does not replace this SHA without revi
 
 ## Same-job host observation
 
-`observe-github` no longer writes a value to `$GITHUB_OUTPUT`. It writes one canonical
-JSON file directly into the phase payload directory and derives the native-host
-evidence beside it.
+The sole production command replacing both `observe-github` and `finalize-github` is:
+
+```text
+uv run python -m tools.hpa320.oaf_host_attestation publish-github \
+  --phase <bootstrap|measurement|candidate> \
+  --output <payload-root>/<phase-host-bundle-directory>
+```
+
+The command reads the current job's GitHub defaults and the four reviewed step-level
+context values directly. It accepts no `--observation`, `--github-output`, API-record,
+job-ID, or token input, performs no GitHub REST request, and writes nothing to
+`$GITHUB_OUTPUT`. It fails closed before acquisition, Docker build, measurement, or
+calibration.
+
+On success, it atomically publishes a previously absent host-bundle directory
+containing exactly:
+
+```text
+attestation-bundle.json
+native-host-evidence.json
+native-host-observation.json
+```
+
+The observation, evidence, and bundle are first generated and cross-validated in a
+private sibling staging directory. Publication is one no-replace directory rename;
+failure removes the staging directory and leaves no partially acceptable output.
+The old `observe-github` and `finalize-github` production paths are removed rather
+than retained as compatibility aliases.
 
 The strict observation contains the existing repository, run, workflow, commit,
 Docker, uname, and numeric-fingerprint fields plus:
@@ -240,6 +292,9 @@ The accepted values are phase-specific:
 Every phase requires:
 
 ```text
+RUNNER_ENVIRONMENT_CONTEXT == RUNNER_ENVIRONMENT == github-hosted
+RUNNER_OS_CONTEXT == RUNNER_OS == Linux
+RUNNER_ARCH_CONTEXT == RUNNER_ARCH == X64
 runner_environment = github-hosted
 runner_os = Linux
 runner_arch = X64
@@ -286,6 +341,18 @@ It removes:
 ```text
 api_record_sha256, approved_labels, job_id
 ```
+
+For v2, `run_url` is the run-level URL with exact grammar:
+
+```text
+https://github.com/<owner>/<repository>/actions/runs/<positive-decimal-github_run_id>
+```
+
+Its owner/repository path must equal `github_repository`, and its terminal decimal
+component must equal `github_run_id`. It has no job suffix and no attempt suffix;
+`github_job` and `github_run_attempt` carry those identities separately. The
+historical v1 parser retains its existing job-level URL grammar for historical
+evidence only. A v1 job URL is rejected by the v2 parser.
 
 `tools/hpa320/github_host_evidence.py` remains the sole builder for the strict
 `github_hosted` evidence record. Its v2 builder consumes an already validated
@@ -347,6 +414,58 @@ the phase payload root and preserve nested subdirectories; they do not repeat th
 absolute, contain `.` or `..` segments, use backslashes, collide, escape through a
 symlink, or name the manifest, archive, or external Sigstore bundle.
 
+`role` is not an open string. The v1 manifest role vocabulary is exactly:
+
+```text
+advisory_snapshot
+backend_lock
+base_system_package_evidence
+calibration_bootstrap_evidence
+calibration_measurement_evidence
+checkpoint_acquisition_evidence
+conversion_audit
+diagnostic
+host_adapter_source_manifest
+native_host_attestation_bundle
+native_host_evidence
+native_host_observation
+oci_layout_archive
+oci_layout_manifest
+runtime_lock
+seal_candidate_manifest
+seal_evidence
+security_scan
+smoke_audio
+smoke_oracle
+smoke_prediction
+tensor_coverage
+```
+
+Unknown roles are rejected. `native_host_api_record` is deliberately absent and
+cannot appear in a v2 phase manifest.
+
+The shared vocabulary does not by itself authorize a file. Each phase producer owns
+an exact `(payload-root-relative path, role)` allowlist:
+
+- bootstrap permits the three bootstrap host-bundle paths, operational checkpoint
+  acquisition evidence, the calibration-image bootstrap/OCI outputs,
+  base-system-package evidence, and explicitly named successful diagnostics;
+- measurement permits the three measurement host-bundle paths, operational
+  checkpoint acquisition evidence, the operational-image bootstrap/OCI outputs,
+  calibration-measurement evidence, and explicitly named successful diagnostics; and
+- candidate permits the three candidate host-bundle paths, operational checkpoint
+  acquisition evidence, the operational-image bootstrap/OCI outputs, the seal
+  candidate manifest, every current seal-candidate member under its existing
+  `_CANDIDATE_ARTIFACTS` role except `native_host_api_record`, and explicitly named
+  successful diagnostics.
+
+The concrete mappings live as immutable phase constants in
+`tools/hpa320/oaf_native_artifacts.py` and are asserted path-for-path by tests.
+Diagnostics are allowed only at deterministic phase-specific paths below
+`diagnostics/`; the producer cannot classify an unexpected file as `diagnostic` to
+bypass the allowlist. A role valid for one phase or path remains invalid everywhere
+else unless that phase's mapping names it.
+
 The manifest covers every other regular payload file, including:
 
 - `attestation-bundle.json`;
@@ -356,9 +475,11 @@ The manifest covers every other regular payload file, including:
 - the phase-emitted OCI layout archive and its identity records where applicable; and
 - sanitized diagnostics retained by the successful run.
 
-The producer scans the payload after phase work and fails on an unlisted,
-multiply-listed, non-regular, or changed file. The consumer reproduces every row from
-the extracted payload before reading a phase result.
+The producer starts from the selected phase's exact mapping, scans the payload after
+phase work, and fails on an unlisted, missing, multiply listed, non-regular, or
+changed file. It never infers a role from a filename. The consumer selects the same
+phase mapping and reproduces every row from the extracted payload before reading a
+phase result.
 
 ## Deterministic evidence archive
 
@@ -410,6 +531,36 @@ archive, and detached Sigstore bundle as three non-overlapping paths. The action
 publishes the attestation to GitHub's attestation API and, for this public repository,
 the public Sigstore transparency log.
 
+Each phase uses exactly one `actions/upload-artifact` success invocation named:
+
+```text
+hpa320-native-<phase>-<workflow_commit>
+```
+
+Its `path` input contains exactly:
+
+```text
+artifacts/benchmark/backends/hpa320-<phase>/
+artifacts/benchmark/backends/hpa320-native-<phase>-<workflow_commit>.tar
+artifacts/benchmark/backends/hpa320-native-<phase>-<workflow_commit>.sigstore.json
+```
+
+The manifest is not listed separately because it is already inside the first path.
+The three inputs share `artifacts/benchmark/backends/` as their upload root, so a
+download contains one `hpa320-<phase>/` payload directory and the two sibling files;
+it must not contain an extra nested copy of the payload root, manifest, tar, or
+Sigstore bundle. The invocation sets:
+
+```text
+if-no-files-found: error
+retention-days: 30
+```
+
+It uses no wildcard and no second success upload. Workflow-contract tests freeze the
+artifact name, the three literal path shapes, the retention value, and the facts that
+the tar and Sigstore bundle are outside the payload root and absent from every
+manifest row.
+
 This exclusion is intentional: the bundle is the detached signature, certificate,
 timestamp, and transparency-log material used to verify the two subjects, so placing
 it inside either subject would create a cycle. It is not self-authenticating in
@@ -434,16 +585,53 @@ contains the external attestation's digest.
 ## Acceptance and verification
 
 Before a bootstrap, measurement, or candidate result can be checked in or consumed,
-the reviewer runs GitHub CLI verification against both signed subjects. The policy
-requires:
+the reviewer runs GitHub CLI verification against both signed subjects. The supported
+CLI range is:
 
 ```text
---repo cwchanap/Crux
---signer-workflow cwchanap/Crux/.github/workflows/hpa320-native-<phase>.yml
---source-digest <workflow_commit>
---signer-digest <workflow_commit>
---deny-self-hosted-runners
+2.68.0 <= gh < 3.0.0
 ```
+
+Version 2.68.0 is the first GitHub CLI release containing both
+`--source-digest` and `--signer-digest`. The reviewer records `gh version` and
+rejects an older or new-major client rather than silently dropping unsupported
+policy flags.
+
+`gh attestation verify` accepts one artifact path per invocation. Acceptance
+therefore requires these two invocations, with the same phase, commit, local bundle,
+trusted root, and policy flags:
+
+```text
+gh attestation verify <artifact-manifest-path> \
+  --repo cwchanap/Crux \
+  --signer-workflow cwchanap/Crux/.github/workflows/hpa320-native-<phase>.yml \
+  --source-digest <workflow_commit> \
+  --signer-digest <workflow_commit> \
+  --deny-self-hosted-runners \
+  --digest-alg sha256 \
+  --predicate-type https://slsa.dev/provenance/v1 \
+  --cert-oidc-issuer https://token.actions.githubusercontent.com \
+  --bundle <sigstore-bundle-path> \
+  --custom-trusted-root <trusted-root-path> \
+  --format json
+
+gh attestation verify <archive-path> \
+  --repo cwchanap/Crux \
+  --signer-workflow cwchanap/Crux/.github/workflows/hpa320-native-<phase>.yml \
+  --source-digest <workflow_commit> \
+  --signer-digest <workflow_commit> \
+  --deny-self-hosted-runners \
+  --digest-alg sha256 \
+  --predicate-type https://slsa.dev/provenance/v1 \
+  --cert-oidc-issuer https://token.actions.githubusercontent.com \
+  --bundle <sigstore-bundle-path> \
+  --custom-trusted-root <trusted-root-path> \
+  --format json
+```
+
+Both commands must succeed and report the same verified attestation statement, whose
+subject array contains both expected SHA-256 identities. A pass for only one subject
+is insufficient.
 
 Both digest flags deliberately receive the same value. This is valid only because the
 producer preflight has already required:
@@ -459,11 +647,11 @@ require a new reviewed design and separate `--signer-digest` and `--source-diges
 authorities; an implementer must not loosen this policy in place.
 
 The saved local bundle is supplied with `--bundle` for durable local-bundle
-verification; online lookup may be performed as a second comparison but is not the
-sole authority. A fully disconnected verification additionally supplies a trusted
-root obtained out of band through `gh attestation trusted-root`; the local bundle
-alone is not described as a complete offline trust store. The verifier uses the
-default SLSA provenance predicate and GitHub Actions OIDC issuer.
+verification. The trusted root is obtained out of band through
+`gh attestation trusted-root`, transferred independently, and supplied explicitly to
+both commands. The local bundle alone is not described as a complete offline trust
+store. Online lookup may be performed as a second comparison but is not the sole
+authority.
 
 After signature verification, the consumer:
 
@@ -491,8 +679,12 @@ the review checklist, but that output is not itself treated as signed authority.
 - A runner-environment, OS, architecture, commit, workflow, or Docker mismatch fails
   before native work starts.
 - Native phase failure fails the job and cannot produce an accepted success manifest.
-- Partial sanitized diagnostics may still be uploaded under a clearly diagnostic
-  artifact name. They are never relabeled as accepted evidence.
+- Partial sanitized diagnostics may still be uploaded under exactly
+  `hpa320-native-<phase>-diagnostic-<workflow_commit>-run-<github_run_id>-attempt-<github_run_attempt>`.
+  That name cannot equal the success artifact name, the diagnostic upload contains no
+  `status: success` artifact manifest, archive, or Sigstore bundle, and it is never
+  relabeled as accepted evidence. When present, the diagnostic upload contains only
+  explicitly allowlisted sanitized files and uses `retention-days: 30`.
 - Manifest or deterministic-packing failure fails the job before attestation.
 - Attestation or upload failure fails the job; unsigned phase results are not
   accepted.
@@ -536,17 +728,23 @@ for another job, or treat v1 and v2 as equivalent.
 - Observation accepts the exact GitHub-hosted/Linux/X64 environment.
 - Observation rejects missing, empty, self-hosted, wrong-OS, and wrong-architecture
   runner values before Docker work.
+- Observation rejects disagreement between each runner context value and its
+  corresponding runner-supplied default.
 - Observation rejects wrong job, workflow ref, workflow source SHA, repository, run
   identity, or commit.
+- V2 evidence accepts only the exact run-level `run_url` grammar and rejects the v1
+  job-level form.
 - V2 bundle parsing is strict and rejects v1 substitution at new acceptance
   boundaries.
 - Generic GitHub-hosted native evidence requires `runner_environment`.
 - Manifest parsing rejects noncanonical JSON, extra or missing keys, path escape,
-  duplicates, wrong ordering, missing files, size/hash drift, and self-reference.
+  duplicates, wrong ordering, missing files, size/hash drift, self-reference, an
+  unknown role, and a valid role at a phase-disallowed path.
 - Deterministic packing reproduces byte-identical archives and rejects unsafe member
   types or metadata.
 - External verification policy requires repository, phase workflow, source/signing
-  commit, SLSA predicate, GitHub issuer, and denial of self-hosted runners.
+  commit, SLSA predicate, GitHub issuer, denial of self-hosted runners, a supported
+  GitHub CLI version, and separate passes for both signed subjects.
 - Cross-validation rejects a valid signature over internally inconsistent evidence.
 
 ### Workflow contract tests
@@ -555,13 +753,19 @@ Each phase workflow test requires:
 
 - exactly one job with the expected `native-*` name;
 - no `observe-native-host`, `needs`, `GH_TOKEN`, or `actions: read`;
-- explicit `runner.environment` propagation;
+- exactly one `publish-github` invocation and no `observe-github`,
+  `finalize-github`, `--github-output`, or Jobs API input;
+- explicit `runner.environment`, `runner.os`, and `runner.arch` propagation through
+  the three custom `*_CONTEXT` variables, with no attempted `RUNNER_*` override;
 - host preflight before any native work;
 - manifest and archive generation after successful native work;
 - immutable-SHA-pinned `actions/attest` in that same job;
 - `contents: read`, `id-token: write`, and `attestations: write`;
 - attestation of both manifest and archive;
-- upload of the local Sigstore bundle; and
+- one success upload with the exact success name, three non-overlapping paths,
+  `if-no-files-found: error`, and `retention-days: 30`;
+- the payload-root-relative manifest excludes the sibling tar and Sigstore bundle;
+- a diagnostic upload name that cannot collide with the success artifact; and
 - no bootstrap, measurement, or candidate acceptance before attestation succeeds.
 
 A repository-wide workflow test also requires that
@@ -634,7 +838,17 @@ implementation, the plan records the exact replacement command and source.
 ## Supersession of the HPA-320 design
 
 For bootstrap, measurement, and candidate production after this migration, this
-document supersedes the HPA-320 design passages that require:
+document supersedes the conflicting provenance passages under these exact HPA-320
+design headings:
+
+- `Native-amd64 calibration and sealing prerequisite`;
+- `Calibration-bootstrap authority`;
+- `Calibration, candidate publication, and seal`;
+- `Verification and Execution Flow`;
+- `Normative Schema Key Reference` > `Provenance and report schemas`; and
+- `Continuous Integration`.
+
+Within those passages, the superseded requirements are:
 
 - a separate `observe-native-host` job;
 - a completed `observe-native-host` Jobs API record;
@@ -643,8 +857,9 @@ document supersedes the HPA-320 design passages that require:
 - a four-file phase host bundle containing that API record.
 
 All unrelated HPA-320 contracts remain in force. The HPA-320 design should receive a
-short amendment pointing to this document rather than silently retaining conflicting
-instructions.
+short amendment under each affected heading naming the replaced paragraph by its
+unique opening sentence and pointing to this document. Line numbers are not used
+because later editorial changes would make them stale.
 
 ## Operational gate
 
@@ -670,5 +885,13 @@ and final sealing retain their existing human-review and request/evidence orderi
   <https://github.com/actions/attest>
 - `gh attestation verify`:
   <https://cli.github.com/manual/gh_attestation_verify>
+- GitHub CLI 2.68.0 digest-policy release:
+  <https://github.com/cli/cli/releases/tag/v2.68.0>
 - `gh attestation trusted-root`:
   <https://cli.github.com/manual/gh_attestation_trusted-root>
+- `gh workflow run` dispatch-ref contract:
+  <https://cli.github.com/manual/gh_workflow_run>
+- GitHub Actions default-variable contract:
+  <https://docs.github.com/en/actions/reference/workflows-and-actions/variables>
+- `actions/upload-artifact` multiple-path contract:
+  <https://github.com/actions/upload-artifact/tree/v4#upload-using-multiple-paths-and-exclusions>
