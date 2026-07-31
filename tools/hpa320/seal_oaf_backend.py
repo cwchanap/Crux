@@ -2950,6 +2950,10 @@ def _validate_candidate_work_payload(*, payload_root: Path, repository_root: Pat
     _validate_measurement_evidence_authority(
         measurement=measurement,
         accepted=accepted,
+        bundle=accepted.measurement_bundle,
+        host=accepted.measurement_host,
+        host_payload=accepted.measurement_host_payload,
+        operational_bootstrap=accepted.bootstrap,
     )
     profile = load_seal_profile_request(repository / _SEAL_PROFILE_REQUEST_PATH)
     _validate_seal_profile_authority(
@@ -2979,6 +2983,9 @@ class _AcceptedNativeAuthorities:
     bootstrap_request: CalibrationBootstrapRequest
     checkpoint: CheckpointAcquisitionEvidence
     checkpoint_request: CheckpointAcquisitionRequest
+    measurement_bundle: NativeHostAttestationBundle
+    measurement_host: NativeHostEvidence
+    measurement_host_payload: dict[str, JsonValue]
 
 
 @dataclass(frozen=True)
@@ -3012,6 +3019,9 @@ def _load_accepted_native_authorities(repository: Path) -> _AcceptedNativeAuthor
         or bootstrap_request.payload["base_system_package_request_sha256"] != base_request.sha256
     ):
         raise SealError("bootstrap request does not bind its accepted operational authorities")
+    measurement_bundle, measurement_host, measurement_host_payload = (
+        _load_accepted_measurement_host_authority(evidence_root)
+    )
     return _AcceptedNativeAuthorities(
         base=base,
         base_request=base_request,
@@ -3019,7 +3029,39 @@ def _load_accepted_native_authorities(repository: Path) -> _AcceptedNativeAuthor
         bootstrap_request=bootstrap_request,
         checkpoint=checkpoint,
         checkpoint_request=checkpoint_request,
+        measurement_bundle=measurement_bundle,
+        measurement_host=measurement_host,
+        measurement_host_payload=measurement_host_payload,
     )
+
+
+def _load_accepted_measurement_host_authority(
+    evidence_root: Path,
+) -> tuple[NativeHostAttestationBundle, NativeHostEvidence, dict[str, JsonValue]]:
+    host_root = evidence_root / "measurement-host-attestation"
+    bundle_path = host_root / "attestation-bundle.json"
+    host_path = host_root / "native-host-evidence.json"
+    try:
+        bundle = load_native_host_attestation_bundle(bundle_path, expected_phase="measurement")
+    except HostAttestationError as error:
+        raise SealError(f"accepted measurement native-host bundle is invalid: {error}") from None
+    host_content = _read_regular(host_path, "accepted measurement native host evidence")
+    bundled_host_content = _read_regular(
+        host_root / bundle.native_host_evidence.name,
+        "accepted measurement bundled native host evidence",
+    )
+    if (
+        host_content != bundled_host_content
+        or len(host_content) != bundle.native_host_evidence.size
+        or sha256_hex(host_content) != bundle.native_host_evidence.sha256
+    ):
+        raise SealError("accepted measurement native host evidence does not match its bundle")
+    host_payload = _parse_canonical_json_content(
+        host_content,
+        "accepted measurement native host evidence",
+    )
+    host = _native_host_from_record(host_payload, "accepted measurement native host evidence")
+    return bundle, host, host_payload
 
 
 def _load_operational_authority(

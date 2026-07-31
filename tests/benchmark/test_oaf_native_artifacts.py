@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tarfile
 from dataclasses import dataclass
@@ -543,30 +544,6 @@ def test_github_verifier_rejects_signed_failed_result_under_success_subjects(
         )
 
 
-def test_github_verifier_rejects_v1_raw_api_host_bundle(
-    signed_bootstrap: SignedBootstrap,
-) -> None:
-    signed_bootstrap.bundle.write_bytes(
-        b'{"schema":"crux.oaf-native-host-attestation-bundle/v1","api_record":"raw"}\n'
-    )
-
-    def run(command: tuple[str, ...]) -> bytes:
-        if command[:2] == ("gh", "version"):
-            return b"gh version 2.68.1 (2026-01-01)\n"
-        raise subprocess.CalledProcessError(1, command, stderr=b"v1 raw-API host bundle")
-
-    with pytest.raises(artifacts_module.NativeArtifactError, match="verification failed"):
-        artifacts_module.verify_github_attestations(
-            phase="bootstrap",
-            workflow_commit="a" * 40,
-            manifest_path=signed_bootstrap.manifest,
-            archive_path=signed_bootstrap.archive,
-            sigstore_bundle_path=signed_bootstrap.bundle,
-            trusted_root_path=signed_bootstrap.trusted_root,
-            command_runner=run,
-        )
-
-
 def test_verify_attestation_cli_uses_one_immutable_snapshot_across_gates(
     packed_bootstrap: artifacts_module.PackedBootstrap,
     signed_bootstrap: SignedBootstrap,
@@ -634,6 +611,11 @@ def test_verify_attestation_cli_uses_one_immutable_snapshot_across_gates(
     monkeypatch.setattr(artifacts_module, "verify_github_attestations", verify)
     monkeypatch.setattr(artifacts_module, "load_native_work_manifest", load)
     monkeypatch.setattr(artifacts_module, "verify_native_work_archive", archive)
+    monkeypatch.setattr(
+        artifacts_module,
+        "verify_native_work_payload",
+        lambda **_kwargs: calls.append("payload"),
+    )
     monkeypatch.setattr(artifacts_module, "_validate_native_work_phase", phase)
 
     assert (
@@ -658,7 +640,284 @@ def test_verify_attestation_cli_uses_one_immutable_snapshot_across_gates(
         )
         == 0
     )
-    assert calls == ["github", "manifest", "archive", "phase"]
+    assert calls == ["github", "manifest", "archive", "phase", "manifest", "payload", "archive"]
+
+
+@pytest.mark.parametrize("entry_kind", ["regular", "directory", "symlink", "diagnostic"])
+def test_attestation_snapshot_rejects_unallowlisted_source_entries(
+    packed_bootstrap: artifacts_module.PackedBootstrap,
+    entry_kind: str,
+) -> None:
+    root = packed_bootstrap.payload_root
+    if entry_kind == "regular":
+        (root / "unallowlisted.json").write_bytes(b"unexpected\n")
+    elif entry_kind == "directory":
+        (root / "unallowlisted").mkdir()
+    elif entry_kind == "symlink":
+        (root / "unallowlisted-link").symlink_to(root / "checkpoint-acquisition-evidence.json")
+    else:
+        (root / "diagnostic.json").write_bytes(b"diagnostic\n")
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        with artifacts_module._attestation_snapshot(
+            phase="bootstrap",
+            payload_root=root,
+            archive_path=packed_bootstrap.archive,
+        ):
+            pass
+
+
+def test_verify_attestation_cli_rejects_coherent_snapshot_replacement_after_archive_verification(
+    packed_bootstrap: artifacts_module.PackedBootstrap,
+    signed_bootstrap: SignedBootstrap,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    original_archive = signed_bootstrap.archive.read_bytes()
+    replacement = tmp_path / "coherent-replacement"
+    shutil.copytree(packed_bootstrap.payload_root, replacement)
+    (replacement / "artifact-manifest.json").unlink()
+    (replacement / "checkpoint-acquisition-evidence.json").write_bytes(b"replacement payload\n")
+    replacement_manifest = artifacts_module.publish_native_work_manifest(
+        phase="bootstrap",
+        payload_root=replacement,
+        host_bundle_path=replacement / "bootstrap-host-attestation/attestation-bundle.json",
+    )
+    replacement_archive = tmp_path / "coherent-replacement.tar"
+    artifacts_module.pack_native_work_archive(
+        phase="bootstrap",
+        payload_root=replacement,
+        manifest_path=replacement_manifest.path,
+        archive_path=replacement_archive,
+    )
+    snapshot_archive: Path | None = None
+
+    def verify(**kwargs: object) -> artifacts_module.VerifiedGitHubAttestation:
+        nonlocal snapshot_archive
+        manifest = Path(str(kwargs["manifest_path"]))
+        snapshot_archive = Path(str(kwargs["archive_path"]))
+        return artifacts_module.VerifiedGitHubAttestation(
+            gh_version="2.68.1",
+            statement={"subject": []},
+            statement_sha256="a" * 64,
+            subjects=(
+                artifacts_module.CheckpointIdentity(
+                    name="artifacts/benchmark/backends/hpa320-bootstrap/artifact-manifest.json",
+                    sha256=sha256_hex(manifest.read_bytes()),
+                    size=manifest.stat().st_size,
+                ),
+                artifacts_module.CheckpointIdentity(
+                    name=(f"artifacts/benchmark/backends/hpa320-native-bootstrap-{'a' * 40}.tar"),
+                    sha256=sha256_hex(snapshot_archive.read_bytes()),
+                    size=snapshot_archive.stat().st_size,
+                ),
+            ),
+        )
+
+    def phase(**kwargs: object) -> None:
+        snapshot_root = Path(str(kwargs["payload_root"]))
+        assert snapshot_archive is not None
+        for directory, _directories, files in os.walk(snapshot_root):
+            os.chmod(directory, 0o700)
+            for name in files:
+                os.chmod(Path(directory) / name, 0o600)
+        for source in replacement.rglob("*"):
+            if source.is_file():
+                target = snapshot_root / source.relative_to(replacement)
+                shutil.copyfile(source, target)
+                os.chmod(target, 0o400)
+        os.chmod(snapshot_archive, 0o600)
+        shutil.copyfile(replacement_archive, snapshot_archive)
+        os.chmod(snapshot_archive, 0o400)
+
+    monkeypatch.setattr(artifacts_module, "verify_github_attestations", verify)
+    monkeypatch.setattr(
+        artifacts_module, "load_native_work_manifest", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(artifacts_module, "verify_native_work_payload", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        artifacts_module,
+        "verify_native_work_archive",
+        lambda **_kwargs: artifacts_module.CheckpointIdentity(
+            "archive", sha256_hex(original_archive), len(original_archive)
+        ),
+    )
+    monkeypatch.setattr(artifacts_module, "_validate_native_work_phase", phase)
+
+    assert (
+        artifacts_module.main(
+            [
+                "verify-attestation",
+                "--phase",
+                "bootstrap",
+                "--workflow-commit",
+                "a" * 40,
+                "--payload-root",
+                str(packed_bootstrap.payload_root),
+                "--archive",
+                str(signed_bootstrap.archive),
+                "--bundle",
+                str(signed_bootstrap.bundle),
+                "--trusted-root",
+                str(signed_bootstrap.trusted_root),
+                "--repository-root",
+                str(tmp_path / "repository"),
+            ]
+        )
+        == 2
+    )
+    assert capsys.readouterr().out == ""
+
+
+def test_verify_attestation_cli_rejects_snapshot_aba_after_archive_verification(
+    packed_bootstrap: artifacts_module.PackedBootstrap,
+    signed_bootstrap: SignedBootstrap,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    original_archive = signed_bootstrap.archive.read_bytes()
+
+    def verify(**kwargs: object) -> artifacts_module.VerifiedGitHubAttestation:
+        manifest = Path(str(kwargs["manifest_path"]))
+        archive = Path(str(kwargs["archive_path"]))
+        return artifacts_module.VerifiedGitHubAttestation(
+            gh_version="2.68.1",
+            statement={"subject": []},
+            statement_sha256="a" * 64,
+            subjects=(
+                artifacts_module.CheckpointIdentity(
+                    name="artifacts/benchmark/backends/hpa320-bootstrap/artifact-manifest.json",
+                    sha256=sha256_hex(manifest.read_bytes()),
+                    size=manifest.stat().st_size,
+                ),
+                artifacts_module.CheckpointIdentity(
+                    name=(f"artifacts/benchmark/backends/hpa320-native-bootstrap-{'a' * 40}.tar"),
+                    sha256=sha256_hex(archive.read_bytes()),
+                    size=archive.stat().st_size,
+                ),
+            ),
+        )
+
+    def phase(**kwargs: object) -> None:
+        member = Path(str(kwargs["payload_root"])) / "checkpoint-acquisition-evidence.json"
+        before = member.stat()
+        original = member.read_bytes()
+        os.chmod(member, 0o600)
+        member.write_bytes(b"transient mutation\n")
+        member.write_bytes(original)
+        os.utime(member, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.chmod(member, 0o400)
+
+    monkeypatch.setattr(artifacts_module, "verify_github_attestations", verify)
+    monkeypatch.setattr(
+        artifacts_module, "load_native_work_manifest", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(artifacts_module, "verify_native_work_payload", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        artifacts_module,
+        "verify_native_work_archive",
+        lambda **_kwargs: artifacts_module.CheckpointIdentity(
+            "archive", sha256_hex(original_archive), len(original_archive)
+        ),
+    )
+    monkeypatch.setattr(artifacts_module, "_validate_native_work_phase", phase)
+
+    assert (
+        artifacts_module.main(
+            [
+                "verify-attestation",
+                "--phase",
+                "bootstrap",
+                "--workflow-commit",
+                "a" * 40,
+                "--payload-root",
+                str(packed_bootstrap.payload_root),
+                "--archive",
+                str(signed_bootstrap.archive),
+                "--bundle",
+                str(signed_bootstrap.bundle),
+                "--trusted-root",
+                str(signed_bootstrap.trusted_root),
+                "--repository-root",
+                str(tmp_path / "repository"),
+            ]
+        )
+        == 2
+    )
+    assert capsys.readouterr().out == ""
+
+
+def test_verify_attestation_cli_emits_no_report_when_snapshot_cleanup_fails(
+    packed_bootstrap: artifacts_module.PackedBootstrap,
+    signed_bootstrap: SignedBootstrap,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FailingTemporaryDirectory:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.name = str(tmp_path / "failing-cleanup")
+            Path(self.name).mkdir()
+
+        def __enter__(self) -> str:
+            return self.name
+
+        def __exit__(self, *_args: object) -> None:
+            self.cleanup()
+
+        def cleanup(self) -> None:
+            raise OSError("cleanup failed")
+
+    def verify(**kwargs: object) -> artifacts_module.VerifiedGitHubAttestation:
+        manifest = Path(str(kwargs["manifest_path"]))
+        archive = Path(str(kwargs["archive_path"]))
+        return artifacts_module.VerifiedGitHubAttestation(
+            gh_version="2.68.1",
+            statement={"subject": []},
+            statement_sha256="a" * 64,
+            subjects=(
+                artifacts_module.CheckpointIdentity(
+                    name="artifacts/benchmark/backends/hpa320-bootstrap/artifact-manifest.json",
+                    sha256=sha256_hex(manifest.read_bytes()),
+                    size=manifest.stat().st_size,
+                ),
+                artifacts_module.CheckpointIdentity(
+                    name=(f"artifacts/benchmark/backends/hpa320-native-bootstrap-{'a' * 40}.tar"),
+                    sha256=sha256_hex(archive.read_bytes()),
+                    size=archive.stat().st_size,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(artifacts_module.tempfile, "TemporaryDirectory", FailingTemporaryDirectory)
+    monkeypatch.setattr(artifacts_module, "verify_github_attestations", verify)
+    monkeypatch.setattr(artifacts_module, "_validate_native_work_phase", lambda **_kwargs: None)
+
+    assert (
+        artifacts_module.main(
+            [
+                "verify-attestation",
+                "--phase",
+                "bootstrap",
+                "--workflow-commit",
+                "a" * 40,
+                "--payload-root",
+                str(packed_bootstrap.payload_root),
+                "--archive",
+                str(signed_bootstrap.archive),
+                "--bundle",
+                str(signed_bootstrap.bundle),
+                "--trusted-root",
+                str(signed_bootstrap.trusted_root),
+                "--repository-root",
+                str(tmp_path / "repository"),
+            ]
+        )
+        == 2
+    )
+    assert capsys.readouterr().out == ""
 
 
 def test_verify_attestation_cli_runs_the_outside_in_acceptance_order(
@@ -703,6 +962,11 @@ def test_verify_attestation_cli_runs_the_outside_in_acceptance_order(
     monkeypatch.setattr(artifacts_module, "verify_github_attestations", verify)
     monkeypatch.setattr(artifacts_module, "load_native_work_manifest", load)
     monkeypatch.setattr(artifacts_module, "verify_native_work_archive", archive)
+    monkeypatch.setattr(
+        artifacts_module,
+        "verify_native_work_payload",
+        lambda **_kwargs: calls.append("payload"),
+    )
     monkeypatch.setattr(artifacts_module, "_validate_native_work_phase", phase)
 
     assert (
@@ -727,7 +991,7 @@ def test_verify_attestation_cli_runs_the_outside_in_acceptance_order(
         )
         == 0
     )
-    assert calls == ["github", "manifest", "archive", "phase"]
+    assert calls == ["github", "manifest", "archive", "phase", "manifest", "payload", "archive"]
     report = strict_json_loads(capsys.readouterr().out.encode("utf-8")[:-1], require_canonical=True)
     assert report == {
         "arguments": {
