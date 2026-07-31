@@ -40,9 +40,26 @@ _PROTOCOL_SCHEMA = "crux.transcription-runner/v1"
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _CPU = re.compile(r"(?:[1-9][0-9]*)(?:\.[0-9]+)?\Z")
 _OPAQUE_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
-_GITHUB_RUN = re.compile(
-    r"https://github\.com/[^/?#]+/[^/?#]+/actions/runs/[1-9][0-9]*/job/[1-9][0-9]*\Z"
+_GITHUB_HOSTED_SCHEMA = "crux.github-hosted-native-evidence/v2"
+_GITHUB_HOSTED_PAYLOAD_KEYS = frozenset(
+    {
+        "schema",
+        "github_job",
+        "github_repository",
+        "github_run_attempt",
+        "github_run_id",
+        "github_workflow_ref",
+        "github_workflow_sha",
+        "host_numeric_fingerprint",
+        "run_url",
+        "runner_arch",
+        "runner_environment",
+        "runner_os",
+        "workflow_commit",
+    }
 )
+_GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+_LOWERCASE_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 _SAFE_DIAGNOSTIC = re.compile(
     rb"code=[a-z][a-z0-9_]*"
     rb"(?: tensor=[A-Za-z0-9_.:/-]+)?"
@@ -136,7 +153,7 @@ class NativeHostEvidence:
         if not isinstance(plain, dict):
             raise ValueError("native host evidence payload must be an object")
         if self.kind == "github_hosted":
-            _validate_github_hosted(plain)
+            _validate_github_hosted_payload(plain)
         elif self.kind == "orchestrator_signed":
             _validate_orchestrator(plain)
         elif self.kind == "approved_local":
@@ -159,33 +176,40 @@ class NativeHostEvidence:
         object.__setattr__(self, "host_numeric_fingerprint", fingerprint)
 
 
-def _validate_github_hosted(payload: dict[str, JsonValue]) -> None:
-    _require_exact_keys(
-        payload,
-        {
-            "api_record_sha256",
-            "approved_labels",
-            "job_id",
-            "run_url",
-            "runner_arch",
-            "runner_os",
-            "workflow_commit",
-            "host_numeric_fingerprint",
-        },
-        "GitHub-hosted evidence",
-    )
-    if payload["runner_os"] != "Linux" or payload["runner_arch"] != "X64":
-        raise ValueError("GitHub-hosted evidence must be Linux X64")
-    if payload["approved_labels"] != ["Linux", "X64"]:
-        raise ValueError("GitHub-hosted evidence labels are not approved")
-    _positive_integer(payload["job_id"], "GitHub-hosted job ID")
-    commit = _safe_text(payload["workflow_commit"], "workflow commit")
-    if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
-        raise ValueError("workflow commit must be a lowercase Git identity")
-    run_url = _safe_text(payload["run_url"], "immutable run URL")
-    if not _GITHUB_RUN.fullmatch(run_url):
-        raise ValueError("GitHub run URL must be immutable")
-    _require_hash_value(payload["api_record_sha256"], "API record SHA-256")
+def _validate_github_hosted_payload(payload: Mapping[str, JsonValue]) -> None:
+    if set(payload) != _GITHUB_HOSTED_PAYLOAD_KEYS:
+        raise ValueError("github_hosted native evidence must contain the exact v2 key set")
+    repository = payload["github_repository"]
+    run_id = payload["github_run_id"]
+    run_attempt = payload["github_run_attempt"]
+    workflow_commit = payload["workflow_commit"]
+    workflow_sha = payload["github_workflow_sha"]
+    if (
+        payload["schema"] != _GITHUB_HOSTED_SCHEMA
+        or not isinstance(repository, str)
+        or _GITHUB_REPOSITORY.fullmatch(repository) is None
+        or not isinstance(run_id, int)
+        or isinstance(run_id, bool)
+        or run_id <= 0
+        or not isinstance(run_attempt, int)
+        or isinstance(run_attempt, bool)
+        or run_attempt <= 0
+        or payload["run_url"] != f"https://github.com/{repository}/actions/runs/{run_id}"
+        or not isinstance(payload["github_job"], str)
+        or not payload["github_job"]
+        or not isinstance(payload["github_workflow_ref"], str)
+        or not payload["github_workflow_ref"]
+        or not isinstance(workflow_commit, str)
+        or _LOWERCASE_COMMIT.fullmatch(workflow_commit) is None
+        or not isinstance(workflow_sha, str)
+        or _LOWERCASE_COMMIT.fullmatch(workflow_sha) is None
+        or workflow_sha != workflow_commit
+        or payload["runner_environment"] != "github-hosted"
+        or payload["runner_os"] != "Linux"
+        or payload["runner_arch"] != "X64"
+    ):
+        raise ValueError("github_hosted native evidence identity is invalid")
+    parse_host_numeric_fingerprint(payload["host_numeric_fingerprint"])
 
 
 def _validate_orchestrator(payload: dict[str, JsonValue]) -> None:
