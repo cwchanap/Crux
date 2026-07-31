@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -176,6 +177,415 @@ def _manifest_payload(path: Path) -> dict[str, Any]:
 
 def _rewrite_manifest(path: Path, payload: dict[str, Any]) -> None:
     path.write_bytes(canonical_json_bytes(payload, trailing_newline=True))
+
+
+def test_packer_reproduces_byte_identical_ustar_archives(
+    bootstrap_payload: Any,
+    tmp_path: Path,
+) -> None:
+    manifest = artifacts_module.publish_native_work_manifest(
+        phase="bootstrap",
+        payload_root=bootstrap_payload.root,
+        host_bundle_path=bootstrap_payload.host_bundle,
+    )
+    first = tmp_path / "first.tar"
+    second = tmp_path / "second.tar"
+
+    artifacts_module.pack_native_work_archive(
+        phase="bootstrap",
+        payload_root=bootstrap_payload.root,
+        manifest_path=manifest.path,
+        archive_path=first,
+    )
+    artifacts_module.pack_native_work_archive(
+        phase="bootstrap",
+        payload_root=bootstrap_payload.root,
+        manifest_path=manifest.path,
+        archive_path=second,
+    )
+
+    content = first.read_bytes()
+    assert content == second.read_bytes()
+    assert content.endswith(b"\0" * 1024)
+
+    root = f"hpa320-native-bootstrap-{'a' * 40}/"
+    directories = sorted(
+        {
+            f"{root}{directory}/"
+            for path in BOOTSTRAP_FILES
+            for directory in (
+                "/".join(path.split("/")[:index]) for index in range(1, len(path.split("/")))
+            )
+        },
+        key=str.encode,
+    )
+    expected_members = [
+        root,
+        *directories,
+        *sorted(
+            [f"{root}artifact-manifest.json", *(f"{root}{path}" for path in BOOTSTRAP_FILES)],
+            key=str.encode,
+        ),
+    ]
+    with tarfile.open(first, mode="r:") as archive:
+        members = archive.getmembers()
+    assert [member.name for member in members] == [
+        member.rstrip("/") for member in expected_members
+    ]
+    raw_member_names = []
+    for start, _ in _tar_member_spans(content):
+        header = content[start : start + 512]
+        name = header[:100].split(b"\0", 1)[0]
+        prefix = header[345:500].split(b"\0", 1)[0]
+        raw_member_names.append((prefix + (b"/" if prefix else b"") + name).decode("utf-8"))
+    assert raw_member_names == expected_members
+    assert all(member.uid == member.gid == member.mtime == 0 for member in members)
+    assert all(member.uname == member.gname == "" for member in members)
+    assert all(member.pax_headers == {} for member in members)
+    assert all(member.mode == (0o755 if member.isdir() else 0o644) for member in members)
+    assert all(member.isdir() or member.isfile() for member in members)
+
+
+@pytest.fixture
+def packed_bootstrap(bootstrap_payload: Any, tmp_path: Path) -> Any:
+    published = _publish(bootstrap_payload)
+    archive = tmp_path / f"hpa320-native-bootstrap-{'a' * 40}.tar"
+    artifacts_module.pack_native_work_archive(
+        phase="bootstrap",
+        payload_root=bootstrap_payload.root,
+        manifest_path=published.path,
+        archive_path=archive,
+    )
+    return artifacts_module.PackedBootstrap(
+        payload_root=bootstrap_payload.root,
+        manifest=published.path,
+        archive=archive,
+    )
+
+
+def _tar_member_spans(content: bytes) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    offset = 0
+    while content[offset : offset + 512] != b"\0" * 512:
+        header = content[offset : offset + 512]
+        assert len(header) == 512
+        size = int(header[124:136].split(b"\0", 1)[0], 8)
+        end = offset + 512 + ((size + 511) // 512) * 512
+        spans.append((offset, end))
+        offset = end
+    assert content[offset:] == b"\0" * 1024
+    return spans
+
+
+def _rewrite_tar_checksum(header: bytearray) -> None:
+    header[148:156] = b" " * 8
+    header[148:156] = f"{sum(header):06o}\0 ".encode("ascii")
+
+
+def _set_tar_octal(header: bytearray, offset: int, width: int, value: int) -> None:
+    header[offset : offset + width] = f"{value:0{width - 1}o}\0".encode("ascii")
+
+
+def _mutate_tar_member(
+    content: bytes,
+    index: int,
+    mutate: Any,
+) -> bytes:
+    start, _ = _tar_member_spans(content)[index]
+    result = bytearray(content)
+    header = result[start : start + 512]
+    mutate(header)
+    _rewrite_tar_checksum(header)
+    result[start : start + 512] = header
+    return bytes(result)
+
+
+def _verify_packed_archive(packed_bootstrap: Any, archive: Path) -> None:
+    artifacts_module.verify_native_work_archive(
+        phase="bootstrap",
+        payload_root=packed_bootstrap.payload_root,
+        manifest_path=packed_bootstrap.manifest,
+        archive_path=archive,
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        b"x" * 100,
+        b"p" * 155 + b"/" + b"leaf",
+    ],
+    ids=["full-name-field", "full-prefix-field"],
+)
+def test_ustar_parser_accepts_exactly_full_name_or_prefix_fields(name: bytes) -> None:
+    header = artifacts_module._ustar_header(
+        name=name,
+        mode=0o644,
+        size=1,
+        typeflag=b"0",
+    )
+
+    artifacts_module._parse_ustar_header(header)
+
+
+def test_archive_verifier_rejects_changed_archive_bytes(
+    packed_bootstrap: Any,
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "changed.tar"
+    content = bytearray(read_regular_file_no_follow(packed_bootstrap.archive))
+    content[520] ^= 1
+    archive.write_bytes(content)
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        _verify_packed_archive(packed_bootstrap, archive)
+
+
+def test_archive_verifier_rejects_a_missing_member(
+    packed_bootstrap: Any,
+    tmp_path: Path,
+) -> None:
+    content = read_regular_file_no_follow(packed_bootstrap.archive)
+    start, end = _tar_member_spans(content)[-1]
+    archive = tmp_path / "missing.tar"
+    archive.write_bytes(content[:start] + content[end:])
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        _verify_packed_archive(packed_bootstrap, archive)
+
+
+def test_archive_verifier_rejects_a_duplicate_member(
+    packed_bootstrap: Any,
+    tmp_path: Path,
+) -> None:
+    content = read_regular_file_no_follow(packed_bootstrap.archive)
+    start, end = _tar_member_spans(content)[-1]
+    archive = tmp_path / "duplicate.tar"
+    archive.write_bytes(content[:-1024] + content[start:end] + content[-1024:])
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        _verify_packed_archive(packed_bootstrap, archive)
+
+
+@pytest.mark.parametrize(
+    ("label", "index", "mutate"),
+    [
+        (
+            "wrong-root",
+            0,
+            lambda header: header.__setitem__(slice(0, 100), b"wrong-root/".ljust(100, b"\0")),
+        ),
+        ("wrong-mode", 0, lambda header: _set_tar_octal(header, 100, 8, 0o700)),
+        ("wrong-uid", 0, lambda header: _set_tar_octal(header, 108, 8, 1)),
+        ("wrong-gid", 0, lambda header: _set_tar_octal(header, 116, 8, 1)),
+        ("wrong-mtime", 0, lambda header: _set_tar_octal(header, 136, 12, 1)),
+        (
+            "nonempty-owner-group",
+            0,
+            lambda header: (
+                header.__setitem__(slice(265, 297), b"owner".ljust(32, b"\0")),
+                header.__setitem__(slice(297, 329), b"group".ljust(32, b"\0")),
+            ),
+        ),
+        ("pax-member", -1, lambda header: header.__setitem__(156, ord("x"))),
+        ("symlink", -1, lambda header: header.__setitem__(156, ord("2"))),
+        ("hard-link", -1, lambda header: header.__setitem__(156, ord("1"))),
+        ("device", -1, lambda header: header.__setitem__(156, ord("3"))),
+        ("fifo", -1, lambda header: header.__setitem__(156, ord("6"))),
+    ],
+)
+def test_archive_verifier_rejects_malformed_member_metadata(
+    packed_bootstrap: Any,
+    tmp_path: Path,
+    label: str,
+    index: int,
+    mutate: Any,
+) -> None:
+    archive = tmp_path / f"{label}.tar"
+    archive.write_bytes(
+        _mutate_tar_member(read_regular_file_no_follow(packed_bootstrap.archive), index, mutate)
+    )
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        _verify_packed_archive(packed_bootstrap, archive)
+
+
+def test_archive_verifier_rejects_members_in_the_wrong_order(
+    packed_bootstrap: Any,
+    tmp_path: Path,
+) -> None:
+    content = read_regular_file_no_follow(packed_bootstrap.archive)
+    spans = _tar_member_spans(content)
+    before = content[: spans[-2][0]]
+    penultimate = content[spans[-2][0] : spans[-2][1]]
+    final = content[spans[-1][0] : spans[-1][1]]
+    archive = tmp_path / "wrong-order.tar"
+    archive.write_bytes(before + final + penultimate + content[-1024:])
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        _verify_packed_archive(packed_bootstrap, archive)
+
+
+def test_archive_verifier_rejects_trailing_bytes(
+    packed_bootstrap: Any,
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "trailing.tar"
+    archive.write_bytes(read_regular_file_no_follow(packed_bootstrap.archive) + b"trailing")
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        _verify_packed_archive(packed_bootstrap, archive)
+
+
+def test_packer_removes_temporary_archive_after_a_payload_substitution_race(
+    bootstrap_payload: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = bootstrap_payload.root / "calibration-image/runtime.oci.tar"
+    target.write_bytes(b"x" * (2 * 1024 * 1024))
+    manifest = _publish(bootstrap_payload)
+    archive = tmp_path / "substitution.tar"
+    replaced = False
+
+    def replace_after_first_chunk(path: Path) -> None:
+        nonlocal replaced
+        if path == target and not replaced:
+            replaced = True
+            target.unlink()
+            target.write_bytes(b"replacement\n")
+
+    monkeypatch.setattr(artifacts_module, "_ARCHIVE_CHUNK_HOOK", replace_after_first_chunk)
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        artifacts_module.pack_native_work_archive(
+            phase="bootstrap",
+            payload_root=bootstrap_payload.root,
+            manifest_path=manifest.path,
+            archive_path=archive,
+        )
+    assert replaced
+    assert not archive.exists()
+    assert not list(tmp_path.glob(".substitution.tar.*.tmp"))
+
+
+def test_copy_attestation_bundle_is_no_replace_and_byte_exact(tmp_path: Path) -> None:
+    source = tmp_path / "action-bundle.json"
+    destination = tmp_path / "stable.sigstore.json"
+    source.write_bytes(b'{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.3"}\n')
+
+    identity = artifacts_module.copy_attestation_bundle(source=source, destination=destination)
+
+    assert destination.read_bytes() == source.read_bytes()
+    assert identity.sha256 == sha256_hex(source.read_bytes())
+    assert identity.size == source.stat().st_size
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        artifacts_module.copy_attestation_bundle(source=source, destination=destination)
+
+
+def test_copy_attestation_bundle_rejects_a_symlinked_source(tmp_path: Path) -> None:
+    source = tmp_path / "action-bundle.json"
+    target = tmp_path / "outside.json"
+    destination = tmp_path / "stable.sigstore.json"
+    target.write_bytes(b"bundle\n")
+    source.symlink_to(target)
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        artifacts_module.copy_attestation_bundle(source=source, destination=destination)
+    assert not destination.exists()
+
+
+def test_cli_orders_structural_artifact_operations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload_root = tmp_path / "payload"
+    host_bundle = payload_root / "bootstrap-host-attestation/attestation-bundle.json"
+    archive = tmp_path / "archive.tar"
+    calls: list[str] = []
+    manifest = SimpleNamespace(path=payload_root / "artifact-manifest.json")
+
+    monkeypatch.setattr(
+        artifacts_module,
+        "publish_native_work_manifest",
+        lambda **_kwargs: calls.append("publish-manifest") or manifest,
+    )
+    monkeypatch.setattr(
+        artifacts_module,
+        "pack_native_work_archive",
+        lambda **_kwargs: calls.append("pack"),
+    )
+    monkeypatch.setattr(
+        artifacts_module,
+        "verify_native_work_archive",
+        lambda **_kwargs: calls.append("verify-archive"),
+    )
+
+    assert (
+        artifacts_module.main(
+            [
+                "publish",
+                "--phase",
+                "bootstrap",
+                "--payload-root",
+                str(payload_root),
+                "--host-bundle",
+                str(host_bundle),
+                "--archive",
+                str(archive),
+            ]
+        )
+        == 0
+    )
+    assert calls == ["publish-manifest", "pack", "verify-archive"]
+
+    calls.clear()
+    monkeypatch.setattr(
+        artifacts_module,
+        "load_native_work_manifest",
+        lambda *_args, **_kwargs: calls.append("load-manifest") or manifest,
+    )
+    monkeypatch.setattr(
+        artifacts_module,
+        "verify_native_work_payload",
+        lambda **_kwargs: calls.append("verify-payload"),
+    )
+    monkeypatch.setattr(
+        artifacts_module,
+        "_stream_regular_file_identity",
+        lambda _path: calls.append("verify-bundle"),
+    )
+    assert (
+        artifacts_module.main(
+            [
+                "verify",
+                "--phase",
+                "bootstrap",
+                "--payload-root",
+                str(payload_root),
+                "--archive",
+                str(archive),
+                "--bundle",
+                str(host_bundle),
+            ]
+        )
+        == 0
+    )
+    assert calls == ["load-manifest", "verify-payload", "verify-archive", "verify-bundle"]
+
+    calls.clear()
+    monkeypatch.setattr(
+        artifacts_module,
+        "copy_attestation_bundle",
+        lambda **_kwargs: calls.append("copy-bundle"),
+    )
+    assert (
+        artifacts_module.main(
+            ["copy-bundle", "--source", str(host_bundle), "--destination", str(archive)]
+        )
+        == 0
+    )
+    assert calls == ["copy-bundle"]
 
 
 def test_phase_mappings_are_the_exact_immutable_inventories() -> None:
