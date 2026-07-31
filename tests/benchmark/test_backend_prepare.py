@@ -767,6 +767,37 @@ def test_post_rename_sync_failure_rolls_back_the_owned_final_cache(
     assert not expected.exists()
 
 
+def test_post_rename_lookup_failure_rolls_back_the_owned_final_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_bytes = _valid_archive_bytes()
+    backend_lock = _loaded_lock(archive_bytes)
+    expected = _final_path(tmp_path, backend_lock)
+    real_rename = backend_publication._rename_no_replace_syscall
+    real_stat = os.stat
+
+    def rename_then_fail_lookup(*args: object, **kwargs: object) -> None:
+        real_rename(*args, **kwargs)  # type: ignore[arg-type]
+
+        def fail_once(*_args: object, **_kwargs: object) -> os.stat_result:
+            monkeypatch.setattr(backend_publication.os, "stat", real_stat)
+            raise OSError("injected post-rename lookup failure")
+
+        monkeypatch.setattr(backend_publication.os, "stat", fail_once)
+
+    monkeypatch.setattr(backend_publication, "_rename_no_replace_syscall", rename_then_fail_lookup)
+
+    outcome = prepare_oaf_backend(
+        _request(tmp_path, archive_path=_write_archive(tmp_path, archive_bytes)),
+        backend_lock=backend_lock,
+    )
+
+    assert outcome.status == "integrity_failed"
+    assert outcome.exit_code == 2
+    assert not expected.exists()
+
+
 def test_concurrent_loser_verifies_winner_instead_of_replacing_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
