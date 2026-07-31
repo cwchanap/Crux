@@ -68,6 +68,46 @@ def test_rename_directory_no_replace_never_replaces_existing_target(tmp_path: Pa
     assert source.is_dir()
 
 
+def test_rename_directory_no_replace_rejects_parent_swap_without_touching_attacker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted = tmp_path / "trusted"
+    original = tmp_path / "trusted-original"
+    attacker = tmp_path / "attacker"
+    source = trusted / "reports" / "source"
+    destination = trusted / "reports" / "published"
+    source.mkdir(parents=True)
+    (source / "trusted").write_text("trusted", encoding="utf-8")
+    (attacker / "reports" / "source").mkdir(parents=True)
+    (attacker / "reports" / "source" / "attacker").write_text("attacker", encoding="utf-8")
+    real_rename = backend_publication._rename_no_replace_syscall
+    swapped = False
+
+    def swap_before_rename(*args: object, **kwargs: object) -> None:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            trusted.rename(original)
+            trusted.symlink_to(attacker, target_is_directory=True)
+        real_rename(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(backend_publication, "_rename_no_replace_syscall", swap_before_rename)
+
+    with pytest.raises(ArtifactPublicationError):
+        rename_directory_no_replace(source, destination)
+
+    assert not (attacker / "reports" / "published").exists()
+
+
+def test_no_follow_reader_rejects_content_larger_than_its_bound(tmp_path: Path) -> None:
+    source = tmp_path / "oversized.json"
+    source.write_bytes(b"12345")
+
+    with pytest.raises(OSError):
+        read_regular_file_no_follow(source, max_bytes=4)
+
+
 @pytest.mark.parametrize("raise_inside", [False, True])
 def test_directory_anchor_closes_descriptor_on_every_exit(
     tmp_path: Path,

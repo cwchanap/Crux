@@ -17,6 +17,7 @@ from typing import BinaryIO
 import pytest
 
 import src.benchmark.backend_prepare as backend_prepare
+from src.benchmark import backend_publication
 from src.benchmark.backend_identity import BackendDescriptor
 from src.benchmark.backend_lock import LoadedBackendLock
 from src.benchmark.backend_prepare import (
@@ -733,6 +734,37 @@ def test_publication_failure_is_integrity_failure_and_leaves_no_final_cache(
     assert outcome.status == "integrity_failed"
     assert outcome.exit_code == 2
     assert not _final_path(tmp_path, backend_lock).exists()
+
+
+def test_post_rename_sync_failure_rolls_back_the_owned_final_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_bytes = _valid_archive_bytes()
+    backend_lock = _loaded_lock(archive_bytes)
+    expected = _final_path(tmp_path, backend_lock)
+    real_rename = backend_publication._rename_no_replace_syscall
+    real_fsync = os.fsync
+
+    def rename_then_fail_sync(*args: object, **kwargs: object) -> None:
+        real_rename(*args, **kwargs)  # type: ignore[arg-type]
+
+        def fail_once(_descriptor: int) -> None:
+            monkeypatch.setattr(backend_publication.os, "fsync", real_fsync)
+            raise OSError("injected parent sync failure")
+
+        monkeypatch.setattr(backend_publication.os, "fsync", fail_once)
+
+    monkeypatch.setattr(backend_publication, "_rename_no_replace_syscall", rename_then_fail_sync)
+
+    outcome = prepare_oaf_backend(
+        _request(tmp_path, archive_path=_write_archive(tmp_path, archive_bytes)),
+        backend_lock=backend_lock,
+    )
+
+    assert outcome.status == "integrity_failed"
+    assert outcome.exit_code == 2
+    assert not expected.exists()
 
 
 def test_concurrent_loser_verifies_winner_instead_of_replacing_it(
