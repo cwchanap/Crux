@@ -1709,6 +1709,55 @@ def _remove_temporary_archive(path: Path, name: str) -> None:
         pass
 
 
+def _remove_directory_tree_at(
+    *,
+    parent_descriptor: int,
+    name: str,
+    expected: os.stat_result,
+) -> None:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent_descriptor)
+        opened = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or not _same_inode(expected, opened)
+            or not _same_inode(expected, current)
+        ):
+            raise NativeArtifactError("native work archive cleanup directory binding changed")
+        for child_name in os.listdir(descriptor):
+            if child_name in {"", ".", ".."}:
+                raise NativeArtifactError(
+                    "native work archive cleanup found an unsafe directory entry"
+                )
+            child = os.stat(child_name, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISDIR(child.st_mode):
+                _remove_directory_tree_at(
+                    parent_descriptor=descriptor,
+                    name=child_name,
+                    expected=child,
+                )
+            else:
+                current_child = os.stat(
+                    child_name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if not _same_inode(child, current_child):
+                    raise NativeArtifactError("native work archive cleanup entry binding changed")
+                os.unlink(child_name, dir_fd=descriptor)
+        os.fsync(descriptor)
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if not stat.S_ISDIR(current.st_mode) or not _same_inode(expected, current):
+            raise NativeArtifactError("native work archive cleanup directory binding changed")
+        os.rmdir(name, dir_fd=parent_descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _remove_linked_archive_if_owned(path: Path, expected: os.stat_result) -> None:
     try:
         absolute = _absolute_path(path, "archive")
@@ -1716,7 +1765,11 @@ def _remove_linked_archive_if_owned(path: Path, expected: os.stat_result) -> Non
             current = os.stat(absolute.name, dir_fd=parent.descriptor, follow_symlinks=False)
             if _same_inode(current, expected):
                 if stat.S_ISDIR(current.st_mode):
-                    os.rmdir(absolute.name, dir_fd=parent.descriptor)
+                    _remove_directory_tree_at(
+                        parent_descriptor=parent.descriptor,
+                        name=absolute.name,
+                        expected=current,
+                    )
                 else:
                     os.unlink(absolute.name, dir_fd=parent.descriptor)
                 os.fsync(parent.descriptor)
