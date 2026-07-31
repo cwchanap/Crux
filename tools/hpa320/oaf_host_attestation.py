@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strictly authenticate durable phase-specific OaF native-host bundles."""
+"""Strictly publish same-job OaF native-host attestation bundles."""
 
 from __future__ import annotations
 
@@ -7,11 +7,14 @@ import argparse
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
-import urllib.request
+import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, cast
 
 from src.benchmark.backend_attestation import parse_host_numeric_fingerprint
@@ -22,25 +25,32 @@ from src.benchmark.backend_identity import (
     strict_json_loads,
 )
 from src.benchmark.backend_process import NativeHostEvidence
-from src.benchmark.backend_publication import read_regular_file_no_follow
+from src.benchmark.backend_publication import (
+    ArtifactPublicationError,
+    read_regular_file_no_follow,
+    rename_directory_no_replace,
+)
 from src.benchmark.checkpoint_acquisition import CheckpointIdentity
 from tools.hpa320.github_host_evidence import (
     build_github_hosted_evidence,
     collect_host_numeric_fingerprint,
 )
 
-BUNDLE_SCHEMA = "crux.oaf-native-host-attestation-bundle/v1"
-PHASES = frozenset({"bootstrap", "measurement", "candidate"})
-
-_BUNDLE_KEYS = frozenset(
+BUNDLE_SCHEMA = "crux.oaf-native-host-attestation-bundle/v2"
+PHASE_WORKFLOWS = MappingProxyType(
     {
-        "api_record",
-        "native_host_evidence",
-        "native_host_observation",
-        "phase",
-        "schema",
+        "bootstrap": ("native-bootstrap", "hpa320-native-bootstrap.yml"),
+        "measurement": ("native-measurement", "hpa320-native-measurement.yml"),
+        "candidate": ("native-candidate", "hpa320-native-candidate.yml"),
     }
 )
+_IDENTITY_NAMES = MappingProxyType(
+    {
+        "native_host_evidence": "native-host-evidence.json",
+        "native_host_observation": "native-host-observation.json",
+    }
+)
+_BUNDLE_KEYS = frozenset({"native_host_evidence", "native_host_observation", "phase", "schema"})
 _IDENTITY_KEYS = frozenset({"name", "sha256", "size"})
 _EVIDENCE_KEYS = frozenset({"kind", "official_execution_allowed", "payload", "sha256"})
 _OBSERVATION_KEYS = frozenset(
@@ -48,24 +58,23 @@ _OBSERVATION_KEYS = frozenset(
         "docker_architecture",
         "docker_os_type",
         "docker_server_version",
+        "github_job",
         "github_repository",
         "github_run_attempt",
         "github_run_id",
         "github_run_url",
         "github_sha",
         "github_workflow_ref",
+        "github_workflow_sha",
         "host_numeric_fingerprint",
         "runner_arch",
+        "runner_environment",
         "runner_os",
         "uname_architecture",
     }
 )
-_IDENTITY_NAMES = {
-    "api_record": "github-job-api-record.json.hex",
-    "native_host_evidence": "native-host-evidence.json",
-    "native_host_observation": "native-host-observation.json",
-}
 _GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+_LOWERCASE_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 
 
 class HostAttestationError(ValueError):
@@ -74,11 +83,12 @@ class HostAttestationError(ValueError):
 
 @dataclass(frozen=True)
 class NativeHostAttestationBundle:
-    api_record: CheckpointIdentity
     native_host_evidence: CheckpointIdentity
     native_host_observation: CheckpointIdentity
     phase: str
     sha256: str
+    evidence: NativeHostEvidence
+    observation: Mapping[str, JsonValue]
 
 
 def bundle_phase(path: Path) -> str:
@@ -87,7 +97,7 @@ def bundle_phase(path: Path) -> str:
     content = _read_file(Path(path), "native-host attestation bundle")
     payload = _canonical_object(content, "native-host attestation bundle")
     phase = payload.get("phase")
-    if phase not in PHASES:
+    if phase not in PHASE_WORKFLOWS:
         raise HostAttestationError("native-host attestation phase is invalid")
     return cast(str, phase)
 
@@ -97,9 +107,9 @@ def load_native_host_attestation_bundle(
     *,
     expected_phase: str,
 ) -> NativeHostAttestationBundle:
-    """Authenticate one canonical bundle and its exact three sibling files."""
+    """Authenticate one canonical v2 bundle and its exact two sibling files."""
 
-    if expected_phase not in PHASES:
+    if expected_phase not in PHASE_WORKFLOWS:
         raise HostAttestationError("expected native-host attestation phase is invalid")
     bundle_path = Path(path)
     content = _read_file(bundle_path, "native-host attestation bundle")
@@ -114,8 +124,10 @@ def load_native_host_attestation_bundle(
     sibling_contents: dict[str, bytes] = {}
     for field, expected_name in _IDENTITY_NAMES.items():
         identity = _load_identity(payload[field], expected_name, field)
-        sibling = bundle_path.parent / expected_name
-        sibling_content = _read_file(sibling, f"native-host attestation {field}")
+        sibling_content = _read_file(
+            bundle_path.parent / expected_name,
+            f"native-host attestation {field}",
+        )
         if (
             len(sibling_content) != identity.size
             or hashlib.sha256(sibling_content).hexdigest() != identity.sha256
@@ -123,196 +135,94 @@ def load_native_host_attestation_bundle(
             raise HostAttestationError(f"native-host attestation {field} identity mismatch")
         identities[field] = identity
         sibling_contents[field] = sibling_content
-    api_bytes = _decode_api_hex(sibling_contents["api_record"])
-    api_record = _raw_object(api_bytes, "GitHub job API record")
-    evidence_record = _canonical_object(
-        sibling_contents["native_host_evidence"],
-        "native host evidence",
+    evidence = _load_native_evidence(
+        _canonical_object(sibling_contents["native_host_evidence"], "native host evidence")
     )
     observation = _canonical_object(
         sibling_contents["native_host_observation"],
         "native host observation",
     )
-    evidence = _load_native_evidence(evidence_record)
-    _cross_validate(
-        api_record=api_record,
-        api_bytes=api_bytes,
-        evidence=evidence,
-        observation=observation,
-        phase=expected_phase,
-    )
+    _cross_validate(evidence=evidence, observation=observation, phase=expected_phase)
     return NativeHostAttestationBundle(
-        api_record=identities["api_record"],
         native_host_evidence=identities["native_host_evidence"],
         native_host_observation=identities["native_host_observation"],
         phase=expected_phase,
         sha256=hashlib.sha256(content).hexdigest(),
+        evidence=evidence,
+        observation=MappingProxyType(observation),
     )
 
 
-def observe_github_host(*, output_path: Path, github_output_path: Path) -> bytes:
-    """Record one native Linux X64 observation for the exact checked-out commit."""
-
-    runner_os = _required_environment("RUNNER_OS")
-    runner_arch = _required_environment("RUNNER_ARCH")
-    commit = _required_environment("COMMIT_SHA")
-    github_sha = _required_environment("GITHUB_SHA")
-    checked_out_commit = _run_text(("git", "rev-parse", "HEAD"), "checked-out commit")
-    uname_architecture = _run_text(("uname", "-m"), "host architecture")
-    docker_os_type = _docker_info("OSType")
-    docker_architecture = _docker_info("Architecture")
-    docker_server_version = _docker_info("ServerVersion")
-    if (
-        not re.fullmatch(r"[0-9a-f]{40}", commit)
-        or checked_out_commit != commit
-        or github_sha != commit
-    ):
-        raise HostAttestationError("workflow commit does not match the exact checkout")
-    if (
-        runner_os != "Linux"
-        or runner_arch != "X64"
-        or uname_architecture != "x86_64"
-        or docker_os_type != "linux"
-        or docker_architecture != "x86_64"
-    ):
-        raise HostAttestationError("workflow host is not native Linux X64")
-    repository = _required_environment("GITHUB_REPOSITORY")
-    run_id = _positive_environment_integer("GITHUB_RUN_ID")
-    run_attempt = _positive_environment_integer("GITHUB_RUN_ATTEMPT")
-    server_url = _required_environment("GITHUB_SERVER_URL").rstrip("/")
-    if server_url != "https://github.com":
-        raise HostAttestationError(
-            "GITHUB_SERVER_URL must be the canonical https://github.com value"
-        )
-    observation: JsonValue = {
-        "docker_architecture": docker_architecture,
-        "docker_os_type": docker_os_type,
-        "docker_server_version": docker_server_version,
-        "github_repository": repository,
-        "github_run_attempt": run_attempt,
-        "github_run_id": run_id,
-        "github_run_url": f"{server_url}/{repository}/actions/runs/{run_id}",
-        "github_sha": commit,
-        "github_workflow_ref": _required_environment("GITHUB_WORKFLOW_REF"),
-        "host_numeric_fingerprint": collect_host_numeric_fingerprint().as_json(),
-        "runner_arch": runner_arch,
-        "runner_os": runner_os,
-        "uname_architecture": uname_architecture,
-    }
-    content = canonical_json_bytes(observation, trailing_newline=True)
-    Path(output_path).write_bytes(content)
-    with Path(github_output_path).open("a", encoding="utf-8") as output:
-        output.write(f"observation={content[:-1].decode('utf-8')}\n")
-    return content
-
-
-def finalize_github_host_attestation(
+def publish_github_host_attestation(
     *,
     phase: str,
-    observation_path: Path,
     output_directory: Path,
 ) -> NativeHostAttestationBundle:
-    """Fetch completed-job bytes and publish one exact phase-specific bundle."""
+    """Validate this exact work job and atomically publish its v2 host bundle."""
 
-    if phase not in PHASES:
-        raise HostAttestationError("native-host attestation phase is invalid")
-    token = _required_environment("GH_TOKEN")
-    repository = _required_environment("GITHUB_REPOSITORY")
-    if not _GITHUB_REPOSITORY.fullmatch(repository):
-        raise HostAttestationError("GITHUB_REPOSITORY is not a canonical owner/name value")
-    run_id = _positive_environment_integer("GITHUB_RUN_ID")
-    commit = _required_environment("COMMIT_SHA")
-    observation_content = _read_file(Path(observation_path), "native host observation")
-    observation = _canonical_object(observation_content, "native host observation")
-    if (
-        observation.get("github_repository") != repository
-        or observation.get("github_run_id") != run_id
-        or observation.get("github_sha") != commit
-    ):
-        raise HostAttestationError("native host observation belongs to another execution")
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    jobs = _github_json(
-        (
-            f"https://api.github.com/repos/{repository}/actions/runs/"
-            f"{run_id}/jobs?filter=latest&per_page=100"
-        ),
-        headers,
-        "completed GitHub jobs",
-    )
-    job_rows = jobs.get("jobs")
-    if not isinstance(job_rows, list):
-        raise HostAttestationError("completed GitHub jobs payload is invalid")
-    matches = [
-        row
-        for row in job_rows
-        if isinstance(row, dict) and row.get("name") == "observe-native-host"
-    ]
-    if len(matches) != 1:
-        raise HostAttestationError("completed observation job is not unique")
-    job_id = matches[0].get("id")
-    if not isinstance(job_id, int) or isinstance(job_id, bool) or job_id <= 0:
-        raise HostAttestationError("completed observation job ID is invalid")
-    api_bytes = _github_bytes(
-        f"https://api.github.com/repos/{repository}/actions/jobs/{job_id}",
-        headers,
-        "completed GitHub job",
-    )
-    api_record = _raw_object(api_bytes, "GitHub job API record")
-    job_url = api_record.get("html_url")
-    if not isinstance(job_url, str):
-        raise HostAttestationError("completed observation job URL is invalid")
     try:
-        fingerprint = parse_host_numeric_fingerprint(observation.get("host_numeric_fingerprint"))
-        evidence = build_github_hosted_evidence(
-            api_record_bytes=api_bytes,
+        observation = _same_job_observation(phase)
+        fingerprint = parse_host_numeric_fingerprint(observation["host_numeric_fingerprint"])
+        evidence_record = build_github_hosted_evidence(
+            github_job=cast(str, observation["github_job"]),
+            github_repository=cast(str, observation["github_repository"]),
+            github_run_attempt=cast(int, observation["github_run_attempt"]),
+            github_run_id=cast(int, observation["github_run_id"]),
+            github_workflow_ref=cast(str, observation["github_workflow_ref"]),
+            github_workflow_sha=cast(str, observation["github_workflow_sha"]),
             host_numeric_fingerprint=fingerprint,
-            job_id=job_id,
-            run_url=job_url,
-            workflow_commit=commit,
+            run_url=cast(str, observation["github_run_url"]),
+            runner_arch=cast(str, observation["runner_arch"]),
+            runner_environment=cast(str, observation["runner_environment"]),
+            runner_os=cast(str, observation["runner_os"]),
+            workflow_commit=cast(str, observation["github_sha"]),
         )
-    except (StrictJsonError, TypeError, ValueError) as error:
-        raise HostAttestationError("native host evidence could not be derived") from error
-    api_hex = api_bytes.hex().encode("ascii") + b"\n"
-    evidence_content = canonical_json_bytes(evidence, trailing_newline=True)
-    output = Path(output_directory)
-    try:
-        output.mkdir(parents=True, exist_ok=False)
-    except OSError as error:
-        raise HostAttestationError("native-host attestation output must be absent") from error
-    files = {
-        _IDENTITY_NAMES["api_record"]: api_hex,
-        _IDENTITY_NAMES["native_host_evidence"]: evidence_content,
-        _IDENTITY_NAMES["native_host_observation"]: observation_content,
-    }
-    try:
-        for name, content in files.items():
-            (output / name).write_bytes(content)
-        bundle: JsonValue = {
-            "api_record": _identity_payload(_IDENTITY_NAMES["api_record"], api_hex),
-            "native_host_evidence": _identity_payload(
-                _IDENTITY_NAMES["native_host_evidence"],
-                evidence_content,
-            ),
-            "native_host_observation": _identity_payload(
-                _IDENTITY_NAMES["native_host_observation"],
-                observation_content,
-            ),
-            "phase": phase,
-            "schema": BUNDLE_SCHEMA,
-        }
-        bundle_path = output / "attestation-bundle.json"
-        bundle_path.write_bytes(canonical_json_bytes(bundle, trailing_newline=True))
-        return load_native_host_attestation_bundle(bundle_path, expected_phase=phase)
-    except (OSError, ValueError) as error:
+        output = Path(output_directory)
+        parent = output.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=parent))
+        try:
+            observation_path = staging / "native-host-observation.json"
+            evidence_path = staging / "native-host-evidence.json"
+            observation_content = canonical_json_bytes(observation, trailing_newline=True)
+            evidence_content = canonical_json_bytes(evidence_record, trailing_newline=True)
+            _write_new_regular_file(observation_path, observation_content)
+            _write_new_regular_file(evidence_path, evidence_content)
+            bundle_payload: JsonValue = {
+                "native_host_evidence": _identity_payload(evidence_path.name, evidence_content),
+                "native_host_observation": _identity_payload(
+                    observation_path.name,
+                    observation_content,
+                ),
+                "phase": phase,
+                "schema": BUNDLE_SCHEMA,
+            }
+            bundle_path = staging / "attestation-bundle.json"
+            bundle_content = canonical_json_bytes(bundle_payload, trailing_newline=True)
+            _write_new_regular_file(bundle_path, bundle_content)
+            load_native_host_attestation_bundle(bundle_path, expected_phase=phase)
+            rename_directory_no_replace(staging, output)
+            return load_native_host_attestation_bundle(
+                output / "attestation-bundle.json",
+                expected_phase=phase,
+            )
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+    except (
+        ArtifactPublicationError,
+        OSError,
+        StrictJsonError,
+        TypeError,
+        ValueError,
+    ) as error:
+        if isinstance(error, HostAttestationError):
+            raise
         raise HostAttestationError("native-host attestation publication failed") from error
 
 
 def validate_schema_golden(schema: str, content: bytes) -> None:
-    """Validate the isolated exact bundle schema without inventing sibling evidence."""
+    """Validate the isolated exact v2 bundle schema without sibling evidence."""
 
     try:
         if schema != BUNDLE_SCHEMA:
@@ -321,7 +231,7 @@ def validate_schema_golden(schema: str, content: bytes) -> None:
         if (
             set(payload) != _BUNDLE_KEYS
             or payload["schema"] != BUNDLE_SCHEMA
-            or payload["phase"] not in PHASES
+            or payload["phase"] not in PHASE_WORKFLOWS
         ):
             raise HostAttestationError("native-host attestation bundle fields are invalid")
         for field, expected_name in _IDENTITY_NAMES.items():
@@ -330,16 +240,90 @@ def validate_schema_golden(schema: str, content: bytes) -> None:
         raise ValueError(str(error)) from None
 
 
+def _same_job_observation(phase: str) -> dict[str, JsonValue]:
+    if phase not in PHASE_WORKFLOWS:
+        raise HostAttestationError("native-host attestation phase is invalid")
+    runner_environment = _matching_runner_value(
+        context_name="RUNNER_ENVIRONMENT_CONTEXT",
+        default_name="RUNNER_ENVIRONMENT",
+        expected="github-hosted",
+    )
+    runner_os = _matching_runner_value(
+        context_name="RUNNER_OS_CONTEXT",
+        default_name="RUNNER_OS",
+        expected="Linux",
+    )
+    runner_arch = _matching_runner_value(
+        context_name="RUNNER_ARCH_CONTEXT",
+        default_name="RUNNER_ARCH",
+        expected="X64",
+    )
+    job, workflow_file = PHASE_WORKFLOWS[phase]
+    if _required_environment("GITHUB_JOB") != job:
+        raise HostAttestationError("current GitHub job does not own this native phase")
+    commit = _required_environment("COMMIT_SHA")
+    checked_out_commit = _run_text(("git", "rev-parse", "HEAD"), "checked-out commit")
+    if _LOWERCASE_COMMIT.fullmatch(commit) is None or {
+        commit,
+        _required_environment("GITHUB_SHA"),
+        _required_environment("WORKFLOW_SOURCE_SHA"),
+        checked_out_commit,
+    } != {commit}:
+        raise HostAttestationError("workflow commit does not match the exact checkout")
+    repository = _required_environment("GITHUB_REPOSITORY")
+    if _GITHUB_REPOSITORY.fullmatch(repository) is None:
+        raise HostAttestationError("GITHUB_REPOSITORY is not a canonical owner/name value")
+    run_id = _positive_environment_integer("GITHUB_RUN_ID")
+    run_attempt = _positive_environment_integer("GITHUB_RUN_ATTEMPT")
+    server_url = _required_environment("GITHUB_SERVER_URL").rstrip("/")
+    if server_url != "https://github.com":
+        raise HostAttestationError("GITHUB_SERVER_URL must be https://github.com")
+    workflow_ref = _required_environment("GITHUB_WORKFLOW_REF")
+    workflow_prefix = f"{repository}/.github/workflows/{workflow_file}@"
+    if not workflow_ref.startswith(workflow_prefix) or workflow_ref == workflow_prefix:
+        raise HostAttestationError("current GitHub workflow does not own this native phase")
+    uname_architecture = _run_text(("uname", "-m"), "host architecture")
+    docker_os_type = _docker_info("OSType")
+    docker_architecture = _docker_info("Architecture")
+    docker_server_version = _docker_info("ServerVersion")
+    if (
+        uname_architecture != "x86_64"
+        or docker_os_type != "linux"
+        or docker_architecture != "x86_64"
+        or not docker_server_version
+    ):
+        raise HostAttestationError("workflow host is not native Linux X64")
+    return {
+        "docker_architecture": docker_architecture,
+        "docker_os_type": docker_os_type,
+        "docker_server_version": docker_server_version,
+        "github_job": job,
+        "github_repository": repository,
+        "github_run_attempt": run_attempt,
+        "github_run_id": run_id,
+        "github_run_url": f"{server_url}/{repository}/actions/runs/{run_id}",
+        "github_sha": commit,
+        "github_workflow_ref": workflow_ref,
+        "github_workflow_sha": commit,
+        "host_numeric_fingerprint": collect_host_numeric_fingerprint().as_json(),
+        "runner_arch": runner_arch,
+        "runner_environment": runner_environment,
+        "runner_os": runner_os,
+        "uname_architecture": uname_architecture,
+    }
+
+
 def _cross_validate(
     *,
-    api_record: dict[str, JsonValue],
-    api_bytes: bytes,
     evidence: NativeHostEvidence,
     observation: dict[str, JsonValue],
     phase: str,
 ) -> None:
     if set(observation) != _OBSERVATION_KEYS:
         raise HostAttestationError("native host observation fields are invalid")
+    if phase not in PHASE_WORKFLOWS:
+        raise HostAttestationError("native-host attestation phase is invalid")
+    job, workflow_file = PHASE_WORKFLOWS[phase]
     integer_fields = ("github_run_attempt", "github_run_id")
     if any(
         not isinstance(observation[field], int)
@@ -351,62 +335,54 @@ def _cross_validate(
     repository = observation["github_repository"]
     commit = observation["github_sha"]
     run_id = observation["github_run_id"]
-    run_url = observation["github_run_url"]
     workflow_ref = observation["github_workflow_ref"]
     if (
         not isinstance(repository, str)
-        or not _GITHUB_REPOSITORY.fullmatch(repository)
+        or _GITHUB_REPOSITORY.fullmatch(repository) is None
         or not isinstance(commit, str)
-        or len(commit) != 40
-        or any(character not in "0123456789abcdef" for character in commit)
-        or run_url != f"https://github.com/{repository}/actions/runs/{run_id}"
+        or _LOWERCASE_COMMIT.fullmatch(commit) is None
+        or observation["github_workflow_sha"] != commit
+        or observation["github_run_url"] != f"https://github.com/{repository}/actions/runs/{run_id}"
         or not isinstance(workflow_ref, str)
-        or not workflow_ref.startswith(f"{repository}/.github/workflows/hpa320-native-{phase}.yml@")
+        or not workflow_ref.startswith(f"{repository}/.github/workflows/{workflow_file}@")
         or workflow_ref.endswith("@")
     ):
         raise HostAttestationError("native host observation workflow reference is invalid")
     if (
-        observation["docker_architecture"] != "x86_64"
+        observation["github_job"] != job
+        or observation["docker_architecture"] != "x86_64"
         or observation["docker_os_type"] != "linux"
         or not isinstance(observation["docker_server_version"], str)
         or not observation["docker_server_version"]
         or observation["runner_arch"] != "X64"
+        or observation["runner_environment"] != "github-hosted"
         or observation["runner_os"] != "Linux"
         or observation["uname_architecture"] != "x86_64"
     ):
-        raise HostAttestationError("native host observation is not Linux X64")
-    required_api = {
-        "conclusion": "success",
-        "head_sha": commit,
-        "name": "observe-native-host",
-        "run_id": run_id,
-        "status": "completed",
-    }
-    if any(api_record.get(field) != value for field, value in required_api.items()):
-        raise HostAttestationError("GitHub job API record is not a completed successful job")
-    if api_record.get("labels") != ["ubuntu-24.04"]:
-        raise HostAttestationError("GitHub job API runner labels are invalid")
-    job_id = api_record.get("id")
-    job_url = api_record.get("html_url")
-    if (
-        not isinstance(job_id, int)
-        or isinstance(job_id, bool)
-        or job_id <= 0
-        or job_url != f"{run_url}/job/{job_id}"
-    ):
-        raise HostAttestationError("GitHub job API identity is invalid")
+        raise HostAttestationError("native host observation is not GitHub-hosted Linux X64")
+    try:
+        parse_host_numeric_fingerprint(observation["host_numeric_fingerprint"])
+    except (TypeError, ValueError) as error:
+        raise HostAttestationError("native host observation fingerprint is invalid") from error
     host_payload = evidence.payload
-    if (
-        evidence.kind != "github_hosted"
-        or host_payload["api_record_sha256"] != hashlib.sha256(api_bytes).hexdigest()
-        or host_payload["job_id"] != job_id
-        or host_payload["run_url"] != job_url
-        or host_payload["workflow_commit"] != commit
-        or host_payload["runner_arch"] != observation["runner_arch"]
-        or host_payload["runner_os"] != observation["runner_os"]
-        or evidence.host_numeric_fingerprint.as_json() != observation["host_numeric_fingerprint"]
+    expected_fields = {
+        "github_job": observation["github_job"],
+        "github_repository": observation["github_repository"],
+        "github_run_attempt": observation["github_run_attempt"],
+        "github_run_id": observation["github_run_id"],
+        "github_workflow_ref": observation["github_workflow_ref"],
+        "github_workflow_sha": observation["github_workflow_sha"],
+        "host_numeric_fingerprint": observation["host_numeric_fingerprint"],
+        "run_url": observation["github_run_url"],
+        "runner_arch": observation["runner_arch"],
+        "runner_environment": observation["runner_environment"],
+        "runner_os": observation["runner_os"],
+        "workflow_commit": observation["github_sha"],
+    }
+    if evidence.kind != "github_hosted" or any(
+        host_payload[field] != value for field, value in expected_fields.items()
     ):
-        raise HostAttestationError("native host evidence disagrees with observation or API record")
+        raise HostAttestationError("native host evidence disagrees with observation")
 
 
 def _load_native_evidence(value: dict[str, JsonValue]) -> NativeHostEvidence:
@@ -440,39 +416,11 @@ def _load_identity(value: JsonValue, expected_name: str, label: str) -> Checkpoi
     return CheckpointIdentity(name=expected_name, sha256=cast(str, digest), size=size)
 
 
-def _decode_api_hex(content: bytes) -> bytes:
-    if (
-        not content.endswith(b"\n")
-        or content.endswith(b"\n\n")
-        or b"\n" in content[:-1]
-        or not content[:-1]
-        or len(content[:-1]) % 2
-        or any(character not in b"0123456789abcdef" for character in content[:-1])
-    ):
-        raise HostAttestationError(
-            "GitHub job API record hex must be lowercase pairs plus one final newline"
-        )
-    try:
-        return bytes.fromhex(content[:-1].decode("ascii"))
-    except (UnicodeError, ValueError):
-        raise HostAttestationError("GitHub job API record hex is invalid") from None
-
-
 def _canonical_object(content: bytes, label: str) -> dict[str, JsonValue]:
     if not content.endswith(b"\n") or content.endswith(b"\n\n"):
         raise HostAttestationError(f"{label} must have one final newline")
     try:
         value = strict_json_loads(content[:-1], require_canonical=True)
-    except StrictJsonError as error:
-        raise HostAttestationError(f"{label} is invalid: {error}") from None
-    if not isinstance(value, dict):
-        raise HostAttestationError(f"{label} must be an object")
-    return value
-
-
-def _raw_object(content: bytes, label: str) -> dict[str, JsonValue]:
-    try:
-        value = strict_json_loads(content)
     except StrictJsonError as error:
         raise HostAttestationError(f"{label} is invalid: {error}") from None
     if not isinstance(value, dict):
@@ -497,6 +445,28 @@ def _is_sha256(value: object) -> bool:
 
 def _identity_payload(name: str, content: bytes) -> dict[str, JsonValue]:
     return {"name": name, "sha256": hashlib.sha256(content).hexdigest(), "size": len(content)}
+
+
+def _write_new_regular_file(path: Path, content: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+    finally:
+        os.close(descriptor)
+
+
+def _matching_runner_value(*, context_name: str, default_name: str, expected: str) -> str:
+    context_value = _required_environment(context_name)
+    default_value = _required_environment(default_name)
+    if context_value != expected or default_value != expected or context_value != default_value:
+        raise HostAttestationError(f"{context_name} and {default_name} do not prove {expected}")
+    return context_value
 
 
 def _required_environment(name: str) -> str:
@@ -528,49 +498,22 @@ def _docker_info(field: str) -> str:
     return _run_text(("docker", "info", "--format", f"{{{{.{field}}}}}"), f"Docker {field}")
 
 
-def _github_bytes(url: str, headers: dict[str, str], label: str) -> bytes:
-    try:
-        request = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(request, timeout=30) as response:
-            content = response.read()
-    except OSError as error:
-        raise HostAttestationError(f"{label} could not be fetched") from error
-    if not content:
-        raise HostAttestationError(f"{label} is empty")
-    return content
-
-
-def _github_json(url: str, headers: dict[str, str], label: str) -> dict[str, JsonValue]:
-    return _raw_object(_github_bytes(url, headers, label), label)
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest="command", required=True)
-    observe = commands.add_parser("observe-github")
-    observe.add_argument("--output", type=Path, required=True)
-    observe.add_argument("--github-output", type=Path, required=True)
-    finalize = commands.add_parser("finalize-github")
-    finalize.add_argument("--phase", choices=sorted(PHASES), required=True)
-    finalize.add_argument("--observation", type=Path, required=True)
-    finalize.add_argument("--output", type=Path, required=True)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    publish = subparsers.add_parser("publish-github")
+    publish.add_argument("--phase", required=True, choices=tuple(PHASE_WORKFLOWS))
+    publish.add_argument("--output", required=True, type=Path)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
-        if arguments.command == "observe-github":
-            observe_github_host(
-                output_path=arguments.output,
-                github_output_path=arguments.github_output,
-            )
-        else:
-            finalize_github_host_attestation(
-                phase=arguments.phase,
-                observation_path=arguments.observation,
-                output_directory=arguments.output,
-            )
+        publish_github_host_attestation(
+            phase=arguments.phase,
+            output_directory=arguments.output,
+        )
     except HostAttestationError as error:
         print(str(error), file=sys.stderr)
         return 2

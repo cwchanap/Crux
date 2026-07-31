@@ -721,7 +721,7 @@ def test_publication_failure_is_integrity_failure_and_leaves_no_final_cache(
     backend_lock = _loaded_lock(archive_bytes)
     monkeypatch.setattr(
         backend_prepare,
-        "_rename_no_replace",
+        "rename_directory_no_replace",
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("publication failed")),
     )
 
@@ -742,24 +742,13 @@ def test_concurrent_loser_verifies_winner_instead_of_replacing_it(
     archive_bytes = _valid_archive_bytes()
     backend_lock = _loaded_lock(archive_bytes)
     expected = _final_path(tmp_path, backend_lock)
-    real_rename = backend_prepare._rename_no_replace
+    real_rename = backend_prepare.rename_directory_no_replace
 
-    def publish_winner_then_fail(
-        source: str,
-        target: str,
-        *,
-        src_dir_fd: int,
-        dst_dir_fd: int,
-    ) -> None:
+    def publish_winner_then_fail(source: Path, target: Path) -> None:
         _install_directory(expected, COMPONENT_BYTES)
-        real_rename(
-            source,
-            target,
-            src_dir_fd=src_dir_fd,
-            dst_dir_fd=dst_dir_fd,
-        )
+        real_rename(source, target)
 
-    monkeypatch.setattr(backend_prepare, "_rename_no_replace", publish_winner_then_fail)
+    monkeypatch.setattr(backend_prepare, "rename_directory_no_replace", publish_winner_then_fail)
 
     outcome = prepare_oaf_backend(
         _request(tmp_path, archive_path=_write_archive(tmp_path, archive_bytes)),
@@ -778,25 +767,15 @@ def test_final_reverification_rejects_symlink_swap_and_rolls_back_owned_director
 ) -> None:
     archive_bytes = _valid_archive_bytes()
     backend_lock = _loaded_lock(archive_bytes)
-    real_rename = backend_prepare._rename_no_replace
+    real_rename = backend_prepare.rename_directory_no_replace
 
-    def swap_then_publish(
-        source: str,
-        target: str,
-        *,
-        src_dir_fd: int,
-        dst_dir_fd: int,
-    ) -> None:
-        os.unlink("model.ckpt-569400.index", dir_fd=src_dir_fd)
-        os.symlink("model.ckpt-569400.meta", "model.ckpt-569400.index", dir_fd=src_dir_fd)
-        real_rename(
-            source,
-            target,
-            src_dir_fd=src_dir_fd,
-            dst_dir_fd=dst_dir_fd,
-        )
+    def swap_then_publish(source: Path, target: Path) -> None:
+        source_index = source / "model.ckpt-569400.index"
+        source_index.unlink()
+        source_index.symlink_to("model.ckpt-569400.meta")
+        real_rename(source, target)
 
-    monkeypatch.setattr(backend_prepare, "_rename_no_replace", swap_then_publish)
+    monkeypatch.setattr(backend_prepare, "rename_directory_no_replace", swap_then_publish)
 
     outcome = prepare_oaf_backend(
         _request(tmp_path, archive_path=_write_archive(tmp_path, archive_bytes)),
@@ -1132,24 +1111,13 @@ def test_atomic_publication_never_replaces_racing_empty_destination(
     archive_bytes = _valid_archive_bytes()
     backend_lock = _loaded_lock(archive_bytes)
     expected = _final_path(tmp_path, backend_lock)
-    real_rename = backend_prepare._rename_no_replace
+    real_rename = backend_prepare.rename_directory_no_replace
 
-    def race_then_rename(
-        source: str,
-        target: str,
-        *,
-        src_dir_fd: int,
-        dst_dir_fd: int,
-    ) -> None:
-        os.mkdir(target, dir_fd=dst_dir_fd)
-        real_rename(
-            source,
-            target,
-            src_dir_fd=src_dir_fd,
-            dst_dir_fd=dst_dir_fd,
-        )
+    def race_then_rename(source: Path, target: Path) -> None:
+        target.mkdir()
+        real_rename(source, target)
 
-    monkeypatch.setattr(backend_prepare, "_rename_no_replace", race_then_rename)
+    monkeypatch.setattr(backend_prepare, "rename_directory_no_replace", race_then_rename)
 
     outcome = prepare_oaf_backend(
         _request(tmp_path, archive_path=_write_archive(tmp_path, archive_bytes)),
