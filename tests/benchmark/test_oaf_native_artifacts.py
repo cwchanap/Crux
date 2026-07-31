@@ -585,6 +585,76 @@ def test_packer_removes_symlink_replaced_source_after_rename_boundary(
     assert not archive.is_symlink()
 
 
+def test_packer_removes_nonempty_directory_after_rename_boundary(
+    bootstrap_payload: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _publish(bootstrap_payload)
+    archive = tmp_path / "rename-boundary-directory.tar"
+    real_rename = artifacts_module._rename_no_replace
+    replaced = False
+
+    def replace_then_rename(*, source: str, destination: str, parent_descriptor: int) -> None:
+        nonlocal replaced
+        if not replaced:
+            os.unlink(source, dir_fd=parent_descriptor)
+            os.mkdir(source, dir_fd=parent_descriptor)
+            source_descriptor = os.open(
+                source,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_descriptor,
+            )
+            try:
+                os.mkdir("nested", dir_fd=source_descriptor)
+                nested_descriptor = os.open(
+                    "nested",
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=source_descriptor,
+                )
+                try:
+                    file_descriptor = os.open(
+                        "unverified",
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=nested_descriptor,
+                    )
+                    try:
+                        os.write(file_descriptor, b"unverified-at-rename-boundary\n")
+                    finally:
+                        os.close(file_descriptor)
+                finally:
+                    os.close(nested_descriptor)
+            finally:
+                os.close(source_descriptor)
+            replaced = True
+        real_rename(
+            source=source,
+            destination=destination,
+            parent_descriptor=parent_descriptor,
+        )
+
+    monkeypatch.setattr(artifacts_module, "_rename_no_replace", replace_then_rename)
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        artifacts_module.pack_native_work_archive(
+            phase="bootstrap",
+            payload_root=bootstrap_payload.root,
+            manifest_path=manifest.path,
+            archive_path=archive,
+        )
+    assert replaced
+    assert not archive.exists()
+
+    identity = artifacts_module.pack_native_work_archive(
+        phase="bootstrap",
+        payload_root=bootstrap_payload.root,
+        manifest_path=manifest.path,
+        archive_path=archive,
+    )
+    assert identity.size == archive.stat().st_size
+
+
 def test_copy_attestation_bundle_is_no_replace_and_byte_exact(tmp_path: Path) -> None:
     source = tmp_path / "action-bundle.json"
     destination = tmp_path / "stable.sigstore.json"
