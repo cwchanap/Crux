@@ -9,55 +9,18 @@ on:
         type: string
 
 permissions:
-  actions: read
   contents: read
+  id-token: write
+  attestations: write
 
 env:
   UV_FROZEN: "1"
 
 jobs:
-  observe-native-host:
-    name: observe-native-host
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    outputs:
-      observation: ${{ steps.observe.outputs.observation }}
-    env:
-      COMMIT_SHA: ${{ inputs.commit_sha }}
-
-    steps:
-      - name: Check out exact workflow commit
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
-          ref: ${{ inputs.commit_sha }}
-
-      - name: Install exact UV
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
-        with:
-          version: "0.11.8"
-          python-version: "3.12"
-          enable-cache: false
-
-      - name: Observe exact native host
-        id: observe
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "${COMMIT_SHA}" =~ ^[0-9a-f]{40}$ ]]
-          uv run python -m tools.hpa320.oaf_host_attestation observe-github \
-            --output native-host-observation.json \
-            --github-output "${GITHUB_OUTPUT}"
-
   native-bootstrap:
     name: native-bootstrap
-    needs: observe-native-host
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-    env:
-      COMMIT_SHA: ${{ inputs.commit_sha }}
-      GH_TOKEN: ${{ github.token }}
-      NATIVE_HOST_OBSERVATION: ${{ needs.observe-native-host.outputs.observation }}
 
     steps:
       - name: Check out exact workflow commit
@@ -73,17 +36,16 @@ jobs:
           python-version: "3.12"
           enable-cache: false
 
-      - name: Finalize bootstrap host attestation
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "${COMMIT_SHA}" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$(git rev-parse HEAD)" == "${COMMIT_SHA}" ]]
-          printf '%s\n' "${NATIVE_HOST_OBSERVATION}" > native-host-observation.json
-          uv run python -m tools.hpa320.oaf_host_attestation finalize-github \
-            --phase bootstrap \
-            --observation native-host-observation.json \
-            --output artifacts/benchmark/backends/hpa320-bootstrap/bootstrap-host-attestation
+      - name: Observe and validate the current native work job
+        env:
+          RUNNER_ENVIRONMENT_CONTEXT: ${{ runner.environment }}
+          RUNNER_OS_CONTEXT: ${{ runner.os }}
+          RUNNER_ARCH_CONTEXT: ${{ runner.arch }}
+          WORKFLOW_SOURCE_SHA: ${{ github.workflow_sha }}
+        run: >-
+          uv run python -m tools.hpa320.oaf_host_attestation publish-github
+          --phase bootstrap
+          --output artifacts/benchmark/backends/hpa320-bootstrap/bootstrap-host-attestation
 
       - name: Acquire authenticated checkpoint
         shell: bash
@@ -119,19 +81,56 @@ jobs:
             --host-evidence artifacts/benchmark/backends/hpa320-bootstrap/bootstrap-host-attestation/native-host-evidence.json \
             --output artifacts/benchmark/backends/hpa320-bootstrap/base-system-package-evidence.json
 
-      - name: Record artifact hashes
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd artifacts/benchmark/backends/hpa320-bootstrap
-          LC_ALL=C find . -type f ! -name artifact-sha256s.txt -print0 \
-            | LC_ALL=C sort -z \
-            | xargs -0 sha256sum > artifact-sha256s.txt
+      - name: Publish canonical native work subjects
+        run: >-
+          uv run python -m tools.hpa320.oaf_native_artifacts publish
+          --phase bootstrap
+          --payload-root artifacts/benchmark/backends/hpa320-bootstrap
+          --host-bundle
+          artifacts/benchmark/backends/hpa320-bootstrap/bootstrap-host-attestation/attestation-bundle.json
+          --archive
+          artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.tar
 
-      - name: Upload native bootstrap evidence
+      - name: Verify native work subjects before attestation
+        run: >-
+          uv run python -m tools.hpa320.oaf_native_artifacts verify
+          --phase bootstrap
+          --payload-root artifacts/benchmark/backends/hpa320-bootstrap
+          --archive
+          artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.tar
+
+      - name: Attest native phase evidence
+        id: attest
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d
+        with:
+          subject-path: |
+            artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.tar
+            artifacts/benchmark/backends/hpa320-bootstrap/artifact-manifest.json
+
+      - name: Preserve the local Sigstore bundle
+        run: >-
+          uv run python -m tools.hpa320.oaf_native_artifacts copy-bundle
+          --source '${{ steps.attest.outputs.bundle-path }}'
+          --destination
+          artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.sigstore.json
+
+      - name: Reverify the complete upload set
+        run: >-
+          uv run python -m tools.hpa320.oaf_native_artifacts verify
+          --phase bootstrap
+          --payload-root artifacts/benchmark/backends/hpa320-bootstrap
+          --archive
+          artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.tar
+          --bundle
+          artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.sigstore.json
+
+      - name: Upload signed native phase evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: hpa320-native-bootstrap-${{ inputs.commit_sha }}
-          path: artifacts/benchmark/backends/hpa320-bootstrap
+          path: |
+            artifacts/benchmark/backends/hpa320-bootstrap/
+            artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.tar
+            artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.sigstore.json
           if-no-files-found: error
           retention-days: 30
