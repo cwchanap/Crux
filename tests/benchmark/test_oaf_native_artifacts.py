@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -500,6 +501,51 @@ def test_packer_rejects_temp_replacement_after_strict_verification(
     assert replaced
     assert not archive.exists()
     assert not list(tmp_path.glob(".verified.tar.*.tmp"))
+
+
+def test_packer_removes_replaced_source_after_rename_boundary(
+    bootstrap_payload: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _publish(bootstrap_payload)
+    archive = tmp_path / "rename-boundary.tar"
+    real_rename = artifacts_module._rename_no_replace
+    replaced = False
+
+    def replace_then_rename(*, source: str, destination: str, parent_descriptor: int) -> None:
+        nonlocal replaced
+        os.unlink(source, dir_fd=parent_descriptor)
+        replacement_descriptor = os.open(
+            source,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        try:
+            os.write(replacement_descriptor, b"unverified-at-rename-boundary\\n")
+            os.fsync(replacement_descriptor)
+        finally:
+            os.close(replacement_descriptor)
+        replaced = True
+        real_rename(
+            source=source,
+            destination=destination,
+            parent_descriptor=parent_descriptor,
+        )
+
+    monkeypatch.setattr(artifacts_module, "_rename_no_replace", replace_then_rename)
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        artifacts_module.pack_native_work_archive(
+            phase="bootstrap",
+            payload_root=bootstrap_payload.root,
+            manifest_path=manifest.path,
+            archive_path=archive,
+        )
+    assert replaced
+    assert not archive.exists()
+    assert not list(tmp_path.glob(".rename-boundary.tar.*.tmp"))
 
 
 def test_copy_attestation_bundle_is_no_replace_and_byte_exact(tmp_path: Path) -> None:

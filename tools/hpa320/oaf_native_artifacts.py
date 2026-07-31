@@ -828,6 +828,7 @@ def pack_native_work_archive(
     temporary_name: str | None = None
     temporary_stat: os.stat_result | None = None
     temporary_descriptor: int | None = None
+    published_stat: os.stat_result | None = None
     published = False
     try:
         archive = _absolute_path(archive_path, "archive")
@@ -880,6 +881,11 @@ def pack_native_work_archive(
                 parent_descriptor=parent.descriptor,
             )
             published = True
+            published_stat = os.stat(
+                archive.name,
+                dir_fd=parent.descriptor,
+                follow_symlinks=False,
+            )
             temporary_name = None
             parent.verify()
             os.fsync(parent.descriptor)
@@ -911,8 +917,8 @@ def pack_native_work_archive(
             os.close(temporary_descriptor)
         if temporary_name is not None:
             _remove_temporary_archive(archive_path, temporary_name)
-        if published and temporary_stat is not None:
-            _remove_linked_archive_if_owned(archive_path, temporary_stat)
+        if published and published_stat is not None:
+            _remove_linked_archive_if_owned(archive_path, published_stat)
 
 
 def verify_native_work_archive(
