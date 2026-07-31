@@ -1004,6 +1004,17 @@ These scopes intentionally differ because they mirror their owning CI or reposit
 contract. They must not be normalized silently. If either contract changes before
 implementation, the plan records the exact replacement command and source.
 
+### Approved verification exception (2026-07-31)
+
+For HPA-481/HPA-482, the approved exception applies only to
+`uv run black --check src tests` and `uv run pylint src/app src/cli`, and only because
+every diagnostic path is byte-identical to Task 8 base
+`dd9d26124a21291395226113ec8cffa8c4ef5cf1`. No Task 8 regression is waived.
+[HPA-494](https://linear.app/cwchanap/issue/HPA-494/normalize-crux-legacy-black-and-pylint-baseline)
+owns the legacy Black/Pylint cleanup. All scoped and full pytest, Ruff, Ruff-format,
+error-only Pylint, focused tool, drift, and freeze-identity checks remain mandatory
+and green.
+
 ## Repository ownership
 
 - `tools/hpa320/oaf_host_attestation.py` owns same-job observation and strict v2 host
