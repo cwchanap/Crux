@@ -21,7 +21,11 @@ import tools.hpa320.seal_oaf_backend as seal_module
 from src.benchmark.backend_identity import canonical_json_bytes, sha256_hex, strict_json_loads
 from src.benchmark.checkpoint_acquisition import CheckpointIdentity
 from tools.hpa320 import oaf_native_calibration
-from tools.hpa320.oaf_native_artifacts import CANDIDATE_ARTIFACT_PATHS, CANDIDATE_ARTIFACTS
+from tools.hpa320.oaf_native_artifacts import (
+    CANDIDATE_ARTIFACT_PATHS,
+    CANDIDATE_ARTIFACTS,
+    CANDIDATE_FILES,
+)
 from tools.hpa320.oaf_oci import OciLayoutIdentity
 from tools.hpa320.seal_oaf_backend import SealError
 
@@ -852,6 +856,8 @@ def test_v2_candidate_inventory_removes_the_jobs_api_record() -> None:
         not path.endswith("github-job-api-record.json.hex")
         for path in CANDIDATE_ARTIFACT_PATHS.values()
     )
+    assert len(CANDIDATE_FILES) == 24
+    assert all("github-job-api-record" not in path for path in CANDIDATE_FILES)
     assert set(roles) == {
         "conversion_audit",
         "native_host_attestation_bundle",
