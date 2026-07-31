@@ -21,6 +21,8 @@ jobs:
     name: native-bootstrap
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    env:
+      COMMIT_SHA: ${{ inputs.commit_sha }}
 
     steps:
       - name: Check out exact workflow commit
