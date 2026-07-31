@@ -2,6 +2,8 @@ from pathlib import Path
 
 import yaml
 
+from tools.hpa320.oaf_native_artifacts import PHASE_FILES
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPOSITORY_ROOT / ".github/workflows/hpa320-native-measurement.yml"
 CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
@@ -62,6 +64,8 @@ def _assert_native_workflow_contract(
     assert job["runs-on"] == "ubuntu-24.04"
     assert job["timeout-minutes"] == timeout_minutes
     assert "needs" not in job
+    assert "outputs" not in job
+    assert job["env"] == {"COMMIT_SHA": "${{ inputs.commit_sha }}"}
     assert workflow["permissions"] == {
         "contents": "read",
         "id-token": "write",
@@ -116,6 +120,13 @@ def _assert_native_workflow_contract(
         "RUNNER_ARCH_CONTEXT": "${{ runner.arch }}",
         "WORKFLOW_SOURCE_SHA": "${{ github.workflow_sha }}",
     }
+    assert {**job["env"], **preflight["env"]} == {
+        "COMMIT_SHA": "${{ inputs.commit_sha }}",
+        "RUNNER_ENVIRONMENT_CONTEXT": "${{ runner.environment }}",
+        "RUNNER_OS_CONTEXT": "${{ runner.os }}",
+        "RUNNER_ARCH_CONTEXT": "${{ runner.arch }}",
+        "WORKFLOW_SOURCE_SHA": "${{ github.workflow_sha }}",
+    }
     assert preflight["run"] == (
         "uv run python -m tools.hpa320.oaf_host_attestation publish-github "
         f"--phase {phase} --output {payload_root}/{phase}-host-attestation"
@@ -154,6 +165,8 @@ def _assert_native_workflow_contract(
     )
 
     success_upload = _only_success_upload(steps)
+    uploads = [step for step in steps if step.get("uses") == UPLOAD]
+    assert uploads == [success_upload]
     assert success_upload["with"] == {
         "name": f"hpa320-native-{phase}-${{{{ inputs.commit_sha }}}}",
         "path": f"{payload_root}/\n{archive}\n{bundle}\n",
@@ -166,6 +179,11 @@ def _assert_native_workflow_contract(
     assert not bundle.startswith(f"{payload_root}/")
     assert "*" not in archive
     assert "*" not in bundle
+    for manifest_mapping in PHASE_FILES.values():
+        assert archive not in manifest_mapping
+        assert bundle not in manifest_mapping
+        assert archive not in manifest_mapping.values()
+        assert bundle not in manifest_mapping.values()
     assert steps.index(preflight) < min(
         steps.index(_step_named(steps, name)) for name in native_work_steps
     )

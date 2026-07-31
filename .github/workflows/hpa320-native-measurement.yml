@@ -21,6 +21,8 @@ jobs:
     name: native-measurement
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    env:
+      COMMIT_SHA: ${{ inputs.commit_sha }}
 
     steps:
       - name: Check out exact measurement commit
