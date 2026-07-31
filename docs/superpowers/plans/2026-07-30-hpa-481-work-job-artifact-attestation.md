@@ -28,6 +28,8 @@
 - Workflow permissions are exactly `contents: read`, `id-token: write`, and `attestations: write`; omit `push-to-registry`, `create-storage-record`, and `artifact-metadata: write`.
 - Acceptance supports `2.68.0 <= gh < 3.0.0` and runs `gh attestation verify` separately for the manifest and archive with the same local bundle, trusted root, exact repository, workflow, source commit, signer commit, SLSA predicate, GitHub issuer, SHA-256 algorithm, and `--deny-self-hosted-runners`.
 - Both GitHub CLI invocations must return the same verified statement, and that statement must name both expected SHA-256 subjects.
+- Because pinned `actions/attest` uses `path.parse(file).base` for each `subject-path` file when `subject-name` is absent, the exact distinct statement names are `artifact-manifest.json` and `hpa320-native-<phase>-<workflow_commit>.tar`; the workflow inputs remain the two literal repository-relative paths.
+- Treat the two exact subject name/digest identities as an unordered set because `@actions/glob` does not guarantee result order; continue to require the complete statements from both `gh` invocations to be byte-identical.
 - Each phase has exactly one success upload named `hpa320-native-<phase>-<workflow_commit>`, three literal non-overlapping paths, `if-no-files-found: error`, and `retention-days: 30`.
 - A failure upload, when present, is named `hpa320-native-<phase>-diagnostic-<workflow_commit>-run-<github_run_id>-attempt-<github_run_attempt>`, contains only allowlisted sanitized diagnostics, and never contains a success manifest, archive, or Sigstore bundle.
 - Keep request schema identities at `/v1`; after all covered source bytes are final, regenerate the runner source manifest, regenerate the build-context manifest from the exact authenticated wheelhouse, and then reissue the calibration-bootstrap request with the new cross-hashes.
@@ -1791,10 +1793,7 @@ def signed_bootstrap(
     trusted_root.write_bytes(b'{"mediaType":"application/vnd.dev.sigstore.trustedroot+json;version=0.1"}\n')
     subjects = [
         {
-            "name": (
-                "artifacts/benchmark/backends/"
-                "hpa320-bootstrap/artifact-manifest.json"
-            ),
+            "name": "artifact-manifest.json",
             "digest": {
                 "sha256": sha256_hex(
                     read_regular_file_no_follow(packed_bootstrap.manifest)
@@ -1802,10 +1801,7 @@ def signed_bootstrap(
             },
         },
         {
-            "name": (
-                "artifacts/benchmark/backends/"
-                f"hpa320-native-bootstrap-{'a' * 40}.tar"
-            ),
+            "name": f"hpa320-native-bootstrap-{'a' * 40}.tar",
             "digest": {
                 "sha256": sha256_hex(
                     read_regular_file_no_follow(packed_bootstrap.archive)
@@ -1878,7 +1874,7 @@ def test_github_verifier_runs_the_exact_policy_for_both_subjects(
     assert verified.gh_version == "2.68.1"
 ```
 
-The fixture's JSON array must contain `verificationResult.statement` with exactly the manifest and archive subjects.
+The fixture's JSON array must contain `verificationResult.statement` with exactly the action-emitted basename manifest and archive subjects.
 
 - [ ] **Step 2: Run the GitHub policy test to verify RED**
 
@@ -1996,7 +1992,7 @@ def test_github_verifier_rejects_different_verified_statements(
         )
 ```
 
-Add equally direct tests for `gh` 3.0.0, malformed version text, command failure, malformed JSON shape, missing manifest subject, missing archive subject, wrong manifest digest, wrong archive digest, an extra subject, a signed diagnostic/failed result presented under the success name, and a v1 raw-API host bundle presented as v2 authority. Simulate wrong-workflow, wrong-commit, and self-hosted provenance as a nonzero `gh attestation verify` result, while the Step 1 command assertions prove the rejecting flags are always present. Even though `gh` enforces signer policy, parse `verificationResult.statement` and assert both outputs are deep-equal and their subjects are exactly the two canonical workflow subject names and local SHA-256 identities.
+Add equally direct tests for `gh` 3.0.0, malformed version text, command failure, malformed JSON shape, missing manifest subject, missing archive subject, wrong manifest digest, wrong archive digest, an extra subject, a signed diagnostic/failed result presented under the success name, and a v1 raw-API host bundle presented as v2 authority. Simulate wrong-workflow, wrong-commit, and self-hosted provenance as a nonzero `gh attestation verify` result, while the Step 1 command assertions prove the rejecting flags are always present. Even though `gh` enforces signer policy, parse `verificationResult.statement` and assert both outputs are deep-equal and their subjects are exactly `artifact-manifest.json` and `hpa320-native-<phase>-<workflow_commit>.tar` with the local SHA-256 identities.
 
 - [ ] **Step 5: Implement strict verification-result parsing**
 
@@ -2019,7 +2015,7 @@ def _verification_statement(content: bytes) -> dict[str, JsonValue]:
     return cast(dict[str, JsonValue], statement)
 ```
 
-Preserve but do not treat other CLI result fields as authority; the required authority is `verificationResult.statement`. Compare canonical statement bytes from both invocations and validate the exact two `name`/`digest.sha256` subjects against local no-follow identities.
+Preserve but do not treat other CLI result fields as authority; the required authority is `verificationResult.statement`. Compare canonical statement bytes from both invocations and validate the exact two basename `name`/`digest.sha256` subjects against local no-follow identities.
 
 - [ ] **Step 6: Add RED phase acceptance tests**
 
@@ -2168,9 +2164,12 @@ rtk gh api repos/actions/attest/git/ref/tags/v4.2.1 --jq '.object.sha'
 rtk gh api \
   -H 'Accept: application/vnd.github.raw+json' \
   'repos/actions/attest/contents/action.yml?ref=508db95dd578ae2727ebd6217d5ba78e4fbda05d'
+rtk gh api \
+  -H 'Accept: application/vnd.github.raw+json' \
+  'repos/actions/attest/contents/src/subject.ts?ref=508db95dd578ae2727ebd6217d5ba78e4fbda05d'
 ```
 
-Expected: the tag resolves to `508db95dd578ae2727ebd6217d5ba78e4fbda05d`; `action.yml` declares `subject-path` input and `bundle-path` output. If either differs, stop and amend the approved design instead of substituting another action version.
+Expected: the tag resolves to `508db95dd578ae2727ebd6217d5ba78e4fbda05d`; `action.yml` declares `subject-path` input and `bundle-path` output; and `getSubjectFromPath` assigns `subjectName || path.parse(file).base`. If any differs, stop and amend the approved design instead of substituting another action version.
 
 - [ ] **Step 2: Rewrite workflow tests to assert the one-job contract**
 
@@ -2207,7 +2206,7 @@ def assert_native_workflow_contract(
     assert serialized.count("actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d") == 1
 ```
 
-Also inspect ordered step indexes to require host preflight before acquisition/build/native work, manifest/archive publication after native work, structural verification before attestation, bundle copy followed by structural verification, and success upload last.
+Also inspect ordered step indexes to require host preflight before acquisition/build/native work, manifest/archive publication after native work, structural verification before attestation, bundle copy followed by structural verification, and success upload last. For every phase, derive the two path basenames from that literal input and require the distinct names `artifact-manifest.json` and `hpa320-native-<phase>-${{ inputs.commit_sha }}.tar`, matching the pinned action's statement output.
 
 - [ ] **Step 3: Add RED exact attestation/upload tests**
 

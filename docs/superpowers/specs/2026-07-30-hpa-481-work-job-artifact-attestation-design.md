@@ -668,6 +668,25 @@ hard-coded phase; the workflow commit comes only from the required dispatch inpu
 `predicate-type` are absent, so the reviewed v4 invocation generates its default
 SLSA provenance for those two explicit subjects.
 
+At the pinned SHA, `getSubjectFromPath` assigns `path.parse(file).base` to every
+file when the single `subject-name` input is absent. The exact two distinct names in
+the resulting statement are therefore:
+
+```text
+artifact-manifest.json
+hpa320-native-<phase>-<workflow_commit>.tar
+```
+
+These basenames are the signed subject names; the `subject-path` input above remains
+the two literal repository-relative workflow paths. The workflow does not set
+`subject-name`, because that one scalar name would be applied to every matched file
+instead of preserving these distinct names.
+
+`@actions/glob` does not guarantee result ordering. Acceptance therefore requires
+the exact two distinct name/digest identities without treating their array order as
+authority; the two `gh` invocations must still return byte-identical complete
+statements.
+
 Signing the manifest directly preserves a durable link to every payload digest even
 after the convenience archive's GitHub retention window expires. Signing the archive
 also proves that the reviewed download is the exact packaged payload.
@@ -794,8 +813,9 @@ gh attestation verify <archive-path> \
 ```
 
 Both commands must succeed and report the same verified attestation statement, whose
-subject array contains both expected SHA-256 identities. A pass for only one subject
-is insufficient.
+subject array contains `artifact-manifest.json` and
+`hpa320-native-<phase>-<workflow_commit>.tar` with both expected SHA-256 identities.
+A pass for only one subject is insufficient.
 
 Both digest flags deliberately receive the same value. This is valid only because the
 producer preflight has already required:
@@ -819,8 +839,8 @@ authority.
 
 After signature verification, the consumer:
 
-1. requires the manifest and archive to appear as subjects with their exact SHA-256
-   digests;
+1. requires the manifest and archive to appear under their exact action-emitted
+   basenames with their exact SHA-256 digests;
 2. strict-parses the manifest;
 3. verifies the archive's canonical packing and all manifest rows;
 4. loads the v2 host bundle and exact sibling files;
@@ -927,7 +947,8 @@ treat v1 and v2 as equivalent.
   types or metadata.
 - External verification policy requires repository, phase workflow, source/signing
   commit, SLSA predicate, GitHub issuer, denial of self-hosted runners, a supported
-  GitHub CLI version, and separate passes for both signed subjects.
+  GitHub CLI version, separate passes for both signed subjects, and the exact
+  action-emitted basename names for all three phases.
 - Cross-validation rejects a valid signature over internally inconsistent evidence.
 
 ### Workflow contract tests
