@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import tarfile
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -262,6 +265,317 @@ def packed_bootstrap(bootstrap_payload: Any, tmp_path: Path) -> Any:
         manifest=published.path,
         archive=archive,
     )
+
+
+@dataclass(frozen=True)
+class SignedBootstrap:
+    manifest: Path
+    archive: Path
+    bundle: Path
+    trusted_root: Path
+    verification_json: bytes
+
+
+@pytest.fixture
+def signed_bootstrap(packed_bootstrap: Any, tmp_path: Path) -> SignedBootstrap:
+    bundle = tmp_path / "bootstrap.sigstore.json"
+    trusted_root = tmp_path / "trusted-root.json"
+    bundle.write_bytes(b'{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.3"}\n')
+    trusted_root.write_bytes(
+        b'{"mediaType":"application/vnd.dev.sigstore.trustedroot+json;version=0.1"}\n'
+    )
+    subjects = [
+        {
+            "name": "artifacts/benchmark/backends/hpa320-bootstrap/artifact-manifest.json",
+            "digest": {
+                "sha256": sha256_hex(read_regular_file_no_follow(packed_bootstrap.manifest))
+            },
+        },
+        {
+            "name": (f"artifacts/benchmark/backends/hpa320-native-bootstrap-{'a' * 40}.tar"),
+            "digest": {"sha256": sha256_hex(read_regular_file_no_follow(packed_bootstrap.archive))},
+        },
+    ]
+    statement = {
+        "_type": "https://in-toto.io/Statement/v1",
+        "predicate": {},
+        "predicateType": "https://slsa.dev/provenance/v1",
+        "subject": subjects,
+    }
+    verification_json = json.dumps(
+        [{"verificationResult": {"statement": statement}}],
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return SignedBootstrap(
+        manifest=packed_bootstrap.manifest,
+        archive=packed_bootstrap.archive,
+        bundle=bundle,
+        trusted_root=trusted_root,
+        verification_json=verification_json,
+    )
+
+
+def test_github_verifier_runs_the_exact_policy_for_both_subjects(
+    signed_bootstrap: SignedBootstrap,
+) -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def run(command: tuple[str, ...]) -> bytes:
+        commands.append(command)
+        if command[:2] == ("gh", "version"):
+            return b"gh version 2.68.1 (2026-01-01)\n"
+        return signed_bootstrap.verification_json
+
+    verified = artifacts_module.verify_github_attestations(
+        phase="bootstrap",
+        workflow_commit="a" * 40,
+        manifest_path=signed_bootstrap.manifest,
+        archive_path=signed_bootstrap.archive,
+        sigstore_bundle_path=signed_bootstrap.bundle,
+        trusted_root_path=signed_bootstrap.trusted_root,
+        command_runner=run,
+    )
+
+    verify_commands = [
+        command for command in commands if command[:3] == ("gh", "attestation", "verify")
+    ]
+    assert [command[3] for command in verify_commands] == [
+        str(signed_bootstrap.manifest),
+        str(signed_bootstrap.archive),
+    ]
+    for command in verify_commands:
+        assert command[command.index("--repo") + 1] == "cwchanap/Crux"
+        assert command[command.index("--signer-workflow") + 1] == (
+            "cwchanap/Crux/.github/workflows/hpa320-native-bootstrap.yml"
+        )
+        assert command[command.index("--source-digest") + 1] == "a" * 40
+        assert command[command.index("--signer-digest") + 1] == "a" * 40
+        assert "--deny-self-hosted-runners" in command
+        assert command[command.index("--digest-alg") + 1] == "sha256"
+        assert command[command.index("--predicate-type") + 1] == ("https://slsa.dev/provenance/v1")
+        assert command[command.index("--cert-oidc-issuer") + 1] == (
+            "https://token.actions.githubusercontent.com"
+        )
+        assert command[-2:] == ("--format", "json")
+    assert verified.gh_version == "2.68.1"
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        b"gh version 2.67.0 (2025-01-01)\n",
+        b"gh version 3.0.0 (2026-01-01)\n",
+        b"GitHub CLI 2.68.1\n",
+    ],
+)
+def test_github_verifier_rejects_unsupported_or_malformed_cli_versions(
+    signed_bootstrap: SignedBootstrap,
+    version: bytes,
+) -> None:
+    def run(command: tuple[str, ...]) -> bytes:
+        if command[:2] == ("gh", "version"):
+            return version
+        raise AssertionError("verification must not run with an unsupported gh CLI")
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        artifacts_module.verify_github_attestations(
+            phase="bootstrap",
+            workflow_commit="a" * 40,
+            manifest_path=signed_bootstrap.manifest,
+            archive_path=signed_bootstrap.archive,
+            sigstore_bundle_path=signed_bootstrap.bundle,
+            trusted_root_path=signed_bootstrap.trusted_root,
+            command_runner=run,
+        )
+
+
+def test_github_verifier_rejects_different_verified_statements(
+    signed_bootstrap: SignedBootstrap,
+) -> None:
+    invocation = 0
+
+    def run(command: tuple[str, ...]) -> bytes:
+        nonlocal invocation
+        if command[:2] == ("gh", "version"):
+            return b"gh version 2.68.1 (2026-01-01)\n"
+        invocation += 1
+        if invocation == 1:
+            return signed_bootstrap.verification_json
+        value = json.loads(signed_bootstrap.verification_json)
+        value[0]["verificationResult"]["statement"]["predicate"]["changed"] = True
+        return json.dumps(value).encode("utf-8")
+
+    with pytest.raises(artifacts_module.NativeArtifactError, match="disagree"):
+        artifacts_module.verify_github_attestations(
+            phase="bootstrap",
+            workflow_commit="a" * 40,
+            manifest_path=signed_bootstrap.manifest,
+            archive_path=signed_bootstrap.archive,
+            sigstore_bundle_path=signed_bootstrap.bundle,
+            trusted_root_path=signed_bootstrap.trusted_root,
+            command_runner=run,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        ("not-an-array", "one entry"),
+        ("missing-statement", "statement is missing"),
+        ("missing-manifest", "subjects are invalid"),
+        ("missing-archive", "subjects are invalid"),
+        ("wrong-manifest-digest", "do not match"),
+        ("wrong-archive-digest", "do not match"),
+        ("extra-subject", "subjects are invalid"),
+    ],
+)
+def test_github_verifier_rejects_invalid_statement_authority(
+    signed_bootstrap: SignedBootstrap,
+    mutation: str,
+    error: str,
+) -> None:
+    value: object = json.loads(signed_bootstrap.verification_json)
+    if mutation == "not-an-array":
+        value = {"verificationResult": {}}
+    elif mutation == "missing-statement":
+        assert isinstance(value, list)
+        value[0]["verificationResult"] = {}
+    else:
+        assert isinstance(value, list)
+        subjects = value[0]["verificationResult"]["statement"]["subject"]
+        if mutation == "missing-manifest":
+            subjects.pop(0)
+        elif mutation == "missing-archive":
+            subjects.pop(1)
+        elif mutation == "wrong-manifest-digest":
+            subjects[0]["digest"]["sha256"] = "0" * 64
+        elif mutation == "wrong-archive-digest":
+            subjects[1]["digest"]["sha256"] = "0" * 64
+        else:
+            subjects.append({"name": "diagnostic.json", "digest": {"sha256": "f" * 64}})
+    encoded = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+    def run(command: tuple[str, ...]) -> bytes:
+        if command[:2] == ("gh", "version"):
+            return b"gh version 2.68.1 (2026-01-01)\n"
+        return encoded
+
+    with pytest.raises(artifacts_module.NativeArtifactError, match=error):
+        artifacts_module.verify_github_attestations(
+            phase="bootstrap",
+            workflow_commit="a" * 40,
+            manifest_path=signed_bootstrap.manifest,
+            archive_path=signed_bootstrap.archive,
+            sigstore_bundle_path=signed_bootstrap.bundle,
+            trusted_root_path=signed_bootstrap.trusted_root,
+            command_runner=run,
+        )
+
+
+def test_github_verifier_rejects_command_failure(
+    signed_bootstrap: SignedBootstrap,
+) -> None:
+    def run(command: tuple[str, ...]) -> bytes:
+        if command[:2] == ("gh", "version"):
+            return b"gh version 2.68.1 (2026-01-01)\n"
+        raise subprocess.CalledProcessError(1, command)
+
+    with pytest.raises(artifacts_module.NativeArtifactError, match="verification failed"):
+        artifacts_module.verify_github_attestations(
+            phase="bootstrap",
+            workflow_commit="a" * 40,
+            manifest_path=signed_bootstrap.manifest,
+            archive_path=signed_bootstrap.archive,
+            sigstore_bundle_path=signed_bootstrap.bundle,
+            trusted_root_path=signed_bootstrap.trusted_root,
+            command_runner=run,
+        )
+
+
+def test_verify_attestation_cli_runs_the_outside_in_acceptance_order(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[str] = []
+    verified = artifacts_module.VerifiedGitHubAttestation(
+        gh_version="2.68.1",
+        statement={"subject": []},
+        statement_sha256="a" * 64,
+        subjects=(
+            artifacts_module.CheckpointIdentity(
+                name="artifacts/benchmark/backends/hpa320-bootstrap/artifact-manifest.json",
+                sha256="b" * 64,
+                size=1,
+            ),
+        ),
+    )
+
+    def verify(**_kwargs: object) -> artifacts_module.VerifiedGitHubAttestation:
+        calls.append("github")
+        return verified
+
+    def load(*_args: object, **_kwargs: object) -> object:
+        calls.append("manifest")
+        return object()
+
+    def archive(**_kwargs: object) -> object:
+        calls.append("archive")
+        return object()
+
+    def phase(**_kwargs: object) -> None:
+        calls.append("phase")
+
+    monkeypatch.setattr(artifacts_module, "verify_github_attestations", verify)
+    monkeypatch.setattr(artifacts_module, "load_native_work_manifest", load)
+    monkeypatch.setattr(artifacts_module, "verify_native_work_archive", archive)
+    monkeypatch.setattr(artifacts_module, "_validate_native_work_phase", phase)
+
+    assert (
+        artifacts_module.main(
+            [
+                "verify-attestation",
+                "--phase",
+                "bootstrap",
+                "--workflow-commit",
+                "a" * 40,
+                "--payload-root",
+                str(tmp_path),
+                "--archive",
+                str(tmp_path / "archive.tar"),
+                "--bundle",
+                str(tmp_path / "bundle.json"),
+                "--trusted-root",
+                str(tmp_path / "trusted-root.json"),
+                "--repository-root",
+                str(tmp_path / "repository"),
+            ]
+        )
+        == 0
+    )
+    assert calls == ["github", "manifest", "archive", "phase"]
+    report = strict_json_loads(capsys.readouterr().out.encode("utf-8")[:-1], require_canonical=True)
+    assert report == {
+        "arguments": {
+            "archive": str(tmp_path / "archive.tar"),
+            "bundle": str(tmp_path / "bundle.json"),
+            "payload_root": str(tmp_path),
+            "phase": "bootstrap",
+            "repository_root": str(tmp_path / "repository"),
+            "trusted_root": str(tmp_path / "trusted-root.json"),
+            "workflow_commit": "a" * 40,
+        },
+        "gh_version": "2.68.1",
+        "statement_sha256": "a" * 64,
+        "subjects": [
+            {
+                "name": "artifacts/benchmark/backends/hpa320-bootstrap/artifact-manifest.json",
+                "sha256": "b" * 64,
+                "size": 1,
+            }
+        ],
+    }
 
 
 def _tar_member_spans(content: bytes) -> list[tuple[int, int]]:
