@@ -39,11 +39,16 @@ or candidate authority. It is deleted rather than migrated. Its trigger branch
 `hpa-320-native-seal-evidence` is retired, or the workflow is disabled in GitHub,
 before HPA-423 is allowed to dispatch.
 
-This design changes execution provenance only. It does not change the checkpoint,
-runtime image contents, inference parameters, smoke oracle, prediction schema, or the
-acyclic request/evidence/lock ordering frozen by HPA-320. It necessarily changes the
-not-yet-published native evidence bytes and any future lock hashes that transitively
-reference them; it does not rewrite a published backend or runtime identity.
+This design changes execution provenance and the source-attestation surface, not the
+checkpoint, model graph, inference parameters, smoke oracle, prediction schema, or
+the acyclic request/evidence/lock ordering frozen by HPA-320. The bootstrap workflow,
+changed HPA-320 tools, runtime validators, and runner source manifest are copied into
+the provisional image, so its not-yet-published bytes and OCI identity necessarily
+change. The migration therefore regenerates the runner source manifest and build
+context, then reissues the pre-dispatch calibration-bootstrap request with their new
+hashes. No bootstrap evidence, measurement request, seal profile, candidate, backend
+lock, or runtime lock has been accepted, so this does not rewrite a published
+backend, runtime, request/evidence chain, or prediction identity.
 
 ## Ticket ownership and atomic delivery
 
@@ -105,7 +110,10 @@ cannot distinguish the explicitly approved GitHub-hosted producer path.
 - Making self-hosted runners eligible for these three seal-production phases.
 - Redesigning the orchestrator-signed or approved-local evidence forms used by other
   official execution paths.
-- Reopening the HPA-320 backend or runtime identity.
+- Reopening the HPA-320 checkpoint, model, inference, or final sealed-identity
+  contract. The pre-dispatch provisional image and bootstrap request are deliberately
+  reissued because their source-attested inputs change before any evidence accepts
+  them.
 - Claiming that a valid provenance signature makes an inference result correct.
   Result schemas, hashes, and phase-specific validation remain independently
   authoritative.
@@ -396,14 +404,35 @@ Their field sets otherwise remain as frozen by HPA-320 except for the changed ne
 `native_host_api_record` artifact row. Producers, strict loaders, schema registries,
 candidate validation, and goldens switch to these v2 identities in the same commit.
 
-The request schema identities do not move. The already checked-in calibration
-bootstrap request has no output-schema field and remains byte-identical. A newly
-generated `crux.oaf-calibration-measurement-request/v1` names
+The request schema identities do not move, but the checked-in calibration-bootstrap
+request cannot remain byte-identical. The dependency chain is:
+
+1. `runtime/oaf_tf1/runner-source-manifest.json` covers the native bootstrap
+   workflow, the changed HPA-320 attestation and candidate tools, and the runtime
+   validators that enforce the migrated schemas.
+2. `runtime/oaf_tf1/build-context-manifest.json` contains those exact source bytes
+   and the runner source manifest bytes.
+3. The `crux.oaf-calibration-bootstrap-request/v1` record cross-hashes both
+   manifests through `runner_source_manifest_sha256` and
+   `build_context_manifest_sha256`.
+
+After all source changes are final, the migration regenerates the runner source
+manifest, regenerates the build-context manifest using the exact authenticated
+wheelhouse, and reissues
+`config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.calibration-bootstrap-request.json`
+under its existing `/v1` request schema with the new manifest hashes. The old request
+bytes remain in Git history but are superseded before dispatch and are never accepted
+into a bootstrap evidence chain. The vendored upstream source manifest,
+checkpoint-acquisition request, base-system-package request, distribution-build
+manifest, and instrumentation patch remain byte-identical unless implementation
+changes one of their independently frozen inputs.
+
+A newly generated `crux.oaf-calibration-measurement-request/v1` names
 `crux.oaf-calibration-measurement-evidence/v2` in its existing `output_schemas`
 field, and the later seal-profile request references the resulting v2 evidence
-hashes through its existing fields. Neither downstream request has been published,
-so this preserves the acyclic request/evidence order without rewriting accepted
-input authority.
+hashes through its existing fields. No bootstrap evidence or downstream request has
+been published, so this preserves the acyclic request/evidence order without
+rewriting accepted input authority.
 
 For v2, `run_url` is the run-level URL with exact grammar:
 
@@ -846,12 +875,18 @@ all three manual workflows:
    cross-job output handling, and `actions: read`; delete
    `.github/workflows/hpa320-native-host-evidence.yml`.
 6. Update the HPA-320 design's superseded provenance and schema passages.
-7. Run the local verification stack.
-8. Merge HPA-481 and HPA-482 together.
-9. Retire `hpa-320-native-seal-evidence` or disable its legacy workflow in GitHub;
+7. After every covered source byte is final, regenerate
+   `runtime/oaf_tf1/runner-source-manifest.json`, then regenerate
+   `runtime/oaf_tf1/build-context-manifest.json` from the exact authenticated
+   wheelhouse, then reissue the checked-in calibration-bootstrap request with the
+   resulting hashes. Strict-load the request and exact-compare every referenced
+   current file before committing.
+8. Run the local verification stack.
+9. Merge HPA-481 and HPA-482 together.
+10. Retire `hpa-320-native-seal-evidence` or disable its legacy workflow in GitHub;
    deleting the file from the default branch alone does not disable the workflow copy
    retained on that branch.
-10. Only then dispatch HPA-423 at an exact merged commit.
+11. Only then dispatch HPA-423 at an exact merged commit.
 
 No production or test success path retains v1 compatibility. No compatibility mode
 may silently infer `runner_environment`, accept an API record for another job, or
@@ -874,6 +909,15 @@ treat v1 and v2 as equivalent.
   substitution at every migrated boundary.
 - Generic GitHub-hosted native evidence requires `runner_environment`.
 - No v1 GitHub-hosted native-evidence success parser remains.
+- The checked-in runner source manifest reproduces the final covered workflow,
+  tooling, and runtime-validator bytes exactly.
+- The checked-in build-context manifest reproduces from the final repository and
+  authenticated wheelhouse exactly and contains the regenerated runner source
+  manifest bytes.
+- The reissued calibration-bootstrap request strict-loads and exact-cross-hashes the
+  current runner source manifest, build-context manifest, upstream source manifest,
+  checkpoint request, base-system request, distribution manifest, and
+  instrumentation patch.
 - Manifest parsing rejects noncanonical JSON, extra or missing keys, path escape,
   duplicates, wrong ordering, missing files, size/hash drift, self-reference, an
   unknown role, and a valid role at a phase-disallowed path.
