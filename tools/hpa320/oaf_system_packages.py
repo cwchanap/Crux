@@ -53,7 +53,7 @@ _REQUIRED_PACKAGE_FIELDS = frozenset(
     {"Architecture", "Filename", "Package", "SHA256", "Size", "Version"}
 )
 BASE_SYSTEM_PACKAGE_REQUEST_SCHEMA = "crux.oaf-base-system-package-request/v1"
-BASE_SYSTEM_PACKAGE_EVIDENCE_SCHEMA = "crux.oaf-base-system-package-evidence/v1"
+BASE_SYSTEM_PACKAGE_EVIDENCE_SCHEMA = "crux.oaf-base-system-package-evidence/v2"
 BASE_IMAGE_NAME = "python:3.7.17-slim-bullseye"
 BASE_IMAGE_PLATFORM = "linux/amd64"
 _BASE_SYSTEM_REQUEST_KEYS = frozenset(

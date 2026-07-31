@@ -96,15 +96,15 @@ def test_phase_a_and_b_schema_goldens_are_complete_and_strict(repository_root: P
         "crux.drum-prediction-events/v1",
         "crux.transcription-backend-lock/v1",
         "crux.transcription-runtime-lock/v1",
-        "crux.backend-seal-evidence/v1",
+        "crux.backend-seal-evidence/v2",
         "crux.legacy-tf2-conversion-coverage/v1",
         "crux.oaf-checkpoint-acquisition-request/v1",
         "crux.oaf-base-system-package-request/v1",
         "crux.oaf-build-context-manifest/v1",
-        "crux.oaf-calibration-bootstrap-evidence/v1",
+        "crux.oaf-calibration-bootstrap-evidence/v2",
         "crux.oaf-calibration-bootstrap-request/v1",
         "crux.oaf-calibration-measurement-request/v1",
-        "crux.oaf-native-host-attestation-bundle/v1",
+        "crux.oaf-native-host-attestation-bundle/v2",
         "crux.oaf-seal-profile-request/v1",
         "crux.transcription-runner/v1",
         "crux.transcription-runner-response/v1",
@@ -236,8 +236,8 @@ def test_phase_a_schema_golden_validators_reject_important_hash_type_drift(
 @pytest.mark.parametrize(
     ("schema", "field"),
     [
-        ("crux.oaf-calibration-measurement-evidence/v1", "base_system_package_evidence_sha256"),
-        ("crux.oaf-seal-candidate/v1", "seal_profile_request_sha256"),
+        ("crux.oaf-calibration-measurement-evidence/v2", "base_system_package_evidence_sha256"),
+        ("crux.oaf-seal-candidate/v2", "seal_profile_request_sha256"),
         ("crux.oaf-oci-layout-manifest/v1", "config_digest"),
         ("crux.oaf-smoke-oracle/v1", "source_audio_sha256"),
     ],
@@ -260,9 +260,9 @@ def test_phase_a_schema_goldens_reject_nonfirst_critical_field_drift(
 @pytest.mark.parametrize(
     ("schema", "field"),
     [
-        ("crux.oaf-calibration-bootstrap-evidence/v1", "runtime_image_layer_digests"),
+        ("crux.oaf-calibration-bootstrap-evidence/v2", "runtime_image_layer_digests"),
         ("crux.oaf-oci-layout-manifest/v1", "layer_digests"),
-        ("crux.backend-seal-evidence/v1", "runtime_image_layer_digests"),
+        ("crux.backend-seal-evidence/v2", "runtime_image_layer_digests"),
     ],
 )
 def test_oaf_schema_goldens_reject_reordered_image_layers(

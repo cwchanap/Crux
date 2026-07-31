@@ -21,6 +21,7 @@ import tools.hpa320.seal_oaf_backend as seal_module
 from src.benchmark.backend_identity import canonical_json_bytes, sha256_hex, strict_json_loads
 from src.benchmark.checkpoint_acquisition import CheckpointIdentity
 from tools.hpa320 import oaf_native_calibration
+from tools.hpa320.oaf_native_artifacts import CANDIDATE_ARTIFACT_PATHS, CANDIDATE_ARTIFACTS
 from tools.hpa320.oaf_oci import OciLayoutIdentity
 from tools.hpa320.seal_oaf_backend import SealError
 
@@ -47,6 +48,15 @@ def _lock_fixtures() -> ModuleType:
 
 
 LOCKS = _lock_fixtures()
+V2_SCHEMA_REPLACEMENTS = {
+    "crux.backend-seal-evidence/v1": "crux.backend-seal-evidence/v2",
+    "crux.oaf-base-system-package-evidence/v1": "crux.oaf-base-system-package-evidence/v2",
+    "crux.oaf-calibration-bootstrap-evidence/v1": ("crux.oaf-calibration-bootstrap-evidence/v2"),
+    "crux.oaf-calibration-measurement-evidence/v1": (
+        "crux.oaf-calibration-measurement-evidence/v2"
+    ),
+    "crux.oaf-seal-candidate/v1": "crux.oaf-seal-candidate/v2",
+}
 
 
 def _write_json(path: Path, payload: object) -> Path:
@@ -95,13 +105,20 @@ def test_source_manifest_validator_allows_package_ancestors_only() -> None:
 
 def _native_host_payload() -> dict[str, object]:
     return {
-        "api_record_sha256": "a" * 64,
-        "approved_labels": ["Linux", "X64"],
-        "job_id": 123,
-        "run_url": "https://github.com/acme/crux/actions/runs/456/job/123",
+        "github_job": "native-bootstrap",
+        "github_repository": "acme/crux",
+        "github_run_attempt": 1,
+        "github_run_id": 456,
+        "github_workflow_ref": (
+            "acme/crux/.github/workflows/hpa320-native-bootstrap.yml@refs/heads/test"
+        ),
+        "github_workflow_sha": "b" * 40,
+        "run_url": "https://github.com/acme/crux/actions/runs/456",
         "runner_arch": "X64",
+        "runner_environment": "github-hosted",
         "runner_os": "Linux",
         "workflow_commit": "b" * 40,
+        "schema": "crux.github-hosted-native-evidence/v2",
         "host_numeric_fingerprint": {
             "architecture": "x86_64",
             "cpu_vendor_id": "GenuineIntel",
@@ -142,23 +159,8 @@ def _host_bundle_fixture(
     directory.mkdir()
     commit = "b" * 40
     run_id = {"bootstrap": 456, "measurement": 457, "candidate": 458}[phase]
-    job_id = run_id + 1000
     repository = "acme/crux"
     run_url = f"https://github.com/{repository}/actions/runs/{run_id}"
-    api_record = {
-        "conclusion": "success",
-        "head_sha": commit,
-        "html_url": f"{run_url}/job/{job_id}",
-        "id": job_id,
-        "labels": ["ubuntu-24.04"],
-        "name": "observe-native-host",
-        "run_id": run_id,
-        "status": "completed",
-    }
-    api_bytes = json.dumps(api_record, separators=(", ", ": ")).encode()
-    api_content = api_bytes.hex().encode("ascii") + b"\n"
-    api_path = directory / "github-job-api-record.json.hex"
-    api_path.write_bytes(api_content)
     fingerprint = {
         "architecture": "x86_64",
         "cpu_family": "6",
@@ -167,14 +169,21 @@ def _host_bundle_fixture(
         "cpu_vendor_id": "GenuineIntel",
     }
     evidence_payload = {
-        "api_record_sha256": sha256_hex(api_bytes),
-        "approved_labels": ["Linux", "X64"],
+        "github_job": f"native-{phase}",
+        "github_repository": repository,
+        "github_run_attempt": 1,
+        "github_run_id": run_id,
+        "github_workflow_ref": (
+            f"{repository}/.github/workflows/hpa320-native-{phase}.yml@refs/heads/test"
+        ),
+        "github_workflow_sha": commit,
         "host_numeric_fingerprint": fingerprint,
-        "job_id": job_id,
-        "run_url": api_record["html_url"],
+        "run_url": run_url,
         "runner_arch": "X64",
+        "runner_environment": "github-hosted",
         "runner_os": "Linux",
         "workflow_commit": commit,
+        "schema": "crux.github-hosted-native-evidence/v2",
     }
     record = _native_host_record(payload=evidence_payload)
     host_path = _write_json(directory / "native-host-evidence.json", record)
@@ -184,6 +193,7 @@ def _host_bundle_fixture(
             "docker_architecture": "x86_64",
             "docker_os_type": "linux",
             "docker_server_version": "28.0.4",
+            "github_job": f"native-{phase}",
             "github_repository": repository,
             "github_run_attempt": 1,
             "github_run_id": run_id,
@@ -192,8 +202,10 @@ def _host_bundle_fixture(
             "github_workflow_ref": (
                 f"{repository}/.github/workflows/hpa320-native-{phase}.yml@refs/heads/test"
             ),
+            "github_workflow_sha": commit,
             "host_numeric_fingerprint": fingerprint,
             "runner_arch": "X64",
+            "runner_environment": "github-hosted",
             "runner_os": "Linux",
             "uname_architecture": "x86_64",
         },
@@ -201,11 +213,6 @@ def _host_bundle_fixture(
     bundle_path = _write_json(
         directory / "attestation-bundle.json",
         {
-            "api_record": {
-                "name": api_path.name,
-                "sha256": _content_hash(api_path),
-                "size": api_path.stat().st_size,
-            },
             "native_host_evidence": {
                 "name": host_path.name,
                 "sha256": _content_hash(host_path),
@@ -217,7 +224,7 @@ def _host_bundle_fixture(
                 "size": observation_path.stat().st_size,
             },
             "phase": phase,
-            "schema": "crux.oaf-native-host-attestation-bundle/v1",
+            "schema": "crux.oaf-native-host-attestation-bundle/v2",
         },
     )
     return bundle_path, host_path, record
@@ -459,7 +466,7 @@ def _bootstrap_evidence_fixture(
         "runtime_image_layer_diff_ids": deepcopy(LOCKS.RUNTIME_IMAGE_LAYER_DIFF_IDS),
         "runtime_image_layer_digests": deepcopy(LOCKS.RUNTIME_IMAGE_LAYER_DIGESTS),
         "runtime_image_manifest_digest": f"sha256:{'4' * 64}",
-        "schema": "crux.oaf-calibration-bootstrap-evidence/v1",
+        "schema": V2_SCHEMA_REPLACEMENTS["crux.oaf-calibration-bootstrap-evidence/v1"],
     }
     evidence_path = _write_json(tmp_path / "calibration-bootstrap-evidence.json", payload)
     return request_path, evidence_path, bundle_path, payload
@@ -547,6 +554,19 @@ def test_calibration_bootstrap_evidence_rejects_identity_drift(
     _write_json(evidence, changed)
 
     with pytest.raises(SealError, match=message):
+        seal_module.load_calibration_bootstrap_evidence(request, evidence)
+
+
+def test_calibration_bootstrap_evidence_accepts_v2_and_rejects_former_v1_schema(
+    tmp_path: Path,
+) -> None:
+    request, evidence, _bundle, payload = _bootstrap_evidence_fixture(tmp_path)
+    assert payload["schema"] == V2_SCHEMA_REPLACEMENTS["crux.oaf-calibration-bootstrap-evidence/v1"]
+    seal_module.load_calibration_bootstrap_evidence(request, evidence)
+
+    payload["schema"] = "crux.oaf-calibration-bootstrap-evidence/v1"
+    _write_json(evidence, payload)
+    with pytest.raises(SealError, match="calibration bootstrap evidence fields"):
         seal_module.load_calibration_bootstrap_evidence(request, evidence)
 
 
@@ -818,11 +838,38 @@ def _tensor_payload(seal: dict[str, Any]) -> dict[str, object]:
 
 
 def _output_paths(repository: Path) -> dict[str, Path]:
-    return {role: repository / relative for role, relative in seal_module._CANDIDATE_ARTIFACTS}
+    return {role: repository / relative for role, relative in CANDIDATE_ARTIFACTS}
 
 
 def _candidate_artifact_path(candidate: Path, role: str) -> Path:
-    return candidate / seal_module._CANDIDATE_ARTIFACT_PATHS[role]
+    return candidate / CANDIDATE_ARTIFACT_PATHS[role]
+
+
+def test_v2_candidate_inventory_removes_the_jobs_api_record() -> None:
+    roles = tuple(role for role, _path in CANDIDATE_ARTIFACTS)
+    assert "native_host_api_record" not in roles
+    assert all(
+        not path.endswith("github-job-api-record.json.hex")
+        for path in CANDIDATE_ARTIFACT_PATHS.values()
+    )
+    assert set(roles) == {
+        "conversion_audit",
+        "native_host_attestation_bundle",
+        "native_host_evidence",
+        "native_host_observation",
+        "host_adapter_source_manifest",
+        "tensor_coverage",
+        "advisory_snapshot",
+        "security_scan",
+        "oci_layout_archive",
+        "oci_layout_manifest",
+        "smoke_audio",
+        "smoke_prediction",
+        "smoke_oracle",
+        "seal_evidence",
+        "runtime_lock",
+        "backend_lock",
+    }
 
 
 def _build_candidate(
@@ -840,7 +887,6 @@ def _build_candidate(
     )
     for source, role in (
         (bundle, "native_host_attestation_bundle"),
-        (bundle.parent / "github-job-api-record.json.hex", "native_host_api_record"),
         (host_path, "native_host_evidence"),
         (bundle.parent / "native-host-observation.json", "native_host_observation"),
     ):
@@ -1022,7 +1068,7 @@ def _build_candidate(
             "role": role,
             "sha256": _content_hash(candidate / relative),
         }
-        for role, relative in seal_module._CANDIDATE_ARTIFACTS
+        for role, relative in CANDIDATE_ARTIFACTS
     ]
     _write_json(
         candidate / "candidate-manifest.json",
@@ -1041,12 +1087,30 @@ def _build_candidate(
                 backend["required_inference_inventory"]
             ),
             "runtime_lock_payload_sha256": _content_hash(runtime_path),
-            "schema": "crux.oaf-seal-candidate/v1",
+            "schema": V2_SCHEMA_REPLACEMENTS["crux.oaf-seal-candidate/v1"],
             "seal_evidence_payload_sha256": _content_hash(seal_path),
             "seal_profile_request_sha256": seal["seal_profile_request_sha256"],
         },
     )
     return candidate, audit_path
+
+
+def test_seal_candidate_accepts_v2_and_rejects_former_v1_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_native_host(monkeypatch)
+    repository = _make_repository(tmp_path)
+    candidate, _audit = _build_candidate(repository)
+    seal_module._load_candidate(candidate=candidate, repository_root=repository)
+
+    manifest_path = candidate / "candidate-manifest.json"
+    payload = json.loads(manifest_path.read_bytes())
+    assert payload["schema"] == V2_SCHEMA_REPLACEMENTS["crux.oaf-seal-candidate/v1"]
+    payload["schema"] = "crux.oaf-seal-candidate/v1"
+    _write_json(manifest_path, payload)
+    with pytest.raises(SealError, match="candidate manifest fields"):
+        seal_module._load_candidate(candidate=candidate, repository_root=repository)
 
 
 def _seal(
@@ -1250,7 +1314,9 @@ def _calibration_inputs(
                     "wav_byte_length": 84,
                 },
             ],
-            "output_schemas": ["crux.oaf-calibration-measurement-evidence/v1"],
+            "output_schemas": [
+                V2_SCHEMA_REPLACEMENTS["crux.oaf-calibration-measurement-evidence/v1"]
+            ],
             "repetition_count": 3,
             "required_metrics": ["measurement_row"],
             "schema": "crux.oaf-calibration-measurement-request/v1",
@@ -1352,11 +1418,53 @@ def test_measure_publishes_only_diagnostic_evidence_with_fake_authority(
 
     payload = json.loads(output.read_bytes())
     assert artifact.path == output
-    assert payload["schema"] == "crux.oaf-calibration-measurement-evidence/v1"
+    assert (
+        payload["schema"] == V2_SCHEMA_REPLACEMENTS["crux.oaf-calibration-measurement-evidence/v1"]
+    )
     assert not (output.parent / "candidate-manifest.json").exists()
     assert [
         (row["input_frame_count"], row["repetition"]) for row in payload["measurement_rows"]
     ] == [(10, 1), (10, 2), (10, 3), (20, 1), (20, 2), (20, 3)]
+
+
+def test_measurement_evidence_accepts_v2_and_rejects_former_v1_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        request,
+        bootstrap_request,
+        bootstrap_evidence,
+        bundle,
+        host,
+        cache,
+        checkpoint,
+        base,
+        measurement,
+    ) = _calibration_inputs(tmp_path, monkeypatch)
+    seal_module.measure(
+        request_path=request,
+        bootstrap_request_path=bootstrap_request,
+        bootstrap_evidence_path=bootstrap_evidence,
+        host_attestation_bundle_path=bundle,
+        host_evidence_path=host,
+        model_cache=cache,
+        checkpoint_evidence_path=checkpoint,
+        base_system_evidence_path=base,
+        output_path=measurement,
+        runner=lambda _request, frame, repetition: _fake_measurement_row(frame, repetition),
+    )
+    payload = json.loads(measurement.read_bytes())
+    assert (
+        payload["schema"] == V2_SCHEMA_REPLACEMENTS["crux.oaf-calibration-measurement-evidence/v1"]
+    )
+    request_value = seal_module.load_calibration_measurement_request(request)
+    seal_module._load_measurement_evidence(measurement, request_value)
+
+    payload["schema"] = "crux.oaf-calibration-measurement-evidence/v1"
+    _write_json(measurement, payload)
+    with pytest.raises(SealError, match="calibration measurement evidence fields"):
+        seal_module._load_measurement_evidence(measurement, request_value)
 
 
 def test_measure_rejects_bootstrap_hash_and_phase_bundle_drift(
@@ -1762,9 +1870,7 @@ def test_calibrate_constructs_native_runner_and_internal_candidate_builder(
 
     def fake_builder(**kwargs: object) -> None:
         staging = Path(str(kwargs["staging"]))
-        assert (
-            staging / seal_module._CANDIDATE_ARTIFACT_PATHS["native_host_attestation_bundle"]
-        ).is_file()
+        assert (staging / CANDIDATE_ARTIFACT_PATHS["native_host_attestation_bundle"]).is_file()
         assert kwargs["native_events"] == FakeNativeRunner.smoke_native_events
         reached.append("builder")
         raise SealError("native builder reached")
@@ -1846,7 +1952,7 @@ def _base_system_evidence_payload(
         "package_inventory_sha256": "0" * 64,
         "probes": probe_rows,
         "request_sha256": request_sha256,
-        "schema": "crux.oaf-base-system-package-evidence/v1",
+        "schema": V2_SCHEMA_REPLACEMENTS["crux.oaf-base-system-package-evidence/v1"],
     }
 
 
@@ -1941,6 +2047,24 @@ def test_base_system_evidence_reproduces_exact_inventory(tmp_path: Path) -> None
         loaded.package_inventory
     )
     assert request.additional_system_packages == ()
+
+
+def test_base_system_evidence_accepts_v2_and_rejects_former_v1_schema(tmp_path: Path) -> None:
+    system_packages = importlib.import_module("tools.hpa320.oaf_system_packages")
+    request_path = _write_json(tmp_path / "request.json", _base_system_request_payload())
+    request = system_packages.load_base_system_package_request(request_path)
+    evidence = _base_system_evidence_payload(request.sha256)
+    evidence["package_inventory_sha256"] = system_packages.inventory_sha256(
+        evidence["package_inventory"]
+    )
+    assert evidence["schema"] == V2_SCHEMA_REPLACEMENTS["crux.oaf-base-system-package-evidence/v1"]
+    evidence_path = _write_json(tmp_path / "evidence.json", evidence)
+    system_packages.load_base_system_package_evidence(evidence_path, request=request)
+
+    evidence["schema"] = "crux.oaf-base-system-package-evidence/v1"
+    _write_json(evidence_path, evidence)
+    with pytest.raises(system_packages.SystemPackageError, match="base-system evidence fields"):
+        system_packages.load_base_system_package_evidence(evidence_path, request=request)
 
 
 def _mock_base_system_attestation(monkeypatch: pytest.MonkeyPatch) -> None:

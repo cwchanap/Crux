@@ -65,13 +65,20 @@ def _wav_bytes(sample_frames: int = 4) -> bytes:
 
 def _host_evidence_payload(*, cpu_model: str = "143") -> dict[str, object]:
     return {
-        "api_record_sha256": "a" * 64,
-        "approved_labels": ["Linux", "X64"],
-        "job_id": 123,
-        "run_url": "https://github.com/acme/crux/actions/runs/456/job/123",
+        "github_job": "native-candidate",
+        "github_repository": "acme/crux",
+        "github_run_attempt": 1,
+        "github_run_id": 456,
+        "github_workflow_ref": (
+            "acme/crux/.github/workflows/hpa320-native-candidate.yml@refs/heads/test"
+        ),
+        "github_workflow_sha": "f" * 40,
+        "run_url": "https://github.com/acme/crux/actions/runs/456",
         "runner_arch": "X64",
+        "runner_environment": "github-hosted",
         "runner_os": "Linux",
         "workflow_commit": "f" * 40,
+        "schema": "crux.github-hosted-native-evidence/v2",
         "host_numeric_fingerprint": {
             "architecture": "x86_64",
             "cpu_vendor_id": "GenuineIntel",

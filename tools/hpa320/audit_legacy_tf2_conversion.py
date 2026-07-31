@@ -36,7 +36,7 @@ from src.benchmark.backend_lock import (
 )
 
 CANDIDATE_MANIFEST_NAME = "candidate-manifest.json"
-CANDIDATE_MANIFEST_SCHEMA = "crux.oaf-seal-candidate/v1"
+CANDIDATE_MANIFEST_SCHEMA = "crux.oaf-seal-candidate/v2"
 MATCHING_ALGORITHM = "exact_assignment_trace"
 MATCHING_ALGORITHM_VERSION = "v1"
 

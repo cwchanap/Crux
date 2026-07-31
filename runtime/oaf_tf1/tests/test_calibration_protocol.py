@@ -169,8 +169,14 @@ def _calibration_authorities(tmp_path: Path) -> dict[str, Path]:
     base_request_content = _write_canonical(base_request_path, base_request)
     inventory = [{"architecture": "amd64", "name": "base-files", "version": "1"}]
     host_payload = {
-        "api_record_sha256": "5" * 64,
-        "approved_labels": ["Linux", "X64"],
+        "github_job": "native-bootstrap",
+        "github_repository": "acme/crux",
+        "github_run_attempt": 1,
+        "github_run_id": 2,
+        "github_workflow_ref": (
+            "acme/crux/.github/workflows/hpa320-native-bootstrap.yml@refs/heads/test"
+        ),
+        "github_workflow_sha": "6" * 40,
         "host_numeric_fingerprint": {
             "architecture": "x86_64",
             "cpu_family": "6",
@@ -178,11 +184,12 @@ def _calibration_authorities(tmp_path: Path) -> dict[str, Path]:
             "cpu_stepping": "1",
             "cpu_vendor_id": "GenuineIntel",
         },
-        "job_id": 1,
-        "run_url": "https://github.com/acme/crux/actions/runs/2/job/1",
+        "run_url": "https://github.com/acme/crux/actions/runs/2",
         "runner_arch": "X64",
+        "runner_environment": "github-hosted",
         "runner_os": "Linux",
         "workflow_commit": "6" * 40,
+        "schema": "crux.github-hosted-native-evidence/v2",
     }
     host_evidence = {
         "kind": "github_hosted",
@@ -215,7 +222,7 @@ def _calibration_authorities(tmp_path: Path) -> dict[str, Path]:
         ),
         "probes": [{"name": name, "value": "passed"} for name in base_request["required_probes"]],
         "request_sha256": _sha256(base_request_content),
-        "schema": "crux.oaf-base-system-package-evidence/v1",
+        "schema": "crux.oaf-base-system-package-evidence/v2",
     }
     _write_canonical(base_evidence_path, base_evidence)
 
@@ -275,7 +282,7 @@ def _calibration_authorities(tmp_path: Path) -> dict[str, Path]:
             "sha256:" + "3" * 64,
         ],
         "runtime_image_manifest_digest": "sha256:" + "4" * 64,
-        "schema": "crux.oaf-calibration-bootstrap-evidence/v1",
+        "schema": "crux.oaf-calibration-bootstrap-evidence/v2",
     }
     _write_canonical(bootstrap_evidence_path, bootstrap_evidence)
     runtime_config_path = tmp_path / "runtime-image-config-digest.txt"
@@ -486,6 +493,39 @@ def test_calibration_startup_authenticates_every_authority_before_numeric_import
     startup = calibration_entrypoint.authenticate_calibration_startup(**authorities)
 
     assert startup.runtime_image_config_digest == "sha256:" + "a" * 64
+
+
+@pytest.mark.parametrize(
+    ("authority_key", "former_schema", "replacement_schema"),
+    [
+        (
+            "base_system_evidence_path",
+            "crux.oaf-base-system-package-evidence/v1",
+            "crux.oaf-base-system-package-evidence/v2",
+        ),
+        (
+            "bootstrap_evidence_path",
+            "crux.oaf-calibration-bootstrap-evidence/v1",
+            "crux.oaf-calibration-bootstrap-evidence/v2",
+        ),
+    ],
+)
+def test_calibration_startup_accepts_v2_containing_evidence_and_rejects_former_v1(
+    tmp_path: Path,
+    authority_key: str,
+    former_schema: str,
+    replacement_schema: str,
+) -> None:
+    authorities = _calibration_authorities(tmp_path)
+    path = authorities[authority_key]
+    payload = json.loads(path.read_bytes())
+    assert payload["schema"] == replacement_schema
+    calibration_entrypoint.authenticate_calibration_startup(**authorities)
+
+    payload["schema"] = former_schema
+    _write_canonical(path, payload)
+    with pytest.raises(calibration_entrypoint.CalibrationAuthorityFailure):
+        calibration_entrypoint.authenticate_calibration_startup(**authorities)
 
 
 def test_calibration_startup_rejects_authority_hash_drift_before_numeric_import(

@@ -61,8 +61,10 @@ from tools.hpa320.oaf_host_attestation import (
     NativeHostAttestationBundle,
     load_native_host_attestation_bundle,
 )
+from tools.hpa320.oaf_native_artifacts import CANDIDATE_ARTIFACT_PATHS, CANDIDATE_ARTIFACTS
 from tools.hpa320.oaf_oci import ImageBuildRecipe, OciArchiveRecipe
 from tools.hpa320.oaf_system_packages import (
+    BASE_SYSTEM_PACKAGE_EVIDENCE_SCHEMA,
     BaseSystemPackageEvidence,
     BaseSystemPackageRequest,
     ProbeResult,
@@ -79,83 +81,6 @@ CANDIDATE_HOST_ATTESTATION_ROOT = Path(
 SMOKE_AUDIO_NAME = "canonical.wav"
 SMOKE_PREDICTION_NAME = "smoke-prediction.jsonl"
 _BACKEND_ID = "magenta-egmd-tf1-94529798-8hit-v1"
-_CANDIDATE_ARTIFACTS = (
-    (
-        "conversion_audit",
-        "docs/superpowers/evidence/hpa-320/legacy-conversion-audit.json",
-    ),
-    (
-        "native_host_attestation_bundle",
-        (
-            "docs/superpowers/evidence/hpa-320/native/"
-            "candidate-host-attestation/attestation-bundle.json"
-        ),
-    ),
-    (
-        "native_host_api_record",
-        (
-            "docs/superpowers/evidence/hpa-320/native/"
-            "candidate-host-attestation/github-job-api-record.json.hex"
-        ),
-    ),
-    (
-        "native_host_evidence",
-        (
-            "docs/superpowers/evidence/hpa-320/native/"
-            "candidate-host-attestation/native-host-evidence.json"
-        ),
-    ),
-    (
-        "native_host_observation",
-        (
-            "docs/superpowers/evidence/hpa-320/native/"
-            "candidate-host-attestation/native-host-observation.json"
-        ),
-    ),
-    (
-        "host_adapter_source_manifest",
-        "runtime/oaf_tf1/host-adapter-source-manifest.json",
-    ),
-    (
-        "tensor_coverage",
-        "docs/superpowers/evidence/hpa-320/oaf-tensor-coverage.json",
-    ),
-    (
-        "advisory_snapshot",
-        "docs/superpowers/evidence/hpa-320/oaf-advisory-snapshot.json",
-    ),
-    (
-        "security_scan",
-        "docs/superpowers/evidence/hpa-320/oaf-security-scan.json",
-    ),
-    (
-        "oci_layout_archive",
-        "artifacts/benchmark/backends/oaf-tf1/runtime.oci.tar",
-    ),
-    (
-        "oci_layout_manifest",
-        "docs/superpowers/evidence/hpa-320/oaf-oci-layout-manifest.json",
-    ),
-    ("smoke_audio", "tests/fixtures/oaf_tf1_smoke/canonical.wav"),
-    (
-        "smoke_prediction",
-        "docs/superpowers/evidence/hpa-320/oaf-smoke-prediction.jsonl",
-    ),
-    ("smoke_oracle", "tests/fixtures/oaf_tf1_smoke/smoke-oracle.json"),
-    (
-        "seal_evidence",
-        f"config/benchmark/backends/{_BACKEND_ID}.seal-evidence.json",
-    ),
-    (
-        "runtime_lock",
-        f"config/benchmark/backends/{_BACKEND_ID}.runtime-lock.json",
-    ),
-    (
-        "backend_lock",
-        f"config/benchmark/backends/{_BACKEND_ID}.backend-lock.json",
-    ),
-)
-_CANDIDATE_ARTIFACT_PATHS = dict(_CANDIDATE_ARTIFACTS)
 
 HOST_ADAPTER_SCHEMA = "crux.oaf-host-adapter-source-manifest/v1"
 SMOKE_ORACLE_SCHEMA = "crux.oaf-smoke-oracle/v1"
@@ -236,13 +161,13 @@ _BOOTSTRAP_EVIDENCE_KEYS = frozenset(
         "schema",
     }
 )
-CALIBRATION_BOOTSTRAP_EVIDENCE_SCHEMA = "crux.oaf-calibration-bootstrap-evidence/v1"
+CALIBRATION_BOOTSTRAP_EVIDENCE_SCHEMA = "crux.oaf-calibration-bootstrap-evidence/v2"
 _FINAL_LOCK_HASH_KEYS = frozenset({"backend_lock_sha256", "runtime_lock_sha256"})
 CALIBRATION_MEASUREMENT_REQUEST_SCHEMA = "crux.oaf-calibration-measurement-request/v1"
-CALIBRATION_MEASUREMENT_EVIDENCE_SCHEMA = "crux.oaf-calibration-measurement-evidence/v1"
+CALIBRATION_MEASUREMENT_EVIDENCE_SCHEMA = "crux.oaf-calibration-measurement-evidence/v2"
 CALIBRATION_BOOTSTRAP_REQUEST_SCHEMA = "crux.oaf-calibration-bootstrap-request/v1"
 SEAL_PROFILE_REQUEST_SCHEMA = "crux.oaf-seal-profile-request/v1"
-SEAL_CANDIDATE_SCHEMA = "crux.oaf-seal-candidate/v1"
+SEAL_CANDIDATE_SCHEMA = "crux.oaf-seal-candidate/v2"
 _MEASUREMENT_REQUEST_KEYS = frozenset(
     {
         "backend_id",
@@ -722,7 +647,7 @@ def attest_base_system(
         "package_inventory_sha256": inventory_sha256(inventory),
         "probes": [{"name": probe.name, "value": probe.value} for probe in probes],
         "request_sha256": request.sha256,
-        "schema": "crux.oaf-base-system-package-evidence/v1",
+        "schema": BASE_SYSTEM_PACKAGE_EVIDENCE_SCHEMA,
     }
     content = canonical_json_bytes(payload, trailing_newline=True)
     try:
@@ -1458,7 +1383,7 @@ def validate_schema_golden(schema: str, content: bytes) -> None:
                     _require_digest_array(payload[field], f"schema golden OCI {field}")
                 with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
                     directory_path = Path(directory)
-                    archive_path = directory_path / _CANDIDATE_ARTIFACT_PATHS["oci_layout_archive"]
+                    archive_path = directory_path / CANDIDATE_ARTIFACT_PATHS["oci_layout_archive"]
                     archive_path.parent.mkdir(parents=True)
                     archive_path.write_bytes(b"schema-golden-oci\n")
                     seal = LoadedSealEvidence(
@@ -1945,13 +1870,11 @@ def _copy_candidate_host_attestation(
     target_root.mkdir(parents=True)
     sources = (
         Path(source_bundle),
-        Path(source_bundle).parent / bundle.api_record.name,
         Path(source_bundle).parent / bundle.native_host_evidence.name,
         Path(source_bundle).parent / bundle.native_host_observation.name,
     )
     targets = (
         target_root / "attestation-bundle.json",
-        target_root / bundle.api_record.name,
         target_root / bundle.native_host_evidence.name,
         target_root / bundle.native_host_observation.name,
     )
@@ -2392,10 +2315,10 @@ def seal_candidate(
         candidate=Path(candidate),
         repository_root=repository,
     )
-    order = tuple(role for role, _path in _CANDIDATE_ARTIFACTS)
+    order = tuple(role for role, _path in CANDIDATE_ARTIFACTS)
     published: list[PublishedArtifact] = []
     try:
-        for role, relative in _CANDIDATE_ARTIFACTS:
+        for role, relative in CANDIDATE_ARTIFACTS:
             content = loaded.contents[role]
             published.append(
                 publish_immutable_bytes(
@@ -2418,17 +2341,17 @@ def _load_candidate(
     directory = _require_directory(candidate, "candidate directory")
     repository = _require_directory(repository_root, "repository root")
     manifest, contents = _load_candidate_manifest(directory)
-    host = load_native_host_evidence(directory / _CANDIDATE_ARTIFACT_PATHS["native_host_evidence"])
-    backend = _load_backend(directory / _CANDIDATE_ARTIFACT_PATHS["backend_lock"])
-    runtime = _load_runtime(directory / _CANDIDATE_ARTIFACT_PATHS["runtime_lock"])
-    seal = _load_seal(directory / _CANDIDATE_ARTIFACT_PATHS["seal_evidence"])
-    audit = _load_audit(directory / _CANDIDATE_ARTIFACT_PATHS["conversion_audit"])
+    host = load_native_host_evidence(directory / CANDIDATE_ARTIFACT_PATHS["native_host_evidence"])
+    backend = _load_backend(directory / CANDIDATE_ARTIFACT_PATHS["backend_lock"])
+    runtime = _load_runtime(directory / CANDIDATE_ARTIFACT_PATHS["runtime_lock"])
+    seal = _load_seal(directory / CANDIDATE_ARTIFACT_PATHS["seal_evidence"])
+    audit = _load_audit(directory / CANDIDATE_ARTIFACT_PATHS["conversion_audit"])
     try:
         validate_oaf_lock_set(backend, runtime, seal, audit)
     except BackendLockError as error:
         raise SealError(f"candidate lock set is invalid: {error}") from None
 
-    bundle_path = directory / _CANDIDATE_ARTIFACT_PATHS["native_host_attestation_bundle"]
+    bundle_path = directory / CANDIDATE_ARTIFACT_PATHS["native_host_attestation_bundle"]
     try:
         bundle = load_native_host_attestation_bundle(
             bundle_path,
@@ -2475,12 +2398,12 @@ def _load_candidate_manifest(
     if set(payload) != _CANDIDATE_MANIFEST_KEYS or payload["schema"] != CANDIDATE_MANIFEST_SCHEMA:
         raise SealError("candidate manifest fields must match the exact schema")
     artifacts = payload["artifacts"]
-    if not isinstance(artifacts, list) or len(artifacts) != len(_CANDIDATE_ARTIFACTS):
+    if not isinstance(artifacts, list) or len(artifacts) != len(CANDIDATE_ARTIFACTS):
         raise SealError("candidate artifact allowlist is incomplete")
     contents: dict[str, bytes] = {}
     for row, (expected_role, expected_path) in zip(
         artifacts,
-        _CANDIDATE_ARTIFACTS,
+        CANDIDATE_ARTIFACTS,
         strict=True,
     ):
         if (
@@ -2502,7 +2425,7 @@ def _load_candidate_manifest(
         if path.is_file() and not path.is_symlink()
     }
     expected_files = {CANDIDATE_MANIFEST_NAME}
-    expected_files.update(path for _role, path in _CANDIDATE_ARTIFACTS)
+    expected_files.update(path for _role, path in CANDIDATE_ARTIFACTS)
     if actual_files != expected_files:
         raise SealError("candidate directory contains files outside its exact allowlist")
     return payload, contents
@@ -2631,26 +2554,26 @@ def _validate_candidate_artifacts(
     seal: LoadedSealEvidence,
 ) -> None:
     tensor, tensor_content = _read_canonical_object(
-        directory / _CANDIDATE_ARTIFACT_PATHS["tensor_coverage"],
+        directory / CANDIDATE_ARTIFACT_PATHS["tensor_coverage"],
         "tensor coverage",
     )
     _validate_tensor_coverage(tensor, seal)
     security, security_content = _read_canonical_object(
-        directory / _CANDIDATE_ARTIFACT_PATHS["security_scan"],
+        directory / CANDIDATE_ARTIFACT_PATHS["security_scan"],
         "security scan",
     )
     advisory_content = _read_regular(
-        directory / _CANDIDATE_ARTIFACT_PATHS["advisory_snapshot"],
+        directory / CANDIDATE_ARTIFACT_PATHS["advisory_snapshot"],
         "advisory snapshot",
     )
     _validate_security_scan(security, advisory_content, seal)
     oci, oci_content = _read_canonical_object(
-        directory / _CANDIDATE_ARTIFACT_PATHS["oci_layout_manifest"],
+        directory / CANDIDATE_ARTIFACT_PATHS["oci_layout_manifest"],
         "OCI layout manifest",
     )
     _validate_oci_layout(oci, directory, seal)
     oracle, oracle_content = _read_canonical_object(
-        directory / _CANDIDATE_ARTIFACT_PATHS["smoke_oracle"],
+        directory / CANDIDATE_ARTIFACT_PATHS["smoke_oracle"],
         "smoke oracle",
     )
     _validate_smoke(oracle, directory, seal)
@@ -2767,7 +2690,7 @@ def _validate_oci_layout(
     name = archive["name"]
     if not isinstance(name, str) or not name or PurePosixPath(name).name != name or "\\" in name:
         raise SealError("OCI archive filename is invalid")
-    expected_archive_path = _CANDIDATE_ARTIFACT_PATHS["oci_layout_archive"]
+    expected_archive_path = CANDIDATE_ARTIFACT_PATHS["oci_layout_archive"]
     if PurePosixPath(expected_archive_path).name != name:
         raise SealError("OCI archive filename differs from the candidate allowlist")
     content = _read_regular(directory / expected_archive_path, "OCI archive")
@@ -2793,11 +2716,11 @@ def _validate_smoke(
     ):
         raise SealError("smoke oracle has no exact nonempty prediction")
     audio = _read_regular(
-        directory / _CANDIDATE_ARTIFACT_PATHS["smoke_audio"],
+        directory / CANDIDATE_ARTIFACT_PATHS["smoke_audio"],
         "smoke audio",
     )
     prediction = _read_regular(
-        directory / _CANDIDATE_ARTIFACT_PATHS["smoke_prediction"],
+        directory / CANDIDATE_ARTIFACT_PATHS["smoke_prediction"],
         "smoke prediction",
     )
     if (

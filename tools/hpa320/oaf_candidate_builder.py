@@ -30,14 +30,13 @@ from tools.hpa320.audit_legacy_tf2_conversion import (
     CANDIDATE_MANIFEST_SCHEMA,
 )
 from tools.hpa320.oaf_host_attestation import NativeHostAttestationBundle
+from tools.hpa320.oaf_native_artifacts import CANDIDATE_ARTIFACT_PATHS, CANDIDATE_ARTIFACTS
 from tools.hpa320.oaf_system_packages import (
     BaseSystemPackageEvidence,
     BaseSystemPackageRequest,
 )
 from tools.hpa320.seal_oaf_backend import (
     _BACKEND_ID,
-    _CANDIDATE_ARTIFACT_PATHS,
-    _CANDIDATE_ARTIFACTS,
     _HASH_FIELDS,
     CalibrationBootstrapEvidence,
     CalibrationBootstrapRequest,
@@ -87,11 +86,11 @@ def build_native_candidate(
     required_inventory = _inventory(tensor_payload, "required_inference_inventory")
     non_inference_inventory = _inventory(tensor_payload, "non_inference_inventory")
     _write(
-        Path(staging) / _CANDIDATE_ARTIFACT_PATHS["tensor_coverage"],
+        Path(staging) / CANDIDATE_ARTIFACT_PATHS["tensor_coverage"],
         tensor_content,
     )
 
-    audit_target = Path(staging) / _CANDIDATE_ARTIFACT_PATHS["conversion_audit"]
+    audit_target = Path(staging) / CANDIDATE_ARTIFACT_PATHS["conversion_audit"]
     _generate_conversion_audit(
         repository=repository,
         model_cache=Path(model_cache),
@@ -101,7 +100,7 @@ def build_native_candidate(
     audit_sha256 = sha256_hex(_read(audit_target, "conversion audit"))
 
     distributions = _runtime_distributions(repository)
-    advisory_target = Path(staging) / _CANDIDATE_ARTIFACT_PATHS["advisory_snapshot"]
+    advisory_target = Path(staging) / CANDIDATE_ARTIFACT_PATHS["advisory_snapshot"]
     _write_json(
         advisory_target,
         {
@@ -117,7 +116,7 @@ def build_native_candidate(
         },
     )
     advisory_sha256 = sha256_hex(_read(advisory_target, "advisory snapshot"))
-    security_target = Path(staging) / _CANDIDATE_ARTIFACT_PATHS["security_scan"]
+    security_target = Path(staging) / CANDIDATE_ARTIFACT_PATHS["security_scan"]
     _write_json(
         security_target,
         {
@@ -136,9 +135,9 @@ def build_native_candidate(
         bootstrap_evidence_path=Path(bootstrap_evidence_path),
         identity=archive_identity,
     )
-    archive_target = Path(staging) / _CANDIDATE_ARTIFACT_PATHS["oci_layout_archive"]
+    archive_target = Path(staging) / CANDIDATE_ARTIFACT_PATHS["oci_layout_archive"]
     _write(archive_target, _read(archive_source, "authenticated OCI archive"))
-    oci_target = Path(staging) / _CANDIDATE_ARTIFACT_PATHS["oci_layout_manifest"]
+    oci_target = Path(staging) / CANDIDATE_ARTIFACT_PATHS["oci_layout_manifest"]
     _write_json(
         oci_target,
         {
@@ -160,18 +159,18 @@ def build_native_candidate(
         repository / "tests/fixtures/oaf_tf1_smoke/canonical.wav",
         "canonical smoke audio",
     )
-    smoke_target = Path(staging) / _CANDIDATE_ARTIFACT_PATHS["smoke_audio"]
+    smoke_target = Path(staging) / CANDIDATE_ARTIFACT_PATHS["smoke_audio"]
     _write(smoke_target, smoke_content)
     if not native_events:
         raise SealIntegrityError("calibration smoke prediction is empty")
     smoke_events = _plain(list(native_events))
     smoke_prediction = canonical_json_bytes(smoke_events, trailing_newline=False)
     _write(
-        Path(staging) / _CANDIDATE_ARTIFACT_PATHS["smoke_prediction"],
+        Path(staging) / CANDIDATE_ARTIFACT_PATHS["smoke_prediction"],
         smoke_prediction,
     )
     smoke_sha256 = sha256_hex(smoke_content)
-    oracle_target = Path(staging) / _CANDIDATE_ARTIFACT_PATHS["smoke_oracle"]
+    oracle_target = Path(staging) / CANDIDATE_ARTIFACT_PATHS["smoke_oracle"]
     _write_json(
         oracle_target,
         {
@@ -186,7 +185,7 @@ def build_native_candidate(
     )
     oracle_sha256 = sha256_hex(_read(oracle_target, "smoke oracle"))
 
-    host_manifest_target = Path(staging) / _CANDIDATE_ARTIFACT_PATHS["host_adapter_source_manifest"]
+    host_manifest_target = Path(staging) / CANDIDATE_ARTIFACT_PATHS["host_adapter_source_manifest"]
     _write_json(host_manifest_target, build_host_adapter_source_manifest(repository))
     host_manifest_sha256 = sha256_hex(_read(host_manifest_target, "host adapter source manifest"))
     source_hashes = {
@@ -245,7 +244,7 @@ def build_native_candidate(
         smoke_prediction_sha256=sha256_hex(smoke_prediction),
         tensor_sha256=sha256_hex(tensor_content),
     )
-    seal_target = Path(staging) / _CANDIDATE_ARTIFACT_PATHS["seal_evidence"]
+    seal_target = Path(staging) / CANDIDATE_ARTIFACT_PATHS["seal_evidence"]
     _write_json(seal_target, seal)
     seal_sha256 = sha256_hex(_read(seal_target, "seal evidence"))
 
@@ -261,7 +260,7 @@ def build_native_candidate(
         oci_sha256=oci_sha256,
         seal_sha256=seal_sha256,
     )
-    runtime_target = Path(staging) / _CANDIDATE_ARTIFACT_PATHS["runtime_lock"]
+    runtime_target = Path(staging) / CANDIDATE_ARTIFACT_PATHS["runtime_lock"]
     _write_json(runtime_target, runtime)
     runtime_sha256 = sha256_hex(_read(runtime_target, "runtime lock"))
 
@@ -283,7 +282,7 @@ def build_native_candidate(
         runtime_sha256=runtime_sha256,
         seal_sha256=seal_sha256,
     )
-    backend_target = Path(staging) / _CANDIDATE_ARTIFACT_PATHS["backend_lock"]
+    backend_target = Path(staging) / CANDIDATE_ARTIFACT_PATHS["backend_lock"]
     _write_json(backend_target, backend)
     backend_sha256 = sha256_hex(_read(backend_target, "backend lock"))
 
@@ -294,7 +293,7 @@ def build_native_candidate(
             "role": role,
             "sha256": sha256_hex(_read(Path(staging) / relative, f"candidate {role}")),
         }
-        for role, relative in _CANDIDATE_ARTIFACTS
+        for role, relative in CANDIDATE_ARTIFACTS
     ]
     _write_json(
         Path(staging) / CANDIDATE_MANIFEST_NAME,
@@ -401,7 +400,7 @@ def _seal_payload(  # noqa: PLR0913
         "runtime_image_layer_digests": bootstrap.payload["runtime_image_layer_digests"],
         "runtime_image_manifest_digest": bootstrap.payload["runtime_image_manifest_digest"],
         "runtime_uid": profile.payload["runtime_uid"],
-        "schema": "crux.backend-seal-evidence/v1",
+        "schema": "crux.backend-seal-evidence/v2",
         "seal_profile_request_sha256": profile.sha256,
         "security_scan_sha256": security_sha256,
         "shm_bytes": profile.payload["shm_bytes"],
