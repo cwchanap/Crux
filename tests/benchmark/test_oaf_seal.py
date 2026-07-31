@@ -1244,6 +1244,10 @@ def _phase_bootstrap_payload(
         elif name == "bootstrap_image_identity":
             path = layout
             payload = {"schema": "crux.test-oci-layout/v1", "changed": True}
+        elif name == "v1_raw_api_host_authority":
+            path = root / "bootstrap-host-attestation/attestation-bundle.json"
+            payload = json.loads(path.read_bytes())
+            payload["schema"] = "crux.oaf-native-host-attestation-bundle/v1"
         else:
             raise AssertionError(f"unexpected bootstrap mutation: {name}")
         _write_json(path, payload)
@@ -1264,6 +1268,7 @@ def _phase_measurement_payload(
     shutil.copyfile(inputs["bootstrap_evidence"], accepted_bootstrap)
     shutil.copyfile(inputs["checkpoint"], accepted_checkpoint)
     shutil.copyfile(inputs["base"], accepted_base)
+    _copy_host_bundle(inputs["measurement_bundle"], accepted / "measurement-host-attestation")
     measurement_request_payload = json.loads(inputs["measurement_request"].read_bytes())
     measurement_request_payload["calibration_bootstrap_evidence_sha256"] = _content_hash(
         accepted_bootstrap
@@ -1562,6 +1567,31 @@ def _phase_candidate_payload(
         shutil.copyfile(source, destination)
 
     def mutate(name: str) -> None:
+        def rebind_candidate_measurement_authority() -> None:
+            measurement_sha256 = _content_hash(accepted_measurement)
+            profile_path = repository / _SEAL_PROFILE_REQUEST_RELATIVE
+            profile_payload = json.loads(profile_path.read_bytes())
+            profile_payload["calibration_measurement_evidence_sha256"] = measurement_sha256
+            _write_json(profile_path, profile_payload)
+            profile_sha256 = _content_hash(profile_path)
+
+            seal_path = root / "seal-candidate" / CANDIDATE_ARTIFACT_PATHS["seal_evidence"]
+            seal_payload = json.loads(seal_path.read_bytes())
+            seal_payload["calibration_measurement_evidence_sha256"] = measurement_sha256
+            seal_payload["seal_profile_request_sha256"] = profile_sha256
+            _write_json(seal_path, seal_payload)
+            seal_sha256 = _content_hash(seal_path)
+
+            manifest_path = root / "seal-candidate/candidate-manifest.json"
+            manifest_payload = json.loads(manifest_path.read_bytes())
+            manifest_payload["calibration_measurement_evidence_sha256"] = measurement_sha256
+            manifest_payload["seal_evidence_payload_sha256"] = seal_sha256
+            manifest_payload["seal_profile_request_sha256"] = profile_sha256
+            for artifact in manifest_payload["artifacts"]:
+                if artifact["role"] == "seal_evidence":
+                    artifact["sha256"] = seal_sha256
+            _write_json(manifest_path, manifest_payload)
+
         path = root / "seal-candidate/candidate-manifest.json"
         payload = json.loads(path.read_bytes())
         if name == "candidate_manifest_hash":
@@ -1598,6 +1628,36 @@ def _phase_candidate_payload(
             path = repository / _SEAL_PROFILE_REQUEST_RELATIVE
             payload = json.loads(path.read_bytes())
             payload["calibration_measurement_evidence_sha256"] = "0" * 64
+        elif name == "accepted_measurement_runtime_authority":
+            path = accepted_measurement
+            payload = json.loads(path.read_bytes())
+            payload["runtime_image_config_digest"] = f"sha256:{'f' * 64}"
+            _write_json(path, payload)
+            rebind_candidate_measurement_authority()
+            return
+        elif name == "accepted_measurement_runtime_manifest_authority":
+            path = accepted_measurement
+            payload = json.loads(path.read_bytes())
+            payload["runtime_image_manifest_digest"] = f"sha256:{'f' * 64}"
+            _write_json(path, payload)
+            rebind_candidate_measurement_authority()
+            return
+        elif name == "accepted_measurement_host_bundle_authority":
+            path = accepted_measurement
+            payload = json.loads(path.read_bytes())
+            payload["native_host_attestation_bundle_sha256"] = "0" * 64
+            _write_json(path, payload)
+            rebind_candidate_measurement_authority()
+            return
+        elif name == "accepted_measurement_host_evidence_authority":
+            path = accepted_measurement
+            payload = json.loads(path.read_bytes())
+            payload["native_host_evidence"] = json.loads(
+                (root / "candidate-host-attestation/native-host-evidence.json").read_bytes()
+            )
+            _write_json(path, payload)
+            rebind_candidate_measurement_authority()
+            return
         else:
             raise AssertionError(f"unexpected candidate mutation: {name}")
         _write_json(path, payload)
@@ -1648,6 +1708,10 @@ def native_phase_payload(
         ("candidate", "outer_checkpoint_authority"),
         ("candidate", "outer_image_authority"),
         ("candidate", "accepted_measurement_authority"),
+        ("candidate", "accepted_measurement_runtime_authority"),
+        ("candidate", "accepted_measurement_runtime_manifest_authority"),
+        ("candidate", "accepted_measurement_host_bundle_authority"),
+        ("candidate", "accepted_measurement_host_evidence_authority"),
         ("candidate", "seal_profile_authority"),
     ],
 )
@@ -1659,12 +1723,28 @@ def test_native_work_phase_gate_rejects_internal_inconsistency(
     payload = native_phase_payload(phase)
     payload.mutate(mutation)
 
-    with pytest.raises(SealError):
+    with pytest.raises(SealError) as raised:
         seal_module.validate_native_work_phase(
             phase=phase,
             payload_root=payload.root,
             repository_root=payload.repository_root,
         )
+    expected_errors = {
+        "accepted_measurement_runtime_authority": (
+            "measurement evidence does not bind its operational image identity"
+        ),
+        "accepted_measurement_runtime_manifest_authority": (
+            "measurement evidence does not bind its operational image identity"
+        ),
+        "accepted_measurement_host_bundle_authority": (
+            "measurement evidence does not bind its phase host bundle"
+        ),
+        "accepted_measurement_host_evidence_authority": (
+            "measurement evidence does not bind its phase host evidence"
+        ),
+    }
+    if mutation in expected_errors:
+        assert expected_errors[mutation] in str(raised.value)
 
 
 def test_measurement_phase_gate_accepts_the_genuine_workflow_layout(
@@ -1677,6 +1757,20 @@ def test_candidate_phase_gate_accepts_the_genuine_workflow_layout(
     native_phase_payload: Callable[[str], NativePhasePayload],
 ) -> None:
     native_phase_payload("candidate")
+
+
+def test_bootstrap_phase_gate_rejects_v1_raw_api_host_authority(
+    native_phase_payload: Callable[[str], NativePhasePayload],
+) -> None:
+    payload = native_phase_payload("bootstrap")
+    payload.mutate("v1_raw_api_host_authority")
+
+    with pytest.raises(SealError):
+        seal_module.validate_native_work_phase(
+            phase="bootstrap",
+            payload_root=payload.root,
+            repository_root=payload.repository_root,
+        )
 
 
 def test_seal_candidate_accepts_v2_and_rejects_former_v1_schema(

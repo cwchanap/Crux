@@ -231,13 +231,22 @@ class VerifiedGitHubAttestation:
 
 
 @dataclass(frozen=True)
+class _SnapshotBinding:
+    """One file-system identity that must survive the native acceptance gate."""
+
+    path: Path
+    metadata: os.stat_result
+    sha256: str | None
+
+
+@dataclass(frozen=True)
 class _AttestationSnapshot:
     """Private immutable copies consumed by every acceptance gate."""
 
     archive_path: Path
     manifest_path: Path
     payload_root: Path
-    subjects: tuple[CheckpointIdentity, ...]
+    bindings: tuple[_SnapshotBinding, ...]
 
 
 def _run_checked_command(command: tuple[str, ...]) -> bytes:
@@ -399,56 +408,168 @@ def _verification_statement(content: bytes) -> dict[str, JsonValue]:
 def _attestation_snapshot(
     *,
     phase: str,
-    workflow_commit: str,
     payload_root: Path,
     archive_path: Path,
 ) -> Iterator[_AttestationSnapshot]:
     """Copy only the exact phase allowlist before any external verifier runs."""
 
+    temporary_directory: tempfile.TemporaryDirectory[str] | None = None
+    snapshot_root: Path | None = None
     try:
         source_root = _absolute_path(payload_root, "payload root")
         source_archive = _absolute_path(archive_path, "archive")
-        with tempfile.TemporaryDirectory(prefix=".hpa320-attestation-") as temporary:
-            temporary_root = Path(temporary)
-            snapshot_root = temporary_root / "payload"
-            snapshot_root.mkdir(mode=0o700)
-            manifest_content: bytes | None = None
-            for relative in (MANIFEST_NAME, *_phase_files(phase)):
-                content = read_regular_file_no_follow(source_root / relative)
-                if relative == MANIFEST_NAME:
-                    manifest_content = content
-                destination = snapshot_root / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(content)
-            snapshot_archive = temporary_root / source_archive.name
-            archive_content = read_regular_file_no_follow(source_archive)
-            snapshot_archive.write_bytes(archive_content)
-            if manifest_content is None:
-                raise NativeArtifactError("native work attestation manifest is missing")
-            yield _AttestationSnapshot(
-                archive_path=snapshot_archive,
-                manifest_path=snapshot_root / MANIFEST_NAME,
-                payload_root=snapshot_root,
-                subjects=(
-                    CheckpointIdentity(
-                        name=(f"artifacts/benchmark/backends/hpa320-{phase}/{MANIFEST_NAME}"),
-                        sha256=hashlib.sha256(manifest_content).hexdigest(),
-                        size=len(manifest_content),
-                    ),
-                    CheckpointIdentity(
-                        name=(
-                            "artifacts/benchmark/backends/"
-                            f"hpa320-native-{phase}-{workflow_commit}.tar"
-                        ),
-                        sha256=hashlib.sha256(archive_content).hexdigest(),
-                        size=len(archive_content),
-                    ),
-                ),
+        _scan_phase_payload(phase=phase, payload_root=source_root, include_manifest=False)
+        temporary_directory = tempfile.TemporaryDirectory(prefix=".hpa320-attestation-")
+        temporary_root = Path(os.path.realpath(temporary_directory.name))
+        snapshot_root = temporary_root / "payload"
+        snapshot_root.mkdir(mode=0o700)
+        for relative in (MANIFEST_NAME, *_phase_files(phase)):
+            _copy_snapshot_file(
+                source=source_root / relative,
+                destination=snapshot_root / relative,
             )
+        snapshot_archive = temporary_root / source_archive.name
+        _copy_snapshot_file(source=source_archive, destination=snapshot_archive)
+        _scan_phase_payload(phase=phase, payload_root=source_root, include_manifest=False)
+        _seal_snapshot(
+            phase=phase,
+            payload_root=snapshot_root,
+            archive_path=snapshot_archive,
+        )
+        yield _AttestationSnapshot(
+            archive_path=snapshot_archive,
+            manifest_path=snapshot_root / MANIFEST_NAME,
+            payload_root=snapshot_root,
+            bindings=_capture_snapshot_bindings(
+                phase=phase,
+                payload_root=snapshot_root,
+                archive_path=snapshot_archive,
+            ),
+        )
     except NativeArtifactError:
         raise
     except (OSError, TypeError, ValueError) as error:
         raise NativeArtifactError("native work attestation snapshot failed") from error
+    finally:
+        if temporary_directory is not None:
+            try:
+                if snapshot_root is not None:
+                    _make_snapshot_cleanup_writable(snapshot_root)
+                temporary_directory.cleanup()
+            except OSError as error:
+                raise NativeArtifactError(
+                    "native work attestation snapshot cleanup failed"
+                ) from error
+
+
+def _copy_snapshot_file(*, source: Path, destination: Path) -> None:
+    content = read_regular_file_no_follow(source)
+    descriptor: int | None = None
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        descriptor = os.open(destination, _new_regular_file_flags(), 0o600)
+        _require_owned_regular_descriptor(descriptor)
+        _write_all(descriptor, content)
+        os.fsync(descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _snapshot_directory_paths(*, phase: str, payload_root: Path) -> tuple[Path, ...]:
+    return (
+        payload_root,
+        *(
+            payload_root / relative
+            for relative in sorted(_expected_directories(_phase_files(phase)))
+        ),
+    )
+
+
+def _snapshot_file_paths(*, phase: str, payload_root: Path, archive_path: Path) -> tuple[Path, ...]:
+    return (
+        payload_root / MANIFEST_NAME,
+        *(payload_root / relative for relative in sorted(_phase_files(phase))),
+        archive_path,
+    )
+
+
+def _seal_snapshot(*, phase: str, payload_root: Path, archive_path: Path) -> None:
+    for path in _snapshot_file_paths(
+        phase=phase,
+        payload_root=payload_root,
+        archive_path=archive_path,
+    ):
+        os.chmod(path, 0o400)
+    for path in sorted(
+        _snapshot_directory_paths(phase=phase, payload_root=payload_root),
+        key=lambda candidate: len(candidate.parts),
+        reverse=True,
+    ):
+        os.chmod(path, 0o500)
+
+
+def _capture_snapshot_bindings(
+    *,
+    phase: str,
+    payload_root: Path,
+    archive_path: Path,
+) -> tuple[_SnapshotBinding, ...]:
+    bindings: list[_SnapshotBinding] = []
+    for path in _snapshot_directory_paths(phase=phase, payload_root=payload_root):
+        metadata = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise NativeArtifactError("native work attestation snapshot directory is unsafe")
+        bindings.append(_SnapshotBinding(path=path, metadata=metadata, sha256=None))
+    for path in _snapshot_file_paths(
+        phase=phase,
+        payload_root=payload_root,
+        archive_path=archive_path,
+    ):
+        content = read_regular_file_no_follow(path)
+        metadata = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise NativeArtifactError("native work attestation snapshot file is unsafe")
+        bindings.append(
+            _SnapshotBinding(
+                path=path,
+                metadata=metadata,
+                sha256=hashlib.sha256(content).hexdigest(),
+            )
+        )
+    return tuple(bindings)
+
+
+def _require_live_snapshot_bindings(snapshot: _AttestationSnapshot) -> None:
+    for binding in snapshot.bindings:
+        metadata = os.stat(binding.path, follow_symlinks=False)
+        if not _same_file_snapshot(binding.metadata, metadata):
+            raise NativeArtifactError("native work attestation snapshot identity changed")
+        if binding.sha256 is None:
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise NativeArtifactError("native work attestation snapshot directory changed")
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise NativeArtifactError("native work attestation snapshot file changed")
+        content = read_regular_file_no_follow(binding.path)
+        after = os.stat(binding.path, follow_symlinks=False)
+        if (
+            not _same_file_snapshot(binding.metadata, after)
+            or hashlib.sha256(content).hexdigest() != binding.sha256
+        ):
+            raise NativeArtifactError("native work attestation snapshot content changed")
+
+
+def _make_snapshot_cleanup_writable(snapshot_root: Path) -> None:
+    for path in sorted(snapshot_root.rglob("*"), key=lambda candidate: len(candidate.parts)):
+        metadata = os.stat(path, follow_symlinks=False)
+        if stat.S_ISDIR(metadata.st_mode):
+            os.chmod(path, 0o700)
+        elif stat.S_ISREG(metadata.st_mode):
+            os.chmod(path, 0o600)
+    metadata = os.stat(snapshot_root, follow_symlinks=False)
+    if stat.S_ISDIR(metadata.st_mode):
+        os.chmod(snapshot_root, 0o700)
 
 
 def _validate_attestation_subjects(
@@ -2105,9 +2226,9 @@ def main(argv: list[str] | None = None) -> int:
             if arguments.bundle is not None:
                 _verify_optional_attestation_bundle(arguments.bundle)
         elif arguments.command == "verify-attestation":
+            report: bytes
             with _attestation_snapshot(
                 phase=arguments.phase,
-                workflow_commit=arguments.workflow_commit,
                 payload_root=arguments.payload_root,
                 archive_path=arguments.archive,
             ) as snapshot:
@@ -2138,13 +2259,30 @@ def main(argv: list[str] | None = None) -> int:
                     payload_root=snapshot.payload_root,
                     repository_root=arguments.repository_root,
                 )
+                _require_live_snapshot_bindings(snapshot)
+                manifest = load_native_work_manifest(
+                    snapshot.manifest_path,
+                    expected_phase=arguments.phase,
+                )
+                verify_native_work_payload(
+                    payload_root=snapshot.payload_root,
+                    manifest=manifest,
+                )
+                archive = verify_native_work_archive(
+                    phase=arguments.phase,
+                    payload_root=snapshot.payload_root,
+                    manifest_path=snapshot.manifest_path,
+                    archive_path=snapshot.archive_path,
+                )
+                _require_verified_archive_identity(archive=archive, verified=verified)
                 _require_snapshot_subjects(
                     phase=arguments.phase,
                     workflow_commit=arguments.workflow_commit,
                     snapshot=snapshot,
                     verified=verified,
                 )
-                _write_attestation_review_report(arguments, verified)
+                report = _attestation_review_report(arguments, verified)
+            sys.stdout.buffer.write(report)
         elif arguments.command == "copy-bundle":
             copy_attestation_bundle(source=arguments.source, destination=arguments.destination)
         else:
@@ -2184,11 +2322,40 @@ def _require_snapshot_subjects(
         f"artifacts/benchmark/backends/hpa320-{phase}/{MANIFEST_NAME}",
         f"artifacts/benchmark/backends/hpa320-native-{phase}-{workflow_commit}.tar",
     )
+    _require_live_snapshot_bindings(snapshot)
+    subjects = _snapshot_subjects(
+        phase=phase,
+        workflow_commit=workflow_commit,
+        snapshot=snapshot,
+    )
+    _require_live_snapshot_bindings(snapshot)
     if (
-        tuple(subject.name for subject in snapshot.subjects) != expected_names
-        or snapshot.subjects != verified.subjects
+        tuple(subject.name for subject in subjects) != expected_names
+        or subjects != verified.subjects
     ):
         raise NativeArtifactError("native work attestation snapshot differs from verified subjects")
+
+
+def _snapshot_subjects(
+    *,
+    phase: str,
+    workflow_commit: str,
+    snapshot: _AttestationSnapshot,
+) -> tuple[CheckpointIdentity, ...]:
+    manifest_content = read_regular_file_no_follow(snapshot.manifest_path)
+    archive_content = read_regular_file_no_follow(snapshot.archive_path)
+    return (
+        CheckpointIdentity(
+            name=f"artifacts/benchmark/backends/hpa320-{phase}/{MANIFEST_NAME}",
+            sha256=hashlib.sha256(manifest_content).hexdigest(),
+            size=len(manifest_content),
+        ),
+        CheckpointIdentity(
+            name=f"artifacts/benchmark/backends/hpa320-native-{phase}-{workflow_commit}.tar",
+            sha256=hashlib.sha256(archive_content).hexdigest(),
+            size=len(archive_content),
+        ),
+    )
 
 
 def _require_verified_archive_identity(
@@ -2201,10 +2368,10 @@ def _require_verified_archive_identity(
         raise NativeArtifactError("native work archive differs from the verified subject")
 
 
-def _write_attestation_review_report(
+def _attestation_review_report(
     arguments: argparse.Namespace,
     verified: VerifiedGitHubAttestation,
-) -> None:
+) -> bytes:
     report: JsonValue = {
         "arguments": {
             "archive": str(arguments.archive),
@@ -2222,7 +2389,7 @@ def _write_attestation_review_report(
             for subject in verified.subjects
         ],
     }
-    sys.stdout.buffer.write(canonical_json_bytes(report, trailing_newline=True))
+    return canonical_json_bytes(report, trailing_newline=True)
 
 
 def _verify_optional_attestation_bundle(path: Path) -> None:
