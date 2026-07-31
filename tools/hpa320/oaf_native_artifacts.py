@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import argparse
+import ctypes
+import errno
 import hashlib
 import os
 import stat
+import sys
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import cast
+from typing import Iterator, cast
+from uuid import uuid4
 
 from src.benchmark.backend_identity import (
     JsonValue,
@@ -24,6 +30,7 @@ from src.benchmark.backend_publication import (
     publish_immutable_bytes,
     read_regular_file_no_follow,
 )
+from src.benchmark.checkpoint_acquisition import CheckpointIdentity
 from tools.hpa320.oaf_host_attestation import (
     HostAttestationError,
     NativeHostAttestationBundle,
@@ -200,6 +207,7 @@ _REFERENCE_KEYS = frozenset({"path", "role", "sha256", "size"})
 _CHUNK_SIZE = 1024 * 1024
 _MANIFEST_MAX_BYTES = 1024 * 1024
 _SCAN_CHUNK_HOOK: Callable[[Path], None] | None = None
+_ARCHIVE_CHUNK_HOOK: Callable[[Path], None] | None = None
 
 
 class NativeArtifactError(ValueError):
@@ -235,6 +243,23 @@ class NativeWorkArtifactManifest:  # pylint: disable=too-many-instance-attribute
 class BootstrapPayload:
     root: Path
     host_bundle: Path
+
+
+@dataclass(frozen=True)
+class PackedBootstrap:
+    payload_root: Path
+    manifest: Path
+    archive: Path
+
+
+@dataclass(frozen=True)
+class _ArchiveMember:
+    name: str
+    mode: int
+    size: int
+    source_relative: str | None
+    source_identity: CheckpointIdentity | None
+    typeflag: bytes
 
 
 def publish_native_work_manifest(
@@ -789,3 +814,921 @@ def _same_file_snapshot(first: os.stat_result, second: os.stat_result) -> bool:
         and first.st_mtime_ns == second.st_mtime_ns
         and first.st_ctime_ns == second.st_ctime_ns
     )
+
+
+def pack_native_work_archive(
+    *,
+    phase: str,
+    payload_root: Path,
+    manifest_path: Path,
+    archive_path: Path,
+) -> CheckpointIdentity:
+    """Write, self-verify, and no-replace publish the canonical ustar archive."""
+
+    temporary_name: str | None = None
+    temporary_stat: os.stat_result | None = None
+    temporary_descriptor: int | None = None
+    published = False
+    try:
+        archive = _absolute_path(archive_path, "archive")
+        _require_leaf_path(archive, "archive")
+        root, manifest, members = _archive_recipe(
+            phase=phase,
+            payload_root=payload_root,
+            manifest_path=manifest_path,
+        )
+        with open_directory_anchor(archive.parent) as parent:
+            parent.verify()
+            _require_absent_at(parent, archive.name, "archive destination")
+            temporary_name = f".{archive.name}.{uuid4().hex}.tmp"
+            temporary_descriptor = os.open(
+                temporary_name,
+                _new_regular_file_flags(),
+                0o600,
+                dir_fd=parent.descriptor,
+            )
+            temporary_stat = _require_owned_regular_descriptor(temporary_descriptor)
+            _write_canonical_archive(
+                descriptor=temporary_descriptor,
+                payload_root=root,
+                members=members,
+            )
+            os.fsync(temporary_descriptor)
+            parent.verify()
+            os.close(temporary_descriptor)
+            temporary_descriptor = None
+
+            verify_native_work_archive(
+                phase=phase,
+                payload_root=root,
+                manifest_path=manifest.path,
+                archive_path=archive.parent / temporary_name,
+            )
+            identity = _stream_regular_file_identity(archive.parent / temporary_name)
+            _rename_no_replace(
+                source=temporary_name,
+                destination=archive.name,
+                parent_descriptor=parent.descriptor,
+            )
+            published = True
+            temporary_name = None
+            parent.verify()
+            os.fsync(parent.descriptor)
+            parent.verify()
+            published_identity = _stream_regular_file_identity(archive)
+            if (published_identity.sha256, published_identity.size) != (
+                identity.sha256,
+                identity.size,
+            ):
+                raise NativeArtifactError("published native work archive identity changed")
+            published = False
+            return CheckpointIdentity(
+                name=archive.name,
+                sha256=published_identity.sha256,
+                size=published_identity.size,
+            )
+    except NativeArtifactError:
+        raise
+    except (OSError, TypeError, ValueError) as error:
+        raise NativeArtifactError("native work archive publication failed") from error
+    finally:
+        if temporary_descriptor is not None:
+            os.close(temporary_descriptor)
+        if temporary_name is not None:
+            _remove_temporary_archive(archive_path, temporary_name)
+        if published and temporary_stat is not None:
+            _remove_linked_archive_if_owned(archive_path, temporary_stat)
+
+
+def verify_native_work_archive(
+    *,
+    phase: str,
+    payload_root: Path,
+    manifest_path: Path,
+    archive_path: Path,
+) -> CheckpointIdentity:
+    """Require the archive to be the byte-exact canonical packing."""
+
+    try:
+        archive = _absolute_path(archive_path, "archive")
+        _require_leaf_path(archive, "archive")
+        root, _manifest, members = _archive_recipe(
+            phase=phase,
+            payload_root=payload_root,
+            manifest_path=manifest_path,
+        )
+        actual_identity = _verify_archive_structure(
+            archive_path=archive,
+            payload_root=root,
+            members=members,
+        )
+        expected_identity = _repack_for_comparison(
+            payload_root=root,
+            members=members,
+            parent=archive.parent,
+        )
+        if (actual_identity.sha256, actual_identity.size) != (
+            expected_identity.sha256,
+            expected_identity.size,
+        ):
+            raise NativeArtifactError("native work archive is not the canonical packing")
+        return CheckpointIdentity(
+            name=archive.name,
+            sha256=actual_identity.sha256,
+            size=actual_identity.size,
+        )
+    except NativeArtifactError:
+        raise
+    except (OSError, TypeError, ValueError) as error:
+        raise NativeArtifactError("native work archive is invalid or unsafe") from error
+
+
+def copy_attestation_bundle(*, source: Path, destination: Path) -> CheckpointIdentity:
+    """Copy one no-follow regular Sigstore bundle to a previously absent path."""
+
+    temporary_name: str | None = None
+    temporary_stat: os.stat_result | None = None
+    temporary_descriptor: int | None = None
+    published = False
+    try:
+        source_path = _absolute_path(source, "attestation source")
+        destination_path = _absolute_path(destination, "attestation destination")
+        _require_leaf_path(source_path, "attestation source")
+        _require_leaf_path(destination_path, "attestation destination")
+        with open_directory_anchor(destination_path.parent) as destination_parent:
+            destination_parent.verify()
+            _require_absent_at(destination_parent, destination_path.name, "attestation destination")
+            temporary_name = f".{destination_path.name}.{uuid4().hex}.tmp"
+            temporary_descriptor = os.open(
+                temporary_name,
+                _new_regular_file_flags(),
+                0o600,
+                dir_fd=destination_parent.descriptor,
+            )
+            temporary_stat = _require_owned_regular_descriptor(temporary_descriptor)
+            source_identity = _copy_regular_file(
+                source_path=source_path,
+                destination_descriptor=temporary_descriptor,
+            )
+            os.fsync(temporary_descriptor)
+            destination_parent.verify()
+            os.close(temporary_descriptor)
+            temporary_descriptor = None
+            temporary_identity = _stream_regular_file_identity(
+                destination_path.parent / temporary_name
+            )
+            if (temporary_identity.sha256, temporary_identity.size) != (
+                source_identity.sha256,
+                source_identity.size,
+            ):
+                raise NativeArtifactError(
+                    "attestation bundle temporary copy differs from its source"
+                )
+            _rename_no_replace(
+                source=temporary_name,
+                destination=destination_path.name,
+                parent_descriptor=destination_parent.descriptor,
+            )
+            published = True
+            temporary_name = None
+            destination_parent.verify()
+            os.fsync(destination_parent.descriptor)
+            destination_parent.verify()
+            copied_identity = _stream_regular_file_identity(destination_path)
+            if (copied_identity.sha256, copied_identity.size) != (
+                source_identity.sha256,
+                source_identity.size,
+            ):
+                raise NativeArtifactError("attestation bundle destination identity changed")
+            published = False
+            return CheckpointIdentity(
+                name=destination_path.name,
+                sha256=copied_identity.sha256,
+                size=copied_identity.size,
+            )
+    except NativeArtifactError:
+        raise
+    except (OSError, TypeError, ValueError) as error:
+        raise NativeArtifactError("attestation bundle copy failed") from error
+    finally:
+        if temporary_descriptor is not None:
+            os.close(temporary_descriptor)
+        if temporary_name is not None:
+            _remove_temporary_archive(destination, temporary_name)
+        if published and temporary_stat is not None:
+            _remove_linked_archive_if_owned(destination, temporary_stat)
+
+
+def _archive_recipe(
+    *,
+    phase: str,
+    payload_root: Path,
+    manifest_path: Path,
+) -> tuple[Path, NativeWorkArtifactManifest, tuple[_ArchiveMember, ...]]:
+    root = _absolute_path(payload_root, "payload root")
+    manifest = load_native_work_manifest(manifest_path, expected_phase=phase)
+    if manifest.path != root / MANIFEST_NAME:
+        raise NativeArtifactError("native work manifest does not belong to payload root")
+    verify_native_work_payload(payload_root=root, manifest=manifest)
+    manifest_content = read_regular_file_no_follow(manifest.path, max_bytes=_MANIFEST_MAX_BYTES)
+    manifest_identity = CheckpointIdentity(
+        name=MANIFEST_NAME,
+        sha256=hashlib.sha256(manifest_content).hexdigest(),
+        size=len(manifest_content),
+    )
+    if manifest_identity.sha256 != manifest.sha256:
+        raise NativeArtifactError("native work manifest bytes changed")
+    root_member = _archive_root_name(phase=phase, workflow_commit=manifest.workflow_commit)
+    directories = sorted(
+        _expected_directories({row.path: row.role for row in manifest.files}),
+        key=lambda path: path.encode("utf-8"),
+    )
+    members: list[_ArchiveMember] = [
+        _ArchiveMember(
+            name=root_member,
+            mode=0o755,
+            size=0,
+            source_relative=None,
+            source_identity=None,
+            typeflag=b"5",
+        )
+    ]
+    members.extend(
+        _ArchiveMember(
+            name=f"{root_member}{directory}/",
+            mode=0o755,
+            size=0,
+            source_relative=None,
+            source_identity=None,
+            typeflag=b"5",
+        )
+        for directory in directories
+    )
+    source_members = [
+        _ArchiveMember(
+            name=f"{root_member}{MANIFEST_NAME}",
+            mode=0o644,
+            size=manifest_identity.size,
+            source_relative=MANIFEST_NAME,
+            source_identity=manifest_identity,
+            typeflag=b"0",
+        )
+    ]
+    source_members.extend(
+        _ArchiveMember(
+            name=f"{root_member}{row.path}",
+            mode=0o644,
+            size=row.size,
+            source_relative=row.path,
+            source_identity=CheckpointIdentity(
+                name=row.path,
+                sha256=row.sha256,
+                size=row.size,
+            ),
+            typeflag=b"0",
+        )
+        for row in manifest.files
+    )
+    members.extend(sorted(source_members, key=lambda member: member.name.encode("utf-8")))
+    return root, manifest, tuple(members)
+
+
+def _archive_root_name(*, phase: str, workflow_commit: str) -> str:
+    if (
+        phase not in PHASE_FILES
+        or len(workflow_commit) != 40
+        or any(character not in "0123456789abcdef" for character in workflow_commit)
+    ):
+        raise NativeArtifactError("native work archive root identity is invalid")
+    return f"hpa320-native-{phase}-{workflow_commit}/"
+
+
+def _write_canonical_archive(
+    *,
+    descriptor: int,
+    payload_root: Path,
+    members: tuple[_ArchiveMember, ...],
+) -> None:
+    with open_directory_anchor(payload_root) as payload_anchor:
+        for member in members:
+            _write_all(
+                descriptor,
+                _ustar_header(
+                    name=_utf8_member_name(member.name),
+                    mode=member.mode,
+                    size=member.size,
+                    typeflag=member.typeflag,
+                ),
+            )
+            if member.source_relative is None:
+                continue
+            if member.source_identity is None:
+                raise NativeArtifactError("native work archive member source is missing")
+            _write_payload_member(
+                archive_descriptor=descriptor,
+                payload_root=payload_root,
+                payload_anchor=payload_anchor,
+                relative=member.source_relative,
+                expected=member.source_identity,
+            )
+            padding = (-member.size) % 512
+            if padding:
+                _write_all(descriptor, b"\0" * padding)
+        _write_all(descriptor, b"\0" * 1024)
+
+
+def _write_payload_member(
+    *,
+    archive_descriptor: int,
+    payload_root: Path,
+    payload_anchor: DirectoryAnchor,
+    relative: str,
+    expected: CheckpointIdentity,
+) -> None:
+    digest = hashlib.sha256()
+    size = 0
+    with _open_payload_regular_file(
+        payload_root=payload_root,
+        payload_anchor=payload_anchor,
+        relative=relative,
+    ) as descriptor:
+        while True:
+            chunk = os.read(descriptor, _CHUNK_SIZE)
+            if not chunk:
+                break
+            _write_all(archive_descriptor, chunk)
+            digest.update(chunk)
+            size += len(chunk)
+            if _ARCHIVE_CHUNK_HOOK is not None:
+                _ARCHIVE_CHUNK_HOOK(payload_root / relative)
+    if (digest.hexdigest(), size) != (expected.sha256, expected.size):
+        raise NativeArtifactError("native work archive member differs from its manifest identity")
+
+
+def _verify_archive_structure(
+    *,
+    archive_path: Path,
+    payload_root: Path,
+    members: tuple[_ArchiveMember, ...],
+) -> CheckpointIdentity:
+    digest = hashlib.sha256()
+    size = 0
+    with _open_regular_file(archive_path) as archive_descriptor:
+        with open_directory_anchor(payload_root) as payload_anchor:
+            for member in members:
+                header = _read_exact(archive_descriptor, 512)
+                _parse_ustar_header(header)
+                expected_header = _ustar_header(
+                    name=_utf8_member_name(member.name),
+                    mode=member.mode,
+                    size=member.size,
+                    typeflag=member.typeflag,
+                )
+                if header != expected_header:
+                    raise NativeArtifactError("native work archive member header is not canonical")
+                digest.update(header)
+                size += len(header)
+                if member.source_relative is None:
+                    continue
+                if member.source_identity is None:
+                    raise NativeArtifactError("native work archive member source is missing")
+                member_digest, member_size = _compare_archive_member_to_payload(
+                    archive_descriptor=archive_descriptor,
+                    payload_root=payload_root,
+                    payload_anchor=payload_anchor,
+                    relative=member.source_relative,
+                    expected=member.source_identity,
+                    archive_digest=digest,
+                )
+                if (member_digest, member_size) != (
+                    member.source_identity.sha256,
+                    member.source_identity.size,
+                ):
+                    raise NativeArtifactError("native work archive member differs from its payload")
+                size += member_size
+                padding = (-member.size) % 512
+                if padding:
+                    padding_bytes = _read_exact(archive_descriptor, padding)
+                    if padding_bytes != b"\0" * padding:
+                        raise NativeArtifactError("native work archive member padding is invalid")
+                    digest.update(padding_bytes)
+                    size += len(padding_bytes)
+            terminal = _read_exact(archive_descriptor, 1024)
+            if terminal != b"\0" * 1024:
+                raise NativeArtifactError("native work archive terminal blocks are invalid")
+            if os.read(archive_descriptor, 1):
+                raise NativeArtifactError("native work archive has trailing bytes")
+            digest.update(terminal)
+            size += len(terminal)
+    return CheckpointIdentity(name=archive_path.name, sha256=digest.hexdigest(), size=size)
+
+
+def _compare_archive_member_to_payload(
+    *,
+    archive_descriptor: int,
+    payload_root: Path,
+    payload_anchor: DirectoryAnchor,
+    relative: str,
+    expected: CheckpointIdentity,
+    archive_digest: hashlib._Hash,
+) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    remaining = expected.size
+    with _open_payload_regular_file(
+        payload_root=payload_root,
+        payload_anchor=payload_anchor,
+        relative=relative,
+    ) as payload_descriptor:
+        while remaining:
+            count = min(_CHUNK_SIZE, remaining)
+            archive_chunk = _read_exact(archive_descriptor, count)
+            payload_chunk = _read_exact(payload_descriptor, count)
+            if archive_chunk != payload_chunk:
+                raise NativeArtifactError("native work archive body differs from payload")
+            digest.update(payload_chunk)
+            archive_digest.update(archive_chunk)
+            remaining -= count
+        if os.read(payload_descriptor, 1):
+            raise NativeArtifactError("native work payload member size changed")
+    return digest.hexdigest(), expected.size
+
+
+def _repack_for_comparison(
+    *,
+    payload_root: Path,
+    members: tuple[_ArchiveMember, ...],
+    parent: Path,
+) -> CheckpointIdentity:
+    temporary_name: str | None = None
+    descriptor: int | None = None
+    try:
+        with open_directory_anchor(parent) as parent_anchor:
+            temporary_name = f".native-work-repack.{uuid4().hex}.tmp"
+            descriptor = os.open(
+                temporary_name,
+                _new_regular_file_flags(),
+                0o600,
+                dir_fd=parent_anchor.descriptor,
+            )
+            _require_owned_regular_descriptor(descriptor)
+            _write_canonical_archive(
+                descriptor=descriptor,
+                payload_root=payload_root,
+                members=members,
+            )
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            identity = _stream_regular_file_identity(parent / temporary_name)
+            parent_anchor.verify()
+            return identity
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary_name is not None:
+            _remove_temporary_archive(parent / "unused", temporary_name)
+
+
+def _stream_regular_file_identity(path: Path) -> CheckpointIdentity:
+    digest = hashlib.sha256()
+    size = 0
+    with _open_regular_file(path) as descriptor:
+        while True:
+            chunk = os.read(descriptor, _CHUNK_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+    return CheckpointIdentity(name=path.name, sha256=digest.hexdigest(), size=size)
+
+
+def _copy_regular_file(
+    *,
+    source_path: Path,
+    destination_descriptor: int,
+) -> CheckpointIdentity:
+    digest = hashlib.sha256()
+    size = 0
+    with _open_regular_file(source_path) as source_descriptor:
+        while True:
+            chunk = os.read(source_descriptor, _CHUNK_SIZE)
+            if not chunk:
+                break
+            _write_all(destination_descriptor, chunk)
+            digest.update(chunk)
+            size += len(chunk)
+    return CheckpointIdentity(name=source_path.name, sha256=digest.hexdigest(), size=size)
+
+
+@contextmanager
+def _open_regular_file(path: Path) -> Iterator[int]:
+    absolute = _absolute_path(path, "regular file")
+    _require_leaf_path(absolute, "regular file")
+    descriptor: int | None = None
+    with open_directory_anchor(absolute.parent) as parent:
+        try:
+            parent.verify()
+            expected = os.stat(absolute.name, dir_fd=parent.descriptor, follow_symlinks=False)
+            descriptor = os.open(
+                absolute.name,
+                _regular_file_flags(),
+                dir_fd=parent.descriptor,
+            )
+            before = _require_owned_regular_descriptor(descriptor)
+            if not _same_inode(expected, before):
+                raise NativeArtifactError("regular file identity changed before it was opened")
+            yield descriptor
+            after = os.fstat(descriptor)
+            current = os.stat(absolute.name, dir_fd=parent.descriptor, follow_symlinks=False)
+            parent.verify()
+            if (
+                not _same_file_snapshot(before, after)
+                or not _same_inode(expected, current)
+                or not stat.S_ISREG(current.st_mode)
+            ):
+                raise NativeArtifactError("regular file changed while it was read")
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+
+@contextmanager
+def _open_payload_regular_file(
+    *,
+    payload_root: Path,
+    payload_anchor: DirectoryAnchor,
+    relative: str,
+) -> Iterator[int]:
+    if not _safe_relative_path(relative):
+        raise NativeArtifactError("native work archive member path is unsafe")
+    directory_descriptor = os.dup(payload_anchor.descriptor)
+    owned_descriptors: list[int] = [directory_descriptor]
+    descriptor: int | None = None
+    bindings: list[tuple[int, str, os.stat_result]] = []
+    try:
+        parts = relative.split("/")
+        for part in parts[:-1]:
+            expected_directory = os.stat(
+                part,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(expected_directory.st_mode):
+                raise NativeArtifactError("native work archive directory is unsafe")
+            child = os.open(part, _directory_flags(), dir_fd=directory_descriptor)
+            opened_directory = os.fstat(child)
+            if not stat.S_ISDIR(opened_directory.st_mode) or not _same_inode(
+                expected_directory, opened_directory
+            ):
+                os.close(child)
+                raise NativeArtifactError("native work archive directory identity changed")
+            bindings.append((directory_descriptor, part, expected_directory))
+            owned_descriptors.append(child)
+            directory_descriptor = child
+        name = parts[-1]
+        expected = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+        descriptor = os.open(name, _regular_file_flags(), dir_fd=directory_descriptor)
+        before = _require_owned_regular_descriptor(descriptor)
+        if not _same_inode(expected, before):
+            raise NativeArtifactError("native work archive member identity changed before reading")
+        yield descriptor
+        after = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+        payload_anchor.verify()
+        _verify_directory_bindings(bindings)
+        if (
+            not _same_file_snapshot(before, after)
+            or not _same_inode(expected, current)
+            or not stat.S_ISREG(current.st_mode)
+        ):
+            raise NativeArtifactError("native work archive member changed while it was read")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        for owned_descriptor in reversed(owned_descriptors):
+            os.close(owned_descriptor)
+
+
+def _verify_directory_bindings(bindings: list[tuple[int, str, os.stat_result]]) -> None:
+    for parent_descriptor, name, expected in bindings:
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if not stat.S_ISDIR(current.st_mode) or not _same_inode(expected, current):
+            raise NativeArtifactError("native work archive directory binding changed")
+
+
+def _ustar_header(*, name: bytes, mode: int, size: int, typeflag: bytes) -> bytes:
+    prefix, leaf = _split_ustar_path(name)
+    if typeflag not in {b"0", b"5"}:
+        raise NativeArtifactError("native work archive member type is invalid")
+    block = bytearray(512)
+    _write_bytes(block, 0, 100, leaf)
+    _write_octal(block, 100, 8, mode)
+    _write_octal(block, 108, 8, 0)
+    _write_octal(block, 116, 8, 0)
+    _write_octal(block, 124, 12, size)
+    _write_octal(block, 136, 12, 0)
+    block[148:156] = b"        "
+    block[156:157] = typeflag
+    block[257:263] = b"ustar\0"
+    block[263:265] = b"00"
+    _write_bytes(block, 345, 155, prefix)
+    checksum = sum(block)
+    block[148:156] = f"{checksum:06o}\0 ".encode("ascii")
+    return bytes(block)
+
+
+def _split_ustar_path(name: bytes) -> tuple[bytes, bytes]:
+    if not name or b"\0" in name:
+        raise NativeArtifactError("native work archive member name is invalid")
+    try:
+        decoded = name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise NativeArtifactError("native work archive member name is not UTF-8") from error
+    if decoded.encode("utf-8") != name:
+        raise NativeArtifactError("native work archive member name is not stable UTF-8")
+    if len(name) <= 100:
+        return b"", name
+    separators = [index for index, value in enumerate(name) if value == ord("/")]
+    for separator in reversed(separators):
+        prefix = name[:separator]
+        leaf = name[separator + 1 :]
+        if prefix and leaf and len(prefix) <= 155 and len(leaf) <= 100:
+            return prefix, leaf
+    raise NativeArtifactError("native work archive member name does not fit POSIX ustar")
+
+
+def _utf8_member_name(name: str) -> bytes:
+    try:
+        encoded = name.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise NativeArtifactError("native work archive member name is not UTF-8") from error
+    if b"\0" in encoded:
+        raise NativeArtifactError("native work archive member name is invalid")
+    return encoded
+
+
+def _write_bytes(block: bytearray, offset: int, width: int, value: bytes) -> None:
+    if len(value) > width or b"\0" in value:
+        raise NativeArtifactError("native work archive field is invalid")
+    block[offset : offset + width] = value.ljust(width, b"\0")
+
+
+def _write_octal(block: bytearray, offset: int, width: int, value: int) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise NativeArtifactError("native work archive numeric field is invalid")
+    maximum = (8 ** (width - 1)) - 1
+    if value > maximum:
+        raise NativeArtifactError("native work archive numeric field exceeds POSIX ustar")
+    block[offset : offset + width] = f"{value:0{width - 1}o}\0".encode("ascii")
+
+
+def _parse_ustar_header(block: bytes) -> None:
+    if len(block) != 512 or block == b"\0" * 512:
+        raise NativeArtifactError("native work archive header is incomplete")
+    checksum_field = block[148:156]
+    if (
+        len(checksum_field) != 8
+        or checksum_field[6:] != b"\0 "
+        or any(value not in b"01234567" for value in checksum_field[:6])
+    ):
+        raise NativeArtifactError("native work archive checksum field is invalid")
+    expected_checksum = sum(block[:148] + b" " * 8 + block[156:])
+    if int(checksum_field[:6], 8) != expected_checksum:
+        raise NativeArtifactError("native work archive checksum is invalid")
+    name = _read_ustar_string(block[0:100], "member name")
+    prefix = _read_ustar_string(block[345:500], "member prefix")
+    if not name:
+        raise NativeArtifactError("native work archive member name is empty")
+    try:
+        (prefix + (b"/" if prefix else b"") + name).decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise NativeArtifactError("native work archive member name is not UTF-8") from error
+    _read_ustar_octal(block[100:108], "mode")
+    _read_ustar_octal(block[108:116], "uid")
+    _read_ustar_octal(block[116:124], "gid")
+    _read_ustar_octal(block[124:136], "size")
+    _read_ustar_octal(block[136:148], "mtime")
+    if block[156:157] not in {b"0", b"5"}:
+        raise NativeArtifactError("native work archive member type is invalid")
+    if block[157:257] != b"\0" * 100:
+        raise NativeArtifactError("native work archive member link target is invalid")
+    if block[257:263] != b"ustar\0" or block[263:265] != b"00":
+        raise NativeArtifactError("native work archive format is not POSIX ustar")
+    if block[265:345] != b"\0" * 80:
+        raise NativeArtifactError("native work archive owner metadata is invalid")
+    if block[329:345] != b"\0" * 16 or block[500:] != b"\0" * 12:
+        raise NativeArtifactError("native work archive device metadata is invalid")
+
+
+def _read_ustar_string(value: bytes, label: str) -> bytes:
+    try:
+        end = value.index(b"\0")
+    except ValueError:
+        return value
+    if value[end + 1 :] != b"\0" * (len(value) - end - 1):
+        raise NativeArtifactError(f"native work archive {label} has trailing data")
+    return value[:end]
+
+
+def _read_ustar_octal(value: bytes, label: str) -> int:
+    if len(value) < 2 or value[-1:] != b"\0" or any(byte not in b"01234567" for byte in value[:-1]):
+        raise NativeArtifactError(f"native work archive {label} field is invalid")
+    return int(value[:-1], 8)
+
+
+def _read_exact(descriptor: int, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = os.read(descriptor, remaining)
+        if not chunk:
+            raise NativeArtifactError("native work archive is truncated")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _write_all(descriptor: int, content: bytes) -> None:
+    offset = 0
+    while offset < len(content):
+        written = os.write(descriptor, content[offset:])
+        if written <= 0:
+            raise OSError("native work archive write was incomplete")
+        offset += written
+
+
+def _require_owned_regular_descriptor(descriptor: int) -> os.stat_result:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise NativeArtifactError("native work archive file is not a private regular file")
+    return metadata
+
+
+def _require_leaf_path(path: Path, label: str) -> None:
+    if path.name in {"", ".", ".."} or path.parent == path:
+        raise NativeArtifactError(f"{label} must name a regular file")
+
+
+def _require_absent_at(anchor: DirectoryAnchor, name: str, label: str) -> None:
+    try:
+        os.stat(name, dir_fd=anchor.descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    raise NativeArtifactError(f"{label} already exists")
+
+
+def _new_regular_file_flags() -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise OSError("no-follow file creation is unavailable")
+    return os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow | getattr(os, "O_CLOEXEC", 0)
+
+
+def _rename_no_replace(*, source: str, destination: str, parent_descriptor: int) -> None:
+    """Atomically publish a sibling path only when its destination is absent."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    encoded_source = os.fsencode(source)
+    encoded_destination = os.fsencode(destination)
+    if sys.platform == "darwin":
+        try:
+            rename = libc.renameatx_np
+        except AttributeError:
+            raise OSError(errno.ENOTSUP, "renameatx_np is unavailable") from None
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            parent_descriptor,
+            encoded_source,
+            parent_descriptor,
+            encoded_destination,
+            0x00000004,  # RENAME_EXCL
+        )
+    elif sys.platform.startswith("linux"):
+        try:
+            rename = libc.renameat2
+        except AttributeError:
+            raise OSError(errno.ENOTSUP, "renameat2 is unavailable") from None
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            parent_descriptor,
+            encoded_source,
+            parent_descriptor,
+            encoded_destination,
+            0x00000001,  # RENAME_NOREPLACE
+        )
+    else:
+        raise OSError(errno.ENOTSUP, "atomic no-replace rename is unsupported")
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error_number, os.strerror(error_number), destination)
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
+def _unlink_at(descriptor: int, name: str) -> None:
+    os.unlink(name, dir_fd=descriptor)
+
+
+def _remove_temporary_archive(path: Path, name: str) -> None:
+    try:
+        absolute = _absolute_path(path, "archive")
+        with open_directory_anchor(absolute.parent) as parent:
+            os.unlink(name, dir_fd=parent.descriptor)
+            os.fsync(parent.descriptor)
+    except (OSError, NativeArtifactError):
+        pass
+
+
+def _remove_linked_archive_if_owned(path: Path, expected: os.stat_result) -> None:
+    try:
+        absolute = _absolute_path(path, "archive")
+        with open_directory_anchor(absolute.parent) as parent:
+            current = os.stat(absolute.name, dir_fd=parent.descriptor, follow_symlinks=False)
+            if stat.S_ISREG(current.st_mode) and _same_inode(current, expected):
+                os.unlink(absolute.name, dir_fd=parent.descriptor)
+                os.fsync(parent.descriptor)
+    except (FileNotFoundError, OSError, NativeArtifactError):
+        pass
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    publish_parser = subparsers.add_parser("publish")
+    publish_parser.add_argument("--phase", required=True, choices=tuple(PHASE_FILES))
+    publish_parser.add_argument("--payload-root", required=True, type=Path)
+    publish_parser.add_argument("--host-bundle", required=True, type=Path)
+    publish_parser.add_argument("--archive", required=True, type=Path)
+    verify_parser = subparsers.add_parser("verify")
+    verify_parser.add_argument("--phase", required=True, choices=tuple(PHASE_FILES))
+    verify_parser.add_argument("--payload-root", required=True, type=Path)
+    verify_parser.add_argument("--archive", required=True, type=Path)
+    verify_parser.add_argument("--bundle", type=Path)
+    copy_parser = subparsers.add_parser("copy-bundle")
+    copy_parser.add_argument("--source", required=True, type=Path)
+    copy_parser.add_argument("--destination", required=True, type=Path)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = _parser().parse_args(argv)
+    try:
+        if arguments.command == "publish":
+            manifest = publish_native_work_manifest(
+                phase=arguments.phase,
+                payload_root=arguments.payload_root,
+                host_bundle_path=arguments.host_bundle,
+            )
+            pack_native_work_archive(
+                phase=arguments.phase,
+                payload_root=arguments.payload_root,
+                manifest_path=manifest.path,
+                archive_path=arguments.archive,
+            )
+            verify_native_work_archive(
+                phase=arguments.phase,
+                payload_root=arguments.payload_root,
+                manifest_path=manifest.path,
+                archive_path=arguments.archive,
+            )
+        elif arguments.command == "verify":
+            manifest = load_native_work_manifest(
+                arguments.payload_root / MANIFEST_NAME,
+                expected_phase=arguments.phase,
+            )
+            verify_native_work_payload(payload_root=arguments.payload_root, manifest=manifest)
+            verify_native_work_archive(
+                phase=arguments.phase,
+                payload_root=arguments.payload_root,
+                manifest_path=manifest.path,
+                archive_path=arguments.archive,
+            )
+            if arguments.bundle is not None:
+                _stream_regular_file_identity(arguments.bundle)
+        elif arguments.command == "copy-bundle":
+            copy_attestation_bundle(source=arguments.source, destination=arguments.destination)
+        else:
+            raise NativeArtifactError("native work archive command is invalid")
+    except NativeArtifactError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
