@@ -25,6 +25,18 @@ class ArtifactPublicationError(OSError):
     pass
 
 
+@dataclass(frozen=True)
+class PublishedDirectory:
+    path: Path
+    metadata: os.stat_result
+
+
+class DirectoryPublicationError(ArtifactPublicationError):
+    def __init__(self, publication: PublishedDirectory) -> None:
+        super().__init__("atomic directory publication failed after rename")
+        self.publication = publication
+
+
 class PrivateSnapshotIntegrityError(OSError):
     pass
 
@@ -33,39 +45,94 @@ class _AncestorBindingError(OSError):
     pass
 
 
-def rename_directory_no_replace(source: Path, destination: Path) -> None:
+def rename_directory_no_replace(source: Path, destination: Path) -> PublishedDirectory:
     """Atomically publish a directory only when destination is absent."""
 
     source_path = Path(source)
     destination_path = Path(destination)
-    try:
-        source_metadata = os.lstat(source_path)
-    except OSError as error:
-        raise ArtifactPublicationError("publication source is unavailable") from error
-    if not stat.S_ISDIR(source_metadata.st_mode):
-        raise ArtifactPublicationError("publication source must be a non-symlink directory")
     if source_path.parent != destination_path.parent:
         raise ArtifactPublicationError("publication rename must stay within one parent directory")
+    publication: PublishedDirectory | None = None
+    source_descriptor: int | None = None
     try:
-        _rename_no_replace_syscall(source_path, destination_path)
-        published_metadata = os.lstat(destination_path)
-        if not stat.S_ISDIR(published_metadata.st_mode) or not _same_inode(
-            source_metadata,
-            published_metadata,
-        ):
-            raise OSError("publication destination binding changed")
-        parent_descriptor = os.open(
-            source_path.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(parent_descriptor)
-        finally:
-            os.close(parent_descriptor)
+        with _anchored_parent(source_path, create=False) as parent:
+            parent.verify()
+            source_descriptor = os.open(
+                parent.name,
+                _directory_open_flags(),
+                dir_fd=parent.parent_descriptor,
+            )
+            source_metadata = os.fstat(source_descriptor)
+            _verify_directory_binding_at(parent, source_metadata)
+            _rename_no_replace_syscall(
+                parent.name,
+                destination_path.name,
+                src_dir_fd=parent.parent_descriptor,
+                dst_dir_fd=parent.parent_descriptor,
+            )
+            published_metadata = os.stat(
+                destination_path.name,
+                dir_fd=parent.parent_descriptor,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(published_metadata.st_mode):
+                raise OSError("publication destination is not a directory")
+            publication = PublishedDirectory(destination_path, published_metadata)
+            if not _same_inode(source_metadata, published_metadata):
+                raise OSError("publication destination binding changed")
+            parent.verify()
+            os.fsync(parent.parent_descriptor)
+            parent.verify()
+            return publication
     except FileExistsError as error:
         raise ArtifactPublicationError("publication destination already exists") from error
     except OSError as error:
+        if publication is not None:
+            raise DirectoryPublicationError(publication) from error
         raise ArtifactPublicationError("atomic no-replace directory publication failed") from error
+    finally:
+        if source_descriptor is not None:
+            os.close(source_descriptor)
+
+
+def rollback_published_directory(publication: PublishedDirectory) -> None:
+    """Remove one inode-bound directory and synchronize its anchored parent."""
+
+    if not isinstance(publication, PublishedDirectory):
+        raise TypeError("publication must be a PublishedDirectory")
+    directory_descriptor: int | None = None
+    try:
+        with _anchored_parent(publication.path, create=False) as parent:
+            parent.verify()
+            directory_descriptor = os.open(
+                parent.name,
+                _directory_open_flags(),
+                dir_fd=parent.parent_descriptor,
+            )
+            directory_metadata = os.fstat(directory_descriptor)
+            _verify_directory_binding_at(parent, directory_metadata)
+            if not _same_inode(directory_metadata, publication.metadata):
+                raise OSError("published directory binding changed")
+            for entry in os.listdir(directory_descriptor):
+                entry_metadata = os.stat(
+                    entry,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISREG(entry_metadata.st_mode):
+                    raise OSError("published directory contains an unsafe entry")
+                os.unlink(entry, dir_fd=directory_descriptor)
+            os.fsync(directory_descriptor)
+            parent.verify()
+            _verify_directory_binding_at(parent, directory_metadata)
+            os.rmdir(parent.name, dir_fd=parent.parent_descriptor)
+            os.fsync(parent.parent_descriptor)
+            parent.verify()
+    except OSError as error:
+        raise ArtifactPublicationError("published directory rollback failed") from error
+    finally:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
 
 
 @dataclass(frozen=True)
@@ -332,7 +399,12 @@ def read_regular_file_no_follow(
     path: Path,
     *,
     anchor: DirectoryAnchor | None = None,
+    max_bytes: int | None = None,
 ) -> bytes:
+    if max_bytes is not None and (not isinstance(max_bytes, int) or isinstance(max_bytes, bool)):
+        raise TypeError("max_bytes must be an integer or None")
+    if max_bytes is not None and max_bytes < 0:
+        raise ValueError("max_bytes must be nonnegative")
     descriptor: int | None = None
     with _anchored_parent(path, create=False, anchor=anchor) as parent:
         try:
@@ -343,7 +415,9 @@ def read_regular_file_no_follow(
                 dir_fd=parent.parent_descriptor,
             )
             descriptor_stat = _require_regular_descriptor(descriptor)
-            content = _read_descriptor(descriptor)
+            if max_bytes is not None and descriptor_stat.st_size > max_bytes:
+                raise OSError("artifact exceeds bounded read size")
+            content = _read_descriptor(descriptor, max_bytes=max_bytes)
             parent.verify()
             _verify_file_binding_at(parent, descriptor_stat)
             return content
@@ -918,6 +992,19 @@ def _verify_file_binding_at(
         raise OSError("artifact path binding changed")
 
 
+def _verify_directory_binding_at(
+    parent: _AnchoredParent,
+    descriptor_stat: os.stat_result,
+) -> None:
+    path_stat = os.stat(
+        parent.name,
+        dir_fd=parent.parent_descriptor,
+        follow_symlinks=False,
+    )
+    if not stat.S_ISDIR(path_stat.st_mode) or not _same_inode(path_stat, descriptor_stat):
+        raise OSError("directory path binding changed")
+
+
 def _verify_bindings(bindings: list[tuple[int, str, os.stat_result]]) -> None:
     for parent_descriptor, component, expected in bindings:
         current = os.stat(
@@ -950,7 +1037,13 @@ def _same_inode(first: os.stat_result, second: os.stat_result) -> bool:
     return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
 
-def _rename_no_replace_syscall(source: Path, destination: Path) -> None:
+def _rename_no_replace_syscall(
+    source: str,
+    destination: str,
+    *,
+    src_dir_fd: int,
+    dst_dir_fd: int,
+) -> None:
     """Rename sibling paths with the platform no-replace syscall."""
 
     libc = ctypes.CDLL(None, use_errno=True)
@@ -970,9 +1063,9 @@ def _rename_no_replace_syscall(source: Path, destination: Path) -> None:
         ]
         rename.restype = ctypes.c_int
         result = rename(
-            getattr(os, "AT_FDCWD", -2),
+            src_dir_fd,
             encoded_source,
-            getattr(os, "AT_FDCWD", -2),
+            dst_dir_fd,
             encoded_destination,
             0x00000004,  # RENAME_EXCL
         )
@@ -990,9 +1083,9 @@ def _rename_no_replace_syscall(source: Path, destination: Path) -> None:
         ]
         rename.restype = ctypes.c_int
         result = rename(
-            getattr(os, "AT_FDCWD", -100),
+            src_dir_fd,
             encoded_source,
-            getattr(os, "AT_FDCWD", -100),
+            dst_dir_fd,
             encoded_destination,
             0x00000001,  # RENAME_NOREPLACE
         )
@@ -1007,9 +1100,19 @@ def _rename_no_replace_syscall(source: Path, destination: Path) -> None:
     raise OSError(error_number, os.strerror(error_number), destination)
 
 
-def _read_descriptor(descriptor: int) -> bytes:
+def _read_descriptor(descriptor: int, *, max_bytes: int | None = None) -> bytes:
     chunks: list[bytes] = []
+    total = 0
     os.lseek(descriptor, 0, os.SEEK_SET)
-    while chunk := os.read(descriptor, 1024 * 1024):
+    while True:
+        read_size = 1024 * 1024
+        if max_bytes is not None:
+            read_size = min(read_size, max_bytes - total + 1)
+        chunk = os.read(descriptor, read_size)
+        if not chunk:
+            break
+        total += len(chunk)
+        if max_bytes is not None and total > max_bytes:
+            raise OSError("artifact exceeds bounded read size")
         chunks.append(chunk)
     return b"".join(chunks)

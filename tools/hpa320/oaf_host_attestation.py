@@ -27,8 +27,10 @@ from src.benchmark.backend_identity import (
 from src.benchmark.backend_process import NativeHostEvidence
 from src.benchmark.backend_publication import (
     ArtifactPublicationError,
+    DirectoryPublicationError,
     read_regular_file_no_follow,
     rename_directory_no_replace,
+    rollback_published_directory,
 )
 from src.benchmark.checkpoint_acquisition import CheckpointIdentity
 from tools.hpa320.github_host_evidence import (
@@ -75,6 +77,8 @@ _OBSERVATION_KEYS = frozenset(
 )
 _GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _LOWERCASE_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
+_BUNDLE_MAX_BYTES = 64 * 1024
+_SIBLING_MAX_BYTES = 64 * 1024
 
 
 class HostAttestationError(ValueError):
@@ -94,7 +98,11 @@ class NativeHostAttestationBundle:
 def bundle_phase(path: Path) -> str:
     """Return the strictly parsed phase before loading a phase-owned bundle."""
 
-    content = _read_file(Path(path), "native-host attestation bundle")
+    content = _read_file(
+        Path(path),
+        "native-host attestation bundle",
+        max_bytes=_BUNDLE_MAX_BYTES,
+    )
     payload = _canonical_object(content, "native-host attestation bundle")
     phase = payload.get("phase")
     if phase not in PHASE_WORKFLOWS:
@@ -112,7 +120,11 @@ def load_native_host_attestation_bundle(
     if expected_phase not in PHASE_WORKFLOWS:
         raise HostAttestationError("expected native-host attestation phase is invalid")
     bundle_path = Path(path)
-    content = _read_file(bundle_path, "native-host attestation bundle")
+    content = _read_file(
+        bundle_path,
+        "native-host attestation bundle",
+        max_bytes=_BUNDLE_MAX_BYTES,
+    )
     payload = _canonical_object(content, "native-host attestation bundle")
     if (
         set(payload) != _BUNDLE_KEYS
@@ -123,10 +135,16 @@ def load_native_host_attestation_bundle(
     identities: dict[str, CheckpointIdentity] = {}
     sibling_contents: dict[str, bytes] = {}
     for field, expected_name in _IDENTITY_NAMES.items():
-        identity = _load_identity(payload[field], expected_name, field)
+        identity = _load_identity(
+            payload[field],
+            expected_name,
+            field,
+            maximum_size=_SIBLING_MAX_BYTES,
+        )
         sibling_content = _read_file(
             bundle_path.parent / expected_name,
             f"native-host attestation {field}",
+            max_bytes=identity.size,
         )
         if (
             len(sibling_content) != identity.size
@@ -181,6 +199,7 @@ def publish_github_host_attestation(
         parent = output.parent
         parent.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=parent))
+        publication = None
         try:
             observation_path = staging / "native-host-observation.json"
             evidence_path = staging / "native-host-evidence.json"
@@ -201,13 +220,19 @@ def publish_github_host_attestation(
             bundle_content = canonical_json_bytes(bundle_payload, trailing_newline=True)
             _write_new_regular_file(bundle_path, bundle_content)
             load_native_host_attestation_bundle(bundle_path, expected_phase=phase)
-            rename_directory_no_replace(staging, output)
+            publication = rename_directory_no_replace(staging, output)
             return load_native_host_attestation_bundle(
                 output / "attestation-bundle.json",
                 expected_phase=phase,
             )
+        except DirectoryPublicationError as error:
+            rollback_published_directory(error.publication)
+            raise
         except Exception:
-            shutil.rmtree(staging, ignore_errors=True)
+            if publication is None:
+                shutil.rmtree(staging, ignore_errors=True)
+            else:
+                rollback_published_directory(publication)
             raise
     except (
         ArtifactPublicationError,
@@ -399,7 +424,13 @@ def _load_native_evidence(value: dict[str, JsonValue]) -> NativeHostEvidence:
         raise HostAttestationError(f"native host evidence is invalid: {error}") from None
 
 
-def _load_identity(value: JsonValue, expected_name: str, label: str) -> CheckpointIdentity:
+def _load_identity(
+    value: JsonValue,
+    expected_name: str,
+    label: str,
+    *,
+    maximum_size: int | None = None,
+) -> CheckpointIdentity:
     if not isinstance(value, dict) or set(value) != _IDENTITY_KEYS:
         raise HostAttestationError(f"native-host attestation {label} identity fields are invalid")
     name = value["name"]
@@ -411,6 +442,8 @@ def _load_identity(value: JsonValue, expected_name: str, label: str) -> Checkpoi
         or not isinstance(size, int)
         or isinstance(size, bool)
         or size <= 0
+        or maximum_size is not None
+        and size > maximum_size
     ):
         raise HostAttestationError(f"native-host attestation {label} name or identity is invalid")
     return CheckpointIdentity(name=expected_name, sha256=cast(str, digest), size=size)
@@ -428,9 +461,9 @@ def _canonical_object(content: bytes, label: str) -> dict[str, JsonValue]:
     return value
 
 
-def _read_file(path: Path, label: str) -> bytes:
+def _read_file(path: Path, label: str, *, max_bytes: int) -> bytes:
     try:
-        return read_regular_file_no_follow(path)
+        return read_regular_file_no_follow(path, max_bytes=max_bytes)
     except OSError as error:
         raise HostAttestationError(f"{label} is missing or unsafe") from error
 

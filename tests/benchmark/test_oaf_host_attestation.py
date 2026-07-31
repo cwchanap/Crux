@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
+from src.benchmark import backend_publication
 from src.benchmark.backend_attestation import HostNumericFingerprint
 from tools.hpa320 import oaf_host_attestation as host_module
 from tools.hpa320.oaf_host_attestation import (
@@ -295,6 +297,58 @@ def test_publish_github_host_attestation_cleans_unpublished_staging_on_write_fai
 
     assert not output.exists()
     assert not list(tmp_path.glob(".bootstrap-host-attestation.*"))
+
+
+def test_publish_github_host_attestation_rolls_back_after_post_rename_sync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_same_job_environment(monkeypatch)
+    stub_native_commands(monkeypatch)
+    output = tmp_path / "bootstrap-host-attestation"
+    real_rename = backend_publication._rename_no_replace_syscall
+    real_fsync = os.fsync
+
+    def rename_then_fail_sync(*args: object, **kwargs: object) -> None:
+        real_rename(*args, **kwargs)  # type: ignore[arg-type]
+
+        def fail_once(_descriptor: int) -> None:
+            monkeypatch.setattr(backend_publication.os, "fsync", real_fsync)
+            raise OSError("injected parent sync failure")
+
+        monkeypatch.setattr(backend_publication.os, "fsync", fail_once)
+
+    monkeypatch.setattr(backend_publication, "_rename_no_replace_syscall", rename_then_fail_sync)
+
+    with pytest.raises(HostAttestationError):
+        publish_github_host_attestation(phase="bootstrap", output_directory=output)
+
+    assert not output.exists()
+
+
+def test_host_attestation_loader_never_uses_an_unbounded_file_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_same_job_environment(monkeypatch)
+    stub_native_commands(monkeypatch)
+    output = tmp_path / "bootstrap-host-attestation"
+    publish_github_host_attestation(phase="bootstrap", output_directory=output)
+    real_reader = host_module.read_regular_file_no_follow
+
+    def bounded_reader(path: Path, *, max_bytes: int | None = None) -> bytes:
+        if max_bytes is None:
+            raise OSError("unbounded test read")
+        return real_reader(path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(host_module, "read_regular_file_no_follow", bounded_reader)
+
+    bundle = load_native_host_attestation_bundle(
+        output / "attestation-bundle.json",
+        expected_phase="bootstrap",
+    )
+
+    assert bundle.phase == "bootstrap"
 
 
 def test_host_attestation_cli_only_accepts_same_job_publication() -> None:

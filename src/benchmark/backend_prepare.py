@@ -25,6 +25,7 @@ from src.benchmark.backend_lock import (
 )
 from src.benchmark.backend_publication import (
     ArtifactPublicationError,
+    DirectoryPublicationError,
     publish_immutable_bytes,
     rename_directory_no_replace,
 )
@@ -340,6 +341,16 @@ def _stage_and_publish(
                 request.cache_root / "sha256" / stage_name,
                 request.cache_root / "sha256" / contract.model_artifact_set_sha256,
             )
+        except DirectoryPublicationError:
+            if not _rollback_owned_directory(
+                sha256_fd,
+                contract.model_artifact_set_sha256,
+                published_identity,
+            ):
+                stage_name = None
+                raise _IntegrityError("published checkpoint rollback failed") from None
+            stage_name = None
+            raise _IntegrityError("atomic checkpoint publication failed") from None
         except ArtifactPublicationError as error:
             if not isinstance(error.__cause__, FileExistsError):
                 raise _IntegrityError("atomic checkpoint publication failed") from None
@@ -1339,13 +1350,15 @@ def _rollback_owned_directory(
     parent_fd: int,
     name: str,
     expected_identity: tuple[int, int] | None,
-) -> None:
+) -> bool:
     if expected_identity is None:
-        return
+        return False
     try:
         metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
     except OSError:
-        return
+        return False
     if (metadata.st_dev, metadata.st_ino) != expected_identity:
-        return
-    _cleanup_staging_directory(parent_fd, name)
+        return False
+    return _cleanup_staging_directory(parent_fd, name)
