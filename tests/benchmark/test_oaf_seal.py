@@ -1362,6 +1362,19 @@ def _calibration_inputs(
     )
 
 
+def test_calibration_measurement_request_rejects_former_v1_output_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_path, *_rest = _calibration_inputs(tmp_path, monkeypatch)
+    payload = json.loads(request_path.read_bytes())
+    payload["output_schemas"] = ["crux.oaf-calibration-measurement-evidence/v1"]
+    _write_json(request_path, payload)
+
+    with pytest.raises(SealError, match="calibration measurement output contract"):
+        seal_module.load_calibration_measurement_request(request_path)
+
+
 def _fake_measurement_row(
     frame_count: int, repetition: int, process: str | None = None
 ) -> dict[str, object]:

@@ -1231,7 +1231,9 @@ def load_calibration_measurement_request(path: Path) -> CalibrationMeasurementRe
             raise SealError("calibration measurement fixture identities are invalid")
     if counts != sorted(counts) or len(set(counts)) != len(counts):
         raise SealError("calibration measurement fixture frame counts are invalid")
-    if not _string_list(payload["required_metrics"]) or not _string_list(payload["output_schemas"]):
+    if not _string_list(payload["required_metrics"]) or payload["output_schemas"] != [
+        CALIBRATION_MEASUREMENT_EVIDENCE_SCHEMA
+    ]:
         raise SealError("calibration measurement output contract is invalid")
     return CalibrationMeasurementRequest(tuple(counts), repetitions, sha256_hex(content), payload)
 
