@@ -326,6 +326,33 @@ def test_publish_github_host_attestation_rolls_back_after_post_rename_sync_failu
     assert not output.exists()
 
 
+def test_publish_github_host_attestation_rolls_back_after_post_rename_lookup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_same_job_environment(monkeypatch)
+    stub_native_commands(monkeypatch)
+    output = tmp_path / "bootstrap-host-attestation"
+    real_rename = backend_publication._rename_no_replace_syscall
+    real_stat = os.stat
+
+    def rename_then_fail_lookup(*args: object, **kwargs: object) -> None:
+        real_rename(*args, **kwargs)  # type: ignore[arg-type]
+
+        def fail_once(*_args: object, **_kwargs: object) -> os.stat_result:
+            monkeypatch.setattr(backend_publication.os, "stat", real_stat)
+            raise OSError("injected post-rename lookup failure")
+
+        monkeypatch.setattr(backend_publication.os, "stat", fail_once)
+
+    monkeypatch.setattr(backend_publication, "_rename_no_replace_syscall", rename_then_fail_lookup)
+
+    with pytest.raises(HostAttestationError):
+        publish_github_host_attestation(phase="bootstrap", output_directory=output)
+
+    assert not output.exists()
+
+
 def test_host_attestation_loader_never_uses_an_unbounded_file_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

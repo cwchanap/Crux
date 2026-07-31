@@ -70,6 +70,7 @@ def rename_directory_no_replace(source: Path, destination: Path) -> PublishedDir
                 src_dir_fd=parent.parent_descriptor,
                 dst_dir_fd=parent.parent_descriptor,
             )
+            publication = PublishedDirectory(destination_path, source_metadata)
             published_metadata = os.stat(
                 destination_path.name,
                 dir_fd=parent.parent_descriptor,
@@ -77,7 +78,6 @@ def rename_directory_no_replace(source: Path, destination: Path) -> PublishedDir
             )
             if not stat.S_ISDIR(published_metadata.st_mode):
                 raise OSError("publication destination is not a directory")
-            publication = PublishedDirectory(destination_path, published_metadata)
             if not _same_inode(source_metadata, published_metadata):
                 raise OSError("publication destination binding changed")
             parent.verify()
