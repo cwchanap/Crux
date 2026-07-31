@@ -854,17 +854,26 @@ def pack_native_work_archive(
                 members=members,
             )
             os.fsync(temporary_descriptor)
+            temporary_stat = _require_owned_regular_descriptor(temporary_descriptor)
             parent.verify()
-            os.close(temporary_descriptor)
-            temporary_descriptor = None
 
-            verify_native_work_archive(
+            verified_identity = verify_native_work_archive(
                 phase=phase,
                 payload_root=root,
                 manifest_path=manifest.path,
                 archive_path=archive.parent / temporary_name,
             )
-            identity = _stream_regular_file_identity(archive.parent / temporary_name)
+            temporary_identity = _stream_descriptor_identity(
+                temporary_descriptor,
+                name=temporary_name,
+                expected=temporary_stat,
+            )
+            if (temporary_identity.sha256, temporary_identity.size) != (
+                verified_identity.sha256,
+                verified_identity.size,
+            ):
+                raise NativeArtifactError("native work archive changed after strict verification")
+            _verify_regular_file_binding_at(parent, temporary_name, temporary_stat)
             _rename_no_replace(
                 source=temporary_name,
                 destination=archive.name,
@@ -875,13 +884,19 @@ def pack_native_work_archive(
             parent.verify()
             os.fsync(parent.descriptor)
             parent.verify()
-            published_identity = _stream_regular_file_identity(archive)
+            _verify_regular_file_binding_at(parent, archive.name, temporary_stat)
+            published_identity = _stream_descriptor_identity(
+                temporary_descriptor,
+                name=archive.name,
+            )
             if (published_identity.sha256, published_identity.size) != (
-                identity.sha256,
-                identity.size,
+                verified_identity.sha256,
+                verified_identity.size,
             ):
                 raise NativeArtifactError("published native work archive identity changed")
             published = False
+            os.close(temporary_descriptor)
+            temporary_descriptor = None
             return CheckpointIdentity(
                 name=archive.name,
                 sha256=published_identity.sha256,
@@ -1302,6 +1317,30 @@ def _stream_regular_file_identity(path: Path) -> CheckpointIdentity:
     return CheckpointIdentity(name=path.name, sha256=digest.hexdigest(), size=size)
 
 
+def _stream_descriptor_identity(
+    descriptor: int,
+    *,
+    name: str,
+    expected: os.stat_result | None = None,
+) -> CheckpointIdentity:
+    before = _require_owned_regular_descriptor(descriptor)
+    if expected is not None and not _same_file_snapshot(before, expected):
+        raise NativeArtifactError("native work archive temporary inode changed")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    size = 0
+    while True:
+        chunk = os.read(descriptor, _CHUNK_SIZE)
+        if not chunk:
+            break
+        digest.update(chunk)
+        size += len(chunk)
+    after = _require_owned_regular_descriptor(descriptor)
+    if not _same_file_snapshot(before, after):
+        raise NativeArtifactError("native work archive descriptor changed while it was read")
+    return CheckpointIdentity(name=name, sha256=digest.hexdigest(), size=size)
+
+
 def _copy_regular_file(
     *,
     source_path: Path,
@@ -1581,7 +1620,17 @@ def _new_regular_file_flags() -> int:
     no_follow = getattr(os, "O_NOFOLLOW", None)
     if no_follow is None:
         raise OSError("no-follow file creation is unavailable")
-    return os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow | getattr(os, "O_CLOEXEC", 0)
+    return os.O_RDWR | os.O_CREAT | os.O_EXCL | no_follow | getattr(os, "O_CLOEXEC", 0)
+
+
+def _verify_regular_file_binding_at(
+    anchor: DirectoryAnchor,
+    name: str,
+    expected: os.stat_result,
+) -> None:
+    current = os.stat(name, dir_fd=anchor.descriptor, follow_symlinks=False)
+    if not stat.S_ISREG(current.st_mode) or not _same_inode(current, expected):
+        raise NativeArtifactError("native work archive path binding changed")
 
 
 def _rename_no_replace(*, source: str, destination: str, parent_descriptor: int) -> None:
@@ -1719,7 +1768,7 @@ def main(argv: list[str] | None = None) -> int:
                 archive_path=arguments.archive,
             )
             if arguments.bundle is not None:
-                _stream_regular_file_identity(arguments.bundle)
+                _verify_optional_attestation_bundle(arguments.bundle)
         elif arguments.command == "copy-bundle":
             copy_attestation_bundle(source=arguments.source, destination=arguments.destination)
         else:
@@ -1728,6 +1777,13 @@ def main(argv: list[str] | None = None) -> int:
         print(str(error), file=sys.stderr)
         return 2
     return 0
+
+
+def _verify_optional_attestation_bundle(path: Path) -> None:
+    try:
+        _stream_regular_file_identity(path)
+    except OSError as error:
+        raise NativeArtifactError("native work attestation bundle is missing or unsafe") from error
 
 
 if __name__ == "__main__":

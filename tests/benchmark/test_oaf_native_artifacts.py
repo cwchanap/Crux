@@ -469,6 +469,39 @@ def test_packer_removes_temporary_archive_after_a_payload_substitution_race(
     assert not list(tmp_path.glob(".substitution.tar.*.tmp"))
 
 
+def test_packer_rejects_temp_replacement_after_strict_verification(
+    bootstrap_payload: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _publish(bootstrap_payload)
+    archive = tmp_path / "verified.tar"
+    real_verify = artifacts_module.verify_native_work_archive
+    replaced = False
+
+    def verify_then_replace(**kwargs: Any) -> Any:
+        nonlocal replaced
+        identity = real_verify(**kwargs)
+        temporary = kwargs["archive_path"]
+        temporary.unlink()
+        temporary.write_bytes(b"unverified-after-strict-read\n")
+        replaced = True
+        return identity
+
+    monkeypatch.setattr(artifacts_module, "verify_native_work_archive", verify_then_replace)
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        artifacts_module.pack_native_work_archive(
+            phase="bootstrap",
+            payload_root=bootstrap_payload.root,
+            manifest_path=manifest.path,
+            archive_path=archive,
+        )
+    assert replaced
+    assert not archive.exists()
+    assert not list(tmp_path.glob(".verified.tar.*.tmp"))
+
+
 def test_copy_attestation_bundle_is_no_replace_and_byte_exact(tmp_path: Path) -> None:
     source = tmp_path / "action-bundle.json"
     destination = tmp_path / "stable.sigstore.json"
@@ -586,6 +619,38 @@ def test_cli_orders_structural_artifact_operations(
         == 0
     )
     assert calls == ["copy-bundle"]
+
+
+def test_cli_verify_reports_an_unsafe_optional_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    payload_root = tmp_path / "payload"
+    archive = tmp_path / "archive.tar"
+    manifest = SimpleNamespace(path=payload_root / "artifact-manifest.json")
+    monkeypatch.setattr(
+        artifacts_module, "load_native_work_manifest", lambda *_args, **_kwargs: manifest
+    )
+    monkeypatch.setattr(artifacts_module, "verify_native_work_payload", lambda **_kwargs: None)
+    monkeypatch.setattr(artifacts_module, "verify_native_work_archive", lambda **_kwargs: None)
+
+    result = artifacts_module.main(
+        [
+            "verify",
+            "--phase",
+            "bootstrap",
+            "--payload-root",
+            str(payload_root),
+            "--archive",
+            str(archive),
+            "--bundle",
+            str(tmp_path / "missing.sigstore.json"),
+        ]
+    )
+
+    assert result == 2
+    assert capsys.readouterr().err == "native work attestation bundle is missing or unsafe\n"
 
 
 def test_phase_mappings_are_the_exact_immutable_inventories() -> None:
