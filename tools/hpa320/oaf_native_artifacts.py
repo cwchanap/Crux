@@ -1714,8 +1714,11 @@ def _remove_linked_archive_if_owned(path: Path, expected: os.stat_result) -> Non
         absolute = _absolute_path(path, "archive")
         with open_directory_anchor(absolute.parent) as parent:
             current = os.stat(absolute.name, dir_fd=parent.descriptor, follow_symlinks=False)
-            if stat.S_ISREG(current.st_mode) and _same_inode(current, expected):
-                os.unlink(absolute.name, dir_fd=parent.descriptor)
+            if _same_inode(current, expected):
+                if stat.S_ISDIR(current.st_mode):
+                    os.rmdir(absolute.name, dir_fd=parent.descriptor)
+                else:
+                    os.unlink(absolute.name, dir_fd=parent.descriptor)
                 os.fsync(parent.descriptor)
     except (FileNotFoundError, OSError, NativeArtifactError):
         pass
