@@ -548,6 +548,43 @@ def test_packer_removes_replaced_source_after_rename_boundary(
     assert not list(tmp_path.glob(".rename-boundary.tar.*.tmp"))
 
 
+def test_packer_removes_symlink_replaced_source_after_rename_boundary(
+    bootstrap_payload: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _publish(bootstrap_payload)
+    archive = tmp_path / "rename-boundary-symlink.tar"
+    target = tmp_path / "renamed-source-target"
+    target.write_bytes(b"unverified-at-rename-boundary\\n")
+    real_rename = artifacts_module._rename_no_replace
+    replaced = False
+
+    def replace_then_rename(*, source: str, destination: str, parent_descriptor: int) -> None:
+        nonlocal replaced
+        os.unlink(source, dir_fd=parent_descriptor)
+        os.symlink(target, source, dir_fd=parent_descriptor)
+        replaced = True
+        real_rename(
+            source=source,
+            destination=destination,
+            parent_descriptor=parent_descriptor,
+        )
+
+    monkeypatch.setattr(artifacts_module, "_rename_no_replace", replace_then_rename)
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        artifacts_module.pack_native_work_archive(
+            phase="bootstrap",
+            payload_root=bootstrap_payload.root,
+            manifest_path=manifest.path,
+            archive_path=archive,
+        )
+    assert replaced
+    assert not archive.exists()
+    assert not archive.is_symlink()
+
+
 def test_copy_attestation_bundle_is_no_replace_and_byte_exact(tmp_path: Path) -> None:
     source = tmp_path / "action-bundle.json"
     destination = tmp_path / "stable.sigstore.json"
