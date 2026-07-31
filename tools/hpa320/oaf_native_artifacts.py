@@ -354,30 +354,43 @@ def _attestation_subjects(
     manifest_path: Path,
     archive_path: Path,
 ) -> tuple[CheckpointIdentity, ...]:
+    manifest_name, archive_name = _attestation_subject_names(
+        phase=phase,
+        workflow_commit=workflow_commit,
+        manifest_path=manifest_path,
+        archive_path=archive_path,
+    )
     paths_and_names = (
-        (
-            manifest_path,
-            f"artifacts/benchmark/backends/hpa320-{phase}/{MANIFEST_NAME}",
-        ),
-        (
-            archive_path,
-            f"artifacts/benchmark/backends/hpa320-native-{phase}-{workflow_commit}.tar",
-        ),
+        (manifest_path, manifest_name),
+        (archive_path, archive_name),
     )
     subjects: list[CheckpointIdentity] = []
     for path, name in paths_and_names:
         try:
-            content = read_regular_file_no_follow(path)
+            identity = _stream_regular_file_identity(path)
         except OSError as error:
             raise NativeArtifactError("GitHub attestation subject is missing or unsafe") from error
         subjects.append(
             CheckpointIdentity(
                 name=name,
-                sha256=hashlib.sha256(content).hexdigest(),
-                size=len(content),
+                sha256=identity.sha256,
+                size=identity.size,
             )
         )
     return tuple(subjects)
+
+
+def _attestation_subject_names(
+    *,
+    phase: str,
+    workflow_commit: str,
+    manifest_path: Path,
+    archive_path: Path,
+) -> tuple[str, str]:
+    archive_name = f"hpa320-native-{phase}-{workflow_commit}.tar"
+    if manifest_path.name != MANIFEST_NAME or archive_path.name != archive_name:
+        raise NativeArtifactError("GitHub attestation subject basename is invalid")
+    return MANIFEST_NAME, archive_name
 
 
 def _verification_statement(content: bytes) -> dict[str, JsonValue]:
@@ -463,17 +476,42 @@ def _attestation_snapshot(
 
 
 def _copy_snapshot_file(*, source: Path, destination: Path) -> None:
-    content = read_regular_file_no_follow(source)
     descriptor: int | None = None
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        descriptor = os.open(destination, _new_regular_file_flags(), 0o600)
-        _require_owned_regular_descriptor(descriptor)
-        _write_all(descriptor, content)
-        os.fsync(descriptor)
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
+    with open_directory_anchor(destination.parent) as parent:
+        try:
+            parent.verify()
+            _require_absent_at(parent, destination.name, "snapshot destination")
+            descriptor = os.open(
+                destination.name,
+                _new_regular_file_flags(),
+                0o600,
+                dir_fd=parent.descriptor,
+            )
+            initial = _require_owned_regular_descriptor(descriptor)
+            source_identity = _copy_regular_file(
+                source_path=source,
+                destination_descriptor=descriptor,
+            )
+            os.fsync(descriptor)
+            copied = _require_owned_regular_descriptor(descriptor)
+            if not _same_inode(initial, copied):
+                raise NativeArtifactError("snapshot destination inode changed while copying")
+            _verify_regular_file_binding_at(parent, destination.name, copied)
+            copied_identity = _stream_descriptor_identity(
+                descriptor,
+                name=destination.name,
+                expected=copied,
+            )
+            if (copied_identity.sha256, copied_identity.size) != (
+                source_identity.sha256,
+                source_identity.size,
+            ):
+                raise NativeArtifactError("snapshot copy differs from its source")
+            parent.verify()
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
 
 def _snapshot_directory_paths(*, phase: str, payload_root: Path) -> tuple[Path, ...]:
@@ -526,15 +564,16 @@ def _capture_snapshot_bindings(
         payload_root=payload_root,
         archive_path=archive_path,
     ):
-        content = read_regular_file_no_follow(path)
-        metadata = os.stat(path, follow_symlinks=False)
-        if not stat.S_ISREG(metadata.st_mode):
+        before = os.stat(path, follow_symlinks=False)
+        identity = _stream_regular_file_identity(path)
+        after = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(after.st_mode) or not _same_file_snapshot(before, after):
             raise NativeArtifactError("native work attestation snapshot file is unsafe")
         bindings.append(
             _SnapshotBinding(
                 path=path,
-                metadata=metadata,
-                sha256=hashlib.sha256(content).hexdigest(),
+                metadata=after,
+                sha256=identity.sha256,
             )
         )
     return tuple(bindings)
@@ -551,11 +590,12 @@ def _require_live_snapshot_bindings(snapshot: _AttestationSnapshot) -> None:
             continue
         if not stat.S_ISREG(metadata.st_mode):
             raise NativeArtifactError("native work attestation snapshot file changed")
-        content = read_regular_file_no_follow(binding.path)
+        identity = _stream_regular_file_identity(binding.path)
         after = os.stat(binding.path, follow_symlinks=False)
         if (
             not _same_file_snapshot(binding.metadata, after)
-            or hashlib.sha256(content).hexdigest() != binding.sha256
+            or identity.sha256 != binding.sha256
+            or identity.size != binding.metadata.st_size
         ):
             raise NativeArtifactError("native work attestation snapshot content changed")
 
@@ -594,7 +634,7 @@ def _validate_attestation_subjects(
             raise NativeArtifactError("GitHub attestation subject identity is invalid")
         actual.append((name, digest["sha256"]))
     expected_identities = [(subject.name, subject.sha256) for subject in expected]
-    if actual != expected_identities:
+    if sorted(actual) != sorted(expected_identities):
         raise NativeArtifactError("GitHub attestation subjects do not match local artifacts")
 
 
@@ -1354,6 +1394,7 @@ def copy_attestation_bundle(*, source: Path, destination: Path) -> CheckpointIde
     temporary_name: str | None = None
     temporary_stat: os.stat_result | None = None
     temporary_descriptor: int | None = None
+    published_stat: os.stat_result | None = None
     published = False
     try:
         source_path = _absolute_path(source, "attestation source")
@@ -1376,11 +1417,12 @@ def copy_attestation_bundle(*, source: Path, destination: Path) -> CheckpointIde
                 destination_descriptor=temporary_descriptor,
             )
             os.fsync(temporary_descriptor)
+            temporary_stat = _require_owned_regular_descriptor(temporary_descriptor)
             destination_parent.verify()
-            os.close(temporary_descriptor)
-            temporary_descriptor = None
-            temporary_identity = _stream_regular_file_identity(
-                destination_path.parent / temporary_name
+            temporary_identity = _stream_descriptor_identity(
+                temporary_descriptor,
+                name=temporary_name,
+                expected=temporary_stat,
             )
             if (temporary_identity.sha256, temporary_identity.size) != (
                 source_identity.sha256,
@@ -1389,23 +1431,43 @@ def copy_attestation_bundle(*, source: Path, destination: Path) -> CheckpointIde
                 raise NativeArtifactError(
                     "attestation bundle temporary copy differs from its source"
                 )
+            _verify_regular_file_binding_at(
+                destination_parent,
+                temporary_name,
+                temporary_stat,
+            )
             _rename_no_replace(
                 source=temporary_name,
                 destination=destination_path.name,
                 parent_descriptor=destination_parent.descriptor,
             )
             published = True
+            published_stat = os.stat(
+                destination_path.name,
+                dir_fd=destination_parent.descriptor,
+                follow_symlinks=False,
+            )
             temporary_name = None
             destination_parent.verify()
             os.fsync(destination_parent.descriptor)
             destination_parent.verify()
-            copied_identity = _stream_regular_file_identity(destination_path)
+            _verify_regular_file_binding_at(
+                destination_parent,
+                destination_path.name,
+                temporary_stat,
+            )
+            copied_identity = _stream_descriptor_identity(
+                temporary_descriptor,
+                name=destination_path.name,
+            )
             if (copied_identity.sha256, copied_identity.size) != (
                 source_identity.sha256,
                 source_identity.size,
             ):
                 raise NativeArtifactError("attestation bundle destination identity changed")
             published = False
+            os.close(temporary_descriptor)
+            temporary_descriptor = None
             return CheckpointIdentity(
                 name=destination_path.name,
                 sha256=copied_identity.sha256,
@@ -1420,8 +1482,8 @@ def copy_attestation_bundle(*, source: Path, destination: Path) -> CheckpointIde
             os.close(temporary_descriptor)
         if temporary_name is not None:
             _remove_temporary_archive(destination, temporary_name)
-        if published and temporary_stat is not None:
-            _remove_linked_archive_if_owned(destination, temporary_stat)
+        if published and published_stat is not None:
+            _remove_linked_archive_if_owned(destination, published_stat)
 
 
 def _archive_recipe(
@@ -2318,9 +2380,11 @@ def _require_snapshot_subjects(
     snapshot: _AttestationSnapshot,
     verified: VerifiedGitHubAttestation,
 ) -> None:
-    expected_names = (
-        f"artifacts/benchmark/backends/hpa320-{phase}/{MANIFEST_NAME}",
-        f"artifacts/benchmark/backends/hpa320-native-{phase}-{workflow_commit}.tar",
+    expected_names = _attestation_subject_names(
+        phase=phase,
+        workflow_commit=workflow_commit,
+        manifest_path=snapshot.manifest_path,
+        archive_path=snapshot.archive_path,
     )
     _require_live_snapshot_bindings(snapshot)
     subjects = _snapshot_subjects(
@@ -2342,18 +2406,24 @@ def _snapshot_subjects(
     workflow_commit: str,
     snapshot: _AttestationSnapshot,
 ) -> tuple[CheckpointIdentity, ...]:
-    manifest_content = read_regular_file_no_follow(snapshot.manifest_path)
-    archive_content = read_regular_file_no_follow(snapshot.archive_path)
+    manifest_name, archive_name = _attestation_subject_names(
+        phase=phase,
+        workflow_commit=workflow_commit,
+        manifest_path=snapshot.manifest_path,
+        archive_path=snapshot.archive_path,
+    )
+    manifest_identity = _stream_regular_file_identity(snapshot.manifest_path)
+    archive_identity = _stream_regular_file_identity(snapshot.archive_path)
     return (
         CheckpointIdentity(
-            name=f"artifacts/benchmark/backends/hpa320-{phase}/{MANIFEST_NAME}",
-            sha256=hashlib.sha256(manifest_content).hexdigest(),
-            size=len(manifest_content),
+            name=manifest_name,
+            sha256=manifest_identity.sha256,
+            size=manifest_identity.size,
         ),
         CheckpointIdentity(
-            name=f"artifacts/benchmark/backends/hpa320-native-{phase}-{workflow_commit}.tar",
-            sha256=hashlib.sha256(archive_content).hexdigest(),
-            size=len(archive_content),
+            name=archive_name,
+            sha256=archive_identity.sha256,
+            size=archive_identity.size,
         ),
     )
 

@@ -287,13 +287,13 @@ def signed_bootstrap(packed_bootstrap: Any, tmp_path: Path) -> SignedBootstrap:
     )
     subjects = [
         {
-            "name": "artifacts/benchmark/backends/hpa320-bootstrap/artifact-manifest.json",
+            "name": "artifact-manifest.json",
             "digest": {
                 "sha256": sha256_hex(read_regular_file_no_follow(packed_bootstrap.manifest))
             },
         },
         {
-            "name": (f"artifacts/benchmark/backends/hpa320-native-bootstrap-{'a' * 40}.tar"),
+            "name": f"hpa320-native-bootstrap-{'a' * 40}.tar",
             "digest": {"sha256": sha256_hex(read_regular_file_no_follow(packed_bootstrap.archive))},
         },
     ]
@@ -364,6 +364,143 @@ def test_github_verifier_runs_the_exact_policy_for_both_subjects(
         )
         assert command[-2:] == ("--format", "json")
     assert verified.gh_version == "2.68.1"
+
+
+@pytest.mark.parametrize(
+    ("phase", "archive_name"),
+    [
+        (
+            "bootstrap",
+            f"hpa320-native-bootstrap-{'a' * 40}.tar",
+        ),
+        (
+            "measurement",
+            f"hpa320-native-measurement-{'a' * 40}.tar",
+        ),
+        (
+            "candidate",
+            f"hpa320-native-candidate-{'a' * 40}.tar",
+        ),
+    ],
+)
+def test_github_verifier_accepts_pinned_action_basename_subjects_for_every_phase(
+    tmp_path: Path,
+    phase: str,
+    archive_name: str,
+) -> None:
+    manifest = tmp_path / phase / "artifact-manifest.json"
+    archive = tmp_path / archive_name
+    manifest.parent.mkdir()
+    manifest.write_bytes(b"manifest\n")
+    archive.write_bytes(b"archive\n")
+    # actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d resolves the
+    # literal subject-path list through @actions/glob and uses path.parse(file).base.
+    statement = {
+        "_type": "https://in-toto.io/Statement/v1",
+        "predicate": {},
+        "predicateType": "https://slsa.dev/provenance/v1",
+        "subject": [
+            {
+                "name": archive_name,
+                "digest": {"sha256": sha256_hex(b"archive\n")},
+            },
+            {
+                "name": "artifact-manifest.json",
+                "digest": {"sha256": sha256_hex(b"manifest\n")},
+            },
+        ],
+    }
+    action_output = json.dumps(
+        [{"verificationResult": {"statement": statement}}],
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    def run(command: tuple[str, ...]) -> bytes:
+        if command[:2] == ("gh", "version"):
+            return b"gh version 2.68.1 (2026-01-01)\n"
+        return action_output
+
+    verified = artifacts_module.verify_github_attestations(
+        phase=phase,
+        workflow_commit="a" * 40,
+        manifest_path=manifest,
+        archive_path=archive,
+        sigstore_bundle_path=tmp_path / "bundle.sigstore.json",
+        trusted_root_path=tmp_path / "trusted-root.json",
+        command_runner=run,
+    )
+
+    assert tuple(subject.name for subject in verified.subjects) == (
+        "artifact-manifest.json",
+        archive_name,
+    )
+
+
+def test_acceptance_streams_sparse_artifacts_without_whole_file_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = tmp_path / "artifact-manifest.json"
+    archive = tmp_path / f"hpa320-native-bootstrap-{'a' * 40}.tar"
+    snapshot_copy = tmp_path / "snapshot" / archive.name
+    manifest.write_bytes(b"manifest\n")
+    for relative in artifacts_module.BOOTSTRAP_FILES:
+        payload_file = tmp_path / relative
+        payload_file.parent.mkdir(parents=True, exist_ok=True)
+        payload_file.write_bytes(b"payload\n")
+    with archive.open("wb") as stream:
+        stream.seek(3 * artifacts_module._CHUNK_SIZE)
+        stream.write(b"archive-tail\n")
+
+    read_sizes: list[int] = []
+    real_read = artifacts_module.os.read
+
+    def bounded_read(descriptor: int, size: int) -> bytes:
+        read_sizes.append(size)
+        assert size <= artifacts_module._CHUNK_SIZE
+        return real_read(descriptor, size)
+
+    def reject_whole_file_read(_path: Path) -> bytes:
+        raise AssertionError("acceptance must not use a whole-file helper")
+
+    monkeypatch.setattr(artifacts_module.os, "read", bounded_read)
+    monkeypatch.setattr(
+        artifacts_module,
+        "read_regular_file_no_follow",
+        reject_whole_file_read,
+    )
+
+    artifacts_module._copy_snapshot_file(source=archive, destination=snapshot_copy)
+    subjects = artifacts_module._attestation_subjects(
+        phase="bootstrap",
+        workflow_commit="a" * 40,
+        manifest_path=manifest,
+        archive_path=archive,
+    )
+    snapshot = artifacts_module._AttestationSnapshot(
+        archive_path=archive,
+        manifest_path=manifest,
+        payload_root=tmp_path,
+        bindings=artifacts_module._capture_snapshot_bindings(
+            phase="bootstrap",
+            payload_root=tmp_path,
+            archive_path=archive,
+        ),
+    )
+
+    assert (
+        artifacts_module._snapshot_subjects(
+            phase="bootstrap",
+            workflow_commit="a" * 40,
+            snapshot=snapshot,
+        )
+        == subjects
+    )
+    artifacts_module._require_live_snapshot_bindings(snapshot)
+    assert snapshot_copy.stat().st_size == archive.stat().st_size
+    assert len(read_sizes) > 3
+    assert max(read_sizes) <= artifacts_module._CHUNK_SIZE
 
 
 @pytest.mark.parametrize(
@@ -573,12 +710,12 @@ def test_verify_attestation_cli_uses_one_immutable_snapshot_across_gates(
             statement_sha256="a" * 64,
             subjects=(
                 artifacts_module.CheckpointIdentity(
-                    name=("artifacts/benchmark/backends/hpa320-bootstrap/artifact-manifest.json"),
+                    name="artifact-manifest.json",
                     sha256=sha256_hex(manifest_before),
                     size=len(manifest_before),
                 ),
                 artifacts_module.CheckpointIdentity(
-                    name=(f"artifacts/benchmark/backends/hpa320-native-bootstrap-{'a' * 40}.tar"),
+                    name=f"hpa320-native-bootstrap-{'a' * 40}.tar",
                     sha256=sha256_hex(archive_before),
                     size=len(archive_before),
                 ),
@@ -703,12 +840,12 @@ def test_verify_attestation_cli_rejects_coherent_snapshot_replacement_after_arch
             statement_sha256="a" * 64,
             subjects=(
                 artifacts_module.CheckpointIdentity(
-                    name="artifacts/benchmark/backends/hpa320-bootstrap/artifact-manifest.json",
+                    name="artifact-manifest.json",
                     sha256=sha256_hex(manifest.read_bytes()),
                     size=manifest.stat().st_size,
                 ),
                 artifacts_module.CheckpointIdentity(
-                    name=(f"artifacts/benchmark/backends/hpa320-native-bootstrap-{'a' * 40}.tar"),
+                    name=f"hpa320-native-bootstrap-{'a' * 40}.tar",
                     sha256=sha256_hex(snapshot_archive.read_bytes()),
                     size=snapshot_archive.stat().st_size,
                 ),
@@ -788,12 +925,12 @@ def test_verify_attestation_cli_rejects_snapshot_aba_after_archive_verification(
             statement_sha256="a" * 64,
             subjects=(
                 artifacts_module.CheckpointIdentity(
-                    name="artifacts/benchmark/backends/hpa320-bootstrap/artifact-manifest.json",
+                    name="artifact-manifest.json",
                     sha256=sha256_hex(manifest.read_bytes()),
                     size=manifest.stat().st_size,
                 ),
                 artifacts_module.CheckpointIdentity(
-                    name=(f"artifacts/benchmark/backends/hpa320-native-bootstrap-{'a' * 40}.tar"),
+                    name=f"hpa320-native-bootstrap-{'a' * 40}.tar",
                     sha256=sha256_hex(archive.read_bytes()),
                     size=archive.stat().st_size,
                 ),
@@ -879,12 +1016,12 @@ def test_verify_attestation_cli_emits_no_report_when_snapshot_cleanup_fails(
             statement_sha256="a" * 64,
             subjects=(
                 artifacts_module.CheckpointIdentity(
-                    name="artifacts/benchmark/backends/hpa320-bootstrap/artifact-manifest.json",
+                    name="artifact-manifest.json",
                     sha256=sha256_hex(manifest.read_bytes()),
                     size=manifest.stat().st_size,
                 ),
                 artifacts_module.CheckpointIdentity(
-                    name=(f"artifacts/benchmark/backends/hpa320-native-bootstrap-{'a' * 40}.tar"),
+                    name=f"hpa320-native-bootstrap-{'a' * 40}.tar",
                     sha256=sha256_hex(archive.read_bytes()),
                     size=archive.stat().st_size,
                 ),
@@ -928,12 +1065,12 @@ def test_verify_attestation_cli_runs_the_outside_in_acceptance_order(
 ) -> None:
     calls: list[str] = []
     manifest_identity = artifacts_module.CheckpointIdentity(
-        name="artifacts/benchmark/backends/hpa320-bootstrap/artifact-manifest.json",
+        name="artifact-manifest.json",
         sha256=sha256_hex(read_regular_file_no_follow(signed_bootstrap.manifest)),
         size=signed_bootstrap.manifest.stat().st_size,
     )
     archive_identity = artifacts_module.CheckpointIdentity(
-        name=(f"artifacts/benchmark/backends/hpa320-native-bootstrap-{'a' * 40}.tar"),
+        name=f"hpa320-native-bootstrap-{'a' * 40}.tar",
         sha256=sha256_hex(read_regular_file_no_follow(signed_bootstrap.archive)),
         size=signed_bootstrap.archive.stat().st_size,
     )
@@ -1435,6 +1572,90 @@ def test_copy_attestation_bundle_rejects_a_symlinked_source(tmp_path: Path) -> N
     with pytest.raises(artifacts_module.NativeArtifactError):
         artifacts_module.copy_attestation_bundle(source=source, destination=destination)
     assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    "replacement_kind",
+    ["regular", "symlink", "nonempty-directory"],
+)
+def test_copy_attestation_bundle_removes_every_rename_boundary_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_kind: str,
+) -> None:
+    source = tmp_path / "action-bundle.json"
+    destination = tmp_path / "stable.sigstore.json"
+    symlink_target = tmp_path / "raced-target.json"
+    bundle_content = b'{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.3"}\n'
+    source.write_bytes(bundle_content)
+    symlink_target.write_bytes(b"raced bundle\n")
+    real_rename = artifacts_module._rename_no_replace
+    replaced = False
+
+    def replace_then_rename(*, source: str, destination: str, parent_descriptor: int) -> None:
+        nonlocal replaced
+        os.unlink(source, dir_fd=parent_descriptor)
+        if replacement_kind == "regular":
+            descriptor = os.open(
+                source,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+            try:
+                os.write(descriptor, bundle_content)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        elif replacement_kind == "symlink":
+            os.symlink(symlink_target, source, dir_fd=parent_descriptor)
+        else:
+            os.mkdir(source, dir_fd=parent_descriptor)
+            directory = os.open(
+                source,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_descriptor,
+            )
+            try:
+                os.mkdir("nested", dir_fd=directory)
+                nested = os.open(
+                    "nested",
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory,
+                )
+                try:
+                    descriptor = os.open(
+                        "raced.json",
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=nested,
+                    )
+                    try:
+                        os.write(descriptor, b"raced bundle\n")
+                    finally:
+                        os.close(descriptor)
+                finally:
+                    os.close(nested)
+            finally:
+                os.close(directory)
+        replaced = True
+        real_rename(
+            source=source,
+            destination=destination,
+            parent_descriptor=parent_descriptor,
+        )
+
+    monkeypatch.setattr(artifacts_module, "_rename_no_replace", replace_then_rename)
+
+    with pytest.raises(artifacts_module.NativeArtifactError):
+        artifacts_module.copy_attestation_bundle(source=source, destination=destination)
+    assert replaced
+    assert not destination.exists()
+    assert not destination.is_symlink()
+
+    monkeypatch.setattr(artifacts_module, "_rename_no_replace", real_rename)
+    identity = artifacts_module.copy_attestation_bundle(source=source, destination=destination)
+    assert identity.size == source.stat().st_size
 
 
 def test_cli_orders_structural_artifact_operations(

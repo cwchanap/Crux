@@ -152,6 +152,10 @@ def _assert_native_workflow_contract(
             f"artifacts/benchmark/backends/hpa320-{phase}/artifact-manifest.json\n"
         )
     }
+    assert {Path(subject).name for subject in attest["with"]["subject-path"].splitlines()} == {
+        "artifact-manifest.json",
+        f"hpa320-native-{phase}-${{{{ inputs.commit_sha }}}}.tar",
+    }
     copy_bundle = _step_named(steps, "Preserve the local Sigstore bundle")
     assert copy_bundle["run"] == (
         "uv run python -m tools.hpa320.oaf_native_artifacts copy-bundle "
