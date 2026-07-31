@@ -28,6 +28,11 @@ Acceptance verifies the signed provenance outside-in before trusting any native
 result. The separate observation job, GitHub Jobs REST lookup, raw completed-job API
 record, and `actions: read` permission are removed.
 
+The changed GitHub-hosted evidence is not inserted into existing `/v1` containers.
+The host bundle and all five existing outer evidence schemas that embed the changed
+payload or candidate inventory move to `/v2` together. There is no production v1
+compatibility reader.
+
 The legacy `.github/workflows/hpa320-native-host-evidence.yml` scratch collector uses
 the same cross-runner API-record pattern but does not produce bootstrap, measurement,
 or candidate authority. It is deleted rather than migrated. Its trigger branch
@@ -35,8 +40,25 @@ or candidate authority. It is deleted rather than migrated. Its trigger branch
 before HPA-423 is allowed to dispatch.
 
 This design changes execution provenance only. It does not change the checkpoint,
-runtime image, backend lock, inference parameters, smoke oracle, prediction schema,
-or the acyclic request/evidence/lock ordering frozen by HPA-320.
+runtime image contents, inference parameters, smoke oracle, prediction schema, or the
+acyclic request/evidence/lock ordering frozen by HPA-320. It necessarily changes the
+not-yet-published native evidence bytes and any future lock hashes that transitively
+reference them; it does not rewrite a published backend or runtime identity.
+
+## Ticket ownership and atomic delivery
+
+The live issue split is:
+
+| Issue | Owned requirements |
+| --- | --- |
+| HPA-481 | Collapse observation and native work into one job; remove the Jobs REST/API-record path; bind the complete work-job output through the canonical manifest, deterministic archive, GitHub attestation, and acceptance policy. |
+| HPA-482 | Propagate `runner.environment`; cross-check the context and default environment values; record `runner_environment`; and reject non-`github-hosted` production and consumption. |
+
+The manifest and deterministic packer are HPA-481 mechanisms, not HPA-482 scope.
+HPA-482 is folded into HPA-481 because both issues change the same host observation,
+evidence payload, outer schemas, workflows, and tests. Implementation may stage
+internally by the ownership above, but there is one schema migration, one acceptance
+gate, and one atomic merge.
 
 ## Existing defect
 
@@ -113,7 +135,10 @@ outputs of the job that did the work and needs no completed-job lookup.
 
 ## Trust boundary
 
-The phase work job is the producer trust boundary:
+The external runner-class authority is the Fulcio certificate in GitHub's signed
+provenance. Acceptance verifies that certificate and applies
+`--deny-self-hosted-runners`; this is the independent proof that the signer used a
+GitHub-hosted runner. The phase work job is then the producer trust boundary:
 
 ```text
 reviewed workflow at exact commit
@@ -127,8 +152,10 @@ reviewed workflow at exact commit
 ```
 
 The in-job observation is a signed payload claim, not the cryptographic root. The
-Sigstore certificate and verified GitHub provenance are the external root. Acceptance
-requires both:
+Sigstore certificate and verified GitHub provenance are the external root. The
+`RUNNER_*_CONTEXT == RUNNER_*` checks compare two values exposed to the same runner
+process; they are useful consistency and accidental-override guards, but they are not
+an independent runner-class authority. Acceptance requires both:
 
 - the signed provenance passes repository, signer-workflow, exact source commit, and
   non-self-hosted policy; and
@@ -190,9 +217,13 @@ Each remaining job performs these ordered stages:
 5. Produce the phase's existing outputs.
 6. Generate the canonical payload manifest.
 7. Pack the deterministic evidence archive.
-8. Generate one SLSA provenance attestation covering both the manifest and archive.
-9. Copy the action's local `bundle-path` output to a stable artifact filename.
-10. In one success-artifact upload, publish the complete payload root, which already
+8. Revalidate the exact payload and require the manifest and archive to be no-follow
+   regular files.
+9. Generate one SLSA provenance attestation covering both the manifest and archive.
+10. Copy the action's local `bundle-path` output to a stable artifact filename.
+11. Revalidate the exact payload and require the manifest, archive, and copied bundle
+    to be present at their literal no-follow paths.
+12. In one success-artifact upload, publish the complete payload root, which already
     contains the manifest, plus the sibling archive and local attestation bundle.
 
 The runner and workflow context values are injected only through the observation
@@ -239,7 +270,8 @@ actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d  # v4.2.1
 ```
 
 The implementation plan must revalidate the tag-to-commit mapping and action inputs
-before editing the workflows. A newer tag does not replace this SHA without review.
+before editing the workflows. Neither a newer nor an older tag or action version
+replaces this SHA without review.
 
 ## Same-job host observation
 
@@ -289,6 +321,11 @@ The accepted values are phase-specific:
 | measurement | `native-measurement` | `hpa320-native-measurement.yml` |
 | candidate | `native-candidate` | `hpa320-native-candidate.yml` |
 
+`github_job` is the `jobs.<job_id>` YAML mapping key exposed as `GITHUB_JOB`, not the
+optional human-readable job `name:`. The workflow may keep a matching `name:` for
+readability, but changing that display name does not change the evidence identity;
+changing the YAML key does.
+
 Every phase requires:
 
 ```text
@@ -309,7 +346,7 @@ validated as the phase-specific repository/workflow/ref path; its suffix is a Gi
 not a commit identity. A missing field is a hard error; there is no inferred or
 compatibility default.
 
-## Host evidence schema migration
+## Host and containing-evidence schema migration
 
 New phase executions use:
 
@@ -327,8 +364,8 @@ It removes `api_record` and the sibling
 `github-job-api-record.json.hex`. The raw Jobs API record described another job and
 is not replaced by a fabricated same-job record.
 
-The strict `github_hosted` native-evidence payload gains a schema discriminator and
-contains:
+The strict `github_hosted` native-evidence payload has
+`schema = "crux.github-hosted-native-evidence/v2"` and contains:
 
 ```text
 schema, github_job, github_repository, github_run_attempt, github_run_id,
@@ -342,6 +379,32 @@ It removes:
 api_record_sha256, approved_labels, job_id
 ```
 
+Changing that exact nested payload and removing the candidate API-record row also
+changes every existing containing schema. The migration therefore replaces these
+five identities:
+
+| Removed production identity | Replacement identity |
+| --- | --- |
+| `crux.backend-seal-evidence/v1` | `crux.backend-seal-evidence/v2` |
+| `crux.oaf-base-system-package-evidence/v1` | `crux.oaf-base-system-package-evidence/v2` |
+| `crux.oaf-calibration-bootstrap-evidence/v1` | `crux.oaf-calibration-bootstrap-evidence/v2` |
+| `crux.oaf-calibration-measurement-evidence/v1` | `crux.oaf-calibration-measurement-evidence/v2` |
+| `crux.oaf-seal-candidate/v1` | `crux.oaf-seal-candidate/v2` |
+
+Their field sets otherwise remain as frozen by HPA-320 except for the changed nested
+`native_host_evidence` payload and, for the seal candidate, removal of the
+`native_host_api_record` artifact row. Producers, strict loaders, schema registries,
+candidate validation, and goldens switch to these v2 identities in the same commit.
+
+The request schema identities do not move. The already checked-in calibration
+bootstrap request has no output-schema field and remains byte-identical. A newly
+generated `crux.oaf-calibration-measurement-request/v1` names
+`crux.oaf-calibration-measurement-evidence/v2` in its existing `output_schemas`
+field, and the later seal-profile request references the resulting v2 evidence
+hashes through its existing fields. Neither downstream request has been published,
+so this preserves the acyclic request/evidence order without rewriting accepted
+input authority.
+
 For v2, `run_url` is the run-level URL with exact grammar:
 
 ```text
@@ -351,8 +414,7 @@ https://github.com/<owner>/<repository>/actions/runs/<positive-decimal-github_ru
 Its owner/repository path must equal `github_repository`, and its terminal decimal
 component must equal `github_run_id`. It has no job suffix and no attempt suffix;
 `github_job` and `github_run_attempt` carry those identities separately. The
-historical v1 parser retains its existing job-level URL grammar for historical
-evidence only. A v1 job URL is rejected by the v2 parser.
+v2-only parser rejects the former job-level URL grammar.
 
 `tools/hpa320/github_host_evidence.py` remains the sole builder for the strict
 `github_hosted` evidence record. Its v2 builder consumes an already validated
@@ -369,6 +431,14 @@ verification policy.
 A standalone v2 bundle must therefore never authorize sealing, publication, or
 official execution. Consumer paths require the signed manifest and Sigstore bundle in
 addition to the internal v2 bundle.
+
+No durable v1 bootstrap, measurement, candidate, or seal evidence exists in the
+repository or its Git history; the existing v1 examples are schema goldens and test
+fixtures. The migration does not retain a production v1 parser. For
+`kind == "github_hosted"`, `NativeHostEvidence` accepts only the exact v2 payload
+after the migration. Existing v1 success goldens are replaced by v2 goldens. Old v1
+bytes may remain only as clearly named negative fixtures proving rejection; no
+runtime entry point loads them successfully.
 
 ## Canonical artifact manifest
 
@@ -455,9 +525,45 @@ an exact `(payload-root-relative path, role)` allowlist:
   calibration-measurement evidence, and explicitly named successful diagnostics; and
 - candidate permits the three candidate host-bundle paths, operational checkpoint
   acquisition evidence, the operational-image bootstrap/OCI outputs, the seal
-  candidate manifest, every current seal-candidate member under its existing
-  `_CANDIDATE_ARTIFACTS` role except `native_host_api_record`, and explicitly named
-  successful diagnostics.
+  candidate subtree described below, and explicitly named successful diagnostics.
+
+`calibrate --output <payload-root>/seal-candidate` writes a repository-shaped tree
+inside that output directory. `_CANDIDATE_ARTIFACTS` paths are relative to the
+seal-candidate directory, not to the phase payload root. The outer candidate phase
+mapping therefore uses this exact prefix transformation:
+
+```text
+payload path = "seal-candidate/" + candidate repository-relative path
+role         = existing candidate role
+```
+
+The v2 payload-root-relative seal-candidate mapping is exactly:
+
+| Payload-root-relative path | Role |
+| --- | --- |
+| `seal-candidate/candidate-manifest.json` | `seal_candidate_manifest` |
+| `seal-candidate/docs/superpowers/evidence/hpa-320/legacy-conversion-audit.json` | `conversion_audit` |
+| `seal-candidate/docs/superpowers/evidence/hpa-320/native/candidate-host-attestation/attestation-bundle.json` | `native_host_attestation_bundle` |
+| `seal-candidate/docs/superpowers/evidence/hpa-320/native/candidate-host-attestation/native-host-evidence.json` | `native_host_evidence` |
+| `seal-candidate/docs/superpowers/evidence/hpa-320/native/candidate-host-attestation/native-host-observation.json` | `native_host_observation` |
+| `seal-candidate/runtime/oaf_tf1/host-adapter-source-manifest.json` | `host_adapter_source_manifest` |
+| `seal-candidate/docs/superpowers/evidence/hpa-320/oaf-tensor-coverage.json` | `tensor_coverage` |
+| `seal-candidate/docs/superpowers/evidence/hpa-320/oaf-advisory-snapshot.json` | `advisory_snapshot` |
+| `seal-candidate/docs/superpowers/evidence/hpa-320/oaf-security-scan.json` | `security_scan` |
+| `seal-candidate/artifacts/benchmark/backends/oaf-tf1/runtime.oci.tar` | `oci_layout_archive` |
+| `seal-candidate/docs/superpowers/evidence/hpa-320/oaf-oci-layout-manifest.json` | `oci_layout_manifest` |
+| `seal-candidate/tests/fixtures/oaf_tf1_smoke/canonical.wav` | `smoke_audio` |
+| `seal-candidate/docs/superpowers/evidence/hpa-320/oaf-smoke-prediction.jsonl` | `smoke_prediction` |
+| `seal-candidate/tests/fixtures/oaf_tf1_smoke/smoke-oracle.json` | `smoke_oracle` |
+| `seal-candidate/config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.seal-evidence.json` | `seal_evidence` |
+| `seal-candidate/config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.runtime-lock.json` | `runtime_lock` |
+| `seal-candidate/config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.backend-lock.json` | `backend_lock` |
+
+The former
+`seal-candidate/docs/superpowers/evidence/hpa-320/native/candidate-host-attestation/github-job-api-record.json.hex`
+path is absent. The three phase-level `candidate-host-attestation/` rows remain
+separate from the repository-shaped copies inside `seal-candidate/`; both locations
+must match their exact allowlisted roles and expected bytes.
 
 The concrete mappings live as immutable phase constants in
 `tools/hpa320/oaf_native_artifacts.py` and are asserted path-for-path by tests.
@@ -515,6 +621,24 @@ subjects in one attestation:
 1. the deterministic evidence archive; and
 2. the canonical artifact manifest.
 
+Every phase uses this exact input shape. `<phase>` is replaced by the workflow's
+hard-coded phase; the workflow commit comes only from the required dispatch input:
+
+```yaml
+- name: Attest native phase evidence
+  id: attest
+  uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d
+  with:
+    subject-path: |
+      artifacts/benchmark/backends/hpa320-native-<phase>-${{ inputs.commit_sha }}.tar
+      artifacts/benchmark/backends/hpa320-<phase>/artifact-manifest.json
+```
+
+`subject-path` is mandatory. The workflow does not rely on the action's
+`$GITHUB_ARTIFACTS_LIST` subject discovery. `sbom-path`, `predicate`, and
+`predicate-type` are absent, so the reviewed v4 invocation generates its default
+SLSA provenance for those two explicit subjects.
+
 Signing the manifest directly preserves a durable link to every payload digest even
 after the convenience archive's GitHub retention window expires. Signing the archive
 also proves that the reviewed download is the exact packaged payload.
@@ -560,6 +684,17 @@ It uses no wildcard and no second success upload. Workflow-contract tests freeze
 artifact name, the three literal path shapes, the retention value, and the facts that
 the tar and Sigstore bundle are outside the payload root and absent from every
 manifest row.
+
+`if-no-files-found: error` is only an aggregate final guard: it fails when none of
+the configured paths yields a file, not when one of the three inputs is missing. The
+real completeness guarantee is ordered before upload. The Python-owned verifier
+reproduces the exact manifest scan and canonical archive, rejects a symlinked payload
+root, and requires the manifest and archive to be no-follow regular files immediately
+before attestation. After the action returns and its bundle is copied, the workflow
+runs the same payload verification again, requires the payload root to be a
+non-symlink directory, and requires the manifest, archive, and detached bundle to be
+no-follow regular files at their literal paths. Any missing or changed input fails
+the job before `actions/upload-artifact`.
 
 This exclusion is intentional: the bundle is the detached signature, certificate,
 timestamp, and transparency-log material used to verify the two subjects, so placing
@@ -691,35 +826,36 @@ the review checklist, but that output is not itself treated as signed authority.
 - A valid attestation with an invalid manifest or phase result is rejected.
 - A valid phase result with a missing, invalid, wrong-workflow, wrong-commit, or
   self-hosted attestation is rejected.
-- Previously published historical artifacts are preserved for audit. They are not
-  rewritten to v2.
+- Any retained ephemeral v1 workflow artifacts are preserved as audit material only.
+  They are not rewritten to v2 and migrated production readers reject them.
 
 ## Migration
 
 The migration is atomic across tooling, schemas, consumers, tests, documentation, and
 all three manual workflows:
 
-1. Add v2 host-bundle, artifact-manifest, deterministic-packer, and verification
-   support.
-2. Change all acceptance consumers to reject an unaccompanied v2 bundle.
-3. Convert bootstrap, measurement, and candidate workflows to their single-job form.
-4. Remove the Jobs REST finalizer, API-record decoder, raw-record schema fields,
+1. Add the v2 host bundle, exact v2 GitHub-hosted evidence payload, five v2
+   containing-evidence identities, artifact manifest, deterministic packer, and
+   verification support.
+2. Replace the v1 success goldens and schema-registry rows with v2 goldens; retain
+   old v1 bytes only where a named negative fixture proves rejection.
+3. Change all producers and acceptance consumers to the v2 identities and reject an
+   unaccompanied v2 bundle.
+4. Convert bootstrap, measurement, and candidate workflows to their single-job form.
+5. Remove the Jobs REST finalizer, API-record decoder, raw-record schema fields,
    cross-job output handling, and `actions: read`; delete
    `.github/workflows/hpa320-native-host-evidence.yml`.
-5. Update schema goldens and the HPA-320 design's superseded provenance passages.
-6. Run the local verification stack.
-7. Merge HPA-481 and HPA-482 together.
-8. Retire `hpa-320-native-seal-evidence` or disable its legacy workflow in GitHub;
+6. Update the HPA-320 design's superseded provenance and schema passages.
+7. Run the local verification stack.
+8. Merge HPA-481 and HPA-482 together.
+9. Retire `hpa-320-native-seal-evidence` or disable its legacy workflow in GitHub;
    deleting the file from the default branch alone does not disable the workflow copy
    retained on that branch.
-9. Only then dispatch HPA-423 at an exact merged commit.
+10. Only then dispatch HPA-423 at an exact merged commit.
 
-The v1 schema remains readable only for explicitly historical evidence and tests.
-It is not accepted as newly produced bootstrap, measurement, candidate, final-seal,
-or official-publication authority after the migration commit.
-
-No compatibility mode may silently infer `runner_environment`, accept an API record
-for another job, or treat v1 and v2 as equivalent.
+No production or test success path retains v1 compatibility. No compatibility mode
+may silently infer `runner_environment`, accept an API record for another job, or
+treat v1 and v2 as equivalent.
 
 ## Verification strategy
 
@@ -734,12 +870,15 @@ for another job, or treat v1 and v2 as equivalent.
   identity, or commit.
 - V2 evidence accepts only the exact run-level `run_url` grammar and rejects the v1
   job-level form.
-- V2 bundle parsing is strict and rejects v1 substitution at new acceptance
-  boundaries.
+- V2 bundle and all five v2 containing-evidence parsers are strict and reject v1
+  substitution at every migrated boundary.
 - Generic GitHub-hosted native evidence requires `runner_environment`.
+- No v1 GitHub-hosted native-evidence success parser remains.
 - Manifest parsing rejects noncanonical JSON, extra or missing keys, path escape,
   duplicates, wrong ordering, missing files, size/hash drift, self-reference, an
   unknown role, and a valid role at a phase-disallowed path.
+- Candidate manifest tests assert every payload-root-relative row in the explicit
+  `seal-candidate/` mapping and reject the removed API-record path.
 - Deterministic packing reproduces byte-identical archives and rejects unsafe member
   types or metadata.
 - External verification policy requires repository, phase workflow, source/signing
@@ -751,7 +890,8 @@ for another job, or treat v1 and v2 as equivalent.
 
 Each phase workflow test requires:
 
-- exactly one job with the expected `native-*` name;
+- exactly one `jobs.<job_id>` YAML key with the expected `native-*` identity;
+- `GITHUB_JOB` validation against that key rather than the optional `name:` value;
 - no `observe-native-host`, `needs`, `GH_TOKEN`, or `actions: read`;
 - exactly one `publish-github` invocation and no `observe-github`,
   `finalize-github`, `--github-output`, or Jobs API input;
@@ -759,11 +899,14 @@ Each phase workflow test requires:
   the three custom `*_CONTEXT` variables, with no attempted `RUNNER_*` override;
 - host preflight before any native work;
 - manifest and archive generation after successful native work;
-- immutable-SHA-pinned `actions/attest` in that same job;
+- `actions/attest` pinned to the reviewed v4.2.1 immutable SHA in that same job;
 - `contents: read`, `id-token: write`, and `attestations: write`;
-- attestation of both manifest and archive;
+- the exact two-line `subject-path` block for archive and manifest, with no implicit
+  `$GITHUB_ARTIFACTS_LIST` discovery;
+- ordered no-follow subject checks before attestation and exact payload,
+  manifest, archive, and bundle checks before upload;
 - one success upload with the exact success name, three non-overlapping paths,
-  `if-no-files-found: error`, and `retention-days: 30`;
+  aggregate `if-no-files-found: error`, and `retention-days: 30`;
 - the payload-root-relative manifest excludes the sibling tar and Sigstore bundle;
 - a diagnostic upload name that cannot collide with the success artifact; and
 - no bootstrap, measurement, or candidate acceptance before attestation succeeds.
@@ -827,8 +970,19 @@ implementation, the plan records the exact replacement command and source.
   deterministic archive packing, and structural verification; workflow shell must
   not reimplement these rules.
 - `src/benchmark/backend_process.py` owns strict generic
-  `github_hosted` native-evidence validation.
-- `tools/hpa320/seal_oaf_backend.py` owns phase-specific producer and consumer gates.
+  v2-only `github_hosted` native-evidence validation; it owns no v1 compatibility
+  entry point.
+- `src/benchmark/backend_lock.py`, `tools/hpa320/oaf_system_packages.py`, and
+  `tools/hpa320/seal_oaf_backend.py` own their exact v2 containing-evidence identities
+  and reject the replaced v1 identities.
+- `tools/hpa320/seal_oaf_backend.py` also owns phase-specific producer and consumer
+  gates.
+- `tools/hpa320/oaf_native_calibration.py`,
+  `tools/hpa320/oaf_candidate_builder.py`,
+  `runtime/oaf_tf1/calibration_entrypoint.py`, and
+  `runtime/oaf_tf1/oaf_backend.py` own the corresponding native-runtime production
+  and strict-consumption expectations for those v2 identities; they migrate in the
+  same commit.
 - The bootstrap, measurement, and candidate files under `.github/workflows/` own
   ordered invocation, least privileges, pinned actions, and artifact publication.
 - `tests/benchmark/` owns schema, tamper, workflow-contract, and failure-path coverage.
@@ -854,7 +1008,13 @@ Within those passages, the superseded requirements are:
 - a completed `observe-native-host` Jobs API record;
 - `github-job-api-record.json.hex`;
 - `crux.oaf-native-host-attestation-bundle/v1` as new phase authority; or
-- a four-file phase host bundle containing that API record.
+- a four-file phase host bundle containing that API record;
+- `crux.backend-seal-evidence/v1`,
+  `crux.oaf-base-system-package-evidence/v1`,
+  `crux.oaf-calibration-bootstrap-evidence/v1`,
+  `crux.oaf-calibration-measurement-evidence/v1`, or
+  `crux.oaf-seal-candidate/v1` as identities for newly produced native phase
+  evidence.
 
 All unrelated HPA-320 contracts remain in force. The HPA-320 design should receive a
 short amendment under each affected heading naming the replaced paragraph by its
