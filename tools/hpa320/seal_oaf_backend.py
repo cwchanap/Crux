@@ -277,7 +277,26 @@ _CALIBRATION_MEASUREMENT_REQUEST_PATH = Path(
     "config/benchmark/backends/"
     "magenta-egmd-tf1-94529798-8hit-v1.calibration-measurement-request.json"
 )
+_SEAL_PROFILE_REQUEST_PATH = Path(
+    "config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.seal-profile-request.json"
+)
 _BASE_SYSTEM_REQUEST_PATH = Path("runtime/oaf_tf1/base-system-package-request.json")
+_ACCEPTED_NATIVE_EVIDENCE_ROOT = Path("docs/superpowers/evidence/hpa-320/native")
+_OPERATIONAL_IMAGE_IDENTITY_FIELDS = (
+    "base_image_config_digest",
+    "base_image_layer_diff_ids",
+    "base_image_layer_digests",
+    "build_context_manifest_sha256",
+    "calibration_bootstrap_request_sha256",
+    "image_build",
+    "oci_layout_archive",
+    "oci_layout_manifest_sha256",
+    "runtime_image_config_digest",
+    "runtime_image_index_digest",
+    "runtime_image_layer_diff_ids",
+    "runtime_image_layer_digests",
+    "runtime_image_manifest_digest",
+)
 _HASH_FIELDS = (
     (
         "runtime/oaf_tf1/source-manifest.json",
@@ -2881,37 +2900,199 @@ def _validate_bootstrap_work_payload(*, payload_root: Path, repository_root: Pat
 
 
 def _validate_measurement_work_payload(*, payload_root: Path, repository_root: Path) -> None:
-    bootstrap, checkpoint, base, bundle, host, host_payload = _validate_bootstrap_authority(
-        payload_root=payload_root,
-        repository_root=repository_root,
+    root = _require_directory(payload_root, "native work payload root")
+    repository = _require_directory(repository_root, "repository root")
+    accepted = _load_accepted_native_authorities(repository)
+    operational = _load_operational_authority(
+        payload_root=root,
+        repository_root=repository,
         phase="measurement",
-        checkpoint_evidence_name="operational-checkpoint-acquisition-evidence.json",
-        image_directory_name="operational-image",
         host_directory_name="measurement-host-attestation",
+        accepted_bootstrap=accepted.bootstrap,
+        checkpoint_request=accepted.checkpoint_request,
     )
+    if operational.checkpoint.sha256 != accepted.checkpoint.sha256:
+        raise SealError(
+            "operational checkpoint does not reproduce the accepted checkpoint authority"
+        )
     _validate_measurement_authority(
-        payload_root=payload_root,
-        repository_root=repository_root,
-        bootstrap=bootstrap,
-        checkpoint=checkpoint,
+        payload_root=root,
+        repository_root=repository,
+        accepted=accepted,
+        operational=operational,
+    )
+
+
+def _validate_candidate_work_payload(*, payload_root: Path, repository_root: Path) -> None:
+    root = _require_directory(payload_root, "native work payload root")
+    repository = _require_directory(repository_root, "repository root")
+    accepted = _load_accepted_native_authorities(repository)
+    operational = _load_operational_authority(
+        payload_root=root,
+        repository_root=repository,
+        phase="candidate",
+        host_directory_name="candidate-host-attestation",
+        accepted_bootstrap=accepted.bootstrap,
+        checkpoint_request=accepted.checkpoint_request,
+    )
+    if operational.checkpoint.sha256 != accepted.checkpoint.sha256:
+        raise SealError(
+            "operational checkpoint does not reproduce the accepted checkpoint authority"
+        )
+    measurement_request = load_calibration_measurement_request(
+        repository / _CALIBRATION_MEASUREMENT_REQUEST_PATH
+    )
+    _validate_measurement_request_binding(measurement_request, accepted)
+    measurement, rows, measurement_sha256 = _load_measurement_evidence(
+        repository / _ACCEPTED_NATIVE_EVIDENCE_ROOT / "calibration-measurement-evidence.json",
+        measurement_request,
+    )
+    _validate_measurement_evidence_authority(
+        measurement=measurement,
+        accepted=accepted,
+    )
+    profile = load_seal_profile_request(repository / _SEAL_PROFILE_REQUEST_PATH)
+    _validate_seal_profile_authority(
+        profile=profile,
+        accepted=accepted,
+        measurement_request=measurement_request,
+        measurement_sha256=measurement_sha256,
+    )
+    candidate = _load_candidate(candidate=root / "seal-candidate", repository_root=repository)
+    _require_matching_candidate_host_files(root)
+    _validate_candidate_authority(
+        candidate=candidate,
+        accepted=accepted,
+        operational=operational,
+        measurement_request=measurement_request,
+        measurement_sha256=measurement_sha256,
+        measurement_rows=rows,
+        profile=profile,
+    )
+
+
+@dataclass(frozen=True)
+class _AcceptedNativeAuthorities:
+    base: BaseSystemPackageEvidence
+    base_request: BaseSystemPackageRequest
+    bootstrap: CalibrationBootstrapEvidence
+    bootstrap_request: CalibrationBootstrapRequest
+    checkpoint: CheckpointAcquisitionEvidence
+    checkpoint_request: CheckpointAcquisitionRequest
+
+
+@dataclass(frozen=True)
+class _OperationalNativeAuthority:
+    bootstrap: CalibrationBootstrapEvidence
+    bundle: NativeHostAttestationBundle
+    checkpoint: CheckpointAcquisitionEvidence
+    host: NativeHostEvidence
+    host_payload: dict[str, JsonValue]
+
+
+def _load_accepted_native_authorities(repository: Path) -> _AcceptedNativeAuthorities:
+    evidence_root = repository / _ACCEPTED_NATIVE_EVIDENCE_ROOT
+    bootstrap_request, bootstrap = load_calibration_bootstrap_evidence(
+        repository / _CALIBRATION_BOOTSTRAP_REQUEST_PATH,
+        evidence_root / "calibration-bootstrap-evidence.json",
+    )
+    checkpoint_request = load_checkpoint_acquisition_request(repository / _CHECKPOINT_REQUEST_PATH)
+    checkpoint = load_checkpoint_acquisition_evidence(
+        evidence_root / "checkpoint-acquisition-evidence.json",
+        request=checkpoint_request,
+    )
+    base_request = load_base_system_package_request(repository / _BASE_SYSTEM_REQUEST_PATH)
+    base = load_base_system_package_evidence(
+        evidence_root / "base-system-package-evidence.json",
+        request=base_request,
+    )
+    if (
+        bootstrap_request.payload["checkpoint_acquisition_request_sha256"]
+        != checkpoint_request.sha256
+        or bootstrap_request.payload["base_system_package_request_sha256"] != base_request.sha256
+    ):
+        raise SealError("bootstrap request does not bind its accepted operational authorities")
+    return _AcceptedNativeAuthorities(
         base=base,
+        base_request=base_request,
+        bootstrap=bootstrap,
+        bootstrap_request=bootstrap_request,
+        checkpoint=checkpoint,
+        checkpoint_request=checkpoint_request,
+    )
+
+
+def _load_operational_authority(
+    *,
+    payload_root: Path,
+    repository_root: Path,
+    phase: str,
+    host_directory_name: str,
+    accepted_bootstrap: CalibrationBootstrapEvidence,
+    checkpoint_request: CheckpointAcquisitionRequest,
+) -> _OperationalNativeAuthority:
+    bootstrap_request, bootstrap = load_calibration_bootstrap_evidence(
+        repository_root / _CALIBRATION_BOOTSTRAP_REQUEST_PATH,
+        payload_root / "operational-image/calibration-bootstrap-evidence.json",
+    )
+    bundle, host, host_payload = _authenticate_phase_host(
+        host_attestation_bundle_path=payload_root / host_directory_name / "attestation-bundle.json",
+        host_evidence_path=payload_root / host_directory_name / "native-host-evidence.json",
+        phase=phase,
+    )
+    if (
+        bootstrap.payload["native_host_attestation_bundle_sha256"] != bundle.sha256
+        or bootstrap.payload["native_host_evidence"] != host_payload
+    ):
+        raise SealError("operational bootstrap image does not match its phase host authority")
+    _require_imported_runtime_image(cast(str, bootstrap.payload["runtime_image_config_digest"]))
+    _validate_bootstrap_image_files(
+        image_directory=payload_root / "operational-image",
+        bootstrap=bootstrap,
+    )
+    _validate_operational_image_identity(
+        accepted=accepted_bootstrap,
+        operational=bootstrap,
+    )
+    checkpoint = load_checkpoint_acquisition_evidence(
+        payload_root / "operational-checkpoint-acquisition-evidence.json",
+        request=checkpoint_request,
+    )
+    if (
+        bootstrap_request.sha256
+        != accepted_bootstrap.payload["calibration_bootstrap_request_sha256"]
+    ):
+        raise SealError("operational bootstrap image does not reproduce the accepted request")
+    return _OperationalNativeAuthority(
+        bootstrap=bootstrap,
         bundle=bundle,
+        checkpoint=checkpoint,
         host=host,
         host_payload=host_payload,
     )
 
 
-def _validate_candidate_work_payload(*, payload_root: Path, repository_root: Path) -> None:
-    _validate_bootstrap_authority(
-        payload_root=payload_root,
-        repository_root=repository_root,
-        phase="candidate",
-        checkpoint_evidence_name="operational-checkpoint-acquisition-evidence.json",
-        image_directory_name="operational-image",
-        host_directory_name="candidate-host-attestation",
-    )
-    _load_candidate(candidate=payload_root / "seal-candidate", repository_root=repository_root)
-    _require_matching_candidate_host_files(payload_root)
+def _validate_operational_image_identity(
+    *,
+    accepted: CalibrationBootstrapEvidence,
+    operational: CalibrationBootstrapEvidence,
+) -> None:
+    if any(
+        _plain_json(accepted.payload[field]) != _plain_json(operational.payload[field])
+        for field in _OPERATIONAL_IMAGE_IDENTITY_FIELDS
+    ):
+        raise SealError("operational bootstrap image differs from the accepted image identity")
+
+
+def _validate_measurement_request_binding(
+    request: CalibrationMeasurementRequest,
+    accepted: _AcceptedNativeAuthorities,
+) -> None:
+    if (
+        request.payload["calibration_bootstrap_request_sha256"] != accepted.bootstrap_request.sha256
+        or request.payload["calibration_bootstrap_evidence_sha256"] != accepted.bootstrap.sha256
+    ):
+        raise SealError("measurement request does not bind the accepted bootstrap authority")
 
 
 def _validate_bootstrap_authority(
@@ -2972,33 +3153,221 @@ def _validate_measurement_authority(
     *,
     payload_root: Path,
     repository_root: Path,
-    bootstrap: CalibrationBootstrapEvidence,
-    checkpoint: CheckpointAcquisitionEvidence,
-    base: BaseSystemPackageEvidence,
-    bundle: NativeHostAttestationBundle,
-    host: NativeHostEvidence,
-    host_payload: dict[str, JsonValue],
+    accepted: _AcceptedNativeAuthorities,
+    operational: _OperationalNativeAuthority,
 ) -> None:
     repository = _require_directory(repository_root, "repository root")
     request = load_calibration_measurement_request(
         repository / _CALIBRATION_MEASUREMENT_REQUEST_PATH
     )
+    _validate_measurement_request_binding(request, accepted)
     payload, _rows, _sha256 = _load_measurement_evidence(
         payload_root / "calibration-measurement-evidence.json",
         request,
     )
+    _validate_measurement_evidence_authority(
+        measurement=payload,
+        accepted=accepted,
+        bundle=operational.bundle,
+        host=operational.host,
+        host_payload=operational.host_payload,
+        operational_bootstrap=operational.bootstrap,
+    )
+
+
+def _validate_measurement_evidence_authority(
+    *,
+    measurement: Mapping[str, JsonValue],
+    accepted: _AcceptedNativeAuthorities,
+    bundle: NativeHostAttestationBundle | None = None,
+    host: NativeHostEvidence | None = None,
+    host_payload: Mapping[str, JsonValue] | None = None,
+    operational_bootstrap: CalibrationBootstrapEvidence | None = None,
+) -> None:
     if (
-        payload["calibration_bootstrap_evidence_sha256"] != bootstrap.sha256
-        or payload["checkpoint_acquisition_evidence_sha256"] != checkpoint.sha256
-        or payload["base_system_package_evidence_sha256"] != base.sha256
-        or payload["native_host_attestation_bundle_sha256"] != bundle.sha256
-        or payload["native_host_evidence"] != host_payload
-        or not _same_native_host(
-            _native_host_from_record(payload["native_host_evidence"], "measurement native host"),
-            host,
-        )
+        measurement["calibration_bootstrap_evidence_sha256"] != accepted.bootstrap.sha256
+        or measurement["checkpoint_acquisition_evidence_sha256"] != accepted.checkpoint.sha256
+        or measurement["base_system_package_evidence_sha256"] != accepted.base.sha256
     ):
-        raise SealError("measurement evidence does not bind its operational authorities")
+        raise SealError("measurement evidence does not bind its accepted authorities")
+    if operational_bootstrap is not None and (
+        measurement["runtime_image_config_digest"]
+        != operational_bootstrap.payload["runtime_image_config_digest"]
+        or measurement["runtime_image_manifest_digest"]
+        != operational_bootstrap.payload["runtime_image_manifest_digest"]
+    ):
+        raise SealError("measurement evidence does not bind its operational image identity")
+    if bundle is not None and measurement["native_host_attestation_bundle_sha256"] != bundle.sha256:
+        raise SealError("measurement evidence does not bind its phase host bundle")
+    if host_payload is not None and measurement["native_host_evidence"] != host_payload:
+        raise SealError("measurement evidence does not bind its phase host evidence")
+    if host is not None and not _same_native_host(
+        _native_host_from_record(measurement["native_host_evidence"], "measurement native host"),
+        host,
+    ):
+        raise SealError("measurement evidence does not bind its phase host identity")
+
+
+def _validate_seal_profile_authority(
+    *,
+    profile: SealProfileRequest,
+    accepted: _AcceptedNativeAuthorities,
+    measurement_request: CalibrationMeasurementRequest,
+    measurement_sha256: str,
+) -> None:
+    expected = {
+        "calibration_bootstrap_request_sha256": accepted.bootstrap_request.sha256,
+        "calibration_bootstrap_evidence_sha256": accepted.bootstrap.sha256,
+        "calibration_measurement_request_sha256": measurement_request.sha256,
+        "calibration_measurement_evidence_sha256": measurement_sha256,
+        "checkpoint_acquisition_evidence_sha256": accepted.checkpoint.sha256,
+        "checkpoint_acquisition_request_sha256": accepted.checkpoint.request_sha256,
+        "base_system_package_evidence_sha256": accepted.base.sha256,
+        "base_system_package_request_sha256": accepted.base.request_sha256,
+    }
+    if any(profile.payload[field] != value for field, value in expected.items()):
+        raise SealError("seal profile request is unrelated to the accepted authority")
+
+
+def _validate_candidate_authority(
+    *,
+    candidate: _Candidate,
+    accepted: _AcceptedNativeAuthorities,
+    operational: _OperationalNativeAuthority,
+    measurement_request: CalibrationMeasurementRequest,
+    measurement_sha256: str,
+    measurement_rows: Sequence[MeasurementRow],
+    profile: SealProfileRequest,
+) -> None:
+    checkpoint_components = [
+        {
+            "name": member.name,
+            "sha256": member.sha256,
+            "size": member.size,
+        }
+        for member in accepted.checkpoint_request.archive_members
+        if member.role == "published_component"
+    ]
+    checkpoint_archive = {
+        "name": accepted.checkpoint_request.archive.name,
+        "sha256": accepted.checkpoint_request.archive.sha256,
+        "size": accepted.checkpoint_request.archive.size,
+    }
+    package_inventory = [
+        {
+            "architecture": package.architecture,
+            "name": package.name,
+            "version": package.version,
+        }
+        for package in accepted.base.package_inventory
+    ]
+    expected_backend = {
+        "checkpoint_acquisition_evidence_sha256": operational.checkpoint.sha256,
+        "checkpoint_acquisition_request_sha256": operational.checkpoint.request_sha256,
+        "checkpoint_archive": checkpoint_archive,
+        "checkpoint_components": checkpoint_components,
+        "max_input_audio_frames": profile.max_input_audio_frames,
+        "runtime_image_manifest_digest": operational.bootstrap.payload[
+            "runtime_image_manifest_digest"
+        ],
+    }
+    expected_runtime = {
+        "additional_system_packages": [],
+        "base_image": accepted.base_request.base_image,
+        "base_image_archive_keyring_sha256": (
+            accepted.base_request.base_image_archive_keyring_sha256
+        ),
+        "base_image_config_digest": operational.bootstrap.payload["base_image_config_digest"],
+        "base_image_layer_diff_ids": operational.bootstrap.payload["base_image_layer_diff_ids"],
+        "base_image_layer_digests": operational.bootstrap.payload["base_image_layer_digests"],
+        "base_image_manifest_digest": accepted.base_request.base_image_manifest_digest,
+        "base_system_package_evidence_sha256": accepted.base.sha256,
+        "base_system_package_inventory": package_inventory,
+        "base_system_package_inventory_sha256": accepted.base.package_inventory_sha256,
+        "base_system_package_request_sha256": accepted.base.request_sha256,
+        "build_context_manifest_sha256": accepted.bootstrap_request.build_context_manifest_sha256,
+        "calibration_bootstrap_evidence_sha256": accepted.bootstrap.sha256,
+        "calibration_bootstrap_request_sha256": accepted.bootstrap_request.sha256,
+        "image_build": accepted.bootstrap.payload["image_build"],
+        "platform": accepted.base_request.platform,
+        "runtime_image_config_digest": operational.bootstrap.payload["runtime_image_config_digest"],
+        "runtime_image_manifest_digest": operational.bootstrap.payload[
+            "runtime_image_manifest_digest"
+        ],
+    }
+    for field in (
+        "stderr_max_line_bytes",
+        "stderr_read_chunk_bytes",
+        "stderr_ring_buffer_bytes",
+        "stdout_max_line_bytes",
+    ):
+        expected_runtime[field] = profile.payload[field]
+    expected_seal = {
+        **expected_backend,
+        **{
+            field: expected_runtime[field]
+            for field in (
+                "additional_system_packages",
+                "base_image_archive_keyring_sha256",
+                "base_image_config_digest",
+                "base_image_layer_diff_ids",
+                "base_image_layer_digests",
+                "base_image_manifest_digest",
+                "base_system_package_evidence_sha256",
+                "base_system_package_inventory",
+                "base_system_package_inventory_sha256",
+                "base_system_package_request_sha256",
+                "build_context_manifest_sha256",
+                "calibration_bootstrap_evidence_sha256",
+                "calibration_bootstrap_request_sha256",
+                "runtime_image_config_digest",
+                "runtime_image_manifest_digest",
+            )
+        },
+        "calibration_measurement_evidence_sha256": measurement_sha256,
+        "calibration_measurement_request_sha256": measurement_request.sha256,
+        "measurements": [_row_payload(row) for row in measurement_rows],
+        "native_host_attestation_bundle_sha256": operational.bundle.sha256,
+        "native_host_evidence": operational.host_payload,
+        "oci_layout_archive": operational.bootstrap.payload["oci_layout_archive"],
+        "oci_layout_manifest_sha256": operational.bootstrap.payload["oci_layout_manifest_sha256"],
+        "runtime_gid": accepted.bootstrap_request.runtime_gid,
+        "runtime_image_index_digest": operational.bootstrap.payload["runtime_image_index_digest"],
+        "runtime_image_layer_diff_ids": operational.bootstrap.payload[
+            "runtime_image_layer_diff_ids"
+        ],
+        "runtime_image_layer_digests": operational.bootstrap.payload["runtime_image_layer_digests"],
+        "runtime_uid": accepted.bootstrap_request.runtime_uid,
+        "seal_profile_request_sha256": profile.sha256,
+    }
+    for field in (
+        "cpu_limit_millis",
+        "memory_limit_bytes",
+        "pid_limit",
+        "request_deadline_seconds",
+        "shm_bytes",
+        "startup_deadline_seconds",
+        "stderr_max_line_bytes",
+        "stderr_read_chunk_bytes",
+        "stderr_ring_buffer_bytes",
+        "stdout_max_line_bytes",
+        "tmp_bytes",
+    ):
+        expected_seal[field] = profile.payload[field]
+    _require_authority_fields(candidate.backend.payload, expected_backend, "candidate backend")
+    _require_authority_fields(candidate.runtime.payload, expected_runtime, "candidate runtime")
+    _require_authority_fields(candidate.seal.payload, expected_seal, "candidate seal")
+
+
+def _require_authority_fields(
+    payload: Mapping[str, JsonValue],
+    expected: Mapping[str, JsonValue],
+    label: str,
+) -> None:
+    if any(
+        _plain_json(payload.get(field)) != _plain_json(value) for field, value in expected.items()
+    ):
+        raise SealError(f"{label} is unrelated to the accepted authority")
 
 
 def _validate_bootstrap_image_files(

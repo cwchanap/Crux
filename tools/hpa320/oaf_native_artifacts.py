@@ -12,6 +12,7 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -229,6 +230,16 @@ class VerifiedGitHubAttestation:
     subjects: tuple[CheckpointIdentity, ...]
 
 
+@dataclass(frozen=True)
+class _AttestationSnapshot:
+    """Private immutable copies consumed by every acceptance gate."""
+
+    archive_path: Path
+    manifest_path: Path
+    payload_root: Path
+    subjects: tuple[CheckpointIdentity, ...]
+
+
 def _run_checked_command(command: tuple[str, ...]) -> bytes:
     completed = subprocess.run(
         command,
@@ -378,7 +389,66 @@ def _verification_statement(content: bytes) -> dict[str, JsonValue]:
     statement = verification["statement"]
     if not isinstance(statement, dict):
         raise NativeArtifactError("GitHub attestation statement is invalid")
+    predicate = statement.get("predicate")
+    if isinstance(predicate, dict) and predicate.get("status") == "failed":
+        raise NativeArtifactError("GitHub attestation statement is a failed result")
     return cast(dict[str, JsonValue], statement)
+
+
+@contextmanager
+def _attestation_snapshot(
+    *,
+    phase: str,
+    workflow_commit: str,
+    payload_root: Path,
+    archive_path: Path,
+) -> Iterator[_AttestationSnapshot]:
+    """Copy only the exact phase allowlist before any external verifier runs."""
+
+    try:
+        source_root = _absolute_path(payload_root, "payload root")
+        source_archive = _absolute_path(archive_path, "archive")
+        with tempfile.TemporaryDirectory(prefix=".hpa320-attestation-") as temporary:
+            temporary_root = Path(temporary)
+            snapshot_root = temporary_root / "payload"
+            snapshot_root.mkdir(mode=0o700)
+            manifest_content: bytes | None = None
+            for relative in (MANIFEST_NAME, *_phase_files(phase)):
+                content = read_regular_file_no_follow(source_root / relative)
+                if relative == MANIFEST_NAME:
+                    manifest_content = content
+                destination = snapshot_root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(content)
+            snapshot_archive = temporary_root / source_archive.name
+            archive_content = read_regular_file_no_follow(source_archive)
+            snapshot_archive.write_bytes(archive_content)
+            if manifest_content is None:
+                raise NativeArtifactError("native work attestation manifest is missing")
+            yield _AttestationSnapshot(
+                archive_path=snapshot_archive,
+                manifest_path=snapshot_root / MANIFEST_NAME,
+                payload_root=snapshot_root,
+                subjects=(
+                    CheckpointIdentity(
+                        name=(f"artifacts/benchmark/backends/hpa320-{phase}/{MANIFEST_NAME}"),
+                        sha256=hashlib.sha256(manifest_content).hexdigest(),
+                        size=len(manifest_content),
+                    ),
+                    CheckpointIdentity(
+                        name=(
+                            "artifacts/benchmark/backends/"
+                            f"hpa320-native-{phase}-{workflow_commit}.tar"
+                        ),
+                        sha256=hashlib.sha256(archive_content).hexdigest(),
+                        size=len(archive_content),
+                    ),
+                ),
+            )
+    except NativeArtifactError:
+        raise
+    except (OSError, TypeError, ValueError) as error:
+        raise NativeArtifactError("native work attestation snapshot failed") from error
 
 
 def _validate_attestation_subjects(
@@ -2035,28 +2105,46 @@ def main(argv: list[str] | None = None) -> int:
             if arguments.bundle is not None:
                 _verify_optional_attestation_bundle(arguments.bundle)
         elif arguments.command == "verify-attestation":
-            manifest_path = arguments.payload_root / MANIFEST_NAME
-            verified = verify_github_attestations(
+            with _attestation_snapshot(
                 phase=arguments.phase,
                 workflow_commit=arguments.workflow_commit,
-                manifest_path=manifest_path,
-                archive_path=arguments.archive,
-                sigstore_bundle_path=arguments.bundle,
-                trusted_root_path=arguments.trusted_root,
-            )
-            load_native_work_manifest(manifest_path, expected_phase=arguments.phase)
-            verify_native_work_archive(
-                phase=arguments.phase,
                 payload_root=arguments.payload_root,
-                manifest_path=manifest_path,
                 archive_path=arguments.archive,
-            )
-            _validate_native_work_phase(
-                phase=arguments.phase,
-                payload_root=arguments.payload_root,
-                repository_root=arguments.repository_root,
-            )
-            _write_attestation_review_report(arguments, verified)
+            ) as snapshot:
+                verified = verify_github_attestations(
+                    phase=arguments.phase,
+                    workflow_commit=arguments.workflow_commit,
+                    manifest_path=snapshot.manifest_path,
+                    archive_path=snapshot.archive_path,
+                    sigstore_bundle_path=arguments.bundle,
+                    trusted_root_path=arguments.trusted_root,
+                )
+                _require_snapshot_subjects(
+                    phase=arguments.phase,
+                    workflow_commit=arguments.workflow_commit,
+                    snapshot=snapshot,
+                    verified=verified,
+                )
+                load_native_work_manifest(snapshot.manifest_path, expected_phase=arguments.phase)
+                archive = verify_native_work_archive(
+                    phase=arguments.phase,
+                    payload_root=snapshot.payload_root,
+                    manifest_path=snapshot.manifest_path,
+                    archive_path=snapshot.archive_path,
+                )
+                _require_verified_archive_identity(archive=archive, verified=verified)
+                _validate_native_work_phase(
+                    phase=arguments.phase,
+                    payload_root=snapshot.payload_root,
+                    repository_root=arguments.repository_root,
+                )
+                _require_snapshot_subjects(
+                    phase=arguments.phase,
+                    workflow_commit=arguments.workflow_commit,
+                    snapshot=snapshot,
+                    verified=verified,
+                )
+                _write_attestation_review_report(arguments, verified)
         elif arguments.command == "copy-bundle":
             copy_attestation_bundle(source=arguments.source, destination=arguments.destination)
         else:
@@ -2083,6 +2171,34 @@ def _validate_native_work_phase(
         )
     except ValueError as error:
         raise NativeArtifactError("native work phase acceptance failed") from error
+
+
+def _require_snapshot_subjects(
+    *,
+    phase: str,
+    workflow_commit: str,
+    snapshot: _AttestationSnapshot,
+    verified: VerifiedGitHubAttestation,
+) -> None:
+    expected_names = (
+        f"artifacts/benchmark/backends/hpa320-{phase}/{MANIFEST_NAME}",
+        f"artifacts/benchmark/backends/hpa320-native-{phase}-{workflow_commit}.tar",
+    )
+    if (
+        tuple(subject.name for subject in snapshot.subjects) != expected_names
+        or snapshot.subjects != verified.subjects
+    ):
+        raise NativeArtifactError("native work attestation snapshot differs from verified subjects")
+
+
+def _require_verified_archive_identity(
+    *,
+    archive: CheckpointIdentity,
+    verified: VerifiedGitHubAttestation,
+) -> None:
+    expected = verified.subjects[1]
+    if (archive.sha256, archive.size) != (expected.sha256, expected.size):
+        raise NativeArtifactError("native work archive differs from the verified subject")
 
 
 def _write_attestation_review_report(
