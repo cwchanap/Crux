@@ -2716,6 +2716,14 @@ rtk uv run pylint --errors-only --disable=E1120,E0401 \
 
 Expected: every command passes. Record any platform-unavailable check explicitly; do not substitute a narrower scope.
 
+**Approved verification exception (2026-07-31):** The user re-approved Task 8 Step 9
+with exceptions only for `uv run black --check src tests` and
+`uv run pylint src/app src/cli`, because every diagnostic path is byte-identical to
+Task 8 base `dd9d26124a21291395226113ec8cffa8c4ef5cf1`. No Task 8 regression is
+waived; [HPA-494](https://linear.app/cwchanap/issue/HPA-494/normalize-crux-legacy-black-and-pylint-baseline)
+owns cleanup. All scoped and full pytest, Ruff, Ruff-format, error-only Pylint,
+focused tool, drift, and freeze-identity checks remain mandatory and green.
+
 - [ ] **Step 10: Review the final diff and commit the regenerated freeze**
 
 Run:
