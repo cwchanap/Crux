@@ -604,6 +604,13 @@ additional-system-package set are seal-required values with no code defaults.
 
 ### Native-amd64 calibration and sealing prerequisite
 
+> **HPA-481/HPA-482 amendment:** The paragraph beginning “Every newly accepted
+> bootstrap, measurement, and candidate execution preserves its own
+> `crux.oaf-native-host-attestation-bundle/v1`.” is superseded by the signed
+> same-work-job v2 authority in
+> [the HPA-481/HPA-482 design](2026-07-30-hpa-481-work-job-artifact-attestation-design.md).
+> All unrelated HPA-320 contracts remain in force.
+
 Before Phase A can finalize the OaF locks or its real-checkpoint runner integration,
 or satisfy HPA-320, a narrowly scoped evidence pass on a reference native
 `linux/amd64` host must check in:
@@ -697,6 +704,13 @@ chain:
    reinterpret, or replace candidate bytes.
 
 ### Calibration-bootstrap authority
+
+> **HPA-481/HPA-482 amendment:** The paragraph beginning “`bootstrap-image`
+> materializes two fresh copies of the exact request-authenticated build context and
+> performs one `linux/amd64` build from each.” is superseded by the signed
+> same-work-job bootstrap authority in
+> [the HPA-481/HPA-482 design](2026-07-30-hpa-481-work-job-artifact-attestation-design.md).
+> All unrelated HPA-320 contracts remain in force.
 
 The calibration-bootstrap request fixes these diagnostic ceilings:
 
@@ -793,6 +807,16 @@ limit to be strictly greater than the corresponding observed in-bound peak after
 exact unit conversion and no greater than its bootstrap ceiling.
 
 ### Calibration, candidate publication, and seal
+
+> **HPA-481/HPA-482 amendment:** The paragraph beginning “After those probes,
+> `calibrate` generates exact 130/78/52 tensor coverage, uninitialized-variable
+> evidence, active-dropout evidence, patched/unmodified `NoteSequence` parity, the
+> nonempty raw smoke oracle and calibration-native event payload,
+> security/advisory evidence, OCI archive/manifest/config/layer evidence, candidate
+> runtime/backend/seal payloads, and a manifest of every candidate artifact.” is
+> superseded by the signed same-work-job candidate authority in
+> [the HPA-481/HPA-482 design](2026-07-30-hpa-481-work-job-artifact-attestation-design.md).
+> All unrelated HPA-320 contracts remain in force.
 
 The measurement evidence is diagnostic and cannot by itself be consumed by `seal`,
 inference, or a scorer. Only a separately reviewed profile and complete calibrated
@@ -1838,6 +1862,13 @@ published and that item returns exit `1`.
 
 ## Verification and Execution Flow
 
+> **HPA-481/HPA-482 amendment:** The paragraph beginning “`verify-backend` performs
+> the following steps in order:” retains its 13-step post-seal behavior unchanged.
+> Only pre-consumption acceptance of bootstrap, measurement, and candidate artifacts
+> now uses the signed outside-in v2 gate specified by
+> [the HPA-481/HPA-482 design](2026-07-30-hpa-481-work-job-artifact-attestation-design.md).
+> All unrelated HPA-320 contracts remain in force.
+
 `verify-backend` performs the following steps in order:
 
 1. Strictly parse and hash the checkpoint-acquisition request, backend lock, and
@@ -2706,6 +2737,12 @@ Its `native_events` rows use the runner native-event key set above.
 
 ### Provenance and report schemas
 
+> **HPA-481/HPA-482 amendment:** The paragraph beginning “The host-attestation
+> bundle's `phase` is exactly one of `bootstrap`, `measurement`, or `candidate`.” is
+> superseded by the strict v2 bundle and containing-evidence schemas in
+> [the HPA-481/HPA-482 design](2026-07-30-hpa-481-work-job-artifact-attestation-design.md).
+> All unrelated HPA-320 contracts remain in force.
+
 `crux.input-view-manifest/v1`:
 
 ```text
@@ -3021,6 +3058,24 @@ CLI tests prove:
 - backend-fatal and per-item failures remain distinguishable.
 
 ## Continuous Integration
+
+> **HPA-481/HPA-482 amendment:** The paragraphs beginning “A manual native Linux
+> `amd64` bootstrap workflow accepts one exact commit SHA, checks out that commit,
+> and records it in regenerated authenticated native-host evidence.”, “A manual
+> native Linux `amd64` measurement workflow accepts that exact measurement-request
+> commit, regenerates authenticated native-host evidence, obtains the exact accepted
+> OCI archive or rebuilds and exact-compares it, regenerates and exact-compares all
+> five fixture rows, runs exactly three fresh-container repetitions per row,
+> validates the exact 15 healthy measurement rows, and uploads a canonical artifact
+> manifest plus the complete measurement host-attestation bundle and every
+> measurement and sanitized diagnostic artifact needed for review.”, and “A
+> separate manual candidate phase accepts that exact profile commit, regenerates
+> native-host evidence for it, strict-validates the committed evidence/profile
+> chain, runs `calibrate`, and uploads the complete candidate, its host-attestation
+> bundle, and a canonical artifact manifest for review.” are superseded by the
+> signed same-work-job workflows and outside-in acceptance gate in
+> [the HPA-481/HPA-482 design](2026-07-30-hpa-481-work-job-artifact-attestation-design.md).
+> All unrelated HPA-320 contracts remain in force.
 
 The normal Python suite uses the fake runner and does not install TensorFlow 1 or
 require Docker. It validates schemas, identities, host logic, entrypoint separation

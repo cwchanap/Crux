@@ -4,13 +4,17 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import stat
 from fnmatch import fnmatchcase
 from pathlib import Path
 
 import pytest
 
-from src.benchmark.backend_identity import canonical_json_bytes
+import tools.hpa320.generate_runner_source_manifest as runner_manifest_module
+import tools.hpa320.oaf_build_context as context_module
+import tools.hpa320.seal_oaf_backend as seal_module
+from src.benchmark.backend_identity import canonical_json_bytes, sha256_hex, strict_json_loads
 from tools.hpa320.generate_runner_source_manifest import SOURCE_PATHS
 from tools.hpa320.oaf_build_context import (
     BUILD_CONTEXT_MANIFEST_PATH,
@@ -276,6 +280,128 @@ def test_generate_build_context_excludes_generated_python_cache(
     assert paths == {"runtime/oaf_tf1/Dockerfile"}
 
 
+def _configure_minimal_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path, Path]:
+    repository = tmp_path / "repository"
+    wheelhouse = tmp_path / "wheelhouse"
+    wheelhouse.mkdir()
+    source = repository / "runtime/oaf_tf1/Dockerfile"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"FROM scratch\n")
+    monkeypatch.setattr(
+        context_module,
+        "REVIEWED_REPOSITORY_PATHS",
+        ("runtime/oaf_tf1/Dockerfile",),
+    )
+    monkeypatch.setattr(context_module, "REVIEWED_REPOSITORY_ROOTS", ())
+    monkeypatch.setattr(context_module, "REVIEWED_WHEELHOUSE_ROOTS", ())
+    return repository, wheelhouse, source
+
+
+def _generate_arguments(repository: Path, wheelhouse: Path, output: Path) -> list[str]:
+    return [
+        "generate",
+        "--repository-root",
+        os.fspath(repository),
+        "--wheelhouse-root",
+        os.fspath(wheelhouse),
+        "--output",
+        os.fspath(output),
+    ]
+
+
+def test_build_context_generate_default_requires_absent_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, wheelhouse, _source = _configure_minimal_generation(tmp_path, monkeypatch)
+    output = tmp_path / "build-context-manifest.json"
+    arguments = _generate_arguments(repository, wheelhouse, output)
+
+    assert context_module.main(arguments) == 0
+    original = output.read_bytes()
+    assert context_module.main(arguments) == 2
+    assert output.read_bytes() == original
+
+
+def test_build_context_generate_check_is_exact_and_non_mutating(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, wheelhouse, source = _configure_minimal_generation(tmp_path, monkeypatch)
+    output = tmp_path / "build-context-manifest.json"
+    arguments = _generate_arguments(repository, wheelhouse, output)
+    assert context_module.main(arguments) == 0
+    original = output.read_bytes()
+    original_mtime_ns = 1_234_567_890
+    os.utime(output, ns=(original_mtime_ns, original_mtime_ns))
+
+    assert context_module.main([*arguments, "--check"]) == 0
+    assert output.read_bytes() == original
+    assert output.stat().st_mtime_ns == original_mtime_ns
+
+    source.write_bytes(b"FROM changed\n")
+    assert context_module.main([*arguments, "--check"]) == 2
+    assert output.read_bytes() == original
+    assert output.stat().st_mtime_ns == original_mtime_ns
+
+
+def test_build_context_generate_replace_updates_only_named_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, wheelhouse, source = _configure_minimal_generation(tmp_path, monkeypatch)
+    output = tmp_path / "build-context-manifest.json"
+    sibling = tmp_path / "keep.txt"
+    sibling.write_bytes(b"keep\n")
+    arguments = _generate_arguments(repository, wheelhouse, output)
+    assert context_module.main(arguments) == 0
+    original_inode = output.stat().st_ino
+    source.write_bytes(b"FROM changed\n")
+
+    assert context_module.main([*arguments, "--replace"]) == 0
+    assert output.stat().st_ino != original_inode
+    assert output.read_bytes() == generate_build_context_manifest(
+        repository_root=repository,
+        wheelhouse_root=wheelhouse,
+    )
+    assert sibling.read_bytes() == b"keep\n"
+    assert tuple(tmp_path.glob(".build-context-manifest-*")) == ()
+
+
+def test_runner_source_manifest_check_is_exact_and_non_mutating(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    source = repository / "source.py"
+    source.parent.mkdir()
+    source.write_bytes(b"first\n")
+    output = tmp_path / "runner-source-manifest.json"
+    monkeypatch.setattr(runner_manifest_module, "SOURCE_PATHS", ("source.py",))
+    arguments = [
+        "--repository-root",
+        os.fspath(repository),
+        "--output",
+        os.fspath(output),
+    ]
+    assert runner_manifest_module.main(arguments) == 0
+    original = output.read_bytes()
+    original_mtime_ns = 1_234_567_890
+    os.utime(output, ns=(original_mtime_ns, original_mtime_ns))
+
+    assert runner_manifest_module.main([*arguments, "--check"]) == 0
+    assert output.read_bytes() == original
+    assert output.stat().st_mtime_ns == original_mtime_ns
+
+    source.write_bytes(b"second\n")
+    assert runner_manifest_module.main([*arguments, "--check"]) == 2
+    assert output.read_bytes() == original
+    assert output.stat().st_mtime_ns == original_mtime_ns
+
+
 def test_build_context_reviews_native_bootstrap_host_tools() -> None:
     assert {
         ".github/workflows/hpa320-native-bootstrap.yml",
@@ -289,6 +415,94 @@ def test_build_context_reviews_native_bootstrap_host_tools() -> None:
         "tools/hpa320/oaf_oci.py",
         "tools/hpa320/seal_oaf_backend.py",
     }.issubset(REVIEWED_REPOSITORY_PATHS)
+
+
+def test_native_artifact_tool_is_covered_once_by_each_freeze_manifest() -> None:
+    path = "tools/hpa320/oaf_native_artifacts.py"
+    assert SOURCE_PATHS.count(path) == 1
+    assert REVIEWED_REPOSITORY_PATHS.count(path) == 1
+
+
+def _copy_bootstrap_request_authority(tmp_path: Path) -> tuple[Path, Path]:
+    source_root = Path(__file__).resolve().parents[2]
+    repository = tmp_path / "repository"
+    request_relative = (
+        "config/benchmark/backends/"
+        "magenta-egmd-tf1-94529798-8hit-v1.calibration-bootstrap-request.json"
+    )
+    for relative in (
+        request_relative,
+        *(relative for relative, _field in seal_module._BOOTSTRAP_HASH_FIELDS),
+    ):
+        target = repository / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_root / relative, target)
+    return repository, repository / request_relative
+
+
+def test_reissue_bootstrap_request_changes_only_current_cross_hashes(
+    tmp_path: Path,
+) -> None:
+    repository, request_path = _copy_bootstrap_request_authority(tmp_path)
+    original = strict_json_loads(request_path.read_bytes()[:-1], require_canonical=True)
+    assert isinstance(original, dict)
+    sibling = request_path.with_name("keep.json")
+    sibling.write_bytes(b"keep\n")
+    original_inode = request_path.stat().st_ino
+    hash_fields = {field for _relative, field in seal_module._BOOTSTRAP_HASH_FIELDS}
+    for relative, field in seal_module._BOOTSTRAP_HASH_FIELDS:
+        (repository / relative).write_bytes(f"current {field}\n".encode())
+
+    digest = seal_module.reissue_calibration_bootstrap_request(
+        request_path=request_path,
+        repository_root=repository,
+    )
+
+    reissued = strict_json_loads(request_path.read_bytes()[:-1], require_canonical=True)
+    assert isinstance(reissued, dict)
+    assert {key: value for key, value in reissued.items() if key not in hash_fields} == {
+        key: value for key, value in original.items() if key not in hash_fields
+    }
+    for relative, field in seal_module._BOOTSTRAP_HASH_FIELDS:
+        assert reissued[field] == sha256_hex((repository / relative).read_bytes())
+    assert digest == sha256_hex(request_path.read_bytes())
+    assert request_path.stat().st_ino != original_inode
+    assert stat.S_IMODE(request_path.stat().st_mode) == 0o644
+    assert sibling.read_bytes() == b"keep\n"
+    assert tuple(request_path.parent.glob(f".{request_path.name}.reissue-*")) == ()
+
+
+def test_reissue_bootstrap_request_cli_reissues_named_request(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository, request_path = _copy_bootstrap_request_authority(tmp_path)
+    relative, field = seal_module._BOOTSTRAP_HASH_FIELDS[0]
+    (repository / relative).write_bytes(b"new authority\n")
+
+    assert (
+        seal_module.main(
+            [
+                "reissue-bootstrap-request",
+                "--repository-root",
+                os.fspath(repository),
+                "--request",
+                os.fspath(request_path),
+            ]
+        )
+        == 0
+    )
+
+    summary = json.loads(capsys.readouterr().out)
+    assert summary == {
+        "exit_code": 0,
+        "report_path": os.fspath(request_path),
+        "report_sha256": sha256_hex(request_path.read_bytes()),
+        "status": "reissued",
+    }
+    assert json.loads(request_path.read_bytes())[field] == sha256_hex(
+        (repository / relative).read_bytes()
+    )
 
 
 def _stage_copy_sources(dockerfile: str, stage: str, next_stage: str | None) -> tuple[str, ...]:

@@ -9,6 +9,7 @@ import os
 import shutil
 import stat
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -37,6 +38,7 @@ REVIEWED_REPOSITORY_PATHS = (
     "tools/hpa320/oaf_candidate_builder.py",
     "tools/hpa320/oaf_host_attestation.py",
     "tools/hpa320/oaf_native_calibration.py",
+    "tools/hpa320/oaf_native_artifacts.py",
     "tools/hpa320/oaf_native_runner.py",
     "tools/hpa320/oaf_oci.py",
     "tools/hpa320/oaf_system_packages.py",
@@ -403,6 +405,70 @@ def _is_sha256(value: object) -> bool:
     )
 
 
+def _write_manifest_content(path: Path, content: bytes, *, replace: bool) -> None:
+    output = Path(path)
+    parent = _require_root(output.parent, "build-context manifest parent")
+    if not replace:
+        if output.exists() or output.is_symlink():
+            raise BuildContextError("build-context manifest output must be absent")
+        temporary: str | None = None
+        try:
+            descriptor = os.open(
+                output,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                FILE_MODE,
+            )
+            temporary = os.fspath(output)
+            with os.fdopen(descriptor, "wb") as handle:
+                os.fchmod(handle.fileno(), FILE_MODE)
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            load_build_context_manifest(output)
+            temporary = None
+            _fsync_directory(parent)
+        except (BuildContextError, OSError):
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+            raise
+        return
+
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".build-context-manifest-",
+        dir=parent,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            os.fchmod(handle.fileno(), FILE_MODE)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        load_build_context_manifest(Path(temporary))
+        os.replace(temporary, output)
+        _fsync_directory(parent)
+    except (BuildContextError, OSError):
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -410,6 +476,9 @@ def _parser() -> argparse.ArgumentParser:
     generate.add_argument("--repository-root", type=Path, required=True)
     generate.add_argument("--wheelhouse-root", type=Path, required=True)
     generate.add_argument("--output", type=Path)
+    mode = generate.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true")
+    mode.add_argument("--replace", action="store_true")
     return parser
 
 
@@ -421,12 +490,19 @@ def main(argv: list[str] | None = None) -> int:
             wheelhouse_root=args.wheelhouse_root,
         )
         if args.output is None:
+            if args.check or args.replace:
+                raise BuildContextError("build-context manifest mode requires --output")
             sys.stdout.buffer.write(content)
         else:
             output = Path(args.output)
-            if output.exists() or output.is_symlink():
-                raise BuildContextError("build-context manifest output must be absent")
-            output.write_bytes(content)
+            if args.check:
+                checked = _read_regular(output, "build-context manifest output")
+                if checked != content:
+                    raise BuildContextError(
+                        "build-context manifest does not match generated canonical bytes"
+                    )
+            else:
+                _write_manifest_content(output, content, replace=args.replace)
     except (BuildContextError, OSError) as error:
         print(str(error), file=sys.stderr)
         return 2
