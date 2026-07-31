@@ -1041,9 +1041,13 @@ def _build_candidate(
         "runner_source_manifest_sha256",
         "runtime_image_config_digest",
         "runtime_image_manifest_digest",
+        "stderr_max_line_bytes",
+        "stderr_read_chunk_bytes",
+        "stderr_ring_buffer_bytes",
         "tensorflow_abi",
         "tensorflow_build",
         "upstream_source_manifest_sha256",
+        "stdout_max_line_bytes",
     ):
         runtime[field] = deepcopy(seal[field])
     runtime_path = _write_json(_candidate_artifact_path(candidate, "runtime_lock"), runtime)
@@ -1054,6 +1058,8 @@ def _build_candidate(
         audit_sha256=_content_hash(audit_path),
     )
     for field in (
+        "checkpoint_acquisition_evidence_sha256",
+        "checkpoint_acquisition_request_sha256",
         "checkpoint_archive",
         "checkpoint_components",
         "checkpoint_inventory",
@@ -1122,6 +1128,10 @@ _MEASUREMENT_REQUEST_RELATIVE = Path(
     "config/benchmark/backends/"
     "magenta-egmd-tf1-94529798-8hit-v1.calibration-measurement-request.json"
 )
+_SEAL_PROFILE_REQUEST_RELATIVE = Path(
+    "config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.seal-profile-request.json"
+)
+_ACCEPTED_NATIVE_RELATIVE = Path("docs/superpowers/evidence/hpa-320/native")
 
 
 def _copy_host_bundle(bundle: Path, destination: Path) -> None:
@@ -1246,9 +1256,17 @@ def _phase_measurement_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> NativePhasePayload:
     inputs = _phase_bootstrap_inputs(tmp_path, monkeypatch)
+    accepted = inputs["repository"] / _ACCEPTED_NATIVE_RELATIVE
+    accepted.mkdir(parents=True)
+    accepted_bootstrap = accepted / "calibration-bootstrap-evidence.json"
+    accepted_checkpoint = accepted / "checkpoint-acquisition-evidence.json"
+    accepted_base = accepted / "base-system-package-evidence.json"
+    shutil.copyfile(inputs["bootstrap_evidence"], accepted_bootstrap)
+    shutil.copyfile(inputs["checkpoint"], accepted_checkpoint)
+    shutil.copyfile(inputs["base"], accepted_base)
     measurement_request_payload = json.loads(inputs["measurement_request"].read_bytes())
     measurement_request_payload["calibration_bootstrap_evidence_sha256"] = _content_hash(
-        inputs["bootstrap_evidence"]
+        accepted_bootstrap
     )
     measurement_request_payload["calibration_bootstrap_request_sha256"] = _content_hash(
         inputs["bootstrap_request"]
@@ -1256,16 +1274,15 @@ def _phase_measurement_payload(
     _write_json(inputs["measurement_request"], measurement_request_payload)
     repository_measurement_request = inputs["repository"] / _MEASUREMENT_REQUEST_RELATIVE
     _write_json(repository_measurement_request, measurement_request_payload)
-    shutil.copyfile(inputs["base"], inputs["repository"] / "base-system-package-evidence.json")
     seal_module.measure(
         request_path=repository_measurement_request,
         bootstrap_request_path=inputs["bootstrap_request"],
-        bootstrap_evidence_path=inputs["bootstrap_evidence"],
+        bootstrap_evidence_path=accepted_bootstrap,
         host_attestation_bundle_path=inputs["measurement_bundle"],
         host_evidence_path=inputs["measurement_host"],
         model_cache=inputs["cache"],
-        checkpoint_evidence_path=inputs["checkpoint"],
-        base_system_evidence_path=inputs["base"],
+        checkpoint_evidence_path=accepted_checkpoint,
+        base_system_evidence_path=accepted_base,
         output_path=inputs["measurement"],
         runner=lambda _request, frame, repetition: _fake_measurement_row(frame, repetition),
     )
@@ -1275,7 +1292,14 @@ def _phase_measurement_payload(
     shutil.copyfile(inputs["checkpoint"], root / "operational-checkpoint-acquisition-evidence.json")
     image = root / "operational-image"
     image.mkdir(parents=True)
-    shutil.copyfile(inputs["bootstrap_evidence"], image / "calibration-bootstrap-evidence.json")
+    operational_bootstrap = json.loads(accepted_bootstrap.read_bytes())
+    operational_bootstrap["native_host_attestation_bundle_sha256"] = _content_hash(
+        inputs["measurement_bundle"]
+    )
+    operational_bootstrap["native_host_evidence"] = json.loads(
+        inputs["measurement_host"].read_bytes()
+    )
+    _write_json(image / "calibration-bootstrap-evidence.json", operational_bootstrap)
     shutil.copyfile(inputs["archive"], image / "runtime.oci.tar")
     shutil.copyfile(inputs["layout"], image / "oci-layout-manifest.json")
     shutil.copyfile(inputs["measurement"], root / "calibration-measurement-evidence.json")
@@ -1289,6 +1313,14 @@ def _phase_measurement_payload(
             payload["request_sha256"] = "0" * 64
         elif name == "host_bundle_hash":
             payload["native_host_attestation_bundle_sha256"] = "0" * 64
+        elif name == "measurement_request_bootstrap_binding":
+            path = repository_measurement_request
+            payload = json.loads(path.read_bytes())
+            payload["calibration_bootstrap_evidence_sha256"] = "0" * 64
+        elif name == "operational_image_identity":
+            path = image / "calibration-bootstrap-evidence.json"
+            payload = json.loads(path.read_bytes())
+            payload["runtime_image_config_digest"] = f"sha256:{'f' * 64}"
         else:
             raise AssertionError(f"unexpected measurement mutation: {name}")
         _write_json(path, payload)
@@ -1302,6 +1334,7 @@ def _phase_candidate_payload(
 ) -> NativePhasePayload:
     measurement = _phase_measurement_payload(tmp_path, monkeypatch)
     repository = measurement.repository_root
+    accepted = repository / _ACCEPTED_NATIVE_RELATIVE
     source_fixture_root = _make_repository(tmp_path / "candidate-source")
     for relative in (*HOST_PATHS, *[path for path, _field in seal_module._HASH_FIELDS]):
         source = source_fixture_root / relative
@@ -1313,13 +1346,198 @@ def _phase_candidate_payload(
     for relative, field in seal_module._BOOTSTRAP_HASH_FIELDS:
         bootstrap_request_payload[field] = _content_hash(repository / relative)
     _write_json(bootstrap_request, bootstrap_request_payload)
-    bootstrap_evidence = measurement.root / "operational-image/calibration-bootstrap-evidence.json"
-    bootstrap_evidence_payload = json.loads(bootstrap_evidence.read_bytes())
-    bootstrap_evidence_payload["calibration_bootstrap_request_sha256"] = _content_hash(
+    accepted_bootstrap = accepted / "calibration-bootstrap-evidence.json"
+    accepted_bootstrap_payload = json.loads(accepted_bootstrap.read_bytes())
+    accepted_bootstrap_payload["calibration_bootstrap_request_sha256"] = _content_hash(
         bootstrap_request
     )
-    _write_json(bootstrap_evidence, bootstrap_evidence_payload)
-    candidate, _audit = _build_candidate(repository)
+    candidate_archive = measurement.root / "operational-image/runtime.oci.tar"
+    candidate_archive.write_bytes(b"complete deterministic OCI archive bytes")
+    candidate_layout = measurement.root / "operational-image/oci-layout-manifest.json"
+    candidate_archive_identity = {
+        "name": candidate_archive.name,
+        "sha256": _content_hash(candidate_archive),
+        "size": candidate_archive.stat().st_size,
+    }
+    candidate_layout_payload = {
+        "archive": candidate_archive_identity,
+        "base_image_config_digest": accepted_bootstrap_payload["base_image_config_digest"],
+        "base_image_layer_diff_ids": accepted_bootstrap_payload["base_image_layer_diff_ids"],
+        "base_image_layer_digests": accepted_bootstrap_payload["base_image_layer_digests"],
+        "config_digest": accepted_bootstrap_payload["runtime_image_config_digest"],
+        "image_manifest_digest": accepted_bootstrap_payload["runtime_image_manifest_digest"],
+        "index_digest": accepted_bootstrap_payload["runtime_image_index_digest"],
+        "layer_diff_ids": accepted_bootstrap_payload["runtime_image_layer_diff_ids"],
+        "layer_digests": accepted_bootstrap_payload["runtime_image_layer_digests"],
+        "schema": "crux.oaf-oci-layout-manifest/v1",
+    }
+    _write_json(candidate_layout, candidate_layout_payload)
+    accepted_bootstrap_payload["oci_layout_archive"] = candidate_archive_identity
+    accepted_bootstrap_payload["oci_layout_manifest_sha256"] = _content_hash(candidate_layout)
+    _write_json(accepted_bootstrap, accepted_bootstrap_payload)
+    measurement_request = repository / _MEASUREMENT_REQUEST_RELATIVE
+    measurement_request_payload = json.loads(measurement_request.read_bytes())
+    measurement_request_payload["calibration_bootstrap_evidence_sha256"] = _content_hash(
+        accepted_bootstrap
+    )
+    measurement_request_payload["calibration_bootstrap_request_sha256"] = _content_hash(
+        bootstrap_request
+    )
+    _write_json(measurement_request, measurement_request_payload)
+    measurement_image = measurement.root / "operational-image/calibration-bootstrap-evidence.json"
+    measurement_image_payload = json.loads(accepted_bootstrap.read_bytes())
+    measurement_image_payload["native_host_attestation_bundle_sha256"] = _content_hash(
+        measurement.root / "measurement-host-attestation/attestation-bundle.json"
+    )
+    measurement_image_payload["native_host_evidence"] = json.loads(
+        (measurement.root / "measurement-host-attestation/native-host-evidence.json").read_bytes()
+    )
+    _write_json(measurement_image, measurement_image_payload)
+    measurement_output = measurement.root / "calibration-measurement-evidence.json"
+    measurement_output.unlink()
+    seal_module.measure(
+        request_path=measurement_request,
+        bootstrap_request_path=bootstrap_request,
+        bootstrap_evidence_path=accepted_bootstrap,
+        host_attestation_bundle_path=(
+            measurement.root / "measurement-host-attestation/attestation-bundle.json"
+        ),
+        host_evidence_path=(
+            measurement.root / "measurement-host-attestation/native-host-evidence.json"
+        ),
+        model_cache=tmp_path / "model-cache",
+        checkpoint_evidence_path=accepted / "checkpoint-acquisition-evidence.json",
+        base_system_evidence_path=accepted / "base-system-package-evidence.json",
+        output_path=measurement_output,
+        runner=lambda _request, frame, repetition: _fake_measurement_row(frame, repetition),
+    )
+    accepted_measurement = accepted / "calibration-measurement-evidence.json"
+    shutil.copyfile(measurement_output, accepted_measurement)
+    profile = _profile_payload(
+        measurement_request=measurement_request,
+        measurement_evidence=accepted_measurement,
+        checkpoint=accepted / "checkpoint-acquisition-evidence.json",
+        base=accepted / "base-system-package-evidence.json",
+    )
+    _write_json(repository / _SEAL_PROFILE_REQUEST_RELATIVE, profile)
+
+    def bind_candidate_authorities(seal: dict[str, Any]) -> None:
+        acquisition = importlib.import_module("src.benchmark.checkpoint_acquisition")
+        packages = importlib.import_module("tools.hpa320.oaf_system_packages")
+        checkpoint_request = acquisition.load_checkpoint_acquisition_request(
+            repository / _CHECKPOINT_REQUEST_RELATIVE
+        )
+        checkpoint = acquisition.load_checkpoint_acquisition_evidence(
+            accepted / "checkpoint-acquisition-evidence.json",
+            request=checkpoint_request,
+        )
+        base_request = packages.load_base_system_package_request(
+            repository / _BASE_SYSTEM_REQUEST_RELATIVE
+        )
+        base = packages.load_base_system_package_evidence(
+            accepted / "base-system-package-evidence.json",
+            request=base_request,
+        )
+        _request, bootstrap = seal_module.load_calibration_bootstrap_evidence(
+            bootstrap_request,
+            accepted_bootstrap,
+        )
+        loaded_measurement_request = seal_module.load_calibration_measurement_request(
+            measurement_request
+        )
+        _measurement, rows, measurement_sha256 = seal_module._load_measurement_evidence(
+            accepted_measurement,
+            loaded_measurement_request,
+        )
+        loaded_profile = seal_module.load_seal_profile_request(
+            repository / _SEAL_PROFILE_REQUEST_RELATIVE
+        )
+        components = [
+            {"name": member.name, "sha256": member.sha256, "size": member.size}
+            for member in checkpoint_request.archive_members
+            if member.role == "published_component"
+        ]
+        package_inventory = [
+            {
+                "architecture": package.architecture,
+                "name": package.name,
+                "version": package.version,
+            }
+            for package in base.package_inventory
+        ]
+        seal.update(
+            {
+                "base_image_archive_keyring_sha256": (
+                    base_request.base_image_archive_keyring_sha256
+                ),
+                "base_image_config_digest": bootstrap.payload["base_image_config_digest"],
+                "base_image_layer_diff_ids": bootstrap.payload["base_image_layer_diff_ids"],
+                "base_image_layer_digests": bootstrap.payload["base_image_layer_digests"],
+                "base_image_manifest_digest": base_request.base_image_manifest_digest,
+                "base_system_package_evidence_sha256": base.sha256,
+                "base_system_package_inventory": package_inventory,
+                "base_system_package_inventory_sha256": base.package_inventory_sha256,
+                "base_system_package_request_sha256": base.request_sha256,
+                "build_context_manifest_sha256": bootstrap_request_payload[
+                    "build_context_manifest_sha256"
+                ],
+                "calibration_bootstrap_evidence_sha256": bootstrap.sha256,
+                "calibration_bootstrap_request_sha256": _content_hash(bootstrap_request),
+                "calibration_measurement_evidence_sha256": measurement_sha256,
+                "calibration_measurement_request_sha256": loaded_measurement_request.sha256,
+                "checkpoint_acquisition_evidence_sha256": checkpoint.sha256,
+                "checkpoint_acquisition_request_sha256": checkpoint.request_sha256,
+                "checkpoint_archive": {
+                    "name": checkpoint_request.archive.name,
+                    "sha256": checkpoint_request.archive.sha256,
+                    "size": checkpoint_request.archive.size,
+                },
+                "checkpoint_components": components,
+                "max_input_audio_frames": loaded_profile.max_input_audio_frames,
+                "measurements": [seal_module._row_payload(row) for row in rows],
+                "oci_layout_archive": bootstrap.payload["oci_layout_archive"],
+                "oci_layout_manifest_sha256": bootstrap.payload["oci_layout_manifest_sha256"],
+                "runtime_gid": bootstrap_request_payload["runtime_gid"],
+                "runtime_image_config_digest": bootstrap.payload["runtime_image_config_digest"],
+                "runtime_image_index_digest": bootstrap.payload["runtime_image_index_digest"],
+                "runtime_image_layer_diff_ids": bootstrap.payload["runtime_image_layer_diff_ids"],
+                "runtime_image_layer_digests": bootstrap.payload["runtime_image_layer_digests"],
+                "runtime_image_manifest_digest": bootstrap.payload["runtime_image_manifest_digest"],
+                "runtime_uid": bootstrap_request_payload["runtime_uid"],
+                "seal_profile_request_sha256": loaded_profile.sha256,
+            }
+        )
+        for field in (
+            "cpu_limit_millis",
+            "memory_limit_bytes",
+            "pid_limit",
+            "request_deadline_seconds",
+            "shm_bytes",
+            "startup_deadline_seconds",
+            "stderr_max_line_bytes",
+            "stderr_read_chunk_bytes",
+            "stderr_ring_buffer_bytes",
+            "stdout_max_line_bytes",
+            "tmp_bytes",
+        ):
+            seal[field] = loaded_profile.payload[field]
+
+    acquisition = importlib.import_module("src.benchmark.checkpoint_acquisition")
+    candidate_checkpoint_request = acquisition.load_checkpoint_acquisition_request(
+        repository / _CHECKPOINT_REQUEST_RELATIVE
+    )
+    candidate_components = [
+        {"name": member.name, "sha256": member.sha256, "size": member.size}
+        for member in candidate_checkpoint_request.archive_members
+        if member.role == "published_component"
+    ]
+    candidate, _audit = _build_candidate(
+        repository,
+        audit_mutation=lambda audit: audit.__setitem__(
+            "model_artifact_set_sha256", LOCKS.identity_sha256(candidate_components)
+        ),
+        seal_mutation=bind_candidate_authorities,
+    )
 
     root = tmp_path / "candidate-payload"
     shutil.copytree(candidate, root / "seal-candidate")
@@ -1327,9 +1545,14 @@ def _phase_candidate_payload(
         root / "seal-candidate" / CANDIDATE_ARTIFACT_PATHS["native_host_attestation_bundle"]
     )
     _copy_host_bundle(nested_host, root / "candidate-host-attestation")
+    candidate_image = json.loads(accepted_bootstrap.read_bytes())
+    candidate_image["native_host_attestation_bundle_sha256"] = _content_hash(nested_host)
+    candidate_image["native_host_evidence"] = json.loads(
+        (nested_host.parent / "native-host-evidence.json").read_bytes()
+    )
+    _write_json(root / "operational-image/calibration-bootstrap-evidence.json", candidate_image)
     for relative in (
         "operational-checkpoint-acquisition-evidence.json",
-        "operational-image/calibration-bootstrap-evidence.json",
         "operational-image/oci-layout-manifest.json",
         "operational-image/runtime.oci.tar",
     ):
@@ -1349,6 +1572,32 @@ def _phase_candidate_payload(
             payload["backend_lock_payload_sha256"] = "0" * 64
         elif name == "host_bundle_hash":
             payload["native_host_attestation_bundle_sha256"] = "0" * 64
+        elif name == "outer_checkpoint_authority":
+            path = root / "operational-checkpoint-acquisition-evidence.json"
+            acquisition = importlib.import_module("src.benchmark.checkpoint_acquisition")
+            request = acquisition.load_checkpoint_acquisition_request(
+                repository / _CHECKPOINT_REQUEST_RELATIVE
+            )
+            _identity, content = acquisition.render_checkpoint_acquisition_evidence(
+                request,
+                acquisition_mode="cache_verify",
+                model_artifact_set_sha256="d" * 64,
+                cache_path=acquisition.PurePosixPath("sha256", "d" * 64),
+            )
+            path.write_bytes(content)
+            return
+        elif name == "outer_image_authority":
+            path = root / "operational-image/calibration-bootstrap-evidence.json"
+            payload = json.loads(path.read_bytes())
+            payload["runtime_image_config_digest"] = f"sha256:{'f' * 64}"
+        elif name == "accepted_measurement_authority":
+            path = accepted_measurement
+            payload = json.loads(path.read_bytes())
+            payload["request_sha256"] = "0" * 64
+        elif name == "seal_profile_authority":
+            path = repository / _SEAL_PROFILE_REQUEST_RELATIVE
+            payload = json.loads(path.read_bytes())
+            payload["calibration_measurement_evidence_sha256"] = "0" * 64
         else:
             raise AssertionError(f"unexpected candidate mutation: {name}")
         _write_json(path, payload)
@@ -1390,10 +1639,16 @@ def native_phase_payload(
         ("measurement", "bootstrap_evidence_hash"),
         ("measurement", "measurement_request_hash"),
         ("measurement", "host_bundle_hash"),
+        ("measurement", "measurement_request_bootstrap_binding"),
+        ("measurement", "operational_image_identity"),
         ("candidate", "candidate_manifest_hash"),
         ("candidate", "runtime_lock_hash"),
         ("candidate", "backend_lock_hash"),
         ("candidate", "host_bundle_hash"),
+        ("candidate", "outer_checkpoint_authority"),
+        ("candidate", "outer_image_authority"),
+        ("candidate", "accepted_measurement_authority"),
+        ("candidate", "seal_profile_authority"),
     ],
 )
 def test_native_work_phase_gate_rejects_internal_inconsistency(
@@ -1410,6 +1665,18 @@ def test_native_work_phase_gate_rejects_internal_inconsistency(
             payload_root=payload.root,
             repository_root=payload.repository_root,
         )
+
+
+def test_measurement_phase_gate_accepts_the_genuine_workflow_layout(
+    native_phase_payload: Callable[[str], NativePhasePayload],
+) -> None:
+    native_phase_payload("measurement")
+
+
+def test_candidate_phase_gate_accepts_the_genuine_workflow_layout(
+    native_phase_payload: Callable[[str], NativePhasePayload],
+) -> None:
+    native_phase_payload("candidate")
 
 
 def test_seal_candidate_accepts_v2_and_rejects_former_v1_schema(
