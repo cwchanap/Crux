@@ -811,6 +811,32 @@ def load_calibration_bootstrap_request(path: Path) -> CalibrationBootstrapReques
     )
 
 
+def reissue_calibration_bootstrap_request(
+    *,
+    request_path: Path,
+    repository_root: Path,
+) -> str:
+    """Reissue only the seven cross-hashes in one canonical bootstrap request."""
+
+    request_path = Path(request_path)
+    repository_root = Path(repository_root)
+    payload, original = _read_canonical_object(
+        request_path,
+        "calibration bootstrap request",
+    )
+    reissued = dict(payload)
+    for relative, field in _BOOTSTRAP_HASH_FIELDS:
+        content = _read_regular(repository_root / relative, relative)
+        reissued[field] = sha256_hex(content)
+    _validate_calibration_bootstrap_request_payload(reissued)
+    content = canonical_json_bytes(reissued, trailing_newline=True)
+    if strict_json_loads(original[:-1], require_canonical=True) != payload:
+        raise SealError("existing calibration bootstrap request is not canonical")
+    _atomic_replace_regular_file(request_path, content)
+    loaded = load_calibration_bootstrap_request(request_path)
+    return loaded.sha256
+
+
 def _validate_calibration_bootstrap_request_payload(
     payload: Mapping[str, JsonValue],
 ) -> ImageBuildRecipe:
@@ -2805,6 +2831,29 @@ def _read_regular(path: Path, label: str) -> bytes:
         raise SealError(f"{label} must be a no-follow regular file") from None
 
 
+def _atomic_replace_regular_file(path: Path, content: bytes) -> None:
+    target = Path(path)
+    parent = _require_directory(target.parent, "replacement parent")
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{target.name}.reissue-",
+        dir=parent,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            os.fchmod(handle.fileno(), 0o644)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        _fsync_directory(parent)
+    except OSError:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise SealError("calibration bootstrap request replacement failed") from None
+
+
 def _require_directory(path: Path, label: str) -> Path:
     try:
         metadata = path.lstat()
@@ -3517,6 +3566,10 @@ def _parser() -> argparse.ArgumentParser:
     calibration.add_argument("--model-cache", type=Path, required=True)
     calibration.add_argument("--output", type=Path, required=True)
 
+    reissue = commands.add_parser("reissue-bootstrap-request")
+    reissue.add_argument("--repository-root", type=Path, required=True)
+    reissue.add_argument("--request", type=Path, required=True)
+
     seal = commands.add_parser("seal")
     seal.add_argument("--candidate", type=Path, required=True)
     seal.add_argument("--repository-root", type=Path, required=True)
@@ -3531,6 +3584,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "validate-host":
             load_native_host_evidence(arguments.evidence)
             _write_producer_summary(ProducerOutcome("validated", 0, None, None))
+            return 0
+        if arguments.command == "reissue-bootstrap-request":
+            digest = reissue_calibration_bootstrap_request(
+                request_path=arguments.request,
+                repository_root=arguments.repository_root,
+            )
+            _write_producer_summary(ProducerOutcome("reissued", 0, arguments.request, digest))
             return 0
         if arguments.command == "bootstrap-image":
             published = bootstrap_image(

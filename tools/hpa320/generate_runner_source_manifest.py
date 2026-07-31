@@ -44,6 +44,7 @@ SOURCE_PATHS = (
     "tools/hpa320/oaf_candidate_builder.py",
     "tools/hpa320/oaf_host_attestation.py",
     "tools/hpa320/oaf_native_calibration.py",
+    "tools/hpa320/oaf_native_artifacts.py",
     "tools/hpa320/oaf_native_runner.py",
     "tools/hpa320/oaf_oci.py",
     "tools/hpa320/oaf_system_packages.py",
@@ -126,6 +127,10 @@ def canonical_manifest_bytes(manifest: Mapping[str, object]) -> bytes:
 
 def write_runner_source_manifest(repository_root: Path, output_path: Path) -> str:
     content = canonical_manifest_bytes(build_runner_source_manifest(repository_root))
+    return _write_runner_source_manifest_bytes(content, output_path)
+
+
+def _write_runner_source_manifest_bytes(content: bytes, output_path: Path) -> str:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(
@@ -151,10 +156,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repository-root", type=Path, default=Path.cwd())
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="compare generated canonical bytes with --output without writing",
+    )
     args = parser.parse_args(argv)
     output = args.output or args.repository_root / MANIFEST_PATH
     try:
-        digest = write_runner_source_manifest(args.repository_root, output)
+        content = canonical_manifest_bytes(build_runner_source_manifest(args.repository_root))
+        if args.check:
+            if _read_regular_no_follow(output) != content:
+                raise RunnerManifestError("runner source manifest does not match final sources")
+            digest = hashlib.sha256(content).hexdigest()
+        else:
+            digest = _write_runner_source_manifest_bytes(content, output)
     except RunnerManifestError:
         os.write(2, b"code=runner_source_manifest_invalid count=1\n")
         return 2

@@ -1,7 +1,7 @@
 # HPA-481/HPA-482 Work-Job Artifact Attestation Design
 
 **Date:** 2026-07-30
-**Status:** Proposed
+**Status:** Implemented
 **Issues:** HPA-481, HPA-482
 **Blocks:** HPA-423, then HPA-424 and HPA-425
 
