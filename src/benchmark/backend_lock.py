@@ -27,7 +27,7 @@ from src.benchmark.backend_identity import (
 
 BACKEND_LOCK_SCHEMA = "crux.transcription-backend-lock/v1"
 RUNTIME_LOCK_SCHEMA = "crux.transcription-runtime-lock/v1"
-SEAL_EVIDENCE_SCHEMA = "crux.backend-seal-evidence/v1"
+SEAL_EVIDENCE_SCHEMA = "crux.backend-seal-evidence/v2"
 CONVERSION_AUDIT_SCHEMA = "crux.legacy-tf2-conversion-coverage/v1"
 
 _BACKEND_IDENTITIES = MappingProxyType(

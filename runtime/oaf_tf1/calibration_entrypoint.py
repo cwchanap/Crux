@@ -44,6 +44,8 @@ EXPECTED_ENVIRONMENT = {
     "TF_NUM_INTEROP_THREADS": "1",
     "TF_NUM_INTRAOP_THREADS": "1",
 }
+CALIBRATION_BOOTSTRAP_EVIDENCE_SCHEMA = "crux.oaf-calibration-bootstrap-evidence/v2"
+BASE_SYSTEM_PACKAGE_EVIDENCE_SCHEMA = "crux.oaf-base-system-package-evidence/v2"
 EXPECTED_RESOURCE_CEILING = {
     "cpu_limit_millis": 2_000,
     "memory_limit_bytes": 4_294_967_296,
@@ -417,7 +419,7 @@ def authenticate_calibration_startup(
             bootstrap_evidence_path,
             "calibration_bootstrap_evidence",
             _BOOTSTRAP_EVIDENCE_KEYS,
-            "crux.oaf-calibration-bootstrap-evidence/v1",
+            CALIBRATION_BOOTSTRAP_EVIDENCE_SCHEMA,
         )
         _validate_bootstrap_evidence(
             bootstrap_request.payload,
@@ -465,7 +467,7 @@ def authenticate_calibration_startup(
             base_system_evidence_path,
             "base_system_package_evidence",
             _BASE_SYSTEM_EVIDENCE_KEYS,
-            "crux.oaf-base-system-package-evidence/v1",
+            BASE_SYSTEM_PACKAGE_EVIDENCE_SCHEMA,
         )
         _validate_base_system_evidence(
             base_request.payload,

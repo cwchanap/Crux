@@ -46,6 +46,7 @@ except (ImportError, ValueError):
 CHECKPOINT_COUNT = 130
 REQUIRED_INFERENCE_COUNT = 78
 NON_INFERENCE_COUNT = 52
+SEAL_EVIDENCE_SCHEMA = "crux.backend-seal-evidence/v2"
 MIN_MIDI_PITCH = 21
 CALIBRATION_TRAINING_GROUPS = (
     {"base_midi": 36, "group_id": "kick", "member_pitches": [36], "output_bin": 15},
@@ -374,7 +375,7 @@ def validate_schema_golden(schema, content):
     if schema in {
         "crux.transcription-backend-lock/v1",
         "crux.transcription-runtime-lock/v1",
-        "crux.backend-seal-evidence/v1",
+        SEAL_EVIDENCE_SCHEMA,
         "crux.legacy-tf2-conversion-coverage/v1",
     }:
         try:
@@ -437,8 +438,8 @@ def validate_schema_golden(schema, content):
                 raise ValueError("schema golden source audio hash is invalid")
             with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
                 root = Path(directory)
-                audio_path = root / seal._CANDIDATE_ARTIFACT_PATHS["smoke_audio"]
-                prediction_path = root / seal._CANDIDATE_ARTIFACT_PATHS["smoke_prediction"]
+                audio_path = root / seal.CANDIDATE_ARTIFACT_PATHS["smoke_audio"]
+                prediction_path = root / seal.CANDIDATE_ARTIFACT_PATHS["smoke_prediction"]
                 audio_path.parent.mkdir(parents=True)
                 prediction_path.parent.mkdir(parents=True)
                 audio_path.write_bytes(audio)
@@ -1485,7 +1486,7 @@ def authenticate_startup(
         seal_evidence_path,
         label="seal_evidence",
         exact_keys=SEAL_EVIDENCE_KEYS,
-        expected_schema="crux.backend-seal-evidence/v1",
+        expected_schema=SEAL_EVIDENCE_SCHEMA,
         expected_sha256=backend.payload["seal_evidence_sha256"],
     )
     runner_manifest = load_authenticated_object(

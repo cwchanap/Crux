@@ -42,7 +42,7 @@ from tools.hpa320.seal_oaf_backend import SealError, load_calibration_bootstrap_
 BOOTSTRAP_EVIDENCE_NAME = "calibration-bootstrap-evidence.json"
 OCI_LAYOUT_MANIFEST_NAME = "oci-layout-manifest.json"
 OCI_ARCHIVE_NAME = "runtime.oci.tar"
-BOOTSTRAP_EVIDENCE_SCHEMA = "crux.oaf-calibration-bootstrap-evidence/v1"
+BOOTSTRAP_EVIDENCE_SCHEMA = "crux.oaf-calibration-bootstrap-evidence/v2"
 OCI_LAYOUT_MANIFEST_SCHEMA = "crux.oaf-oci-layout-manifest/v1"
 
 

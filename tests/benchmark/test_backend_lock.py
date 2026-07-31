@@ -173,6 +173,13 @@ RUNTIME_IMAGE_LAYER_DIFF_IDS = [
     *BASE_IMAGE_LAYER_DIFF_IDS,
     f"sha256:{'0' * 64}",
 ]
+V2_SCHEMA_REPLACEMENTS = {
+    "crux.backend-seal-evidence/v1": "crux.backend-seal-evidence/v2",
+    "crux.oaf-base-system-package-evidence/v1": "crux.oaf-base-system-package-evidence/v2",
+    "crux.oaf-calibration-bootstrap-evidence/v1": "crux.oaf-calibration-bootstrap-evidence/v2",
+    "crux.oaf-calibration-measurement-evidence/v1": "crux.oaf-calibration-measurement-evidence/v2",
+    "crux.oaf-seal-candidate/v1": "crux.oaf-seal-candidate/v2",
+}
 
 
 def canonical_bytes(payload: Any) -> bytes:
@@ -324,14 +331,21 @@ def seal_payload(*, audit_sha256: str = "c" * 64) -> dict[str, Any]:
         "cpu_vendor_id": "GenuineIntel",
     }
     host_payload = {
-        "api_record_sha256": "b" * 64,
-        "approved_labels": ["Linux", "X64"],
+        "github_job": "native-candidate",
+        "github_repository": "acme/crux",
+        "github_run_attempt": 1,
+        "github_run_id": 456,
+        "github_workflow_ref": (
+            "acme/crux/.github/workflows/hpa320-native-candidate.yml@refs/heads/test"
+        ),
+        "github_workflow_sha": "c" * 40,
         "host_numeric_fingerprint": fingerprint,
-        "job_id": 123,
-        "run_url": "https://github.com/acme/crux/actions/runs/456/job/123",
+        "run_url": "https://github.com/acme/crux/actions/runs/456",
         "runner_arch": "X64",
+        "runner_environment": "github-hosted",
         "runner_os": "Linux",
         "workflow_commit": "c" * 40,
+        "schema": "crux.github-hosted-native-evidence/v2",
     }
     measurement = {
         "exit_code": 0,
@@ -423,7 +437,7 @@ def seal_payload(*, audit_sha256: str = "c" * 64) -> dict[str, Any]:
         "runtime_image_layer_digests": deepcopy(RUNTIME_IMAGE_LAYER_DIGESTS),
         "runtime_image_manifest_digest": f"sha256:{'4' * 64}",
         "runtime_uid": 10001,
-        "schema": "crux.backend-seal-evidence/v1",
+        "schema": V2_SCHEMA_REPLACEMENTS["crux.backend-seal-evidence/v1"],
         "seal_profile_request_sha256": "e" * 64,
         "security_scan_sha256": "0" * 64,
         "shm_bytes": 67108864,
@@ -525,6 +539,16 @@ def test_valid_lock_set_reproduces_descriptor_and_immutable_records(tmp_path: Pa
         backend.payload["hparams"]["hop_length"] = 512  # type: ignore[index]
     with pytest.raises(TypeError):
         backend.payload["checkpoint_components"][0]["size"] = 0  # type: ignore[index]
+
+
+def test_backend_seal_evidence_accepts_v2_and_rejects_former_v1_schema(tmp_path: Path) -> None:
+    payload = seal_payload()
+    assert payload["schema"] == V2_SCHEMA_REPLACEMENTS["crux.backend-seal-evidence/v1"]
+    load_seal_evidence(write_json(tmp_path / "v2-seal.json", payload))
+
+    payload["schema"] = "crux.backend-seal-evidence/v1"
+    with pytest.raises(BackendLockError, match="seal evidence schema"):
+        load_seal_evidence(write_json(tmp_path / "v1-seal.json", payload))
 
 
 def test_backend_lock_rejects_missing_audio_frame_bound(tmp_path: Path) -> None:
