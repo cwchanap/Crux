@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from runtime.oaf_tf1.protocol import serve_requests
-from src.benchmark.backend_identity import canonical_json_bytes
+from src.benchmark.backend_identity import canonical_json_bytes, sha256_hex
 from src.benchmark.backend_lock import REQUIRED_ENVIRONMENT
 from src.benchmark.backend_process import (
     DiagnosticHostEvidence,
@@ -34,12 +34,49 @@ HOST_NUMERIC_FINGERPRINT = {
     "cpu_model": "143",
     "cpu_stepping": "8",
 }
+GITHUB_V2_PAYLOAD = {
+    "schema": "crux.github-hosted-native-evidence/v2",
+    "github_job": "native-bootstrap",
+    "github_repository": "cwchanap/Crux",
+    "github_run_attempt": 2,
+    "github_run_id": 123456789,
+    "github_workflow_ref": (
+        "cwchanap/Crux/.github/workflows/hpa320-native-bootstrap.yml@refs/tags/native-v2"
+    ),
+    "github_workflow_sha": "a" * 40,
+    "host_numeric_fingerprint": HOST_NUMERIC_FINGERPRINT,
+    "run_url": "https://github.com/cwchanap/Crux/actions/runs/123456789",
+    "runner_arch": "X64",
+    "runner_environment": "github-hosted",
+    "runner_os": "Linux",
+    "workflow_commit": "a" * 40,
+}
+GITHUB_V1_PAYLOAD = {
+    "api_record_sha256": "a" * 64,
+    "approved_labels": ["Linux", "X64"],
+    "job_id": 123,
+    "run_url": "https://github.com/acme/crux/actions/runs/456/job/123",
+    "runner_arch": "X64",
+    "runner_os": "Linux",
+    "workflow_commit": "b" * 40,
+    "host_numeric_fingerprint": HOST_NUMERIC_FINGERPRINT,
+}
 
 
 def _canonical_sha256(payload: dict[str, object]) -> str:
     from src.benchmark.backend_identity import canonical_json_bytes
 
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def github_v2_record(payload: dict[str, object] | None = None) -> dict[str, object]:
+    selected = GITHUB_V2_PAYLOAD if payload is None else payload
+    return {
+        "kind": "github_hosted",
+        "official_execution_allowed": True,
+        "payload": selected,
+        "sha256": sha256_hex(canonical_json_bytes(selected)),
+    }
 
 
 def _write_mounts(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
@@ -235,19 +272,7 @@ def test_launch_profile_is_frozen_and_rechecks_mount_identity(tmp_path: Path) ->
 @pytest.mark.parametrize(
     ("kind", "payload"),
     [
-        (
-            "github_hosted",
-            {
-                "api_record_sha256": "a" * 64,
-                "approved_labels": ["Linux", "X64"],
-                "job_id": 123,
-                "run_url": "https://github.com/acme/crux/actions/runs/456/job/123",
-                "runner_arch": "X64",
-                "runner_os": "Linux",
-                "workflow_commit": "b" * 40,
-                "host_numeric_fingerprint": HOST_NUMERIC_FINGERPRINT,
-            },
-        ),
+        ("github_hosted", GITHUB_V2_PAYLOAD),
         (
             "orchestrator_signed",
             {
@@ -284,23 +309,59 @@ def test_native_host_evidence_accepts_only_exact_official_forms(
     assert evidence.official_execution_allowed is True
     with pytest.raises(TypeError):
         evidence.payload["extra"] = "no"  # type: ignore[index]
-    if kind == "github_hosted":
-        with pytest.raises((TypeError, AttributeError)):
-            evidence.payload["approved_labels"].append("ARM64")  # type: ignore[union-attr]
+
+
+def test_github_hosted_native_evidence_accepts_exact_v2_run_identity() -> None:
+    record = github_v2_record()
+
+    evidence = NativeHostEvidence(**record)  # type: ignore[arg-type]
+
+    assert evidence.payload == GITHUB_V2_PAYLOAD
+    assert evidence.host_numeric_fingerprint.as_json() == HOST_NUMERIC_FINGERPRINT
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema", "crux.github-hosted-native-evidence/v1"),
+        ("runner_environment", "self-hosted"),
+        ("runner_environment", ""),
+        ("runner_os", "Windows"),
+        ("runner_arch", "ARM64"),
+        ("github_job", ""),
+        ("github_run_attempt", 0),
+        ("github_run_id", 0),
+        ("run_url", "https://github.com/cwchanap/Crux/actions/runs/123456789/job/7"),
+        ("run_url", "https://github.com/other/Crux/actions/runs/123456789"),
+        ("run_url", "https://github.com/cwchanap/Crux/actions/runs/9"),
+    ],
+)
+def test_github_hosted_native_evidence_rejects_invalid_v2_identity(
+    field: str,
+    value: object,
+) -> None:
+    payload = dict(GITHUB_V2_PAYLOAD)
+    payload[field] = value
+
+    with pytest.raises(ValueError):
+        NativeHostEvidence(**github_v2_record(payload))  # type: ignore[arg-type]
+
+
+def test_github_hosted_native_evidence_rejects_the_exact_v1_key_set() -> None:
+    with pytest.raises(ValueError):
+        NativeHostEvidence(
+            kind="github_hosted",
+            payload=GITHUB_V1_PAYLOAD,
+            sha256=sha256_hex(canonical_json_bytes(GITHUB_V1_PAYLOAD)),
+            official_execution_allowed=True,
+        )
 
 
 def test_native_host_evidence_requires_the_exact_stable_fingerprint() -> None:
-    payload = {
-        "api_record_sha256": "a" * 64,
-        "approved_labels": ["Linux", "X64"],
-        "job_id": 123,
-        "run_url": "https://github.com/acme/crux/actions/runs/456/job/123",
-        "runner_arch": "X64",
-        "runner_os": "Linux",
-        "workflow_commit": "b" * 40,
-    }
+    payload = dict(GITHUB_V2_PAYLOAD)
+    del payload["host_numeric_fingerprint"]
 
-    with pytest.raises(ValueError, match="exact schema"):
+    with pytest.raises(ValueError, match="exact v2 key set"):
         NativeHostEvidence(
             kind="github_hosted",
             payload=payload,
@@ -308,13 +369,7 @@ def test_native_host_evidence_requires_the_exact_stable_fingerprint() -> None:
             official_execution_allowed=True,
         )
 
-    fingerprint = {
-        "architecture": "x86_64",
-        "cpu_vendor_id": "GenuineIntel",
-        "cpu_family": "6",
-        "cpu_model": "143",
-        "cpu_stepping": "8",
-    }
+    fingerprint = dict(HOST_NUMERIC_FINGERPRINT)
     evidence_payload = {**payload, "host_numeric_fingerprint": fingerprint}
     evidence = NativeHostEvidence(
         kind="github_hosted",
@@ -327,16 +382,7 @@ def test_native_host_evidence_requires_the_exact_stable_fingerprint() -> None:
 
 
 def test_native_evidence_rejects_hash_shape_and_policy_drift() -> None:
-    payload = {
-        "api_record_sha256": "a" * 64,
-        "approved_labels": ["Linux", "X64"],
-        "job_id": 123,
-        "run_url": "https://github.com/acme/crux/actions/runs/456/job/123",
-        "runner_arch": "X64",
-        "runner_os": "Linux",
-        "workflow_commit": "b" * 40,
-        "host_numeric_fingerprint": HOST_NUMERIC_FINGERPRINT,
-    }
+    payload = dict(GITHUB_V2_PAYLOAD)
     for changed in [
         {**payload, "runner_arch": "ARM64"},
         {**payload, "extra": "field"},

@@ -15,27 +15,34 @@ def collect_host_numeric_fingerprint() -> HostNumericFingerprint:
 
 def build_github_hosted_evidence(
     *,
-    api_record_bytes: bytes,
-    job_id: int,
+    github_job: str,
+    github_repository: str,
+    github_run_attempt: int,
+    github_run_id: int,
+    github_workflow_ref: str,
+    github_workflow_sha: str,
+    host_numeric_fingerprint: HostNumericFingerprint,
     run_url: str,
+    runner_arch: str,
+    runner_environment: str,
+    runner_os: str,
     workflow_commit: str,
-    host_numeric_fingerprint: HostNumericFingerprint | None = None,
 ) -> dict[str, JsonValue]:
-    """Build one payload and validate it with the current NativeHostEvidence reader."""
+    """Build and self-validate one strict v2 GitHub-hosted evidence record."""
 
-    fingerprint = (
-        collect_host_numeric_fingerprint()
-        if host_numeric_fingerprint is None
-        else host_numeric_fingerprint
-    )
     payload: dict[str, JsonValue] = {
-        "api_record_sha256": sha256_hex(api_record_bytes),
-        "approved_labels": ["Linux", "X64"],
-        "host_numeric_fingerprint": fingerprint.as_json(),
-        "job_id": job_id,
+        "schema": "crux.github-hosted-native-evidence/v2",
+        "github_job": github_job,
+        "github_repository": github_repository,
+        "github_run_attempt": github_run_attempt,
+        "github_run_id": github_run_id,
+        "github_workflow_ref": github_workflow_ref,
+        "github_workflow_sha": github_workflow_sha,
+        "host_numeric_fingerprint": host_numeric_fingerprint.as_json(),
         "run_url": run_url,
-        "runner_arch": "X64",
-        "runner_os": "Linux",
+        "runner_arch": runner_arch,
+        "runner_environment": runner_environment,
+        "runner_os": runner_os,
         "workflow_commit": workflow_commit,
     }
     digest = sha256_hex(canonical_json_bytes(payload))
