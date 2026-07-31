@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ctypes
 import errno
 import fcntl
 import hashlib
@@ -8,7 +7,6 @@ import os
 import secrets
 import stat
 import struct
-import sys
 import urllib.request
 import zipfile
 import zlib
@@ -25,7 +23,11 @@ from src.benchmark.backend_lock import (
     LoadedBackendLock,
     revalidate_loaded_backend_lock,
 )
-from src.benchmark.backend_publication import ArtifactPublicationError, publish_immutable_bytes
+from src.benchmark.backend_publication import (
+    ArtifactPublicationError,
+    publish_immutable_bytes,
+    rename_directory_no_replace,
+)
 from src.benchmark.backends import PublishedArtifact
 from src.benchmark.checkpoint_acquisition import (
     CheckpointAcquisitionError,
@@ -334,13 +336,13 @@ def _stage_and_publish(
 
         _verify_model_directory(sha256_fd, stage_name, contract.components)
         try:
-            _rename_no_replace(
-                stage_name,
-                contract.model_artifact_set_sha256,
-                src_dir_fd=sha256_fd,
-                dst_dir_fd=sha256_fd,
+            rename_directory_no_replace(
+                request.cache_root / "sha256" / stage_name,
+                request.cache_root / "sha256" / contract.model_artifact_set_sha256,
             )
-        except FileExistsError:
+        except ArtifactPublicationError as error:
+            if not isinstance(error.__cause__, FileExistsError):
+                raise _IntegrityError("atomic checkpoint publication failed") from None
             if not _cleanup_staging_directory(sha256_fd, stage_name):
                 raise _AcquisitionError("losing staging cleanup failed") from None
             stage_name = None
@@ -1252,68 +1254,6 @@ def _fsync_staging_directory(stage_fd: int) -> bool:
         return True
     except OSError:
         return False
-
-
-def _rename_no_replace(
-    source: str,
-    target: str,
-    *,
-    src_dir_fd: int,
-    dst_dir_fd: int,
-) -> None:
-    """Atomically publish *source* only if *target* does not already exist."""
-    libc = ctypes.CDLL(None, use_errno=True)
-    encoded_source = os.fsencode(source)
-    encoded_target = os.fsencode(target)
-    if sys.platform == "darwin":
-        try:
-            rename = libc.renameatx_np
-        except AttributeError:
-            raise OSError(errno.ENOTSUP, "renameatx_np is unavailable") from None
-        rename.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        rename.restype = ctypes.c_int
-        result = rename(
-            src_dir_fd,
-            encoded_source,
-            dst_dir_fd,
-            encoded_target,
-            0x00000004,  # RENAME_EXCL
-        )
-    elif sys.platform.startswith("linux"):
-        try:
-            rename = libc.renameat2
-        except AttributeError:
-            raise OSError(errno.ENOTSUP, "renameat2 is unavailable") from None
-        rename.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        rename.restype = ctypes.c_int
-        result = rename(
-            src_dir_fd,
-            encoded_source,
-            dst_dir_fd,
-            encoded_target,
-            0x00000001,  # RENAME_NOREPLACE
-        )
-    else:
-        raise OSError(errno.ENOTSUP, "atomic no-replace rename is unsupported")
-
-    if result == 0:
-        return
-    error_number = ctypes.get_errno()
-    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
-        raise FileExistsError(error_number, os.strerror(error_number), target)
-    raise OSError(error_number, os.strerror(error_number), target)
 
 
 def _verify_model_directory(

@@ -3,8 +3,11 @@ from __future__ import annotations
 # Publication converts every low-level failure into one stable error and must also
 # catch cleanup failures raised by injected or platform filesystem implementations.
 # pylint: disable=broad-exception-caught
+import ctypes
+import errno
 import os
 import stat
+import sys
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -28,6 +31,41 @@ class PrivateSnapshotIntegrityError(OSError):
 
 class _AncestorBindingError(OSError):
     pass
+
+
+def rename_directory_no_replace(source: Path, destination: Path) -> None:
+    """Atomically publish a directory only when destination is absent."""
+
+    source_path = Path(source)
+    destination_path = Path(destination)
+    try:
+        source_metadata = os.lstat(source_path)
+    except OSError as error:
+        raise ArtifactPublicationError("publication source is unavailable") from error
+    if not stat.S_ISDIR(source_metadata.st_mode):
+        raise ArtifactPublicationError("publication source must be a non-symlink directory")
+    if source_path.parent != destination_path.parent:
+        raise ArtifactPublicationError("publication rename must stay within one parent directory")
+    try:
+        _rename_no_replace_syscall(source_path, destination_path)
+        published_metadata = os.lstat(destination_path)
+        if not stat.S_ISDIR(published_metadata.st_mode) or not _same_inode(
+            source_metadata,
+            published_metadata,
+        ):
+            raise OSError("publication destination binding changed")
+        parent_descriptor = os.open(
+            source_path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    except FileExistsError as error:
+        raise ArtifactPublicationError("publication destination already exists") from error
+    except OSError as error:
+        raise ArtifactPublicationError("atomic no-replace directory publication failed") from error
 
 
 @dataclass(frozen=True)
@@ -910,6 +948,63 @@ def _unlink_if_same_inode(
 
 def _same_inode(first: os.stat_result, second: os.stat_result) -> bool:
     return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
+def _rename_no_replace_syscall(source: Path, destination: Path) -> None:
+    """Rename sibling paths with the platform no-replace syscall."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    encoded_source = os.fsencode(source)
+    encoded_destination = os.fsencode(destination)
+    if sys.platform == "darwin":
+        try:
+            rename = libc.renameatx_np
+        except AttributeError:
+            raise OSError(errno.ENOTSUP, "renameatx_np is unavailable") from None
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            getattr(os, "AT_FDCWD", -2),
+            encoded_source,
+            getattr(os, "AT_FDCWD", -2),
+            encoded_destination,
+            0x00000004,  # RENAME_EXCL
+        )
+    elif sys.platform.startswith("linux"):
+        try:
+            rename = libc.renameat2
+        except AttributeError:
+            raise OSError(errno.ENOTSUP, "renameat2 is unavailable") from None
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            getattr(os, "AT_FDCWD", -100),
+            encoded_source,
+            getattr(os, "AT_FDCWD", -100),
+            encoded_destination,
+            0x00000001,  # RENAME_NOREPLACE
+        )
+    else:
+        raise OSError(errno.ENOTSUP, "atomic no-replace rename is unsupported")
+
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error_number, os.strerror(error_number), destination)
+    raise OSError(error_number, os.strerror(error_number), destination)
 
 
 def _read_descriptor(descriptor: int) -> bytes:

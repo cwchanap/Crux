@@ -1,180 +1,309 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from pathlib import Path
 
 import pytest
 
-from src.benchmark.backend_identity import canonical_json_bytes, sha256_hex
+from src.benchmark.backend_attestation import HostNumericFingerprint
+from tools.hpa320 import oaf_host_attestation as host_module
 from tools.hpa320.oaf_host_attestation import (
     HostAttestationError,
     load_native_host_attestation_bundle,
+    publish_github_host_attestation,
 )
 
 
-def _write_canonical(path: Path, payload: object) -> bytes:
-    content = canonical_json_bytes(payload, trailing_newline=True)
-    path.write_bytes(content)
-    return content
+def set_same_job_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    phase: str = "bootstrap",
+    runner_environment: str = "github-hosted",
+) -> None:
+    job = f"native-{phase}"
+    workflow = f"hpa320-native-{phase}.yml"
+    values = {
+        "COMMIT_SHA": "a" * 40,
+        "GITHUB_JOB": job,
+        "GITHUB_REPOSITORY": "cwchanap/Crux",
+        "GITHUB_RUN_ATTEMPT": "2",
+        "GITHUB_RUN_ID": "123456789",
+        "GITHUB_SERVER_URL": "https://github.com",
+        "GITHUB_SHA": "a" * 40,
+        "GITHUB_WORKFLOW_REF": (f"cwchanap/Crux/.github/workflows/{workflow}@refs/tags/native-v2"),
+        "RUNNER_ARCH": "X64",
+        "RUNNER_ARCH_CONTEXT": "X64",
+        "RUNNER_ENVIRONMENT": runner_environment,
+        "RUNNER_ENVIRONMENT_CONTEXT": runner_environment,
+        "RUNNER_OS": "Linux",
+        "RUNNER_OS_CONTEXT": "Linux",
+        "WORKFLOW_SOURCE_SHA": "a" * 40,
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
 
 
-def _bundle_fixture(tmp_path: Path, *, phase: str = "bootstrap") -> tuple[Path, dict[str, Path]]:
-    directory = tmp_path / "bundle"
-    directory.mkdir()
-    commit = "b" * 40
-    run_id = 456
-    job_id = 123
-    repository = "acme/crux"
-    run_url = f"https://github.com/{repository}/actions/runs/{run_id}"
-    fingerprint = {
-        "architecture": "x86_64",
-        "cpu_family": "6",
-        "cpu_model": "143",
-        "cpu_stepping": "8",
-        "cpu_vendor_id": "GenuineIntel",
+def stub_native_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    def run_text(command: tuple[str, ...], _label: str) -> str:
+        if command == ("git", "rev-parse", "HEAD"):
+            return "a" * 40
+        if command == ("uname", "-m"):
+            return "x86_64"
+        raise AssertionError(f"unexpected native command: {command!r}")
+
+    docker_values = {
+        "OSType": "linux",
+        "Architecture": "x86_64",
+        "ServerVersion": "28.3.2",
     }
-    api_record = {
-        "conclusion": "success",
-        "head_sha": commit,
-        "html_url": f"{run_url}/job/{job_id}",
-        "id": job_id,
-        "labels": ["ubuntu-24.04"],
-        "name": "observe-native-host",
-        "run_id": run_id,
-        "status": "completed",
-    }
-    api_bytes = json.dumps(api_record, separators=(", ", ": ")).encode()
-    api_path = directory / "github-job-api-record.json.hex"
-    api_content = api_bytes.hex().encode("ascii") + b"\n"
-    api_path.write_bytes(api_content)
-    evidence_payload = {
-        "api_record_sha256": sha256_hex(api_bytes),
-        "approved_labels": ["Linux", "X64"],
-        "host_numeric_fingerprint": fingerprint,
-        "job_id": job_id,
-        "run_url": api_record["html_url"],
-        "runner_arch": "X64",
-        "runner_os": "Linux",
-        "workflow_commit": commit,
-    }
-    evidence_content = _write_canonical(
-        directory / "native-host-evidence.json",
-        {
-            "kind": "github_hosted",
-            "official_execution_allowed": True,
-            "payload": evidence_payload,
-            "sha256": sha256_hex(canonical_json_bytes(evidence_payload)),
-        },
+    monkeypatch.setattr(host_module, "_run_text", run_text)
+    monkeypatch.setattr(host_module, "_docker_info", docker_values.__getitem__)
+    monkeypatch.setattr(
+        host_module,
+        "collect_host_numeric_fingerprint",
+        lambda: HostNumericFingerprint(
+            architecture="x86_64",
+            cpu_vendor_id="GenuineIntel",
+            cpu_family="6",
+            cpu_model="143",
+            cpu_stepping="8",
+        ),
     )
-    observation_content = _write_canonical(
-        directory / "native-host-observation.json",
-        {
-            "docker_architecture": "x86_64",
-            "docker_os_type": "linux",
-            "docker_server_version": "28.0.4",
-            "github_repository": repository,
-            "github_run_attempt": 1,
-            "github_run_id": run_id,
-            "github_run_url": run_url,
-            "github_sha": commit,
-            "github_workflow_ref": (
-                f"{repository}/.github/workflows/hpa320-native-{phase}.yml@refs/heads/test"
-            ),
-            "host_numeric_fingerprint": fingerprint,
-            "runner_arch": "X64",
-            "runner_os": "Linux",
-            "uname_architecture": "x86_64",
-        },
-    )
-    identities = {
-        "api_record": {
-            "name": api_path.name,
-            "sha256": hashlib.sha256(api_content).hexdigest(),
-            "size": len(api_content),
-        },
-        "native_host_evidence": {
-            "name": "native-host-evidence.json",
-            "sha256": hashlib.sha256(evidence_content).hexdigest(),
-            "size": len(evidence_content),
-        },
-        "native_host_observation": {
-            "name": "native-host-observation.json",
-            "sha256": hashlib.sha256(observation_content).hexdigest(),
-            "size": len(observation_content),
-        },
+
+
+def test_publish_github_host_attestation_binds_the_current_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_same_job_environment(monkeypatch)
+    stub_native_commands(monkeypatch)
+    output = tmp_path / "bootstrap-host-attestation"
+
+    bundle = publish_github_host_attestation(phase="bootstrap", output_directory=output)
+
+    assert {path.name for path in output.iterdir()} == {
+        "attestation-bundle.json",
+        "native-host-evidence.json",
+        "native-host-observation.json",
     }
-    bundle_path = directory / "attestation-bundle.json"
-    _write_canonical(
-        bundle_path,
-        {
-            **identities,
-            "phase": phase,
-            "schema": "crux.oaf-native-host-attestation-bundle/v1",
-        },
+    assert bundle.observation["github_job"] == "native-bootstrap"
+    assert bundle.observation["github_workflow_sha"] == "a" * 40
+    assert bundle.observation["runner_environment"] == "github-hosted"
+    assert bundle.evidence.payload["run_url"].endswith("/actions/runs/123456789")
+    assert (
+        load_native_host_attestation_bundle(
+            output / "attestation-bundle.json",
+            expected_phase="bootstrap",
+        )
+        == bundle
     )
-    return bundle_path, {
-        "api": api_path,
-        "evidence": directory / "native-host-evidence.json",
-        "observation": directory / "native-host-observation.json",
-    }
-
-
-def test_host_attestation_bundle_authenticates_raw_api_and_siblings(tmp_path: Path) -> None:
-    bundle_path, paths = _bundle_fixture(tmp_path)
-
-    bundle = load_native_host_attestation_bundle(bundle_path, expected_phase="bootstrap")
-
-    assert bundle.phase == "bootstrap"
-    assert bundle.api_record.name == paths["api"].name
-    assert bundle.native_host_evidence.name == paths["evidence"].name
-    assert bundle.sha256 == hashlib.sha256(bundle_path.read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize(
-    "mutation",
-    ("odd-hex", "uppercase-hex", "internal-newline", "wrong-hash", "wrong-name"),
+    ("name", "value"),
+    [
+        ("RUNNER_ENVIRONMENT", "self-hosted"),
+        ("RUNNER_ENVIRONMENT_CONTEXT", "self-hosted"),
+        ("RUNNER_OS_CONTEXT", "Windows"),
+        ("RUNNER_ARCH_CONTEXT", "ARM64"),
+        ("GITHUB_JOB", "observe-native-host"),
+        ("WORKFLOW_SOURCE_SHA", "b" * 40),
+    ],
 )
-def test_host_attestation_bundle_rejects_corrupt_siblings(
+def test_publish_github_host_attestation_fails_closed(
     tmp_path: Path,
-    mutation: str,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
 ) -> None:
-    bundle_path, paths = _bundle_fixture(tmp_path)
-    bundle = json.loads(bundle_path.read_bytes())
-    if mutation == "odd-hex":
-        paths["api"].write_bytes(paths["api"].read_bytes()[:-2] + b"\n")
-    elif mutation == "uppercase-hex":
-        paths["api"].write_bytes(paths["api"].read_bytes().upper())
-    elif mutation == "internal-newline":
-        content = paths["api"].read_bytes()
-        paths["api"].write_bytes(content[:10] + b"\n" + content[10:])
-    elif mutation == "wrong-hash":
-        bundle["native_host_evidence"]["sha256"] = "0" * 64
-        _write_canonical(bundle_path, bundle)
-    elif mutation == "wrong-name":
-        bundle["native_host_observation"]["name"] = "observation.json"
-        _write_canonical(bundle_path, bundle)
+    set_same_job_environment(monkeypatch)
+    monkeypatch.setenv(name, value)
+    stub_native_commands(monkeypatch)
+    output = tmp_path / "bootstrap-host-attestation"
 
-    with pytest.raises(HostAttestationError, match="hex|hash|name|identity"):
-        load_native_host_attestation_bundle(bundle_path, expected_phase="bootstrap")
+    with pytest.raises(HostAttestationError):
+        publish_github_host_attestation(phase="bootstrap", output_directory=output)
+
+    assert not output.exists()
 
 
-def test_host_attestation_bundle_rejects_phase_and_api_disagreement(tmp_path: Path) -> None:
-    bundle_path, paths = _bundle_fixture(tmp_path)
+@pytest.mark.parametrize(
+    "name",
+    [
+        "COMMIT_SHA",
+        "GITHUB_JOB",
+        "GITHUB_REPOSITORY",
+        "GITHUB_RUN_ATTEMPT",
+        "GITHUB_RUN_ID",
+        "GITHUB_SERVER_URL",
+        "GITHUB_SHA",
+        "GITHUB_WORKFLOW_REF",
+        "RUNNER_ARCH",
+        "RUNNER_ARCH_CONTEXT",
+        "RUNNER_ENVIRONMENT",
+        "RUNNER_ENVIRONMENT_CONTEXT",
+        "RUNNER_OS",
+        "RUNNER_OS_CONTEXT",
+        "WORKFLOW_SOURCE_SHA",
+    ],
+)
+@pytest.mark.parametrize("missing", [True, False])
+def test_publish_github_host_attestation_requires_every_environment_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    missing: bool,
+) -> None:
+    set_same_job_environment(monkeypatch)
+    if missing:
+        monkeypatch.delenv(name)
+    else:
+        monkeypatch.setenv(name, "")
+    stub_native_commands(monkeypatch)
 
-    with pytest.raises(HostAttestationError, match="phase"):
-        load_native_host_attestation_bundle(bundle_path, expected_phase="measurement")
+    with pytest.raises(HostAttestationError):
+        publish_github_host_attestation(
+            phase="bootstrap",
+            output_directory=tmp_path / "bootstrap-host-attestation",
+        )
 
-    api_bytes = bytes.fromhex(paths["api"].read_text(encoding="ascii").strip())
-    api_record = json.loads(api_bytes)
-    api_record["conclusion"] = "failure"
-    changed = json.dumps(api_record, separators=(", ", ": ")).encode()
-    paths["api"].write_bytes(changed.hex().encode() + b"\n")
-    bundle = json.loads(bundle_path.read_bytes())
-    api_content = paths["api"].read_bytes()
-    bundle["api_record"]["sha256"] = hashlib.sha256(api_content).hexdigest()
-    bundle["api_record"]["size"] = len(api_content)
-    _write_canonical(bundle_path, bundle)
 
-    with pytest.raises(HostAttestationError, match="successful|completed"):
-        load_native_host_attestation_bundle(bundle_path, expected_phase="bootstrap")
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("RUNNER_ENVIRONMENT", "self-hosted"),
+        ("RUNNER_ENVIRONMENT_CONTEXT", "self-hosted"),
+        ("RUNNER_OS", "Windows"),
+        ("RUNNER_OS_CONTEXT", "Windows"),
+        ("RUNNER_ARCH", "ARM64"),
+        ("RUNNER_ARCH_CONTEXT", "ARM64"),
+    ],
+)
+def test_publish_github_host_attestation_rejects_runner_context_disagreement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+) -> None:
+    set_same_job_environment(monkeypatch)
+    monkeypatch.setenv(name, value)
+    stub_native_commands(monkeypatch)
+
+    with pytest.raises(HostAttestationError):
+        publish_github_host_attestation(
+            phase="bootstrap",
+            output_directory=tmp_path / "bootstrap-host-attestation",
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("GITHUB_REPOSITORY", "other/Crux"),
+        (
+            "GITHUB_WORKFLOW_REF",
+            "cwchanap/Crux/.github/workflows/hpa320-native-measurement.yml@refs/tags/native-v2",
+        ),
+        ("GITHUB_RUN_ID", "0"),
+        ("GITHUB_RUN_ATTEMPT", "0"),
+        ("GITHUB_SERVER_URL", "https://github.example"),
+        ("GITHUB_SHA", "b" * 40),
+        ("COMMIT_SHA", "b" * 40),
+    ],
+)
+def test_publish_github_host_attestation_rejects_wrong_execution_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+) -> None:
+    set_same_job_environment(monkeypatch)
+    monkeypatch.setenv(name, value)
+    stub_native_commands(monkeypatch)
+
+    with pytest.raises(HostAttestationError):
+        publish_github_host_attestation(
+            phase="bootstrap",
+            output_directory=tmp_path / "bootstrap-host-attestation",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("OSType", "darwin"), ("Architecture", "arm64"), ("ServerVersion", "")],
+)
+def test_publish_github_host_attestation_rejects_wrong_docker_facts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+) -> None:
+    set_same_job_environment(monkeypatch)
+    stub_native_commands(monkeypatch)
+    original_docker_info = host_module._docker_info
+
+    def docker_info(name: str) -> str:
+        return value if name == field else original_docker_info(name)
+
+    monkeypatch.setattr(host_module, "_docker_info", docker_info)
+
+    with pytest.raises(HostAttestationError):
+        publish_github_host_attestation(
+            phase="bootstrap",
+            output_directory=tmp_path / "bootstrap-host-attestation",
+        )
+
+
+def test_publish_github_host_attestation_never_replaces_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_same_job_environment(monkeypatch)
+    stub_native_commands(monkeypatch)
+    output = tmp_path / "bootstrap-host-attestation"
+    output.mkdir()
+    sentinel = output / "sentinel"
+    sentinel.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(HostAttestationError):
+        publish_github_host_attestation(phase="bootstrap", output_directory=output)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert {path.name for path in output.iterdir()} == {"sentinel"}
+
+
+def test_publish_github_host_attestation_cleans_unpublished_staging_on_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_same_job_environment(monkeypatch)
+    stub_native_commands(monkeypatch)
+    output = tmp_path / "bootstrap-host-attestation"
+    original_write = host_module._write_new_regular_file
+    writes = 0
+
+    def fail_second_write(path: Path, content: bytes) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise OSError("injected write failure")
+        original_write(path, content)
+
+    monkeypatch.setattr(host_module, "_write_new_regular_file", fail_second_write)
+
+    with pytest.raises(HostAttestationError):
+        publish_github_host_attestation(phase="bootstrap", output_directory=output)
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".bootstrap-host-attestation.*"))
+
+
+def test_host_attestation_cli_only_accepts_same_job_publication() -> None:
+    parser = host_module._parser()
+
+    arguments = parser.parse_args(["publish-github", "--phase", "bootstrap", "--output", "bundle"])
+
+    assert arguments.command == "publish-github"
+    assert arguments.phase == "bootstrap"
+    assert arguments.output == Path("bundle")
+    with pytest.raises(SystemExit):
+        parser.parse_args(["observe-github", "--output", "bundle"])

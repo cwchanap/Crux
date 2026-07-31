@@ -20,6 +20,7 @@ from src.benchmark.backend_publication import (
     open_directory_anchor,
     publish_immutable_bytes,
     read_regular_file_no_follow,
+    rename_directory_no_replace,
 )
 
 
@@ -39,6 +40,32 @@ def test_immutable_publication_uses_expected_bytes_hash_and_role(tmp_path: Path)
     assert published.sha256 == sha256_hex(content)
     assert destination.read_bytes() == content
     assert stat.S_ISREG(destination.lstat().st_mode)
+
+
+def test_rename_directory_no_replace_publishes_once(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "evidence.json").write_text("{}\n", encoding="utf-8")
+    destination = tmp_path / "published"
+
+    rename_directory_no_replace(source, destination)
+
+    assert not source.exists()
+    assert (destination / "evidence.json").read_bytes() == b"{}\n"
+
+
+def test_rename_directory_no_replace_never_replaces_existing_target(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "published"
+    source.mkdir()
+    destination.mkdir()
+    (destination / "sentinel").write_text("keep", encoding="utf-8")
+
+    with pytest.raises(ArtifactPublicationError):
+        rename_directory_no_replace(source, destination)
+
+    assert (destination / "sentinel").read_text(encoding="utf-8") == "keep"
+    assert source.is_dir()
 
 
 @pytest.mark.parametrize("raise_inside", [False, True])
