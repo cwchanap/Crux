@@ -6,8 +6,11 @@ import argparse
 import ctypes
 import errno
 import hashlib
+import json
 import os
+import re
 import stat
+import subprocess
 import sys
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
@@ -208,10 +211,200 @@ _CHUNK_SIZE = 1024 * 1024
 _MANIFEST_MAX_BYTES = 1024 * 1024
 _SCAN_CHUNK_HOOK: Callable[[Path], None] | None = None
 _ARCHIVE_CHUNK_HOOK: Callable[[Path], None] | None = None
+_GH_VERSION = re.compile(r"gh version ([0-9]+)\.([0-9]+)\.([0-9]+)(?:\s.*)?\Z")
+_WORKFLOW_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 
 
 class NativeArtifactError(ValueError):
     """The native work-artifact payload or manifest is unsafe or inconsistent."""
+
+
+@dataclass(frozen=True)
+class VerifiedGitHubAttestation:
+    """The one statement jointly verified for an immutable work-artifact pair."""
+
+    gh_version: str
+    statement: Mapping[str, JsonValue]
+    statement_sha256: str
+    subjects: tuple[CheckpointIdentity, ...]
+
+
+def _run_checked_command(command: tuple[str, ...]) -> bytes:
+    completed = subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if completed.returncode != 0:
+        raise NativeArtifactError("GitHub attestation command failed")
+    if not isinstance(completed.stdout, bytes):
+        raise NativeArtifactError("GitHub attestation command did not produce bytes")
+    return completed.stdout
+
+
+def verify_github_attestations(
+    *,
+    phase: str,
+    workflow_commit: str,
+    manifest_path: Path,
+    archive_path: Path,
+    sigstore_bundle_path: Path,
+    trusted_root_path: Path,
+    command_runner: Callable[[tuple[str, ...]], bytes] = _run_checked_command,
+) -> VerifiedGitHubAttestation:
+    """Verify both signed subjects under the frozen GitHub policy."""
+
+    if phase not in PHASE_HOST_BUNDLE_PATHS:
+        raise NativeArtifactError("native work attestation phase is invalid")
+    if _WORKFLOW_COMMIT.fullmatch(workflow_commit) is None:
+        raise NativeArtifactError("native work attestation workflow commit is invalid")
+    try:
+        gh_version = _supported_gh_version(command_runner(("gh", "version")))
+        subjects = _attestation_subjects(
+            phase=phase,
+            workflow_commit=workflow_commit,
+            manifest_path=Path(manifest_path),
+            archive_path=Path(archive_path),
+        )
+        policy = (
+            "--repo",
+            "cwchanap/Crux",
+            "--signer-workflow",
+            f"cwchanap/Crux/.github/workflows/hpa320-native-{phase}.yml",
+            "--source-digest",
+            workflow_commit,
+            "--signer-digest",
+            workflow_commit,
+            "--deny-self-hosted-runners",
+            "--digest-alg",
+            "sha256",
+            "--predicate-type",
+            "https://slsa.dev/provenance/v1",
+            "--cert-oidc-issuer",
+            "https://token.actions.githubusercontent.com",
+            "--bundle",
+            str(sigstore_bundle_path),
+            "--custom-trusted-root",
+            str(trusted_root_path),
+            "--format",
+            "json",
+        )
+        statements = tuple(
+            _verification_statement(
+                command_runner(("gh", "attestation", "verify", str(path), *policy))
+            )
+            for path in (Path(manifest_path), Path(archive_path))
+        )
+    except NativeArtifactError:
+        raise
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError) as error:
+        raise NativeArtifactError("GitHub attestation verification failed") from error
+    first, second = statements
+    first_content = canonical_json_bytes(first)
+    if first_content != canonical_json_bytes(second):
+        raise NativeArtifactError("GitHub attestation statements disagree")
+    _validate_attestation_subjects(first, subjects)
+    return VerifiedGitHubAttestation(
+        gh_version=gh_version,
+        statement=first,
+        statement_sha256=hashlib.sha256(first_content).hexdigest(),
+        subjects=subjects,
+    )
+
+
+def _supported_gh_version(output: bytes) -> str:
+    try:
+        first_line = output.decode("utf-8", errors="strict").splitlines()[0]
+    except (IndexError, UnicodeDecodeError) as error:
+        raise NativeArtifactError("GitHub CLI version output is invalid") from error
+    match = _GH_VERSION.fullmatch(first_line)
+    if match is None:
+        raise NativeArtifactError("GitHub CLI version output is invalid")
+    version = tuple(int(part) for part in match.groups())
+    if version < (2, 68, 0) or version >= (3, 0, 0):
+        raise NativeArtifactError("GitHub CLI must satisfy 2.68.0 <= gh < 3.0.0")
+    return ".".join(match.groups())
+
+
+def _attestation_subjects(
+    *,
+    phase: str,
+    workflow_commit: str,
+    manifest_path: Path,
+    archive_path: Path,
+) -> tuple[CheckpointIdentity, ...]:
+    paths_and_names = (
+        (
+            manifest_path,
+            f"artifacts/benchmark/backends/hpa320-{phase}/{MANIFEST_NAME}",
+        ),
+        (
+            archive_path,
+            f"artifacts/benchmark/backends/hpa320-native-{phase}-{workflow_commit}.tar",
+        ),
+    )
+    subjects: list[CheckpointIdentity] = []
+    for path, name in paths_and_names:
+        try:
+            content = read_regular_file_no_follow(path)
+        except OSError as error:
+            raise NativeArtifactError("GitHub attestation subject is missing or unsafe") from error
+        subjects.append(
+            CheckpointIdentity(
+                name=name,
+                sha256=hashlib.sha256(content).hexdigest(),
+                size=len(content),
+            )
+        )
+    return tuple(subjects)
+
+
+def _verification_statement(content: bytes) -> dict[str, JsonValue]:
+    try:
+        value = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise NativeArtifactError(
+            "GitHub attestation verification result is invalid JSON"
+        ) from error
+    if not isinstance(value, list) or len(value) != 1:
+        raise NativeArtifactError("GitHub attestation verification result must have one entry")
+    result = value[0]
+    if not isinstance(result, dict) or "verificationResult" not in result:
+        raise NativeArtifactError("GitHub attestation verification result fields are invalid")
+    verification = result["verificationResult"]
+    if not isinstance(verification, dict) or "statement" not in verification:
+        raise NativeArtifactError("GitHub attestation statement is missing")
+    statement = verification["statement"]
+    if not isinstance(statement, dict):
+        raise NativeArtifactError("GitHub attestation statement is invalid")
+    return cast(dict[str, JsonValue], statement)
+
+
+def _validate_attestation_subjects(
+    statement: Mapping[str, JsonValue],
+    expected: tuple[CheckpointIdentity, ...],
+) -> None:
+    subjects = statement.get("subject")
+    if not isinstance(subjects, list) or len(subjects) != len(expected):
+        raise NativeArtifactError("GitHub attestation subjects are invalid")
+    actual: list[tuple[str, str]] = []
+    for subject in subjects:
+        if not isinstance(subject, dict) or set(subject) != {"name", "digest"}:
+            raise NativeArtifactError("GitHub attestation subject fields are invalid")
+        name = subject["name"]
+        digest = subject["digest"]
+        if (
+            not isinstance(name, str)
+            or not isinstance(digest, dict)
+            or set(digest) != {"sha256"}
+            or not isinstance(digest["sha256"], str)
+        ):
+            raise NativeArtifactError("GitHub attestation subject identity is invalid")
+        actual.append((name, digest["sha256"]))
+    expected_identities = [(subject.name, subject.sha256) for subject in expected]
+    if actual != expected_identities:
+        raise NativeArtifactError("GitHub attestation subjects do not match local artifacts")
 
 
 @dataclass(frozen=True)
@@ -1790,6 +1983,16 @@ def _parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--payload-root", required=True, type=Path)
     verify_parser.add_argument("--archive", required=True, type=Path)
     verify_parser.add_argument("--bundle", type=Path)
+    attestation_parser = subparsers.add_parser("verify-attestation")
+    attestation_parser.add_argument(
+        "--phase", required=True, choices=tuple(PHASE_HOST_BUNDLE_PATHS)
+    )
+    attestation_parser.add_argument("--workflow-commit", required=True)
+    attestation_parser.add_argument("--payload-root", required=True, type=Path)
+    attestation_parser.add_argument("--archive", required=True, type=Path)
+    attestation_parser.add_argument("--bundle", required=True, type=Path)
+    attestation_parser.add_argument("--trusted-root", required=True, type=Path)
+    attestation_parser.add_argument("--repository-root", required=True, type=Path)
     copy_parser = subparsers.add_parser("copy-bundle")
     copy_parser.add_argument("--source", required=True, type=Path)
     copy_parser.add_argument("--destination", required=True, type=Path)
@@ -1831,6 +2034,29 @@ def main(argv: list[str] | None = None) -> int:
             )
             if arguments.bundle is not None:
                 _verify_optional_attestation_bundle(arguments.bundle)
+        elif arguments.command == "verify-attestation":
+            manifest_path = arguments.payload_root / MANIFEST_NAME
+            verified = verify_github_attestations(
+                phase=arguments.phase,
+                workflow_commit=arguments.workflow_commit,
+                manifest_path=manifest_path,
+                archive_path=arguments.archive,
+                sigstore_bundle_path=arguments.bundle,
+                trusted_root_path=arguments.trusted_root,
+            )
+            load_native_work_manifest(manifest_path, expected_phase=arguments.phase)
+            verify_native_work_archive(
+                phase=arguments.phase,
+                payload_root=arguments.payload_root,
+                manifest_path=manifest_path,
+                archive_path=arguments.archive,
+            )
+            _validate_native_work_phase(
+                phase=arguments.phase,
+                payload_root=arguments.payload_root,
+                repository_root=arguments.repository_root,
+            )
+            _write_attestation_review_report(arguments, verified)
         elif arguments.command == "copy-bundle":
             copy_attestation_bundle(source=arguments.source, destination=arguments.destination)
         else:
@@ -1839,6 +2065,48 @@ def main(argv: list[str] | None = None) -> int:
         print(str(error), file=sys.stderr)
         return 2
     return 0
+
+
+def _validate_native_work_phase(
+    *,
+    phase: str,
+    payload_root: Path,
+    repository_root: Path,
+) -> None:
+    try:
+        from tools.hpa320.seal_oaf_backend import validate_native_work_phase
+
+        validate_native_work_phase(
+            phase=phase,
+            payload_root=payload_root,
+            repository_root=repository_root,
+        )
+    except ValueError as error:
+        raise NativeArtifactError("native work phase acceptance failed") from error
+
+
+def _write_attestation_review_report(
+    arguments: argparse.Namespace,
+    verified: VerifiedGitHubAttestation,
+) -> None:
+    report: JsonValue = {
+        "arguments": {
+            "archive": str(arguments.archive),
+            "bundle": str(arguments.bundle),
+            "payload_root": str(arguments.payload_root),
+            "phase": arguments.phase,
+            "repository_root": str(arguments.repository_root),
+            "trusted_root": str(arguments.trusted_root),
+            "workflow_commit": arguments.workflow_commit,
+        },
+        "gh_version": verified.gh_version,
+        "statement_sha256": verified.statement_sha256,
+        "subjects": [
+            {"name": subject.name, "sha256": subject.sha256, "size": subject.size}
+            for subject in verified.subjects
+        ],
+    }
+    sys.stdout.buffer.write(canonical_json_bytes(report, trailing_newline=True))
 
 
 def _verify_optional_attestation_bundle(path: Path) -> None:

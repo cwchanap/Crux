@@ -8,9 +8,11 @@ import importlib.util
 import json
 import os
 import platform
+import shutil
 import stat
 import subprocess
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, Callable
@@ -1099,6 +1101,315 @@ def _build_candidate(
         },
     )
     return candidate, audit_path
+
+
+@dataclass(frozen=True)
+class NativePhasePayload:
+    root: Path
+    repository_root: Path
+    mutate: Callable[[str], None]
+
+
+_BOOTSTRAP_REQUEST_RELATIVE = Path(
+    "config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.calibration-bootstrap-request.json"
+)
+_CHECKPOINT_REQUEST_RELATIVE = Path(
+    "config/benchmark/backends/"
+    "magenta-egmd-tf1-94529798-8hit-v1.checkpoint-acquisition-request.json"
+)
+_BASE_SYSTEM_REQUEST_RELATIVE = Path("runtime/oaf_tf1/base-system-package-request.json")
+_MEASUREMENT_REQUEST_RELATIVE = Path(
+    "config/benchmark/backends/"
+    "magenta-egmd-tf1-94529798-8hit-v1.calibration-measurement-request.json"
+)
+
+
+def _copy_host_bundle(bundle: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "attestation-bundle.json",
+        "native-host-evidence.json",
+        "native-host-observation.json",
+    ):
+        shutil.copyfile(bundle.parent / name, destination / name)
+
+
+def _phase_bootstrap_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Path]:
+    (
+        measurement_request,
+        bootstrap_request,
+        bootstrap_evidence,
+        measurement_bundle,
+        measurement_host,
+        cache,
+        checkpoint,
+        base,
+        measurement,
+    ) = _calibration_inputs(tmp_path, monkeypatch)
+    repository = bootstrap_request.parents[3]
+    source_root = Path.cwd()
+    for relative in (_CHECKPOINT_REQUEST_RELATIVE, _BASE_SYSTEM_REQUEST_RELATIVE):
+        destination = repository / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_root / relative, destination)
+
+    bootstrap_request_payload = json.loads(bootstrap_request.read_bytes())
+    bootstrap_request_payload["base_system_package_request_sha256"] = _content_hash(
+        repository / _BASE_SYSTEM_REQUEST_RELATIVE
+    )
+    bootstrap_request_payload["checkpoint_acquisition_request_sha256"] = _content_hash(
+        repository / _CHECKPOINT_REQUEST_RELATIVE
+    )
+    _write_json(bootstrap_request, bootstrap_request_payload)
+
+    bootstrap_evidence_payload = json.loads(bootstrap_evidence.read_bytes())
+    bootstrap_evidence_payload["calibration_bootstrap_request_sha256"] = _content_hash(
+        bootstrap_request
+    )
+    bootstrap_image = tmp_path / "bootstrap-image"
+    bootstrap_image.mkdir()
+    archive = bootstrap_image / "runtime.oci.tar"
+    archive.write_bytes(b"bootstrap OCI archive\n")
+    layout = bootstrap_image / "oci-layout-manifest.json"
+    layout.write_bytes(
+        canonical_json_bytes({"schema": "crux.test-oci-layout/v1"}, trailing_newline=True)
+    )
+    bootstrap_evidence_payload["oci_layout_archive"] = {
+        "name": archive.name,
+        "sha256": _content_hash(archive),
+        "size": archive.stat().st_size,
+    }
+    bootstrap_evidence_payload["oci_layout_manifest_sha256"] = _content_hash(layout)
+    _write_json(bootstrap_evidence, bootstrap_evidence_payload)
+
+    bootstrap_bundle = (
+        bootstrap_evidence.parent / "bootstrap-host-attestation/attestation-bundle.json"
+    )
+    return {
+        "base": base,
+        "archive": archive,
+        "bootstrap_bundle": bootstrap_bundle,
+        "bootstrap_evidence": bootstrap_evidence,
+        "bootstrap_request": bootstrap_request,
+        "cache": cache,
+        "checkpoint": checkpoint,
+        "measurement": measurement,
+        "measurement_bundle": measurement_bundle,
+        "measurement_host": measurement_host,
+        "measurement_request": measurement_request,
+        "layout": layout,
+        "repository": repository,
+    }
+
+
+def _phase_bootstrap_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> NativePhasePayload:
+    inputs = _phase_bootstrap_inputs(tmp_path, monkeypatch)
+    root = tmp_path / "bootstrap-payload"
+    _copy_host_bundle(inputs["bootstrap_bundle"], root / "bootstrap-host-attestation")
+    shutil.copyfile(inputs["checkpoint"], root / "checkpoint-acquisition-evidence.json")
+    shutil.copyfile(inputs["base"], root / "base-system-package-evidence.json")
+    image = root / "calibration-image"
+    image.mkdir(parents=True)
+    archive = image / "runtime.oci.tar"
+    layout = image / "oci-layout-manifest.json"
+    shutil.copyfile(inputs["archive"], archive)
+    shutil.copyfile(inputs["layout"], layout)
+    shutil.copyfile(inputs["bootstrap_evidence"], image / "calibration-bootstrap-evidence.json")
+
+    def mutate(name: str) -> None:
+        if name == "checkpoint_request_hash":
+            path = inputs["bootstrap_request"]
+            payload = json.loads(path.read_bytes())
+            payload["checkpoint_acquisition_request_sha256"] = "0" * 64
+        elif name == "base_system_request_hash":
+            path = inputs["bootstrap_request"]
+            payload = json.loads(path.read_bytes())
+            payload["base_system_package_request_sha256"] = "0" * 64
+        elif name == "bootstrap_image_identity":
+            path = layout
+            payload = {"schema": "crux.test-oci-layout/v1", "changed": True}
+        else:
+            raise AssertionError(f"unexpected bootstrap mutation: {name}")
+        _write_json(path, payload)
+
+    return NativePhasePayload(root=root, repository_root=inputs["repository"], mutate=mutate)
+
+
+def _phase_measurement_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> NativePhasePayload:
+    inputs = _phase_bootstrap_inputs(tmp_path, monkeypatch)
+    measurement_request_payload = json.loads(inputs["measurement_request"].read_bytes())
+    measurement_request_payload["calibration_bootstrap_evidence_sha256"] = _content_hash(
+        inputs["bootstrap_evidence"]
+    )
+    measurement_request_payload["calibration_bootstrap_request_sha256"] = _content_hash(
+        inputs["bootstrap_request"]
+    )
+    _write_json(inputs["measurement_request"], measurement_request_payload)
+    repository_measurement_request = inputs["repository"] / _MEASUREMENT_REQUEST_RELATIVE
+    _write_json(repository_measurement_request, measurement_request_payload)
+    shutil.copyfile(inputs["base"], inputs["repository"] / "base-system-package-evidence.json")
+    seal_module.measure(
+        request_path=repository_measurement_request,
+        bootstrap_request_path=inputs["bootstrap_request"],
+        bootstrap_evidence_path=inputs["bootstrap_evidence"],
+        host_attestation_bundle_path=inputs["measurement_bundle"],
+        host_evidence_path=inputs["measurement_host"],
+        model_cache=inputs["cache"],
+        checkpoint_evidence_path=inputs["checkpoint"],
+        base_system_evidence_path=inputs["base"],
+        output_path=inputs["measurement"],
+        runner=lambda _request, frame, repetition: _fake_measurement_row(frame, repetition),
+    )
+
+    root = tmp_path / "measurement-payload"
+    _copy_host_bundle(inputs["measurement_bundle"], root / "measurement-host-attestation")
+    shutil.copyfile(inputs["checkpoint"], root / "operational-checkpoint-acquisition-evidence.json")
+    image = root / "operational-image"
+    image.mkdir(parents=True)
+    shutil.copyfile(inputs["bootstrap_evidence"], image / "calibration-bootstrap-evidence.json")
+    shutil.copyfile(inputs["archive"], image / "runtime.oci.tar")
+    shutil.copyfile(inputs["layout"], image / "oci-layout-manifest.json")
+    shutil.copyfile(inputs["measurement"], root / "calibration-measurement-evidence.json")
+
+    def mutate(name: str) -> None:
+        path = root / "calibration-measurement-evidence.json"
+        payload = json.loads(path.read_bytes())
+        if name == "bootstrap_evidence_hash":
+            payload["calibration_bootstrap_evidence_sha256"] = "0" * 64
+        elif name == "measurement_request_hash":
+            payload["request_sha256"] = "0" * 64
+        elif name == "host_bundle_hash":
+            payload["native_host_attestation_bundle_sha256"] = "0" * 64
+        else:
+            raise AssertionError(f"unexpected measurement mutation: {name}")
+        _write_json(path, payload)
+
+    return NativePhasePayload(root=root, repository_root=inputs["repository"], mutate=mutate)
+
+
+def _phase_candidate_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> NativePhasePayload:
+    measurement = _phase_measurement_payload(tmp_path, monkeypatch)
+    repository = measurement.repository_root
+    source_fixture_root = _make_repository(tmp_path / "candidate-source")
+    for relative in (*HOST_PATHS, *[path for path, _field in seal_module._HASH_FIELDS]):
+        source = source_fixture_root / relative
+        destination = repository / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+    bootstrap_request = repository / _BOOTSTRAP_REQUEST_RELATIVE
+    bootstrap_request_payload = json.loads(bootstrap_request.read_bytes())
+    for relative, field in seal_module._BOOTSTRAP_HASH_FIELDS:
+        bootstrap_request_payload[field] = _content_hash(repository / relative)
+    _write_json(bootstrap_request, bootstrap_request_payload)
+    bootstrap_evidence = measurement.root / "operational-image/calibration-bootstrap-evidence.json"
+    bootstrap_evidence_payload = json.loads(bootstrap_evidence.read_bytes())
+    bootstrap_evidence_payload["calibration_bootstrap_request_sha256"] = _content_hash(
+        bootstrap_request
+    )
+    _write_json(bootstrap_evidence, bootstrap_evidence_payload)
+    candidate, _audit = _build_candidate(repository)
+
+    root = tmp_path / "candidate-payload"
+    shutil.copytree(candidate, root / "seal-candidate")
+    nested_host = (
+        root / "seal-candidate" / CANDIDATE_ARTIFACT_PATHS["native_host_attestation_bundle"]
+    )
+    _copy_host_bundle(nested_host, root / "candidate-host-attestation")
+    for relative in (
+        "operational-checkpoint-acquisition-evidence.json",
+        "operational-image/calibration-bootstrap-evidence.json",
+        "operational-image/oci-layout-manifest.json",
+        "operational-image/runtime.oci.tar",
+    ):
+        source = measurement.root / relative
+        destination = root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+
+    def mutate(name: str) -> None:
+        path = root / "seal-candidate/candidate-manifest.json"
+        payload = json.loads(path.read_bytes())
+        if name == "candidate_manifest_hash":
+            payload["seal_evidence_payload_sha256"] = "0" * 64
+        elif name == "runtime_lock_hash":
+            payload["runtime_lock_payload_sha256"] = "0" * 64
+        elif name == "backend_lock_hash":
+            payload["backend_lock_payload_sha256"] = "0" * 64
+        elif name == "host_bundle_hash":
+            payload["native_host_attestation_bundle_sha256"] = "0" * 64
+        else:
+            raise AssertionError(f"unexpected candidate mutation: {name}")
+        _write_json(path, payload)
+
+    return NativePhasePayload(root=root, repository_root=repository, mutate=mutate)
+
+
+@pytest.fixture
+def native_phase_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[str], NativePhasePayload]:
+    _set_native_host(monkeypatch)
+    monkeypatch.setattr(seal_module, "_require_imported_runtime_image", lambda _digest: None)
+    factories = {
+        "bootstrap": _phase_bootstrap_payload,
+        "measurement": _phase_measurement_payload,
+        "candidate": _phase_candidate_payload,
+    }
+
+    def build(phase: str) -> NativePhasePayload:
+        payload = factories[phase](tmp_path / phase, monkeypatch)
+        seal_module.validate_native_work_phase(
+            phase=phase,
+            payload_root=payload.root,
+            repository_root=payload.repository_root,
+        )
+        return payload
+
+    return build
+
+
+@pytest.mark.parametrize(
+    ("phase", "mutation"),
+    [
+        ("bootstrap", "checkpoint_request_hash"),
+        ("bootstrap", "base_system_request_hash"),
+        ("bootstrap", "bootstrap_image_identity"),
+        ("measurement", "bootstrap_evidence_hash"),
+        ("measurement", "measurement_request_hash"),
+        ("measurement", "host_bundle_hash"),
+        ("candidate", "candidate_manifest_hash"),
+        ("candidate", "runtime_lock_hash"),
+        ("candidate", "backend_lock_hash"),
+        ("candidate", "host_bundle_hash"),
+    ],
+)
+def test_native_work_phase_gate_rejects_internal_inconsistency(
+    native_phase_payload: Callable[[str], NativePhasePayload],
+    phase: str,
+    mutation: str,
+) -> None:
+    payload = native_phase_payload(phase)
+    payload.mutate(mutation)
+
+    with pytest.raises(SealError):
+        seal_module.validate_native_work_phase(
+            phase=phase,
+            payload_root=payload.root,
+            repository_root=payload.repository_root,
+        )
 
 
 def test_seal_candidate_accepts_v2_and_rejects_former_v1_schema(

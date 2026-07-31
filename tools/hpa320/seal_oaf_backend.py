@@ -270,6 +270,13 @@ _CHECKPOINT_REQUEST_PATH = Path(
     "config/benchmark/backends/"
     "magenta-egmd-tf1-94529798-8hit-v1.checkpoint-acquisition-request.json"
 )
+_CALIBRATION_BOOTSTRAP_REQUEST_PATH = Path(
+    "config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.calibration-bootstrap-request.json"
+)
+_CALIBRATION_MEASUREMENT_REQUEST_PATH = Path(
+    "config/benchmark/backends/"
+    "magenta-egmd-tf1-94529798-8hit-v1.calibration-measurement-request.json"
+)
 _BASE_SYSTEM_REQUEST_PATH = Path("runtime/oaf_tf1/base-system-package-request.json")
 _HASH_FIELDS = (
     (
@@ -2840,6 +2847,213 @@ def bootstrap_image(
         output=output,
         repository_root=repository_root,
     )
+
+
+def validate_native_work_phase(
+    *,
+    phase: str,
+    payload_root: Path,
+    repository_root: Path,
+) -> None:
+    """Apply the selected phase's existing request/evidence/content validation."""
+
+    try:
+        validator = _PHASE_VALIDATORS[phase]
+    except KeyError as error:
+        raise SealError("native work phase is invalid") from error
+    try:
+        validator(payload_root=Path(payload_root), repository_root=Path(repository_root))
+    except SealError:
+        raise
+    except (CheckpointAcquisitionError, HostAttestationError, OSError, SystemPackageError) as error:
+        raise SealError(f"{phase} native work payload is invalid: {error}") from None
+
+
+def _validate_bootstrap_work_payload(*, payload_root: Path, repository_root: Path) -> None:
+    _validate_bootstrap_authority(
+        payload_root=payload_root,
+        repository_root=repository_root,
+        phase="bootstrap",
+        checkpoint_evidence_name="checkpoint-acquisition-evidence.json",
+        image_directory_name="calibration-image",
+        host_directory_name="bootstrap-host-attestation",
+    )
+
+
+def _validate_measurement_work_payload(*, payload_root: Path, repository_root: Path) -> None:
+    bootstrap, checkpoint, base, bundle, host, host_payload = _validate_bootstrap_authority(
+        payload_root=payload_root,
+        repository_root=repository_root,
+        phase="measurement",
+        checkpoint_evidence_name="operational-checkpoint-acquisition-evidence.json",
+        image_directory_name="operational-image",
+        host_directory_name="measurement-host-attestation",
+    )
+    _validate_measurement_authority(
+        payload_root=payload_root,
+        repository_root=repository_root,
+        bootstrap=bootstrap,
+        checkpoint=checkpoint,
+        base=base,
+        bundle=bundle,
+        host=host,
+        host_payload=host_payload,
+    )
+
+
+def _validate_candidate_work_payload(*, payload_root: Path, repository_root: Path) -> None:
+    _validate_bootstrap_authority(
+        payload_root=payload_root,
+        repository_root=repository_root,
+        phase="candidate",
+        checkpoint_evidence_name="operational-checkpoint-acquisition-evidence.json",
+        image_directory_name="operational-image",
+        host_directory_name="candidate-host-attestation",
+    )
+    _load_candidate(candidate=payload_root / "seal-candidate", repository_root=repository_root)
+    _require_matching_candidate_host_files(payload_root)
+
+
+def _validate_bootstrap_authority(
+    *,
+    payload_root: Path,
+    repository_root: Path,
+    phase: str,
+    checkpoint_evidence_name: str,
+    image_directory_name: str,
+    host_directory_name: str,
+) -> tuple[
+    CalibrationBootstrapEvidence,
+    CheckpointAcquisitionEvidence,
+    BaseSystemPackageEvidence,
+    NativeHostAttestationBundle,
+    NativeHostEvidence,
+    dict[str, JsonValue],
+]:
+    root = _require_directory(payload_root, "native work payload root")
+    repository = _require_directory(repository_root, "repository root")
+    bootstrap_request, bootstrap, bundle, host, host_payload = _authenticate_bootstrap_for_phase(
+        bootstrap_request_path=repository / _CALIBRATION_BOOTSTRAP_REQUEST_PATH,
+        bootstrap_evidence_path=root / image_directory_name / "calibration-bootstrap-evidence.json",
+        host_attestation_bundle_path=(root / host_directory_name / "attestation-bundle.json"),
+        host_evidence_path=root / host_directory_name / "native-host-evidence.json",
+        phase=phase,
+    )
+    _validate_bootstrap_image_files(
+        image_directory=root / image_directory_name,
+        bootstrap=bootstrap,
+    )
+    checkpoint_request = load_checkpoint_acquisition_request(repository / _CHECKPOINT_REQUEST_PATH)
+    checkpoint = load_checkpoint_acquisition_evidence(
+        root / checkpoint_evidence_name,
+        request=checkpoint_request,
+    )
+    base_request = load_base_system_package_request(repository / _BASE_SYSTEM_REQUEST_PATH)
+    base_path = root / "base-system-package-evidence.json"
+    if phase != "bootstrap":
+        base_path = repository / "base-system-package-evidence.json"
+    base = load_base_system_package_evidence(base_path, request=base_request)
+    if (
+        bootstrap_request.payload["checkpoint_acquisition_request_sha256"]
+        != checkpoint_request.sha256
+        or bootstrap_request.payload["base_system_package_request_sha256"] != base_request.sha256
+    ):
+        raise SealError("bootstrap request does not bind its operational authorities")
+    bootstrap_host = _native_host_from_record(
+        bootstrap.payload["native_host_evidence"],
+        "bootstrap native host evidence",
+    )
+    if not _same_native_host(base.native_host_evidence, bootstrap_host):
+        raise SealError("base-system evidence does not match bootstrap host authority")
+    return bootstrap, checkpoint, base, bundle, host, host_payload
+
+
+def _validate_measurement_authority(
+    *,
+    payload_root: Path,
+    repository_root: Path,
+    bootstrap: CalibrationBootstrapEvidence,
+    checkpoint: CheckpointAcquisitionEvidence,
+    base: BaseSystemPackageEvidence,
+    bundle: NativeHostAttestationBundle,
+    host: NativeHostEvidence,
+    host_payload: dict[str, JsonValue],
+) -> None:
+    repository = _require_directory(repository_root, "repository root")
+    request = load_calibration_measurement_request(
+        repository / _CALIBRATION_MEASUREMENT_REQUEST_PATH
+    )
+    payload, _rows, _sha256 = _load_measurement_evidence(
+        payload_root / "calibration-measurement-evidence.json",
+        request,
+    )
+    if (
+        payload["calibration_bootstrap_evidence_sha256"] != bootstrap.sha256
+        or payload["checkpoint_acquisition_evidence_sha256"] != checkpoint.sha256
+        or payload["base_system_package_evidence_sha256"] != base.sha256
+        or payload["native_host_attestation_bundle_sha256"] != bundle.sha256
+        or payload["native_host_evidence"] != host_payload
+        or not _same_native_host(
+            _native_host_from_record(payload["native_host_evidence"], "measurement native host"),
+            host,
+        )
+    ):
+        raise SealError("measurement evidence does not bind its operational authorities")
+
+
+def _validate_bootstrap_image_files(
+    *,
+    image_directory: Path,
+    bootstrap: CalibrationBootstrapEvidence,
+) -> None:
+    archive = _read_regular(image_directory / "runtime.oci.tar", "bootstrap OCI archive")
+    expected_archive = cast(dict[str, JsonValue], bootstrap.payload["oci_layout_archive"])
+    if (
+        expected_archive.get("name") != "runtime.oci.tar"
+        or expected_archive.get("size") != len(archive)
+        or expected_archive.get("sha256") != sha256_hex(archive)
+    ):
+        raise SealError("bootstrap OCI archive does not match bootstrap evidence")
+    layout = _read_regular(
+        image_directory / "oci-layout-manifest.json",
+        "bootstrap OCI layout manifest",
+    )
+    if bootstrap.payload["oci_layout_manifest_sha256"] != sha256_hex(layout):
+        raise SealError("bootstrap OCI layout manifest does not match bootstrap evidence")
+
+
+def _same_native_host(left: NativeHostEvidence, right: NativeHostEvidence) -> bool:
+    return (
+        left.kind == right.kind
+        and left.official_execution_allowed == right.official_execution_allowed
+        and _plain_json(left.payload) == _plain_json(right.payload)
+        and left.sha256 == right.sha256
+    )
+
+
+def _require_matching_candidate_host_files(payload_root: Path) -> None:
+    outer = payload_root / "candidate-host-attestation"
+    inner = (
+        payload_root
+        / "seal-candidate/docs/superpowers/evidence/hpa-320/native/candidate-host-attestation"
+    )
+    for name in (
+        "attestation-bundle.json",
+        "native-host-evidence.json",
+        "native-host-observation.json",
+    ):
+        if _read_regular(outer / name, f"candidate phase {name}") != _read_regular(
+            inner / name,
+            f"candidate repository-shaped {name}",
+        ):
+            raise SealError("candidate phase host files do not match repository-shaped copies")
+
+
+_PHASE_VALIDATORS: Mapping[str, Callable[..., None]] = {
+    "bootstrap": _validate_bootstrap_work_payload,
+    "measurement": _validate_measurement_work_payload,
+    "candidate": _validate_candidate_work_payload,
+}
 
 
 def _parser() -> argparse.ArgumentParser:
