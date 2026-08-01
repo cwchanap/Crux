@@ -1753,6 +1753,41 @@ def test_measurement_phase_gate_accepts_the_genuine_workflow_layout(
     native_phase_payload("measurement")
 
 
+def test_measurement_phase_gate_does_not_require_an_accepted_measurement_host_bundle(
+    native_phase_payload: Callable[[str], NativePhasePayload],
+) -> None:
+    payload = native_phase_payload("measurement")
+    accepted_measurement_host = (
+        payload.repository_root / _ACCEPTED_NATIVE_RELATIVE / "measurement-host-attestation"
+    )
+    assert accepted_measurement_host.exists()
+    shutil.rmtree(accepted_measurement_host)
+
+    seal_module.validate_native_work_phase(
+        phase="measurement",
+        payload_root=payload.root,
+        repository_root=payload.repository_root,
+    )
+
+
+def test_candidate_phase_gate_requires_an_accepted_measurement_host_bundle(
+    native_phase_payload: Callable[[str], NativePhasePayload],
+) -> None:
+    payload = native_phase_payload("candidate")
+    accepted_measurement_host = (
+        payload.repository_root / _ACCEPTED_NATIVE_RELATIVE / "measurement-host-attestation"
+    )
+    assert accepted_measurement_host.exists()
+    shutil.rmtree(accepted_measurement_host)
+
+    with pytest.raises(SealError):
+        seal_module.validate_native_work_phase(
+            phase="candidate",
+            payload_root=payload.root,
+            repository_root=payload.repository_root,
+        )
+
+
 def test_candidate_phase_gate_accepts_the_genuine_workflow_layout(
     native_phase_payload: Callable[[str], NativePhasePayload],
 ) -> None:

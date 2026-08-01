@@ -478,10 +478,18 @@ def test_acceptance_streams_sparse_artifacts_without_whole_file_reads(
         manifest_path=manifest,
         archive_path=archive,
     )
+    bundle = tmp_path / "sigstore.bundle.json"
+    trusted_root = tmp_path / "trusted-root.json"
+    bundle.write_bytes(b"bundle\n")
+    trusted_root.write_bytes(b"trusted-root\n")
     snapshot = artifacts_module._AttestationSnapshot(
         archive_path=archive,
         manifest_path=manifest,
         payload_root=tmp_path,
+        bundle_path=bundle,
+        bundle_identity=artifacts_module._stream_regular_file_identity(bundle),
+        trusted_root_path=trusted_root,
+        trusted_root_identity=artifacts_module._stream_regular_file_identity(trusted_root),
         bindings=artifacts_module._capture_snapshot_bindings(
             phase="bootstrap",
             payload_root=tmp_path,
@@ -780,9 +788,98 @@ def test_verify_attestation_cli_uses_one_immutable_snapshot_across_gates(
     assert calls == ["github", "manifest", "archive", "phase", "manifest", "payload", "archive"]
 
 
+def test_verify_attestation_cli_pins_trust_inputs_in_the_snapshot(
+    packed_bootstrap: artifacts_module.PackedBootstrap,
+    signed_bootstrap: SignedBootstrap,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bundle_before = signed_bootstrap.bundle.read_bytes()
+    trusted_root_before = signed_bootstrap.trusted_root.read_bytes()
+    manifest_before = signed_bootstrap.manifest.read_bytes()
+    archive_before = signed_bootstrap.archive.read_bytes()
+    observed_bundle: list[Path] = []
+    observed_trusted_root: list[Path] = []
+
+    def verify(**kwargs: object) -> artifacts_module.VerifiedGitHubAttestation:
+        observed_bundle.append(Path(str(kwargs["sigstore_bundle_path"])))
+        observed_trusted_root.append(Path(str(kwargs["trusted_root_path"])))
+        assert observed_bundle[0].read_bytes() == bundle_before
+        assert observed_trusted_root[0].read_bytes() == trusted_root_before
+        signed_bootstrap.bundle.write_bytes(b"swapped bundle\n")
+        signed_bootstrap.trusted_root.write_bytes(b"swapped trusted root\n")
+        return artifacts_module.VerifiedGitHubAttestation(
+            gh_version="2.68.1",
+            statement={"subject": []},
+            statement_sha256="a" * 64,
+            subjects=(
+                artifacts_module.CheckpointIdentity(
+                    name="artifact-manifest.json",
+                    sha256=sha256_hex(manifest_before),
+                    size=len(manifest_before),
+                ),
+                artifacts_module.CheckpointIdentity(
+                    name=f"hpa320-native-bootstrap-{'a' * 40}.tar",
+                    sha256=sha256_hex(archive_before),
+                    size=len(archive_before),
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(artifacts_module, "verify_github_attestations", verify)
+    monkeypatch.setattr(
+        artifacts_module, "load_native_work_manifest", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        artifacts_module,
+        "verify_native_work_archive",
+        lambda **_kwargs: artifacts_module.CheckpointIdentity(
+            "archive", sha256_hex(archive_before), len(archive_before)
+        ),
+    )
+    monkeypatch.setattr(artifacts_module, "verify_native_work_payload", lambda **_kwargs: None)
+    monkeypatch.setattr(artifacts_module, "_validate_native_work_phase", lambda **_kwargs: None)
+
+    assert (
+        artifacts_module.main(
+            [
+                "verify-attestation",
+                "--phase",
+                "bootstrap",
+                "--workflow-commit",
+                "a" * 40,
+                "--payload-root",
+                str(packed_bootstrap.payload_root),
+                "--archive",
+                str(signed_bootstrap.archive),
+                "--bundle",
+                str(signed_bootstrap.bundle),
+                "--trusted-root",
+                str(signed_bootstrap.trusted_root),
+                "--repository-root",
+                str(tmp_path / "repository"),
+            ]
+        )
+        == 0
+    )
+    assert observed_bundle[0] != signed_bootstrap.bundle
+    assert observed_trusted_root[0] != signed_bootstrap.trusted_root
+    report = strict_json_loads(capsys.readouterr().out.encode("utf-8")[:-1], require_canonical=True)
+    assert report["sigstore_bundle"] == {
+        "sha256": sha256_hex(bundle_before),
+        "size": len(bundle_before),
+    }
+    assert report["trusted_root"] == {
+        "sha256": sha256_hex(trusted_root_before),
+        "size": len(trusted_root_before),
+    }
+
+
 @pytest.mark.parametrize("entry_kind", ["regular", "directory", "symlink", "diagnostic"])
 def test_attestation_snapshot_rejects_unallowlisted_source_entries(
     packed_bootstrap: artifacts_module.PackedBootstrap,
+    tmp_path: Path,
     entry_kind: str,
 ) -> None:
     root = packed_bootstrap.payload_root
@@ -794,12 +891,18 @@ def test_attestation_snapshot_rejects_unallowlisted_source_entries(
         (root / "unallowlisted-link").symlink_to(root / "checkpoint-acquisition-evidence.json")
     else:
         (root / "diagnostic.json").write_bytes(b"diagnostic\n")
+    bundle = tmp_path / "sigstore.bundle.json"
+    trusted_root = tmp_path / "trusted-root.json"
+    bundle.write_bytes(b"bundle\n")
+    trusted_root.write_bytes(b"trusted-root\n")
 
     with pytest.raises(artifacts_module.NativeArtifactError):
         with artifacts_module._attestation_snapshot(
             phase="bootstrap",
             payload_root=root,
             archive_path=packed_bootstrap.archive,
+            sigstore_bundle_path=bundle,
+            trusted_root_path=trusted_root,
         ):
             pass
 
@@ -1141,6 +1244,10 @@ def test_verify_attestation_cli_runs_the_outside_in_acceptance_order(
             "workflow_commit": "a" * 40,
         },
         "gh_version": "2.68.1",
+        "sigstore_bundle": {
+            "sha256": sha256_hex(read_regular_file_no_follow(signed_bootstrap.bundle)),
+            "size": signed_bootstrap.bundle.stat().st_size,
+        },
         "statement_sha256": "a" * 64,
         "subjects": [
             {
@@ -1154,6 +1261,10 @@ def test_verify_attestation_cli_runs_the_outside_in_acceptance_order(
                 "size": archive_identity.size,
             },
         ],
+        "trusted_root": {
+            "sha256": sha256_hex(read_regular_file_no_follow(signed_bootstrap.trusted_root)),
+            "size": signed_bootstrap.trusted_root.stat().st_size,
+        },
     }
 
 
@@ -1661,6 +1772,7 @@ def test_copy_attestation_bundle_removes_every_rename_boundary_substitution(
 def test_cli_orders_structural_artifact_operations(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     payload_root = tmp_path / "payload"
     host_bundle = payload_root / "bootstrap-host-attestation/attestation-bundle.json"
@@ -1715,8 +1827,8 @@ def test_cli_orders_structural_artifact_operations(
     )
     monkeypatch.setattr(
         artifacts_module,
-        "_stream_regular_file_identity",
-        lambda _path: calls.append("verify-bundle"),
+        "_verify_optional_attestation_bundle",
+        lambda _path, **_kwargs: calls.append("verify-bundle"),
     )
     assert (
         artifacts_module.main(
@@ -1730,6 +1842,10 @@ def test_cli_orders_structural_artifact_operations(
                 str(archive),
                 "--bundle",
                 str(host_bundle),
+                "--expected-bundle-sha256",
+                "0" * 64,
+                "--expected-bundle-size",
+                "1",
             ]
         )
         == 0
@@ -1740,7 +1856,8 @@ def test_cli_orders_structural_artifact_operations(
     monkeypatch.setattr(
         artifacts_module,
         "copy_attestation_bundle",
-        lambda **_kwargs: calls.append("copy-bundle"),
+        lambda **_kwargs: calls.append("copy-bundle")
+        or artifacts_module.CheckpointIdentity("stable.sigstore.json", "a" * 64, 7),
     )
     assert (
         artifacts_module.main(
@@ -1749,6 +1866,12 @@ def test_cli_orders_structural_artifact_operations(
         == 0
     )
     assert calls == ["copy-bundle"]
+    assert json.loads(capsys.readouterr().out) == {
+        "destination": str(archive),
+        "sha256": "a" * 64,
+        "size": 7,
+        "status": "copied",
+    }
 
 
 def test_cli_verify_reports_an_unsafe_optional_bundle(
@@ -1776,11 +1899,87 @@ def test_cli_verify_reports_an_unsafe_optional_bundle(
             str(archive),
             "--bundle",
             str(tmp_path / "missing.sigstore.json"),
+            "--expected-bundle-sha256",
+            "0" * 64,
+            "--expected-bundle-size",
+            "1",
         ]
     )
 
     assert result == 2
     assert capsys.readouterr().err == "native work attestation bundle is missing or unsafe\n"
+
+
+def test_cli_verify_requires_an_expected_bundle_identity_when_a_bundle_is_given(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    payload_root = tmp_path / "payload"
+    archive = tmp_path / "archive.tar"
+    bundle = tmp_path / "bundle.sigstore.json"
+    bundle.write_bytes(b"bundle\n")
+    manifest = SimpleNamespace(path=payload_root / "artifact-manifest.json")
+    monkeypatch.setattr(
+        artifacts_module, "load_native_work_manifest", lambda *_args, **_kwargs: manifest
+    )
+    monkeypatch.setattr(artifacts_module, "verify_native_work_payload", lambda **_kwargs: None)
+    monkeypatch.setattr(artifacts_module, "verify_native_work_archive", lambda **_kwargs: None)
+
+    result = artifacts_module.main(
+        [
+            "verify",
+            "--phase",
+            "bootstrap",
+            "--payload-root",
+            str(payload_root),
+            "--archive",
+            str(archive),
+            "--bundle",
+            str(bundle),
+        ]
+    )
+
+    assert result == 2
+    assert capsys.readouterr().err == "native work attestation bundle identity is required\n"
+
+
+def test_cli_verify_rejects_an_optional_bundle_whose_identity_does_not_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    payload_root = tmp_path / "payload"
+    archive = tmp_path / "archive.tar"
+    bundle = tmp_path / "bundle.sigstore.json"
+    bundle.write_bytes(b"replacement bundle\n")
+    manifest = SimpleNamespace(path=payload_root / "artifact-manifest.json")
+    monkeypatch.setattr(
+        artifacts_module, "load_native_work_manifest", lambda *_args, **_kwargs: manifest
+    )
+    monkeypatch.setattr(artifacts_module, "verify_native_work_payload", lambda **_kwargs: None)
+    monkeypatch.setattr(artifacts_module, "verify_native_work_archive", lambda **_kwargs: None)
+
+    result = artifacts_module.main(
+        [
+            "verify",
+            "--phase",
+            "bootstrap",
+            "--payload-root",
+            str(payload_root),
+            "--archive",
+            str(archive),
+            "--bundle",
+            str(bundle),
+            "--expected-bundle-sha256",
+            sha256_hex(b"action-produced bundle\n"),
+            "--expected-bundle-size",
+            str(len(b"action-produced bundle\n")),
+        ]
+    )
+
+    assert result == 2
+    assert capsys.readouterr().err == "native work attestation bundle identity does not match\n"
 
 
 def test_phase_mappings_are_the_exact_immutable_inventories() -> None:
