@@ -406,9 +406,35 @@ def _is_sha256(value: object) -> bool:
     )
 
 
-def _unlink_if_owned(path: str, metadata: os.stat_result, parent: Path) -> None:
+def _open_parent_directory(parent: Path) -> int:
+    """Open ``parent`` as a no-follow directory descriptor and return it.
+
+    The descriptor is retained across the manifest publication so that the
+    identity check, unlink, and directory fsync performed during rollback all
+    resolve relative to the same directory inode. This closes the window where
+    a path-based ``stat`` authenticates a file in the original parent while a
+    subsequent path-based ``unlink`` removes a same-named file from a parent
+    directory that was renamed and replaced between the two calls.
+    """
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory is None:
+        raise BuildContextError("build-context manifest parent durability support is unavailable")
+    descriptor = os.open(parent, os.O_RDONLY | no_follow | directory | getattr(os, "O_CLOEXEC", 0))
     try:
-        current = os.stat(path, follow_symlinks=False)
+        current = os.fstat(descriptor)
+    except OSError:
+        os.close(descriptor)
+        raise
+    if not stat.S_ISDIR(current.st_mode) or stat.S_ISLNK(current.st_mode):
+        os.close(descriptor)
+        raise BuildContextError("build-context manifest parent must be a stable directory")
+    return descriptor
+
+
+def _unlink_if_owned(name: str, metadata: os.stat_result, parent_fd: int) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError:
         return
     if stat.S_ISREG(current.st_mode) and (current.st_dev, current.st_ino) == (
@@ -416,11 +442,11 @@ def _unlink_if_owned(path: str, metadata: os.stat_result, parent: Path) -> None:
         metadata.st_ino,
     ):
         try:
-            os.unlink(path)
+            os.unlink(name, dir_fd=parent_fd)
         except OSError:
             return
         try:
-            _fsync_directory(parent)
+            os.fsync(parent_fd)
         except OSError:
             pass
 
@@ -431,20 +457,22 @@ def _write_manifest_content(path: Path, content: bytes, *, replace: bool) -> Non
     if not replace:
         if output.exists() or output.is_symlink():
             raise BuildContextError("build-context manifest output must be absent")
-        published_path: str | None = None
+        published_name: str | None = None
         created_metadata: os.stat_result | None = None
+        parent_fd = _open_parent_directory(parent)
         try:
             descriptor = os.open(
-                output,
+                output.name,
                 os.O_WRONLY
                 | os.O_CREAT
                 | os.O_EXCL
                 | getattr(os, "O_CLOEXEC", 0)
                 | getattr(os, "O_NOFOLLOW", 0),
                 FILE_MODE,
+                dir_fd=parent_fd,
             )
             created_metadata = os.fstat(descriptor)
-            published_path = os.fspath(output)
+            published_name = output.name
             with os.fdopen(descriptor, "wb") as handle:
                 os.fchmod(handle.fileno(), FILE_MODE)
                 handle.write(content)
@@ -452,11 +480,13 @@ def _write_manifest_content(path: Path, content: bytes, *, replace: bool) -> Non
                 os.fsync(handle.fileno())
             load_build_context_manifest(output)
             _fsync_directory(parent)
-            published_path = None
+            published_name = None
         except (BuildContextError, OSError):
-            if published_path is not None and created_metadata is not None:
-                _unlink_if_owned(published_path, created_metadata, parent)
+            if published_name is not None and created_metadata is not None:
+                _unlink_if_owned(published_name, created_metadata, parent_fd)
             raise
+        finally:
+            os.close(parent_fd)
         return
 
     descriptor, temporary = tempfile.mkstemp(

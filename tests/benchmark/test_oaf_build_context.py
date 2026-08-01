@@ -383,6 +383,50 @@ def test_build_context_generate_cleans_only_owned_output_after_substitution(
     assert output.read_bytes() == b"substituted authority\n"
 
 
+def test_unlink_if_owned_binds_cleanup_to_held_parent_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The inode check alone authenticates the file at stat time; without a
+    # held parent descriptor, a parent-directory rename/swap between stat and
+    # unlink would let rollback delete a same-named file in the replacement
+    # directory. Cleanup must stay bound to the directory inode captured when
+    # publication began.
+    original = tmp_path / "parent"
+    original.mkdir()
+    target = original / "build-context-manifest.json"
+    target.write_bytes(b"owned publication\n")
+    owned_metadata = target.lstat()
+
+    parent_fd = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    try:
+        replacement = tmp_path / "replacement"
+        replacement.mkdir()
+        (replacement / "build-context-manifest.json").write_bytes(b"decoy authority\n")
+
+        real_unlink = os.unlink
+
+        def swap_parent_before_unlink(path, *args, **kwargs):
+            # Swap the parent directory path after stat has authenticated the
+            # owned file but before unlink resolves the name, so a path-bound
+            # cleanup would target the decoy in the replacement directory.
+            if kwargs.get("dir_fd") == parent_fd:
+                os.rename(original, tmp_path / "moved")
+                os.replace(replacement, original)
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "unlink", swap_parent_before_unlink)
+
+        context_module._unlink_if_owned("build-context-manifest.json", owned_metadata, parent_fd)
+
+        # The owned file (now under moved/) was removed via the held descriptor.
+        assert not (tmp_path / "moved" / "build-context-manifest.json").exists()
+        # The decoy that took over the parent path must survive.
+        assert (original / "build-context-manifest.json").read_bytes() == b"decoy authority\n"
+    finally:
+        os.close(parent_fd)
+
+
 def test_build_context_generate_check_is_exact_and_non_mutating(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
