@@ -22,6 +22,7 @@ import pytest
 import tools.hpa320.seal_oaf_backend as seal_module
 from src.benchmark.backend_identity import canonical_json_bytes, sha256_hex, strict_json_loads
 from src.benchmark.checkpoint_acquisition import CheckpointIdentity
+from tests.benchmark.test_backend_lock import V2_SCHEMA_REPLACEMENTS
 from tools.hpa320 import oaf_native_calibration
 from tools.hpa320.oaf_native_artifacts import (
     CANDIDATE_ARTIFACT_PATHS,
@@ -31,6 +32,7 @@ from tools.hpa320.oaf_native_artifacts import (
 from tools.hpa320.oaf_oci import OciLayoutIdentity
 from tools.hpa320.seal_oaf_backend import SealError
 
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 HOST_PATHS = (
     "src/benchmark/backend_attestation.py",
     "src/benchmark/backend_identity.py",
@@ -54,15 +56,6 @@ def _lock_fixtures() -> ModuleType:
 
 
 LOCKS = _lock_fixtures()
-V2_SCHEMA_REPLACEMENTS = {
-    "crux.backend-seal-evidence/v1": "crux.backend-seal-evidence/v2",
-    "crux.oaf-base-system-package-evidence/v1": "crux.oaf-base-system-package-evidence/v2",
-    "crux.oaf-calibration-bootstrap-evidence/v1": ("crux.oaf-calibration-bootstrap-evidence/v2"),
-    "crux.oaf-calibration-measurement-evidence/v1": (
-        "crux.oaf-calibration-measurement-evidence/v2"
-    ),
-    "crux.oaf-seal-candidate/v1": "crux.oaf-seal-candidate/v2",
-}
 
 
 def _write_json(path: Path, payload: object) -> Path:
@@ -878,6 +871,7 @@ def test_v2_candidate_inventory_removes_the_jobs_api_record() -> None:
         "runtime_lock",
         "backend_lock",
     }
+    assert len(roles) == 16
 
 
 def _build_candidate(
@@ -1160,7 +1154,7 @@ def _phase_bootstrap_inputs(
         measurement,
     ) = _calibration_inputs(tmp_path, monkeypatch)
     repository = bootstrap_request.parents[3]
-    source_root = Path.cwd()
+    source_root = _REPOSITORY_ROOT
     for relative in (_CHECKPOINT_REQUEST_RELATIVE, _BASE_SYSTEM_REQUEST_RELATIVE):
         destination = repository / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1730,21 +1724,72 @@ def test_native_work_phase_gate_rejects_internal_inconsistency(
             repository_root=payload.repository_root,
         )
     expected_errors = {
-        "accepted_measurement_runtime_authority": (
-            "measurement evidence does not bind its operational image identity"
+        ("bootstrap", "checkpoint_request_hash"): (
+            "calibration bootstrap request checkpoint_acquisition_request_sha256 hash does not match"
         ),
-        "accepted_measurement_runtime_manifest_authority": (
-            "measurement evidence does not bind its operational image identity"
+        ("bootstrap", "base_system_request_hash"): (
+            "calibration bootstrap request base_system_package_request_sha256 hash does not match"
         ),
-        "accepted_measurement_host_bundle_authority": (
+        ("bootstrap", "bootstrap_image_identity"): (
+            "bootstrap OCI layout manifest does not match bootstrap evidence"
+        ),
+        ("measurement", "bootstrap_evidence_hash"): (
+            "measurement evidence does not bind its accepted authorities"
+        ),
+        ("measurement", "measurement_request_hash"): (
+            "calibration measurement evidence request hash does not match"
+        ),
+        ("measurement", "host_bundle_hash"): (
             "measurement evidence does not bind its phase host bundle"
         ),
-        "accepted_measurement_host_evidence_authority": (
+        ("measurement", "measurement_request_bootstrap_binding"): (
+            "measurement request does not bind the accepted bootstrap authority"
+        ),
+        ("measurement", "operational_image_identity"): (
+            "operational bootstrap image differs from the accepted image identity"
+        ),
+        ("candidate", "candidate_manifest_hash"): (
+            "candidate manifest identity does not match the proposed backend lock"
+        ),
+        ("candidate", "runtime_lock_hash"): (
+            "candidate manifest identity does not match the proposed backend lock"
+        ),
+        ("candidate", "backend_lock_hash"): (
+            "candidate manifest identity does not match the proposed backend lock"
+        ),
+        ("candidate", "host_bundle_hash"): (
+            "candidate manifest identity does not match the proposed backend lock"
+        ),
+        ("candidate", "outer_checkpoint_authority"): (
+            "operational checkpoint does not reproduce the accepted checkpoint authority"
+        ),
+        ("candidate", "outer_image_authority"): (
+            "operational bootstrap image differs from the accepted image identity"
+        ),
+        ("candidate", "accepted_measurement_authority"): (
+            "calibration measurement evidence request hash does not match"
+        ),
+        ("candidate", "accepted_measurement_runtime_authority"): (
+            "measurement evidence does not bind its operational image identity"
+        ),
+        ("candidate", "accepted_measurement_runtime_manifest_authority"): (
+            "measurement evidence does not bind its operational image identity"
+        ),
+        ("candidate", "accepted_measurement_host_bundle_authority"): (
+            "measurement evidence does not bind its phase host bundle"
+        ),
+        ("candidate", "accepted_measurement_host_evidence_authority"): (
             "measurement evidence does not bind its phase host evidence"
         ),
+        ("candidate", "seal_profile_authority"): (
+            "seal profile request is unrelated to the accepted authority"
+        ),
     }
-    if mutation in expected_errors:
-        assert expected_errors[mutation] in str(raised.value)
+    key = (phase, mutation)
+    assert key in expected_errors, f"mutation {key} has no expected error"
+    assert expected_errors[key] in str(raised.value), (
+        f"mutation {key} expected '{expected_errors[key]}' but got '{raised.value}'"
+    )
 
 
 def test_measurement_phase_gate_accepts_the_genuine_workflow_layout(

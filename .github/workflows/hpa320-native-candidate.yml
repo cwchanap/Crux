@@ -96,7 +96,7 @@ jobs:
           --host-bundle
           artifacts/benchmark/backends/hpa320-candidate/candidate-host-attestation/attestation-bundle.json
           --archive
-          artifacts/benchmark/backends/hpa320-native-candidate-${{ inputs.commit_sha }}.tar
+          artifacts/benchmark/backends/hpa320-native-candidate-$COMMIT_SHA.tar
 
       - name: Verify native work subjects before attestation
         run: >-
@@ -104,7 +104,7 @@ jobs:
           --phase candidate
           --payload-root artifacts/benchmark/backends/hpa320-candidate
           --archive
-          artifacts/benchmark/backends/hpa320-native-candidate-${{ inputs.commit_sha }}.tar
+          artifacts/benchmark/backends/hpa320-native-candidate-$COMMIT_SHA.tar
 
       - name: Attest native phase evidence
         id: attest
@@ -120,8 +120,8 @@ jobs:
           set -euo pipefail
           uv run python -m tools.hpa320.oaf_native_artifacts copy-bundle \
             --source '${{ steps.attest.outputs.bundle-path }}' \
-            --destination artifacts/benchmark/backends/hpa320-native-candidate-${{ inputs.commit_sha }}.sigstore.json \
-            | tee artifacts/benchmark/backends/hpa320-native-candidate-${{ inputs.commit_sha }}.sigstore.identity.json
+            --destination artifacts/benchmark/backends/hpa320-native-candidate-$COMMIT_SHA.sigstore.json \
+            | tee artifacts/benchmark/backends/hpa320-native-candidate-$COMMIT_SHA.sigstore.identity.json
 
       - name: Reverify the complete upload set
         run: >-
@@ -129,11 +129,11 @@ jobs:
           --phase candidate
           --payload-root artifacts/benchmark/backends/hpa320-candidate
           --archive
-          artifacts/benchmark/backends/hpa320-native-candidate-${{ inputs.commit_sha }}.tar
+          artifacts/benchmark/backends/hpa320-native-candidate-$COMMIT_SHA.tar
           --bundle
-          artifacts/benchmark/backends/hpa320-native-candidate-${{ inputs.commit_sha }}.sigstore.json
+          artifacts/benchmark/backends/hpa320-native-candidate-$COMMIT_SHA.sigstore.json
           --expected-bundle-identity
-          artifacts/benchmark/backends/hpa320-native-candidate-${{ inputs.commit_sha }}.sigstore.identity.json
+          artifacts/benchmark/backends/hpa320-native-candidate-$COMMIT_SHA.sigstore.identity.json
 
       - name: Upload signed native phase evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -143,5 +143,6 @@ jobs:
             artifacts/benchmark/backends/hpa320-candidate/
             artifacts/benchmark/backends/hpa320-native-candidate-${{ inputs.commit_sha }}.tar
             artifacts/benchmark/backends/hpa320-native-candidate-${{ inputs.commit_sha }}.sigstore.json
+            artifacts/benchmark/backends/hpa320-native-candidate-${{ inputs.commit_sha }}.sigstore.identity.json
           if-no-files-found: error
           retention-days: 30

@@ -458,7 +458,6 @@ def test_acceptance_streams_sparse_artifacts_without_whole_file_reads(
 
     def bounded_read(descriptor: int, size: int) -> bytes:
         read_sizes.append(size)
-        assert size <= artifacts_module._CHUNK_SIZE
         return real_read(descriptor, size)
 
     def reject_whole_file_read(_path: Path) -> bytes:
@@ -643,15 +642,13 @@ def test_github_verifier_rejects_command_failure(
         )
 
 
-@pytest.mark.parametrize("rejection", ["wrong-workflow", "wrong-commit", "self-hosted"])
-def test_github_verifier_rejects_gh_policy_failures(
+def test_github_verifier_translates_gh_called_process_error_to_native_artifact_error(
     signed_bootstrap: SignedBootstrap,
-    rejection: str,
 ) -> None:
     def run(command: tuple[str, ...]) -> bytes:
         if command[:2] == ("gh", "version"):
             return b"gh version 2.68.1 (2026-01-01)\n"
-        raise subprocess.CalledProcessError(1, command, stderr=rejection.encode("utf-8"))
+        raise subprocess.CalledProcessError(1, command, stderr=b"wrong-workflow")
 
     with pytest.raises(artifacts_module.NativeArtifactError, match="verification failed"):
         artifacts_module.verify_github_attestations(

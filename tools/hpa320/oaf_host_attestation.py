@@ -179,7 +179,7 @@ def publish_github_host_attestation(
     """Validate this exact work job and atomically publish its v2 host bundle."""
 
     try:
-        observation = _same_job_observation(phase)
+        observation = _collect_same_job_observation(phase)
         fingerprint = parse_host_numeric_fingerprint(observation["host_numeric_fingerprint"])
         evidence_record = build_github_hosted_evidence(
             github_job=cast(str, observation["github_job"]),
@@ -265,20 +265,20 @@ def validate_schema_golden(schema: str, content: bytes) -> None:
         raise ValueError(str(error)) from None
 
 
-def _same_job_observation(phase: str) -> dict[str, JsonValue]:
+def _collect_same_job_observation(phase: str) -> dict[str, JsonValue]:
     if phase not in PHASE_WORKFLOWS:
         raise HostAttestationError("native-host attestation phase is invalid")
-    runner_environment = _matching_runner_value(
+    runner_environment = _require_matching_runner_value(
         context_name="RUNNER_ENVIRONMENT_CONTEXT",
         default_name="RUNNER_ENVIRONMENT",
         expected="github-hosted",
     )
-    runner_os = _matching_runner_value(
+    runner_os = _require_matching_runner_value(
         context_name="RUNNER_OS_CONTEXT",
         default_name="RUNNER_OS",
         expected="Linux",
     )
-    runner_arch = _matching_runner_value(
+    runner_arch = _require_matching_runner_value(
         context_name="RUNNER_ARCH_CONTEXT",
         default_name="RUNNER_ARCH",
         expected="X64",
@@ -494,7 +494,7 @@ def _write_new_regular_file(path: Path, content: bytes) -> None:
         os.close(descriptor)
 
 
-def _matching_runner_value(*, context_name: str, default_name: str, expected: str) -> str:
+def _require_matching_runner_value(*, context_name: str, default_name: str, expected: str) -> str:
     context_value = _required_environment(context_name)
     default_value = _required_environment(default_name)
     if context_value != expected or default_value != expected or context_value != default_value:

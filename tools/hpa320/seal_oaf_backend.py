@@ -52,6 +52,7 @@ from src.benchmark.checkpoint_acquisition import (
     load_checkpoint_acquisition_evidence,
     load_checkpoint_acquisition_request,
 )
+from tools.hpa320._fsync import _fsync_directory
 from tools.hpa320.audit_legacy_tf2_conversion import (
     CANDIDATE_MANIFEST_NAME,
     CANDIDATE_MANIFEST_SCHEMA,
@@ -832,7 +833,7 @@ def reissue_calibration_bootstrap_request(
     content = canonical_json_bytes(reissued, trailing_newline=True)
     if strict_json_loads(original[:-1], require_canonical=True) != payload:
         raise SealError("existing calibration bootstrap request is not canonical")
-    _atomic_replace_regular_file(request_path, content)
+    _atomic_replace_regular_file(request_path, content, label="calibration bootstrap request")
     loaded = load_calibration_bootstrap_request(request_path)
     return loaded.sha256
 
@@ -1957,14 +1958,6 @@ def _remove_staging_directory(path: Path) -> None:
     path.rmdir()
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def calibrate(
     *,
     request_path: Path,
@@ -2831,7 +2824,7 @@ def _read_regular(path: Path, label: str) -> bytes:
         raise SealError(f"{label} must be a no-follow regular file") from None
 
 
-def _atomic_replace_regular_file(path: Path, content: bytes) -> None:
+def _atomic_replace_regular_file(path: Path, content: bytes, label: str) -> None:
     target = Path(path)
     parent = _require_directory(target.parent, "replacement parent")
     descriptor, temporary = tempfile.mkstemp(
@@ -2851,7 +2844,7 @@ def _atomic_replace_regular_file(path: Path, content: bytes) -> None:
             os.unlink(temporary)
         except OSError:
             pass
-        raise SealError("calibration bootstrap request replacement failed") from None
+        raise SealError(f"{label} replacement failed") from None
 
 
 def _require_directory(path: Path, label: str) -> Path:
@@ -3245,8 +3238,6 @@ def _validate_bootstrap_authority(
     )
     base_request = load_base_system_package_request(repository / _BASE_SYSTEM_REQUEST_PATH)
     base_path = root / "base-system-package-evidence.json"
-    if phase != "bootstrap":
-        base_path = repository / "base-system-package-evidence.json"
     base = load_base_system_package_evidence(base_path, request=base_request)
     if (
         bootstrap_request.payload["checkpoint_acquisition_request_sha256"]
@@ -3293,10 +3284,10 @@ def _validate_measurement_evidence_authority(
     *,
     measurement: Mapping[str, JsonValue],
     accepted: _AcceptedPreMeasurementAuthorities,
-    bundle: NativeHostAttestationBundle | None = None,
-    host: NativeHostEvidence | None = None,
-    host_payload: Mapping[str, JsonValue] | None = None,
-    operational_bootstrap: CalibrationBootstrapEvidence | None = None,
+    bundle: NativeHostAttestationBundle,
+    host: NativeHostEvidence,
+    host_payload: Mapping[str, JsonValue],
+    operational_bootstrap: CalibrationBootstrapEvidence,
 ) -> None:
     if (
         measurement["calibration_bootstrap_evidence_sha256"] != accepted.bootstrap.sha256

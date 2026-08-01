@@ -25,6 +25,10 @@ class ArtifactPublicationError(OSError):
     pass
 
 
+class ArtifactAlreadyPublishedError(ArtifactPublicationError):
+    """The publication destination already exists (benign race)."""
+
+
 @dataclass(frozen=True)
 class PublishedDirectory:
     path: Path
@@ -85,7 +89,7 @@ def rename_directory_no_replace(source: Path, destination: Path) -> PublishedDir
             parent.verify()
             return publication
     except FileExistsError as error:
-        raise ArtifactPublicationError("publication destination already exists") from error
+        raise ArtifactAlreadyPublishedError("publication destination already exists") from error
     except OSError as error:
         if publication is not None:
             raise DirectoryPublicationError(publication) from error
@@ -1037,18 +1041,18 @@ def _same_inode(first: os.stat_result, second: os.stat_result) -> bool:
     return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
 
-def _rename_no_replace_syscall(
-    source: str,
-    destination: str,
-    *,
-    src_dir_fd: int,
-    dst_dir_fd: int,
-) -> None:
-    """Rename sibling paths with the platform no-replace syscall."""
+_LIBC: ctypes.CDLL | None = None
+_RENAME_CALLABLE: object | None = None
 
+
+def _resolve_rename_callable() -> object:
+    """Resolve and configure the platform no-replace rename callable once."""
+
+    global _LIBC, _RENAME_CALLABLE
+    if _RENAME_CALLABLE is not None:
+        return _RENAME_CALLABLE
     libc = ctypes.CDLL(None, use_errno=True)
-    encoded_source = os.fsencode(source)
-    encoded_destination = os.fsencode(destination)
+    _LIBC = libc
     if sys.platform == "darwin":
         try:
             rename = libc.renameatx_np
@@ -1062,18 +1066,12 @@ def _rename_no_replace_syscall(
             ctypes.c_uint,
         ]
         rename.restype = ctypes.c_int
-        result = rename(
-            src_dir_fd,
-            encoded_source,
-            dst_dir_fd,
-            encoded_destination,
-            0x00000004,  # RENAME_EXCL
-        )
+        _RENAME_CALLABLE = rename
     elif sys.platform.startswith("linux"):
         try:
             rename = libc.renameat2
         except AttributeError:
-            raise OSError(errno.ENOTSUP, "renameat2 is unavailable") from None
+            rename = _resolve_linux_syscall_renameat2(libc)
         rename.argtypes = [
             ctypes.c_int,
             ctypes.c_char_p,
@@ -1082,6 +1080,66 @@ def _rename_no_replace_syscall(
             ctypes.c_uint,
         ]
         rename.restype = ctypes.c_int
+        _RENAME_CALLABLE = rename
+    else:
+        raise OSError(errno.ENOTSUP, "atomic no-replace rename is unsupported")
+    return _RENAME_CALLABLE
+
+
+def _resolve_linux_syscall_renameat2(libc: ctypes.CDLL) -> object:
+    """Fall back to libc.syscall(SYS_renameat2) when the wrapper is absent."""
+
+    try:
+        syscall = libc.syscall
+    except AttributeError:
+        raise OSError(errno.ENOTSUP, "renameat2 is unavailable") from None
+    try:
+        sys_renameat2 = getattr(sys, "SYS", {}).get("renameat2")
+    except AttributeError:
+        sys_renameat2 = None
+    if sys_renameat2 is None:
+        raise OSError(errno.ENOTSUP, "renameat2 is unavailable") from None
+
+    def _renameat2_via_syscall(
+        src_dir_fd: int,
+        source: bytes,
+        dst_dir_fd: int,
+        destination: bytes,
+        flags: int,
+    ) -> int:
+        return syscall(
+            ctypes.c_long(sys_renameat2),
+            ctypes.c_int(src_dir_fd),
+            ctypes.c_char_p(source),
+            ctypes.c_int(dst_dir_fd),
+            ctypes.c_char_p(destination),
+            ctypes.c_uint(flags),
+        )
+
+    return _renameat2_via_syscall
+
+
+def _rename_no_replace_syscall(
+    source: str,
+    destination: str,
+    *,
+    src_dir_fd: int,
+    dst_dir_fd: int,
+) -> None:
+    """Rename sibling paths with the platform no-replace syscall."""
+
+    rename = _resolve_rename_callable()
+    encoded_source = os.fsencode(source)
+    encoded_destination = os.fsencode(destination)
+    if sys.platform == "darwin":
+        result = rename(
+            src_dir_fd,
+            encoded_source,
+            dst_dir_fd,
+            encoded_destination,
+            0x00000004,  # RENAME_EXCL
+        )
+    elif sys.platform.startswith("linux"):
         result = rename(
             src_dir_fd,
             encoded_source,

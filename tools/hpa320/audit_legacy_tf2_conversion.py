@@ -37,6 +37,7 @@ from src.benchmark.backend_lock import (
 
 CANDIDATE_MANIFEST_NAME = "candidate-manifest.json"
 CANDIDATE_MANIFEST_SCHEMA = "crux.oaf-seal-candidate/v2"
+AUDIT_CANDIDATE_MANIFEST_SCHEMA = "crux.oaf-audit-candidate-manifest/v1"
 MATCHING_ALGORITHM = "exact_assignment_trace"
 MATCHING_ALGORITHM_VERSION = "v1"
 
@@ -273,7 +274,7 @@ def resolve_candidate_checkpoint(
     )
     if not isinstance(value, dict) or set(value) != _CANDIDATE_MANIFEST_KEYS:
         raise AuditError("candidate manifest fields must match the exact schema")
-    if value["schema"] != CANDIDATE_MANIFEST_SCHEMA:
+    if value["schema"] != AUDIT_CANDIDATE_MANIFEST_SCHEMA:
         raise AuditError("candidate manifest schema is unsupported")
 
     artifact_sha256 = _require_sha256_value(

@@ -64,12 +64,10 @@ GITHUB_V1_PAYLOAD = {
 
 
 def _canonical_sha256(payload: dict[str, object]) -> str:
-    from src.benchmark.backend_identity import canonical_json_bytes
-
-    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+    return sha256_hex(canonical_json_bytes(payload))
 
 
-def github_v2_record(payload: dict[str, object] | None = None) -> dict[str, object]:
+def build_github_v2_record(payload: dict[str, object] | None = None) -> dict[str, object]:
     selected = GITHUB_V2_PAYLOAD if payload is None else payload
     return {
         "kind": "github_hosted",
@@ -312,7 +310,7 @@ def test_native_host_evidence_accepts_only_exact_official_forms(
 
 
 def test_github_hosted_native_evidence_accepts_exact_v2_run_identity() -> None:
-    record = github_v2_record()
+    record = build_github_v2_record()
 
     evidence = NativeHostEvidence(**record)  # type: ignore[arg-type]
 
@@ -344,7 +342,7 @@ def test_github_hosted_native_evidence_rejects_invalid_v2_identity(
     payload[field] = value
 
     with pytest.raises(ValueError):
-        NativeHostEvidence(**github_v2_record(payload))  # type: ignore[arg-type]
+        NativeHostEvidence(**build_github_v2_record(payload))  # type: ignore[arg-type]
 
 
 def test_github_hosted_native_evidence_rejects_the_exact_v1_key_set() -> None:
