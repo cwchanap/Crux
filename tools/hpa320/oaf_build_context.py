@@ -76,6 +76,18 @@ def load_build_context_manifest(path: Path) -> BuildContextManifest:
     """Strict-load one canonical self-excluding build-context manifest."""
 
     content = _read_regular(Path(path), "build-context manifest")
+    return _validate_manifest_content(content)
+
+
+def _validate_manifest_content(content: bytes) -> BuildContextManifest:
+    """Strict-validate canonical build-context manifest bytes.
+
+    Factored from :func:`load_build_context_manifest` so the publication path
+    can schema-validate the exact bytes it wrote through a held descriptor,
+    without re-reading the output by path (which a concurrent substitution
+    could swap for a different, structurally valid authority).
+    """
+
     if not content.endswith(b"\n") or content.endswith(b"\n\n"):
         raise BuildContextError("build-context manifest must have one final newline")
     try:
@@ -451,6 +463,86 @@ def _unlink_if_owned(name: str, metadata: os.stat_result, parent_fd: int) -> Non
             pass
 
 
+def _verify_published_descriptor(
+    name: str,
+    parent_fd: int,
+    created_metadata: os.stat_result,
+    content: bytes,
+) -> None:
+    """Validate the published manifest through the held parent descriptor.
+
+    Reopens ``name`` relative to ``parent_fd`` (not by path) so a concurrent
+    substitution at the output path cannot make publication succeed for a
+    different authority. Confirms the reopened file is the same inode we
+    created, that its exact bytes equal ``content``, and that those bytes
+    schema-validate as a canonical build-context manifest.
+    """
+
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+    try:
+        current = os.fstat(descriptor)
+        if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (
+            created_metadata.st_dev,
+            created_metadata.st_ino,
+        ):
+            raise BuildContextError(
+                "build-context manifest output was substituted before validation"
+            )
+        read_back = bytearray()
+        remaining = len(content)
+        while remaining > 0:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            read_back += chunk
+            remaining -= len(chunk)
+        if bytes(read_back) != content:
+            raise BuildContextError("build-context manifest output bytes drifted before validation")
+        _validate_manifest_content(content)
+    finally:
+        os.close(descriptor)
+
+
+def _verify_parent_ancestry(parent: Path, parent_metadata: os.stat_result) -> None:
+    """Confirm the path-facing parent still resolves to the held directory inode.
+
+    The held ``parent_fd`` always refers to the directory the manifest was
+    created in, but the path ``parent`` may have been renamed and replaced by a
+    different directory. If so, the published path no longer refers to the
+    directory we wrote into; treat the ancestry substitution as failure rather
+    than reporting success for an output the caller's path can no longer reach.
+    """
+
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory is None:
+        raise BuildContextError("build-context manifest parent ancestry support is unavailable")
+    try:
+        descriptor = os.open(
+            parent,
+            os.O_RDONLY | no_follow | directory | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as error:
+        raise BuildContextError(
+            "build-context manifest parent path no longer resolves to a stable directory"
+        ) from error
+    try:
+        current = os.fstat(descriptor)
+        if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (
+            parent_metadata.st_dev,
+            parent_metadata.st_ino,
+        ):
+            raise BuildContextError(
+                "build-context manifest parent directory was substituted before completion"
+            )
+    finally:
+        os.close(descriptor)
+
+
 def _write_manifest_content(path: Path, content: bytes, *, replace: bool) -> None:
     output = Path(path)
     parent = _require_root(output.parent, "build-context manifest parent")
@@ -460,6 +552,7 @@ def _write_manifest_content(path: Path, content: bytes, *, replace: bool) -> Non
         published_name: str | None = None
         created_metadata: os.stat_result | None = None
         parent_fd = _open_parent_directory(parent)
+        parent_metadata = os.fstat(parent_fd)
         try:
             descriptor = os.open(
                 output.name,
@@ -473,13 +566,34 @@ def _write_manifest_content(path: Path, content: bytes, *, replace: bool) -> Non
             )
             created_metadata = os.fstat(descriptor)
             published_name = output.name
-            with os.fdopen(descriptor, "wb") as handle:
-                os.fchmod(handle.fileno(), FILE_MODE)
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-            load_build_context_manifest(output)
-            _fsync_directory(parent)
+            try:
+                view = memoryview(content)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("short write")
+                    view = view[written:]
+                os.fchmod(descriptor, FILE_MODE)
+                os.utime(descriptor, ns=(0, 0))
+                os.fsync(descriptor)
+                # Validate the manifest through the held parent descriptor
+                # rather than by path: a concurrent substitution at the output
+                # path must not make publication succeed for a different, even
+                # structurally valid, authority. Reopening relative to
+                # ``parent_fd`` and checking the inode proves the file we
+                # created is the one being validated, and byte-equality with
+                # ``content`` proves it is the authority we generated.
+                _verify_published_descriptor(output.name, parent_fd, created_metadata, content)
+                # Sync the directory entry through the held parent descriptor,
+                # not a path re-open, so a parent-directory swap cannot sync the
+                # replacement directory.
+                os.fsync(parent_fd)
+                # Confirm the path-facing parent still resolves to the held
+                # directory inode; an ancestry substitution means the published
+                # path no longer refers to the directory we wrote into.
+                _verify_parent_ancestry(parent, parent_metadata)
+            finally:
+                os.close(descriptor)
             published_name = None
         except (BuildContextError, OSError):
             if published_name is not None and created_metadata is not None:
