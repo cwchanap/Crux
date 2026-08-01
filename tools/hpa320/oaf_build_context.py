@@ -406,6 +406,25 @@ def _is_sha256(value: object) -> bool:
     )
 
 
+def _unlink_if_owned(path: str, metadata: os.stat_result, parent: Path) -> None:
+    try:
+        current = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return
+    if stat.S_ISREG(current.st_mode) and (current.st_dev, current.st_ino) == (
+        metadata.st_dev,
+        metadata.st_ino,
+    ):
+        try:
+            os.unlink(path)
+        except OSError:
+            return
+        try:
+            _fsync_directory(parent)
+        except OSError:
+            pass
+
+
 def _write_manifest_content(path: Path, content: bytes, *, replace: bool) -> None:
     output = Path(path)
     parent = _require_root(output.parent, "build-context manifest parent")
@@ -413,6 +432,7 @@ def _write_manifest_content(path: Path, content: bytes, *, replace: bool) -> Non
         if output.exists() or output.is_symlink():
             raise BuildContextError("build-context manifest output must be absent")
         published_path: str | None = None
+        created_metadata: os.stat_result | None = None
         try:
             descriptor = os.open(
                 output,
@@ -423,6 +443,7 @@ def _write_manifest_content(path: Path, content: bytes, *, replace: bool) -> Non
                 | getattr(os, "O_NOFOLLOW", 0),
                 FILE_MODE,
             )
+            created_metadata = os.fstat(descriptor)
             published_path = os.fspath(output)
             with os.fdopen(descriptor, "wb") as handle:
                 os.fchmod(handle.fileno(), FILE_MODE)
@@ -433,16 +454,8 @@ def _write_manifest_content(path: Path, content: bytes, *, replace: bool) -> Non
             _fsync_directory(parent)
             published_path = None
         except (BuildContextError, OSError):
-            if published_path is not None:
-                try:
-                    os.unlink(published_path)
-                except OSError:
-                    pass
-                else:
-                    try:
-                        _fsync_directory(parent)
-                    except OSError:
-                        pass
+            if published_path is not None and created_metadata is not None:
+                _unlink_if_owned(published_path, created_metadata, parent)
             raise
         return
 

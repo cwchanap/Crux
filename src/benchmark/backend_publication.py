@@ -49,7 +49,12 @@ class _AncestorBindingError(OSError):
     pass
 
 
-def rename_directory_no_replace(source: Path, destination: Path) -> PublishedDirectory:
+def rename_directory_no_replace(
+    source: Path,
+    destination: Path,
+    *,
+    anchor: DirectoryAnchor | None = None,
+) -> PublishedDirectory:
     """Atomically publish a directory only when destination is absent."""
 
     source_path = Path(source)
@@ -59,7 +64,7 @@ def rename_directory_no_replace(source: Path, destination: Path) -> PublishedDir
     publication: PublishedDirectory | None = None
     source_descriptor: int | None = None
     try:
-        with _anchored_parent(source_path, create=False) as parent:
+        with _anchored_parent(source_path, create=False, anchor=anchor) as parent:
             parent.verify()
             source_descriptor = os.open(
                 parent.name,
@@ -99,14 +104,18 @@ def rename_directory_no_replace(source: Path, destination: Path) -> PublishedDir
             os.close(source_descriptor)
 
 
-def rollback_published_directory(publication: PublishedDirectory) -> None:
+def rollback_published_directory(
+    publication: PublishedDirectory,
+    *,
+    anchor: DirectoryAnchor | None = None,
+) -> None:
     """Remove one inode-bound directory and synchronize its anchored parent."""
 
     if not isinstance(publication, PublishedDirectory):
         raise TypeError("publication must be a PublishedDirectory")
     directory_descriptor: int | None = None
     try:
-        with _anchored_parent(publication.path, create=False) as parent:
+        with _anchored_parent(publication.path, create=False, anchor=anchor) as parent:
             parent.verify()
             directory_descriptor = os.open(
                 parent.name,
@@ -520,6 +529,23 @@ def open_directory_anchor(path: Path) -> Iterator[DirectoryAnchor]:
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+def directory_anchor_from_descriptor(path: Path, descriptor: int) -> DirectoryAnchor:
+    """Wrap an already-open trusted directory descriptor into an anchor.
+
+    The caller owns ``descriptor`` for the lifetime of the returned anchor; the
+    anchor never closes it. The path is only used as the anchor root identity and
+    is not reopened, so no path-based TOCTOU is introduced here.
+    """
+    if not isinstance(path, Path):
+        raise TypeError("directory anchor path must be a Path")
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise OSError("directory anchor descriptor is not a directory")
+    anchor = DirectoryAnchor(path=path, descriptor=descriptor, metadata=metadata)
+    anchor.verify()
+    return anchor
 
 
 @contextmanager

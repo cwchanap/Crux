@@ -355,6 +355,34 @@ def test_build_context_generate_cleans_output_when_parent_sync_fails(
     assert output.exists()
 
 
+def test_build_context_generate_cleans_only_owned_output_after_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, wheelhouse, _source = _configure_minimal_generation(tmp_path, monkeypatch)
+    output = tmp_path / "build-context-manifest.json"
+    arguments = _generate_arguments(repository, wheelhouse, output)
+    real_fsync = context_module._fsync_directory
+    sync_calls = 0
+
+    def fail_first_parent_sync(path: Path) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            substituted = tmp_path / ".substituted"
+            substituted.write_bytes(b"substituted authority\n")
+            os.replace(substituted, output)
+            raise OSError("injected parent directory sync failure")
+        real_fsync(path)
+
+    monkeypatch.setattr(context_module, "_fsync_directory", fail_first_parent_sync)
+
+    assert context_module.main(arguments) == 2
+    # The output was replaced by a different inode before cleanup; the rollback
+    # must unlink only the file it created, never a substituted authority.
+    assert output.read_bytes() == b"substituted authority\n"
+
+
 def test_build_context_generate_check_is_exact_and_non_mutating(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
