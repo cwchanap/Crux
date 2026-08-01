@@ -27,8 +27,10 @@ from src.benchmark.backend_publication import (
     ArtifactAlreadyPublishedError,
     ArtifactPublicationError,
     DirectoryPublicationError,
+    PublishedDirectory,
     publish_immutable_bytes,
     rename_directory_no_replace,
+    rollback_published_directory,
 )
 from src.benchmark.backends import PublishedArtifact
 from src.benchmark.checkpoint_acquisition import (
@@ -334,16 +336,16 @@ def _stage_and_publish(
         stage_fd = None
 
         _verify_model_directory(sha256_fd, stage_name, contract.components)
+        publication: PublishedDirectory | None = None
         try:
-            rename_directory_no_replace(
+            publication = rename_directory_no_replace(
                 request.cache_root / "sha256" / stage_name,
                 request.cache_root / "sha256" / contract.model_artifact_set_sha256,
             )
-        except DirectoryPublicationError:
-            if not _rollback_owned_directory(
-                sha256_fd,
-                contract.model_artifact_set_sha256,
-            ):
+        except DirectoryPublicationError as error:
+            try:
+                rollback_published_directory(error.publication)
+            except ArtifactPublicationError:
                 stage_name = None
                 raise _IntegrityError("published checkpoint rollback failed") from None
             stage_name = None
@@ -370,10 +372,10 @@ def _stage_and_publish(
                 contract.components,
             )
         except (OSError, _PrepareError):
-            _rollback_owned_directory(
-                sha256_fd,
-                contract.model_artifact_set_sha256,
-            )
+            try:
+                rollback_published_directory(publication)
+            except ArtifactPublicationError:
+                pass
             raise _IntegrityError("published checkpoint failed final verification") from None
         return _ready(request, contract)
     except _PrepareError as error:
@@ -1338,13 +1340,3 @@ def _cleanup_staging_directory(parent_fd: int, name: str) -> bool:
         return True
     except OSError:
         return False
-
-
-def _rollback_owned_directory(parent_fd: int, name: str) -> bool:
-    try:
-        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-    return _cleanup_staging_directory(parent_fd, name)
