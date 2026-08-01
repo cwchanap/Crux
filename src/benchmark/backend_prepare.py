@@ -28,6 +28,7 @@ from src.benchmark.backend_publication import (
     ArtifactPublicationError,
     DirectoryPublicationError,
     PublishedDirectory,
+    directory_anchor_from_descriptor,
     publish_immutable_bytes,
     rename_directory_no_replace,
     rollback_published_directory,
@@ -336,15 +337,21 @@ def _stage_and_publish(
         stage_fd = None
 
         _verify_model_directory(sha256_fd, stage_name, contract.components)
+        sha256_root = (request.cache_root / "sha256").resolve()
+        publication_anchor = directory_anchor_from_descriptor(
+            sha256_root,
+            sha256_fd,
+        )
         publication: PublishedDirectory | None = None
         try:
             publication = rename_directory_no_replace(
-                request.cache_root / "sha256" / stage_name,
-                request.cache_root / "sha256" / contract.model_artifact_set_sha256,
+                sha256_root / stage_name,
+                sha256_root / contract.model_artifact_set_sha256,
+                anchor=publication_anchor,
             )
         except DirectoryPublicationError as error:
             try:
-                rollback_published_directory(error.publication)
+                rollback_published_directory(error.publication, anchor=publication_anchor)
             except ArtifactPublicationError:
                 stage_name = None
                 raise _IntegrityError("published checkpoint rollback failed") from None
@@ -373,7 +380,7 @@ def _stage_and_publish(
             )
         except (OSError, _PrepareError):
             try:
-                rollback_published_directory(publication)
+                rollback_published_directory(publication, anchor=publication_anchor)
             except ArtifactPublicationError:
                 pass
             raise _IntegrityError("published checkpoint failed final verification") from None

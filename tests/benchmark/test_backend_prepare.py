@@ -813,9 +813,9 @@ def test_concurrent_loser_verifies_winner_instead_of_replacing_it(
     expected = _final_path(tmp_path, backend_lock)
     real_rename = backend_prepare.rename_directory_no_replace
 
-    def publish_winner_then_fail(source: Path, target: Path) -> None:
+    def publish_winner_then_fail(source: Path, target: Path, **kwargs: object) -> None:
         _install_directory(expected, COMPONENT_BYTES)
-        real_rename(source, target)
+        real_rename(source, target, **kwargs)
 
     monkeypatch.setattr(backend_prepare, "rename_directory_no_replace", publish_winner_then_fail)
 
@@ -839,11 +839,11 @@ def test_final_reverification_rejects_symlink_swap_and_refuses_unsafe_rollback(
     expected = _final_path(tmp_path, backend_lock)
     real_rename = backend_prepare.rename_directory_no_replace
 
-    def swap_then_publish(source: Path, target: Path) -> PublishedDirectory:
+    def swap_then_publish(source: Path, target: Path, **kwargs: object) -> PublishedDirectory:
         source_index = source / "model.ckpt-569400.index"
         source_index.unlink()
         source_index.symlink_to("model.ckpt-569400.meta")
-        return real_rename(source, target)
+        return real_rename(source, target, **kwargs)
 
     monkeypatch.setattr(backend_prepare, "rename_directory_no_replace", swap_then_publish)
 
@@ -1227,9 +1227,9 @@ def test_atomic_publication_never_replaces_racing_empty_destination(
     expected = _final_path(tmp_path, backend_lock)
     real_rename = backend_prepare.rename_directory_no_replace
 
-    def race_then_rename(source: Path, target: Path) -> None:
+    def race_then_rename(source: Path, target: Path, **kwargs: object) -> None:
         target.mkdir()
-        real_rename(source, target)
+        real_rename(source, target, **kwargs)
 
     monkeypatch.setattr(backend_prepare, "rename_directory_no_replace", race_then_rename)
 
@@ -1252,7 +1252,7 @@ def test_directory_publication_error_rolls_back_owned_final_cache(
     backend_lock = _loaded_lock(archive_bytes)
     expected = _final_path(tmp_path, backend_lock)
 
-    def rename_then_raise(source: Path, target: Path) -> PublishedDirectory:
+    def rename_then_raise(source: Path, target: Path, **kwargs: object) -> PublishedDirectory:
         source_stat = os.stat(source, follow_symlinks=False)
         os.rename(source, target)
         raise DirectoryPublicationError(PublishedDirectory(target, source_stat))
@@ -1277,7 +1277,9 @@ def test_directory_publication_error_with_rollback_failure_reports_rollback_fail
     backend_lock = _loaded_lock(archive_bytes)
     expected = _final_path(tmp_path, backend_lock)
 
-    def raise_directory_publication_error(source: Path, target: Path) -> PublishedDirectory:
+    def raise_directory_publication_error(
+        source: Path, target: Path, **kwargs: object
+    ) -> PublishedDirectory:
         raise DirectoryPublicationError(
             PublishedDirectory(target, os.stat(source, follow_symlinks=False))
         )
@@ -1287,7 +1289,7 @@ def test_directory_publication_error_with_rollback_failure_reports_rollback_fail
     )
     rollback_calls: list[PublishedDirectory] = []
 
-    def failing_rollback(publication: PublishedDirectory) -> None:
+    def failing_rollback(publication: PublishedDirectory, **kwargs: object) -> None:
         rollback_calls.append(publication)
         raise ArtifactPublicationError("injected rollback failure")
 
@@ -1314,7 +1316,7 @@ def test_directory_publication_error_preserves_replacement_at_target(
     expected = _final_path(tmp_path, backend_lock)
     replacement_marker = b"replacement-authority\n"
 
-    def rename_then_substitute(source: Path, target: Path) -> PublishedDirectory:
+    def rename_then_substitute(source: Path, target: Path, **kwargs: object) -> PublishedDirectory:
         source_stat = os.stat(source, follow_symlinks=False)
         os.rename(source, target)
         substituted = target.parent / f".{target.name}.substituted"
@@ -1346,7 +1348,9 @@ def test_artifact_publication_error_without_file_exists_cause_is_integrity_failu
     backend_lock = _loaded_lock(archive_bytes)
     expected = _final_path(tmp_path, backend_lock)
 
-    def raise_artifact_publication_error(source: Path, target: Path) -> PublishedDirectory:
+    def raise_artifact_publication_error(
+        source: Path, target: Path, **kwargs: object
+    ) -> PublishedDirectory:
         raise ArtifactPublicationError("publication failed without file-exists cause")
 
     monkeypatch.setattr(
@@ -1371,7 +1375,7 @@ def test_file_exists_cause_with_losing_cleanup_failure_is_acquisition_failure(
     backend_lock = _loaded_lock(archive_bytes)
     expected = _final_path(tmp_path, backend_lock)
 
-    def raise_file_exists_error(source: Path, target: Path) -> PublishedDirectory:
+    def raise_file_exists_error(source: Path, target: Path, **kwargs: object) -> PublishedDirectory:
         raise ArtifactAlreadyPublishedError("destination exists") from FileExistsError(
             "raced target"
         )
