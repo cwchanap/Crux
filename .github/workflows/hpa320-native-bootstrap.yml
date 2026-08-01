@@ -110,11 +110,13 @@ jobs:
             artifacts/benchmark/backends/hpa320-bootstrap/artifact-manifest.json
 
       - name: Preserve the local Sigstore bundle
-        run: >-
-          uv run python -m tools.hpa320.oaf_native_artifacts copy-bundle
-          --source '${{ steps.attest.outputs.bundle-path }}'
-          --destination
-          artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.sigstore.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -m tools.hpa320.oaf_native_artifacts copy-bundle \
+            --source '${{ steps.attest.outputs.bundle-path }}' \
+            --destination artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.sigstore.json \
+            | tee artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.sigstore.identity.json
 
       - name: Reverify the complete upload set
         run: >-
@@ -125,6 +127,8 @@ jobs:
           artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.tar
           --bundle
           artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.sigstore.json
+          --expected-bundle-identity
+          artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.sigstore.identity.json
 
       - name: Upload signed native phase evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

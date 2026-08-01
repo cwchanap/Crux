@@ -1982,6 +1982,206 @@ def test_cli_verify_rejects_an_optional_bundle_whose_identity_does_not_match(
     assert capsys.readouterr().err == "native work attestation bundle identity does not match\n"
 
 
+def _verify_cli_bundle_fixtures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path]:
+    payload_root = tmp_path / "payload"
+    bundle = tmp_path / "bundle.sigstore.json"
+    bundle.write_bytes(b"action-produced bundle\n")
+    manifest = SimpleNamespace(path=payload_root / "artifact-manifest.json")
+    monkeypatch.setattr(
+        artifacts_module, "load_native_work_manifest", lambda *_args, **_kwargs: manifest
+    )
+    monkeypatch.setattr(artifacts_module, "verify_native_work_payload", lambda **_kwargs: None)
+    monkeypatch.setattr(artifacts_module, "verify_native_work_archive", lambda **_kwargs: None)
+    return bundle, payload_root
+
+
+def test_cli_verify_accepts_an_expected_bundle_identity_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle, payload_root = _verify_cli_bundle_fixtures(tmp_path, monkeypatch)
+    archive = tmp_path / "archive.tar"
+    identity = tmp_path / "bundle.sigstore.identity.json"
+    identity.write_bytes(
+        canonical_json_bytes(
+            {
+                "destination": str(bundle),
+                "sha256": sha256_hex(b"action-produced bundle\n"),
+                "size": len(b"action-produced bundle\n"),
+                "status": "copied",
+            },
+            trailing_newline=True,
+        )
+    )
+
+    result = artifacts_module.main(
+        [
+            "verify",
+            "--phase",
+            "bootstrap",
+            "--payload-root",
+            str(payload_root),
+            "--archive",
+            str(archive),
+            "--bundle",
+            str(bundle),
+            "--expected-bundle-identity",
+            str(identity),
+        ]
+    )
+
+    assert result == 0
+
+
+def test_cli_verify_rejects_an_optional_bundle_whose_identity_file_does_not_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bundle, payload_root = _verify_cli_bundle_fixtures(tmp_path, monkeypatch)
+    archive = tmp_path / "archive.tar"
+    bundle.write_bytes(b"replacement bundle\n")
+    identity = tmp_path / "bundle.sigstore.identity.json"
+    identity.write_bytes(
+        canonical_json_bytes(
+            {
+                "destination": str(bundle),
+                "sha256": sha256_hex(b"action-produced bundle\n"),
+                "size": len(b"action-produced bundle\n"),
+                "status": "copied",
+            },
+            trailing_newline=True,
+        )
+    )
+
+    result = artifacts_module.main(
+        [
+            "verify",
+            "--phase",
+            "bootstrap",
+            "--payload-root",
+            str(payload_root),
+            "--archive",
+            str(archive),
+            "--bundle",
+            str(bundle),
+            "--expected-bundle-identity",
+            str(identity),
+        ]
+    )
+
+    assert result == 2
+    assert capsys.readouterr().err == "native work attestation bundle identity does not match\n"
+
+
+def test_cli_verify_rejects_an_ambiguous_expected_bundle_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bundle, payload_root = _verify_cli_bundle_fixtures(tmp_path, monkeypatch)
+    archive = tmp_path / "archive.tar"
+    identity = tmp_path / "bundle.sigstore.identity.json"
+    identity.write_bytes(
+        canonical_json_bytes(
+            {
+                "destination": str(bundle),
+                "sha256": sha256_hex(b"action-produced bundle\n"),
+                "size": len(b"action-produced bundle\n"),
+                "status": "copied",
+            },
+            trailing_newline=True,
+        )
+    )
+
+    result = artifacts_module.main(
+        [
+            "verify",
+            "--phase",
+            "bootstrap",
+            "--payload-root",
+            str(payload_root),
+            "--archive",
+            str(archive),
+            "--bundle",
+            str(bundle),
+            "--expected-bundle-sha256",
+            "0" * 64,
+            "--expected-bundle-size",
+            "1",
+            "--expected-bundle-identity",
+            str(identity),
+        ]
+    )
+
+    assert result == 2
+    assert capsys.readouterr().err == "native work attestation bundle identity is ambiguous\n"
+
+
+def test_cli_verify_rejects_a_missing_expected_bundle_identity_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bundle, payload_root = _verify_cli_bundle_fixtures(tmp_path, monkeypatch)
+    archive = tmp_path / "archive.tar"
+    identity = tmp_path / "bundle.sigstore.identity.json"
+
+    result = artifacts_module.main(
+        [
+            "verify",
+            "--phase",
+            "bootstrap",
+            "--payload-root",
+            str(payload_root),
+            "--archive",
+            str(archive),
+            "--bundle",
+            str(bundle),
+            "--expected-bundle-identity",
+            str(identity),
+        ]
+    )
+
+    assert result == 2
+    assert (
+        capsys.readouterr().err == "native work attestation bundle identity is missing or unsafe\n"
+    )
+
+
+def test_cli_verify_rejects_a_malformed_expected_bundle_identity_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bundle, payload_root = _verify_cli_bundle_fixtures(tmp_path, monkeypatch)
+    archive = tmp_path / "archive.tar"
+    identity = tmp_path / "bundle.sigstore.identity.json"
+    identity.write_bytes(b"not json\n")
+
+    result = artifacts_module.main(
+        [
+            "verify",
+            "--phase",
+            "bootstrap",
+            "--payload-root",
+            str(payload_root),
+            "--archive",
+            str(archive),
+            "--bundle",
+            str(bundle),
+            "--expected-bundle-identity",
+            str(identity),
+        ]
+    )
+
+    assert result == 2
+    assert capsys.readouterr().err == "native work attestation bundle identity is invalid\n"
+
+
 def test_phase_mappings_are_the_exact_immutable_inventories() -> None:
     assert dict(artifacts_module.BOOTSTRAP_FILES) == BOOTSTRAP_FILES
     assert dict(artifacts_module.MEASUREMENT_FILES) == MEASUREMENT_FILES

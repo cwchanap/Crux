@@ -113,6 +113,7 @@ def _assert_native_workflow_contract(
     payload_root = f"artifacts/benchmark/backends/hpa320-{phase}"
     archive = f"artifacts/benchmark/backends/hpa320-native-{phase}-${{{{ inputs.commit_sha }}}}.tar"
     bundle = f"artifacts/benchmark/backends/hpa320-native-{phase}-${{{{ inputs.commit_sha }}}}.sigstore.json"
+    identity = f"artifacts/benchmark/backends/hpa320-native-{phase}-${{{{ inputs.commit_sha }}}}.sigstore.identity.json"
     preflight = _step_named(steps, "Observe and validate the current native work job")
     assert preflight["env"] == {
         "RUNNER_ENVIRONMENT_CONTEXT": "${{ runner.environment }}",
@@ -157,15 +158,17 @@ def _assert_native_workflow_contract(
         f"hpa320-native-{phase}-${{{{ inputs.commit_sha }}}}.tar",
     }
     copy_bundle = _step_named(steps, "Preserve the local Sigstore bundle")
-    assert copy_bundle["run"] == (
-        "uv run python -m tools.hpa320.oaf_native_artifacts copy-bundle "
-        "--source '${{ steps.attest.outputs.bundle-path }}' --destination "
-        f"{bundle}"
-    )
+    assert copy_bundle["shell"] == "bash"
+    copy_bundle_run = copy_bundle["run"]
+    assert "copy-bundle" in copy_bundle_run
+    assert "--source '${{ steps.attest.outputs.bundle-path }}'" in copy_bundle_run
+    assert f"--destination {bundle}" in copy_bundle_run
+    assert f"tee {identity}" in copy_bundle_run
     reverify = _step_named(steps, "Reverify the complete upload set")
     assert reverify["run"] == (
         "uv run python -m tools.hpa320.oaf_native_artifacts verify "
-        f"--phase {phase} --payload-root {payload_root} --archive {archive} --bundle {bundle}"
+        f"--phase {phase} --payload-root {payload_root} --archive {archive} --bundle {bundle} "
+        f"--expected-bundle-identity {identity}"
     )
 
     success_upload = _only_success_upload(steps)
