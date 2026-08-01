@@ -515,6 +515,116 @@ def test_build_context_generate_rejects_parent_ancestry_swap_before_completion(
     assert not (tmp_path / "moved" / "build-context-manifest.json").exists()
 
 
+def test_build_context_generate_rejects_appended_suffix_before_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A concurrent writer that appends bytes to the manifest file's inode
+    # after the write but before validation must not pass publication. The
+    # exact-byte check must read to EOF, not just len(content) bytes, so a
+    # noncanonical suffix appended to the same inode is detected and the
+    # on-disk bytes (not the in-memory content) are schema-validated.
+    repository, wheelhouse, _source = _configure_minimal_generation(tmp_path, monkeypatch)
+    output = tmp_path / "build-context-manifest.json"
+    arguments = _generate_arguments(repository, wheelhouse, output)
+    real_fsync = os.fsync
+    sync_calls = 0
+
+    def append_suffix_on_file_sync(fd: int) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            os.write(fd, b"\n//appended suffix\n")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", append_suffix_on_file_sync)
+
+    assert context_module.main(arguments) == 2
+    # The owned output (with the appended suffix) was rolled back.
+    assert not output.exists()
+
+
+def test_build_context_generate_rejects_substitution_during_directory_sync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A concurrent substitution at the output path after the first validation
+    # but before completion (during the directory entry fsync) must not let
+    # publication succeed for the replacement. A second verification after the
+    # directory fsync must catch the swapped inode even when the parent
+    # directory itself is unchanged.
+    repository, wheelhouse, _source = _configure_minimal_generation(tmp_path, monkeypatch)
+    output = tmp_path / "build-context-manifest.json"
+    arguments = _generate_arguments(repository, wheelhouse, output)
+    real_fsync = os.fsync
+    sync_calls = 0
+
+    def substitute_on_directory_sync(fd: int) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 2:
+            substituted = tmp_path / ".substituted"
+            substituted.write_bytes(b"substituted authority\n")
+            os.replace(substituted, output)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", substitute_on_directory_sync)
+
+    assert context_module.main(arguments) == 2
+    # The substituted authority survives at the output path (rollback only
+    # unlinks the file it created, which the substitution displaced), but
+    # publication did not claim success for it.
+    assert output.read_bytes() == b"substituted authority\n"
+
+
+def test_unlink_if_owned_quarantines_before_unlink_to_avoid_basename_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The stat-then-unlink pattern has a TOCTOU window: a concurrent writer
+    # can replace the basename between the ownership check and the unlink,
+    # causing rollback to delete the replacement. The quarantine-rename
+    # protocol atomically renames the entry to a unique quarantine name,
+    # re-verifies ownership, and only then unlinks—so a replacement swapped
+    # between stat and rename is restored to the original name, not deleted.
+    original = tmp_path / "parent"
+    original.mkdir()
+    target_name = "build-context-manifest.json"
+    target = original / target_name
+    target.write_bytes(b"owned publication\n")
+    owned_metadata = target.lstat()
+
+    parent_fd = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    try:
+        real_rename = os.rename
+
+        def swap_basename_before_rename(src, dst, *args, **kwargs):
+            if kwargs.get("src_dir_fd") == parent_fd and src == target_name and dst != target_name:
+                # Replace the target with a decoy just before the quarantine
+                # rename, simulating a concurrent writer swapping the basename
+                # between the stat and the rename.
+                decoy = original / ".decoy"
+                decoy.write_bytes(b"decoy authority\n")
+                real_rename(
+                    ".decoy",
+                    target_name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            return real_rename(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(os, "rename", swap_basename_before_rename)
+
+        context_module._unlink_if_owned(target_name, owned_metadata, parent_fd)
+
+        # The decoy was restored to the target name and not deleted.
+        assert target.read_bytes() == b"decoy authority\n"
+        # No quarantine leftovers remain in the parent directory.
+        assert tuple(original.glob(".build-context-manifest.json.rollback-quarantine.*")) == ()
+    finally:
+        os.close(parent_fd)
+
+
 def test_build_context_generate_check_is_exact_and_non_mutating(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -445,22 +445,54 @@ def _open_parent_directory(parent: Path) -> int:
 
 
 def _unlink_if_owned(name: str, metadata: os.stat_result, parent_fd: int) -> None:
+    """Remove ``name`` only if it is still the inode we created.
+
+    Uses an atomic rename-to-quarantine protocol rather than stat-then-unlink
+    so a concurrent writer that replaces ``name`` between the ownership check
+    and the unlink cannot cause rollback to delete the replacement. The entry
+    is atomically renamed to a unique quarantine name within the held parent
+    directory, re-verified by inode, and only then unlinked. If the quarantine
+    holds a different inode (the replacement was swapped in between the stat
+    and the rename), it is restored to ``name`` and left untouched rather than
+    deleted.
+    """
+
     try:
         current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError:
         return
-    if stat.S_ISREG(current.st_mode) and (current.st_dev, current.st_ino) == (
+    if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (
         metadata.st_dev,
         metadata.st_ino,
     ):
+        return
+    quarantine = f".{name}.rollback-quarantine.{metadata.st_ino}.{os.getpid()}"
+    try:
+        os.rename(name, quarantine, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    except OSError:
+        return
+    try:
+        quarantined = os.stat(quarantine, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return
+    if (quarantined.st_dev, quarantined.st_ino) != (metadata.st_dev, metadata.st_ino):
+        # A concurrent writer replaced ``name`` between our stat and the
+        # atomic rename. The replacement is now at ``quarantine``; restore it
+        # to ``name`` and leave it untouched rather than deleting a file we
+        # do not own.
         try:
-            os.unlink(name, dir_fd=parent_fd)
-        except OSError:
-            return
-        try:
-            os.fsync(parent_fd)
+            os.rename(quarantine, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         except OSError:
             pass
+        return
+    try:
+        os.unlink(quarantine, dir_fd=parent_fd)
+    except OSError:
+        return
+    try:
+        os.fsync(parent_fd)
+    except OSError:
+        pass
 
 
 def _verify_published_descriptor(
@@ -474,8 +506,10 @@ def _verify_published_descriptor(
     Reopens ``name`` relative to ``parent_fd`` (not by path) so a concurrent
     substitution at the output path cannot make publication succeed for a
     different authority. Confirms the reopened file is the same inode we
-    created, that its exact bytes equal ``content``, and that those bytes
-    schema-validate as a canonical build-context manifest.
+    created, that its exact bytes (read to EOF, so a suffix appended to the
+    same inode is detected) equal ``content``, and that the bytes actually
+    read from disk—not the in-memory ``content`` variable—schema-validate as
+    a canonical build-context manifest.
     """
 
     descriptor = os.open(
@@ -493,16 +527,14 @@ def _verify_published_descriptor(
                 "build-context manifest output was substituted before validation"
             )
         read_back = bytearray()
-        remaining = len(content)
-        while remaining > 0:
-            chunk = os.read(descriptor, remaining)
+        while True:
+            chunk = os.read(descriptor, 65536)
             if not chunk:
                 break
             read_back += chunk
-            remaining -= len(chunk)
         if bytes(read_back) != content:
             raise BuildContextError("build-context manifest output bytes drifted before validation")
-        _validate_manifest_content(content)
+        _validate_manifest_content(bytes(read_back))
     finally:
         os.close(descriptor)
 
@@ -543,7 +575,9 @@ def _verify_parent_ancestry(parent: Path, parent_metadata: os.stat_result) -> No
         os.close(descriptor)
 
 
-def _write_manifest_content(path: Path, content: bytes, *, replace: bool) -> None:
+def _write_manifest_content(  # pylint: disable=too-many-statements
+    path: Path, content: bytes, *, replace: bool
+) -> None:
     output = Path(path)
     parent = _require_root(output.parent, "build-context manifest parent")
     if not replace:
@@ -592,6 +626,13 @@ def _write_manifest_content(path: Path, content: bytes, *, replace: bool) -> Non
                 # directory inode; an ancestry substitution means the published
                 # path no longer refers to the directory we wrote into.
                 _verify_parent_ancestry(parent, parent_metadata)
+                # Re-verify the output through the held parent descriptor after
+                # the directory fsync: a same-directory substitution between the
+                # first verification and here would pass the ancestry check
+                # (parent inode unchanged) but leave a replacement at the output
+                # path. Reopening and re-checking inode + exact bytes closes
+                # that window before publication is declared successful.
+                _verify_published_descriptor(output.name, parent_fd, created_metadata, content)
             finally:
                 os.close(descriptor)
             published_name = None
