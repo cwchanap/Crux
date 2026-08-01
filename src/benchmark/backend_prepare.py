@@ -24,6 +24,7 @@ from src.benchmark.backend_lock import (
     revalidate_loaded_backend_lock,
 )
 from src.benchmark.backend_publication import (
+    ArtifactAlreadyPublishedError,
     ArtifactPublicationError,
     DirectoryPublicationError,
     publish_immutable_bytes,
@@ -302,14 +303,11 @@ def _stage_and_publish(
 ) -> PrepareBackendOutcome:
     stage_name: str | None = None
     stage_fd: int | None = None
-    published_identity: tuple[int, int] | None = None
     try:
         stage_name, stage_fd = _create_staging_directory(
             sha256_fd,
             contract.model_artifact_set_sha256,
         )
-        stage_stat = os.fstat(stage_fd)
-        published_identity = (stage_stat.st_dev, stage_stat.st_ino)
 
         if request.download:
             archive_fd = _download_archive(stage_fd, contract)
@@ -345,15 +343,12 @@ def _stage_and_publish(
             if not _rollback_owned_directory(
                 sha256_fd,
                 contract.model_artifact_set_sha256,
-                published_identity,
             ):
                 stage_name = None
                 raise _IntegrityError("published checkpoint rollback failed") from None
             stage_name = None
             raise _IntegrityError("atomic checkpoint publication failed") from None
-        except ArtifactPublicationError as error:
-            if not isinstance(error.__cause__, FileExistsError):
-                raise _IntegrityError("atomic checkpoint publication failed") from None
+        except ArtifactAlreadyPublishedError:
             if not _cleanup_staging_directory(sha256_fd, stage_name):
                 raise _AcquisitionError("losing staging cleanup failed") from None
             stage_name = None
@@ -378,7 +373,6 @@ def _stage_and_publish(
             _rollback_owned_directory(
                 sha256_fd,
                 contract.model_artifact_set_sha256,
-                published_identity,
             )
             raise _IntegrityError("published checkpoint failed final verification") from None
         return _ready(request, contract)
@@ -1346,19 +1340,11 @@ def _cleanup_staging_directory(parent_fd: int, name: str) -> bool:
         return False
 
 
-def _rollback_owned_directory(
-    parent_fd: int,
-    name: str,
-    expected_identity: tuple[int, int] | None,
-) -> bool:
-    if expected_identity is None:
-        return False
+def _rollback_owned_directory(parent_fd: int, name: str) -> bool:
     try:
-        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
         return True
     except OSError:
-        return False
-    if (metadata.st_dev, metadata.st_ino) != expected_identity:
         return False
     return _cleanup_staging_directory(parent_fd, name)

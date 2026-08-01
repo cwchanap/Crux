@@ -173,7 +173,8 @@ CANDIDATE_FILES = MappingProxyType(
         **{f"seal-candidate/{path}": role for role, path in CANDIDATE_ARTIFACTS},
     }
 )
-assert len(CANDIDATE_FILES) == 24
+if len(CANDIDATE_FILES) != 24:
+    raise ValueError("CANDIDATE_FILES must contain exactly 24 entries")
 
 PHASE_FILES: Mapping[str, Mapping[str, str]] = MappingProxyType(
     {
@@ -254,12 +255,18 @@ class _AttestationSnapshot:
 
 
 def _run_checked_command(command: tuple[str, ...]) -> bytes:
-    completed = subprocess.run(
-        command,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise NativeArtifactError(
+            f"GitHub attestation command timed out after {error.timeout} seconds"
+        ) from error
     if completed.returncode != 0:
         raise NativeArtifactError("GitHub attestation command failed")
     if not isinstance(completed.stdout, bytes):
@@ -2413,7 +2420,7 @@ def _validate_native_work_phase(
             payload_root=payload_root,
             repository_root=repository_root,
         )
-    except ValueError as error:
+    except (ValueError, ImportError) as error:
         raise NativeArtifactError("native work phase acceptance failed") from error
 
 

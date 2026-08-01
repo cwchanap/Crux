@@ -19,8 +19,8 @@ import tools.hpa320.audit_legacy_tf2_conversion as audit_module
 from src.benchmark.backend_identity import canonical_json_bytes
 from src.benchmark.backend_lock import load_conversion_audit
 from tools.hpa320.audit_legacy_tf2_conversion import (
+    AUDIT_CANDIDATE_MANIFEST_SCHEMA,
     CANDIDATE_MANIFEST_NAME,
-    CANDIDATE_MANIFEST_SCHEMA,
     AuditError,
     ConversionCoverage,
     ConverterLayerSpec,
@@ -130,7 +130,7 @@ def _candidate_fixture(
         "checkpoint_prefix": f"sha256/{artifact_sha256}/model.ckpt-569400",
         "model_artifact_set_sha256": artifact_sha256,
         "required_inference_inventory_sha256": required_inventory_sha256,
-        "schema": CANDIDATE_MANIFEST_SCHEMA,
+        "schema": AUDIT_CANDIDATE_MANIFEST_SCHEMA,
     }
     _write_canonical(candidate / CANDIDATE_MANIFEST_NAME, payload)
     return candidate, cache_root, payload

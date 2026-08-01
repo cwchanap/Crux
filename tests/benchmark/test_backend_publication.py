@@ -121,23 +121,13 @@ def test_rename_directory_no_replace_wraps_post_rename_non_directory_as_director
     destination = tmp_path / "published"
     source.mkdir()
     real_rename = backend_publication._rename_no_replace_syscall
-    real_stat = os.stat
 
     def rename_then_swap_to_file(*args: object, **kwargs: object) -> None:
         real_rename(*args, **kwargs)  # type: ignore[arg-type]
         destination.rmdir()
         destination.write_bytes(b"not a directory")
 
-    def stat_after_rename(path: object, *args: object, **kwargs: object) -> os.stat_result:
-        if Path(path) == destination.name or path == destination.name:
-            swapped = destination.exists() and not destination.is_dir()
-            result = real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
-            if swapped:
-                return result
-        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
-
     monkeypatch.setattr(backend_publication, "_rename_no_replace_syscall", rename_then_swap_to_file)
-    monkeypatch.setattr(backend_publication.os, "stat", stat_after_rename)
 
     with pytest.raises(DirectoryPublicationError):
         rename_directory_no_replace(source, destination)
@@ -171,7 +161,6 @@ def test_rename_directory_no_replace_wraps_post_rename_inode_swap_as_directory_e
     source.mkdir()
     (source / "evidence.json").write_bytes(b"{}\n")
     real_rename = backend_publication._rename_no_replace_syscall
-    real_stat = os.stat
 
     def rename_then_swap_to_other_directory(*args: object, **kwargs: object) -> None:
         real_rename(*args, **kwargs)  # type: ignore[arg-type]
@@ -181,13 +170,9 @@ def test_rename_directory_no_replace_wraps_post_rename_inode_swap_as_directory_e
         destination.rmdir()
         replacement.rename(destination)
 
-    def stat_after_swap(path: object, *args: object, **kwargs: object) -> os.stat_result:
-        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
-
     monkeypatch.setattr(
         backend_publication, "_rename_no_replace_syscall", rename_then_swap_to_other_directory
     )
-    monkeypatch.setattr(backend_publication.os, "stat", stat_after_swap)
 
     with pytest.raises(DirectoryPublicationError):
         rename_directory_no_replace(source, destination)
@@ -288,6 +273,7 @@ def test_rename_no_replace_syscall_rejects_unsupported_platform(
     tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(backend_publication.sys, "platform", "unsupported-os")
+    monkeypatch.setattr(backend_publication, "_RENAME_CALLABLE", None)
     parent = os.open(tmp_path, os.O_RDONLY)
 
     try:
@@ -307,6 +293,7 @@ def test_rename_no_replace_syscall_reports_missing_darwin_syscall(
     tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(backend_publication.sys, "platform", "darwin")
+    monkeypatch.setattr(backend_publication, "_RENAME_CALLABLE", None)
 
     class _MissingLibc:
         pass
@@ -331,6 +318,7 @@ def test_rename_no_replace_syscall_reports_missing_linux_syscall(
     tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(backend_publication.sys, "platform", "linux")
+    monkeypatch.setattr(backend_publication, "_RENAME_CALLABLE", None)
 
     class _MissingLibc:
         pass
@@ -367,6 +355,7 @@ def test_rename_no_replace_linux_syscall_success_returns_without_error(
     tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(backend_publication.sys, "platform", "linux")
+    monkeypatch.setattr(backend_publication, "_RENAME_CALLABLE", None)
 
     class _FakeLibc:
         renameat2 = _FakeRenameSyscall(return_value=0)
@@ -390,6 +379,7 @@ def test_rename_no_replace_linux_syscall_generic_error_raises_oserror(
     tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(backend_publication.sys, "platform", "linux")
+    monkeypatch.setattr(backend_publication, "_RENAME_CALLABLE", None)
     backend_publication.ctypes.set_errno(5)  # EIO-style generic errno
 
     class _FakeLibc:

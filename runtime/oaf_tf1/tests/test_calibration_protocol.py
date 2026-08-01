@@ -168,6 +168,10 @@ def _calibration_authorities(tmp_path: Path) -> dict[str, Path]:
     }
     base_request_content = _write_canonical(base_request_path, base_request)
     inventory = [{"architecture": "amd64", "name": "base-files", "version": "1"}]
+    # The crux.github-hosted-native-evidence/v2 schema has no standalone golden
+    # fixture here because it is validated only through the nested
+    # host_payload["schema"] field when authenticate_calibration_startup loads
+    # the host evidence via _validate_github_hosted_payload in backend_process.
     host_payload = {
         "github_job": "native-bootstrap",
         "github_repository": "acme/crux",

@@ -20,6 +20,7 @@ from src.benchmark.backend_identity import (
     strict_json_loads,
 )
 from src.benchmark.backend_publication import read_regular_file_no_follow
+from tools.hpa320._fsync import _fsync_directory
 
 BUILD_CONTEXT_SCHEMA = "crux.oaf-build-context-manifest/v1"
 BUILD_CONTEXT_MANIFEST_PATH = "runtime/oaf_tf1/build-context-manifest.json"
@@ -411,7 +412,7 @@ def _write_manifest_content(path: Path, content: bytes, *, replace: bool) -> Non
     if not replace:
         if output.exists() or output.is_symlink():
             raise BuildContextError("build-context manifest output must be absent")
-        temporary: str | None = None
+        published_path: str | None = None
         try:
             descriptor = os.open(
                 output,
@@ -422,19 +423,19 @@ def _write_manifest_content(path: Path, content: bytes, *, replace: bool) -> Non
                 | getattr(os, "O_NOFOLLOW", 0),
                 FILE_MODE,
             )
-            temporary = os.fspath(output)
+            published_path = os.fspath(output)
             with os.fdopen(descriptor, "wb") as handle:
                 os.fchmod(handle.fileno(), FILE_MODE)
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
             load_build_context_manifest(output)
-            temporary = None
+            published_path = None
             _fsync_directory(parent)
         except (BuildContextError, OSError):
-            if temporary is not None:
+            if published_path is not None:
                 try:
-                    os.unlink(temporary)
+                    os.unlink(published_path)
                 except OSError:
                     pass
             raise
@@ -459,14 +460,6 @@ def _write_manifest_content(path: Path, content: bytes, *, replace: bool) -> Non
         except OSError:
             pass
         raise
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _parser() -> argparse.ArgumentParser:
