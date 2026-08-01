@@ -57,6 +57,7 @@ jobs:
             pytest \
             pytest-asyncio \
             pytest-cov \
+            pyyaml \
             aiofiles \
             httpx \
             python-multipart \
