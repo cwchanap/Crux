@@ -2951,7 +2951,7 @@ def _validate_bootstrap_work_payload(*, payload_root: Path, repository_root: Pat
 def _validate_measurement_work_payload(*, payload_root: Path, repository_root: Path) -> None:
     root = _require_directory(payload_root, "native work payload root")
     repository = _require_directory(repository_root, "repository root")
-    accepted = _load_accepted_native_authorities(repository)
+    accepted = _load_accepted_pre_measurement_authorities(repository)
     operational = _load_operational_authority(
         payload_root=root,
         repository_root=repository,
@@ -3025,13 +3025,21 @@ def _validate_candidate_work_payload(*, payload_root: Path, repository_root: Pat
 
 
 @dataclass(frozen=True)
-class _AcceptedNativeAuthorities:
+class _AcceptedPreMeasurementAuthorities:
+    """Accepted authorities available before the measurement phase is checked in."""
+
     base: BaseSystemPackageEvidence
     base_request: BaseSystemPackageRequest
     bootstrap: CalibrationBootstrapEvidence
     bootstrap_request: CalibrationBootstrapRequest
     checkpoint: CheckpointAcquisitionEvidence
     checkpoint_request: CheckpointAcquisitionRequest
+
+
+@dataclass(frozen=True)
+class _AcceptedNativeAuthorities(_AcceptedPreMeasurementAuthorities):
+    """Accepted authorities including the committed measurement host bundle."""
+
     measurement_bundle: NativeHostAttestationBundle
     measurement_host: NativeHostEvidence
     measurement_host_payload: dict[str, JsonValue]
@@ -3046,7 +3054,9 @@ class _OperationalNativeAuthority:
     host_payload: dict[str, JsonValue]
 
 
-def _load_accepted_native_authorities(repository: Path) -> _AcceptedNativeAuthorities:
+def _load_accepted_pre_measurement_authorities(
+    repository: Path,
+) -> _AcceptedPreMeasurementAuthorities:
     evidence_root = repository / _ACCEPTED_NATIVE_EVIDENCE_ROOT
     bootstrap_request, bootstrap = load_calibration_bootstrap_evidence(
         repository / _CALIBRATION_BOOTSTRAP_REQUEST_PATH,
@@ -3068,16 +3078,29 @@ def _load_accepted_native_authorities(repository: Path) -> _AcceptedNativeAuthor
         or bootstrap_request.payload["base_system_package_request_sha256"] != base_request.sha256
     ):
         raise SealError("bootstrap request does not bind its accepted operational authorities")
-    measurement_bundle, measurement_host, measurement_host_payload = (
-        _load_accepted_measurement_host_authority(evidence_root)
-    )
-    return _AcceptedNativeAuthorities(
+    return _AcceptedPreMeasurementAuthorities(
         base=base,
         base_request=base_request,
         bootstrap=bootstrap,
         bootstrap_request=bootstrap_request,
         checkpoint=checkpoint,
         checkpoint_request=checkpoint_request,
+    )
+
+
+def _load_accepted_native_authorities(repository: Path) -> _AcceptedNativeAuthorities:
+    evidence_root = repository / _ACCEPTED_NATIVE_EVIDENCE_ROOT
+    authorities = _load_accepted_pre_measurement_authorities(repository)
+    measurement_bundle, measurement_host, measurement_host_payload = (
+        _load_accepted_measurement_host_authority(evidence_root)
+    )
+    return _AcceptedNativeAuthorities(
+        base=authorities.base,
+        base_request=authorities.base_request,
+        bootstrap=authorities.bootstrap,
+        bootstrap_request=authorities.bootstrap_request,
+        checkpoint=authorities.checkpoint,
+        checkpoint_request=authorities.checkpoint_request,
         measurement_bundle=measurement_bundle,
         measurement_host=measurement_host,
         measurement_host_payload=measurement_host_payload,
@@ -3177,7 +3200,7 @@ def _validate_operational_image_identity(
 
 def _validate_measurement_request_binding(
     request: CalibrationMeasurementRequest,
-    accepted: _AcceptedNativeAuthorities,
+    accepted: _AcceptedPreMeasurementAuthorities,
 ) -> None:
     if (
         request.payload["calibration_bootstrap_request_sha256"] != accepted.bootstrap_request.sha256
@@ -3244,7 +3267,7 @@ def _validate_measurement_authority(
     *,
     payload_root: Path,
     repository_root: Path,
-    accepted: _AcceptedNativeAuthorities,
+    accepted: _AcceptedPreMeasurementAuthorities,
     operational: _OperationalNativeAuthority,
 ) -> None:
     repository = _require_directory(repository_root, "repository root")
@@ -3269,7 +3292,7 @@ def _validate_measurement_authority(
 def _validate_measurement_evidence_authority(
     *,
     measurement: Mapping[str, JsonValue],
-    accepted: _AcceptedNativeAuthorities,
+    accepted: _AcceptedPreMeasurementAuthorities,
     bundle: NativeHostAttestationBundle | None = None,
     host: NativeHostEvidence | None = None,
     host_payload: Mapping[str, JsonValue] | None = None,

@@ -246,6 +246,10 @@ class _AttestationSnapshot:
     archive_path: Path
     manifest_path: Path
     payload_root: Path
+    bundle_path: Path
+    bundle_identity: CheckpointIdentity
+    trusted_root_path: Path
+    trusted_root_identity: CheckpointIdentity
     bindings: tuple[_SnapshotBinding, ...]
 
 
@@ -423,6 +427,8 @@ def _attestation_snapshot(
     phase: str,
     payload_root: Path,
     archive_path: Path,
+    sigstore_bundle_path: Path,
+    trusted_root_path: Path,
 ) -> Iterator[_AttestationSnapshot]:
     """Copy only the exact phase allowlist before any external verifier runs."""
 
@@ -431,6 +437,8 @@ def _attestation_snapshot(
     try:
         source_root = _absolute_path(payload_root, "payload root")
         source_archive = _absolute_path(archive_path, "archive")
+        source_bundle = _absolute_path(sigstore_bundle_path, "sigstore bundle")
+        source_trusted_root = _absolute_path(trusted_root_path, "trusted root")
         _scan_phase_payload(phase=phase, payload_root=source_root, include_manifest=False)
         temporary_directory = tempfile.TemporaryDirectory(prefix=".hpa320-attestation-")
         temporary_root = Path(os.path.realpath(temporary_directory.name))
@@ -443,21 +451,36 @@ def _attestation_snapshot(
             )
         snapshot_archive = temporary_root / source_archive.name
         _copy_snapshot_file(source=source_archive, destination=snapshot_archive)
+        snapshot_bundle = temporary_root / "sigstore.bundle.json"
+        snapshot_trusted_root = temporary_root / "trusted-root.json"
+        _copy_snapshot_file(source=source_bundle, destination=snapshot_bundle)
+        _copy_snapshot_file(source=source_trusted_root, destination=snapshot_trusted_root)
         _scan_phase_payload(phase=phase, payload_root=source_root, include_manifest=False)
         _seal_snapshot(
             phase=phase,
             payload_root=snapshot_root,
             archive_path=snapshot_archive,
         )
+        os.chmod(snapshot_bundle, 0o400)
+        os.chmod(snapshot_trusted_root, 0o400)
+        bindings: list[_SnapshotBinding] = list(
+            _capture_snapshot_bindings(
+                phase=phase,
+                payload_root=snapshot_root,
+                archive_path=snapshot_archive,
+            )
+        )
+        bindings.append(_capture_regular_file_binding(snapshot_bundle))
+        bindings.append(_capture_regular_file_binding(snapshot_trusted_root))
         yield _AttestationSnapshot(
             archive_path=snapshot_archive,
             manifest_path=snapshot_root / MANIFEST_NAME,
             payload_root=snapshot_root,
-            bindings=_capture_snapshot_bindings(
-                phase=phase,
-                payload_root=snapshot_root,
-                archive_path=snapshot_archive,
-            ),
+            bundle_path=snapshot_bundle,
+            bundle_identity=_stream_regular_file_identity(snapshot_bundle),
+            trusted_root_path=snapshot_trusted_root,
+            trusted_root_identity=_stream_regular_file_identity(snapshot_trusted_root),
+            bindings=tuple(bindings),
         )
     except NativeArtifactError:
         raise
@@ -547,6 +570,15 @@ def _seal_snapshot(*, phase: str, payload_root: Path, archive_path: Path) -> Non
         os.chmod(path, 0o500)
 
 
+def _capture_regular_file_binding(path: Path) -> _SnapshotBinding:
+    before = os.stat(path, follow_symlinks=False)
+    identity = _stream_regular_file_identity(path)
+    after = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(after.st_mode) or not _same_file_snapshot(before, after):
+        raise NativeArtifactError("native work attestation snapshot file is unsafe")
+    return _SnapshotBinding(path=path, metadata=after, sha256=identity.sha256)
+
+
 def _capture_snapshot_bindings(
     *,
     phase: str,
@@ -564,18 +596,7 @@ def _capture_snapshot_bindings(
         payload_root=payload_root,
         archive_path=archive_path,
     ):
-        before = os.stat(path, follow_symlinks=False)
-        identity = _stream_regular_file_identity(path)
-        after = os.stat(path, follow_symlinks=False)
-        if not stat.S_ISREG(after.st_mode) or not _same_file_snapshot(before, after):
-            raise NativeArtifactError("native work attestation snapshot file is unsafe")
-        bindings.append(
-            _SnapshotBinding(
-                path=path,
-                metadata=after,
-                sha256=identity.sha256,
-            )
-        )
+        bindings.append(_capture_regular_file_binding(path))
     return tuple(bindings)
 
 
@@ -2236,6 +2257,8 @@ def _parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--payload-root", required=True, type=Path)
     verify_parser.add_argument("--archive", required=True, type=Path)
     verify_parser.add_argument("--bundle", type=Path)
+    verify_parser.add_argument("--expected-bundle-sha256")
+    verify_parser.add_argument("--expected-bundle-size", type=int)
     attestation_parser = subparsers.add_parser("verify-attestation")
     attestation_parser.add_argument(
         "--phase", required=True, choices=tuple(PHASE_HOST_BUNDLE_PATHS)
@@ -2286,21 +2309,32 @@ def main(argv: list[str] | None = None) -> int:
                 archive_path=arguments.archive,
             )
             if arguments.bundle is not None:
-                _verify_optional_attestation_bundle(arguments.bundle)
+                if (
+                    arguments.expected_bundle_sha256 is None
+                    or arguments.expected_bundle_size is None
+                ):
+                    raise NativeArtifactError("native work attestation bundle identity is required")
+                _verify_optional_attestation_bundle(
+                    arguments.bundle,
+                    expected_sha256=arguments.expected_bundle_sha256,
+                    expected_size=arguments.expected_bundle_size,
+                )
         elif arguments.command == "verify-attestation":
             report: bytes
             with _attestation_snapshot(
                 phase=arguments.phase,
                 payload_root=arguments.payload_root,
                 archive_path=arguments.archive,
+                sigstore_bundle_path=arguments.bundle,
+                trusted_root_path=arguments.trusted_root,
             ) as snapshot:
                 verified = verify_github_attestations(
                     phase=arguments.phase,
                     workflow_commit=arguments.workflow_commit,
                     manifest_path=snapshot.manifest_path,
                     archive_path=snapshot.archive_path,
-                    sigstore_bundle_path=arguments.bundle,
-                    trusted_root_path=arguments.trusted_root,
+                    sigstore_bundle_path=snapshot.bundle_path,
+                    trusted_root_path=snapshot.trusted_root_path,
                 )
                 _require_snapshot_subjects(
                     phase=arguments.phase,
@@ -2343,10 +2377,23 @@ def main(argv: list[str] | None = None) -> int:
                     snapshot=snapshot,
                     verified=verified,
                 )
-                report = _attestation_review_report(arguments, verified)
+                report = _attestation_review_report(arguments, verified, snapshot)
             sys.stdout.buffer.write(report)
         elif arguments.command == "copy-bundle":
-            copy_attestation_bundle(source=arguments.source, destination=arguments.destination)
+            identity = copy_attestation_bundle(
+                source=arguments.source, destination=arguments.destination
+            )
+            sys.stdout.buffer.write(
+                canonical_json_bytes(
+                    {
+                        "destination": os.fspath(arguments.destination),
+                        "sha256": identity.sha256,
+                        "size": identity.size,
+                        "status": "copied",
+                    },
+                    trailing_newline=True,
+                )
+            )
         else:
             raise NativeArtifactError("native work archive command is invalid")
     except NativeArtifactError as error:
@@ -2441,6 +2488,7 @@ def _require_verified_archive_identity(
 def _attestation_review_report(
     arguments: argparse.Namespace,
     verified: VerifiedGitHubAttestation,
+    snapshot: _AttestationSnapshot,
 ) -> bytes:
     report: JsonValue = {
         "arguments": {
@@ -2453,20 +2501,35 @@ def _attestation_review_report(
             "workflow_commit": arguments.workflow_commit,
         },
         "gh_version": verified.gh_version,
+        "sigstore_bundle": {
+            "sha256": snapshot.bundle_identity.sha256,
+            "size": snapshot.bundle_identity.size,
+        },
         "statement_sha256": verified.statement_sha256,
         "subjects": [
             {"name": subject.name, "sha256": subject.sha256, "size": subject.size}
             for subject in verified.subjects
         ],
+        "trusted_root": {
+            "sha256": snapshot.trusted_root_identity.sha256,
+            "size": snapshot.trusted_root_identity.size,
+        },
     }
     return canonical_json_bytes(report, trailing_newline=True)
 
 
-def _verify_optional_attestation_bundle(path: Path) -> None:
+def _verify_optional_attestation_bundle(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_size: int,
+) -> None:
     try:
-        _stream_regular_file_identity(path)
+        identity = _stream_regular_file_identity(path)
     except OSError as error:
         raise NativeArtifactError("native work attestation bundle is missing or unsafe") from error
+    if identity.sha256 != expected_sha256 or identity.size != expected_size:
+        raise NativeArtifactError("native work attestation bundle identity does not match")
 
 
 if __name__ == "__main__":
