@@ -26,6 +26,11 @@ from src.benchmark.backend_prepare import (
 from src.benchmark.backend_prepare import (
     prepare_oaf_backend as _public_prepare_oaf_backend,
 )
+from src.benchmark.backend_publication import (
+    ArtifactPublicationError,
+    DirectoryPublicationError,
+    PublishedDirectory,
+)
 from src.benchmark.backend_registry import OFFICIAL_BACKEND_ID
 from src.benchmark.checkpoint_acquisition import (
     ArchiveMemberIdentity,
@@ -1191,3 +1196,169 @@ def test_atomic_publication_never_replaces_racing_empty_destination(
     assert outcome.exit_code == 2
     assert expected.is_dir()
     assert list(expected.iterdir()) == []
+
+
+def test_directory_publication_error_rolls_back_owned_final_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_bytes = _valid_archive_bytes()
+    backend_lock = _loaded_lock(archive_bytes)
+    expected = _final_path(tmp_path, backend_lock)
+
+    def raise_directory_publication_error(source: Path, target: Path) -> PublishedDirectory:
+        raise DirectoryPublicationError(
+            PublishedDirectory(target, os.stat(source, follow_symlinks=False))
+        )
+
+    monkeypatch.setattr(
+        backend_prepare, "rename_directory_no_replace", raise_directory_publication_error
+    )
+
+    outcome = prepare_oaf_backend(
+        _request(tmp_path, archive_path=_write_archive(tmp_path, archive_bytes)),
+        backend_lock=backend_lock,
+    )
+
+    assert outcome.status == "integrity_failed"
+    assert outcome.exit_code == 2
+    assert not expected.exists()
+
+
+def test_directory_publication_error_with_rollback_failure_reports_rollback_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_bytes = _valid_archive_bytes()
+    backend_lock = _loaded_lock(archive_bytes)
+    expected = _final_path(tmp_path, backend_lock)
+
+    def raise_directory_publication_error(source: Path, target: Path) -> PublishedDirectory:
+        raise DirectoryPublicationError(
+            PublishedDirectory(target, os.stat(source, follow_symlinks=False))
+        )
+
+    monkeypatch.setattr(
+        backend_prepare, "rename_directory_no_replace", raise_directory_publication_error
+    )
+    monkeypatch.setattr(backend_prepare, "_rollback_owned_directory", lambda *a, **k: False)
+
+    outcome = prepare_oaf_backend(
+        _request(tmp_path, archive_path=_write_archive(tmp_path, archive_bytes)),
+        backend_lock=backend_lock,
+    )
+
+    assert outcome.status == "integrity_failed"
+    assert outcome.exit_code == 2
+    assert not expected.exists()
+
+
+def test_artifact_publication_error_without_file_exists_cause_is_integrity_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_bytes = _valid_archive_bytes()
+    backend_lock = _loaded_lock(archive_bytes)
+    expected = _final_path(tmp_path, backend_lock)
+
+    def raise_artifact_publication_error(source: Path, target: Path) -> PublishedDirectory:
+        raise ArtifactPublicationError("publication failed without file-exists cause")
+
+    monkeypatch.setattr(
+        backend_prepare, "rename_directory_no_replace", raise_artifact_publication_error
+    )
+
+    outcome = prepare_oaf_backend(
+        _request(tmp_path, archive_path=_write_archive(tmp_path, archive_bytes)),
+        backend_lock=backend_lock,
+    )
+
+    assert outcome.status == "integrity_failed"
+    assert outcome.exit_code == 2
+    assert not expected.exists()
+
+
+def test_file_exists_cause_with_losing_cleanup_failure_is_acquisition_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_bytes = _valid_archive_bytes()
+    backend_lock = _loaded_lock(archive_bytes)
+    expected = _final_path(tmp_path, backend_lock)
+
+    def raise_file_exists_error(source: Path, target: Path) -> PublishedDirectory:
+        raise ArtifactPublicationError("destination exists") from FileExistsError("raced target")
+
+    monkeypatch.setattr(backend_prepare, "rename_directory_no_replace", raise_file_exists_error)
+    monkeypatch.setattr(backend_prepare, "_cleanup_staging_directory", lambda *a, **k: False)
+
+    outcome = prepare_oaf_backend(
+        _request(tmp_path, archive_path=_write_archive(tmp_path, archive_bytes)),
+        backend_lock=backend_lock,
+    )
+
+    assert outcome.status == "acquisition_failed"
+    assert outcome.exit_code == 1
+    assert not expected.exists()
+
+
+def test_rollback_owned_directory_returns_false_for_missing_identity() -> None:
+    parent_fd = os.open("/", os.O_RDONLY)
+    try:
+        assert backend_prepare._rollback_owned_directory(parent_fd, "name", None) is False
+    finally:
+        os.close(parent_fd)
+
+
+def test_rollback_owned_directory_returns_true_when_target_is_absent(tmp_path: Path) -> None:
+    parent_fd = os.open(tmp_path, os.O_RDONLY)
+    try:
+        identity = (tmp_path.stat().st_dev, tmp_path.stat().st_ino)
+        assert backend_prepare._rollback_owned_directory(parent_fd, "missing", identity) is True
+    finally:
+        os.close(parent_fd)
+
+
+def test_rollback_owned_directory_returns_false_on_oserror(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_fd = os.open(tmp_path, os.O_RDONLY)
+    try:
+        identity = (tmp_path.stat().st_dev, tmp_path.stat().st_ino)
+
+        def failing_stat(*_args: object, **_kwargs: object) -> os.stat_result:
+            raise OSError("injected stat failure")
+
+        monkeypatch.setattr(os, "stat", failing_stat)
+        assert backend_prepare._rollback_owned_directory(parent_fd, "name", identity) is False
+    finally:
+        os.close(parent_fd)
+
+
+def test_rollback_owned_directory_returns_false_on_inode_mismatch(tmp_path: Path) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    parent_fd = os.open(tmp_path, os.O_RDONLY)
+    try:
+        mismatched_identity = (tmp_path.stat().st_dev, tmp_path.stat().st_ino + 1)
+        assert (
+            backend_prepare._rollback_owned_directory(parent_fd, "staging", mismatched_identity)
+            is False
+        )
+        assert staging.exists()
+    finally:
+        os.close(parent_fd)
+
+
+def test_rollback_owned_directory_cleans_matching_inode(tmp_path: Path) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "member.json").write_bytes(b"{}\n")
+    parent_fd = os.open(tmp_path, os.O_RDONLY)
+    try:
+        identity = (staging.stat().st_dev, staging.stat().st_ino)
+        assert backend_prepare._rollback_owned_directory(parent_fd, "staging", identity) is True
+        assert not staging.exists()
+    finally:
+        os.close(parent_fd)

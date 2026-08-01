@@ -16,11 +16,13 @@ from src.benchmark import backend_publication
 from src.benchmark.backend_identity import sha256_hex
 from src.benchmark.backend_publication import (
     ArtifactPublicationError,
+    DirectoryPublicationError,
     atomic_replace_bytes,
     open_directory_anchor,
     publish_immutable_bytes,
     read_regular_file_no_follow,
     rename_directory_no_replace,
+    rollback_published_directory,
 )
 
 
@@ -100,12 +102,346 @@ def test_rename_directory_no_replace_rejects_parent_swap_without_touching_attack
     assert not (attacker / "reports" / "published").exists()
 
 
+def test_rename_directory_no_replace_rejects_cross_parent_rename(tmp_path: Path) -> None:
+    source = tmp_path / "alpha" / "source"
+    destination = tmp_path / "beta" / "published"
+    source.mkdir(parents=True)
+
+    with pytest.raises(ArtifactPublicationError, match="one parent directory"):
+        rename_directory_no_replace(source, destination)
+
+    assert source.is_dir()
+
+
+def test_rename_directory_no_replace_wraps_post_rename_non_directory_as_directory_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "published"
+    source.mkdir()
+    real_rename = backend_publication._rename_no_replace_syscall
+    real_stat = os.stat
+
+    def rename_then_swap_to_file(*args: object, **kwargs: object) -> None:
+        real_rename(*args, **kwargs)  # type: ignore[arg-type]
+        destination.rmdir()
+        destination.write_bytes(b"not a directory")
+
+    def stat_after_rename(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        if Path(path) == destination.name or path == destination.name:
+            swapped = destination.exists() and not destination.is_dir()
+            result = real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+            if swapped:
+                return result
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(backend_publication, "_rename_no_replace_syscall", rename_then_swap_to_file)
+    monkeypatch.setattr(backend_publication.os, "stat", stat_after_rename)
+
+    with pytest.raises(DirectoryPublicationError):
+        rename_directory_no_replace(source, destination)
+
+
+def test_rename_directory_no_replace_wraps_pre_rename_oserror_as_publication_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "published"
+    source.mkdir()
+
+    def failing_rename(*args: object, **kwargs: object) -> None:
+        raise OSError("rename syscall failed before publication")
+
+    monkeypatch.setattr(backend_publication, "_rename_no_replace_syscall", failing_rename)
+
+    with pytest.raises(ArtifactPublicationError, match="atomic no-replace"):
+        rename_directory_no_replace(source, destination)
+
+    assert source.is_dir()
+
+
+def test_rename_directory_no_replace_wraps_post_rename_inode_swap_as_directory_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "published"
+    source.mkdir()
+    (source / "evidence.json").write_bytes(b"{}\n")
+    real_rename = backend_publication._rename_no_replace_syscall
+    real_stat = os.stat
+
+    def rename_then_swap_to_other_directory(*args: object, **kwargs: object) -> None:
+        real_rename(*args, **kwargs)  # type: ignore[arg-type]
+        replacement = tmp_path / "replacement"
+        replacement.mkdir()
+        (destination / "evidence.json").unlink()
+        destination.rmdir()
+        replacement.rename(destination)
+
+    def stat_after_swap(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        backend_publication, "_rename_no_replace_syscall", rename_then_swap_to_other_directory
+    )
+    monkeypatch.setattr(backend_publication.os, "stat", stat_after_swap)
+
+    with pytest.raises(DirectoryPublicationError):
+        rename_directory_no_replace(source, destination)
+
+
+def test_rollback_published_directory_removes_inode_bound_directory(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "published"
+    source.mkdir()
+    (source / "evidence.json").write_bytes(b"{}\n")
+    publication = rename_directory_no_replace(source, destination)
+
+    rollback_published_directory(publication)
+
+    assert not destination.exists()
+    assert not source.exists()
+
+
+def test_rollback_published_directory_rejects_non_publication(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="PublishedDirectory"):
+        rollback_published_directory(tmp_path)  # type: ignore[arg-type]
+
+
+def test_rollback_published_directory_rejects_inode_substitution(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "published"
+    source.mkdir()
+    (source / "evidence.json").write_bytes(b"{}\n")
+    publication = rename_directory_no_replace(source, destination)
+
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / "attacker.json").write_bytes(b"attacker\n")
+    (destination / "evidence.json").unlink()
+    destination.rmdir()
+    replacement.rename(destination)
+
+    with pytest.raises(ArtifactPublicationError, match="rollback failed"):
+        rollback_published_directory(publication)
+
+    assert (destination / "attacker.json").read_bytes() == b"attacker\n"
+
+
+def test_rollback_published_directory_rejects_unsafe_entry(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "published"
+    source.mkdir()
+    (source / "evidence.json").write_bytes(b"{}\n")
+    publication = rename_directory_no_replace(source, destination)
+
+    nested = destination / "nested"
+    nested.mkdir()
+
+    with pytest.raises(ArtifactPublicationError, match="rollback failed"):
+        rollback_published_directory(publication)
+
+    nested.rmdir()
+
+
 def test_no_follow_reader_rejects_content_larger_than_its_bound(tmp_path: Path) -> None:
     source = tmp_path / "oversized.json"
     source.write_bytes(b"12345")
 
     with pytest.raises(OSError):
         read_regular_file_no_follow(source, max_bytes=4)
+
+
+def test_no_follow_reader_rejects_non_integer_max_bytes(tmp_path: Path) -> None:
+    source = tmp_path / "artifact.json"
+    source.write_bytes(b"12345")
+
+    with pytest.raises(TypeError, match="max_bytes"):
+        read_regular_file_no_follow(source, max_bytes=True)  # type: ignore[arg-type]
+
+
+def test_no_follow_reader_rejects_negative_max_bytes(tmp_path: Path) -> None:
+    source = tmp_path / "artifact.json"
+    source.write_bytes(b"12345")
+
+    with pytest.raises(ValueError, match="max_bytes"):
+        read_regular_file_no_follow(source, max_bytes=-1)
+
+
+def test_no_follow_reader_returns_exact_bytes_under_bound(tmp_path: Path) -> None:
+    source = tmp_path / "artifact.json"
+    source.write_bytes(b"12345")
+
+    assert read_regular_file_no_follow(source, max_bytes=5) == b"12345"
+    assert read_regular_file_no_follow(source, max_bytes=None) == b"12345"
+
+
+def test_rename_no_replace_syscall_rejects_unsupported_platform(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(backend_publication.sys, "platform", "unsupported-os")
+    parent = os.open(tmp_path, os.O_RDONLY)
+
+    try:
+        with pytest.raises(OSError, match="unsupported"):
+            backend_publication._rename_no_replace_syscall(
+                "source",
+                "destination",
+                src_dir_fd=parent,
+                dst_dir_fd=parent,
+            )
+    finally:
+        os.close(parent)
+
+
+def test_rename_no_replace_syscall_reports_missing_darwin_syscall(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(backend_publication.sys, "platform", "darwin")
+
+    class _MissingLibc:
+        pass
+
+    monkeypatch.setattr(backend_publication.ctypes, "CDLL", lambda *a, **k: _MissingLibc())
+    parent = os.open(tmp_path, os.O_RDONLY)
+
+    try:
+        with pytest.raises(OSError, match="renameatx_np is unavailable"):
+            backend_publication._rename_no_replace_syscall(
+                "source",
+                "destination",
+                src_dir_fd=parent,
+                dst_dir_fd=parent,
+            )
+    finally:
+        os.close(parent)
+
+
+def test_rename_no_replace_syscall_reports_missing_linux_syscall(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(backend_publication.sys, "platform", "linux")
+
+    class _MissingLibc:
+        pass
+
+    monkeypatch.setattr(backend_publication.ctypes, "CDLL", lambda *a, **k: _MissingLibc())
+    parent = os.open(tmp_path, os.O_RDONLY)
+
+    try:
+        with pytest.raises(OSError, match="renameat2 is unavailable"):
+            backend_publication._rename_no_replace_syscall(
+                "source",
+                "destination",
+                src_dir_fd=parent,
+                dst_dir_fd=parent,
+            )
+    finally:
+        os.close(parent)
+
+
+class _FakeRenameSyscall:
+    """A stand-in for a libc rename function with settable argtypes/restype."""
+
+    def __init__(self, return_value: int) -> None:
+        self.return_value = return_value
+        self.argtypes: object = None
+        self.restype: object = None
+
+    def __call__(self, *args: object) -> int:
+        return self.return_value
+
+
+def test_rename_no_replace_linux_syscall_success_returns_without_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(backend_publication.sys, "platform", "linux")
+
+    class _FakeLibc:
+        renameat2 = _FakeRenameSyscall(return_value=0)
+
+    monkeypatch.setattr(backend_publication.ctypes, "CDLL", lambda *a, **k: _FakeLibc())
+    parent = os.open(tmp_path, os.O_RDONLY)
+
+    try:
+        backend_publication._rename_no_replace_syscall(
+            "source",
+            "destination",
+            src_dir_fd=parent,
+            dst_dir_fd=parent,
+        )
+    finally:
+        os.close(parent)
+
+
+def test_rename_no_replace_linux_syscall_generic_error_raises_oserror(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(backend_publication.sys, "platform", "linux")
+    backend_publication.ctypes.set_errno(5)  # EIO-style generic errno
+
+    class _FakeLibc:
+        renameat2 = _FakeRenameSyscall(return_value=-1)
+
+    monkeypatch.setattr(backend_publication.ctypes, "CDLL", lambda *a, **k: _FakeLibc())
+    parent = os.open(tmp_path, os.O_RDONLY)
+
+    try:
+        with pytest.raises(OSError):
+            backend_publication._rename_no_replace_syscall(
+                "source",
+                "destination",
+                src_dir_fd=parent,
+                dst_dir_fd=parent,
+            )
+    finally:
+        os.close(parent)
+
+
+def test_read_descriptor_raises_when_content_exceeds_bound(tmp_path: Path) -> None:
+    source = tmp_path / "oversized.bin"
+    source.write_bytes(b"12345")
+    descriptor = os.open(source, os.O_RDONLY)
+
+    try:
+        with pytest.raises(OSError, match="bounded read size"):
+            backend_publication._read_descriptor(descriptor, max_bytes=4)
+    finally:
+        os.close(descriptor)
+
+
+def test_verify_directory_binding_at_rejects_path_substitution(tmp_path: Path) -> None:
+    parent_fd = os.open(tmp_path, os.O_RDONLY)
+    target = tmp_path / "target"
+    target.mkdir()
+    try:
+        target_stat = os.stat(target, follow_symlinks=False)
+        mismatched = os.stat_result(
+            (target_stat.st_mode, target_stat.st_ino + 1, target_stat.st_dev, 1, 0, 0, 0, 0, 0, 0)
+        )
+        anchored = backend_publication._AnchoredParent(
+            descriptors=[],
+            bindings=[],
+            parent_descriptor=parent_fd,
+            name="target",
+        )
+
+        with pytest.raises(OSError, match="directory path binding changed"):
+            backend_publication._verify_directory_binding_at(anchored, mismatched)
+    finally:
+        os.close(parent_fd)
 
 
 @pytest.mark.parametrize("raise_inside", [False, True])
