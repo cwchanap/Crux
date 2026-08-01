@@ -1341,7 +1341,7 @@ def test_rollback_owned_directory_returns_false_on_inode_mismatch(tmp_path: Path
     staging.mkdir()
     parent_fd = os.open(tmp_path, os.O_RDONLY)
     try:
-        mismatched_identity = (tmp_path.stat().st_dev, tmp_path.stat().st_ino + 1)
+        mismatched_identity = (staging.stat().st_dev, staging.stat().st_ino + 100)
         assert (
             backend_prepare._rollback_owned_directory(parent_fd, "staging", mismatched_identity)
             is False
