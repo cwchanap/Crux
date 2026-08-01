@@ -326,6 +326,35 @@ def test_build_context_generate_default_requires_absent_output(
     assert output.read_bytes() == original
 
 
+def test_build_context_generate_cleans_output_when_parent_sync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, wheelhouse, _source = _configure_minimal_generation(tmp_path, monkeypatch)
+    output = tmp_path / "build-context-manifest.json"
+    arguments = _generate_arguments(repository, wheelhouse, output)
+    real_fsync = context_module._fsync_directory
+    sync_calls = 0
+
+    def fail_first_parent_sync(path: Path) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            raise OSError("injected parent directory sync failure")
+        real_fsync(path)
+
+    monkeypatch.setattr(context_module, "_fsync_directory", fail_first_parent_sync)
+
+    assert context_module.main(arguments) == 2
+    # The still-owned output must be rolled back so a retry does not collide
+    # with a leftover file whose directory entry was never synchronized.
+    assert not output.exists()
+
+    monkeypatch.setattr(context_module, "_fsync_directory", real_fsync)
+    assert context_module.main(arguments) == 0
+    assert output.exists()
+
+
 def test_build_context_generate_check_is_exact_and_non_mutating(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

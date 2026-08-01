@@ -830,19 +830,20 @@ def test_concurrent_loser_verifies_winner_instead_of_replacing_it(
     assert {path.name: path.read_bytes() for path in expected.iterdir()} == COMPONENT_BYTES
 
 
-def test_final_reverification_rejects_symlink_swap_and_rolls_back_owned_directory(
+def test_final_reverification_rejects_symlink_swap_and_refuses_unsafe_rollback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     archive_bytes = _valid_archive_bytes()
     backend_lock = _loaded_lock(archive_bytes)
+    expected = _final_path(tmp_path, backend_lock)
     real_rename = backend_prepare.rename_directory_no_replace
 
-    def swap_then_publish(source: Path, target: Path) -> None:
+    def swap_then_publish(source: Path, target: Path) -> PublishedDirectory:
         source_index = source / "model.ckpt-569400.index"
         source_index.unlink()
         source_index.symlink_to("model.ckpt-569400.meta")
-        real_rename(source, target)
+        return real_rename(source, target)
 
     monkeypatch.setattr(backend_prepare, "rename_directory_no_replace", swap_then_publish)
 
@@ -853,7 +854,51 @@ def test_final_reverification_rejects_symlink_swap_and_rolls_back_owned_director
 
     assert outcome.status == "integrity_failed"
     assert outcome.exit_code == 2
-    assert not _final_path(tmp_path, backend_lock).exists()
+    # The inode-safe rollback refuses to delete a published directory that now
+    # contains a non-regular entry, so the unsafe artifact remains on disk for
+    # forensics instead of being removed by name.
+    assert expected.exists()
+
+
+def test_final_reverification_preserves_replacement_swapped_before_revalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_bytes = _valid_archive_bytes()
+    backend_lock = _loaded_lock(archive_bytes)
+    expected = _final_path(tmp_path, backend_lock)
+    replacement_marker = b"replacement-authority\n"
+    real_verify = backend_prepare._verify_model_directory
+    verify_calls = 0
+
+    def swap_target_then_fail(
+        parent_fd: int,
+        name: str,
+        components: tuple[backend_prepare._Component, ...],
+    ) -> None:
+        nonlocal verify_calls
+        verify_calls += 1
+        if verify_calls == 2:
+            substituted = expected.parent / f".{expected.name}.substituted"
+            os.rename(expected, substituted)
+            expected.mkdir()
+            (expected / "marker.txt").write_bytes(replacement_marker)
+            raise OSError("injected final revalidation failure")
+        real_verify(parent_fd, name, components)
+
+    monkeypatch.setattr(backend_prepare, "_verify_model_directory", swap_target_then_fail)
+
+    outcome = prepare_oaf_backend(
+        _request(tmp_path, archive_path=_write_archive(tmp_path, archive_bytes)),
+        backend_lock=backend_lock,
+    )
+
+    assert outcome.status == "integrity_failed"
+    assert outcome.exit_code == 2
+    # The substituted authority at the target must survive final-verification
+    # rollback; only this process's own published directory may be rolled back.
+    assert expected.exists()
+    assert (expected / "marker.txt").read_bytes() == replacement_marker
 
 
 class _DownloadResponse(io.BytesIO):
@@ -1207,14 +1252,12 @@ def test_directory_publication_error_rolls_back_owned_final_cache(
     backend_lock = _loaded_lock(archive_bytes)
     expected = _final_path(tmp_path, backend_lock)
 
-    def raise_directory_publication_error(source: Path, target: Path) -> PublishedDirectory:
-        raise DirectoryPublicationError(
-            PublishedDirectory(target, os.stat(source, follow_symlinks=False))
-        )
+    def rename_then_raise(source: Path, target: Path) -> PublishedDirectory:
+        source_stat = os.stat(source, follow_symlinks=False)
+        os.rename(source, target)
+        raise DirectoryPublicationError(PublishedDirectory(target, source_stat))
 
-    monkeypatch.setattr(
-        backend_prepare, "rename_directory_no_replace", raise_directory_publication_error
-    )
+    monkeypatch.setattr(backend_prepare, "rename_directory_no_replace", rename_then_raise)
 
     outcome = prepare_oaf_backend(
         _request(tmp_path, archive_path=_write_archive(tmp_path, archive_bytes)),
@@ -1242,12 +1285,13 @@ def test_directory_publication_error_with_rollback_failure_reports_rollback_fail
     monkeypatch.setattr(
         backend_prepare, "rename_directory_no_replace", raise_directory_publication_error
     )
-    rollback_calls: list[tuple] = []
-    monkeypatch.setattr(
-        backend_prepare,
-        "_rollback_owned_directory",
-        lambda *a, **k: rollback_calls.append((a, k)) or False,
-    )
+    rollback_calls: list[PublishedDirectory] = []
+
+    def failing_rollback(publication: PublishedDirectory) -> None:
+        rollback_calls.append(publication)
+        raise ArtifactPublicationError("injected rollback failure")
+
+    monkeypatch.setattr(backend_prepare, "rollback_published_directory", failing_rollback)
 
     outcome = prepare_oaf_backend(
         _request(tmp_path, archive_path=_write_archive(tmp_path, archive_bytes)),
@@ -1258,8 +1302,40 @@ def test_directory_publication_error_with_rollback_failure_reports_rollback_fail
     assert outcome.exit_code == 2
     assert not expected.exists()
     assert len(rollback_calls) == 1
-    args, _kwargs = rollback_calls[0]
-    assert args[1] == backend_lock.descriptor.payload["model_artifact_set_sha256"]
+    assert rollback_calls[0].path == expected
+
+
+def test_directory_publication_error_preserves_replacement_at_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_bytes = _valid_archive_bytes()
+    backend_lock = _loaded_lock(archive_bytes)
+    expected = _final_path(tmp_path, backend_lock)
+    replacement_marker = b"replacement-authority\n"
+
+    def rename_then_substitute(source: Path, target: Path) -> PublishedDirectory:
+        source_stat = os.stat(source, follow_symlinks=False)
+        os.rename(source, target)
+        substituted = target.parent / f".{target.name}.substituted"
+        os.rename(target, substituted)
+        target.mkdir()
+        (target / "marker.txt").write_bytes(replacement_marker)
+        raise DirectoryPublicationError(PublishedDirectory(target, source_stat))
+
+    monkeypatch.setattr(backend_prepare, "rename_directory_no_replace", rename_then_substitute)
+
+    outcome = prepare_oaf_backend(
+        _request(tmp_path, archive_path=_write_archive(tmp_path, archive_bytes)),
+        backend_lock=backend_lock,
+    )
+
+    assert outcome.status == "integrity_failed"
+    assert outcome.exit_code == 2
+    # The substituted authority at the target must survive; only this process's
+    # own published directory may be rolled back, never a replacement.
+    assert expected.exists()
+    assert (expected / "marker.txt").read_bytes() == replacement_marker
 
 
 def test_artifact_publication_error_without_file_exists_cause_is_integrity_failure(
@@ -1317,47 +1393,3 @@ def test_file_exists_cause_with_losing_cleanup_failure_is_acquisition_failure(
     assert outcome.exit_code == 1
     assert not expected.exists()
     assert len(cleanup_calls) == 2
-
-
-def test_rollback_owned_directory_returns_true_for_missing_directory() -> None:
-    parent_fd = os.open("/", os.O_RDONLY)
-    try:
-        assert backend_prepare._rollback_owned_directory(parent_fd, "nonexistent_name") is True
-    finally:
-        os.close(parent_fd)
-
-
-def test_rollback_owned_directory_returns_true_when_target_is_absent(tmp_path: Path) -> None:
-    parent_fd = os.open(tmp_path, os.O_RDONLY)
-    try:
-        assert backend_prepare._rollback_owned_directory(parent_fd, "missing") is True
-    finally:
-        os.close(parent_fd)
-
-
-def test_rollback_owned_directory_returns_false_on_oserror(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    parent_fd = os.open(tmp_path, os.O_RDONLY)
-    try:
-
-        def failing_stat(*_args: object, **_kwargs: object) -> os.stat_result:
-            raise OSError("injected stat failure")
-
-        monkeypatch.setattr(os, "stat", failing_stat)
-        assert backend_prepare._rollback_owned_directory(parent_fd, "name") is False
-    finally:
-        os.close(parent_fd)
-
-
-def test_rollback_owned_directory_cleans_present_directory(tmp_path: Path) -> None:
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    (staging / "member.json").write_bytes(b"{}\n")
-    parent_fd = os.open(tmp_path, os.O_RDONLY)
-    try:
-        assert backend_prepare._rollback_owned_directory(parent_fd, "staging") is True
-        assert not staging.exists()
-    finally:
-        os.close(parent_fd)

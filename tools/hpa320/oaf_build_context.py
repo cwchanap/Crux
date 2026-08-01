@@ -430,14 +430,19 @@ def _write_manifest_content(path: Path, content: bytes, *, replace: bool) -> Non
                 handle.flush()
                 os.fsync(handle.fileno())
             load_build_context_manifest(output)
-            published_path = None
             _fsync_directory(parent)
+            published_path = None
         except (BuildContextError, OSError):
             if published_path is not None:
                 try:
                     os.unlink(published_path)
                 except OSError:
                     pass
+                else:
+                    try:
+                        _fsync_directory(parent)
+                    except OSError:
+                        pass
             raise
         return
 
