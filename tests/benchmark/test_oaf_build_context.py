@@ -521,9 +521,9 @@ def test_build_context_generate_rejects_appended_suffix_before_validation(
 ) -> None:
     # A concurrent writer that appends bytes to the manifest file's inode
     # after the write but before validation must not pass publication. The
-    # exact-byte check must read to EOF, not just len(content) bytes, so a
-    # noncanonical suffix appended to the same inode is detected and the
-    # on-disk bytes (not the in-memory content) are schema-validated.
+    # up-front size check rejects any appended suffix without reading it, and
+    # the bounded read then confirms the on-disk bytes (not the in-memory
+    # content) equal the authority we generated.
     repository, wheelhouse, _source = _configure_minimal_generation(tmp_path, monkeypatch)
     output = tmp_path / "build-context-manifest.json"
     arguments = _generate_arguments(repository, wheelhouse, output)
@@ -596,24 +596,28 @@ def test_unlink_if_owned_quarantines_before_unlink_to_avoid_basename_race(
 
     parent_fd = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
     try:
-        real_rename = os.rename
+        real_rename_no_replace = context_module._rename_no_replace
 
-        def swap_basename_before_rename(src, dst, *args, **kwargs):
-            if kwargs.get("src_dir_fd") == parent_fd and src == target_name and dst != target_name:
+        def swap_basename_before_quarantine(*, source, destination, parent_fd):
+            if source == target_name and destination != target_name:
                 # Replace the target with a decoy just before the quarantine
-                # rename, simulating a concurrent writer swapping the basename
-                # between the stat and the rename.
+                # move, simulating a concurrent writer swapping the basename
+                # between the stat and the atomic rename.
                 decoy = original / ".decoy"
                 decoy.write_bytes(b"decoy authority\n")
-                real_rename(
+                os.rename(
                     ".decoy",
                     target_name,
                     src_dir_fd=parent_fd,
                     dst_dir_fd=parent_fd,
                 )
-            return real_rename(src, dst, *args, **kwargs)
+            return real_rename_no_replace(
+                source=source,
+                destination=destination,
+                parent_fd=parent_fd,
+            )
 
-        monkeypatch.setattr(os, "rename", swap_basename_before_rename)
+        monkeypatch.setattr(context_module, "_rename_no_replace", swap_basename_before_quarantine)
 
         context_module._unlink_if_owned(target_name, owned_metadata, parent_fd)
 
@@ -621,6 +625,146 @@ def test_unlink_if_owned_quarantines_before_unlink_to_avoid_basename_race(
         assert target.read_bytes() == b"decoy authority\n"
         # No quarantine leftovers remain in the parent directory.
         assert tuple(original.glob(".build-context-manifest.json.rollback-quarantine.*")) == ()
+    finally:
+        os.close(parent_fd)
+
+
+def test_verify_published_descriptor_rejects_large_suffix_without_unbounded_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The verification read must be bounded so a concurrent writer appending a
+    # very large suffix to the manifest inode cannot turn validation into an
+    # OOM or nonterminating operation. The up-front size check rejects the
+    # mismatch without reading the suffix, so the unbounded append is never
+    # loaded into memory.
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    try:
+        name = "build-context-manifest.json"
+        path = tmp_path / name
+        content = b'{"schema":"crux.oaf-build-context-manifest/v1"}\n'
+        path.write_bytes(content)
+        created_metadata = path.lstat()
+        # Append a large suffix to the same inode after recording metadata.
+        with open(path, "ab") as handle:
+            handle.write(b"x" * (4 * 1024 * 1024))
+
+        read_bytes = 0
+        real_read = os.read
+
+        def counting_read(fd, n, *args, **kwargs):
+            nonlocal read_bytes
+            data = real_read(fd, n, *args, **kwargs)
+            read_bytes += len(data)
+            return data
+
+        monkeypatch.setattr(os, "read", counting_read)
+        with pytest.raises(BuildContextError, match="size drifted"):
+            context_module._verify_published_descriptor(name, parent_fd, created_metadata, content)
+        # The size check rejected the suffix before any byte was read; the
+        # 4 MiB suffix was never loaded into memory.
+        assert read_bytes == 0
+    finally:
+        os.close(parent_fd)
+
+
+def test_unlink_if_owned_preserves_pre_existing_quarantine_destination(
+    tmp_path: Path,
+) -> None:
+    # The quarantine name is predictable from the filename, inode and PID. A
+    # pre-existing or concurrently created entry at that name must not be
+    # silently overwritten by the quarantine move. The no-replace rename
+    # refuses to clobber it; the owned file is left in place rather than risk
+    # deleting a replacement we do not own.
+    original = tmp_path / "parent"
+    original.mkdir()
+    target_name = "build-context-manifest.json"
+    target = original / target_name
+    target.write_bytes(b"owned publication\n")
+    owned_metadata = target.lstat()
+
+    quarantine_name = f".{target_name}.rollback-quarantine.{owned_metadata.st_ino}.{os.getpid()}"
+    quarantine = original / quarantine_name
+    quarantine.write_bytes(b"pre-existing quarantine\n")
+
+    parent_fd = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    try:
+        context_module._unlink_if_owned(target_name, owned_metadata, parent_fd)
+
+        # The pre-existing quarantine entry is preserved, not overwritten.
+        assert quarantine.read_bytes() == b"pre-existing quarantine\n"
+        # The owned file could not be quarantined safely, so it is left in
+        # place rather than deleted.
+        assert target.read_bytes() == b"owned publication\n"
+    finally:
+        os.close(parent_fd)
+
+
+def test_unlink_if_owned_restoration_preserves_newer_occupant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # After a raced replacement is moved into quarantine, another writer can
+    # create a new file at ``name`` before the mismatch-restoration branch
+    # runs. The restoration must not silently overwrite that newer occupant;
+    # the quarantined entry is retained for recovery instead.
+    original = tmp_path / "parent"
+    original.mkdir()
+    target_name = "build-context-manifest.json"
+    target = original / target_name
+    target.write_bytes(b"owned publication\n")
+    owned_metadata = target.lstat()
+
+    quarantine_name = f".{target_name}.rollback-quarantine.{owned_metadata.st_ino}.{os.getpid()}"
+
+    parent_fd = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    try:
+        real_rename_no_replace = context_module._rename_no_replace
+
+        def swap_then_occupy(*, source, destination, parent_fd):
+            if source == target_name and destination == quarantine_name:
+                # Quarantine move: first swap a decoy into name (so the
+                # quarantined inode differs from owned), then perform the
+                # move, then have a concurrent writer create a new file at
+                # name before the restoration branch runs.
+                decoy = original / ".decoy"
+                decoy.write_bytes(b"decoy authority\n")
+                os.rename(
+                    ".decoy",
+                    target_name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                real_rename_no_replace(
+                    source=source,
+                    destination=destination,
+                    parent_fd=parent_fd,
+                )
+                newcomer = original / ".newcomer"
+                newcomer.write_bytes(b"newcomer authority\n")
+                os.rename(
+                    ".newcomer",
+                    target_name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                return None
+            return real_rename_no_replace(
+                source=source,
+                destination=destination,
+                parent_fd=parent_fd,
+            )
+
+        monkeypatch.setattr(context_module, "_rename_no_replace", swap_then_occupy)
+
+        context_module._unlink_if_owned(target_name, owned_metadata, parent_fd)
+
+        # The newer occupant at name is preserved; restoration did not
+        # overwrite it.
+        assert target.read_bytes() == b"newcomer authority\n"
+        # The quarantined decoy is retained at the quarantine name for
+        # recovery rather than being deleted or overwriting the new occupant.
+        assert (original / quarantine_name).read_bytes() == b"decoy authority\n"
     finally:
         os.close(parent_fd)
 

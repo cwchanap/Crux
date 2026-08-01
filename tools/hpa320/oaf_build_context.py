@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import os
 import shutil
@@ -444,6 +446,68 @@ def _open_parent_directory(parent: Path) -> int:
     return descriptor
 
 
+def _rename_no_replace(*, source: str, destination: str, parent_fd: int) -> None:
+    """Atomically rename ``source`` to ``destination`` within ``parent_fd``.
+
+    Refuses to overwrite an existing destination so a pre-existing or
+    concurrently created entry at ``destination`` is preserved rather than
+    silently replaced. Used by rollback quarantine/restoration moves so a
+    racing writer cannot cause rollback to clobber a file it does not own.
+    """
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    encoded_source = os.fsencode(source)
+    encoded_destination = os.fsencode(destination)
+    if sys.platform == "darwin":
+        try:
+            rename = libc.renameatx_np
+        except AttributeError:
+            raise OSError(errno.ENOTSUP, "renameatx_np is unavailable") from None
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            parent_fd,
+            encoded_source,
+            parent_fd,
+            encoded_destination,
+            0x00000004,  # RENAME_EXCL
+        )
+    elif sys.platform.startswith("linux"):
+        try:
+            rename = libc.renameat2
+        except AttributeError:
+            raise OSError(errno.ENOTSUP, "renameat2 is unavailable") from None
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            parent_fd,
+            encoded_source,
+            parent_fd,
+            encoded_destination,
+            0x00000001,  # RENAME_NOREPLACE
+        )
+    else:
+        raise OSError(errno.ENOTSUP, "atomic no-replace rename is unsupported")
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error_number, os.strerror(error_number), destination)
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
 def _unlink_if_owned(name: str, metadata: os.stat_result, parent_fd: int) -> None:
     """Remove ``name`` only if it is still the inode we created.
 
@@ -451,10 +515,14 @@ def _unlink_if_owned(name: str, metadata: os.stat_result, parent_fd: int) -> Non
     so a concurrent writer that replaces ``name`` between the ownership check
     and the unlink cannot cause rollback to delete the replacement. The entry
     is atomically renamed to a unique quarantine name within the held parent
-    directory, re-verified by inode, and only then unlinked. If the quarantine
-    holds a different inode (the replacement was swapped in between the stat
-    and the rename), it is restored to ``name`` and left untouched rather than
-    deleted.
+    directory, re-verified by inode, and only then unlinked. Both the
+    quarantine move and any mismatch restoration use no-replace rename
+    semantics, so a pre-existing quarantine destination or a newer occupant at
+    ``name`` is never silently overwritten. If the quarantine destination is
+    already occupied, the owned file is left in place rather than risk
+    deleting a replacement; if ``name`` is reoccupied before restoration, the
+    quarantined entry is retained for recovery rather than clobbering the new
+    occupant.
     """
 
     try:
@@ -468,8 +536,11 @@ def _unlink_if_owned(name: str, metadata: os.stat_result, parent_fd: int) -> Non
         return
     quarantine = f".{name}.rollback-quarantine.{metadata.st_ino}.{os.getpid()}"
     try:
-        os.rename(name, quarantine, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        _rename_no_replace(source=name, destination=quarantine, parent_fd=parent_fd)
     except OSError:
+        # The quarantine destination is already occupied (or no-replace rename
+        # is unsupported): do not overwrite it. Leave the owned file in place
+        # rather than risk deleting a replacement we do not own.
         return
     try:
         quarantined = os.stat(quarantine, dir_fd=parent_fd, follow_symlinks=False)
@@ -479,10 +550,14 @@ def _unlink_if_owned(name: str, metadata: os.stat_result, parent_fd: int) -> Non
         # A concurrent writer replaced ``name`` between our stat and the
         # atomic rename. The replacement is now at ``quarantine``; restore it
         # to ``name`` and leave it untouched rather than deleting a file we
-        # do not own.
+        # do not own. Use no-replace so a newer occupant at ``name`` is
+        # preserved and the quarantined entry is retained for recovery.
         try:
-            os.rename(quarantine, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            _rename_no_replace(source=quarantine, destination=name, parent_fd=parent_fd)
         except OSError:
+            # ``name`` is occupied by a newer file (or rename is unsupported):
+            # preserve the quarantined entry for recovery, never overwrite the
+            # new occupant.
             pass
         return
     try:
@@ -506,10 +581,12 @@ def _verify_published_descriptor(
     Reopens ``name`` relative to ``parent_fd`` (not by path) so a concurrent
     substitution at the output path cannot make publication succeed for a
     different authority. Confirms the reopened file is the same inode we
-    created, that its exact bytes (read to EOF, so a suffix appended to the
-    same inode is detected) equal ``content``, and that the bytes actually
-    read from disk—not the in-memory ``content`` variable—schema-validate as
-    a canonical build-context manifest.
+    created, that its exact bytes equal ``content``, and that the bytes
+    actually read from disk—not the in-memory ``content`` variable—
+    schema-validate as a canonical build-context manifest. The verification
+    read is bounded to ``len(content) + 1`` bytes (with an up-front size
+    check) so a concurrent writer that appends an unbounded suffix to the same
+    inode cannot turn validation into an OOM or nonterminating operation.
     """
 
     descriptor = os.open(
@@ -526,15 +603,25 @@ def _verify_published_descriptor(
             raise BuildContextError(
                 "build-context manifest output was substituted before validation"
             )
-        read_back = bytearray()
-        while True:
-            chunk = os.read(descriptor, 65536)
+        # Bound the verification read so an appended suffix cannot consume
+        # unbounded memory/time. The expected length is known, so reject any
+        # size mismatch up front and read at most one byte past it: an empty
+        # extra read confirms EOF at exactly len(content), a nonempty extra
+        # read means bytes were appended after the size check.
+        expected = len(content)
+        if current.st_size != expected:
+            raise BuildContextError("build-context manifest output size drifted before validation")
+        bounded = bytearray()
+        to_read = expected + 1
+        while to_read > 0:
+            chunk = os.read(descriptor, min(to_read, 65536))
             if not chunk:
                 break
-            read_back += chunk
-        if bytes(read_back) != content:
+            bounded += chunk
+            to_read -= len(chunk)
+        if len(bounded) != expected or bytes(bounded) != content:
             raise BuildContextError("build-context manifest output bytes drifted before validation")
-        _validate_manifest_content(bytes(read_back))
+        _validate_manifest_content(bytes(bounded))
     finally:
         os.close(descriptor)
 
