@@ -2320,11 +2320,13 @@ After the existing phase work:
       artifacts/benchmark/backends/hpa320-<phase>/artifact-manifest.json
 
 - name: Preserve the local Sigstore bundle
-  run: >-
-    uv run python -m tools.hpa320.oaf_native_artifacts copy-bundle
-    --source '${{ steps.attest.outputs.bundle-path }}'
-    --destination
-    artifacts/benchmark/backends/hpa320-native-<phase>-${{ inputs.commit_sha }}.sigstore.json
+  shell: bash
+  run: |
+    set -euo pipefail
+    uv run python -m tools.hpa320.oaf_native_artifacts copy-bundle \
+      --source '${{ steps.attest.outputs.bundle-path }}' \
+      --destination artifacts/benchmark/backends/hpa320-native-<phase>-${{ inputs.commit_sha }}.sigstore.json \
+      | tee artifacts/benchmark/backends/hpa320-native-<phase>-${{ inputs.commit_sha }}.sigstore.identity.json
 
 - name: Reverify the complete upload set
   run: >-
@@ -2335,6 +2337,8 @@ After the existing phase work:
     artifacts/benchmark/backends/hpa320-native-<phase>-${{ inputs.commit_sha }}.tar
     --bundle
     artifacts/benchmark/backends/hpa320-native-<phase>-${{ inputs.commit_sha }}.sigstore.json
+    --expected-bundle-identity
+    artifacts/benchmark/backends/hpa320-native-<phase>-${{ inputs.commit_sha }}.sigstore.identity.json
 ```
 
 Keep `push-to-registry`, `create-storage-record`, `sbom-path`, `predicate`, and `predicate-type` absent.

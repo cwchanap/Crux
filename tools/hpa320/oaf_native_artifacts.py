@@ -2259,6 +2259,7 @@ def _parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--bundle", type=Path)
     verify_parser.add_argument("--expected-bundle-sha256")
     verify_parser.add_argument("--expected-bundle-size", type=int)
+    verify_parser.add_argument("--expected-bundle-identity", type=Path)
     attestation_parser = subparsers.add_parser("verify-attestation")
     attestation_parser.add_argument(
         "--phase", required=True, choices=tuple(PHASE_HOST_BUNDLE_PATHS)
@@ -2309,15 +2310,11 @@ def main(argv: list[str] | None = None) -> int:
                 archive_path=arguments.archive,
             )
             if arguments.bundle is not None:
-                if (
-                    arguments.expected_bundle_sha256 is None
-                    or arguments.expected_bundle_size is None
-                ):
-                    raise NativeArtifactError("native work attestation bundle identity is required")
+                expected_sha256, expected_size = _resolve_expected_bundle_identity(arguments)
                 _verify_optional_attestation_bundle(
                     arguments.bundle,
-                    expected_sha256=arguments.expected_bundle_sha256,
-                    expected_size=arguments.expected_bundle_size,
+                    expected_sha256=expected_sha256,
+                    expected_size=expected_size,
                 )
         elif arguments.command == "verify-attestation":
             report: bytes
@@ -2530,6 +2527,47 @@ def _verify_optional_attestation_bundle(
         raise NativeArtifactError("native work attestation bundle is missing or unsafe") from error
     if identity.sha256 != expected_sha256 or identity.size != expected_size:
         raise NativeArtifactError("native work attestation bundle identity does not match")
+
+
+def _resolve_expected_bundle_identity(arguments: argparse.Namespace) -> tuple[str, int]:
+    """Select the expected sigstore bundle identity from exactly one source.
+
+    The identity may arrive either as an explicit sha256/size pair or as a JSON
+    file emitted by ``copy-bundle``. Requiring exactly one source keeps the
+    trust flow unambiguous and avoids ``$GITHUB_OUTPUT`` step outputs.
+    """
+
+    has_explicit = (
+        arguments.expected_bundle_sha256 is not None and arguments.expected_bundle_size is not None
+    )
+    has_identity_file = arguments.expected_bundle_identity is not None
+    if has_explicit and has_identity_file:
+        raise NativeArtifactError("native work attestation bundle identity is ambiguous")
+    if has_identity_file:
+        return _load_expected_bundle_identity(arguments.expected_bundle_identity)
+    if has_explicit:
+        return arguments.expected_bundle_sha256, arguments.expected_bundle_size
+    raise NativeArtifactError("native work attestation bundle identity is required")
+
+
+def _load_expected_bundle_identity(path: Path) -> tuple[str, int]:
+    try:
+        content = read_regular_file_no_follow(path)
+    except OSError as error:
+        raise NativeArtifactError(
+            "native work attestation bundle identity is missing or unsafe"
+        ) from error
+    try:
+        value = strict_json_loads(content)
+    except StrictJsonError as error:
+        raise NativeArtifactError("native work attestation bundle identity is invalid") from error
+    if not isinstance(value, Mapping):
+        raise NativeArtifactError("native work attestation bundle identity is invalid")
+    sha256 = value.get("sha256")
+    size = value.get("size")
+    if not isinstance(sha256, str) or not isinstance(size, int) or isinstance(size, bool):
+        raise NativeArtifactError("native work attestation bundle identity is invalid")
+    return sha256, size
 
 
 if __name__ == "__main__":
