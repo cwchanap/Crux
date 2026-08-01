@@ -333,24 +333,27 @@ def test_build_context_generate_cleans_output_when_parent_sync_fails(
     repository, wheelhouse, _source = _configure_minimal_generation(tmp_path, monkeypatch)
     output = tmp_path / "build-context-manifest.json"
     arguments = _generate_arguments(repository, wheelhouse, output)
-    real_fsync = context_module._fsync_directory
+    real_fsync = os.fsync
     sync_calls = 0
 
-    def fail_first_parent_sync(path: Path) -> None:
+    def fail_directory_entry_sync(fd: int) -> None:
         nonlocal sync_calls
         sync_calls += 1
-        if sync_calls == 1:
+        # The first fsync syncs the file body; the second syncs the directory
+        # entry through the held parent descriptor. Failing the directory entry
+        # sync must roll back the still-owned output.
+        if sync_calls == 2:
             raise OSError("injected parent directory sync failure")
-        real_fsync(path)
+        real_fsync(fd)
 
-    monkeypatch.setattr(context_module, "_fsync_directory", fail_first_parent_sync)
+    monkeypatch.setattr(os, "fsync", fail_directory_entry_sync)
 
     assert context_module.main(arguments) == 2
     # The still-owned output must be rolled back so a retry does not collide
     # with a leftover file whose directory entry was never synchronized.
     assert not output.exists()
 
-    monkeypatch.setattr(context_module, "_fsync_directory", real_fsync)
+    monkeypatch.setattr(os, "fsync", real_fsync)
     assert context_module.main(arguments) == 0
     assert output.exists()
 
@@ -362,20 +365,20 @@ def test_build_context_generate_cleans_only_owned_output_after_substitution(
     repository, wheelhouse, _source = _configure_minimal_generation(tmp_path, monkeypatch)
     output = tmp_path / "build-context-manifest.json"
     arguments = _generate_arguments(repository, wheelhouse, output)
-    real_fsync = context_module._fsync_directory
+    real_fsync = os.fsync
     sync_calls = 0
 
-    def fail_first_parent_sync(path: Path) -> None:
+    def fail_directory_entry_sync_after_substitution(fd: int) -> None:
         nonlocal sync_calls
         sync_calls += 1
-        if sync_calls == 1:
+        if sync_calls == 2:
             substituted = tmp_path / ".substituted"
             substituted.write_bytes(b"substituted authority\n")
             os.replace(substituted, output)
             raise OSError("injected parent directory sync failure")
-        real_fsync(path)
+        real_fsync(fd)
 
-    monkeypatch.setattr(context_module, "_fsync_directory", fail_first_parent_sync)
+    monkeypatch.setattr(os, "fsync", fail_directory_entry_sync_after_substitution)
 
     assert context_module.main(arguments) == 2
     # The output was replaced by a different inode before cleanup; the rollback
@@ -425,6 +428,91 @@ def test_unlink_if_owned_binds_cleanup_to_held_parent_descriptor(
         assert (original / "build-context-manifest.json").read_bytes() == b"decoy authority\n"
     finally:
         os.close(parent_fd)
+
+
+def test_build_context_generate_rejects_substituted_output_before_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A concurrent substitution at the output path after the file is written
+    # but before validation must not let publication succeed for a different,
+    # structurally valid authority. Validation must reopen through the held
+    # parent descriptor and reject the swapped inode, even when the substitute
+    # is itself a schema-valid manifest.
+    repository, wheelhouse, _source = _configure_minimal_generation(tmp_path, monkeypatch)
+    output = tmp_path / "build-context-manifest.json"
+    arguments = _generate_arguments(repository, wheelhouse, output)
+    substituted_bytes = canonical_json_bytes(
+        {
+            "directory_mode": 0o755,
+            "file_mode": 0o644,
+            "files": [
+                {
+                    "byte_length": 99,
+                    "path": "runtime/oaf_tf1/Dockerfile",
+                    "sha256": "0" * 64,
+                }
+            ],
+            "manifest_path": BUILD_CONTEXT_MANIFEST_PATH,
+            "schema": "crux.oaf-build-context-manifest/v1",
+        },
+        trailing_newline=True,
+    )
+    real_fsync = os.fsync
+    sync_calls = 0
+
+    def substitute_on_first_file_sync(fd: int) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            substituted = tmp_path / ".substituted"
+            substituted.write_bytes(substituted_bytes)
+            os.replace(substituted, output)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", substitute_on_first_file_sync)
+
+    assert context_module.main(arguments) == 2
+    # The substituted authority survives at the output path (rollback only
+    # unlinks the file it created, which the substitution already displaced),
+    # but publication did not claim success for it.
+    assert output.read_bytes() == substituted_bytes
+
+
+def test_build_context_generate_rejects_parent_ancestry_swap_before_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A parent-directory swap after the directory entry is synced but before
+    # completion means the published path no longer refers to the directory we
+    # wrote into. Publication must treat the ancestry substitution as failure
+    # and roll back the file it created in the original (now-moved) directory.
+    repository, wheelhouse, _source = _configure_minimal_generation(tmp_path, monkeypatch)
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    output = output_dir / "build-context-manifest.json"
+    arguments = _generate_arguments(repository, wheelhouse, output)
+    real_fsync = os.fsync
+    sync_calls = 0
+
+    def swap_parent_on_directory_sync(fd: int) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        real_fsync(fd)
+        if sync_calls == 2:
+            moved = tmp_path / "moved"
+            replacement = tmp_path / "replacement"
+            replacement.mkdir()
+            os.rename(output_dir, moved)
+            os.replace(replacement, output_dir)
+
+    monkeypatch.setattr(os, "fsync", swap_parent_on_directory_sync)
+
+    assert context_module.main(arguments) == 2
+    # The replacement directory now occupies the parent path and contains no
+    # manifest; the file we created was rolled back from the moved directory.
+    assert not output.exists()
+    assert not (tmp_path / "moved" / "build-context-manifest.json").exists()
 
 
 def test_build_context_generate_check_is_exact_and_non_mutating(
