@@ -15,8 +15,11 @@ def fsync_directory(path: Path) -> None:
     ``O_DIRECTORY`` so a non-directory at the path is rejected rather than
     silently synced.
     """
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
-    descriptor = os.open(path, flags)
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory is None:
+        raise OSError("directory durability support is unavailable")
+    descriptor = os.open(path, os.O_RDONLY | no_follow | directory)
     try:
         os.fsync(descriptor)
     finally:
