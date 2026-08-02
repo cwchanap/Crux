@@ -55,9 +55,7 @@ def test_main_reports_the_safe_failure_chain(
 
     monkeypatch.setattr(diagnostic, "publish_github_host_attestation", fail_publisher)
 
-    result = diagnostic.main(
-        ["--phase", "bootstrap", "--output", str(tmp_path / "diagnostic")]
-    )
+    result = diagnostic.main(["--phase", "bootstrap", "--output", str(tmp_path / "diagnostic")])
 
     assert result == 2
     assert capsys.readouterr().err == (
