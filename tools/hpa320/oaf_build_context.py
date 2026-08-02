@@ -686,9 +686,14 @@ def _replace_manifest_content(  # pylint: disable=too-many-statements
     # Mirror the create path's descriptor-based substitution and durability
     # guarantees: hold the parent directory descriptor throughout, validate
     # the temporary through that descriptor (not by path), atomically replace
-    # into the output, and fsync the held parent descriptor. Track whether
-    # the replace completed so a post-replace fsync failure rolls back the
-    # owned output rather than unlinking the already-renamed temporary.
+    # into the output, and fsync the held parent descriptor. Once
+    # ``os.replace`` succeeds the temporary no longer exists and the owned
+    # inode is the published authority at the output path; a subsequent
+    # fsync, ancestry, or verification failure must raise without unlinking
+    # it, otherwise a durability or validation error destroys the checked-in
+    # authority (the previous inode was already displaced by the rename).
+    # This mirrors ``_atomic_replace_regular_file`` in ``seal_oaf_backend``:
+    # the temporary is cleaned up only if the rename has not completed.
     published_name: str | None = None
     created_metadata: os.stat_result | None = None
     parent_fd = _open_parent_directory(parent)
@@ -727,10 +732,16 @@ def _replace_manifest_content(  # pylint: disable=too-many-statements
         # paths are relative to the held parent descriptor so a parent
         # directory swap cannot redirect the rename.
         os.replace(temp_name, output.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        # The replace completed: the owned inode now lives at the output path.
-        # Track it so a post-replace failure rolls back the output, not the
-        # already-renamed temporary (which no longer exists).
-        published_name = output.name
+        # The rename completed: the temporary path no longer exists and the
+        # owned inode is now the published authority at the output path. Clear
+        # the rollback sentinel so a post-replace fsync, ancestry, or
+        # verification failure raises without unlinking the new output. The
+        # previous inode was already displaced by the rename, so unlinking the
+        # new output would destroy the checked-in authority rather than roll
+        # back. This matches ``_atomic_replace_regular_file`` in
+        # ``seal_oaf_backend``, which only cleans up the temporary when the
+        # rename has not completed.
+        published_name = None
         # Sync the directory entry through the held parent descriptor, not a
         # path re-open, so a parent-directory swap cannot sync the replacement
         # directory.
@@ -746,7 +757,6 @@ def _replace_manifest_content(  # pylint: disable=too-many-statements
         # inode + exact bytes closes that window before publication is
         # declared successful.
         _verify_published_descriptor(output.name, parent_fd, created_metadata, content)
-        published_name = None
     except (BuildContextError, OSError):
         if published_name is not None and created_metadata is not None:
             _unlink_if_owned(published_name, created_metadata, parent_fd)
