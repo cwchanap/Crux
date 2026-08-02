@@ -4,28 +4,26 @@ on:
   workflow_dispatch:
     inputs:
       commit_sha:
-        description: Exact lowercase 40-character commit to execute
+        description: Exact lowercase 40-character diagnostic commit to execute
         required: true
         type: string
 
 permissions:
   contents: read
-  id-token: write
-  attestations: write
 
 env:
   UV_FROZEN: "1"
 
 jobs:
   native-bootstrap:
-    name: native-bootstrap
+    name: native-bootstrap-diagnostic
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 20
     env:
       COMMIT_SHA: ${{ inputs.commit_sha }}
 
     steps:
-      - name: Check out exact workflow commit
+      - name: Check out exact diagnostic commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
@@ -38,106 +36,13 @@ jobs:
           python-version: "3.12"
           enable-cache: false
 
-      - name: Observe and validate the current native work job
+      - name: Diagnose the current native host
         env:
           RUNNER_ENVIRONMENT_CONTEXT: ${{ runner.environment }}
           RUNNER_OS_CONTEXT: ${{ runner.os }}
           RUNNER_ARCH_CONTEXT: ${{ runner.arch }}
           WORKFLOW_SOURCE_SHA: ${{ github.workflow_sha }}
         run: >-
-          uv run python -m tools.hpa320.oaf_host_attestation publish-github
+          uv run python -m tools.hpa320.oaf_host_attestation_diagnostic
           --phase bootstrap
-          --output artifacts/benchmark/backends/hpa320-bootstrap/bootstrap-host-attestation
-
-      - name: Acquire authenticated checkpoint
-        shell: bash
-        run: |
-          set -euo pipefail
-          uv run crux benchmark prepare-backend \
-            --backend magenta-egmd-tf1-94529798-8hit-v1 \
-            --download \
-            --cache-root artifacts/benchmark/model-cache \
-            --acquisition-request config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.checkpoint-acquisition-request.json \
-            --evidence-output artifacts/benchmark/backends/hpa320-bootstrap/checkpoint-acquisition-evidence.json
-
-      - name: Build the authenticated image twice
-        shell: bash
-        run: |
-          set -euo pipefail
-          uv run python -m tools.hpa320.seal_oaf_backend bootstrap-image \
-            --request config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.calibration-bootstrap-request.json \
-            --host-attestation-bundle artifacts/benchmark/backends/hpa320-bootstrap/bootstrap-host-attestation/attestation-bundle.json \
-            --host-evidence artifacts/benchmark/backends/hpa320-bootstrap/bootstrap-host-attestation/native-host-evidence.json \
-            --output artifacts/benchmark/backends/hpa320-bootstrap/calibration-image \
-            --repository-root .
-
-      - name: Attest the imported base system
-        shell: bash
-        run: |
-          set -euo pipefail
-          uv run python -m tools.hpa320.seal_oaf_backend attest-base-system \
-            --request runtime/oaf_tf1/base-system-package-request.json \
-            --bootstrap-request config/benchmark/backends/magenta-egmd-tf1-94529798-8hit-v1.calibration-bootstrap-request.json \
-            --bootstrap-evidence artifacts/benchmark/backends/hpa320-bootstrap/calibration-image/calibration-bootstrap-evidence.json \
-            --host-attestation-bundle artifacts/benchmark/backends/hpa320-bootstrap/bootstrap-host-attestation/attestation-bundle.json \
-            --host-evidence artifacts/benchmark/backends/hpa320-bootstrap/bootstrap-host-attestation/native-host-evidence.json \
-            --output artifacts/benchmark/backends/hpa320-bootstrap/base-system-package-evidence.json
-
-      - name: Publish canonical native work subjects
-        run: >-
-          uv run python -m tools.hpa320.oaf_native_artifacts publish
-          --phase bootstrap
-          --payload-root artifacts/benchmark/backends/hpa320-bootstrap
-          --host-bundle
-          artifacts/benchmark/backends/hpa320-bootstrap/bootstrap-host-attestation/attestation-bundle.json
-          --archive
-          artifacts/benchmark/backends/hpa320-native-bootstrap-$COMMIT_SHA.tar
-
-      - name: Verify native work subjects before attestation
-        run: >-
-          uv run python -m tools.hpa320.oaf_native_artifacts verify
-          --phase bootstrap
-          --payload-root artifacts/benchmark/backends/hpa320-bootstrap
-          --archive
-          artifacts/benchmark/backends/hpa320-native-bootstrap-$COMMIT_SHA.tar
-
-      - name: Attest native phase evidence
-        id: attest
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d
-        with:
-          subject-path: |
-            artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.tar
-            artifacts/benchmark/backends/hpa320-bootstrap/artifact-manifest.json
-
-      - name: Preserve the local Sigstore bundle
-        shell: bash
-        run: |
-          set -euo pipefail
-          uv run python -m tools.hpa320.oaf_native_artifacts copy-bundle \
-            --source '${{ steps.attest.outputs.bundle-path }}' \
-            --destination artifacts/benchmark/backends/hpa320-native-bootstrap-$COMMIT_SHA.sigstore.json \
-            | tee artifacts/benchmark/backends/hpa320-native-bootstrap-$COMMIT_SHA.sigstore.identity.json
-
-      - name: Reverify the complete upload set
-        run: >-
-          uv run python -m tools.hpa320.oaf_native_artifacts verify
-          --phase bootstrap
-          --payload-root artifacts/benchmark/backends/hpa320-bootstrap
-          --archive
-          artifacts/benchmark/backends/hpa320-native-bootstrap-$COMMIT_SHA.tar
-          --bundle
-          artifacts/benchmark/backends/hpa320-native-bootstrap-$COMMIT_SHA.sigstore.json
-          --expected-bundle-identity
-          artifacts/benchmark/backends/hpa320-native-bootstrap-$COMMIT_SHA.sigstore.identity.json
-
-      - name: Upload signed native phase evidence
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: hpa320-native-bootstrap-${{ inputs.commit_sha }}
-          path: |
-            artifacts/benchmark/backends/hpa320-bootstrap/
-            artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.tar
-            artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.sigstore.json
-            artifacts/benchmark/backends/hpa320-native-bootstrap-${{ inputs.commit_sha }}.sigstore.identity.json
-          if-no-files-found: error
-          retention-days: 30
+          --output "$RUNNER_TEMP/hpa423-bootstrap-host-attestation"
