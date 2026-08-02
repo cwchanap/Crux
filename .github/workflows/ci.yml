@@ -29,7 +29,7 @@ jobs:
         run: ruff check .
 
       - name: Ruff format check
-        run: ruff format --check src tests
+        run: ruff format --check --diff src tests
 
       - name: Pylint (errors-only)
         run: |
