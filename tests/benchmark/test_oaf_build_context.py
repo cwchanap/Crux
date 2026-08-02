@@ -334,15 +334,18 @@ def test_build_context_generate_cleans_output_when_parent_sync_fails(
     output = tmp_path / "build-context-manifest.json"
     arguments = _generate_arguments(repository, wheelhouse, output)
     real_fsync = os.fsync
-    sync_calls = 0
+    parent_stat = output.parent.stat()
 
     def fail_directory_entry_sync(fd: int) -> None:
-        nonlocal sync_calls
-        sync_calls += 1
-        # The first fsync syncs the file body; the second syncs the directory
-        # entry through the held parent descriptor. Failing the directory entry
-        # sync must roll back the still-owned output.
-        if sync_calls == 2:
+        # Fail only the directory-entry fsync (the held parent descriptor),
+        # identified by its inode rather than by call order, so the test does
+        # not depend on the sequence of fsync calls. The file-body fsync uses a
+        # regular-file descriptor and must pass through.
+        current = os.fstat(fd)
+        if stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == (
+            parent_stat.st_dev,
+            parent_stat.st_ino,
+        ):
             raise OSError("injected parent directory sync failure")
         real_fsync(fd)
 
@@ -366,12 +369,17 @@ def test_build_context_generate_cleans_only_owned_output_after_substitution(
     output = tmp_path / "build-context-manifest.json"
     arguments = _generate_arguments(repository, wheelhouse, output)
     real_fsync = os.fsync
-    sync_calls = 0
+    parent_stat = output.parent.stat()
 
     def fail_directory_entry_sync_after_substitution(fd: int) -> None:
-        nonlocal sync_calls
-        sync_calls += 1
-        if sync_calls == 2:
+        # Substitute the output just before the directory-entry fsync (the held
+        # parent descriptor), identified by inode rather than call order. The
+        # file-body fsync uses a regular-file descriptor and must pass through.
+        current = os.fstat(fd)
+        if stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == (
+            parent_stat.st_dev,
+            parent_stat.st_ino,
+        ):
             substituted = tmp_path / ".substituted"
             substituted.write_bytes(b"substituted authority\n")
             os.replace(substituted, output)
@@ -596,9 +604,9 @@ def test_unlink_if_owned_quarantines_before_unlink_to_avoid_basename_race(
 
     parent_fd = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
     try:
-        real_rename_no_replace = context_module._rename_no_replace
+        real_rename_no_replace = context_module._rename_no_replace_syscall
 
-        def swap_basename_before_quarantine(*, source, destination, parent_fd):
+        def swap_basename_before_quarantine(*, source, destination, src_dir_fd, dst_dir_fd):
             if source == target_name and destination != target_name:
                 # Replace the target with a decoy just before the quarantine
                 # move, simulating a concurrent writer swapping the basename
@@ -608,16 +616,19 @@ def test_unlink_if_owned_quarantines_before_unlink_to_avoid_basename_race(
                 os.rename(
                     ".decoy",
                     target_name,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
+                    src_dir_fd=src_dir_fd,
+                    dst_dir_fd=dst_dir_fd,
                 )
             return real_rename_no_replace(
                 source=source,
                 destination=destination,
-                parent_fd=parent_fd,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
             )
 
-        monkeypatch.setattr(context_module, "_rename_no_replace", swap_basename_before_quarantine)
+        monkeypatch.setattr(
+            context_module, "_rename_no_replace_syscall", swap_basename_before_quarantine
+        )
 
         context_module._unlink_if_owned(target_name, owned_metadata, parent_fd)
 
@@ -719,9 +730,9 @@ def test_unlink_if_owned_restoration_preserves_newer_occupant(
 
     parent_fd = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
     try:
-        real_rename_no_replace = context_module._rename_no_replace
+        real_rename_no_replace = context_module._rename_no_replace_syscall
 
-        def swap_then_occupy(*, source, destination, parent_fd):
+        def swap_then_occupy(*, source, destination, src_dir_fd, dst_dir_fd):
             if source == target_name and destination == quarantine_name:
                 # Quarantine move: first swap a decoy into name (so the
                 # quarantined inode differs from owned), then perform the
@@ -732,30 +743,32 @@ def test_unlink_if_owned_restoration_preserves_newer_occupant(
                 os.rename(
                     ".decoy",
                     target_name,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
+                    src_dir_fd=src_dir_fd,
+                    dst_dir_fd=dst_dir_fd,
                 )
                 real_rename_no_replace(
                     source=source,
                     destination=destination,
-                    parent_fd=parent_fd,
+                    src_dir_fd=src_dir_fd,
+                    dst_dir_fd=dst_dir_fd,
                 )
                 newcomer = original / ".newcomer"
                 newcomer.write_bytes(b"newcomer authority\n")
                 os.rename(
                     ".newcomer",
                     target_name,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
+                    src_dir_fd=src_dir_fd,
+                    dst_dir_fd=dst_dir_fd,
                 )
                 return None
             return real_rename_no_replace(
                 source=source,
                 destination=destination,
-                parent_fd=parent_fd,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
             )
 
-        monkeypatch.setattr(context_module, "_rename_no_replace", swap_then_occupy)
+        monkeypatch.setattr(context_module, "_rename_no_replace_syscall", swap_then_occupy)
 
         context_module._unlink_if_owned(target_name, owned_metadata, parent_fd)
 

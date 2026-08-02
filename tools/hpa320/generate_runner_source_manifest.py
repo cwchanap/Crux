@@ -18,6 +18,7 @@ SCHEMA = "crux.oaf-runner-source-manifest/v1"
 MANIFEST_PATH = "runtime/oaf_tf1/runner-source-manifest.json"
 SOURCE_PATHS = (
     ".github/workflows/hpa320-native-bootstrap.yml",
+    ".github/workflows/hpa320-native-candidate.yml",
     "runtime/oaf_tf1/Dockerfile",
     "runtime/oaf_tf1/apply_instrumentation_patch.py",
     "runtime/oaf_tf1/calibration_entrypoint.py",
@@ -37,6 +38,7 @@ SOURCE_PATHS = (
     "runtime/oaf_tf1/tests/test_calibration_protocol.py",
     "runtime/oaf_tf1/tests/test_protocol.py",
     "runtime/oaf_tf1/tests/test_tensor_coverage.py",
+    "tools/hpa320/_fsync.py",
     "tools/hpa320/audit_legacy_tf2_conversion.py",
     "tools/hpa320/generate_runner_source_manifest.py",
     "tools/hpa320/github_host_evidence.py",

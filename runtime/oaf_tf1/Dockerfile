@@ -64,6 +64,7 @@ COPY runtime/oaf_tf1/runner-source-manifest.json /opt/crux/runtime/runner-source
 # Preserve the manifest-addressed repository layout in the test image too.
 COPY runtime/oaf_tf1/ /opt/crux/runtime/oaf_tf1/
 COPY .github/workflows/hpa320-native-bootstrap.yml /opt/crux/.github/workflows/hpa320-native-bootstrap.yml
+COPY .github/workflows/hpa320-native-candidate.yml /opt/crux/.github/workflows/hpa320-native-candidate.yml
 COPY tools/hpa320/ /opt/crux/tools/hpa320/
 WORKDIR /opt/crux
 USER "${RUNTIME_UID}:${RUNTIME_GID}"
@@ -82,6 +83,7 @@ COPY runtime/oaf_tf1/runner-source-manifest.json /opt/crux/runtime/runner-source
 # Preserve the manifest-addressed repository layout solely for fail-closed source attestation.
 COPY runtime/oaf_tf1/ /opt/crux/runtime/oaf_tf1/
 COPY .github/workflows/hpa320-native-bootstrap.yml /opt/crux/.github/workflows/hpa320-native-bootstrap.yml
+COPY .github/workflows/hpa320-native-candidate.yml /opt/crux/.github/workflows/hpa320-native-candidate.yml
 COPY tools/hpa320/ /opt/crux/tools/hpa320/
 WORKDIR /opt/crux
 USER "${RUNTIME_UID}:${RUNTIME_GID}"

@@ -523,6 +523,23 @@ def test_candidate_manifest_rejects_malformed_identity_or_traversal(
         )
 
 
+def test_candidate_manifest_rejects_former_seal_candidate_schema(tmp_path: Path) -> None:
+    # The audit candidate manifest split from the former shared
+    # "crux.oaf-seal-candidate/v2" schema; the audit resolver must reject the
+    # old schema so a stale seal-candidate manifest cannot be accepted as an
+    # audit-candidate manifest.
+    candidate, cache_root, payload = _candidate_fixture(tmp_path)
+    payload["schema"] = "crux.oaf-seal-candidate/v2"
+    _write_canonical(candidate / CANDIDATE_MANIFEST_NAME, payload)
+
+    with pytest.raises(AuditError, match="candidate manifest schema is unsupported"):
+        resolve_candidate_checkpoint(
+            candidate,
+            cache_root,
+            expected_required_inventory_sha256="a" * 64,
+        )
+
+
 def test_candidate_and_cache_symlink_boundaries_are_rejected(tmp_path: Path) -> None:
     candidate, cache_root, payload = _candidate_fixture(tmp_path)
     candidate_link = tmp_path / "candidate-link"
