@@ -10,13 +10,10 @@ from pathlib import Path
 
 from src.benchmark.backend_attestation import AttestationError
 from src.benchmark.backend_identity import StrictJsonError
-from src.benchmark.backend_publication import (
-    ArtifactPublicationError,
-    DirectoryPublicationError,
-)
+from src.benchmark.backend_publication import ArtifactPublicationError, DirectoryPublicationError
 from tools.hpa320.oaf_host_attestation import (
-    HostAttestationError,
     PHASE_WORKFLOWS,
+    HostAttestationError,
     publish_github_host_attestation,
 )
 
