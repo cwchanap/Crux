@@ -10,7 +10,9 @@ def _controlled_failure() -> HostAttestationError:
         raise AttestationError("logical CPU fingerprints are inconsistent")
     except AttestationError as error:
         try:
-            raise HostAttestationError("native-host attestation publication failed") from error
+            raise HostAttestationError(
+                "native-host attestation publication failed"
+            ) from error
         except HostAttestationError as wrapped:
             return wrapped
 
@@ -20,7 +22,9 @@ def _uncontrolled_failure() -> HostAttestationError:
         raise RuntimeError("secret-bearing implementation detail")
     except RuntimeError as error:
         try:
-            raise HostAttestationError("native-host attestation publication failed") from error
+            raise HostAttestationError(
+                "native-host attestation publication failed"
+            ) from error
         except HostAttestationError as wrapped:
             return wrapped
 
