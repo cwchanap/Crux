@@ -111,9 +111,6 @@ def _assert_native_workflow_contract(
 
     payload_root = f"artifacts/benchmark/backends/hpa320-{phase}"
     stem = f"artifacts/benchmark/backends/hpa320-native-{phase}"
-    archive = f"{stem}-${{{{ inputs.commit_sha }}}}.tar"
-    bundle = f"{stem}-${{{{ inputs.commit_sha }}}}.sigstore.json"
-    identity = f"{stem}-${{{{ inputs.commit_sha }}}}.sigstore.identity.json"
     archive_run = f"{stem}-$COMMIT_SHA.tar"
     bundle_run = f"{stem}-$COMMIT_SHA.sigstore.json"
     identity_run = f"{stem}-$COMMIT_SHA.sigstore.identity.json"
@@ -160,6 +157,8 @@ def _assert_native_workflow_contract(
         "artifact-manifest.json",
         f"hpa320-native-{phase}-${{{{ inputs.commit_sha }}}}.tar",
     }
+    attest_subjects = [line for line in attest["with"]["subject-path"].splitlines() if line]
+    archive = attest_subjects[0]
     copy_bundle = _step_named(steps, "Preserve the local Sigstore bundle")
     assert copy_bundle["shell"] == "bash"
     copy_bundle_run = copy_bundle["run"]
@@ -177,12 +176,19 @@ def _assert_native_workflow_contract(
     success_upload = _only_success_upload(steps)
     uploads = [step for step in steps if step.get("uses") == UPLOAD]
     assert uploads == [success_upload]
-    assert success_upload["with"] == {
-        "name": f"hpa320-native-{phase}-${{{{ inputs.commit_sha }}}}",
-        "path": f"{payload_root}/\n{archive}\n{bundle}\n{identity}\n",
-        "if-no-files-found": "error",
-        "retention-days": 30,
-    }
+    assert success_upload["with"]["name"] == f"hpa320-native-{phase}-${{{{ inputs.commit_sha }}}}"
+    assert success_upload["with"]["if-no-files-found"] == "error"
+    assert success_upload["with"]["retention-days"] == 30
+    # Derive the published archive and bundle from the workflow steps
+    # themselves rather than reconstructing them locally, so the payload-root,
+    # wildcard, and PHASE_FILES checks bind to what the workflow actually
+    # publishes. The archive is cross-checked against the attest subject; the
+    # bundle is taken from the success-upload path.
+    upload_paths = [line for line in success_upload["with"]["path"].splitlines() if line]
+    assert len(upload_paths) == 4
+    assert upload_paths[0] == f"{payload_root}/"
+    assert upload_paths[1] == archive
+    bundle = upload_paths[2]
     assert archive.startswith("artifacts/benchmark/backends/")
     assert bundle.startswith("artifacts/benchmark/backends/")
     assert not archive.startswith(f"{payload_root}/")

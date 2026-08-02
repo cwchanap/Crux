@@ -1511,17 +1511,19 @@ def test_packer_removes_replaced_source_after_rename_boundary(
 ) -> None:
     manifest = _publish(bootstrap_payload)
     archive = tmp_path / "rename-boundary.tar"
-    real_rename = artifacts_module._rename_no_replace
+    real_rename = artifacts_module._rename_no_replace_syscall
     replaced = False
 
-    def replace_then_rename(*, source: str, destination: str, parent_descriptor: int) -> None:
+    def replace_then_rename(
+        *, source: str, destination: str, src_dir_fd: int, dst_dir_fd: int
+    ) -> None:
         nonlocal replaced
-        os.unlink(source, dir_fd=parent_descriptor)
+        os.unlink(source, dir_fd=src_dir_fd)
         replacement_descriptor = os.open(
             source,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
             0o600,
-            dir_fd=parent_descriptor,
+            dir_fd=src_dir_fd,
         )
         try:
             os.write(replacement_descriptor, b"unverified-at-rename-boundary\\n")
@@ -1532,10 +1534,11 @@ def test_packer_removes_replaced_source_after_rename_boundary(
         real_rename(
             source=source,
             destination=destination,
-            parent_descriptor=parent_descriptor,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=src_dir_fd,
         )
 
-    monkeypatch.setattr(artifacts_module, "_rename_no_replace", replace_then_rename)
+    monkeypatch.setattr(artifacts_module, "_rename_no_replace_syscall", replace_then_rename)
 
     with pytest.raises(artifacts_module.NativeArtifactError):
         artifacts_module.pack_native_work_archive(
@@ -1558,21 +1561,24 @@ def test_packer_removes_symlink_replaced_source_after_rename_boundary(
     archive = tmp_path / "rename-boundary-symlink.tar"
     target = tmp_path / "renamed-source-target"
     target.write_bytes(b"unverified-at-rename-boundary\\n")
-    real_rename = artifacts_module._rename_no_replace
+    real_rename = artifacts_module._rename_no_replace_syscall
     replaced = False
 
-    def replace_then_rename(*, source: str, destination: str, parent_descriptor: int) -> None:
+    def replace_then_rename(
+        *, source: str, destination: str, src_dir_fd: int, dst_dir_fd: int
+    ) -> None:
         nonlocal replaced
-        os.unlink(source, dir_fd=parent_descriptor)
-        os.symlink(target, source, dir_fd=parent_descriptor)
+        os.unlink(source, dir_fd=src_dir_fd)
+        os.symlink(target, source, dir_fd=src_dir_fd)
         replaced = True
         real_rename(
             source=source,
             destination=destination,
-            parent_descriptor=parent_descriptor,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=src_dir_fd,
         )
 
-    monkeypatch.setattr(artifacts_module, "_rename_no_replace", replace_then_rename)
+    monkeypatch.setattr(artifacts_module, "_rename_no_replace_syscall", replace_then_rename)
 
     with pytest.raises(artifacts_module.NativeArtifactError):
         artifacts_module.pack_native_work_archive(
@@ -1593,18 +1599,20 @@ def test_packer_removes_nonempty_directory_after_rename_boundary(
 ) -> None:
     manifest = _publish(bootstrap_payload)
     archive = tmp_path / "rename-boundary-directory.tar"
-    real_rename = artifacts_module._rename_no_replace
+    real_rename = artifacts_module._rename_no_replace_syscall
     replaced = False
 
-    def replace_then_rename(*, source: str, destination: str, parent_descriptor: int) -> None:
+    def replace_then_rename(
+        *, source: str, destination: str, src_dir_fd: int, dst_dir_fd: int
+    ) -> None:
         nonlocal replaced
         if not replaced:
-            os.unlink(source, dir_fd=parent_descriptor)
-            os.mkdir(source, dir_fd=parent_descriptor)
+            os.unlink(source, dir_fd=src_dir_fd)
+            os.mkdir(source, dir_fd=src_dir_fd)
             source_descriptor = os.open(
                 source,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=parent_descriptor,
+                dir_fd=src_dir_fd,
             )
             try:
                 os.mkdir("nested", dir_fd=source_descriptor)
@@ -1632,10 +1640,11 @@ def test_packer_removes_nonempty_directory_after_rename_boundary(
         real_rename(
             source=source,
             destination=destination,
-            parent_descriptor=parent_descriptor,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=src_dir_fd,
         )
 
-    monkeypatch.setattr(artifacts_module, "_rename_no_replace", replace_then_rename)
+    monkeypatch.setattr(artifacts_module, "_rename_no_replace_syscall", replace_then_rename)
 
     with pytest.raises(artifacts_module.NativeArtifactError):
         artifacts_module.pack_native_work_archive(
@@ -1697,18 +1706,20 @@ def test_copy_attestation_bundle_removes_every_rename_boundary_substitution(
     bundle_content = b'{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.3"}\n'
     source.write_bytes(bundle_content)
     symlink_target.write_bytes(b"raced bundle\n")
-    real_rename = artifacts_module._rename_no_replace
+    real_rename = artifacts_module._rename_no_replace_syscall
     replaced = False
 
-    def replace_then_rename(*, source: str, destination: str, parent_descriptor: int) -> None:
+    def replace_then_rename(
+        *, source: str, destination: str, src_dir_fd: int, dst_dir_fd: int
+    ) -> None:
         nonlocal replaced
-        os.unlink(source, dir_fd=parent_descriptor)
+        os.unlink(source, dir_fd=src_dir_fd)
         if replacement_kind == "regular":
             descriptor = os.open(
                 source,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                 0o600,
-                dir_fd=parent_descriptor,
+                dir_fd=src_dir_fd,
             )
             try:
                 os.write(descriptor, bundle_content)
@@ -1716,13 +1727,13 @@ def test_copy_attestation_bundle_removes_every_rename_boundary_substitution(
             finally:
                 os.close(descriptor)
         elif replacement_kind == "symlink":
-            os.symlink(symlink_target, source, dir_fd=parent_descriptor)
+            os.symlink(symlink_target, source, dir_fd=src_dir_fd)
         else:
-            os.mkdir(source, dir_fd=parent_descriptor)
+            os.mkdir(source, dir_fd=src_dir_fd)
             directory = os.open(
                 source,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=parent_descriptor,
+                dir_fd=src_dir_fd,
             )
             try:
                 os.mkdir("nested", dir_fd=directory)
@@ -1750,10 +1761,11 @@ def test_copy_attestation_bundle_removes_every_rename_boundary_substitution(
         real_rename(
             source=source,
             destination=destination,
-            parent_descriptor=parent_descriptor,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=src_dir_fd,
         )
 
-    monkeypatch.setattr(artifacts_module, "_rename_no_replace", replace_then_rename)
+    monkeypatch.setattr(artifacts_module, "_rename_no_replace_syscall", replace_then_rename)
 
     with pytest.raises(artifacts_module.NativeArtifactError):
         artifacts_module.copy_attestation_bundle(source=source, destination=destination)
@@ -1761,7 +1773,7 @@ def test_copy_attestation_bundle_removes_every_rename_boundary_substitution(
     assert not destination.exists()
     assert not destination.is_symlink()
 
-    monkeypatch.setattr(artifacts_module, "_rename_no_replace", real_rename)
+    monkeypatch.setattr(artifacts_module, "_rename_no_replace_syscall", real_rename)
     identity = artifacts_module.copy_attestation_bundle(source=source, destination=destination)
     assert identity.size == source.stat().st_size
 

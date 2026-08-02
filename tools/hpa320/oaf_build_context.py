@@ -4,14 +4,11 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
-import errno
 import hashlib
 import os
 import shutil
 import stat
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -21,8 +18,10 @@ from src.benchmark.backend_identity import (
     canonical_json_bytes,
     strict_json_loads,
 )
-from src.benchmark.backend_publication import read_regular_file_no_follow
-from tools.hpa320._fsync import _fsync_directory
+from src.benchmark.backend_publication import (
+    _rename_no_replace_syscall,
+    read_regular_file_no_follow,
+)
 
 BUILD_CONTEXT_SCHEMA = "crux.oaf-build-context-manifest/v1"
 BUILD_CONTEXT_MANIFEST_PATH = "runtime/oaf_tf1/build-context-manifest.json"
@@ -34,6 +33,8 @@ WHEELHOUSE_PREFIX = "runtime/oaf_tf1/wheelhouse/"
 # their COPY instructions land; the repository root is never supplied as the context.
 REVIEWED_REPOSITORY_PATHS = (
     ".github/workflows/hpa320-native-bootstrap.yml",
+    ".github/workflows/hpa320-native-candidate.yml",
+    "tools/hpa320/_fsync.py",
     "tools/hpa320/audit_legacy_tf2_conversion.py",
     "tools/hpa320/generate_runner_source_manifest.py",
     "tools/hpa320/github_host_evidence.py",
@@ -446,68 +447,6 @@ def _open_parent_directory(parent: Path) -> int:
     return descriptor
 
 
-def _rename_no_replace(*, source: str, destination: str, parent_fd: int) -> None:
-    """Atomically rename ``source`` to ``destination`` within ``parent_fd``.
-
-    Refuses to overwrite an existing destination so a pre-existing or
-    concurrently created entry at ``destination`` is preserved rather than
-    silently replaced. Used by rollback quarantine/restoration moves so a
-    racing writer cannot cause rollback to clobber a file it does not own.
-    """
-
-    libc = ctypes.CDLL(None, use_errno=True)
-    encoded_source = os.fsencode(source)
-    encoded_destination = os.fsencode(destination)
-    if sys.platform == "darwin":
-        try:
-            rename = libc.renameatx_np
-        except AttributeError:
-            raise OSError(errno.ENOTSUP, "renameatx_np is unavailable") from None
-        rename.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        rename.restype = ctypes.c_int
-        result = rename(
-            parent_fd,
-            encoded_source,
-            parent_fd,
-            encoded_destination,
-            0x00000004,  # RENAME_EXCL
-        )
-    elif sys.platform.startswith("linux"):
-        try:
-            rename = libc.renameat2
-        except AttributeError:
-            raise OSError(errno.ENOTSUP, "renameat2 is unavailable") from None
-        rename.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        rename.restype = ctypes.c_int
-        result = rename(
-            parent_fd,
-            encoded_source,
-            parent_fd,
-            encoded_destination,
-            0x00000001,  # RENAME_NOREPLACE
-        )
-    else:
-        raise OSError(errno.ENOTSUP, "atomic no-replace rename is unsupported")
-    if result == 0:
-        return
-    error_number = ctypes.get_errno()
-    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
-        raise FileExistsError(error_number, os.strerror(error_number), destination)
-    raise OSError(error_number, os.strerror(error_number), destination)
-
-
 def _unlink_if_owned(name: str, metadata: os.stat_result, parent_fd: int) -> None:
     """Remove ``name`` only if it is still the inode we created.
 
@@ -536,7 +475,9 @@ def _unlink_if_owned(name: str, metadata: os.stat_result, parent_fd: int) -> Non
         return
     quarantine = f".{name}.rollback-quarantine.{metadata.st_ino}.{os.getpid()}"
     try:
-        _rename_no_replace(source=name, destination=quarantine, parent_fd=parent_fd)
+        _rename_no_replace_syscall(
+            source=name, destination=quarantine, src_dir_fd=parent_fd, dst_dir_fd=parent_fd
+        )
     except OSError:
         # The quarantine destination is already occupied (or no-replace rename
         # is unsupported): do not overwrite it. Leave the owned file in place
@@ -553,7 +494,9 @@ def _unlink_if_owned(name: str, metadata: os.stat_result, parent_fd: int) -> Non
         # do not own. Use no-replace so a newer occupant at ``name`` is
         # preserved and the quarantined entry is retained for recovery.
         try:
-            _rename_no_replace(source=quarantine, destination=name, parent_fd=parent_fd)
+            _rename_no_replace_syscall(
+                source=quarantine, destination=name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd
+            )
         except OSError:
             # ``name`` is occupied by a newer file (or rename is unsupported):
             # preserve the quarantined entry for recovery, never overwrite the
@@ -662,94 +605,154 @@ def _verify_parent_ancestry(parent: Path, parent_metadata: os.stat_result) -> No
         os.close(descriptor)
 
 
-def _write_manifest_content(  # pylint: disable=too-many-statements
-    path: Path, content: bytes, *, replace: bool
-) -> None:
+def _write_manifest_content(path: Path, content: bytes, *, replace: bool) -> None:
     output = Path(path)
     parent = _require_root(output.parent, "build-context manifest parent")
     if not replace:
         if output.exists() or output.is_symlink():
             raise BuildContextError("build-context manifest output must be absent")
-        published_name: str | None = None
-        created_metadata: os.stat_result | None = None
-        parent_fd = _open_parent_directory(parent)
-        parent_metadata = os.fstat(parent_fd)
-        try:
-            descriptor = os.open(
-                output.name,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
-                FILE_MODE,
-                dir_fd=parent_fd,
-            )
-            created_metadata = os.fstat(descriptor)
-            published_name = output.name
-            try:
-                view = memoryview(content)
-                while view:
-                    written = os.write(descriptor, view)
-                    if written <= 0:
-                        raise OSError("short write")
-                    view = view[written:]
-                os.fchmod(descriptor, FILE_MODE)
-                os.utime(descriptor, ns=(0, 0))
-                os.fsync(descriptor)
-                # Validate the manifest through the held parent descriptor
-                # rather than by path: a concurrent substitution at the output
-                # path must not make publication succeed for a different, even
-                # structurally valid, authority. Reopening relative to
-                # ``parent_fd`` and checking the inode proves the file we
-                # created is the one being validated, and byte-equality with
-                # ``content`` proves it is the authority we generated.
-                _verify_published_descriptor(output.name, parent_fd, created_metadata, content)
-                # Sync the directory entry through the held parent descriptor,
-                # not a path re-open, so a parent-directory swap cannot sync the
-                # replacement directory.
-                os.fsync(parent_fd)
-                # Confirm the path-facing parent still resolves to the held
-                # directory inode; an ancestry substitution means the published
-                # path no longer refers to the directory we wrote into.
-                _verify_parent_ancestry(parent, parent_metadata)
-                # Re-verify the output through the held parent descriptor after
-                # the directory fsync: a same-directory substitution between the
-                # first verification and here would pass the ancestry check
-                # (parent inode unchanged) but leave a replacement at the output
-                # path. Reopening and re-checking inode + exact bytes closes
-                # that window before publication is declared successful.
-                _verify_published_descriptor(output.name, parent_fd, created_metadata, content)
-            finally:
-                os.close(descriptor)
-            published_name = None
-        except (BuildContextError, OSError):
-            if published_name is not None and created_metadata is not None:
-                _unlink_if_owned(published_name, created_metadata, parent_fd)
-            raise
-        finally:
-            os.close(parent_fd)
-        return
+        _create_manifest_content(output, parent, content)
+    else:
+        _replace_manifest_content(output, parent, content)
 
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=".build-context-manifest-",
-        dir=parent,
-    )
+
+def _create_manifest_content(  # pylint: disable=too-many-statements
+    output: Path, parent: Path, content: bytes
+) -> None:
+    published_name: str | None = None
+    created_metadata: os.stat_result | None = None
+    parent_fd = _open_parent_directory(parent)
+    parent_metadata = os.fstat(parent_fd)
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            os.fchmod(handle.fileno(), FILE_MODE)
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        load_build_context_manifest(Path(temporary))
-        os.replace(temporary, output)
-        _fsync_directory(parent)
-    except (BuildContextError, OSError):
+        descriptor = os.open(
+            output.name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            FILE_MODE,
+            dir_fd=parent_fd,
+        )
+        created_metadata = os.fstat(descriptor)
+        published_name = output.name
         try:
-            os.unlink(temporary)
-        except OSError:
-            pass
+            view = memoryview(content)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short write")
+                view = view[written:]
+            os.fchmod(descriptor, FILE_MODE)
+            os.utime(descriptor, ns=(0, 0))
+            os.fsync(descriptor)
+            # Validate the manifest through the held parent descriptor
+            # rather than by path: a concurrent substitution at the output
+            # path must not make publication succeed for a different, even
+            # structurally valid, authority. Reopening relative to
+            # ``parent_fd`` and checking the inode proves the file we
+            # created is the one being validated, and byte-equality with
+            # ``content`` proves it is the authority we generated.
+            _verify_published_descriptor(output.name, parent_fd, created_metadata, content)
+            # Sync the directory entry through the held parent descriptor,
+            # not a path re-open, so a parent-directory swap cannot sync the
+            # replacement directory.
+            os.fsync(parent_fd)
+            # Confirm the path-facing parent still resolves to the held
+            # directory inode; an ancestry substitution means the published
+            # path no longer refers to the directory we wrote into.
+            _verify_parent_ancestry(parent, parent_metadata)
+            # Re-verify the output through the held parent descriptor after
+            # the directory fsync: a same-directory substitution between the
+            # first verification and here would pass the ancestry check
+            # (parent inode unchanged) but leave a replacement at the output
+            # path. Reopening and re-checking inode + exact bytes closes
+            # that window before publication is declared successful.
+            _verify_published_descriptor(output.name, parent_fd, created_metadata, content)
+        finally:
+            os.close(descriptor)
+        published_name = None
+    except (BuildContextError, OSError):
+        if published_name is not None and created_metadata is not None:
+            _unlink_if_owned(published_name, created_metadata, parent_fd)
         raise
+    finally:
+        os.close(parent_fd)
+
+
+def _replace_manifest_content(  # pylint: disable=too-many-statements
+    output: Path, parent: Path, content: bytes
+) -> None:
+    # Mirror the create path's descriptor-based substitution and durability
+    # guarantees: hold the parent directory descriptor throughout, validate
+    # the temporary through that descriptor (not by path), atomically replace
+    # into the output, and fsync the held parent descriptor. Track whether
+    # the replace completed so a post-replace fsync failure rolls back the
+    # owned output rather than unlinking the already-renamed temporary.
+    published_name: str | None = None
+    created_metadata: os.stat_result | None = None
+    parent_fd = _open_parent_directory(parent)
+    parent_metadata = os.fstat(parent_fd)
+    try:
+        temp_name = f".{output.name}.replace.{os.getpid()}.{os.urandom(8).hex()}"
+        descriptor = os.open(
+            temp_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            FILE_MODE,
+            dir_fd=parent_fd,
+        )
+        created_metadata = os.fstat(descriptor)
+        published_name = temp_name
+        try:
+            view = memoryview(content)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short write")
+                view = view[written:]
+            os.fchmod(descriptor, FILE_MODE)
+            os.utime(descriptor, ns=(0, 0))
+            os.fsync(descriptor)
+            # Validate the temporary through the held parent descriptor rather
+            # than by path, so a substitution at the temporary path cannot
+            # make publication succeed for a different authority.
+            _verify_published_descriptor(temp_name, parent_fd, created_metadata, content)
+        finally:
+            os.close(descriptor)
+        # Atomically replace the output with the validated temporary. Both
+        # paths are relative to the held parent descriptor so a parent
+        # directory swap cannot redirect the rename.
+        os.replace(temp_name, output.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        # The replace completed: the owned inode now lives at the output path.
+        # Track it so a post-replace failure rolls back the output, not the
+        # already-renamed temporary (which no longer exists).
+        published_name = output.name
+        # Sync the directory entry through the held parent descriptor, not a
+        # path re-open, so a parent-directory swap cannot sync the replacement
+        # directory.
+        os.fsync(parent_fd)
+        # Confirm the path-facing parent still resolves to the held directory
+        # inode; an ancestry substitution means the published path no longer
+        # refers to the directory we wrote into.
+        _verify_parent_ancestry(parent, parent_metadata)
+        # Re-verify the output through the held parent descriptor after the
+        # directory fsync: a same-directory substitution between the rename
+        # and here would pass the ancestry check (parent inode unchanged) but
+        # leave a replacement at the output path. Reopening and re-checking
+        # inode + exact bytes closes that window before publication is
+        # declared successful.
+        _verify_published_descriptor(output.name, parent_fd, created_metadata, content)
+        published_name = None
+    except (BuildContextError, OSError):
+        if published_name is not None and created_metadata is not None:
+            _unlink_if_owned(published_name, created_metadata, parent_fd)
+        raise
+    finally:
+        os.close(parent_fd)
 
 
 def _parser() -> argparse.ArgumentParser:

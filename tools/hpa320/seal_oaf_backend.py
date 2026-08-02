@@ -52,7 +52,7 @@ from src.benchmark.checkpoint_acquisition import (
     load_checkpoint_acquisition_evidence,
     load_checkpoint_acquisition_request,
 )
-from tools.hpa320._fsync import _fsync_directory
+from tools.hpa320._fsync import fsync_directory
 from tools.hpa320.audit_legacy_tf2_conversion import (
     CANDIDATE_MANIFEST_NAME,
     CANDIDATE_MANIFEST_SCHEMA,
@@ -825,14 +825,24 @@ def reissue_calibration_bootstrap_request(
         request_path,
         "calibration bootstrap request",
     )
+    # Reject non-canonical input before any work or write occurs. The loader
+    # derives the repository root from ``request_path.parents[3]``, so the
+    # caller-supplied ``repository_root`` must match that path or the reissued
+    # hashes would be recomputed from a different tree than the loader reads.
+    if strict_json_loads(original[:-1], require_canonical=True) != payload:
+        raise SealError("existing calibration bootstrap request is not canonical")
+    try:
+        expected_repository = request_path.parents[3]
+    except IndexError:
+        raise SealError("calibration bootstrap request repository path is invalid") from None
+    if repository_root != expected_repository:
+        raise SealError("calibration bootstrap request repository root does not match request path")
     reissued = dict(payload)
     for relative, field in _BOOTSTRAP_HASH_FIELDS:
         content = _read_regular(repository_root / relative, relative)
         reissued[field] = sha256_hex(content)
     _validate_calibration_bootstrap_request_payload(reissued)
     content = canonical_json_bytes(reissued, trailing_newline=True)
-    if strict_json_loads(original[:-1], require_canonical=True) != payload:
-        raise SealError("existing calibration bootstrap request is not canonical")
     _atomic_replace_regular_file(request_path, content, label="calibration bootstrap request")
     loaded = load_calibration_bootstrap_request(request_path)
     return loaded.sha256
@@ -1905,8 +1915,8 @@ def _publish_candidate_directory(source: Path, output: Path) -> PublishedArtifac
             key=lambda item: len(item.parts),
             reverse=True,
         ):
-            _fsync_directory(staging / directory.relative_to(source))
-        _fsync_directory(staging)
+            fsync_directory(staging / directory.relative_to(source))
+        fsync_directory(staging)
         os.rename(staging, output)
     except (OSError, SealError):
         _remove_staging_directory(staging)
@@ -2831,6 +2841,7 @@ def _atomic_replace_regular_file(path: Path, content: bytes, label: str) -> None
         prefix=f".{target.name}.reissue-",
         dir=parent,
     )
+    replaced = False
     try:
         with os.fdopen(descriptor, "wb") as handle:
             os.fchmod(handle.fileno(), 0o644)
@@ -2838,13 +2849,23 @@ def _atomic_replace_regular_file(path: Path, content: bytes, label: str) -> None
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, target)
-        _fsync_directory(parent)
-    except OSError:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise SealError(f"{label} replacement failed") from None
+        replaced = True
+        fsync_directory(parent)
+    except OSError as error:
+        # Only clean up the temporary when the rename has not completed: once
+        # os.replace succeeded the temporary path no longer exists and the
+        # owned inode now lives at the target. Unlinking the vanished
+        # temporary would be a no-op at best and could target an unrelated
+        # path if a concurrent writer reused the name.
+        if not replaced:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+        # Preserve the original OSError as the cause rather than suppressing
+        # it, so callers can distinguish an unsynchronized publication from a
+        # write failure.
+        raise SealError(f"{label} replacement failed") from error
 
 
 def _require_directory(path: Path, label: str) -> Path:
@@ -3295,18 +3316,18 @@ def _validate_measurement_evidence_authority(
         or measurement["base_system_package_evidence_sha256"] != accepted.base.sha256
     ):
         raise SealError("measurement evidence does not bind its accepted authorities")
-    if operational_bootstrap is not None and (
+    if (
         measurement["runtime_image_config_digest"]
         != operational_bootstrap.payload["runtime_image_config_digest"]
         or measurement["runtime_image_manifest_digest"]
         != operational_bootstrap.payload["runtime_image_manifest_digest"]
     ):
         raise SealError("measurement evidence does not bind its operational image identity")
-    if bundle is not None and measurement["native_host_attestation_bundle_sha256"] != bundle.sha256:
+    if measurement["native_host_attestation_bundle_sha256"] != bundle.sha256:
         raise SealError("measurement evidence does not bind its phase host bundle")
-    if host_payload is not None and measurement["native_host_evidence"] != host_payload:
+    if measurement["native_host_evidence"] != host_payload:
         raise SealError("measurement evidence does not bind its phase host evidence")
-    if host is not None and not _same_native_host(
+    if not _same_native_host(
         _native_host_from_record(measurement["native_host_evidence"], "measurement native host"),
         host,
     ):

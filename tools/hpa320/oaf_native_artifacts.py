@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
-import errno
 import hashlib
 import json
 import os
@@ -30,6 +28,7 @@ from src.benchmark.backend_identity import (
 from src.benchmark.backend_publication import (
     ArtifactPublicationError,
     DirectoryAnchor,
+    _rename_no_replace_syscall,
     open_directory_anchor,
     publish_immutable_bytes,
     read_regular_file_no_follow,
@@ -1327,10 +1326,11 @@ def pack_native_work_archive(
             ):
                 raise NativeArtifactError("native work archive changed after strict verification")
             _verify_regular_file_binding_at(parent, temporary_name, temporary_stat)
-            _rename_no_replace(
+            _rename_no_replace_syscall(
                 source=temporary_name,
                 destination=archive.name,
-                parent_descriptor=parent.descriptor,
+                src_dir_fd=parent.descriptor,
+                dst_dir_fd=parent.descriptor,
             )
             published = True
             published_stat = os.stat(
@@ -1464,10 +1464,11 @@ def copy_attestation_bundle(*, source: Path, destination: Path) -> CheckpointIde
                 temporary_name,
                 temporary_stat,
             )
-            _rename_no_replace(
+            _rename_no_replace_syscall(
                 source=temporary_name,
                 destination=destination_path.name,
-                parent_descriptor=destination_parent.descriptor,
+                src_dir_fd=destination_parent.descriptor,
+                dst_dir_fd=destination_parent.descriptor,
             )
             published = True
             published_stat = os.stat(
@@ -2111,62 +2112,6 @@ def _verify_regular_file_binding_at(
     current = os.stat(name, dir_fd=anchor.descriptor, follow_symlinks=False)
     if not stat.S_ISREG(current.st_mode) or not _same_inode(current, expected):
         raise NativeArtifactError("native work archive path binding changed")
-
-
-def _rename_no_replace(*, source: str, destination: str, parent_descriptor: int) -> None:
-    """Atomically publish a sibling path only when its destination is absent."""
-
-    libc = ctypes.CDLL(None, use_errno=True)
-    encoded_source = os.fsencode(source)
-    encoded_destination = os.fsencode(destination)
-    if sys.platform == "darwin":
-        try:
-            rename = libc.renameatx_np
-        except AttributeError:
-            raise OSError(errno.ENOTSUP, "renameatx_np is unavailable") from None
-        rename.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        rename.restype = ctypes.c_int
-        result = rename(
-            parent_descriptor,
-            encoded_source,
-            parent_descriptor,
-            encoded_destination,
-            0x00000004,  # RENAME_EXCL
-        )
-    elif sys.platform.startswith("linux"):
-        try:
-            rename = libc.renameat2
-        except AttributeError:
-            raise OSError(errno.ENOTSUP, "renameat2 is unavailable") from None
-        rename.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        rename.restype = ctypes.c_int
-        result = rename(
-            parent_descriptor,
-            encoded_source,
-            parent_descriptor,
-            encoded_destination,
-            0x00000001,  # RENAME_NOREPLACE
-        )
-    else:
-        raise OSError(errno.ENOTSUP, "atomic no-replace rename is unsupported")
-    if result == 0:
-        return
-    error_number = ctypes.get_errno()
-    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
-        raise FileExistsError(error_number, os.strerror(error_number), destination)
-    raise OSError(error_number, os.strerror(error_number), destination)
 
 
 def _unlink_at(descriptor: int, name: str) -> None:
