@@ -827,6 +827,63 @@ def test_build_context_generate_replace_updates_only_named_manifest(
     assert tuple(tmp_path.glob(".build-context-manifest-*")) == ()
 
 
+def test_build_context_generate_replace_preserves_manifest_when_parent_sync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression: once ``os.replace`` succeeds in ``_replace_manifest_content``,
+    # the previous manifest inode is irreversibly displaced. A subsequent
+    # parent-directory fsync, ancestry, or verification failure must raise
+    # without unlinking the new output; otherwise a durability or validation
+    # error destroys the checked-in authority and leaves neither the old nor
+    # the new manifest. The new output is the published authority and must
+    # survive, mirroring ``_atomic_replace_regular_file`` in
+    # ``seal_oaf_backend``.
+    repository, wheelhouse, source = _configure_minimal_generation(tmp_path, monkeypatch)
+    output = tmp_path / "build-context-manifest.json"
+    arguments = _generate_arguments(repository, wheelhouse, output)
+    assert context_module.main(arguments) == 0
+    original_bytes = output.read_bytes()
+    source.write_bytes(b"FROM changed\n")
+    expected_bytes = generate_build_context_manifest(
+        repository_root=repository,
+        wheelhouse_root=wheelhouse,
+    )
+    assert expected_bytes != original_bytes
+
+    real_fsync = os.fsync
+    parent_stat = output.parent.stat()
+
+    def fail_directory_entry_sync(fd: int) -> None:
+        # Fail only the directory-entry fsync (the held parent descriptor),
+        # identified by inode rather than call order so the test does not
+        # depend on the sequence of fsync calls. The temporary file-body
+        # fsync uses a regular-file descriptor and must pass through. This
+        # fires after ``os.replace`` has already installed the new output.
+        current = os.fstat(fd)
+        if stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == (
+            parent_stat.st_dev,
+            parent_stat.st_ino,
+        ):
+            raise OSError("injected parent directory sync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_entry_sync)
+
+    assert context_module.main([*arguments, "--replace"]) == 2
+    # The new manifest was already installed by ``os.replace``; the failed
+    # parent sync must not unlink it. A valid manifest must remain.
+    assert output.exists()
+    assert output.read_bytes() == expected_bytes
+    # No leftover temporary from the replace path.
+    assert tuple(tmp_path.glob(".build-context-manifest.json.replace.*")) == ()
+
+    monkeypatch.setattr(os, "fsync", real_fsync)
+    # A retry with a working fsync succeeds and converges on the same bytes.
+    assert context_module.main([*arguments, "--replace"]) == 0
+    assert output.read_bytes() == expected_bytes
+
+
 def test_runner_source_manifest_check_is_exact_and_non_mutating(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
