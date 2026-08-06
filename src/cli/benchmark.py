@@ -364,6 +364,92 @@ def _emit_sync_summary(outcome: SyncOutcome) -> None:
     )
 
 
+def _emit_reference_chart_selection_summary(
+    *,
+    status: str,
+    exit_code: int,
+    manifest_path: Path | None,
+    manifest_sha256: str | None,
+    corpus_version: str | None,
+    selected_count: int,
+    quarantined_count: int,
+) -> None:
+    """Write the sole machine-readable result after reference-chart selection."""
+    payload = {
+        "corpus_version": corpus_version,
+        "exit_code": exit_code,
+        "manifest_path": None if manifest_path is None else str(manifest_path),
+        "manifest_sha256": manifest_sha256,
+        "quarantined_count": quarantined_count,
+        "selected_count": selected_count,
+        "status": status,
+    }
+    standard_output = click.get_binary_stream("stdout")
+    standard_output.write(canonical_json_bytes(payload, trailing_newline=True))
+    standard_output.flush()
+
+
+@benchmark.command("select-reference-charts")
+@click.option(
+    "--manifest",
+    "manifest_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+)
+@click.option(
+    "--cache-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Local HPA-321 cache root (default: <manifest parent>/../cache/).",
+)
+@click.option(
+    "--overrides-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=Path("config/benchmark-reference-chart-overrides.json"),
+    show_default=True,
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=Path("artifacts/benchmark/reference-charts"),
+    show_default=True,
+)
+@click.pass_context
+def select_reference_charts_command(
+    ctx: click.Context,
+    manifest_path: Path,
+    cache_dir: Path | None,
+    overrides_file: Path,
+    output_dir: Path,
+) -> None:
+    """Select authoritative charts from an immutable local HPA-321 manifest."""
+    from src.benchmark.reference_chart_manifest import SelectionRequest, select_reference_manifest
+
+    outcome = select_reference_manifest(
+        SelectionRequest(
+            manifest_path=manifest_path,
+            cache_dir=manifest_path.parent.parent / "cache" if cache_dir is None else cache_dir,
+            overrides_file=overrides_file,
+            output_dir=output_dir,
+            default_overrides_missing_ok=(
+                ctx.get_parameter_source("overrides_file") is click.core.ParameterSource.DEFAULT
+            ),
+        )
+    )
+    published = outcome.manifest
+    _emit_reference_chart_selection_summary(
+        status=outcome.status,
+        exit_code=outcome.exit_code,
+        manifest_path=None if published is None else published.path,
+        manifest_sha256=None if published is None else published.manifest_sha256,
+        corpus_version=None if published is None else published.corpus_version,
+        selected_count=outcome.selected_count,
+        quarantined_count=outcome.quarantined_count,
+    )
+    if outcome.exit_code:
+        ctx.exit(outcome.exit_code)
+
+
 @benchmark.command("sync-r2-corpus")
 @click.option(
     "--cache-dir",
