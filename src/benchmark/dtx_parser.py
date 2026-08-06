@@ -4,12 +4,12 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from src.benchmark.dtx_text import decode_dtxmania_text
 from src.benchmark.models import DtxEvent
 
 LINE_RE = re.compile(r"^[#*](?P<measure>\d{3})(?P<channel>[0-9A-Za-z]{2})\s*:\s*(?P<value>.*)$")
 HEADER_RE = re.compile(r"^[#*](?P<key>[A-Za-z0-9_]+)\s*:?\s*(?P<value>.*)$")
-ENCODINGS = ("utf-8", "shift-jis", "utf-16le", "utf-16be")
-_DTX_LINE_RE = re.compile(r"^[#*]\s*[0-9A-Za-z]")
+_ASCII_DECIMAL_RE = re.compile(r"^[0-9]+$")
 _STRING_VALUE_HEADER_KEYS = frozenset({"TITLE", "ARTIST"})
 
 
@@ -27,6 +27,8 @@ class ParsedDtxChart:
     chart_id: str
     title: str = ""
     artist: str = ""
+    dlevel_raw: str | None = None
+    dlevel_normalized: int | None = None
     base_bpm: float = 120.0
     bpm_table: dict[str, float] = field(default_factory=dict)
     wav_table: dict[str, str] = field(default_factory=dict)
@@ -39,23 +41,8 @@ class ParsedDtxChart:
 
 
 def parse_dtx_file(path: Path, chart_id: str | None = None) -> ParsedDtxChart:
-    raw = path.read_bytes()
-    last_error: UnicodeDecodeError | None = None
-    for encoding in ENCODINGS:
-        try:
-            text = raw.decode(encoding)
-        except UnicodeDecodeError as exc:
-            last_error = exc
-            continue
-        # Some encodings (notably shift-jis) decode UTF-16 byte sequences
-        # without raising, producing gibberish that parses as an empty chart.
-        # Reject decodes that contain no recognisable DTX lines so that the
-        # next encoding in the list gets a chance.
-        if any(_DTX_LINE_RE.match(line.strip()) for line in text.splitlines()):
-            return parse_dtx_text(text, chart_id=chart_id or path.stem)
-    if last_error is not None:
-        raise last_error
-    raise ValueError(f"could not decode DTX file: {path}")
+    text = decode_dtxmania_text(path.read_bytes(), source_name=str(path), kind="dtx")
+    return parse_dtx_text(text, chart_id=chart_id or path.stem)
 
 
 def _is_string_value_header_key(key: str) -> bool:
@@ -67,6 +54,8 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
     text = text.removeprefix("\ufeff")
     title = ""
     artist = ""
+    dlevel_raw: str | None = None
+    dlevel_normalized: int | None = None
     base_bpm = 120.0
     bpm_table: dict[str, float] = {}
     wav_table: dict[str, str] = {}
@@ -119,6 +108,11 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
             title = value
         elif key == "ARTIST":
             artist = value
+        elif key == "DLEVEL":
+            dlevel_raw = value
+            dlevel_normalized = _normalize_dlevel(value)
+            if dlevel_normalized is None:
+                warnings.append(f"ignoring invalid DLEVEL value: {value!r}")
         elif key == "BPM":
             base_bpm = _parse_positive_float(value, "base BPM")
         elif key.startswith("BPM") and len(key) == 5:
@@ -143,6 +137,8 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
         chart_id=chart_id,
         title=title,
         artist=artist,
+        dlevel_raw=dlevel_raw,
+        dlevel_normalized=dlevel_normalized,
         base_bpm=base_bpm,
         bpm_table=bpm_table,
         wav_table=wav_table,
@@ -162,6 +158,16 @@ def _parse_positive_float(value: str, label: str) -> float:
     if parsed <= 0:
         raise ValueError(f"{label} must be positive")
     return parsed
+
+
+def _normalize_dlevel(value: str) -> int | None:
+    if _ASCII_DECIMAL_RE.fullmatch(value) is None:
+        return None
+    try:
+        normalized = int(value)
+    except ValueError:
+        return None
+    return normalized if normalized <= 100 else None
 
 
 def _chunks(value: str) -> list[str]:
