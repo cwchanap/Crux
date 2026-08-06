@@ -17,8 +17,8 @@ Three correctness gaps exist today:
 HPA-321 caches chart-definition files only, so HPA-323 must fill the cache for the
 exact DTX-referenced source audio without widening the global cache policy.
 
-Implementation begins only after HPA-322 merges its shared manifest reader and hardened
-cache-body adapter.
+Implementation begins only after HPA-322 merges its shared manifest-row,
+cache-body, and inventory object-key contracts.
 
 ## Verified Channel `02` Semantics
 
@@ -42,11 +42,12 @@ this DTX benchmark stage.
 - Add deterministic source order to native pattern events.
 - Build one timing map with sticky DTX channel `02` semantics.
 - Rename chart-time APIs so the clock is explicit at every call site.
-- Consume HPA-322's `inventory_from_manifest_row`,
-  `parse_manifest_timestamp`, and `resolve_verified_cache_body` contracts.
+- Consume HPA-322's `parse_manifest_timestamp`, `manifest_row_view_from_row`,
+  `inventory_from_manifest_row`, `resolve_verified_cache_body`, and
+  `resolve_inventory_object_key` contracts.
 - Resolve source audio through the selected DTX `#WAVxx` table and R2 inventory.
-- Measure real-corpus BGM group and fallback distribution before freezing ambiguity
-  policy.
+- Measure real-corpus BGM group and root-fallback distribution before freezing
+  ambiguity policy.
 - Fill only exact selected source-audio cache misses.
 - Inspect metadata with `soundfile.info` without waveform decode.
 - Shift native events into audio time, preserve native identity, and report bounds.
@@ -62,6 +63,7 @@ this DTX benchmark stage.
 - Automatically repairing authored timing.
 - Downloading every audio object.
 - Embedding full event arrays in the manifest.
+- Reimplementing HPA-322 row parsing, cache validation, or object-key matching.
 - Adding a database, service, workflow engine, plugin system, or new concurrency layer.
 - Preserving the ambiguous name `dtx_events_to_timed_events`.
 
@@ -92,9 +94,8 @@ Exit codes:
 
 ## Pre-Implementation Corpus Measurement Gate
 
-The shape of real channel `01` usage is not yet known. Before implementing BGM selection
-policy, run a read-only analysis over the merged HPA-322 manifest and cache. Publish a
-machine-readable local report containing:
+Before implementing BGM selection policy, run a read-only analysis over the merged
+HPA-322 manifest and cache. Publish a local report containing:
 
 ```text
 selected_rows
@@ -110,14 +111,20 @@ A BGM group uses discrete identity `(audio_object_key, measure, position)`. The 
 also lists a bounded sample of multi-group rows with note IDs, object keys, measures,
 positions, and source order.
 
+Every candidate `#WAVxx` value is resolved with HPA-322's
+`resolve_inventory_object_key` relative to the selected chart directory. The analysis
+may perform a second call with the simfile-root directory after a relative `missing`
+result so it can measure root fallback. It must not implement a separate path
+normalizer, containment check, exact matcher, or casefold matcher.
+
 Decision gate:
 
 - if zero/one-group behavior dominates and multi-group rows are exceptional, retain
   conservative quarantine for distinct groups;
 - if multi-group rows are common, inspect representative authored charts and revise
   this design before implementing selection;
+- remove the second root-level resolver call if the report proves it unnecessary;
 - do not automatically adopt an earliest-group rule merely because it increases yield.
-  Later chips may be stems, continuations, revisions, or genuine competing starts.
 
 No immutable timing artifact is published until the policy is frozen from evidence.
 
@@ -161,38 +168,41 @@ The new reference stage exposes clearly named audio-time construction through
 
 ### 2. Shared HPA-322 contracts
 
-HPA-323 imports the contracts created by HPA-322:
+HPA-323 imports:
 
 - `parse_manifest_timestamp` from `r2_corpus_models.py`;
-- `inventory_from_manifest_row` from `corpus_manifest.py`;
-- `resolve_verified_cache_body` from `corpus_cache.py`.
+- `manifest_row_view_from_row` and `inventory_from_manifest_row` from
+  `corpus_manifest.py`;
+- `resolve_verified_cache_body` from `corpus_cache.py`;
+- `resolve_inventory_object_key` and `ResolvedObjectKey` from
+  `inventory_object_keys.py`.
 
-No `manifest_inventory.py`, private HPA-322 refactor, parallel source-object type, or
+`ManifestRowView` supplies inventory, provenance, cache profile, endpoint, bucket, and
+discovery identity in one validated read. HPA-323 must not parse those fields again.
+
+No `manifest_inventory.py`, parallel source-object type, private path resolver, or
 hand-rolled filesystem verifier belongs in HPA-323.
-
-`resolve_verified_cache_body` is a thin adapter over existing
-`validate_cached_body`, including its no-follow and directory-binding verification.
 
 ### 3. BGM and source-audio resolution
 
-`reference_timing.py` receives a parsed chart, timing map, selected chart key, object
-prefix, and `tuple[RemoteObject, ...]`.
+`reference_timing.py` receives a parsed chart, timing map, selected chart key,
+`ManifestRowView`, and the policy frozen by the measurement gate.
 
 For each BGM event it:
 
 1. resolves `note_id` through `chart.wav_table`;
-2. normalizes Windows separators;
-3. rejects empty, absolute, drive-prefixed, or escaping paths;
-4. resolves relative to the selected chart object directory;
-5. tries exact object-key match;
-6. otherwise allows one unique case-insensitive match;
-7. only after a relative miss, optionally tries the simfile root;
-8. returns the exact inventory `RemoteObject`.
+2. calls `resolve_inventory_object_key` relative to the selected chart directory;
+3. maps `invalid_path`, `ambiguous`, and `missing` to HPA-323 reason codes;
+4. when the measured policy retains root fallback and the relative result is
+   `missing`, calls the same helper with the simfile-root directory;
+5. returns the exact `RemoteObject` supplied by the shared resolver.
 
-The preflight measurement determines whether case-insensitive/root fallback remains in
-the final policy and whether multiple discrete groups quarantine.
+HPA-323 does not normalize separators, walk `..`, check prefix containment, search
+exact keys, or build casefold indexes itself. Those semantics are frozen by HPA-322.
 
-No filename, duration, or arbitrary alphabetical heuristic selects the source audio.
+The preflight measurement determines whether the second root lookup remains and
+whether multiple discrete groups quarantine. No filename, duration, or alphabetical
+heuristic selects source audio.
 
 ### 4. Exact-key cache fill
 
@@ -226,8 +236,6 @@ First pass:
 After cache fill, call `resolve_verified_cache_body` only for rows whose inventory was
 replaced by the merge. Already verified rows are not hashed a second time.
 
-This preserves cache integrity without doubling full-file hashing on offline reruns.
-
 ### 6. Audio metadata and native events
 
 Use `soundfile.info` to record duration, sample rate, channels, and frames. A zero-frame
@@ -252,12 +260,13 @@ both clocks.
 
 `reference_timing_manifest.py`:
 
-1. reads exact HPA-322 bytes and validates source identity;
-2. reconstructs inventories with the HPA-322 reader;
-3. preserves upstream quarantines;
+1. reads exact HPA-322 bytes and validates source identity through
+   `manifest_row_view_from_row`;
+2. preserves upstream quarantines;
+3. verifies and parses selected charts;
 4. maps chart parse failures to `selected_chart_parse_failed`;
 5. maps timing construction failures to `timing_map_invalid`;
-6. resolves/queues audio as described above;
+6. resolves/queues audio through the shared object-key contract;
 7. performs targeted cache fill only when needed;
 8. inspects audio and publishes native events;
 9. publishes the derived manifest through existing canonical helpers.
@@ -317,9 +326,9 @@ Row quarantines:
 - `timing_map_invalid`;
 - `bgm_event_missing`;
 - `unresolved_bgm_wav`;
-- `unsafe_bgm_audio_path`;
-- `source_audio_missing`;
-- `source_audio_key_ambiguous`;
+- `unsafe_bgm_audio_path` for shared resolver `invalid_path`;
+- `source_audio_missing` for shared resolver `missing`;
+- `source_audio_key_ambiguous` for shared resolver `ambiguous`;
 - `ambiguous_bgm_start` when retained by the measured policy;
 - `source_audio_download_failed`;
 - `source_audio_cache_invalid`;
@@ -333,6 +342,7 @@ Row quarantines:
 |---|---|
 | Incorrect DTX channel `02` semantics | Primary DTXMania source reference plus sticky/replacement fixtures |
 | BGM policy quarantines an unacceptable share | Pre-implementation corpus distribution report and sampled multi-group review |
+| HPA-323 forks object-key behavior | Tests call the HPA-322 resolver and contain no private normalization/matching helper |
 | Timing change breaks legacy consumers | Rename clock API and run the full repository suite in the timing task |
 | Existing cache is unnecessarily rehashed | Test complete-cache rows are verified once and never enter post-fill verification |
 | Targeted fill mutates unrelated objects | Compare non-selected object records before/after merge |
@@ -342,9 +352,9 @@ Row quarantines:
 
 ## Delivery Sequence
 
-0. Measure real BGM group/fallback distribution and freeze the policy.
+0. Measure real BGM group/fallback distribution using the shared resolver and freeze the policy.
 1. Add typed BGM events, sticky timing, and explicit clock names; run the full suite.
-2. Implement pure BGM resolution using HPA-322 domain/cache contracts.
+2. Implement BGM policy by mapping shared resolver outcomes, not by reimplementing key resolution.
 3. Add exact-key audio cache fill.
 4. Add metadata, bounds, and immutable native events.
 5. Add one-verification orchestration and derived manifest publication.
