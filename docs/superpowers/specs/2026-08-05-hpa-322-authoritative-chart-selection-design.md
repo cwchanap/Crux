@@ -22,15 +22,19 @@ that HPA-323 immediately reuses.
 
 - Read HPA-321 rows without inventing a parallel inventory model.
 - Preserve provenance and source identity while reconstructing `SimfileInventory`.
-- Reuse `validate_cached_body`; do not add a second filesystem verifier.
+- Reuse existing timestamp, cache-path, and cache-body validators rather than
+  duplicating them.
 - Resolve inventory object keys through one shared pure helper used by HPA-322 and
   HPA-323.
+- Derive chart/set.def candidates from the HPA-321 cache-profile predicates.
 - Select the highest populated and resolvable authored slot, evaluating L5 through L1.
 - Support root and nested `set.def` files, relative references, and a documented
   simfile-root compatibility fallback.
 - Treat `.dtx` and `.txt` as chart candidates consistently with HPA-321.
 - Parse common DTXMania encodings and retain `#DLEVEL`, title, and artist.
 - Support explicit version-controlled overrides.
+- Require evidence of non-control note data before unauthored fallback selection.
+- Share one filename rank with the legacy local-folder selector.
 - Quarantine ambiguity or unusable source files instead of guessing.
 - Publish a closed, deterministic `crux.reference-chart-manifest/v1` contract.
 - Keep the stage offline and sequential.
@@ -42,7 +46,8 @@ that HPA-323 immediately reuses.
 - Downloading missing files or contacting R2.
 - Repairing malformed authored files.
 - Adding a database, service, workflow framework, plugin system, or concurrency.
-- Unifying the legacy local-folder `_select_chart` path.
+- Rewriting the legacy local-folder `_select_chart` path around `set.def`; it remains
+  filename-only, but it shares the same filename rank table used by HPA-322 fallback.
 - Backward-compatibility readers or schema migrations.
 
 ## Operator Interface
@@ -68,10 +73,11 @@ The command performs no network access and emits one canonical JSON summary.
 
 Exit codes are exact:
 
-- `0`: a manifest was published and every non-empty input row is selected;
-- `1`: a manifest was published with one or more quarantined rows, including when all
-  input rows are quarantined;
-- `2`: the input has zero rows, loading/schema validation fails, or publication fails.
+- `0`: a manifest was published and every input row is selected;
+- `1`: a manifest was published with one or more quarantined rows, including an empty
+  simfile row and including when all input rows are quarantined;
+- `2`: the input JSONL has zero records, loading/schema validation fails, or publication
+  fails.
 
 ## Shared Manifest, Cache, and Key Contracts
 
@@ -84,6 +90,8 @@ def parse_manifest_timestamp(value: object) -> datetime: ...
 ```
 
 It accepts only the UTC forms emitted by HPA-321 and returns an aware UTC `datetime`.
+The existing `_is_canonical_utc_timestamp` in `corpus_cache.py` becomes a `try`/`except`
+wrapper around this public parser, so timestamp acceptance has one implementation.
 
 ### Typed HPA-321 row view
 
@@ -149,8 +157,9 @@ The adapter requires:
 
 - `remote.cache_status == "verified"`;
 - a lowercase 64-character SHA-256;
-- `remote.cache_path == f"sha256/{digest[:2]}/{digest}"`;
-- equality with `expected_sha256` when supplied.
+- equality with `expected_sha256` when supplied;
+- a cache path accepted by the existing
+  `_validate_relative_cache_path(remote.cache_path, digest)` helper.
 
 It constructs:
 
@@ -168,11 +177,42 @@ CacheIndexEntry(
 )
 ```
 
-It then calls `validate_cached_body(cache_dir, entry)`. Every state other than
-`verified`, plus any missing/mismatched manifest field, raises
+It first delegates path validation to `_validate_relative_cache_path`, then calls
+`validate_cached_body(cache_dir, entry)`. Every state other than `verified`, plus any
+missing/mismatched manifest field, raises
 `ValueError("verified cache body unavailable")`. The function returns
 `cache_dir / entry.cache_path` and never calls `Path.resolve` or implements another
 hashing path.
+
+### Cache-profile key predicates
+
+Split the current `is_selected` rule in `src/benchmark/corpus_cache.py` without changing
+the `setdef_dtx_txt_v1` profile:
+
+```python
+def is_set_def_key(key: str) -> bool: ...
+def is_chart_key(key: str) -> bool: ...
+
+def is_selected(key: str) -> bool:
+    return is_set_def_key(key) or is_chart_key(key)
+```
+
+`is_set_def_key` owns the case-insensitive `set.def` basename rule.
+`is_chart_key` owns the case-insensitive `.dtx`/`.txt` suffix rule. HPA-322 imports
+these helpers instead of restating the profile.
+
+### Shared fallback filename rank
+
+Create `src/benchmark/chart_names.py`:
+
+```python
+CHART_FILENAME_PRIORITY = ("real", "full", "mas", "ext", "adv", "bas")
+```
+
+The legacy `prepare.py` filename-only selector imports this constant, and HPA-322 uses
+it only as the final tie-break among equal highest `#DLEVEL` fallback candidates.
+Authored `set.def` order still overrides filenames. This shares one rank table without
+porting the legacy selector into the R2 pipeline.
 
 ### Shared inventory object-key resolution
 
@@ -237,7 +277,9 @@ Decoding order is intentional:
 2. UTF-16 LE or BE BOM;
 3. plain UTF-8;
 4. CP932;
-5. Shift-JIS.
+5. Shift-JIS;
+6. BOM-less UTF-16LE;
+7. BOM-less UTF-16BE.
 
 Acceptance is not merely “a line begins with `#` or `*`”:
 
@@ -246,9 +288,9 @@ Acceptance is not merely “a line begins with `#` or `*`”:
 - `kind="set_def"` requires at least one case-insensitive
   `L1..L5` `LABEL` or `FILE` directive.
 
-Existing UTF-8, Shift-JIS, UTF-16, star-prefix, and malformed-file parser tests must
-retain their current outcomes. Add a CP932-only filename fixture so the new capability
-is deliberate rather than an untested codec-order change. Exceptions identify the
+Existing UTF-8, Shift-JIS, BOM-less UTF-16LE, star-prefix, and malformed-file parser
+tests must retain their current outcomes. Add CP932-only and BOM-less UTF-16BE fixtures
+so the extended order is deliberate and regression-locked. Exceptions identify the
 source name but never include body contents.
 
 `ParsedDtxChart` gains:
@@ -322,6 +364,12 @@ class LoadedOverrides:
     document_sha256: str
     by_simfile_id: Mapping[int, SelectionOverride]
 
+def load_selection_overrides(
+    path: Path | None,
+    *,
+    missing_ok: bool,
+) -> LoadedOverrides: ...
+
 @dataclass(frozen=True)
 class ChartSelection:
     status: SelectionStatus
@@ -355,6 +403,18 @@ Invariants:
 root, and `LoadedOverrides`. It owns only selection policy. Every source body is opened
 through `resolve_verified_cache_body`.
 
+### Source inventory gate
+
+Quarantine as `source_inventory_unusable` only when:
+
+- `inventory.sync_status == "empty"`; or
+- no inventory object has `cache_status == "verified"`.
+
+Otherwise selection proceeds even when the row is `partial`/`failed` or has unrelated
+`sync_errors`. Add warning `partial_inventory` whenever the status is not `complete` or
+`sync_errors` is non-empty. Per-object key resolution and cache verification decide
+whether the required `set.def` or chart is usable.
+
 ### Canonical `set.def`
 
 1. Prefer a root-level `set.def`.
@@ -375,7 +435,7 @@ Evaluate L5, L4, L3, L2, L1. For each populated `FILE` value:
 3. reject `invalid_path`;
 4. quarantine `ambiguous`;
 5. continue to the next slot only when both allowed lookups are `missing`;
-6. require a `.dtx` or `.txt` suffix, case-insensitively;
+6. require `is_chart_key(remote.key)`;
 7. verify and parse the existing chart;
 8. quarantine an existing chart that cannot be verified, decoded, or parsed.
 
@@ -383,20 +443,30 @@ Filenames such as `mas`, `real`, and `full` never define authored slot order.
 
 ### Overrides
 
+`load_selection_overrides` owns reading the configured file or the canonical empty
+document when `missing_ok=True`. It uses strict canonical JSON, validates canonical
+decimal `simfile_id` keys and exact entry fields, and hashes the exact bytes.
+
 The versioned override document maps a canonical decimal `simfile_id` to an exact chart
-key and non-empty reason. The exact key must identify a verified `.dtx` or `.txt`
-object. Invalid row-specific overrides quarantine and never fall back. The exact
-override bytes are hashed into every output row.
+key and non-empty reason. The exact key must identify a verified object accepted by
+`is_chart_key`. Invalid row-specific overrides quarantine and never fall back. The
+exact override bytes are hashed into every output row.
 
 ### Fallback
 
-When no usable `set.def` exists, candidates are verified objects whose key ends with
-`.dtx` or `.txt`, case-insensitively.
+When no usable `set.def` exists, candidates are verified objects accepted by
+`is_chart_key`.
 
-1. One parseable candidate wins as `single_candidate_fallback`.
+Unauthored fallback adds one evidence gate: a parsed candidate must contain at least one
+non-control note event (`any(event.lane_id != "01" for event in chart.events)`). Header-
+only, BPM-only, measure-length-only, and BGM-only files are not fallback candidates.
+This gate does not override an explicit `set.def` slot or manual override and does
+not replace HPA-324's final playable-lane eligibility rules.
+
+1. One evidence-bearing candidate wins as `single_candidate_fallback`.
 2. Otherwise the unique highest numeric `#DLEVEL` wins as `dlevel_fallback`.
 3. At the same highest level, compare case-insensitive basenames without suffix using
-   the narrow rank `real > full > mas`.
+   `CHART_FILENAME_PRIORITY = ("real", "full", "mas", "ext", "adv", "bas")`.
 4. Use `filename_tiebreak_fallback` only when that rank yields exactly one recognized
    winner.
 5. All remaining ties quarantine as `ambiguous_fallback`.
@@ -405,10 +475,18 @@ Alphabetical order is never a selection rule.
 
 ## Derived Manifest Contract
 
-`src/benchmark/reference_chart_manifest.py` reads exact source bytes once, calculates
+`src/benchmark/reference_chart_manifest.py` reads exact source bytes once, requires
+every physical JSONL line to end in one newline, and parses each line through
+`strict_json_loads(line[:-1], require_canonical=True)`. It calculates
 `source_manifest_sha256`, requires one non-empty HPA-321 schema/corpus version, rejects
-duplicate IDs, loads `ManifestRowView` values, applies selection, and publishes through
-`render_manifest`, `publish_manifest`, and `publish_latest_manifest`.
+duplicate IDs, validates each source mapping with `ManifestRowView`, applies selection,
+and publishes through `render_manifest`, `publish_manifest`, and
+`publish_latest_manifest`.
+
+Derived row construction starts from the validated source row mapping verbatim, removes
+only its source `corpus_version`, replaces `schema_version`, and appends the closed
+selection fields. The typed reconstruction remains a validation/test seam; it is not
+used to reserialize upstream values.
 
 Output schema: `crux.reference-chart-manifest/v1`.
 
@@ -461,17 +539,17 @@ Every row also contains this exact selection field set:
 Selected example:
 
 ```json
-{"artist":"Example Artist","cache_profile":"setdef_dtx_txt_v1","corpus_version":"sha256:5cfad8e9a015fbfa0dd3e89b8a54f0ee42fd17a5bfa212f5bbcf9d98f5b126cc","dlevel_normalized":99,"dlevel_raw":"99","object_prefix":"42/","objects":[{"cache_path":"sha256/bb/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","cache_status":"verified","content_type":"text/plain","etag":"setdef-etag","etag_is_weak":false,"key":"42/set.def","last_modified":"2026-08-05T00:00:00Z","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":80,"version":null},{"cache_path":"sha256/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","cache_status":"verified","content_type":"text/plain","etag":"chart-etag","etag_is_weak":false,"key":"42/real.dtx","last_modified":"2026-08-05T00:00:01Z","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":123,"version":null}],"override_document_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","provenance_notes":null,"redistribution_allowed":null,"rights_status":"unknown","schema_version":"crux.reference-chart-manifest/v1","selected_chart_cache_path":"sha256/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","selected_chart_content_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","selected_chart_key":"42/real.dtx","selected_level_label":"REAL","selected_level_slot":"L5","selection_method":"set_def_slot","selection_override":null,"selection_reason_codes":[],"selection_status":"selected","selection_warnings":[],"set_def_content_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","set_def_key":"42/set.def","simfile_id":42,"source_author_or_pack":null,"source_bucket":"simfile-dtx","source_corpus_version":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","source_discovery_method":"r2_list_objects_v2","source_endpoint_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","source_manifest_sha256":"9999999999999999999999999999999999999999999999999999999999999999","source_origin":null,"source_reference":null,"sync_errors":[],"sync_status":"complete","title":"Example Song"}
+{"artist":"Example Artist","cache_profile":"setdef_dtx_txt_v1","corpus_version":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","dlevel_normalized":99,"dlevel_raw":"99","object_prefix":"42/","objects":[{"cache_path":"sha256/bb/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","cache_status":"verified","content_type":"text/plain","etag":"setdef-etag","etag_is_weak":false,"key":"42/set.def","last_modified":"2026-08-05T00:00:00Z","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":80,"version":null},{"cache_path":"sha256/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","cache_status":"verified","content_type":"text/plain","etag":"chart-etag","etag_is_weak":false,"key":"42/real.dtx","last_modified":"2026-08-05T00:00:01Z","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":123,"version":null}],"override_document_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","provenance_notes":null,"redistribution_allowed":null,"rights_status":"unknown","schema_version":"crux.reference-chart-manifest/v1","selected_chart_cache_path":"sha256/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","selected_chart_content_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","selected_chart_key":"42/real.dtx","selected_level_label":"REAL","selected_level_slot":"L5","selection_method":"set_def_slot","selection_override":null,"selection_reason_codes":[],"selection_status":"selected","selection_warnings":[],"set_def_content_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","set_def_key":"42/set.def","simfile_id":42,"source_author_or_pack":null,"source_bucket":"simfile-dtx","source_corpus_version":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","source_discovery_method":"r2_list_objects_v2","source_endpoint_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","source_manifest_sha256":"9999999999999999999999999999999999999999999999999999999999999999","source_origin":null,"source_reference":null,"sync_errors":[],"sync_status":"complete","title":"Example Song"}
 ```
 
 Quarantined example:
 
 ```json
-{"artist":null,"cache_profile":"setdef_dtx_txt_v1","corpus_version":"sha256:5cfad8e9a015fbfa0dd3e89b8a54f0ee42fd17a5bfa212f5bbcf9d98f5b126cc","dlevel_normalized":null,"dlevel_raw":null,"object_prefix":"43/","objects":[{"cache_path":"sha256/11/1111111111111111111111111111111111111111111111111111111111111111","cache_status":"verified","content_type":"text/plain","etag":"root-etag","etag_is_weak":false,"key":"43/set.def","last_modified":"2026-08-05T00:00:00Z","sha256":"1111111111111111111111111111111111111111111111111111111111111111","size":70,"version":null},{"cache_path":"sha256/22/2222222222222222222222222222222222222222222222222222222222222222","cache_status":"verified","content_type":"text/plain","etag":"other-etag","etag_is_weak":false,"key":"43/SET.DEF","last_modified":"2026-08-05T00:00:01Z","sha256":"2222222222222222222222222222222222222222222222222222222222222222","size":75,"version":null}],"override_document_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","provenance_notes":null,"redistribution_allowed":null,"rights_status":"unknown","schema_version":"crux.reference-chart-manifest/v1","selected_chart_cache_path":null,"selected_chart_content_hash":null,"selected_chart_key":null,"selected_level_label":null,"selected_level_slot":null,"selection_method":null,"selection_override":null,"selection_reason_codes":["ambiguous_set_def"],"selection_status":"quarantined","selection_warnings":[],"set_def_content_hash":null,"set_def_key":null,"simfile_id":43,"source_author_or_pack":null,"source_bucket":"simfile-dtx","source_corpus_version":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","source_discovery_method":"r2_list_objects_v2","source_endpoint_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","source_manifest_sha256":"9999999999999999999999999999999999999999999999999999999999999999","source_origin":null,"source_reference":null,"sync_errors":[],"sync_status":"complete","title":null}
+{"artist":null,"cache_profile":"setdef_dtx_txt_v1","corpus_version":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","dlevel_normalized":null,"dlevel_raw":null,"object_prefix":"43/","objects":[],"override_document_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","provenance_notes":null,"redistribution_allowed":null,"rights_status":"unknown","schema_version":"crux.reference-chart-manifest/v1","selected_chart_cache_path":null,"selected_chart_content_hash":null,"selected_chart_key":null,"selected_level_label":null,"selected_level_slot":null,"selection_method":null,"selection_override":null,"selection_reason_codes":["source_inventory_unusable"],"selection_status":"quarantined","selection_warnings":[],"set_def_content_hash":null,"set_def_key":null,"simfile_id":43,"source_author_or_pack":null,"source_bucket":"simfile-dtx","source_corpus_version":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","source_discovery_method":"r2_list_objects_v2","source_endpoint_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","source_manifest_sha256":"9999999999999999999999999999999999999999999999999999999999999999","source_origin":null,"source_reference":null,"sync_errors":[],"sync_status":"empty","title":null}
 ```
 
 Add one two-row canonical JSONL golden at
-`tests/benchmark/schema_goldens/reference-chart-manifest.jsonl`, register
+`tests/benchmark/schema_goldens/crux.reference-chart-manifest-v1.jsonl`, register
 `crux.reference-chart-manifest/v1` in the existing golden manifest, and expose
 `validate_schema_golden` from `reference_chart_manifest.py`. Structural mutation tests
 must reject removed, added, duplicate, and mistyped fields.
@@ -492,12 +570,17 @@ discards successful rows.
 
 Tests cover:
 
-- timestamp format/parse round trips;
-- HPA-321 row-view reconstruction and truthful object-error behavior;
-- hardened cache verification and exact `CacheIndexEntry` construction;
+- timestamp format/parse round trips and reuse by `_is_canonical_utc_timestamp`;
+- HPA-321 row-view reconstruction, truthful object-error behavior, and verbatim base-row
+  pass-through;
+- hardened cache verification using `_validate_relative_cache_path` and exact
+  `CacheIndexEntry` construction;
+- composed `is_set_def_key`/`is_chart_key` cache-profile predicates;
 - shared object-key normalization, containment, exact, casefold, missing, and ambiguity;
-- DTX/set.def codec predicates and existing parser regression fixtures;
-- `.dtx` and `.txt` authored slots, overrides, and fallback;
+- DTX/set.def codec predicates, BOM-less UTF-16, and existing parser regressions;
+- shared filename-rank parity between `prepare.py` and fallback selection;
+- `.dtx` and `.txt` authored slots, override loading, inventory gating, and evidence-
+  bearing fallback;
 - closed selected/quarantined schema goldens;
 - deterministic immutable publication;
 - byte-identical output and identical derived identity on a second run;
@@ -513,8 +596,9 @@ enabled Pylint command.
 
 | Risk | Required proof |
 |---|---|
-| A wrong chart is selected silently | Authored-slot, containment, casefold, fallback, and quarantine fixtures |
-| Decoder extraction changes chart identity | Existing decoder suite plus CP932-only and set.def predicate fixtures |
+| A wrong chart is selected silently | Authored-slot, containment, casefold, evidence, fallback, and quarantine fixtures |
+| Legacy and R2 filename ranks diverge | One shared rank constant and parity fixtures |
+| Decoder extraction changes chart identity | Existing decoder suite plus CP932, BOM-less UTF-16, and set.def predicate fixtures |
 | HPA-323 forks the row or key contract | HPA-323 imports the HPA-322 row view, verifier, and object-key resolver |
 | Derived schema drifts between stages | Closed field set, two-row schema golden, and structural mutation tests |
 | A rerun changes identity without input changes | Byte-identical two-run acceptance assertion |
@@ -522,11 +606,13 @@ enabled Pylint command.
 
 ## Delivery Sequence
 
-1. Establish shared timestamp, typed row-view, cache-body, and object-key contracts.
+1. Establish shared timestamp, typed row-view, cache-body, profile-key, and object-key
+   contracts.
 2. Extract shared DTXMania decoding and retain DLEVEL metadata.
 3. Add the focused five-slot `set.def` parser.
-4. Implement selection and overrides against reconstructed inventories.
-5. Freeze the row schema, publish the derived manifest, and wire the CLI acceptance
-   path.
+4. Implement inventory gating, override loading, authored selection, and evidence-bearing
+   fallback with the shared filename rank.
+5. Freeze the row schema and publish the derived manifest.
+6. Wire the CLI and offline acceptance path.
 
 HPA-323 consumes these merged contracts and does not reimplement them.
