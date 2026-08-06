@@ -20,6 +20,10 @@ from src.benchmark.corpus_cache import (
     CacheIndexStore,
     _open_regular_file_at,
     cache_writer_lock,
+    is_chart_key,
+    is_selected,
+    is_set_def_key,
+    resolve_verified_cache_body,
     sync_cache,
 )
 from src.benchmark.r2_corpus_models import (
@@ -259,6 +263,130 @@ def write_index(tmp_path: Path, entries: list[dict[str, object]]) -> None:
         json.dumps({"schema_version": "crux.r2-cache-index/v1", "entries": entries}),
         encoding="utf-8",
     )
+
+
+def cached_remote(body: bytes = b"chart") -> RemoteObject:
+    digest = sha256(body).hexdigest()
+    return replace(
+        remote_object(size=len(body)),
+        cache_status="verified",
+        sha256=digest,
+        cache_path=f"sha256/{digest[:2]}/{digest}",
+    )
+
+
+def install_cached_body(cache_dir: Path, body: bytes = b"chart") -> Path:
+    digest = sha256(body).hexdigest()
+    path = cache_dir / "sha256" / digest[:2] / digest
+    path.parent.mkdir(parents=True)
+    path.write_bytes(body)
+    return path
+
+
+def assert_verified_body_unavailable(
+    cache_dir: Path,
+    remote: RemoteObject,
+    *,
+    expected_sha256: str | None = None,
+) -> None:
+    with pytest.raises(ValueError) as raised:
+        resolve_verified_cache_body(
+            cache_dir,
+            remote,
+            source_endpoint_sha256="f" * 64,
+            bucket="simfile-dtx",
+            expected_sha256=expected_sha256,
+        )
+    assert str(raised.value) == "verified cache body unavailable"
+
+
+def test_resolve_verified_cache_body_returns_a_verified_content_address(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    body = b"chart"
+    digest = sha256(body).hexdigest()
+    remote = cached_remote(body)
+    expected = install_cached_body(cache_dir, body)
+
+    assert expected == cache_dir / "sha256" / digest[:2] / digest
+    assert (
+        resolve_verified_cache_body(
+            cache_dir,
+            remote,
+            source_endpoint_sha256="f" * 64,
+            bucket="simfile-dtx",
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("cache_status", ["not_selected", "failed"])
+def test_resolve_verified_cache_body_rejects_nonverified_rows(
+    tmp_path: Path, cache_status: str
+) -> None:
+    remote = replace(cached_remote(), cache_status=cache_status)
+
+    assert_verified_body_unavailable(tmp_path / "cache", remote)
+
+
+@pytest.mark.parametrize("digest", [None, 1, "A" * 64, "a" * 63])
+def test_resolve_verified_cache_body_rejects_missing_or_malformed_digests(
+    tmp_path: Path, digest: object
+) -> None:
+    remote = replace(cached_remote(), sha256=digest)
+
+    assert_verified_body_unavailable(tmp_path / "cache", remote)
+
+
+def test_resolve_verified_cache_body_rejects_missing_cache_path(tmp_path: Path) -> None:
+    remote = replace(cached_remote(), cache_path=None)
+
+    assert_verified_body_unavailable(tmp_path / "cache", remote)
+
+
+def test_resolve_verified_cache_body_rejects_noncanonical_cache_path(tmp_path: Path) -> None:
+    remote = replace(cached_remote(), cache_path="sha256/incorrect/body")
+
+    assert_verified_body_unavailable(tmp_path / "cache", remote)
+
+
+def test_resolve_verified_cache_body_rejects_unexpected_digest(tmp_path: Path) -> None:
+    remote = cached_remote()
+    install_cached_body(tmp_path / "cache")
+
+    assert_verified_body_unavailable(tmp_path / "cache", remote, expected_sha256="f" * 64)
+
+
+@pytest.mark.parametrize("state", ["missing", "unreadable", "size_mismatch", "sha256_mismatch"])
+def test_resolve_verified_cache_body_rejects_unavailable_or_corrupt_content(
+    tmp_path: Path, state: str
+) -> None:
+    cache_dir = tmp_path / "cache"
+    remote = cached_remote()
+    expected = cache_dir / "sha256" / remote.sha256[:2] / remote.sha256
+    if state == "missing":
+        cache_dir.mkdir()
+    elif state == "unreadable":
+        cache_dir.mkdir()
+        (cache_dir / "sha256").write_bytes(b"not a directory")
+    elif state == "size_mismatch":
+        expected.parent.mkdir(parents=True)
+        expected.write_bytes(b"x")
+    elif state == "sha256_mismatch":
+        expected.parent.mkdir(parents=True)
+        expected.write_bytes(b"wrong")
+    else:
+        raise AssertionError(f"unknown state: {state}")
+
+    assert_verified_body_unavailable(cache_dir, remote)
+
+
+def test_is_set_def_key_and_is_chart_key_preserve_setdef_dtx_txt_v1() -> None:
+    assert is_set_def_key("42/SET.DEF")
+    assert is_chart_key("42/mas.DTX")
+    assert is_chart_key("42/readme.TXT")
+    assert is_selected("42/set.def")
+    assert is_selected("42/mas.dtx")
+    assert not is_selected("42/bgm.ogg")
 
 
 def test_index_checkpoint_is_canonical_and_restart_readable(tmp_path: Path) -> None:

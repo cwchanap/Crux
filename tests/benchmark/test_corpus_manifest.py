@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
@@ -15,6 +16,8 @@ from src.benchmark.corpus_manifest import (
     ManifestPublicationError,
     build_manifest_rows,
     canonical_json_line,
+    inventory_from_manifest_row,
+    manifest_row_view_from_row,
     publish_latest_manifest,
     publish_manifest,
     render_manifest,
@@ -100,6 +103,27 @@ def render_for_action(action: CacheActionName) -> RenderedManifest:
         "simfile-dtx",
     )
     return render_manifest(rows)
+
+
+def hpa_321_row() -> tuple[dict[str, object], SimfileInventory, ProvenanceRecord, str]:
+    source = make_simfile(status="partial", error_code="object_head_failed")
+    provenance = ProvenanceRecord(
+        source_origin="Example archive",
+        source_author_or_pack="Author",
+        source_reference="https://example.invalid/source",
+        rights_status="verified",
+        redistribution_allowed=True,
+        provenance_notes="Verified against the archive index.",
+    )
+    endpoint_hash = "f" * 64
+    (base_row,) = build_manifest_rows(
+        (source,),
+        {source.simfile_id: provenance},
+        endpoint_hash,
+        "simfile-dtx",
+    )
+    (row,) = render_manifest((base_row,)).rows
+    return row, source, provenance, endpoint_hash
 
 
 def test_canonical_json_line_uses_sorted_compact_utf8_with_one_newline() -> None:
@@ -297,6 +321,183 @@ def test_manifest_row_and_object_have_only_durable_contract_fields() -> None:
     assert forbidden.isdisjoint(row)
     assert forbidden.isdisjoint(row["objects"][0])
     assert "corpus_version" not in row
+
+
+def test_manifest_row_view_reconstructs_the_hpa_321_contract() -> None:
+    row, source, provenance, endpoint_hash = hpa_321_row()
+
+    view = manifest_row_view_from_row(row)
+
+    assert view.inventory.simfile_id == source.simfile_id
+    assert view.inventory.object_prefix == source.object_prefix
+    assert view.inventory.sync_status == source.sync_status
+    assert view.inventory.sync_errors == source.sync_errors
+    assert all(remote.errors == () for remote in view.inventory.objects)
+    assert view.provenance == provenance
+    assert view.corpus_version == row["corpus_version"]
+    assert view.cache_profile == "setdef_dtx_txt_v1"
+    assert view.source_endpoint_sha256 == endpoint_hash
+    assert view.source_bucket == "simfile-dtx"
+    assert view.source_discovery_method == "r2_list_objects_v2"
+    assert inventory_from_manifest_row(row) == view.inventory
+
+    rebuilt = build_manifest_rows(
+        (view.inventory,),
+        {view.inventory.simfile_id: view.provenance},
+        view.source_endpoint_sha256,
+        view.source_bucket,
+    )[0]
+    expected = {key: value for key, value in row.items() if key != "corpus_version"}
+
+    assert rebuilt == expected
+
+
+@pytest.mark.parametrize("extra", [False, True])
+def test_manifest_row_view_rejects_nonexact_row_field_set(extra: bool) -> None:
+    row, _, _, _ = hpa_321_row()
+    invalid = deepcopy(row)
+    if extra:
+        invalid["unexpected"] = "field"
+    else:
+        invalid.pop("cache_profile")
+
+    with pytest.raises(ValueError):
+        manifest_row_view_from_row(invalid)
+
+
+@pytest.mark.parametrize("extra", [False, True])
+def test_manifest_row_view_rejects_nonexact_object_field_set(extra: bool) -> None:
+    row, _, _, _ = hpa_321_row()
+    invalid = deepcopy(row)
+    objects = invalid["objects"]
+    assert isinstance(objects, list)
+    first = objects[0]
+    assert isinstance(first, dict)
+    if extra:
+        first["unexpected"] = "field"
+    else:
+        first.pop("cache_path")
+
+    with pytest.raises(ValueError):
+        manifest_row_view_from_row(invalid)
+
+
+def test_manifest_row_view_rejects_duplicate_object_keys() -> None:
+    row, _, _, _ = hpa_321_row()
+    invalid = deepcopy(row)
+    objects = invalid["objects"]
+    assert isinstance(objects, list)
+    objects.append(deepcopy(objects[0]))
+
+    with pytest.raises(ValueError):
+        manifest_row_view_from_row(invalid)
+
+
+@pytest.mark.parametrize(
+    ("location", "value"),
+    [
+        ("schema_version", "crux.r2-corpus-manifest/v2"),
+        ("cache_profile", "different_profile"),
+        ("source_discovery_method", "listing"),
+        ("sync_status", "unknown"),
+        ("object.cache_status", "cached"),
+        ("error.scope", "unknown"),
+        ("error.code", "unknown"),
+    ],
+)
+def test_manifest_row_view_rejects_invalid_serialized_enums(location: str, value: str) -> None:
+    row, _, _, _ = hpa_321_row()
+    invalid = deepcopy(row)
+    if location.startswith("object."):
+        objects = invalid["objects"]
+        assert isinstance(objects, list)
+        object_field = location.removeprefix("object.")
+        assert isinstance(objects[0], dict)
+        objects[0][object_field] = value
+    elif location.startswith("error."):
+        errors = invalid["sync_errors"]
+        assert isinstance(errors, list)
+        error_field = location.removeprefix("error.")
+        assert isinstance(errors[0], dict)
+        errors[0][error_field] = value
+    else:
+        invalid[location] = value
+
+    with pytest.raises(ValueError):
+        manifest_row_view_from_row(invalid)
+
+
+@pytest.mark.parametrize("value", [42.0, True, "42"])
+def test_manifest_row_view_rejects_noninteger_simfile_ids(value: object) -> None:
+    row, _, _, _ = hpa_321_row()
+    invalid = deepcopy(row)
+    invalid["simfile_id"] = value
+
+    with pytest.raises(ValueError):
+        manifest_row_view_from_row(invalid)
+
+
+@pytest.mark.parametrize(
+    ("location", "value"),
+    [
+        ("source_endpoint_sha256", "F" * 64),
+        ("object.sha256", "c" * 63),
+        ("corpus_version", "sha256:" + "C" * 64),
+    ],
+)
+def test_manifest_row_view_rejects_invalid_hashes(location: str, value: str) -> None:
+    row, _, _, _ = hpa_321_row()
+    invalid = deepcopy(row)
+    if location == "object.sha256":
+        objects = invalid["objects"]
+        assert isinstance(objects, list)
+        assert isinstance(objects[0], dict)
+        objects[0]["sha256"] = value
+    else:
+        invalid[location] = value
+
+    with pytest.raises(ValueError):
+        manifest_row_view_from_row(invalid)
+
+
+def test_manifest_row_view_rejects_malformed_object_timestamps() -> None:
+    row, _, _, _ = hpa_321_row()
+    invalid = deepcopy(row)
+    objects = invalid["objects"]
+    assert isinstance(objects, list)
+    assert isinstance(objects[0], dict)
+    objects[0]["last_modified"] = "2026-02-30T01:02:03Z"
+
+    with pytest.raises(ValueError):
+        manifest_row_view_from_row(invalid)
+
+
+def test_manifest_row_view_rejects_error_references_to_unknown_objects() -> None:
+    row, _, _, _ = hpa_321_row()
+    invalid = deepcopy(row)
+    errors = invalid["sync_errors"]
+    assert isinstance(errors, list)
+    assert isinstance(errors[0], dict)
+    errors[0]["object_key"] = "2/missing.dtx"
+
+    with pytest.raises(ValueError):
+        manifest_row_view_from_row(invalid)
+
+
+def test_manifest_row_view_preserves_hpa_321_empty_prefix_errors() -> None:
+    source = SimfileInventory(
+        2,
+        "2/",
+        (),
+        "empty",
+        (SyncError("simfile", "empty_prefix", "No objects were listed.", "2/"),),
+    )
+    (base_row,) = build_manifest_rows((source,), {}, "a" * 64, "simfile-dtx")
+    (row,) = render_manifest((base_row,)).rows
+
+    view = manifest_row_view_from_row(row)
+
+    assert view.inventory == source
 
 
 def test_build_manifest_rows_rejects_a_raw_endpoint_in_place_of_its_sha256() -> None:
