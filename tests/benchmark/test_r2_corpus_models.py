@@ -13,6 +13,7 @@ from src.benchmark.r2_corpus_models import (
     format_manifest_timestamp,
     format_report_filename_timestamp,
     parse_etag,
+    parse_manifest_timestamp,
 )
 
 
@@ -141,6 +142,38 @@ def test_manifest_timestamp_rejects_naive_values_instead_of_using_host_timezone(
 
     with pytest.raises(ValueError, match="timezone-aware"):
         format_manifest_timestamp(naive)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+        datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=timezone.utc),
+    ],
+)
+def test_manifest_timestamp_round_trip(value: datetime) -> None:
+    assert parse_manifest_timestamp(format_manifest_timestamp(value)) == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        1,
+        datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+        "2026-01-02T03:04:05+00:00",
+        "2026-01-02T03:04:05+01:00",
+        "2026-01-02T03:04:05",
+        "2026-02-30T03:04:05Z",
+        "2026-01-02T03:04:05.Z",
+        "2026-01-02T03:04:05.1234567Z",
+        " 2026-01-02T03:04:05Z",
+        "2026-01-02T03:04:05Z ",
+    ],
+)
+def test_parse_manifest_timestamp_rejects_noncanonical_values(value: object) -> None:
+    with pytest.raises(ValueError):
+        parse_manifest_timestamp(value)
 
 
 def test_report_filename_timestamp_rejects_naive_values_instead_of_using_host_timezone():

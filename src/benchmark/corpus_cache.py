@@ -7,7 +7,6 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
 from errno import EAGAIN, ENOSYS, ENOTSUP, EOPNOTSUPP, EWOULDBLOCK
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -25,6 +24,7 @@ from src.benchmark.r2_corpus_models import (
     SimfileInventory,
     SyncError,
     format_manifest_timestamp,
+    parse_manifest_timestamp,
 )
 from src.benchmark.r2_inventory import R2ObjectStore, R2StoreError
 
@@ -204,10 +204,16 @@ class CacheIndexStore:
             raise
 
 
+def is_set_def_key(key: str) -> bool:
+    return key.rsplit("/", 1)[-1].lower() == "set.def"
+
+
+def is_chart_key(key: str) -> bool:
+    return key.lower().endswith((".dtx", ".txt"))
+
+
 def is_selected(key: str) -> bool:
-    basename = key.rsplit("/", 1)[-1].lower()
-    lowered = key.lower()
-    return basename == "set.def" or lowered.endswith((".dtx", ".txt"))
+    return is_set_def_key(key) or is_chart_key(key)
 
 
 def validate_cached_body(
@@ -242,6 +248,46 @@ def validate_cached_body(
     if digest != entry.sha256:
         return CacheValidation("sha256_mismatch", entry)
     return CacheValidation("verified", entry)
+
+
+def resolve_verified_cache_body(
+    cache_dir: Path,
+    remote: RemoteObject,
+    *,
+    source_endpoint_sha256: str,
+    bucket: str,
+    expected_sha256: str | None = None,
+) -> Path:
+    digest = remote.sha256
+    if (
+        remote.cache_status != "verified"
+        or not isinstance(digest, str)
+        or not _is_lower_hex_sha256(digest)
+    ):
+        raise ValueError("verified cache body unavailable")
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise ValueError("verified cache body unavailable")
+    if remote.cache_path is None:
+        raise ValueError("verified cache body unavailable")
+    try:
+        _validate_relative_cache_path(remote.cache_path, digest)
+        entry = CacheIndexEntry(
+            source_endpoint_sha256=source_endpoint_sha256,
+            bucket=bucket,
+            key=remote.key,
+            etag=remote.etag,
+            etag_is_weak=remote.etag_is_weak,
+            size=remote.size,
+            last_modified=format_manifest_timestamp(remote.last_modified),
+            sha256=digest,
+            cache_path=f"sha256/{digest[:2]}/{digest}",
+        )
+        validation = validate_cached_body(cache_dir, entry)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("verified cache body unavailable") from None
+    if validation.state != "verified":
+        raise ValueError("verified cache body unavailable")
+    return cache_dir / entry.cache_path
 
 
 def sync_cache(
@@ -1163,13 +1209,11 @@ def _is_utf8_encodable(value: str) -> bool:
 
 
 def _is_canonical_utc_timestamp(value: str) -> bool:
-    if not value.endswith("Z"):
-        return False
     try:
-        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+        parse_manifest_timestamp(value)
     except ValueError:
         return False
-    return parsed.tzinfo == timezone.utc and format_manifest_timestamp(parsed) == value
+    return True
 
 
 def _validate_relative_cache_path(cache_path: str, sha256: str) -> None:

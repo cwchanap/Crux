@@ -6,9 +6,10 @@ import logging
 import os
 import stat
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 from uuid import uuid4
 
 from src.benchmark.corpus_provenance import provenance_for
@@ -16,6 +17,10 @@ from src.benchmark.durability import ensure_durable_directory, fsync_directory
 from src.benchmark.r2_corpus_models import (
     CACHE_PROFILE,
     MANIFEST_SCHEMA,
+    MAX_SIMFILE_ID,
+    CacheStatus,
+    ErrorCode,
+    ErrorScope,
     ProvenanceRecord,
     PublishedManifest,
     RemoteObject,
@@ -23,9 +28,51 @@ from src.benchmark.r2_corpus_models import (
     SimfileInventory,
     SyncError,
     format_manifest_timestamp,
+    parse_manifest_timestamp,
 )
 
 _LOWERCASE_HEX_DIGITS = frozenset("0123456789abcdef")
+_MANIFEST_ROW_FIELDS = frozenset(
+    {
+        "schema_version",
+        "cache_profile",
+        "corpus_version",
+        "simfile_id",
+        "object_prefix",
+        "source_endpoint_sha256",
+        "source_bucket",
+        "source_discovery_method",
+        "objects",
+        "sync_status",
+        "sync_errors",
+        "source_origin",
+        "source_author_or_pack",
+        "source_reference",
+        "rights_status",
+        "redistribution_allowed",
+        "provenance_notes",
+    }
+)
+_MANIFEST_OBJECT_FIELDS = frozenset(
+    {
+        "key",
+        "size",
+        "etag",
+        "etag_is_weak",
+        "version",
+        "last_modified",
+        "content_type",
+        "cache_status",
+        "sha256",
+        "cache_path",
+    }
+)
+_MANIFEST_ERROR_FIELDS = frozenset({"scope", "code", "object_key", "message"})
+_CACHE_STATUSES = frozenset(get_args(CacheStatus))
+_ERROR_CODES = frozenset(get_args(ErrorCode))
+_ERROR_SCOPES = frozenset(get_args(ErrorScope))
+_SIMFILE_STATUSES = frozenset({"complete", "partial", "failed", "empty"})
+_SOURCE_DISCOVERY_METHOD = "r2_list_objects_v2"
 _PUBLICATION_ERROR = SyncError(
     "artifact",
     "artifact_write_failed",
@@ -38,6 +85,228 @@ class ManifestPublicationError(Exception):
     def __init__(self, error: SyncError):
         super().__init__(error.code)
         self.error = error
+
+
+@dataclass(frozen=True)
+class ManifestRowView:
+    inventory: SimfileInventory
+    provenance: ProvenanceRecord
+    corpus_version: str
+    cache_profile: str
+    source_endpoint_sha256: str
+    source_bucket: str
+    source_discovery_method: str
+
+
+def manifest_row_view_from_row(row: Mapping[str, object]) -> ManifestRowView:
+    if not isinstance(row, Mapping) or set(row) != _MANIFEST_ROW_FIELDS:
+        raise ValueError("invalid HPA-321 manifest row")
+
+    corpus_version = _manifest_corpus_version(row["corpus_version"])
+    cache_profile = row["cache_profile"]
+    source_endpoint_sha256 = row["source_endpoint_sha256"]
+    source_bucket = row["source_bucket"]
+    source_discovery_method = row["source_discovery_method"]
+    simfile_id = row["simfile_id"]
+    object_prefix = row["object_prefix"]
+    sync_status = row["sync_status"]
+
+    if not all(
+        (
+            row["schema_version"] == MANIFEST_SCHEMA,
+            cache_profile == CACHE_PROFILE,
+            _is_lowercase_sha256(source_endpoint_sha256),
+            _is_nonempty_string(source_bucket),
+            source_discovery_method == _SOURCE_DISCOVERY_METHOD,
+            _is_simfile_id(simfile_id),
+            _is_nonempty_string(object_prefix),
+            _is_simfile_status(sync_status),
+        )
+    ):
+        raise ValueError("invalid HPA-321 manifest row")
+
+    objects = _manifest_objects_from_row(row["objects"], object_prefix)
+    object_keys = frozenset(remote.key for remote in objects)
+    sync_errors = _manifest_errors_from_row(row["sync_errors"], object_keys, object_prefix)
+    provenance = _manifest_provenance_from_row(row)
+    inventory = SimfileInventory(
+        simfile_id=simfile_id,
+        object_prefix=object_prefix,
+        objects=objects,
+        sync_status=sync_status,
+        sync_errors=sync_errors,
+    )
+    return ManifestRowView(
+        inventory=inventory,
+        provenance=provenance,
+        corpus_version=corpus_version,
+        cache_profile=cache_profile,
+        source_endpoint_sha256=source_endpoint_sha256,
+        source_bucket=source_bucket,
+        source_discovery_method=source_discovery_method,
+    )
+
+
+def inventory_from_manifest_row(row: Mapping[str, object]) -> SimfileInventory:
+    return manifest_row_view_from_row(row).inventory
+
+
+def _manifest_corpus_version(value: object) -> str:
+    if not isinstance(value, str) or not value.startswith("sha256:"):
+        raise ValueError("invalid HPA-321 manifest row")
+    if not _is_lowercase_sha256(value.removeprefix("sha256:")):
+        raise ValueError("invalid HPA-321 manifest row")
+    return value
+
+
+def _manifest_objects_from_row(value: object, object_prefix: str) -> tuple[RemoteObject, ...]:
+    if not isinstance(value, list):
+        raise ValueError("invalid HPA-321 manifest row")
+
+    objects: list[RemoteObject] = []
+    object_keys: set[str] = set()
+    for raw_object in value:
+        if not isinstance(raw_object, Mapping) or set(raw_object) != _MANIFEST_OBJECT_FIELDS:
+            raise ValueError("invalid HPA-321 manifest row")
+        key = raw_object["key"]
+        size = raw_object["size"]
+        etag = raw_object["etag"]
+        etag_is_weak = raw_object["etag_is_weak"]
+        last_modified = raw_object["last_modified"]
+        content_type = raw_object["content_type"]
+        cache_status = raw_object["cache_status"]
+        digest = raw_object["sha256"]
+        cache_path = raw_object["cache_path"]
+        if not all(
+            (
+                _is_nonempty_string(key),
+                key.startswith(object_prefix) if isinstance(key, str) else False,
+                key not in object_keys if isinstance(key, str) else False,
+                _is_nonnegative_int(size),
+                isinstance(etag, str),
+                isinstance(etag_is_weak, bool),
+                raw_object["version"] is None,
+                content_type is None or isinstance(content_type, str),
+                _is_cache_status(cache_status),
+                digest is None or _is_lowercase_sha256(digest),
+                cache_path is None or _is_nonempty_string(cache_path),
+            )
+        ):
+            raise ValueError("invalid HPA-321 manifest row")
+        try:
+            parsed_last_modified = parse_manifest_timestamp(last_modified)
+        except ValueError:
+            raise ValueError("invalid HPA-321 manifest row") from None
+        object_keys.add(key)
+        objects.append(
+            RemoteObject(
+                key=key,
+                size=size,
+                etag=etag,
+                etag_is_weak=etag_is_weak,
+                last_modified=parsed_last_modified,
+                content_type=content_type,
+                cache_status=cache_status,
+                sha256=digest,
+                cache_path=cache_path,
+            )
+        )
+    return tuple(objects)
+
+
+def _manifest_errors_from_row(
+    value: object,
+    object_keys: frozenset[str],
+    object_prefix: str,
+) -> tuple[SyncError, ...]:
+    if not isinstance(value, list):
+        raise ValueError("invalid HPA-321 manifest row")
+
+    errors: list[SyncError] = []
+    for raw_error in value:
+        if not isinstance(raw_error, Mapping) or set(raw_error) != _MANIFEST_ERROR_FIELDS:
+            raise ValueError("invalid HPA-321 manifest row")
+        scope = raw_error["scope"]
+        code = raw_error["code"]
+        object_key = raw_error["object_key"]
+        message = raw_error["message"]
+        if not all(
+            (
+                _is_error_scope(scope),
+                _is_error_code(code),
+                object_key is None or _is_nonempty_string(object_key),
+                isinstance(message, str),
+            )
+        ):
+            raise ValueError("invalid HPA-321 manifest row")
+        if object_key is not None and object_key not in object_keys:
+            if (scope, code, object_key) != ("simfile", "empty_prefix", object_prefix):
+                raise ValueError("invalid HPA-321 manifest row")
+        errors.append(SyncError(scope, code, message, object_key))
+    return tuple(errors)
+
+
+def _manifest_provenance_from_row(row: Mapping[str, object]) -> ProvenanceRecord:
+    nullable_fields = (
+        "source_origin",
+        "source_author_or_pack",
+        "source_reference",
+        "provenance_notes",
+    )
+    if any(row[field] is not None and not isinstance(row[field], str) for field in nullable_fields):
+        raise ValueError("invalid HPA-321 manifest row")
+    rights_status = row["rights_status"]
+    redistribution_allowed = row["redistribution_allowed"]
+    if (
+        not _is_nonempty_string(rights_status)
+        or redistribution_allowed is not None
+        and not isinstance(redistribution_allowed, bool)
+    ):
+        raise ValueError("invalid HPA-321 manifest row")
+    return ProvenanceRecord(
+        source_origin=row["source_origin"],
+        source_author_or_pack=row["source_author_or_pack"],
+        source_reference=row["source_reference"],
+        rights_status=rights_status,
+        redistribution_allowed=redistribution_allowed,
+        provenance_notes=row["provenance_notes"],
+    )
+
+
+def _is_lowercase_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in _LOWERCASE_HEX_DIGITS for character in value)
+    )
+
+
+def _is_nonempty_string(value: object) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _is_nonnegative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_simfile_id(value: object) -> bool:
+    return _is_nonnegative_int(value) and value <= MAX_SIMFILE_ID
+
+
+def _is_simfile_status(value: object) -> bool:
+    return isinstance(value, str) and value in _SIMFILE_STATUSES
+
+
+def _is_cache_status(value: object) -> bool:
+    return isinstance(value, str) and value in _CACHE_STATUSES
+
+
+def _is_error_scope(value: object) -> bool:
+    return isinstance(value, str) and value in _ERROR_SCOPES
+
+
+def _is_error_code(value: object) -> bool:
+    return isinstance(value, str) and value in _ERROR_CODES
 
 
 def canonical_json_line(value: dict[str, object]) -> bytes:

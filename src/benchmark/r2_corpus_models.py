@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -162,6 +163,22 @@ def format_manifest_timestamp(value: datetime) -> str:
     fraction = f"{normalized.microsecond:06d}".rstrip("0")
     suffix = f".{fraction}" if fraction else ""
     return normalized.strftime("%Y-%m-%dT%H:%M:%S") + suffix + "Z"
+
+
+def parse_manifest_timestamp(value: object) -> datetime:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z", value) is None
+    ):
+        raise ValueError("timestamp must be a canonical UTC manifest timestamp")
+    try:
+        format_string = "%Y-%m-%dT%H:%M:%S.%fZ" if "." in value else "%Y-%m-%dT%H:%M:%SZ"
+        parsed = datetime.strptime(value, format_string).replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise ValueError("timestamp must be a canonical UTC manifest timestamp") from None
+    if format_manifest_timestamp(parsed) != value:
+        raise ValueError("timestamp must be a canonical UTC manifest timestamp")
+    return parsed
 
 
 def format_report_filename_timestamp(value: datetime) -> str:
