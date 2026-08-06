@@ -38,6 +38,7 @@ from src.benchmark.r2_corpus_models import (
     SyncRequest,
 )
 from src.benchmark.r2_corpus_sync import ProgressEvent
+from src.benchmark.reference_chart_manifest import SelectionOutcome, SelectionRequest
 from src.benchmark.transcription import (
     TranscribeOneOutcome,
     TranscribeOneRequest,
@@ -1649,3 +1650,150 @@ def test_sync_r2_corpus_dry_run_summary_states_no_manifest_was_published(monkeyp
     summary = json.loads(result.stdout)
     assert summary["status"] == "dry_run_partial"
     assert summary["manifest_published"] is False
+
+
+def test_select_reference_charts_builds_local_request_and_emits_manifest_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "r2-corpus" / "manifests" / "source.jsonl"
+    output_dir = tmp_path / "reference-charts"
+    published_path = output_dir / "manifests" / ("b" * 64 + ".jsonl")
+    published = PublishedManifest(
+        corpus_version="sha256:" + "a" * 64,
+        manifest_sha256="b" * 64,
+        relative_path="manifests/" + "b" * 64 + ".jsonl",
+        path=published_path,
+        latest_path=output_dir / "latest.json",
+    )
+    captured: list[SelectionRequest] = []
+
+    def fake_select(request: SelectionRequest) -> SelectionOutcome:
+        captured.append(request)
+        return SelectionOutcome(
+            status="partial",
+            exit_code=1,
+            manifest=published,
+            selected_count=7,
+            quarantined_count=1,
+        )
+
+    monkeypatch.setattr(
+        "src.benchmark.reference_chart_manifest.select_reference_manifest",
+        fake_select,
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "select-reference-charts",
+            "--manifest",
+            str(manifest_path),
+            "--output-dir",
+            str(output_dir),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert result.stderr_bytes == b""
+    assert result.stdout_bytes == (
+        f'{{"corpus_version":"sha256:{"a" * 64}","exit_code":1,'
+        f'"manifest_path":"{published_path}","manifest_sha256":"{"b" * 64}",'
+        '"quarantined_count":1,"selected_count":7,"status":"partial"}\n'
+    ).encode("utf-8")
+    assert captured == [
+        SelectionRequest(
+            manifest_path=manifest_path,
+            cache_dir=manifest_path.parent.parent / "cache",
+            overrides_file=Path("config/benchmark-reference-chart-overrides.json"),
+            output_dir=output_dir,
+            default_overrides_missing_ok=True,
+        )
+    ]
+    assert "report_path" not in json.loads(result.stdout)
+
+
+def test_select_reference_charts_requires_an_explicit_override_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "manifests" / "source.jsonl"
+    overrides_file = tmp_path / "overrides.json"
+    captured: list[SelectionRequest] = []
+
+    def fake_select(request: SelectionRequest) -> SelectionOutcome:
+        captured.append(request)
+        return SelectionOutcome(
+            status="failed",
+            exit_code=2,
+            manifest=None,
+            selected_count=0,
+            quarantined_count=0,
+        )
+
+    monkeypatch.setattr(
+        "src.benchmark.reference_chart_manifest.select_reference_manifest",
+        fake_select,
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "select-reference-charts",
+            "--manifest",
+            str(manifest_path),
+            "--overrides-file",
+            str(overrides_file),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert captured == [
+        SelectionRequest(
+            manifest_path=manifest_path,
+            cache_dir=manifest_path.parent.parent / "cache",
+            overrides_file=overrides_file,
+            output_dir=Path("artifacts/benchmark/reference-charts"),
+            default_overrides_missing_ok=False,
+        )
+    ]
+    assert json.loads(result.stdout) == {
+        "corpus_version": None,
+        "exit_code": 2,
+        "manifest_path": None,
+        "manifest_sha256": None,
+        "quarantined_count": 0,
+        "selected_count": 0,
+        "status": "failed",
+    }
+
+
+def test_installed_select_reference_charts_help_is_silent_and_avoids_optional_imports(
+    tmp_path: Path,
+) -> None:
+    import_spies = tmp_path / "import_spies"
+    import_spies.mkdir()
+    for module_name in ("pretty_midi", "boto3"):
+        (import_spies / f"{module_name}.py").write_text(
+            f'raise RuntimeError("{module_name} must not be imported for selection help")\n',
+            encoding="utf-8",
+        )
+
+    command = Path(sys.executable).with_name("crux")
+    result = subprocess.run(
+        [str(command), "benchmark", "select-reference-charts", "--help"],
+        capture_output=True,
+        check=False,
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(import_spies)},
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert "--manifest" in result.stdout
+    assert "--cache-dir" in result.stdout
+    assert "--overrides-file" in result.stdout
+    assert "--output-dir" in result.stdout
