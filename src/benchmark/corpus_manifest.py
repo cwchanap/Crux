@@ -119,7 +119,7 @@ def manifest_row_view_from_row(row: Mapping[str, object]) -> ManifestRowView:
             _is_nonempty_string(source_bucket),
             source_discovery_method == _SOURCE_DISCOVERY_METHOD,
             _is_simfile_id(simfile_id),
-            _is_nonempty_string(object_prefix),
+            _is_object_prefix_for_simfile(object_prefix, simfile_id),
             _is_simfile_status(sync_status),
         )
     ):
@@ -180,7 +180,7 @@ def _manifest_objects_from_row(value: object, object_prefix: str) -> tuple[Remot
         if not all(
             (
                 _is_nonempty_string(key),
-                key.startswith(object_prefix) if isinstance(key, str) else False,
+                _is_object_key_in_prefix(key, object_prefix),
                 key not in object_keys if isinstance(key, str) else False,
                 _is_nonnegative_int(size),
                 isinstance(etag, str),
@@ -291,6 +291,26 @@ def _is_nonnegative_int(value: object) -> bool:
 
 def _is_simfile_id(value: object) -> bool:
     return _is_nonnegative_int(value) and value <= MAX_SIMFILE_ID
+
+
+def _is_object_prefix_for_simfile(object_prefix: object, simfile_id: object) -> bool:
+    if not isinstance(object_prefix, str) or not _is_simfile_id(simfile_id):
+        return False
+    first_segment, separator, remainder = object_prefix.partition("/")
+    return (
+        separator == "/"
+        and not remainder
+        and first_segment.isascii()
+        and first_segment.isdecimal()
+        and int(first_segment) == simfile_id
+    )
+
+
+def _is_object_key_in_prefix(key: object, object_prefix: str) -> bool:
+    if not isinstance(key, str):
+        return False
+    first_segment, separator, _ = key.partition("/")
+    return separator == "/" and f"{first_segment}/" == object_prefix
 
 
 def _is_simfile_status(value: object) -> bool:

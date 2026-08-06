@@ -220,8 +220,18 @@ def validate_cached_body(
     cache_dir: Path,
     entry: CacheIndexEntry | None,
 ) -> CacheValidation:
+    validation, _ = _validate_cached_body(cache_dir, entry, read_content=False)
+    return validation
+
+
+def _validate_cached_body(
+    cache_dir: Path,
+    entry: CacheIndexEntry | None,
+    *,
+    read_content: bool,
+) -> tuple[CacheValidation, bytes | None]:
     if entry is None:
-        return CacheValidation("remote_changed", None)
+        return CacheValidation("remote_changed", None), None
     shard_fd: int | None = None
     final_fd: int | None = None
     try:
@@ -230,24 +240,28 @@ def validate_cached_body(
             shard_fd = _open_directory_at(sha256_fd, shard_name)
             _verify_directory_binding(sha256_fd, shard_name, shard_fd)
             final_fd = _open_regular_file_at(shard_fd, entry.sha256)
-            digest, size = _hash_fd(final_fd)
+            if read_content:
+                digest, size, content = _read_and_hash_fd(final_fd)
+            else:
+                digest, size = _hash_fd(final_fd)
+                content = None
             _verify_regular_file_binding(shard_fd, entry.sha256, final_fd)
             _verify_directory_binding(sha256_fd, shard_name, shard_fd)
             _verify_directory_binding(cache_fd, "sha256", sha256_fd)
+            if size != entry.size:
+                return CacheValidation("size_mismatch", entry), None
+            if digest != entry.sha256:
+                return CacheValidation("sha256_mismatch", entry), None
+            return CacheValidation("verified", entry), content
     except FileNotFoundError:
-        return CacheValidation("missing", entry)
+        return CacheValidation("missing", entry), None
     except OSError:
-        return CacheValidation("unreadable", entry)
+        return CacheValidation("unreadable", entry), None
     finally:
         if final_fd is not None:
             os.close(final_fd)
         if shard_fd is not None:
             os.close(shard_fd)
-    if size != entry.size:
-        return CacheValidation("size_mismatch", entry)
-    if digest != entry.sha256:
-        return CacheValidation("sha256_mismatch", entry)
-    return CacheValidation("verified", entry)
 
 
 def resolve_verified_cache_body(
@@ -258,6 +272,46 @@ def resolve_verified_cache_body(
     bucket: str,
     expected_sha256: str | None = None,
 ) -> Path:
+    entry = _verified_cache_entry(
+        remote,
+        source_endpoint_sha256=source_endpoint_sha256,
+        bucket=bucket,
+        expected_sha256=expected_sha256,
+    )
+    validation = validate_cached_body(cache_dir, entry)
+    if validation.state != "verified":
+        raise ValueError("verified cache body unavailable")
+    return cache_dir / entry.cache_path
+
+
+def read_verified_cache_body(
+    cache_dir: Path,
+    remote: RemoteObject,
+    *,
+    source_endpoint_sha256: str,
+    bucket: str,
+    expected_sha256: str | None = None,
+) -> bytes:
+    """Validate and read a cache body through one pinned file descriptor."""
+    entry = _verified_cache_entry(
+        remote,
+        source_endpoint_sha256=source_endpoint_sha256,
+        bucket=bucket,
+        expected_sha256=expected_sha256,
+    )
+    validation, content = _validate_cached_body(cache_dir, entry, read_content=True)
+    if validation.state != "verified" or content is None:
+        raise ValueError("verified cache body unavailable")
+    return content
+
+
+def _verified_cache_entry(
+    remote: RemoteObject,
+    *,
+    source_endpoint_sha256: str,
+    bucket: str,
+    expected_sha256: str | None,
+) -> CacheIndexEntry:
     digest = remote.sha256
     if (
         remote.cache_status != "verified"
@@ -271,7 +325,7 @@ def resolve_verified_cache_body(
         raise ValueError("verified cache body unavailable")
     try:
         _validate_relative_cache_path(remote.cache_path, digest)
-        entry = CacheIndexEntry(
+        return CacheIndexEntry(
             source_endpoint_sha256=source_endpoint_sha256,
             bucket=bucket,
             key=remote.key,
@@ -282,12 +336,8 @@ def resolve_verified_cache_body(
             sha256=digest,
             cache_path=f"sha256/{digest[:2]}/{digest}",
         )
-        validation = validate_cached_body(cache_dir, entry)
     except (AttributeError, TypeError, ValueError):
         raise ValueError("verified cache body unavailable") from None
-    if validation.state != "verified":
-        raise ValueError("verified cache body unavailable")
-    return cache_dir / entry.cache_path
 
 
 def sync_cache(
@@ -1068,6 +1118,18 @@ def _hash_fd(descriptor: int) -> tuple[str, int]:
         digest.update(chunk)
         size += len(chunk)
     return digest.hexdigest(), size
+
+
+def _read_and_hash_fd(descriptor: int) -> tuple[str, int, bytes]:
+    digest = sha256()
+    size = 0
+    chunks: list[bytes] = []
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+        size += len(chunk)
+        chunks.append(chunk)
+    return digest.hexdigest(), size, b"".join(chunks)
 
 
 def _error_sort_key(error: SyncError) -> tuple[str, str, str, str]:
