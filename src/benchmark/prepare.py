@@ -5,7 +5,9 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
-CHART_LEVEL_PRIORITY = ("mas", "ext", "adv", "bas")
+from src.benchmark.chart_names import CHART_FILENAME_PRIORITY
+
+CHART_LEVEL_PRIORITY = CHART_FILENAME_PRIORITY
 DRUM_AUDIO_FILENAMES = ("2 Drums.mp3", "drum.mp3")
 CHART_SUFFIXES = {".dtx", ".txt"}
 

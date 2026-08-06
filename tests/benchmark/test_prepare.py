@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.benchmark.prepare import (
+    CHART_FILENAME_PRIORITY,
     DRUM_AUDIO_FILENAMES,
     prepare_corpus,
     scan_raw_corpus,
@@ -27,6 +28,24 @@ def test_scan_raw_corpus_selects_highest_chart_and_allowed_drum_audio(tmp_path: 
     assert result.valid_items[0].selected_chart.name == "mas.dtx"
     assert result.valid_items[0].selected_chart_level == "mas"
     assert result.valid_items[0].selected_audio.name == DRUM_AUDIO_FILENAMES[0]
+
+
+def test_scan_raw_corpus_uses_shared_filename_priority_for_same_folder_charts(
+    tmp_path: Path,
+):
+    raw = tmp_path / "raw"
+    song = raw / "Filename Priority"
+    song.mkdir(parents=True)
+    for level in ("real", "full", "mas", "ext", "adv", "bas"):
+        (song / f"{level}.dtx").write_text("#BPM: 120\n", encoding="utf-8")
+    (song / DRUM_AUDIO_FILENAMES[0]).write_bytes(b"drums")
+
+    result = scan_raw_corpus(raw)
+
+    assert CHART_FILENAME_PRIORITY == ("real", "full", "mas", "ext", "adv", "bas")
+    assert result.invalid_items == []
+    assert result.valid_items[0].selected_chart.name == "real.dtx"
+    assert result.valid_items[0].selected_chart_level == "real"
 
 
 def test_scan_raw_corpus_rejects_missing_allowed_drum_audio(tmp_path: Path):
