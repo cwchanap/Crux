@@ -438,6 +438,50 @@ def test_manifest_row_view_rejects_noninteger_simfile_ids(value: object) -> None
 
 
 @pytest.mark.parametrize(
+    ("object_prefix", "object_key"),
+    [
+        ("2", "20/chart.dtx"),
+        ("3/", "3/chart.dtx"),
+        ("2/nested/", "2/nested/chart.dtx"),
+    ],
+)
+def test_manifest_row_view_rejects_prefixes_outside_the_simfile_top_level_contract(
+    object_prefix: str,
+    object_key: str,
+) -> None:
+    row, _, _, _ = hpa_321_row()
+    invalid = deepcopy(row)
+    invalid["object_prefix"] = object_prefix
+    invalid["sync_status"] = "complete"
+    invalid["sync_errors"] = []
+    objects = invalid["objects"]
+    assert isinstance(objects, list)
+    assert isinstance(objects[0], dict)
+    objects[0]["key"] = object_key
+
+    with pytest.raises(ValueError):
+        manifest_row_view_from_row(invalid)
+
+
+def test_manifest_row_view_accepts_zero_padded_numeric_top_level_prefix() -> None:
+    row, _, _, _ = hpa_321_row()
+    valid = deepcopy(row)
+    valid["object_prefix"] = "02/"
+    valid["sync_status"] = "complete"
+    valid["sync_errors"] = []
+    objects = valid["objects"]
+    assert isinstance(objects, list)
+    assert isinstance(objects[0], dict)
+    objects[0]["key"] = "02/chart.dtx"
+
+    view = manifest_row_view_from_row(valid)
+
+    assert view.inventory.simfile_id == 2
+    assert view.inventory.object_prefix == "02/"
+    assert view.inventory.objects[0].key == "02/chart.dtx"
+
+
+@pytest.mark.parametrize(
     ("location", "value"),
     [
         ("source_endpoint_sha256", "F" * 64),

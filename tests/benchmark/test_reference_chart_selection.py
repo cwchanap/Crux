@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -7,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import src.benchmark.corpus_cache as corpus_cache
 from src.benchmark.chart_names import CHART_FILENAME_PRIORITY
 from src.benchmark.corpus_manifest import ManifestRowView
 from src.benchmark.r2_corpus_models import (
@@ -641,6 +643,51 @@ def test_authored_slots_do_not_downgrade_after_existing_l5_chart_parse_failure(
     assert selection.selected_chart is None
 
 
+@pytest.mark.parametrize("replacement_target", ["set_def", "chart"])
+def test_selection_consumes_the_same_cache_descriptor_that_was_verified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_target: str,
+) -> None:
+    set_def_body = _set_def_body("authored.dtx")
+    chart_body = _chart_body(dlevel="50")
+    set_def = _remote("42/set.def", set_def_body)
+    chart = _remote("42/authored.dtx", chart_body)
+    target = set_def if replacement_target == "set_def" else chart
+    assert target.sha256 is not None
+    cache_path = tmp_path / "cache" / "sha256" / target.sha256[:2] / target.sha256
+    replacement_path = tmp_path / f"replacement-{replacement_target}"
+    replacement_path.write_bytes(b"not DTXMania text")
+    original_verify = corpus_cache._verify_regular_file_binding
+    replaced = False
+
+    def replace_after_descriptor_verification(parent_fd: int, name: str, descriptor: int) -> None:
+        nonlocal replaced
+        original_verify(parent_fd, name, descriptor)
+        if not replaced and name == target.sha256:
+            os.replace(replacement_path, cache_path)
+            replaced = True
+
+    monkeypatch.setattr(
+        corpus_cache,
+        "_verify_regular_file_binding",
+        replace_after_descriptor_verification,
+    )
+
+    selection = _select(
+        tmp_path,
+        (
+            (set_def, set_def_body),
+            (chart, chart_body),
+        ),
+    )
+
+    assert replaced
+    assert selection.status == "selected"
+    assert selection.method == "set_def_slot"
+    assert selection.selected_chart == chart
+
+
 def test_override_application_precedes_authored_set_def(tmp_path: Path) -> None:
     set_def_body = _set_def_body("authored.dtx")
     authored_body = _chart_body(dlevel="50")
@@ -733,6 +780,34 @@ def test_fallback_considers_only_verified_chart_objects(tmp_path: Path) -> None:
 
     assert selection.status == "quarantined"
     assert selection.reason_codes == ("no_verified_chart",)
+
+
+@pytest.mark.parametrize("invalid_first", [True, False], ids=["invalid-first", "invalid-last"])
+def test_fallback_skips_verified_nonchart_txt_regardless_of_input_order(
+    tmp_path: Path,
+    invalid_first: bool,
+) -> None:
+    readme_body = b"This package contains one authored chart.\n"
+    chart_body = _chart_body(dlevel="50")
+    readme = (_remote("42/readme.txt", readme_body), readme_body)
+    chart = (_remote("42/real.dtx", chart_body), chart_body)
+    fixtures = (readme, chart) if invalid_first else (chart, readme)
+
+    selection = _select(tmp_path, fixtures)
+
+    assert selection.status == "selected"
+    assert selection.method == "single_candidate_fallback"
+    assert selection.selected_chart == chart[0]
+
+
+def test_fallback_retains_cache_unavailability_quarantine(tmp_path: Path) -> None:
+    chart_body = _chart_body(dlevel="50")
+    chart = _remote("42/real.dtx", chart_body)
+
+    selection = _select(tmp_path, ((chart, None),))
+
+    assert selection.status == "quarantined"
+    assert selection.reason_codes == ("cached_body_unavailable",)
 
 
 def test_fallback_selects_one_evidence_bearing_candidate(tmp_path: Path) -> None:

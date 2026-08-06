@@ -9,9 +9,9 @@ from typing import Literal
 
 from src.benchmark.backend_identity import StrictJsonError, strict_json_loads
 from src.benchmark.chart_names import CHART_FILENAME_PRIORITY
-from src.benchmark.corpus_cache import is_chart_key, is_set_def_key, resolve_verified_cache_body
+from src.benchmark.corpus_cache import is_chart_key, is_set_def_key, read_verified_cache_body
 from src.benchmark.corpus_manifest import ManifestRowView
-from src.benchmark.dtx_parser import ParsedDtxChart, parse_dtx_file
+from src.benchmark.dtx_parser import ParsedDtxChart, parse_dtx_bytes
 from src.benchmark.inventory_object_keys import resolve_inventory_object_key
 from src.benchmark.r2_corpus_models import MAX_SIMFILE_ID, RemoteObject
 from src.benchmark.set_def_parser import ParsedSetDef, parse_set_def_bytes
@@ -315,6 +315,8 @@ def _select_fallback(
         if remote.cache_status != "verified" or not is_chart_key(remote.key):
             continue
         chart, chart_reason = _parse_chart(row, cache_dir, remote)
+        if chart_reason == "selected_chart_parse_failed":
+            continue
         if chart_reason is not None:
             return _quarantined(chart_reason, warnings=warnings)
         assert chart is not None
@@ -432,14 +434,13 @@ def _parse_set_def(
     remote: RemoteObject,
 ) -> tuple[ParsedSetDef | None, SelectionReasonCode | None]:
     try:
-        path = resolve_verified_cache_body(
+        body = read_verified_cache_body(
             cache_dir,
             remote,
             source_endpoint_sha256=row.source_endpoint_sha256,
             bucket=row.source_bucket,
         )
-        body = path.read_bytes()
-    except (OSError, ValueError):
+    except ValueError:
         return None, "cached_body_unavailable"
     try:
         return parse_set_def_bytes(body, source_name=remote.key), None
@@ -453,7 +454,7 @@ def _parse_chart(
     remote: RemoteObject,
 ) -> tuple[ParsedDtxChart | None, SelectionReasonCode | None]:
     try:
-        path = resolve_verified_cache_body(
+        body = read_verified_cache_body(
             cache_dir,
             remote,
             source_endpoint_sha256=row.source_endpoint_sha256,
@@ -462,8 +463,8 @@ def _parse_chart(
     except ValueError:
         return None, "cached_body_unavailable"
     try:
-        return parse_dtx_file(path, chart_id=remote.key), None
-    except (OSError, ValueError):
+        return parse_dtx_bytes(body, chart_id=remote.key, source_name=remote.key), None
+    except ValueError:
         return None, "selected_chart_parse_failed"
 
 

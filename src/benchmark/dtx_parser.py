@@ -41,8 +41,16 @@ class ParsedDtxChart:
 
 
 def parse_dtx_file(path: Path, chart_id: str | None = None) -> ParsedDtxChart:
-    text = decode_dtxmania_text(path.read_bytes(), source_name=str(path), kind="dtx")
-    return parse_dtx_text(text, chart_id=chart_id or path.stem)
+    return parse_dtx_bytes(
+        path.read_bytes(),
+        chart_id=chart_id or path.stem,
+        source_name=str(path),
+    )
+
+
+def parse_dtx_bytes(raw: bytes, *, chart_id: str, source_name: str) -> ParsedDtxChart:
+    text = decode_dtxmania_text(raw, source_name=source_name, kind="dtx")
+    return parse_dtx_text(text, chart_id=chart_id)
 
 
 def _is_string_value_header_key(key: str) -> bool:
