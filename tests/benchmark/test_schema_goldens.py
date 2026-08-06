@@ -88,6 +88,7 @@ def test_phase_a_and_b_schema_goldens_are_complete_and_strict(repository_root: P
         "crux.transcription-backend-descriptor/v1",
         "crux.heuristic-backend-descriptor/v1",
         "crux.input-view-manifest/v1",
+        "crux.reference-chart-manifest/v1",
         "crux.backend-execution-item-id/v1",
         "crux.backend-execution-attestation/v1",
         "crux.backend-verification-report/v1",
@@ -111,6 +112,16 @@ def test_phase_a_and_b_schema_goldens_are_complete_and_strict(repository_root: P
     }.issubset(schemas)
     for entry in entries:
         validate_schema_golden_entry(entry, repository_root)
+
+
+def test_reference_chart_schema_golden_is_registered_and_valid(repository_root: Path) -> None:
+    entry = next(
+        item
+        for item in load_schema_golden_manifest(repository_root)
+        if item.schema == "crux.reference-chart-manifest/v1"
+    )
+
+    validate_schema_golden_entry(entry, repository_root)
 
 
 @pytest.mark.parametrize("duplicate", ["schema", "golden_path"])
