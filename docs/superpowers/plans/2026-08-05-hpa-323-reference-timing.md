@@ -4,23 +4,23 @@
 
 **Goal:** Consume the immutable HPA-322 reference-chart manifest, correct DTX timing semantics, resolve and cache the DTX-referenced full-mix audio, and publish immutable audio-relative native reference-event artifacts for HPA-324.
 
-**Architecture:** Extend the existing parser with typed BGM events and source order, replace ad hoc timing helpers with one shared sticky-measure timing map, and add a focused reference-timing stage. The stage resolves exact source-audio objects from manifest metadata, fills only missing selected audio bodies through the existing R2 cache, then publishes content-addressed per-song event JSONL and a derived immutable manifest.
+**Architecture:** Extend the parser with typed BGM events and deterministic source order, replace ad hoc timing helpers with one shared sticky-measure timing map, and add a focused reference-timing stage. The stage resolves exact source-audio objects from manifest metadata, fills only missing selected audio bodies through the existing R2 cache, then publishes content-addressed per-song event JSONL and a derived immutable manifest.
 
-**Tech Stack:** Python 3.12, dataclasses, pathlib/PurePosixPath, JSONL, hashlib, Click, soundfile, boto3 through the existing optional `r2` extra, pytest.
+**Tech Stack:** Python 3.12, dataclasses, pathlib/PurePosixPath, JSONL, hashlib, Click, soundfile, the existing optional R2/boto3 adapter, pytest.
 
 ## Global Constraints
 
-- Start implementation only after HPA-322 is merged; consume `crux.reference-chart-manifest/v1` rather than guessing its final code shape on an unmerged branch.
+- Start implementation only after HPA-322 is merged; consume its actual `crux.reference-chart-manifest/v1` contract.
 - Channel `02` is sticky beginning with its own measure and remains active until superseded.
-- Channel `01` must never enter generic/native drum events; preserve it as typed BGM control data.
-- Resolve source audio from the DTX `#WAVxx` reference; `bgm.ogg` has no unconditional authority.
+- Channel `01` is typed BGM control data and must never enter native drum-event artifacts.
+- Resolve source audio from the DTX `#WAVxx` reference; never hard-code `bgm.ogg`.
 - Prefer exact object-key matches, then one unique case-insensitive match.
-- Use selected-chart-directory resolution first and simfile-root fallback only when the relative path has no match.
+- Resolve relative to the selected chart directory first; use simfile-root fallback only after a relative miss.
 - Cache only exact selected source-audio keys; do not broaden HPA-321's default suffix policy.
-- Preserve native DTX lane and note identities; HPA-324 owns canonical mapping and final eligibility.
-- Publish a new timing semantics identity: `crux.dtx-audio-timing/v1`.
-- Raw benchmark timing uses the DTX-derived audio clock. Auto-alignment remains separately labeled diagnostics.
-- Process rows sequentially after the targeted cache fill. Do not add a database, service, workflow framework, or new general-purpose concurrency layer.
+- Preserve native DTX lane, note, measure, position, and source-order identities. HPA-324 owns canonical mapping and final eligibility.
+- Publish timing semantics as `crux.dtx-audio-timing/v1`.
+- Raw benchmark timing uses the DTX-derived audio clock. Existing auto-alignment remains a separately labelled diagnostic.
+- Keep processing sequential after the targeted cache fill. Do not add a database, service, workflow framework, or new general concurrency layer.
 - Use TDD, focused commits, and the repository's `uv run` commands.
 
 ---
@@ -29,25 +29,25 @@
 
 ### Create
 
-- `src/benchmark/reference_timing.py` — pure BGM resolution, source-audio metadata, bounds handling, and native reference-event rendering.
-- `src/benchmark/reference_timing_manifest.py` — HPA-322 manifest loading, targeted cache orchestration, event-artifact publication, derived-manifest publication, counters, and outcome.
-- `tests/benchmark/test_reference_timing.py` — BGM path, ambiguity, audio metadata, bounds, and deterministic event tests.
-- `tests/benchmark/test_reference_timing_manifest.py` — manifest validation, cache-fill orchestration, lineage, counters, and immutable publication tests.
-- `tests/benchmark/test_reference_timing_acceptance.py` — offline end-to-end fixture through the real CLI.
+- `src/benchmark/reference_timing.py` — BGM resolution, source-audio metadata, bounds handling, and native event rendering.
+- `src/benchmark/reference_timing_manifest.py` — HPA-322 manifest loading, targeted cache orchestration, event publication, derived manifest, counters, and outcome.
+- `tests/benchmark/test_reference_timing.py` — BGM path, ambiguity, audio metadata, bounds, and deterministic-event tests.
+- `tests/benchmark/test_reference_timing_manifest.py` — input validation, cache orchestration, lineage, counters, and publication tests.
+- `tests/benchmark/test_reference_timing_acceptance.py` — end-to-end CLI fixture with a fake R2 store.
 
 ### Modify
 
-- `src/benchmark/models.py` — preserve deterministic source order on generic DTX events.
-- `src/benchmark/dtx_parser.py` — parse typed channel `01` events and assign source order.
+- `src/benchmark/models.py` — add deterministic source order to `DtxEvent`.
+- `src/benchmark/dtx_parser.py` — parse typed channel `01` events.
 - `tests/benchmark/test_dtx_parser.py` — typed BGM and source-order tests.
 - `src/benchmark/timing.py` — add `DtxTimingMap` and sticky channel `02` semantics.
 - `tests/benchmark/test_timing.py` — persistence, replacement, altered-measure BPM, and BGM parity tests.
-- `src/benchmark/corpus_cache.py` — expose exact-key cache selection while preserving the default HPA-321 policy.
-- `tests/benchmark/test_corpus_cache.py` — exact-key cache tests and default-policy regression.
+- `src/benchmark/corpus_cache.py` — expose exact-key cache selection while preserving default HPA-321 behavior.
+- `tests/benchmark/test_corpus_cache.py` — exact-key cache tests and suffix-policy regression.
 - `src/benchmark/corpus_manifest.py` — expose the existing immutable byte publisher through a public wrapper.
-- `tests/benchmark/test_corpus_manifest.py` — public immutable-content wrapper tests.
+- `tests/benchmark/test_corpus_manifest.py` — immutable-content wrapper tests.
 - `src/cli/benchmark.py` — add `build-reference-timing`.
-- `tests/test_cli_benchmark.py` — CLI help, request wiring, JSON summary, and exit-code tests.
+- `tests/test_cli_benchmark.py` — CLI help, wiring, summary, and exit-code tests.
 
 ---
 
@@ -61,16 +61,16 @@
 - Modify: `tests/benchmark/test_timing.py`
 
 **Interfaces:**
-- Produces: `DtxEvent.source_order: int` with default `0` for direct construction compatibility.
+- Produces: `DtxEvent.source_order: int` with default `0`.
 - Produces: `DtxBgmEvent(chart_id, measure, position, note_id, source_order)`.
 - Produces: `ParsedDtxChart.bgm_events: list[DtxBgmEvent]`.
 - Produces: `DtxTimingMap.time_sec(event: DtxEvent | DtxBpmEvent | DtxBgmEvent) -> float`.
 - Produces: `build_dtx_timing_map(chart: ParsedDtxChart) -> DtxTimingMap`.
 - Consumed by: Tasks 2, 4, and 5.
 
-- [ ] **Step 1: Write failing typed-channel and source-order tests**
+- [ ] **Step 1: Write failing typed-channel tests**
 
-Append focused tests to `tests/benchmark/test_dtx_parser.py`:
+Append to `tests/benchmark/test_dtx_parser.py`:
 
 ```python
 def test_channel_01_is_typed_bgm_not_generic_event() -> None:
@@ -79,36 +79,34 @@ def test_channel_01_is_typed_bgm_not_generic_event() -> None:
         chart_id="song",
     )
 
-    assert [(event.measure, event.position, event.note_id) for event in chart.bgm_events] == [
+    assert [(e.measure, e.position, e.note_id) for e in chart.bgm_events] == [
         (1, 0.0, "01")
     ]
-    assert [(event.lane_id, event.note_id) for event in chart.events] == [("11", "01")]
+    assert [(e.lane_id, e.note_id) for e in chart.events] == [("11", "01")]
 
 
-def test_parser_assigns_monotonic_source_order_to_nonzero_pattern_events() -> None:
+def test_pattern_events_receive_monotonic_source_order() -> None:
     chart = parse_dtx_text(
         "#00111: 0102\n#00101: 0304\n#00112: 0500\n",
         chart_id="song",
     )
 
-    orders = [event.source_order for event in chart.events]
-    bgm_orders = [event.source_order for event in chart.bgm_events]
-
-    assert sorted(orders + bgm_orders) == [0, 1, 2, 3, 4]
+    orders = [e.source_order for e in chart.events]
+    orders.extend(e.source_order for e in chart.bgm_events)
+    assert sorted(orders) == [0, 1, 2, 3, 4]
 ```
 
-- [ ] **Step 2: Run parser tests and verify failure**
+- [ ] **Step 2: Verify the parser tests fail**
 
 ```bash
 uv run pytest tests/benchmark/test_dtx_parser.py -k "channel_01 or source_order" -q
 ```
 
-Expected: assertions fail because channel `01` is generic and the event types have no
-`source_order` or `bgm_events` fields.
+Expected: missing `bgm_events` and `source_order`, and channel `01` remains generic.
 
-- [ ] **Step 3: Add source order and the typed BGM record**
+- [ ] **Step 3: Add typed BGM and source-order records**
 
-In `src/benchmark/models.py`, extend `DtxEvent` without breaking direct test fixtures:
+In `src/benchmark/models.py`:
 
 ```python
 @dataclass(frozen=True)
@@ -121,7 +119,7 @@ class DtxEvent:
     source_order: int = 0
 ```
 
-In `src/benchmark/dtx_parser.py`, add:
+In `src/benchmark/dtx_parser.py`:
 
 ```python
 @dataclass(frozen=True)
@@ -136,8 +134,9 @@ class DtxBgmEvent:
 Add `bgm_events: list[DtxBgmEvent] = field(default_factory=list)` to
 `ParsedDtxChart`.
 
-Replace `_parse_note_events` with one helper that assigns a monotonically increasing
-order only to non-zero tokens:
+- [ ] **Step 4: Parse pattern events through one helper**
+
+Replace the generic-only note helper with:
 
 ```python
 def _parse_pattern_events(
@@ -155,9 +154,7 @@ def _parse_pattern_events(
             continue
         position = index / len(chunks)
         if channel == "01":
-            bgm.append(
-                DtxBgmEvent(chart_id, measure, position, note_id, next_source_order)
-            )
+            bgm.append(DtxBgmEvent(chart_id, measure, position, note_id, next_source_order))
         else:
             generic.append(
                 DtxEvent(
@@ -173,39 +170,21 @@ def _parse_pattern_events(
     return generic, bgm, next_source_order
 ```
 
-Do not reuse the existing BPM `source_counter`; keep pattern-event source order separate
-from tempo-source order because they serve different deterministic ties.
+Keep pattern source order separate from BPM source order. Sort generic events by
+`(measure, position, lane_id, note_id, source_order)` and BGM events by
+`(measure, position, note_id, source_order)`.
 
-- [ ] **Step 4: Return sorted typed and generic events**
-
-Sort generic events by:
-
-```python
-(event.measure, event.position, event.lane_id, event.note_id, event.source_order)
-```
-
-Sort BGM events by:
-
-```python
-(event.measure, event.position, event.note_id, event.source_order)
-```
-
-Return both lists from `parse_dtx_text`.
-
-- [ ] **Step 5: Run parser tests**
+- [ ] **Step 5: Run all parser tests**
 
 ```bash
 uv run pytest tests/benchmark/test_dtx_parser.py -q
 ```
 
-Expected: all parser tests pass, including HPA-322 DLEVEL/decoder tests after that work
-is merged.
+Expected: all pass, including HPA-322 decoder and DLEVEL tests after merge.
 
-- [ ] **Step 6: Replace the old non-sticky timing expectation with persistence tests**
+- [ ] **Step 6: Replace the incorrect measure-reset fixture**
 
-Update `tests/benchmark/test_timing.py`. The current
-`test_measure_length_changes_timing` encodes the incorrect reset-to-`1.0` behavior.
-Replace it with:
+Update `tests/benchmark/test_timing.py`:
 
 ```python
 def test_measure_length_persists_until_superseded() -> None:
@@ -226,8 +205,7 @@ def test_measure_length_persists_until_superseded() -> None:
     )
 
     timed = dtx_events_to_timed_events(chart)
-
-    assert [event.time_sec for event in timed] == [2.0, 3.0, 4.0, 5.0, 7.0]
+    assert [e.time_sec for e in timed] == [2.0, 3.0, 4.0, 5.0, 7.0]
 
 
 def test_bpm_change_inside_sticky_short_measure_uses_resolved_length() -> None:
@@ -237,13 +215,9 @@ def test_bpm_change_inside_sticky_short_measure_uses_resolved_length() -> None:
     )
 
     timed = dtx_events_to_timed_events(chart)
+    assert timed[0].time_sec == 4.5
 
-    assert timed[0].time_sec == 5.0
-```
 
-Add a BGM parity test:
-
-```python
 def test_bgm_and_generic_event_share_one_timing_map() -> None:
     chart = parse_dtx_text(
         "#BPM: 120\n#00102: 0.5\n#00201: 01\n#00211: 0001\n",
@@ -251,24 +225,19 @@ def test_bgm_and_generic_event_share_one_timing_map() -> None:
     )
 
     timing = build_dtx_timing_map(chart)
-
     assert timing.time_sec(chart.bgm_events[0]) == 3.0
     assert timing.time_sec(chart.events[0]) == 3.5
 ```
 
-- [ ] **Step 7: Run timing tests and verify failure**
+- [ ] **Step 7: Verify timing tests fail**
 
 ```bash
 uv run pytest tests/benchmark/test_timing.py -q
 ```
 
-Expected: sticky-measure assertions fail because `_measure_lengths_by_measure` and
-`_event_beat` still default missing measures to `1.0`; the public timing-map API does not
-exist.
+Expected: sticky-measure assertions fail and `build_dtx_timing_map` is missing.
 
-- [ ] **Step 8: Implement `DtxTimingMap`**
-
-In `src/benchmark/timing.py`, add:
+- [ ] **Step 8: Implement the shared timing map**
 
 ```python
 @dataclass(frozen=True)
@@ -279,32 +248,16 @@ class DtxTimingMap:
 
     def time_sec(self, event: DtxEvent | DtxBpmEvent | DtxBgmEvent) -> float:
         length = self.resolved_measure_lengths[event.measure]
-        beat = (
-            self.measure_start_beats[event.measure]
-            + event.position * length * BEATS_PER_MEASURE
-        )
+        beat = self.measure_start_beats[event.measure] + event.position * length * 4.0
         return _time_at_beat(beat, list(self.tempo_points))
 ```
 
-Add `build_dtx_timing_map`:
-
-```python
-def build_dtx_timing_map(chart: ParsedDtxChart) -> DtxTimingMap:
-    lengths = tuple(_measure_lengths_by_measure(chart))
-    starts = tuple(_measure_start_beats(lengths))
-    points = tuple(_tempo_points(chart, lengths, starts))
-    return DtxTimingMap(lengths, starts, points)
-```
-
-Refactor private helpers to consume the resolved sequence rather than
-`chart.measure_lengths`.
-
-- [ ] **Step 9: Implement sticky measure lengths correctly**
+Resolve sticky lengths with:
 
 ```python
 def _measure_lengths_by_measure(chart: ParsedDtxChart) -> list[float]:
-    lengths: list[float] = []
     active = 1.0
+    lengths: list[float] = []
     for measure in range(_max_measure(chart) + 2):
         if measure in chart.measure_lengths:
             active = chart.measure_lengths[measure]
@@ -314,47 +267,21 @@ def _measure_lengths_by_measure(chart: ParsedDtxChart) -> list[float]:
     return lengths
 ```
 
-Extend `_max_measure` with `chart.bgm_events`. Update tempo-point construction so BPM
-events also use `resolved_measure_lengths[event.measure]`.
+Extend `_max_measure` with BGM events. Make measure-start, BPM-event, BGM-event, and
+generic-event time calculations consume the same resolved sequence.
 
-- [ ] **Step 10: Keep the legacy wrapper on the shared map**
+- [ ] **Step 9: Delegate the legacy wrapper to the timing map**
 
-```python
-def dtx_events_to_timed_events(chart: ParsedDtxChart) -> list[BenchmarkEvent]:
-    timing = build_dtx_timing_map(chart)
-    return [
-        BenchmarkEvent(
-            chart_id=event.chart_id,
-            time_sec=timing.time_sec(event),
-            canonical_class=event.lane_id,
-            source="ground_truth",
-            metadata={
-                "lane_id": event.lane_id,
-                "note_id": event.note_id,
-                "source_order": event.source_order,
-            },
-        )
-        for event in chart.events
-    ]
-```
+Keep `dtx_events_to_timed_events` for old commands, but build its chart-time values via
+`build_dtx_timing_map`. Include `source_order` in metadata. Do not apply the BGM shift in
+this legacy wrapper; the new manifest stage owns the audio clock.
 
-Do not apply a BGM shift in this legacy wrapper. HPA-323's new stage owns the selected
-audio clock; old folder-based commands remain chart-time compatibility paths until they
-are retired separately.
-
-- [ ] **Step 11: Run focused checks**
+- [ ] **Step 10: Run focused checks and commit**
 
 ```bash
 uv run pytest tests/benchmark/test_dtx_parser.py tests/benchmark/test_timing.py -q
 uv run ruff check src/benchmark/models.py src/benchmark/dtx_parser.py src/benchmark/timing.py tests/benchmark/test_dtx_parser.py tests/benchmark/test_timing.py
 uv run black --check src/benchmark/models.py src/benchmark/dtx_parser.py src/benchmark/timing.py tests/benchmark/test_dtx_parser.py tests/benchmark/test_timing.py
-```
-
-Expected: all pass.
-
-- [ ] **Step 12: Commit Task 1**
-
-```bash
 git add src/benchmark/models.py src/benchmark/dtx_parser.py src/benchmark/timing.py tests/benchmark/test_dtx_parser.py tests/benchmark/test_timing.py
 git commit -m "fix: derive sticky DTX timing controls"
 ```
@@ -368,40 +295,33 @@ git commit -m "fix: derive sticky DTX timing controls"
 - Create: `tests/benchmark/test_reference_timing.py`
 
 **Interfaces:**
-- Consumes: `ParsedDtxChart`, `DtxBgmEvent`, and `DtxTimingMap` from Task 1.
+- Consumes: `ParsedDtxChart`, `DtxBgmEvent`, and `DtxTimingMap`.
 - Produces: `SourceObject`.
 - Produces: `ResolvedBgm(event, chart_time_sec, audio_object, raw_event_count, warnings)`.
 - Produces: `BgmResolution(status, reason_codes, warnings, resolved)`.
 - Produces: `resolve_bgm_reference(...) -> BgmResolution`.
 - Consumed by: Task 5.
 
-- [ ] **Step 1: Write failing exact and relative-resolution tests**
+- [ ] **Step 1: Write failing path-resolution tests**
 
-Create `tests/benchmark/test_reference_timing.py` with local object helpers and:
+Create `tests/benchmark/test_reference_timing.py`:
 
 ```python
 def test_resolve_bgm_uses_selected_chart_directory() -> None:
-    chart = parse_dtx_text(
-        "#WAV01: audio/song.ogg\n#00101: 01\n",
-        chart_id="song",
-    )
-    timing = build_dtx_timing_map(chart)
-
+    chart = parse_dtx_text("#WAV01: audio/song.ogg\n#00101: 01\n", "song")
     resolution = resolve_bgm_reference(
         chart,
-        timing,
+        build_dtx_timing_map(chart),
         selected_chart_key="42/charts/real.dtx",
         object_prefix="42/",
         objects=(source_object("42/charts/audio/song.ogg"),),
     )
-
     assert resolution.status == "resolved"
     assert resolution.resolved.audio_object.key == "42/charts/audio/song.ogg"
 
 
-def test_resolve_bgm_uses_root_compatibility_only_after_relative_miss() -> None:
+def test_resolve_bgm_uses_root_fallback_only_after_relative_miss() -> None:
     chart = parse_dtx_text("#WAV01: bgm.ogg\n#00101: 01\n", "song")
-
     resolution = resolve_bgm_reference(
         chart,
         build_dtx_timing_map(chart),
@@ -409,70 +329,25 @@ def test_resolve_bgm_uses_root_compatibility_only_after_relative_miss() -> None:
         object_prefix="42/",
         objects=(source_object("42/bgm.ogg"),),
     )
-
-    assert resolution.status == "resolved"
     assert resolution.resolved.audio_object.key == "42/bgm.ogg"
     assert "source_audio_root_fallback" in resolution.warnings
 ```
 
-- [ ] **Step 2: Add failing safety and ambiguity tests**
+Add tests for unknown WAV ID, empty WAV value, absolute path, traversal above the
+simfile prefix, missing object, ambiguous case-insensitive matches, zero BGM events,
+duplicate identical BGM events, and two distinct BGM start groups.
 
-Cover:
-
-```python
-def test_unresolved_wav_id_quarantines() -> None:
-    chart = parse_dtx_text("#00101: 01\n", "song")
-    resolution = resolve_bgm_reference(
-        chart,
-        build_dtx_timing_map(chart),
-        selected_chart_key="42/real.dtx",
-        object_prefix="42/",
-        objects=(),
-    )
-    assert resolution.reason_codes == ("unresolved_bgm_wav",)
-
-
-def test_distinct_bgm_starts_quarantine() -> None:
-    chart = parse_dtx_text(
-        "#WAV01: bgm.ogg\n#00101: 01\n#00201: 01\n",
-        "song",
-    )
-    resolution = resolve_bgm_reference(
-        chart,
-        build_dtx_timing_map(chart),
-        selected_chart_key="42/real.dtx",
-        object_prefix="42/",
-        objects=(source_object("42/bgm.ogg"),),
-    )
-    assert resolution.reason_codes == ("ambiguous_bgm_start",)
-```
-
-Also test absolute paths, `..` traversal above `object_prefix`, duplicate
-case-insensitive matches, unknown audio object, and zero BGM events.
-
-- [ ] **Step 3: Run tests and verify failure**
+- [ ] **Step 2: Verify tests fail**
 
 ```bash
 uv run pytest tests/benchmark/test_reference_timing.py -k bgm -q
 ```
 
-Expected: collection fails because `src.benchmark.reference_timing` does not exist.
+Expected: module import failure.
 
-- [ ] **Step 4: Add the focused domain records**
-
-Create `src/benchmark/reference_timing.py`:
+- [ ] **Step 3: Add domain records**
 
 ```python
-from __future__ import annotations
-
-from dataclasses import dataclass
-from pathlib import PurePosixPath
-from typing import Literal
-
-from src.benchmark.dtx_parser import DtxBgmEvent, ParsedDtxChart
-from src.benchmark.timing import DtxTimingMap
-
-
 @dataclass(frozen=True)
 class SourceObject:
     key: str
@@ -503,61 +378,39 @@ class BgmResolution:
     resolved: ResolvedBgm | None
 ```
 
-- [ ] **Step 5: Implement safe DTX-relative object-key resolution**
+- [ ] **Step 4: Implement safe object-key resolution**
 
-Normalize backslashes to `/`. Reject empty, absolute, drive-prefixed, or traversal paths.
-Resolve first against `PurePosixPath(selected_chart_key).parent`, then against the
-simfile root only when no relative candidate exists.
+Normalize backslashes to `/`. Reject empty, absolute, drive-prefixed, or escaping paths.
+Resolve against `PurePosixPath(selected_chart_key).parent`, then against
+`object_prefix` only after a relative miss.
 
 For each lookup:
 
 1. exact key match;
 2. one unique `casefold()` match with `source_audio_case_fallback` warning;
 3. multiple casefold matches -> `source_audio_key_ambiguous`;
-4. no match -> continue to root fallback or return `source_audio_missing`.
+4. no match -> try root fallback or return `source_audio_missing`.
 
-Do not search by basename across arbitrary nested directories.
+Never search arbitrary directories by basename.
 
-- [ ] **Step 6: Implement WAV lookup and group selection**
+- [ ] **Step 5: Implement WAV lookup and group selection**
 
-For every `chart.bgm_events` item:
+Resolve every channel `01` event through `chart.wav_table[event.note_id]`. Any unresolved
+event quarantines the row; do not silently use another BGM event.
 
-```python
-wav_value = chart.wav_table.get(event.note_id)
-```
+Group resolved events by `(audio_object.key, timing.time_sec(event))`:
 
-An absent or empty value adds `unresolved_bgm_wav` and quarantines the row after all
-source events are inspected. Do not select a remaining resolvable event when another
-channel `01` event is unresolved.
+- zero events -> `bgm_event_missing`;
+- one group -> select the lowest-source-order event;
+- repeated events in that group -> add `duplicate_bgm_event` warning;
+- multiple groups -> `ambiguous_bgm_start`.
 
-Resolve all events, calculate `timing.time_sec(event)`, and group by:
-
-```python
-(audio_object.key, chart_time_sec)
-```
-
-Selection:
-
-- no channel `01`: `bgm_event_missing`;
-- one group: select its lowest-source-order event;
-- one group with multiple events: add `duplicate_bgm_event` warning;
-- multiple groups: `ambiguous_bgm_start`.
-
-Set `raw_event_count=len(chart.bgm_events)`.
-
-- [ ] **Step 7: Run BGM-resolution tests**
+- [ ] **Step 6: Run checks and commit**
 
 ```bash
 uv run pytest tests/benchmark/test_reference_timing.py -k bgm -q
 uv run ruff check src/benchmark/reference_timing.py tests/benchmark/test_reference_timing.py
 uv run black --check src/benchmark/reference_timing.py tests/benchmark/test_reference_timing.py
-```
-
-Expected: all BGM tests pass.
-
-- [ ] **Step 8: Commit Task 2**
-
-```bash
 git add src/benchmark/reference_timing.py tests/benchmark/test_reference_timing.py
 git commit -m "feat: resolve DTX referenced source audio"
 ```
@@ -575,93 +428,57 @@ git commit -m "feat: resolve DTX referenced source audio"
 - Preserves: existing `sync_cache(...)` and `is_selected(...)` behavior.
 - Consumed by: Task 5.
 
-- [ ] **Step 1: Write a failing exact-key cache test**
+- [ ] **Step 1: Write failing exact-key tests**
 
-Add a test using existing fake store/cache fixtures:
-
-```python
-def test_sync_explicit_cache_keys_downloads_only_named_audio(tmp_path: Path) -> None:
-    simfile = inventory_with_objects(
-        remote_object("42/real.dtx", b"chart"),
-        remote_object("42/bgm.ogg", b"audio"),
-        remote_object("42/preview.ogg", b"preview"),
-    )
-    store = fake_store_for(simfile.objects)
-    index = CacheIndexStore.load(tmp_path / "cache")
-
-    result = sync_explicit_cache_keys(
-        (simfile,),
-        store,
-        index,
-        r2_config(),
-        frozenset({"42/bgm.ogg"}),
-    )
-
-    by_key = {obj.key: obj for obj in result.simfiles[0].objects}
-    assert by_key["42/bgm.ogg"].cache_status == "verified"
-    assert by_key["42/real.dtx"].cache_status is None
-    assert by_key["42/preview.ogg"].cache_status is None
-    assert store.opened_keys == ["42/bgm.ogg"]
-```
-
-Use the repository's actual fixture names where they already exist; keep the assertions
-and exact selected-key behavior unchanged.
-
-- [ ] **Step 2: Add default-policy regression tests**
+Add a fixture with `42/real.dtx`, `42/bgm.ogg`, and `42/preview.ogg`. Select only
+`42/bgm.ogg`, then assert:
 
 ```python
-def test_default_sync_cache_still_excludes_audio() -> None:
-    assert is_selected("42/real.dtx") is True
-    assert is_selected("42/set.def") is True
-    assert is_selected("42/bgm.ogg") is False
+assert by_key["42/bgm.ogg"].cache_status == "verified"
+assert by_key["42/real.dtx"].cache_status is None
+assert by_key["42/preview.ogg"].cache_status is None
+assert store.opened_keys == ["42/bgm.ogg"]
 ```
 
-Also test that a selected key absent from the inventory is ignored rather than invented,
-and that duplicate selected keys across repeated input rows still download through the
-cache index at most once.
+Also assert:
 
-- [ ] **Step 3: Run tests and verify failure**
+```python
+assert is_selected("42/real.dtx") is True
+assert is_selected("42/set.def") is True
+assert is_selected("42/bgm.ogg") is False
+```
+
+Test an empty selected-key set and reject a set containing `""`.
+
+- [ ] **Step 2: Verify tests fail**
 
 ```bash
-uv run pytest tests/benchmark/test_corpus_cache.py -k "explicit_cache or default_sync_cache" -q
+uv run pytest tests/benchmark/test_corpus_cache.py -k "explicit_cache or default_policy" -q
 ```
 
-Expected: import or attribute failure because `sync_explicit_cache_keys` does not exist.
+Expected: missing `sync_explicit_cache_keys`.
 
-- [ ] **Step 4: Extract the selector inside `sync_cache`**
+- [ ] **Step 3: Extract one selector-driven worker**
 
-Keep the public default signature. Make it delegate to one private worker:
+Keep `sync_cache`'s signature and delegate to:
 
 ```python
-def sync_cache(
+def _sync_cache_selected(
     simfiles: tuple[SimfileInventory, ...],
     store: R2ObjectStore,
     index: CacheIndexStore,
     config: R2Config,
     dry_run: bool,
+    selector: Callable[[RemoteObject], bool],
     item_progress: Callable[[int, int, int], None] | None = None,
 ) -> CacheSyncResult:
-    return _sync_cache_selected(
-        simfiles,
-        store,
-        index,
-        config,
-        dry_run,
-        selector=lambda remote: is_selected(remote.key),
-        item_progress=item_progress,
-    )
+    ...
 ```
 
-The private worker receives:
+Use `selector` for both `total_selected` and per-object selection. Do not modify cache
+locking, download validation, hashing, or installation.
 
-```python
-selector: Callable[[RemoteObject], bool]
-```
-
-Use it for both `total_selected` and per-object selection. Do not alter download,
-locking, validation, content hashing, or cache-index behavior.
-
-- [ ] **Step 5: Add the explicit-key wrapper**
+- [ ] **Step 4: Add the explicit-key wrapper**
 
 ```python
 def sync_explicit_cache_keys(
@@ -672,6 +489,8 @@ def sync_explicit_cache_keys(
     selected_keys: frozenset[str],
     item_progress: Callable[[int, int, int], None] | None = None,
 ) -> CacheSyncResult:
+    if "" in selected_keys:
+        raise ValueError("selected cache keys must be non-empty")
     return _sync_cache_selected(
         simfiles,
         store,
@@ -683,29 +502,19 @@ def sync_explicit_cache_keys(
     )
 ```
 
-Reject an empty string inside `selected_keys` with `ValueError`; an empty set returns the
-unchanged simfiles and no actions without constructing network work.
-
-- [ ] **Step 6: Run cache tests**
+- [ ] **Step 5: Run checks and commit**
 
 ```bash
 uv run pytest tests/benchmark/test_corpus_cache.py -q
 uv run ruff check src/benchmark/corpus_cache.py tests/benchmark/test_corpus_cache.py
 uv run black --check src/benchmark/corpus_cache.py tests/benchmark/test_corpus_cache.py
-```
-
-Expected: all existing and new cache tests pass.
-
-- [ ] **Step 7: Commit Task 3**
-
-```bash
 git add src/benchmark/corpus_cache.py tests/benchmark/test_corpus_cache.py
 git commit -m "feat: cache explicit benchmark objects"
 ```
 
 ---
 
-### Task 4: Inspect source audio and build deterministic bounded native events
+### Task 4: Inspect source audio and build bounded native events
 
 **Files:**
 - Modify: `src/benchmark/reference_timing.py`
@@ -715,72 +524,42 @@ git commit -m "feat: cache explicit benchmark objects"
 
 **Interfaces:**
 - Produces: `SourceAudioMetadata(duration_sec, sample_rate, channels, frames)`.
-- Produces: `NativeReferenceEvent`.
-- Produces: `ReferenceEventBuild(events, pre_audio_event_count, post_audio_event_count, warnings, reason_codes)`.
+- Produces: `NativeReferenceEvent` and `ReferenceEventBuild`.
 - Produces: `inspect_source_audio(path: Path) -> SourceAudioMetadata`.
 - Produces: `build_audio_relative_events(...) -> ReferenceEventBuild`.
-- Produces: `render_reference_event_jsonl(...) -> bytes`.
+- Produces: `render_reference_event_jsonl(events) -> bytes`.
 - Produces: `publish_immutable_content(path, content, expected_sha256) -> None`.
 - Consumed by: Task 5.
 
-- [ ] **Step 1: Write failing source-audio metadata tests**
-
-Generate a tiny valid WAV through `soundfile.write`:
+- [ ] **Step 1: Write failing audio-metadata tests**
 
 ```python
-def test_inspect_source_audio_returns_exact_frame_metadata(tmp_path: Path) -> None:
+def test_inspect_source_audio_returns_frame_metadata(tmp_path: Path) -> None:
     path = tmp_path / "source.wav"
     soundfile.write(path, np.zeros(8000, dtype=np.float32), 8000)
 
     metadata = inspect_source_audio(path)
-
-    assert metadata.frames == 8000
-    assert metadata.sample_rate == 8000
-    assert metadata.channels == 1
-    assert metadata.duration_sec == 1.0
+    assert metadata == SourceAudioMetadata(1.0, 8000, 1, 8000)
 ```
 
-Add tests for zero frames and an undecodable file raising
-`SourceAudioDecodeError("source_audio_decode_failed")` without including file contents.
+Add undecodable and zero-frame cases. They must raise
+`SourceAudioDecodeError("source_audio_decode_failed")`.
 
-- [ ] **Step 2: Write failing bounds tests**
+- [ ] **Step 2: Write failing audio-relative bounds tests**
 
-Use directly constructed charts/timing and metadata:
+Cover:
 
-```python
-def test_audio_relative_events_shift_by_selected_bgm_time() -> None:
-    chart = parse_dtx_text(
-        "#BPM: 120\n#WAV01: bgm.wav\n#00101: 01\n#00211: 01\n",
-        "song",
-    )
-    timing = build_dtx_timing_map(chart)
-    bgm = resolved_bgm(chart, timing, key="42/bgm.wav")
+- subtraction of selected BGM chart time;
+- one-frame negative time clamped to `0.0`;
+- earlier negative time excluded and counted;
+- one-frame post-duration time clamped to duration;
+- later post-duration time excluded and counted;
+- non-finite time -> `non_finite_reference_time`;
+- no retained native events -> `no_in_bounds_reference_events`.
 
-    built = build_audio_relative_events(
-        simfile_id=42,
-        chart=chart,
-        timing=timing,
-        resolved_bgm=bgm,
-        selected_chart_key="42/real.dtx",
-        selected_chart_content_hash="a" * 64,
-        source_audio_content_hash="b" * 64,
-        audio=SourceAudioMetadata(10.0, 8000, 1, 80000),
-    )
+Use `frame_tolerance_sec = 1.0 / sample_rate`.
 
-    assert built.events[0].chart_time_sec == 4.0
-    assert built.events[0].audio_time_sec == 2.0
-```
-
-Add separate tests for:
-
-- one-frame negative value clamped to zero;
-- earlier negative value excluded and counted;
-- one-frame post-duration value clamped to duration;
-- later post-duration value excluded and counted;
-- NaN/Infinity quarantining with `non_finite_reference_time`;
-- no in-bounds events quarantining with `no_in_bounds_reference_events`.
-
-- [ ] **Step 3: Run tests and verify failure**
+- [ ] **Step 3: Verify tests fail**
 
 ```bash
 uv run pytest tests/benchmark/test_reference_timing.py -k "source_audio or audio_relative" -q
@@ -788,9 +567,7 @@ uv run pytest tests/benchmark/test_reference_timing.py -k "source_audio or audio
 
 Expected: missing interfaces.
 
-- [ ] **Step 4: Add source-audio metadata inspection**
-
-In `src/benchmark/reference_timing.py`:
+- [ ] **Step 4: Implement metadata inspection**
 
 ```python
 @dataclass(frozen=True)
@@ -813,216 +590,105 @@ def inspect_source_audio(path: Path) -> SourceAudioMetadata:
     if info.frames <= 0 or info.samplerate <= 0 or info.channels <= 0:
         raise SourceAudioDecodeError("source_audio_decode_failed")
     return SourceAudioMetadata(
-        duration_sec=info.frames / info.samplerate,
-        sample_rate=info.samplerate,
-        channels=info.channels,
-        frames=info.frames,
+        info.frames / info.samplerate,
+        info.samplerate,
+        info.channels,
+        info.frames,
     )
 ```
 
-Do not fall back to full waveform decode in this stage.
+- [ ] **Step 5: Implement native events and bounds**
 
-- [ ] **Step 5: Add native reference-event records**
+Define `TIMING_SEMANTICS_VERSION = "crux.dtx-audio-timing/v1"` and
+`REFERENCE_EVENT_SCHEMA = "crux.dtx-reference-event/v1"`.
 
-```python
-REFERENCE_EVENT_SCHEMA = "crux.dtx-reference-event/v1"
-TIMING_SEMANTICS_VERSION = "crux.dtx-audio-timing/v1"
-
-
-@dataclass(frozen=True)
-class NativeReferenceEvent:
-    simfile_id: int
-    selected_chart_key: str
-    selected_chart_content_hash: str
-    source_audio_key: str
-    source_audio_content_hash: str
-    source_order: int
-    measure: int
-    position: float
-    lane_id: str
-    note_id: str
-    chart_time_sec: float
-    audio_time_sec: float
-
-
-@dataclass(frozen=True)
-class ReferenceEventBuild:
-    events: tuple[NativeReferenceEvent, ...]
-    pre_audio_event_count: int
-    post_audio_event_count: int
-    warnings: tuple[str, ...]
-    reason_codes: tuple[str, ...]
-```
-
-- [ ] **Step 6: Implement the frame-tolerance bounds policy**
-
-For each `chart.events` item:
+For every generic DTX event:
 
 ```python
 chart_time = timing.time_sec(event)
 audio_time = chart_time - resolved_bgm.chart_time_sec
-frame_tolerance = 1.0 / audio.sample_rate
 ```
 
-Rules:
+Preserve `simfile_id`, selected chart key/hash, source audio key/hash, source order,
+measure, position, lane ID, note ID, chart time, and audio time. Do not map or deduplicate.
+Sort by `(audio_time_sec, measure, position, lane_id, note_id, source_order)`.
 
-- reject non-finite chart/audio times;
-- clamp `[-frame_tolerance, 0)` to `0.0` and add
-  `pre_audio_event_clamped_to_zero` once;
-- exclude `< -frame_tolerance` and increment `pre_audio_event_count`;
-- clamp `(duration, duration + frame_tolerance]` to duration and add
-  `post_audio_event_clamped_to_duration` once;
-- exclude `> duration + frame_tolerance` and increment
-  `post_audio_event_count`;
-- sort included events by
-  `(audio_time_sec, measure, position, lane_id, note_id, source_order)`;
-- when no events remain, return reason `no_in_bounds_reference_events`.
+- [ ] **Step 6: Render deterministic canonical JSONL**
 
-Do not map lanes or deduplicate simultaneous native events.
+Use `canonical_json_line` for each event and include both schema and timing-semantics
+versions. Test exact repeated bytes and SHA-256 equality.
 
-- [ ] **Step 7: Render canonical event JSONL**
+- [ ] **Step 7: Expose the existing immutable byte publisher**
 
-Use `canonical_json_line` from `corpus_manifest.py`:
+In `src/benchmark/corpus_manifest.py`:
 
 ```python
-def render_reference_event_jsonl(events: tuple[NativeReferenceEvent, ...]) -> bytes:
-    return b"".join(
-        canonical_json_line(
-            {
-                "schema_version": REFERENCE_EVENT_SCHEMA,
-                "simfile_id": event.simfile_id,
-                "selected_chart_key": event.selected_chart_key,
-                "selected_chart_content_hash": event.selected_chart_content_hash,
-                "source_audio_key": event.source_audio_key,
-                "source_audio_content_hash": event.source_audio_content_hash,
-                "timing_semantics_version": TIMING_SEMANTICS_VERSION,
-                "source_order": event.source_order,
-                "measure": event.measure,
-                "position": event.position,
-                "lane_id": event.lane_id,
-                "note_id": event.note_id,
-                "chart_time_sec": event.chart_time_sec,
-                "audio_time_sec": event.audio_time_sec,
-            }
-        )
-        for event in events
-    )
-```
-
-Add a deterministic-byte test that builds the same event tuple twice and compares exact
-bytes and SHA-256.
-
-- [ ] **Step 8: Expose the existing immutable publisher safely**
-
-In `src/benchmark/corpus_manifest.py`, add a public wrapper only:
-
-```python
-def publish_immutable_content(
-    path: Path,
-    content: bytes,
-    expected_sha256: str,
-) -> None:
+def publish_immutable_content(path: Path, content: bytes, expected_sha256: str) -> None:
     _publish_immutable(path, content, expected_sha256)
 ```
 
-Do not duplicate or weaken `_publish_immutable`.
+Test new publication, identical reuse, and rejection of different bytes at the same
+path. Do not duplicate or weaken `_publish_immutable`.
 
-Add tests that publish new content, accept identical existing content, and reject a
-same-path different body with `ManifestPublicationError`.
-
-- [ ] **Step 9: Run focused checks**
+- [ ] **Step 8: Run checks and commit**
 
 ```bash
 uv run pytest tests/benchmark/test_reference_timing.py tests/benchmark/test_corpus_manifest.py -q
 uv run ruff check src/benchmark/reference_timing.py src/benchmark/corpus_manifest.py tests/benchmark/test_reference_timing.py tests/benchmark/test_corpus_manifest.py
 uv run black --check src/benchmark/reference_timing.py src/benchmark/corpus_manifest.py tests/benchmark/test_reference_timing.py tests/benchmark/test_corpus_manifest.py
-```
-
-Expected: all pass.
-
-- [ ] **Step 10: Commit Task 4**
-
-```bash
 git add src/benchmark/reference_timing.py src/benchmark/corpus_manifest.py tests/benchmark/test_reference_timing.py tests/benchmark/test_corpus_manifest.py
 git commit -m "feat: publish bounded native reference events"
 ```
 
 ---
 
-### Task 5: Orchestrate HPA-322 manifest loading, cache fill, and derived publication
+### Task 5: Orchestrate manifest loading, cache fill, and derived publication
 
 **Files:**
 - Create: `src/benchmark/reference_timing_manifest.py`
 - Create: `tests/benchmark/test_reference_timing_manifest.py`
 
 **Interfaces:**
-- Consumes: Task 1 timing, Task 2 BGM resolution, Task 3 exact-key cache fill, Task 4 audio/event helpers, and existing canonical manifest publication.
+- Consumes: Tasks 1-4 and existing manifest publication helpers.
 - Produces: `TimingRequest(manifest_path, cache_dir, output_dir)`.
 - Produces: `TimingCounters(ready, quarantined, events_published)`.
 - Produces: `TimingOutcome(status, exit_code, manifest, counters)`.
 - Produces: `build_reference_timing_manifest(request, ...) -> TimingOutcome`.
 - Consumed by: Task 6.
 
-- [ ] **Step 1: Write failing source-manifest validation tests**
+- [ ] **Step 1: Write failing input-validation tests**
 
-Create `tests/benchmark/test_reference_timing_manifest.py` with JSONL helpers and cover:
+Cover empty input, invalid UTF-8/JSON, non-object rows, wrong schema, duplicate simfile
+IDs, mixed `corpus_version`, mixed bucket, mixed endpoint hash, and a selected chart with
+no matching object record.
 
-```python
-def test_rejects_mixed_reference_chart_versions(tmp_path: Path) -> None:
-    manifest = write_jsonl(
-        tmp_path / "input.jsonl",
-        [
-            reference_chart_row(1, corpus_version="sha256:a"),
-            reference_chart_row(2, corpus_version="sha256:b"),
-        ],
-    )
-
-    with pytest.raises(ValueError, match="one corpus_version"):
-        build_reference_timing_manifest(request_for(manifest, tmp_path))
-```
-
-Also cover empty input, invalid JSON, non-object rows, wrong schema, duplicate simfile IDs,
-mixed `source_bucket`, mixed `source_endpoint_sha256`, and selected rows without matching
-selected-chart object metadata.
-
-- [ ] **Step 2: Write a failing complete-cache orchestration test**
-
-Build a selected chart and source audio in the content-addressed cache with manifest
-records already marked verified. Inject a store factory that fails if called:
+A representative assertion:
 
 ```python
-def test_complete_cache_does_not_construct_r2_store(tmp_path: Path) -> None:
-    request = complete_cached_request(tmp_path)
-
-    outcome = build_reference_timing_manifest(
-        request,
-        store_factory=lambda _config: pytest.fail("store must not be constructed"),
-    )
-
-    assert outcome.status == "complete"
-    assert outcome.counters.ready == 1
+with pytest.raises(ValueError, match="one corpus_version"):
+    build_reference_timing_manifest(request_for(mixed_manifest, tmp_path))
 ```
 
-- [ ] **Step 3: Write a failing targeted-cache-fill test**
+- [ ] **Step 2: Write cache-orchestration tests**
 
-Create two inventoried audio objects, but reference only one from channel `01`. Inject a
-fake store and assert only the referenced key opens. Verify the derived row enriches the
-matching `objects[]` record with `cache_status`, `sha256`, and `cache_path` while leaving
-the preview object unchanged.
+- Complete chart/audio cache: inject a store factory that calls `pytest.fail` if used.
+- Audio cache miss: inventory two audio objects, reference one, and assert only that key
+  opens.
+- Upstream HPA-322 quarantine: no chart parsing or R2 access.
+- Per-object download failure: quarantine only rows using that audio object.
 
-- [ ] **Step 4: Run tests and verify failure**
+- [ ] **Step 3: Verify tests fail**
 
 ```bash
 uv run pytest tests/benchmark/test_reference_timing_manifest.py -q
 ```
 
-Expected: collection fails because the module does not exist.
+Expected: module import failure.
 
-- [ ] **Step 5: Add request, counters, and outcome records**
+- [ ] **Step 4: Add request and outcome records**
 
 ```python
 REFERENCE_TIMING_MANIFEST_SCHEMA = "crux.reference-timing-manifest/v1"
-
 
 @dataclass(frozen=True)
 class TimingRequest:
@@ -1030,215 +696,139 @@ class TimingRequest:
     cache_dir: Path
     output_dir: Path
 
-
 @dataclass(frozen=True)
 class TimingCounters:
     ready: int = 0
     quarantined: int = 0
     events_published: int = 0
 
-
 @dataclass(frozen=True)
 class TimingOutcome:
     status: Literal["complete", "partial"]
-    exit_code: Literal[0, 1, 2]
-    manifest: PublishedManifest | None
+    exit_code: Literal[0, 1]
+    manifest: PublishedManifest
     counters: TimingCounters
 ```
 
-Fatal invalid input remains `ValueError`; cache configuration/store adapter failures use
-existing `R2StoreError`; publication failures use `ManifestPublicationError`. The CLI
+Fatal errors raise `ValueError`, `R2StoreError`, or `ManifestPublicationError`; the CLI
 maps them to exit `2`.
 
-- [ ] **Step 6: Load exact input bytes and validate lineage**
+- [ ] **Step 5: Load and validate exact HPA-322 bytes**
 
-Read the file once as bytes, compute `source_manifest_sha256`, decode UTF-8, and parse
-non-empty lines. Require:
+Read once, compute `source_manifest_sha256`, parse non-empty UTF-8 JSONL lines, and
+require one `crux.reference-chart-manifest/v1` corpus version, bucket, endpoint hash,
+and unique integer simfile IDs. Preserve the input version as
+`source_reference_chart_version`.
 
-```text
-schema_version = crux.reference-chart-manifest/v1
-one corpus_version
-unique integer simfile_id
-one source_bucket
-one source_endpoint_sha256
-```
+Rows with `selection_status != "selected"` receive
+`upstream_chart_selection_unavailable` and no further work.
 
-Retain the input corpus version as `source_reference_chart_version`.
+- [ ] **Step 6: Validate selected chart cache bodies**
 
-Rows with `selection_status != "selected"` become quarantined timing rows with
-`upstream_chart_selection_unavailable`; do not parse or download anything for them.
+Require a matching object record with `cache_status == "verified"`, relative
+`cache_path`, regular file under `cache_dir`, exact size, and exact SHA-256 equal to
+`selected_chart_content_hash`. Quarantine violations as
+`selected_chart_cache_invalid`; do not network-repair charts.
 
-- [ ] **Step 7: Validate selected chart cache bodies locally**
-
-Implement a local helper in this module rather than guessing a private HPA-322 function:
-
-```python
-def _verified_cached_path(
-    cache_dir: Path,
-    object_record: dict[str, object],
-    *,
-    expected_sha256: str,
-) -> Path:
-    ...
-```
-
-Require `cache_status == "verified"`, a relative `cache_path`, a regular file under the
-resolved cache directory, exact size, and exact SHA-256. Reject absolute paths and `..`.
-Return `selected_chart_cache_invalid` as a row quarantine reason.
-
-Do not perform network repair for a selected chart; HPA-322 must already have verified
-it.
-
-- [ ] **Step 8: First pass — parse charts and resolve audio candidates**
+- [ ] **Step 7: First pass — parse charts and resolve selected audio keys**
 
 For each selected row:
 
-1. validate the chart cache body;
-2. `parse_dtx_file` with `chart_id=str(simfile_id)`;
-3. `build_dtx_timing_map`;
-4. convert row `objects[]` to `SourceObject` tuples;
-5. call `resolve_bgm_reference`;
-6. retain resolved row state or row quarantine;
-7. collect `resolved.audio_object.key` in one exact-key set.
+1. parse the selected DTX;
+2. build the timing map;
+3. convert `objects[]` into `SourceObject` values;
+4. resolve the BGM reference;
+5. retain resolved row state or quarantine;
+6. collect one deduplicated exact audio-key set.
 
-Do not inspect audio until the cache pass finishes.
+- [ ] **Step 8: Fill only missing selected audio bodies**
 
-- [ ] **Step 9: Reconstruct cache models and fill missing selected audio**
-
-Add private parsers that convert validated row object dictionaries into existing
-`RemoteObject`, `SyncError`, and `SimfileInventory` records. Parse manifest timestamps
-with:
-
-```python
-def _parse_manifest_timestamp(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("last_modified must be timezone-aware")
-    return parsed
-```
-
-Before constructing a store, check whether every selected audio object already has a
-verified cache body/index entry. When all are cached, skip optional dependency and R2
-configuration resolution.
+When every selected audio body is already verified, do not import optional R2
+dependencies or create a store.
 
 When misses exist:
 
 1. `ensure_r2_dependency()`;
-2. `config = R2Config.from_environ(environ)`;
-3. verify `config.bucket` and `config.source_endpoint_sha256` match the input manifest;
-4. `index = CacheIndexStore.load(request.cache_dir)`;
+2. `R2Config.from_environ(environ)`;
+3. verify bucket and endpoint hash match the manifest;
+4. `CacheIndexStore.load(cache_dir)`;
 5. create and validate the store;
-6. hold `cache_writer_lock(request.cache_dir)`;
+6. hold `cache_writer_lock(cache_dir)`;
 7. call `sync_explicit_cache_keys(..., selected_keys)`.
 
-Use dependency, environment, and store-factory injection parameters matching
-`sync_r2_corpus` so tests never need real credentials.
+Inject `environ`, dependency check, and store factory using the same pattern as
+`sync_r2_corpus`.
 
-If an individual selected audio object returns a failed cache action, quarantine only
-rows referencing that key with `source_audio_download_failed`. Configuration, dependency,
-bucket-validation, or cache-index failures abort the command.
+- [ ] **Step 9: Second pass — inspect audio and publish events**
 
-- [ ] **Step 10: Second pass — inspect audio and publish event artifacts**
+For each resolved row:
 
-For each row with a resolved BGM:
+1. verify post-cache body/hash;
+2. call `inspect_source_audio`;
+3. build bounded audio-relative events;
+4. render canonical JSONL;
+5. compute SHA-256;
+6. publish to `events/<sha256>.jsonl` with `publish_immutable_content`.
 
-1. find the post-cache object record;
-2. verify its cached body and SHA;
-3. call `inspect_source_audio`;
-4. call `build_audio_relative_events`;
-5. quarantine on returned reason codes;
-6. render JSONL and compute `event_sha256`;
-7. publish to `output_dir / "events" / f"{event_sha256}.jsonl"` using
-   `publish_immutable_content`;
-8. retain relative path `events/<sha>.jsonl`, hash, and event count.
+- [ ] **Step 10: Build derived rows**
 
-Create the `events` directory before publication and use the existing durability helper
-for directory creation.
-
-- [ ] **Step 11: Build derived rows**
-
-Copy every input row except old `corpus_version` and `schema_version`. Update only the
-selected source-audio record in `objects[]` with post-cache values. Add:
-
-```python
-{
-    "schema_version": REFERENCE_TIMING_MANIFEST_SCHEMA,
-    "source_manifest_sha256": source_manifest_sha256,
-    "source_reference_chart_version": source_reference_chart_version,
-    "timing_semantics_version": TIMING_SEMANTICS_VERSION,
-    "timing_status": "ready" if artifact is not None else "quarantined",
-    "timing_reason_codes": sorted(reason_codes),
-    "timing_warnings": list(warnings),
-    "source_audio_key": source_audio_key,
-    "source_audio_content_hash": source_audio_sha256,
-    "source_audio_duration_sec": audio.duration_sec if audio else None,
-    "source_audio_sample_rate": audio.sample_rate if audio else None,
-    "source_audio_channels": audio.channels if audio else None,
-    "source_audio_frames": audio.frames if audio else None,
-    "bgm_event_count": raw_bgm_event_count,
-    "selected_bgm_note_id": selected_bgm_note_id,
-    "selected_bgm_chart_time_sec": selected_bgm_chart_time_sec,
-    "reference_events_path": artifact.relative_path if artifact else None,
-    "reference_events_sha256": artifact.sha256 if artifact else None,
-    "reference_event_count": artifact.event_count if artifact else 0,
-    "pre_audio_event_count": pre_audio_count,
-    "post_audio_event_count": post_audio_count,
-}
-```
-
-For upstream selection quarantine, set selected audio/BGM fields to `None`, event count
-to `0`, and preserve the HPA-322 selection reason fields unchanged.
-
-- [ ] **Step 12: Publish the derived immutable manifest**
-
-Use existing `render_manifest`, `publish_manifest`, and `publish_latest_manifest`.
-Counters must reconcile exactly:
+Preserve HPA-322 inventory/selection values and add:
 
 ```text
-ready + quarantined = input row count
+schema_version = crux.reference-timing-manifest/v1
+source_manifest_sha256
+source_reference_chart_version
+timing_semantics_version
+timing_status
+timing_reason_codes[]
+timing_warnings[]
+source_audio_key
+source_audio_content_hash
+source_audio_duration_sec
+source_audio_sample_rate
+source_audio_channels
+source_audio_frames
+bgm_event_count
+selected_bgm_note_id
+selected_bgm_chart_time_sec
+reference_events_path
+reference_events_sha256
+reference_event_count
+pre_audio_event_count
+post_audio_event_count
+```
+
+Update only the matching source-audio entry in `objects[]` with verified cache status,
+SHA, and cache path.
+
+- [ ] **Step 11: Publish and test reconciliation**
+
+Use `render_manifest`, `publish_manifest`, and `publish_latest_manifest`.
+
+Require:
+
+```text
+ready + quarantined = input rows
 events_published = ready
 ```
 
-Status/exit mapping:
+All ready -> `complete`, exit `0`; any quarantine -> `partial`, exit `1`.
+Test deterministic reruns, changed-audio identity, partial publication, and publication
+failure without a fake outcome.
 
-- all ready -> `complete`, `0`;
-- any quarantine -> `partial`, `1`;
-- fatal exception -> no fake `TimingOutcome`; the CLI emits exit `2`.
-
-- [ ] **Step 13: Add deterministic and partial-publication tests**
-
-Assert:
-
-- identical input/cache bytes produce identical event hashes, manifest bytes, and
-  derived `corpus_version`;
-- changing the selected audio bytes changes both source-audio hash and manifest identity;
-- duplicate rows are rejected before any file write;
-- one ambiguous BGM row still publishes another ready row;
-- one upstream HPA-322 quarantine remains visible and requires no cache/store access;
-- selected audio object enrichment is limited to the exact matching object;
-- `ready + quarantined` equals input count;
-- publication failure does not return a fake manifest.
-
-- [ ] **Step 14: Run focused checks**
+- [ ] **Step 12: Run checks and commit**
 
 ```bash
 uv run pytest tests/benchmark/test_reference_timing_manifest.py -q
 uv run ruff check src/benchmark/reference_timing_manifest.py tests/benchmark/test_reference_timing_manifest.py
 uv run black --check src/benchmark/reference_timing_manifest.py tests/benchmark/test_reference_timing_manifest.py
-```
-
-Expected: all pass.
-
-- [ ] **Step 15: Commit Task 5**
-
-```bash
 git add src/benchmark/reference_timing_manifest.py tests/benchmark/test_reference_timing_manifest.py
 git commit -m "feat: publish audio relative timing manifest"
 ```
 
 ---
 
-### Task 6: Wire the CLI and offline acceptance fixture
+### Task 6: Wire the CLI and acceptance fixture
 
 **Files:**
 - Modify: `src/cli/benchmark.py`
@@ -1246,48 +836,25 @@ git commit -m "feat: publish audio relative timing manifest"
 - Create: `tests/benchmark/test_reference_timing_acceptance.py`
 
 **Interfaces:**
-- Consumes: `TimingRequest` and `build_reference_timing_manifest` from Task 5.
+- Consumes: `TimingRequest` and `build_reference_timing_manifest`.
 - Produces: `crux benchmark build-reference-timing`.
 - Produces: one JSON stdout summary and exit codes `0`, `1`, or `2`.
 
-- [ ] **Step 1: Write failing CLI help and request-wiring tests**
+- [ ] **Step 1: Write failing CLI tests**
 
 ```python
-def test_build_reference_timing_help_lists_exact_options() -> None:
+def test_build_reference_timing_help_lists_options() -> None:
     result = runner.invoke(main, ["benchmark", "build-reference-timing", "--help"])
-
     assert result.exit_code == 0
     assert "--manifest FILE" in result.stdout
     assert "--cache-dir DIRECTORY" in result.stdout
     assert "--output-dir DIRECTORY" in result.stdout
-
-
-def test_build_reference_timing_wires_request(monkeypatch, tmp_path: Path) -> None:
-    captured = []
-    monkeypatch.setattr(
-        "src.benchmark.reference_timing_manifest.build_reference_timing_manifest",
-        lambda request: captured.append(request) or complete_timing_outcome(tmp_path),
-    )
-
-    result = runner.invoke(
-        main,
-        [
-            "benchmark",
-            "build-reference-timing",
-            "--manifest",
-            str(tmp_path / "reference-charts" / "manifests" / "input.jsonl"),
-            "--cache-dir",
-            str(tmp_path / "cache"),
-            "--output-dir",
-            str(tmp_path / "out"),
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert captured[0].cache_dir == tmp_path / "cache"
 ```
 
-- [ ] **Step 2: Run CLI tests and verify failure**
+Add request-wiring, complete summary, partial summary, invalid-input exit `2`, and
+complete-cache-without-R2 tests.
+
+- [ ] **Step 2: Verify CLI tests fail**
 
 ```bash
 uv run pytest tests/test_cli_benchmark.py -k build_reference_timing -q
@@ -1296,8 +863,6 @@ uv run pytest tests/test_cli_benchmark.py -k build_reference_timing -q
 Expected: unknown command.
 
 - [ ] **Step 3: Add the Click command**
-
-Follow the existing lazy-import pattern:
 
 ```python
 @benchmark.command("build-reference-timing")
@@ -1336,72 +901,37 @@ def build_reference_timing_command(
         click.echo(str(exc), err=True)
         ctx.exit(2)
 
-    click.echo(
-        json.dumps(
-            {
-                "corpus_version": outcome.manifest.corpus_version,
-                "events_published": outcome.counters.events_published,
-                "exit_code": outcome.exit_code,
-                "manifest_path": str(outcome.manifest.path),
-                "quarantined": outcome.counters.quarantined,
-                "ready": outcome.counters.ready,
-                "status": outcome.status,
-            },
-            sort_keys=True,
-        )
-    )
+    click.echo(json.dumps({
+        "corpus_version": outcome.manifest.corpus_version,
+        "events_published": outcome.counters.events_published,
+        "exit_code": outcome.exit_code,
+        "manifest_path": str(outcome.manifest.path),
+        "quarantined": outcome.counters.quarantined,
+        "ready": outcome.counters.ready,
+        "status": outcome.status,
+    }, sort_keys=True))
     if outcome.exit_code:
         ctx.exit(outcome.exit_code)
 ```
 
-Do not log environment values or signed request details.
+- [ ] **Step 4: Build the acceptance fixture**
 
-- [ ] **Step 4: Add summary and fatal-exit tests**
+Create five rows:
 
-Cover:
+1. sticky measure length affecting BGM and drum times;
+2. nested chart with a safe relative audio path;
+3. selected audio cache miss served by a fake store;
+4. conflicting BGM starts causing `ambiguous_bgm_start`;
+5. pre/post-audio events with one retained in-bounds event.
 
-- complete output -> exit `0`, one JSON stdout object;
-- partial output -> exit `1`, published manifest path retained;
-- invalid manifest -> exit `2`, no success JSON;
-- missing required R2 configuration -> exit `2`;
-- complete cache -> command succeeds without `r2` optional imports.
+Invoke the real Click command, assert exit `1`, inspect the output manifest and event
+JSONL, and assert no external network access.
 
-- [ ] **Step 5: Build the offline acceptance fixture**
-
-Create `tests/benchmark/test_reference_timing_acceptance.py` with five rows:
-
-1. sticky measure length, channel `01`, and one in-bounds drum event;
-2. nested selected chart with `../audio/song.wav` remaining inside the simfile prefix;
-3. selected audio cache miss served by a fake R2 store;
-4. two distinct BGM start groups producing `ambiguous_bgm_start`;
-5. pre-audio and post-audio events with one remaining in-bounds event.
-
-The fixture must:
-
-- write a valid `crux.reference-chart-manifest/v1` JSONL;
-- build the HPA-321 content-addressed cache and index for selected charts;
-- provide valid small WAV bytes for source audio;
-- invoke the real Click command;
-- inject the fake store at the manifest function boundary;
-- assert exit `1` because row 4 is quarantined;
-- load the output manifest and verify exact counts/fields;
-- read a published event artifact and verify audio-relative times;
-- assert no external network call occurs.
-
-- [ ] **Step 6: Run focused CLI and acceptance checks**
+- [ ] **Step 5: Run focused and full validation**
 
 ```bash
 uv run pytest tests/test_cli_benchmark.py -k build_reference_timing -q
 uv run pytest tests/benchmark/test_reference_timing_acceptance.py -q
-uv run ruff check src/cli/benchmark.py tests/test_cli_benchmark.py tests/benchmark/test_reference_timing_acceptance.py
-uv run black --check src/cli/benchmark.py tests/test_cli_benchmark.py tests/benchmark/test_reference_timing_acceptance.py
-```
-
-Expected: all pass.
-
-- [ ] **Step 7: Run the complete HPA-323 focused suite**
-
-```bash
 uv run pytest \
   tests/benchmark/test_dtx_parser.py \
   tests/benchmark/test_timing.py \
@@ -1410,37 +940,27 @@ uv run pytest \
   tests/benchmark/test_reference_timing.py \
   tests/benchmark/test_reference_timing_manifest.py \
   tests/benchmark/test_reference_timing_acceptance.py \
-  tests/test_cli_benchmark.py \
-  -q
-```
-
-Expected: all pass.
-
-- [ ] **Step 8: Run repository validation**
-
-```bash
+  tests/test_cli_benchmark.py -q
 uv run pytest -q
 uv run ruff check .
 uv run black --check .
 ```
 
-Expected: all pass. If Pylint is part of the current CI workflow after HPA-322 merges,
-run the same Pylint command from `.github/workflows/ci.yml` and record only existing
-unrelated warnings.
+If current CI runs Pylint after HPA-322 merges, run the exact Pylint command from
+`.github/workflows/ci.yml`.
 
-- [ ] **Step 9: Verify artifact determinism twice**
+- [ ] **Step 6: Verify artifact determinism**
 
-Run the acceptance command twice against the same fixture/output directory. Compare:
+Run the acceptance command twice against the same fixture/output and compare:
 
 ```bash
 sha256sum artifacts/benchmark/reference-timing/manifests/*.jsonl
 sha256sum artifacts/benchmark/reference-timing/events/*.jsonl
 ```
 
-Expected: the second run creates no different content-addressed files and reports the
-same manifest/event hashes.
+Expected: no second set of content-addressed files and identical hashes.
 
-- [ ] **Step 10: Commit Task 6**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/cli/benchmark.py tests/test_cli_benchmark.py tests/benchmark/test_reference_timing_acceptance.py
@@ -1451,20 +971,16 @@ git commit -m "feat: expose reference timing pipeline"
 
 ## Final Review Checklist
 
-- [ ] HPA-322 is merged and the implementation consumes its actual manifest schema and
-      selected-chart fields.
-- [ ] Channel `01` never appears in generic/native event artifacts.
-- [ ] Sticky channel `02` semantics affect both measure starts and positions inside the
-      active measure.
-- [ ] BPM, fractional-position, and same-beat ordering parity tests still pass.
-- [ ] Every BGM source token either contributes to the selected single group or causes
-      an actionable quarantine.
-- [ ] No filename heuristic can override the DTX WAV reference.
+- [ ] HPA-322 is merged and this implementation consumes its real schema.
+- [ ] Channel `01` never appears in native event artifacts.
+- [ ] Sticky channel `02` affects both measure starts and positions within each active measure.
+- [ ] Existing BPM, fractional-position, and same-beat ordering tests still pass.
+- [ ] Every BGM token resolves into the selected group or causes an actionable quarantine.
+- [ ] No filename heuristic overrides the DTX WAV reference.
 - [ ] Only exact selected source-audio keys are downloaded.
-- [ ] Complete-cache reruns require no R2 dependency or credentials.
-- [ ] Native lane/note/source identities survive into event artifacts.
+- [ ] Complete-cache reruns need no R2 dependency or credentials.
+- [ ] Native lane, note, position, and source order survive into event artifacts.
 - [ ] Pre/post-audio exclusions and frame-tolerance clamps reconcile exactly.
-- [ ] Timing-ready plus quarantined equals the HPA-322 input row count.
-- [ ] Raw scoring is not auto-shifted or replaced by aligned diagnostics.
-- [ ] No HPA-324 taxonomy, HPA-326 inference, or HPA-325 scoring scope leaked into the
-      implementation.
+- [ ] `ready + quarantined` equals the HPA-322 input row count.
+- [ ] Raw scoring remains distinct from aligned diagnostics.
+- [ ] No HPA-324 taxonomy, HPA-326 inference, or HPA-325 scoring scope leaked into this work.
