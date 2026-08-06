@@ -165,7 +165,7 @@ def test_parse_text_strips_utf8_bom_from_first_header():
     assert chart.base_bpm == 120.0
 
 
-def test_parse_file_tries_shift_jis(tmp_path: Path):
+def test_parse_file_decodes_shift_jis(tmp_path: Path):
     path = tmp_path / "sjis.dtx"
     path.write_bytes("#TITLE: テスト\r\n#BPM: 120\r\n".encode("shift-jis"))
 
@@ -245,7 +245,7 @@ def test_parse_file_raises_when_no_encoding_produces_valid_dtx(tmp_path: Path):
         parse_dtx_file(path, chart_id="garbage")
 
 
-def test_parse_file_prefers_utf8_over_shift_jis(tmp_path: Path):
+def test_parse_file_prefers_utf8_encoding_over_shift_jis(tmp_path: Path):
     """A UTF-8 encoded chart with non-ASCII text must not be garbled by a
     Shift-JIS decode.  UTF-8 is tried first, so the correct title survives."""
     # " café " in UTF-8 is valid but decodes to garbled text under Shift-JIS.
@@ -258,6 +258,49 @@ def test_parse_file_prefers_utf8_over_shift_jis(tmp_path: Path):
     assert chart.title == "café"
     assert chart.base_bpm == 120.0
     assert len(chart.events) == 1
+
+
+def test_parse_file_decodes_bomless_utf16be(tmp_path: Path) -> None:
+    content = "#TITLE: UTF16BE Song\r\n#BPM: 140\r\n#00011: 0100\r\n"
+    path = tmp_path / "utf16be.dtx"
+    path.write_bytes(content.encode("utf-16be"))
+
+    chart = parse_dtx_file(path, chart_id="utf16be")
+
+    assert chart.title == "UTF16BE Song"
+    assert chart.base_bpm == 140.0
+    assert len(chart.events) == 1
+
+
+def test_parse_dtx_retains_numeric_dlevel() -> None:
+    chart = parse_dtx_text("#DLEVEL: 87\n#BPM: 120\n", "song")
+
+    assert chart.dlevel_raw == "87"
+    assert chart.dlevel_normalized == 87
+
+
+def test_parse_dtx_dlevel_last_directive_wins() -> None:
+    chart = parse_dtx_text("#DLEVEL: 24\n#DLEVEL: 87\n#BPM: 120\n", "song")
+
+    assert chart.dlevel_raw == "87"
+    assert chart.dlevel_normalized == 87
+
+
+@pytest.mark.parametrize(("raw_value", "normalized"), [("0", 0), ("100", 100)])
+def test_parse_dtx_normalizes_ascii_dlevel_boundaries(raw_value: str, normalized: int) -> None:
+    chart = parse_dtx_text(f"#DLEVEL: {raw_value}\n#BPM: 120\n", "song")
+
+    assert chart.dlevel_raw == raw_value
+    assert chart.dlevel_normalized == normalized
+
+
+@pytest.mark.parametrize("raw_value", ["87.5", "１２", "-1", "101"])
+def test_parse_dtx_warns_for_invalid_dlevel(raw_value: str) -> None:
+    chart = parse_dtx_text(f"#DLEVEL: {raw_value}\n#BPM: 120\n", "song")
+
+    assert chart.dlevel_raw == raw_value
+    assert chart.dlevel_normalized is None
+    assert any("DLEVEL" in warning and raw_value in warning for warning in chart.warnings)
 
 
 def test_parse_star_prefixed_headers():
