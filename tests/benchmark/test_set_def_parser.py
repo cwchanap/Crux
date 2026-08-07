@@ -141,3 +141,18 @@ def test_parse_set_def_bytes_decodes_cp932_labels() -> None:
         (4, "①中級", "stage.dtx"),
         (5, None, None),
     ]
+
+
+def test_parse_set_def_bytes_accepts_whitespace_after_marker() -> None:
+    parser = _load_parser()
+    raw = "# L5FILE: real.dtx\n* L5LABEL: Real\n".encode("utf-8")
+
+    parsed = parser.parse_set_def_bytes(raw, source_name="nested/SET.DEF")
+
+    assert _slot_values(parsed) == [
+        (1, None, None),
+        (2, None, None),
+        (3, None, None),
+        (4, None, None),
+        (5, "Real", "real.dtx"),
+    ]

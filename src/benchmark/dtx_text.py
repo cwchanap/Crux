@@ -17,7 +17,7 @@ _DTX_DIRECTIVE_RE = re.compile(
     re.MULTILINE,
 )
 _SET_DEF_DIRECTIVE_RE = re.compile(
-    r"^[ \t]*[#*]L[1-5](?:LABEL|FILE)(?=[ \t]|:|;|$)", re.IGNORECASE | re.MULTILINE
+    r"^[ \t]*[#*][ \t]*L[1-5](?:LABEL|FILE)(?=[ \t]|:|;|$)", re.IGNORECASE | re.MULTILINE
 )
 
 
