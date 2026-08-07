@@ -30,6 +30,7 @@ DEFAULT_DTX_LANE_MAP: dict[str, DtxClassMapping] = {
     "1B": DtxClassMapping("closed_hihat", "pedal_hihat"),
     "1C": DtxClassMapping("kick", "left_kick"),
 }
+DRUM_LANE_IDS = frozenset(DEFAULT_DTX_LANE_MAP)
 
 DEFAULT_MIDI_NOTE_MAP: dict[int, str] = {
     36: "kick",

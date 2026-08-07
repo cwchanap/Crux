@@ -317,6 +317,15 @@ def test_input_loader_rejects_duplicate_simfile_ids(tmp_path: Path) -> None:
         _load_source_manifest(manifest_path)
 
 
+def test_input_loader_rejects_rows_with_stale_corpus_version(tmp_path: Path) -> None:
+    source_row = _source_row(empty=True)
+    source_row["provenance_notes"] = "mutated after corpus rendering"
+    manifest_path, _ = _write_source_manifest(tmp_path, (source_row,))
+
+    with pytest.raises(ValueError, match="corpus"):
+        _load_source_manifest(manifest_path)
+
+
 def test_row_construction_passes_the_validated_hpa_321_mapping_through_verbatim(
     tmp_path: Path,
 ) -> None:
@@ -560,6 +569,9 @@ def test_publication_preserves_verbatim_source_object_array_order(tmp_path: Path
     unrelated = _remote(42, "notes.txt", b"audit note")
     source_row = _source_row(objects=(chart, unrelated))
     source_row["objects"] = list(reversed(source_row["objects"]))
+    (source_row,) = render_manifest(
+        ({key: value for key, value in source_row.items() if key != "corpus_version"},)
+    ).rows
     expected_objects = source_row["objects"]
     manifest_path, _ = _write_source_manifest(tmp_path, (source_row,))
     cache_dir = tmp_path / "cache"

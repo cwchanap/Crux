@@ -13,6 +13,7 @@ from src.benchmark.corpus_cache import is_chart_key, is_set_def_key, read_verifi
 from src.benchmark.corpus_manifest import ManifestRowView
 from src.benchmark.dtx_parser import ParsedDtxChart, parse_dtx_bytes
 from src.benchmark.inventory_object_keys import resolve_inventory_object_key
+from src.benchmark.mapping import DRUM_LANE_IDS
 from src.benchmark.r2_corpus_models import MAX_SIMFILE_ID, RemoteObject
 from src.benchmark.set_def_parser import ParsedSetDef, parse_set_def_bytes
 
@@ -320,7 +321,7 @@ def _select_fallback(
         if chart_reason is not None:
             return _quarantined(chart_reason, warnings=warnings)
         assert chart is not None
-        has_note_evidence = any(event.lane_id != "01" for event in chart.events)
+        has_note_evidence = any(event.lane_id in DRUM_LANE_IDS for event in chart.events)
         if has_note_evidence:
             parsed_candidates.append((remote, chart))
 
