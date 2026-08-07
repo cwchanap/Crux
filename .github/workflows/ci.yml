@@ -4,9 +4,11 @@ on:
   push:
     branches: [ main ]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 jobs:
   lint:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
 
     steps:
@@ -36,6 +38,7 @@ jobs:
           pylint --errors-only --disable=E1120,E0401 src
 
   test:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
 
     steps:
