@@ -528,6 +528,85 @@ def test_manifest_row_view_rejects_error_references_to_unknown_objects() -> None
         manifest_row_view_from_row(invalid)
 
 
+@pytest.mark.parametrize("value", [42, "not-sha256-prefixed"])
+def test_manifest_row_view_rejects_invalid_corpus_version_format(value: object) -> None:
+    row, _, _, _ = hpa_321_row()
+    invalid = deepcopy(row)
+    invalid["corpus_version"] = value
+
+    with pytest.raises(ValueError):
+        manifest_row_view_from_row(invalid)
+
+
+def test_manifest_row_view_rejects_non_list_objects() -> None:
+    row, _, _, _ = hpa_321_row()
+    invalid = deepcopy(row)
+    invalid["objects"] = "not-a-list"
+
+    with pytest.raises(ValueError):
+        manifest_row_view_from_row(invalid)
+
+
+def test_manifest_row_view_rejects_non_list_sync_errors() -> None:
+    row, _, _, _ = hpa_321_row()
+    invalid = deepcopy(row)
+    invalid["sync_errors"] = "not-a-list"
+
+    with pytest.raises(ValueError):
+        manifest_row_view_from_row(invalid)
+
+
+def test_manifest_row_view_rejects_error_entry_with_wrong_keys() -> None:
+    row, _, _, _ = hpa_321_row()
+    invalid = deepcopy(row)
+    errors = invalid["sync_errors"]
+    assert isinstance(errors, list)
+    assert isinstance(errors[0], dict)
+    errors[0]["unexpected"] = "field"
+    errors[0].pop("message")
+
+    with pytest.raises(ValueError):
+        manifest_row_view_from_row(invalid)
+
+
+@pytest.mark.parametrize("field", ["source_origin", "source_author_or_pack"])
+def test_manifest_row_view_rejects_non_string_nullable_provenance(field: str) -> None:
+    row, _, _, _ = hpa_321_row()
+    invalid = deepcopy(row)
+    invalid[field] = 42
+
+    with pytest.raises(ValueError):
+        manifest_row_view_from_row(invalid)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("rights_status", ""),
+        ("redistribution_allowed", "yes"),
+    ],
+)
+def test_manifest_row_view_rejects_invalid_rights_fields(field: str, value: object) -> None:
+    row, _, _, _ = hpa_321_row()
+    invalid = deepcopy(row)
+    invalid[field] = value
+
+    with pytest.raises(ValueError):
+        manifest_row_view_from_row(invalid)
+
+
+def test_manifest_row_view_rejects_non_string_object_key() -> None:
+    row, _, _, _ = hpa_321_row()
+    invalid = deepcopy(row)
+    objects = invalid["objects"]
+    assert isinstance(objects, list)
+    assert isinstance(objects[0], dict)
+    objects[0]["key"] = 42
+
+    with pytest.raises(ValueError):
+        manifest_row_view_from_row(invalid)
+
+
 def test_manifest_row_view_preserves_hpa_321_empty_prefix_errors() -> None:
     source = SimfileInventory(
         2,

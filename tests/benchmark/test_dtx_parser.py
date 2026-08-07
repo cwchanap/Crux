@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from src.benchmark import dtx_parser as dtx_parser_module
 from src.benchmark.dtx_parser import parse_dtx_file, parse_dtx_text
 
 
@@ -330,3 +331,103 @@ def test_parse_star_prefixed_headers():
     assert len(chart.events) == 1
     assert chart.events[0].lane_id == "11"
     assert chart.events[0].note_id == "01"
+
+
+def test_normalize_dlevel_returns_none_when_int_parse_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The except-ValueError branch in _normalize_dlevel is defensive: the
+    ASCII-decimal regex guarantees int() succeeds.  Force the branch by
+    widening the regex so a non-numeric value reaches int()."""
+    import re
+
+    monkeypatch.setattr(dtx_parser_module, "_ASCII_DECIMAL_RE", re.compile(r".*"))
+    assert dtx_parser_module._normalize_dlevel("not-a-number") is None
+
+
+def test_parse_skips_blank_and_semicolon_comment_lines() -> None:
+    text = "\n".join(
+        [
+            "",
+            "; this is a full-line comment",
+            "#BPM: 120",
+            "   ",
+            "; another comment",
+            "#00011: 0100",
+        ]
+    )
+
+    chart = parse_dtx_text(text, chart_id="comments")
+
+    assert chart.base_bpm == 120.0
+    assert len(chart.events) == 1
+
+
+def test_parse_skips_non_header_non_data_lines() -> None:
+    text = "\n".join(
+        [
+            "#BPM: 120",
+            "this is not a header or data line",
+            "#00011: 0100",
+        ]
+    )
+
+    chart = parse_dtx_text(text, chart_id="gibberish")
+
+    assert chart.base_bpm == 120.0
+    assert len(chart.events) == 1
+
+
+def test_parse_warns_for_non_numeric_volume_value() -> None:
+    text = "\n".join(
+        [
+            "#BPM: 120",
+            "#VOLUME01: not-a-number",
+        ]
+    )
+
+    chart = parse_dtx_text(text, chart_id="bad-volume")
+
+    assert chart.volume_table == {}
+    assert any("VOLUME" in w and "not-a-number" in w for w in chart.warnings)
+
+
+def test_parse_warns_for_non_numeric_position_value() -> None:
+    text = "\n".join(
+        [
+            "#BPM: 120",
+            "#POSITION01: not-a-number",
+        ]
+    )
+
+    chart = parse_dtx_text(text, chart_id="bad-position")
+
+    assert chart.position_table == {}
+    assert any("POSITION" in w and "not-a-number" in w for w in chart.warnings)
+
+
+def test_parse_warns_for_bpm_table_reference_to_unknown_entry() -> None:
+    text = "\n".join(
+        [
+            "#BPM: 120",
+            "#00008: 9900",  # references #BPM99 which is never defined
+        ]
+    )
+
+    chart = parse_dtx_text(text, chart_id="missing-bpm-ref")
+
+    assert chart.bpm_events == []
+    assert any("BPM99" in w for w in chart.warnings)
+
+
+def test_parse_note_channel_with_empty_value_produces_no_events() -> None:
+    text = "\n".join(
+        [
+            "#BPM: 120",
+            "#00011:",  # empty value → _chunks returns []
+        ]
+    )
+
+    chart = parse_dtx_text(text, chart_id="empty-notes")
+
+    assert chart.events == []

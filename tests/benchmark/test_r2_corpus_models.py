@@ -176,6 +176,19 @@ def test_parse_manifest_timestamp_rejects_noncanonical_values(value: object) -> 
         parse_manifest_timestamp(value)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2026-01-02T03:04:05.0Z",
+        "2026-01-02T03:04:05.100000Z",
+        "2026-01-02T03:04:05.120000Z",
+    ],
+)
+def test_parse_manifest_timestamp_rejects_noncanonical_fractional_seconds(value: str) -> None:
+    with pytest.raises(ValueError):
+        parse_manifest_timestamp(value)
+
+
 def test_report_filename_timestamp_rejects_naive_values_instead_of_using_host_timezone():
     naive = datetime(2026, 7, 25, 1, 2, 3, 120000)
 
