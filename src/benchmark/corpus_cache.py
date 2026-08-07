@@ -241,7 +241,7 @@ def _validate_cached_body(
             _verify_directory_binding(sha256_fd, shard_name, shard_fd)
             final_fd = _open_regular_file_at(shard_fd, entry.sha256)
             if read_content:
-                digest, size, content = _read_and_hash_fd(final_fd)
+                digest, size, content = _read_and_hash_fd(final_fd, expected_size=entry.size)
             else:
                 digest, size = _hash_fd(final_fd)
                 content = None
@@ -324,7 +324,7 @@ def _verified_cache_entry(
     if remote.cache_path is None:
         raise ValueError("verified cache body unavailable")
     try:
-        _validate_relative_cache_path(remote.cache_path, digest)
+        validate_relative_cache_path(remote.cache_path, digest)
         return CacheIndexEntry(
             source_endpoint_sha256=source_endpoint_sha256,
             bucket=bucket,
@@ -1120,7 +1120,7 @@ def _hash_fd(descriptor: int) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
-def _read_and_hash_fd(descriptor: int) -> tuple[str, int, bytes]:
+def _read_and_hash_fd(descriptor: int, *, expected_size: int) -> tuple[str, int, bytes]:
     digest = sha256()
     size = 0
     chunks: list[bytes] = []
@@ -1129,6 +1129,8 @@ def _read_and_hash_fd(descriptor: int) -> tuple[str, int, bytes]:
         digest.update(chunk)
         size += len(chunk)
         chunks.append(chunk)
+        if size > expected_size:
+            break
     return digest.hexdigest(), size, b"".join(chunks)
 
 
@@ -1243,7 +1245,7 @@ def _validated_entry(raw_entry: object) -> CacheIndexEntry:
     if not _is_canonical_utc_timestamp(last_modified):
         raise ValueError("invalid cache index entry")
     cache_path = raw_entry["cache_path"]
-    _validate_relative_cache_path(cache_path, sha256)
+    validate_relative_cache_path(cache_path, sha256)
 
     return CacheIndexEntry(
         source_endpoint_sha256=source_endpoint_sha256,
@@ -1278,7 +1280,7 @@ def _is_canonical_utc_timestamp(value: str) -> bool:
     return True
 
 
-def _validate_relative_cache_path(cache_path: str, sha256: str) -> None:
+def validate_relative_cache_path(cache_path: str, sha256: str) -> None:
     parts = cache_path.split("/")
     if cache_path.startswith("/") or any(part in {"", ".", ".."} for part in parts):
         raise ValueError("invalid cache index entry")

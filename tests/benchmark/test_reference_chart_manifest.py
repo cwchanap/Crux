@@ -714,7 +714,7 @@ def test_publication_returns_fatal_without_a_manifest_when_immutable_write_fails
 
 
 # ---------------------------------------------------------------------------
-# _load_source_manifest edge cases (lines 130-131, 141)
+# _load_source_manifest edge cases (unreadable paths and malformed records)
 # ---------------------------------------------------------------------------
 
 
@@ -744,7 +744,6 @@ def test_input_loader_rejects_blank_line_between_records(tmp_path: Path) -> None
 
 # ---------------------------------------------------------------------------
 # _build_selection_row: selected chart with valid hash but missing cache_path
-# (line 313)
 # ---------------------------------------------------------------------------
 
 
@@ -794,7 +793,7 @@ def test_row_construction_rejects_selected_chart_with_missing_cache_path(
 
 # ---------------------------------------------------------------------------
 # validate_schema_golden: top-level content / structure errors
-# (lines 363, 365, 375, 380, 396, 409)
+# (canonical JSONL, record count, and derived corpus version checks)
 # ---------------------------------------------------------------------------
 
 
@@ -827,9 +826,9 @@ def test_schema_golden_validator_rejects_non_canonical_json_line() -> None:
 
 def test_schema_golden_validator_accepts_not_selected_cache_status_object() -> None:
     """Objects with cache_status != 'verified' skip the cache identity check
-    (line 440 continue branch).  Adding a not_selected object to the golden
-    row exercises the continue branch without breaking the selected chart or
-    set.def identity checks."""
+    in _validate_cached_objects (the continue branch).  Adding a not_selected
+    object to the golden row exercises the continue branch without breaking the
+    selected chart or set.def identity checks."""
     rows = _schema_golden_rows()
     extra_object = {
         "cache_path": None,

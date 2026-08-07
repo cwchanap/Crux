@@ -36,7 +36,7 @@ def test_scan_raw_corpus_uses_shared_filename_priority_for_same_folder_charts(
     raw = tmp_path / "raw"
     song = raw / "Filename Priority"
     song.mkdir(parents=True)
-    for level in ("real", "full", "mas", "ext", "adv", "bas"):
+    for level in CHART_FILENAME_PRIORITY:
         (song / f"{level}.dtx").write_text("#BPM: 120\n", encoding="utf-8")
     (song / DRUM_AUDIO_FILENAMES[0]).write_bytes(b"drums")
 

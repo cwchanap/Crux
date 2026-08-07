@@ -39,9 +39,6 @@ def resolve_inventory_object_key(
         or not _is_under_prefix(base_parts, prefix_parts)
     ):
         return ResolvedObjectKey("invalid_path", None, None)
-    assert prefix_parts is not None
-    assert base_parts is not None
-    assert relative_parts is not None
 
     resolved_parts = list(base_parts)
     for part in relative_parts or ():
@@ -104,10 +101,7 @@ def _relative_path_parts(value: object) -> tuple[str, ...] | None:
     for part in PurePosixPath(normalized).parts:
         if part == ".":
             continue
-        if part == "..":
-            parts.append(part)
-        else:
-            parts.append(part)
+        parts.append(part)
     return tuple(parts)
 
 

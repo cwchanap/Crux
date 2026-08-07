@@ -395,6 +395,7 @@ def _emit_reference_chart_selection_summary(
     "manifest_path",
     type=click.Path(path_type=Path, dir_okay=False),
     required=True,
+    help="Required path to an immutable local HPA-321 source manifest (JSONL).",
 )
 @click.option(
     "--cache-dir",
@@ -407,12 +408,14 @@ def _emit_reference_chart_selection_summary(
     type=click.Path(path_type=Path, dir_okay=False),
     default=Path("config/benchmark-reference-chart-overrides.json"),
     show_default=True,
+    help="Reference-chart override document mapping simfile IDs to authoritative charts.",
 )
 @click.option(
     "--output-dir",
     type=click.Path(path_type=Path, file_okay=False),
     default=Path("artifacts/benchmark/reference-charts"),
     show_default=True,
+    help="Directory where the published reference-chart manifest and artifacts are written.",
 )
 @click.pass_context
 def select_reference_charts_command(
@@ -425,10 +428,13 @@ def select_reference_charts_command(
     """Select authoritative charts from an immutable local HPA-321 manifest."""
     from src.benchmark.reference_chart_manifest import SelectionRequest, select_reference_manifest
 
+    resolved_manifest_path = manifest_path.absolute()
     outcome = select_reference_manifest(
         SelectionRequest(
-            manifest_path=manifest_path,
-            cache_dir=manifest_path.parent.parent / "cache" if cache_dir is None else cache_dir,
+            manifest_path=resolved_manifest_path,
+            cache_dir=(
+                resolved_manifest_path.parent.parent / "cache" if cache_dir is None else cache_dir
+            ),
             overrides_file=overrides_file,
             output_dir=output_dir,
             default_overrides_missing_ok=(

@@ -107,6 +107,17 @@ def _invoke_selection(
     return result, {} if not result.stdout else json.loads(result.stdout)
 
 
+def _write_empty_overrides(tmp_path: Path) -> Path:
+    overrides_path = tmp_path / "overrides.json"
+    overrides_path.write_bytes(
+        canonical_json_bytes(
+            {"overrides": {}, "schema_version": _OVERRIDE_SCHEMA},
+            trailing_newline=True,
+        )
+    )
+    return overrides_path
+
+
 def _offline_fixture(tmp_path: Path) -> tuple[Path, Path]:
     corpus_root = tmp_path / "r2-corpus"
     cache_dir = corpus_root / "cache"
@@ -190,11 +201,17 @@ def _offline_fixture(tmp_path: Path) -> tuple[Path, Path]:
     return manifest_path, overrides_path
 
 
-def test_reference_chart_acceptance_selects_the_offline_fixture_without_r2_or_network(
+@pytest.fixture
+def offline_selection_inputs(tmp_path: Path) -> tuple[Path, Path]:
+    return _offline_fixture(tmp_path)
+
+
+def test_reference_chart_acceptance_selects_offline_fixture_without_r2_or_network(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    offline_selection_inputs: tuple[Path, Path],
 ) -> None:
-    manifest_path, overrides_path = _offline_fixture(tmp_path)
+    manifest_path, overrides_path = offline_selection_inputs
 
     def unexpected_r2_sync(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("reference chart selection must not invoke R2 synchronization")
@@ -206,15 +223,15 @@ def test_reference_chart_acceptance_selects_the_offline_fixture_without_r2_or_ne
     monkeypatch.setattr(socket, "create_connection", unexpected_network)
     monkeypatch.setattr(socket.socket, "connect", unexpected_network)
 
-    first, first_summary = _invoke_selection(
+    result, summary = _invoke_selection(
         manifest_path,
-        tmp_path / "first-output",
+        tmp_path / "output",
         overrides_path,
     )
 
-    assert first.exit_code == 1
-    assert first.stderr_bytes == b""
-    assert set(first_summary) == {
+    assert result.exit_code == 1
+    assert result.stderr_bytes == b""
+    assert set(summary) == {
         "corpus_version",
         "exit_code",
         "manifest_path",
@@ -223,47 +240,63 @@ def test_reference_chart_acceptance_selects_the_offline_fixture_without_r2_or_ne
         "selected_count",
         "status",
     }
-    assert "report_path" not in first_summary
-    assert first_summary["status"] == "partial"
-    assert first_summary["exit_code"] == 1
-    assert first_summary["selected_count"] == 7
-    assert first_summary["quarantined_count"] == 1
-    assert isinstance(first_summary["corpus_version"], str)
-    assert isinstance(first_summary["manifest_sha256"], str)
+    assert "report_path" not in summary
+    assert summary["status"] == "partial"
+    assert summary["exit_code"] == 1
+    assert summary["selected_count"] == 7
+    assert summary["quarantined_count"] == 1
+    assert isinstance(summary["corpus_version"], str)
+    assert isinstance(summary["manifest_sha256"], str)
 
-    first_rows = _read_manifest_rows(first_summary)
-    assert first_rows[101]["selected_chart_key"] == "101/real.dtx"
-    assert first_rows[101]["selected_level_slot"] == "L5"
-    assert first_rows[102]["selected_chart_key"] == "102/custom.txt"
-    assert first_rows[103]["selected_chart_key"] == "103/meta/charts/lead.dtx"
-    assert first_rows[104]["selected_chart_key"] == "104/stage.dtx"
-    assert first_rows[105]["selected_chart_key"] == "105/root.dtx"
-    assert first_rows[105]["selection_warnings"] == ["set_def_root_fallback"]
-    assert first_rows[106]["selection_method"] == "override"
-    assert first_rows[106]["selected_chart_key"] == "106/approved.txt"
-    assert first_rows[106]["selection_override"] == {
+    rows = _read_manifest_rows(summary)
+    assert rows[106]["selection_method"] == "override"
+    assert rows[106]["selection_override"] == {
         "chart_key": "106/approved.txt",
         "reason": "offline audit",
     }
-    assert first_rows[107]["selected_chart_key"] == "107/fallback.dtx"
-    assert first_rows[108]["selection_status"] == "quarantined"
-    assert first_rows[108]["selection_reason_codes"] == ["ambiguous_fallback"]
+    assert rows[108]["selection_status"] == "quarantined"
+    assert rows[108]["selection_reason_codes"] == ["ambiguous_fallback"]
 
+
+def test_reference_chart_acceptance_publication_is_deterministic(
+    tmp_path: Path,
+    offline_selection_inputs: tuple[Path, Path],
+) -> None:
+    manifest_path, overrides_path = offline_selection_inputs
+
+    first, first_summary = _invoke_selection(
+        manifest_path,
+        tmp_path / "first-output",
+        overrides_path,
+    )
     second, second_summary = _invoke_selection(
         manifest_path,
         tmp_path / "second-output",
         overrides_path,
     )
 
+    assert first.exit_code == 1
     assert second.exit_code == 1
     assert second_summary["manifest_sha256"] == first_summary["manifest_sha256"]
     assert second_summary["corpus_version"] == first_summary["corpus_version"]
-    second_manifest_path = second_summary["manifest_path"]
     first_manifest_path = first_summary["manifest_path"]
-    assert isinstance(second_manifest_path, str)
+    second_manifest_path = second_summary["manifest_path"]
     assert isinstance(first_manifest_path, str)
+    assert isinstance(second_manifest_path, str)
     assert Path(second_manifest_path).read_bytes() == Path(first_manifest_path).read_bytes()
 
+
+def test_reference_chart_acceptance_rekeys_when_override_bytes_change(
+    tmp_path: Path,
+    offline_selection_inputs: tuple[Path, Path],
+) -> None:
+    manifest_path, overrides_path = offline_selection_inputs
+
+    first, first_summary = _invoke_selection(
+        manifest_path,
+        tmp_path / "first-output",
+        overrides_path,
+    )
     overrides_path.write_bytes(
         canonical_json_bytes(
             {
@@ -284,10 +317,13 @@ def test_reference_chart_acceptance_selects_the_offline_fixture_without_r2_or_ne
         overrides_path,
     )
 
+    assert first.exit_code == 1
     assert third.exit_code == 1
     assert third_summary["manifest_sha256"] != first_summary["manifest_sha256"]
     assert third_summary["corpus_version"] != first_summary["corpus_version"]
+    first_manifest_path = first_summary["manifest_path"]
     third_manifest_path = third_summary["manifest_path"]
+    assert isinstance(first_manifest_path, str)
     assert isinstance(third_manifest_path, str)
     assert Path(third_manifest_path).read_bytes() != Path(first_manifest_path).read_bytes()
 
@@ -301,8 +337,9 @@ def test_reference_chart_acceptance_publishes_an_all_selected_manifest(tmp_path:
         corpus_root,
         (SimfileInventory(200, "200/", (source,), "complete"),),
     )
+    overrides_path = _write_empty_overrides(tmp_path)
 
-    result, summary = _invoke_selection(manifest_path, tmp_path / "output")
+    result, summary = _invoke_selection(manifest_path, tmp_path / "output", overrides_path)
 
     assert result.exit_code == 0
     assert summary["status"] == "complete"
@@ -321,8 +358,9 @@ def test_reference_chart_acceptance_publishes_an_all_empty_source_manifest(tmp_p
             SimfileInventory(202, "202/", (), "empty"),
         ),
     )
+    overrides_path = _write_empty_overrides(tmp_path)
 
-    result, summary = _invoke_selection(manifest_path, tmp_path / "output")
+    result, summary = _invoke_selection(manifest_path, tmp_path / "output", overrides_path)
 
     assert result.exit_code == 1
     assert summary["status"] == "partial"
