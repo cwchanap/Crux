@@ -168,6 +168,14 @@ def _load_source_manifest(path: Path) -> _LoadedSourceManifest:
 
     if not rows:
         raise ValueError("source manifest contains no records")
+    normalized_rows = tuple(
+        {key: value for key, value in validated.source_row.items() if key != "corpus_version"}
+        for validated in rows
+    )
+    rendered = render_manifest(normalized_rows)
+    assert source_identity is not None
+    if rendered.content != content or rendered.corpus_version != source_identity[0]:
+        raise ValueError("source manifest has an invalid derived corpus version")
     return _LoadedSourceManifest(
         source_manifest_sha256=sha256(content).hexdigest(),
         rows=tuple(rows),

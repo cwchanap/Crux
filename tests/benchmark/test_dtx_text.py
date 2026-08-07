@@ -105,6 +105,30 @@ def test_decode_dtxmania_text_rejects_marker_separated_by_whitespace(text: str) 
         decode_dtxmania_text(text.encode(), source_name="malformed.dtx", kind="dtx")
 
 
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        ("#00011\n: 0100\n", "dtx"),
+        ("#\nL5FILE: real.dtx\n", "set_def"),
+    ],
+)
+def test_decode_dtxmania_text_does_not_join_directives_across_lines(
+    text: str,
+    kind: str,
+) -> None:
+    with pytest.raises(ValueError, match="could not decode DTXMania"):
+        decode_dtxmania_text(text.encode(), source_name="malformed", kind=kind)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("kind", ["dtx", "set_def"])
+def test_decode_dtxmania_text_accepts_leading_horizontal_whitespace(
+    kind: str,
+) -> None:
+    text = "  #TITLE: Header\n" if kind == "dtx" else "\t#L5FILE: real.dtx\n"
+
+    assert decode_dtxmania_text(text.encode(), source_name="indented", kind=kind) == text
+
+
 def test_decode_dtxmania_text_rejects_an_unsupported_kind() -> None:
     with pytest.raises(ValueError, match="could not decode DTXMania"):
         decode_dtxmania_text(

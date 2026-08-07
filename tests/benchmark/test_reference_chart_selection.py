@@ -859,6 +859,22 @@ def test_fallback_selects_unique_highest_numeric_dlevel(tmp_path: Path) -> None:
     assert selection.selected_chart.key == "42/custom.dtx"
 
 
+def test_fallback_ignores_unmapped_lane_evidence_when_ranking_candidates(tmp_path: Path) -> None:
+    non_drum_body = _chart_body(dlevel="99", note_evidence=False) + b"#00021: 01\n"
+    drum_body = _chart_body(dlevel="50")
+    selection = _select(
+        tmp_path,
+        (
+            (_remote("42/non-drum.dtx", non_drum_body), non_drum_body),
+            (_remote("42/real.dtx", drum_body), drum_body),
+        ),
+    )
+
+    assert selection.status == "selected"
+    assert selection.selected_chart is not None
+    assert selection.selected_chart.key == "42/real.dtx"
+
+
 @pytest.mark.parametrize(
     ("available", "expected"),
     [
