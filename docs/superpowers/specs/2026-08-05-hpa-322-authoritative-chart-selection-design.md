@@ -131,7 +131,7 @@ The reader validates the exact HPA-321 row and object key sets. It reconstructs:
 
 HPA-321 does not serialize `RemoteObject.errors`. Reconstructed objects therefore have
 `errors=()`. Selection must use `cache_status`,
-`SimfileInventory.sync_errors`, and `resolve_verified_cache_body`, never reconstructed
+`SimfileInventory.sync_errors`, and `read_verified_cache_body`, never reconstructed
 object errors.
 
 A round-trip test rebuilds the HPA-321 base row with `build_manifest_rows` and compares
@@ -143,14 +143,14 @@ asserted separately through `ManifestRowView`.
 Add to `src/benchmark/corpus_cache.py`:
 
 ```python
-def resolve_verified_cache_body(
+def read_verified_cache_body(
     cache_dir: Path,
     remote: RemoteObject,
     *,
     source_endpoint_sha256: str,
     bucket: str,
     expected_sha256: str | None = None,
-) -> Path: ...
+) -> bytes: ...
 ```
 
 The adapter requires:
@@ -177,12 +177,12 @@ CacheIndexEntry(
 )
 ```
 
-It first delegates path validation to `_validate_relative_cache_path`, then calls
-`validate_cached_body(cache_dir, entry)`. Every state other than `verified`, plus any
-missing/mismatched manifest field, raises
-`ValueError("verified cache body unavailable")`. The function returns
-`cache_dir / entry.cache_path` and never calls `Path.resolve` or implements another
-hashing path.
+It first delegates path validation to `_validate_relative_cache_path`, then validates
+and reads the body through one pinned file descriptor (`_validate_cached_body` with
+`read_content=True`). Every state other than `verified`, plus any missing/mismatched
+manifest field, raises `ValueError("verified cache body unavailable")`. The function
+returns the verified bytes and never calls `Path.resolve` or implements another hashing
+path.
 
 ### Cache-profile key predicates
 
@@ -401,7 +401,7 @@ Invariants:
 
 `src/benchmark/reference_chart_selection.py` receives one `ManifestRowView`, the cache
 root, and `LoadedOverrides`. It owns only selection policy. Every source body is opened
-through `resolve_verified_cache_body`.
+through `read_verified_cache_body`.
 
 ### Source inventory gate
 
@@ -458,18 +458,28 @@ When no usable `set.def` exists, candidates are verified objects accepted by
 `is_chart_key`.
 
 Unauthored fallback adds one evidence gate: a parsed candidate must contain at least one
-non-control note event (`any(event.lane_id != "01" for event in chart.events)`). Header-
-only, BPM-only, measure-length-only, and BGM-only files are not fallback candidates.
-This gate does not override an explicit `set.def` slot or manual override and does
-not replace HPA-324's final playable-lane eligibility rules.
+mapped drum-lane note event (`any(event.lane_id in DRUM_LANE_IDS for event in chart.events)`).
+Header-only, BPM-only, measure-length-only, BGM-only, and non-drum-lane files are not
+fallback candidates. This gate does not override an explicit `set.def` slot or manual
+override and does not replace HPA-324's final playable-lane eligibility rules.
+
+A verified candidate whose cache body cannot be read quarantines as
+`cached_body_unavailable` rather than being skipped: the object is still a verified
+chart candidate, so its ranking relative to readable candidates is unknowable, and
+guessing would risk silently downgrading the benchmark ground truth. A candidate that
+parses as a malformed or non-DTX file is skipped (`selected_chart_parse_failed`).
 
 1. One evidence-bearing candidate wins as `single_candidate_fallback`.
-2. Otherwise the unique highest numeric `#DLEVEL` wins as `dlevel_fallback`.
-3. At the same highest level, compare case-insensitive basenames without suffix using
+2. Otherwise, every evidence-bearing candidate must carry a normalized `#DLEVEL`; any
+   missing or non-numeric `#DLEVEL` among multiple candidates quarantines as
+   `ambiguous_fallback` (the fallback policy resolves ambiguity rather than inventing
+   ordering).
+3. The unique highest numeric `#DLEVEL` wins as `dlevel_fallback`.
+4. At the same highest level, compare case-insensitive basenames without suffix using
    `CHART_FILENAME_PRIORITY = ("real", "full", "mas", "ext", "adv", "bas")`.
-4. Use `filename_tiebreak_fallback` only when that rank yields exactly one recognized
+5. Use `filename_tiebreak_fallback` only when that rank yields exactly one recognized
    winner.
-5. All remaining ties quarantine as `ambiguous_fallback`.
+6. All remaining ties quarantine as `ambiguous_fallback`.
 
 Alphabetical order is never a selection rule.
 
