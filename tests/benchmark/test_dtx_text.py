@@ -92,6 +92,19 @@ def test_decode_dtxmania_text_rejects_gibberish_without_leaking_source_bytes(raw
     assert repr(raw) not in message
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "# TITLE: Not a directive without a leading marker\n",
+        "# 00111: 0100\n",
+        "* TITLE: Star with space\n",
+    ],
+)
+def test_decode_dtxmania_text_rejects_marker_separated_by_whitespace(text: str) -> None:
+    with pytest.raises(ValueError, match="could not decode DTXMania"):
+        decode_dtxmania_text(text.encode(), source_name="malformed.dtx", kind="dtx")
+
+
 def test_decode_dtxmania_text_rejects_an_unsupported_kind() -> None:
     with pytest.raises(ValueError, match="could not decode DTXMania"):
         decode_dtxmania_text(

@@ -2853,7 +2853,7 @@ def test_validate_relative_cache_path_rejects_mismatched_sha256() -> None:
     import src.benchmark.corpus_cache as cache
 
     with pytest.raises(ValueError, match="invalid cache index entry"):
-        cache._validate_relative_cache_path("sha256/cc/" + "c" * 64, "b" * 64)
+        cache.validate_relative_cache_path("sha256/cc/" + "c" * 64, "b" * 64)
 
 
 def test_open_lock_file_rejects_missing_nofollow(

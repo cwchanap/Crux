@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import Literal, get_args
 
 from src.benchmark.backend_identity import StrictJsonError, require_sha256, strict_json_loads
-from src.benchmark.corpus_cache import _validate_relative_cache_path, is_chart_key, is_set_def_key
+from src.benchmark.corpus_cache import is_chart_key, is_set_def_key, validate_relative_cache_path
 from src.benchmark.corpus_manifest import (
     ManifestPublicationError,
     ManifestRowView,
@@ -337,21 +337,10 @@ def _validate_selection_row_shape(row: Mapping[str, object], selection: ChartSel
             raise ValueError("selected reference chart row is invalid")
         return
     if selection.status == "quarantined":
-        quarantined_fields = (
-            "selected_chart_key",
-            "selected_chart_content_hash",
-            "selected_chart_cache_path",
-            "selected_level_slot",
-            "selected_level_label",
-            "dlevel_raw",
-            "dlevel_normalized",
-            "title",
-            "artist",
-        )
         if (
             selection.method is not None
             or not selection.reason_codes
-            or any(row[field] is not None for field in quarantined_fields)
+            or any(row[field] is not None for field in _QUARANTINED_NULL_FIELDS)
         ):
             raise ValueError("quarantined reference chart row is invalid")
         return
@@ -441,7 +430,7 @@ def _validate_cached_objects(view: ManifestRowView) -> None:
         if remote.sha256 is None or remote.cache_path is None:
             raise ValueError("verified source object must have a cache identity")
         try:
-            _validate_relative_cache_path(remote.cache_path, remote.sha256)
+            validate_relative_cache_path(remote.cache_path, remote.sha256)
         except (AttributeError, TypeError, ValueError):
             raise ValueError("reference chart manifest row has an invalid cache path") from None
 
@@ -543,7 +532,7 @@ def _validate_selected_chart_identity(row: Mapping[str, object], view: ManifestR
         raise ValueError("selected reference chart identity is invalid")
     _require_sha256_value(digest, "selected_chart_content_hash")
     try:
-        _validate_relative_cache_path(cache_path, digest)
+        validate_relative_cache_path(cache_path, digest)
     except (AttributeError, TypeError, ValueError):
         raise ValueError("selected reference chart cache path is invalid") from None
     remote = _remote_by_key(view, key)

@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -1705,7 +1706,7 @@ def test_select_reference_charts_builds_local_request_and_emits_manifest_summary
     assert captured == [
         SelectionRequest(
             manifest_path=manifest_path,
-            cache_dir=manifest_path.parent.parent / "cache",
+            cache_dir=tmp_path / "r2-corpus" / "cache",
             overrides_file=Path("config/benchmark-reference-chart-overrides.json"),
             output_dir=output_dir,
             default_overrides_missing_ok=True,
@@ -1714,7 +1715,7 @@ def test_select_reference_charts_builds_local_request_and_emits_manifest_summary
     assert "report_path" not in json.loads(result.stdout)
 
 
-def test_select_reference_charts_requires_an_explicit_override_file(
+def test_select_reference_charts_treats_an_explicit_override_file_as_mandatory(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1753,7 +1754,7 @@ def test_select_reference_charts_requires_an_explicit_override_file(
     assert captured == [
         SelectionRequest(
             manifest_path=manifest_path,
-            cache_dir=manifest_path.parent.parent / "cache",
+            cache_dir=tmp_path / "cache",
             overrides_file=overrides_file,
             output_dir=Path("artifacts/benchmark/reference-charts"),
             default_overrides_missing_ok=False,
@@ -1781,9 +1782,11 @@ def test_installed_select_reference_charts_help_is_silent_and_avoids_optional_im
             encoding="utf-8",
         )
 
-    command = Path(sys.executable).with_name("crux")
+    command = shutil.which("crux")
+    if command is None:
+        pytest.skip("crux executable is not installed on PATH")
     result = subprocess.run(
-        [str(command), "benchmark", "select-reference-charts", "--help"],
+        [command, "benchmark", "select-reference-charts", "--help"],
         capture_output=True,
         check=False,
         cwd=tmp_path,

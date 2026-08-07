@@ -153,6 +153,23 @@ def test_shared_rank_selects_real_for_equal_dlevel_fallback(tmp_path: Path) -> N
     assert selection.selected_chart.key == "42/real.dtx"
 
 
+def test_fallback_skips_candidate_with_unavailable_cache_body(tmp_path: Path) -> None:
+    unavailable_body = _chart_body(dlevel="99")
+    unavailable = _remote("42/missing.dtx", unavailable_body)
+    selectable_body = _chart_body(dlevel="50")
+    selectable = _remote("42/real.dtx", selectable_body)
+
+    selection = _select(
+        tmp_path,
+        ((unavailable, None), (selectable, selectable_body)),
+    )
+
+    assert selection.status == "selected"
+    assert selection.method == "single_candidate_fallback"
+    assert selection.selected_chart is not None
+    assert selection.selected_chart.key == "42/real.dtx"
+
+
 def test_authored_order_wins_over_shared_rank(tmp_path: Path) -> None:
     set_def_body = b"#L5FILE: bas.dtx\n"
     set_def = _remote("42/set.def", set_def_body)
@@ -801,14 +818,16 @@ def test_fallback_skips_verified_nonchart_txt_regardless_of_input_order(
     assert selection.selected_chart == chart[0]
 
 
-def test_fallback_retains_cache_unavailability_quarantine(tmp_path: Path) -> None:
+def test_fallback_skips_unavailable_candidate_and_quarantines_when_none_remain(
+    tmp_path: Path,
+) -> None:
     chart_body = _chart_body(dlevel="50")
     chart = _remote("42/real.dtx", chart_body)
 
     selection = _select(tmp_path, ((chart, None),))
 
     assert selection.status == "quarantined"
-    assert selection.reason_codes == ("cached_body_unavailable",)
+    assert selection.reason_codes == ("no_verified_chart",)
 
 
 def test_fallback_selects_one_evidence_bearing_candidate(tmp_path: Path) -> None:

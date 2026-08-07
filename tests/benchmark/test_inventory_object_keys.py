@@ -170,7 +170,7 @@ def test_resolve_inventory_object_key_rejects_base_dir_starting_above_prefix() -
 
 def test_resolve_inventory_object_key_normalizes_dot_in_object_prefix() -> None:
     """A prefix like './42/' contains a '.' component that pathlib preserves
-    at the start.  The resolver normalizes it away (line 89)."""
+    at the start.  _object_key_parts normalizes it away for the prefix."""
     result = resolve_inventory_object_key(
         "REAL.DTX",
         base_object_key_dir="42",
@@ -184,7 +184,7 @@ def test_resolve_inventory_object_key_normalizes_dot_in_object_prefix() -> None:
 
 def test_resolve_inventory_object_key_normalizes_dot_dot_in_object_prefix() -> None:
     """A prefix like '42/sub/../' contains a '..' that pathlib preserves.
-    The resolver pops the preceding component (line 93) and normalizes
+    _object_key_parts pops the preceding component and normalizes
     the prefix to '42/'."""
     result = resolve_inventory_object_key(
         "REAL.DTX",
@@ -199,7 +199,7 @@ def test_resolve_inventory_object_key_normalizes_dot_dot_in_object_prefix() -> N
 
 def test_resolve_inventory_object_key_normalizes_dot_in_base_dir() -> None:
     """A base dir like './42' contains a '.' component that pathlib preserves
-    at the start.  The resolver normalizes it away (line 106)."""
+    at the start.  _object_key_parts normalizes it away for the base dir."""
     result = resolve_inventory_object_key(
         "REAL.DTX",
         base_object_key_dir="./42",

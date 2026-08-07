@@ -152,7 +152,7 @@ def select_reference_chart(
     ):
         return _quarantined(
             "source_inventory_unusable",
-            warnings=warnings,
+            warnings=(),
             override=override,
         )
 
@@ -315,7 +315,7 @@ def _select_fallback(
         if remote.cache_status != "verified" or not is_chart_key(remote.key):
             continue
         chart, chart_reason = _parse_chart(row, cache_dir, remote)
-        if chart_reason == "selected_chart_parse_failed":
+        if chart_reason in {"selected_chart_parse_failed", "cached_body_unavailable"}:
             continue
         if chart_reason is not None:
             return _quarantined(chart_reason, warnings=warnings)

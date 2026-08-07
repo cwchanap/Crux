@@ -257,10 +257,8 @@ def _manifest_provenance_from_row(row: Mapping[str, object]) -> ProvenanceRecord
         raise ValueError("invalid HPA-321 manifest row")
     rights_status = row["rights_status"]
     redistribution_allowed = row["redistribution_allowed"]
-    if (
-        not _is_nonempty_string(rights_status)
-        or redistribution_allowed is not None
-        and not isinstance(redistribution_allowed, bool)
+    if not _is_nonempty_string(rights_status) or (
+        redistribution_allowed is not None and not isinstance(redistribution_allowed, bool)
     ):
         raise ValueError("invalid HPA-321 manifest row")
     return ProvenanceRecord(

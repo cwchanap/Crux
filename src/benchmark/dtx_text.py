@@ -13,7 +13,7 @@ _BOM_ENCODINGS = (
 )
 _FALLBACK_ENCODINGS = ("utf-8", "cp932", "shift-jis", "utf-16le", "utf-16be")
 _DTX_DIRECTIVE_RE = re.compile(
-    r"^[#*]\s*(?:\d{3}[0-9A-Za-z]{2}\s*:|[A-Za-z][A-Za-z0-9_]*(?=\s|:|;|$))",
+    r"^[#*](?:\d{3}[0-9A-Za-z]{2}\s*:|[A-Za-z][A-Za-z0-9_]*(?=\s|:|;|$))",
     re.MULTILINE,
 )
 _SET_DEF_DIRECTIVE_RE = re.compile(
