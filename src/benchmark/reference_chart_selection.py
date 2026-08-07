@@ -316,7 +316,7 @@ def _select_fallback(
         if remote.cache_status != "verified" or not is_chart_key(remote.key):
             continue
         chart, chart_reason = _parse_chart(row, cache_dir, remote)
-        if chart_reason in {"selected_chart_parse_failed", "cached_body_unavailable"}:
+        if chart_reason == "selected_chart_parse_failed":
             continue
         if chart_reason is not None:
             return _quarantined(chart_reason, warnings=warnings)
@@ -344,7 +344,7 @@ def _select_fallback(
         for remote, chart in parsed_candidates
         if chart.dlevel_normalized is not None
     )
-    if not numeric_candidates:
+    if len(numeric_candidates) != len(parsed_candidates):
         return _quarantined("ambiguous_fallback", warnings=warnings)
     highest_dlevel = max(chart.dlevel_normalized for _, chart in numeric_candidates)
     assert highest_dlevel is not None
