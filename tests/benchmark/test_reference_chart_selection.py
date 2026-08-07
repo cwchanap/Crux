@@ -12,6 +12,7 @@ import src.benchmark.corpus_cache as corpus_cache
 from src.benchmark.chart_names import CHART_FILENAME_PRIORITY
 from src.benchmark.corpus_manifest import ManifestRowView
 from src.benchmark.r2_corpus_models import (
+    MAX_SIMFILE_ID,
     ProvenanceRecord,
     RemoteObject,
     SimfileInventory,
@@ -922,6 +923,7 @@ def test_fallback_never_uses_alphabetical_order_for_unrecognized_tie(tmp_path: P
         ("selected", "override", (), None, None, "Artist"),
         ("quarantined", "override", ("override_invalid",), None, None, None),
         ("quarantined", None, (), None, None, None),
+        ("pending", None, (), None, None, None),
     ],
 )
 def test_fallback_chart_selection_enforces_status_invariants(
@@ -974,3 +976,169 @@ def test_chart_selection_rejects_nonstring_selected_metadata(
             artist=artist,
             override=None,
         )
+
+
+# ---------------------------------------------------------------------------
+# Override document shape / schema validation (lines 113, 115, 119, 252)
+# ---------------------------------------------------------------------------
+
+
+def _write_overrides(tmp_path: Path, content: bytes) -> Path:
+    path = tmp_path / "overrides.json"
+    path.write_bytes(content)
+    return path
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'{"overrides":{}}\n',
+        b'{"extra":"x","overrides":{},"schema_version":"crux.reference-chart-overrides/v1"}\n',
+        b"[]\n",
+    ],
+    ids=["missing-schema-version", "extra-key", "not-an-object"],
+)
+def test_load_selection_overrides_rejects_invalid_document_shape(
+    tmp_path: Path, content: bytes
+) -> None:
+    with pytest.raises(ValueError, match="invalid shape"):
+        load_selection_overrides(_write_overrides(tmp_path, content), missing_ok=False)
+
+
+def test_load_selection_overrides_rejects_unsupported_schema_version(tmp_path: Path) -> None:
+    content = b'{"overrides":{},"schema_version":"crux.wrong/v1"}\n'
+    with pytest.raises(ValueError, match="unsupported schema_version"):
+        load_selection_overrides(_write_overrides(tmp_path, content), missing_ok=False)
+
+
+def test_load_selection_overrides_rejects_non_object_overrides(tmp_path: Path) -> None:
+    content = b'{"overrides":[],"schema_version":"crux.reference-chart-overrides/v1"}\n'
+    with pytest.raises(ValueError, match="overrides must be an object"):
+        load_selection_overrides(_write_overrides(tmp_path, content), missing_ok=False)
+
+
+def test_load_selection_overrides_rejects_simfile_id_above_max(tmp_path: Path) -> None:
+    over_max = str(MAX_SIMFILE_ID + 1)
+    content = (
+        b'{"overrides":{"' + over_max.encode() + b'":{"chart_key":"42/real.dtx","reason":"audit"}},'
+        b'"schema_version":"crux.reference-chart-overrides/v1"}\n'
+    )
+    with pytest.raises(ValueError, match="decimal integer"):
+        load_selection_overrides(_write_overrides(tmp_path, content), missing_ok=False)
+
+
+# ---------------------------------------------------------------------------
+# Override document I/O edge cases (lines 239, 241-242)
+# ---------------------------------------------------------------------------
+
+
+def test_load_selection_overrides_returns_empty_when_file_missing_and_ok(
+    tmp_path: Path,
+) -> None:
+    loaded = load_selection_overrides(tmp_path / "absent.json", missing_ok=True)
+    assert loaded.document_sha256 == sha256(_EMPTY_OVERRIDE_DOCUMENT).hexdigest()
+    assert loaded.by_simfile_id == {}
+
+
+def test_load_selection_overrides_rejects_unavailable_file_even_when_missing_ok(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "not-a-file"
+    directory.mkdir()
+    with pytest.raises(ValueError, match="unavailable"):
+        load_selection_overrides(directory, missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Authored slot edge cases (lines 186, 212, 227)
+# ---------------------------------------------------------------------------
+
+
+def test_authored_slots_skip_level_with_label_but_no_file(tmp_path: Path) -> None:
+    set_def_body = b"#L5LABEL: Beginner\n#L4FILE: l4.dtx\n"
+    chart_body = _chart_body(dlevel="50")
+    selection = _select(
+        tmp_path,
+        (
+            (_remote("42/set.def", set_def_body), set_def_body),
+            (_remote("42/l4.dtx", chart_body), chart_body),
+        ),
+    )
+
+    assert selection.status == "selected"
+    assert selection.selected_level_slot == "L4"
+    assert selection.selected_chart is not None
+    assert selection.selected_chart.key == "42/l4.dtx"
+
+
+def test_authored_slots_quarantine_when_resolved_object_is_not_a_chart(
+    tmp_path: Path,
+) -> None:
+    set_def_body = b"#L5FILE: readme.md\n"
+    readme_body = b"not a chart"
+    selection = _select(
+        tmp_path,
+        (
+            (_remote("42/set.def", set_def_body), set_def_body),
+            (_remote("42/readme.md", readme_body), readme_body),
+        ),
+    )
+
+    assert selection.status == "quarantined"
+    assert selection.reason_codes == ("invalid_chart_reference",)
+
+
+def test_authored_slots_quarantine_when_all_referenced_files_are_missing(
+    tmp_path: Path,
+) -> None:
+    set_def_body = b"#L5FILE: absent.dtx\n#L4FILE: also_absent.dtx\n"
+    chart_body = _chart_body(dlevel="50")
+    selection = _select(
+        tmp_path,
+        (
+            (_remote("42/set.def", set_def_body), set_def_body),
+            (_remote("42/unrelated.dtx", chart_body), chart_body),
+        ),
+    )
+
+    assert selection.status == "quarantined"
+    assert selection.reason_codes == ("referenced_chart_missing",)
+
+
+# ---------------------------------------------------------------------------
+# Fallback and set.def discovery edge cases (lines 347, 410)
+# ---------------------------------------------------------------------------
+
+
+def test_fallback_quarantines_multiple_candidates_without_numeric_dlevel(
+    tmp_path: Path,
+) -> None:
+    body_a = _chart_body(dlevel="not-a-number")
+    body_b = _chart_body(dlevel="also-bad")
+    selection = _select(
+        tmp_path,
+        (
+            (_remote("42/alpha.dtx", body_a), body_a),
+            (_remote("42/beta.dtx", body_b), body_b),
+        ),
+    )
+
+    assert selection.status == "quarantined"
+    assert selection.reason_codes == ("ambiguous_fallback",)
+
+
+def test_set_def_discovery_quarantines_multiple_root_copies_without_unique_lowercase(
+    tmp_path: Path,
+) -> None:
+    upper_body = _set_def_body("upper.dtx")
+    mixed_body = _set_def_body("mixed.dtx")
+    selection = _select(
+        tmp_path,
+        (
+            (_remote("42/SET.DEF", upper_body), upper_body),
+            (_remote("42/Set.Def", mixed_body), mixed_body),
+        ),
+    )
+
+    assert selection.status == "quarantined"
+    assert selection.reason_codes == ("ambiguous_set_def",)

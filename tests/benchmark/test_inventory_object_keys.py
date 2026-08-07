@@ -144,3 +144,68 @@ def test_resolve_inventory_object_key_never_matches_a_sibling_prefix() -> None:
     )
 
     assert result == ResolvedObjectKey("missing", "42/Charts/REAL.DTX", None)
+
+
+def test_resolve_inventory_object_key_rejects_object_prefix_without_trailing_slash() -> None:
+    result = resolve_inventory_object_key(
+        "REAL.DTX",
+        base_object_key_dir="42",
+        object_prefix="42",
+        objects=(remote("42/REAL.DTX"),),
+    )
+
+    assert result == ResolvedObjectKey("invalid_path", None, None)
+
+
+def test_resolve_inventory_object_key_rejects_base_dir_starting_above_prefix() -> None:
+    result = resolve_inventory_object_key(
+        "REAL.DTX",
+        base_object_key_dir="../42",
+        object_prefix="42/",
+        objects=(remote("42/REAL.DTX"),),
+    )
+
+    assert result == ResolvedObjectKey("invalid_path", None, None)
+
+
+def test_resolve_inventory_object_key_normalizes_dot_in_object_prefix() -> None:
+    """A prefix like './42/' contains a '.' component that pathlib preserves
+    at the start.  The resolver normalizes it away (line 89)."""
+    result = resolve_inventory_object_key(
+        "REAL.DTX",
+        base_object_key_dir="42",
+        object_prefix="./42/",
+        objects=(remote("42/REAL.DTX"),),
+    )
+
+    assert result.status == "exact"
+    assert result.normalized_key == "42/REAL.DTX"
+
+
+def test_resolve_inventory_object_key_normalizes_dot_dot_in_object_prefix() -> None:
+    """A prefix like '42/sub/../' contains a '..' that pathlib preserves.
+    The resolver pops the preceding component (line 93) and normalizes
+    the prefix to '42/'."""
+    result = resolve_inventory_object_key(
+        "REAL.DTX",
+        base_object_key_dir="42",
+        object_prefix="42/sub/../",
+        objects=(remote("42/REAL.DTX"),),
+    )
+
+    assert result.status == "exact"
+    assert result.normalized_key == "42/REAL.DTX"
+
+
+def test_resolve_inventory_object_key_normalizes_dot_in_base_dir() -> None:
+    """A base dir like './42' contains a '.' component that pathlib preserves
+    at the start.  The resolver normalizes it away (line 106)."""
+    result = resolve_inventory_object_key(
+        "REAL.DTX",
+        base_object_key_dir="./42",
+        object_prefix="42/",
+        objects=(remote("42/REAL.DTX"),),
+    )
+
+    assert result.status == "exact"
+    assert result.normalized_key == "42/REAL.DTX"

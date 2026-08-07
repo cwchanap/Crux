@@ -90,3 +90,12 @@ def test_decode_dtxmania_text_rejects_gibberish_without_leaking_source_bytes(raw
     assert source_name in message
     assert raw.decode("latin-1") not in message
     assert repr(raw) not in message
+
+
+def test_decode_dtxmania_text_rejects_an_unsupported_kind() -> None:
+    with pytest.raises(ValueError, match="could not decode DTXMania"):
+        decode_dtxmania_text(
+            DTX_TEXT.encode("utf-8"),
+            source_name="chart.dtx",
+            kind="unknown",  # type: ignore[arg-type]
+        )

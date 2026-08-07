@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
@@ -710,3 +711,361 @@ def test_publication_returns_fatal_without_a_manifest_when_immutable_write_fails
     assert outcome.status == "failed"
     assert outcome.exit_code == 2
     assert outcome.manifest is None
+
+
+# ---------------------------------------------------------------------------
+# _load_source_manifest edge cases (lines 130-131, 141)
+# ---------------------------------------------------------------------------
+
+
+def test_input_loader_rejects_unreadable_manifest_path(tmp_path: Path) -> None:
+    directory = tmp_path / "not-a-file"
+    directory.mkdir()
+
+    with pytest.raises(ValueError, match="unavailable"):
+        _load_source_manifest(directory)
+
+
+def test_input_loader_rejects_blank_line_between_records(tmp_path: Path) -> None:
+    first = _source_row(42, empty=True)
+    second = _source_row(43, empty=True)
+    first["corpus_version"] = _SOURCE_CORPUS_VERSION
+    second["corpus_version"] = _SOURCE_CORPUS_VERSION
+    content = _source_manifest_bytes((first, second))
+    # Insert a standalone blank line between the two records.
+    blank_pos = content.index(b"\n") + 1
+    content = content[:blank_pos] + b"\n" + content[blank_pos:]
+    manifest_path = tmp_path / "source.jsonl"
+    manifest_path.write_bytes(content)
+
+    with pytest.raises(ValueError, match="canonical JSONL"):
+        _load_source_manifest(manifest_path)
+
+
+# ---------------------------------------------------------------------------
+# _build_selection_row: selected chart with valid hash but missing cache_path
+# (line 313)
+# ---------------------------------------------------------------------------
+
+
+def test_row_construction_rejects_selected_chart_with_missing_cache_path(
+    tmp_path: Path,
+) -> None:
+    source_row = _source_row(empty=True)
+    manifest_path, _ = _write_source_manifest(tmp_path, (source_row,))
+    loaded = _load_source_manifest(manifest_path)
+    (validated,) = loaded.rows
+
+    chart_remote = RemoteObject(
+        key="42/real.dtx",
+        size=1,
+        etag="etag",
+        etag_is_weak=False,
+        last_modified=_FIXED_TIME,
+        content_type="text/plain",
+        cache_status="verified",
+        sha256="a" * 64,
+        cache_path=None,
+    )
+    selection = ChartSelection(
+        status="selected",
+        method="override",
+        reason_codes=(),
+        warnings=(),
+        set_def=None,
+        selected_chart=chart_remote,
+        selected_level_slot=None,
+        selected_level_label=None,
+        dlevel_raw="99",
+        dlevel_normalized=99,
+        title="Title",
+        artist="Artist",
+        override=None,
+    )
+
+    with pytest.raises(ValueError, match="selected chart identity is invalid"):
+        _build_selection_row(
+            validated,
+            source_manifest_sha256=loaded.source_manifest_sha256,
+            override_document_sha256="e" * 64,
+            selection=selection,
+        )
+
+
+# ---------------------------------------------------------------------------
+# validate_schema_golden: top-level content / structure errors
+# (lines 363, 365, 375, 380, 396, 409)
+# ---------------------------------------------------------------------------
+
+
+def test_schema_golden_validator_rejects_unsupported_schema_name() -> None:
+    with pytest.raises(ValueError, match="unsupported schema golden"):
+        validate_schema_golden("crux.wrong/v1", _SCHEMA_GOLDEN_PATH.read_bytes())
+
+
+def test_schema_golden_validator_rejects_extra_trailing_newline() -> None:
+    content = _SCHEMA_GOLDEN_PATH.read_bytes() + b"\n"
+    with pytest.raises(ValueError, match="canonical JSONL"):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, content)
+
+
+def test_schema_golden_validator_rejects_non_object_rows() -> None:
+    with pytest.raises(ValueError, match="rows must be objects"):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, b"[]\n[]\n")
+
+
+def test_schema_golden_validator_rejects_non_canonical_json_line() -> None:
+    rows = _schema_golden_rows()
+    # Replace the first line with non-canonical JSON (sorted keys but
+    # extra whitespace after the separator).
+    first = canonical_json_bytes(rows[0])
+    non_canonical = first.replace(b'":', b'" :', 1)
+    content = non_canonical + b"\n" + canonical_json_bytes(rows[1]) + b"\n"
+    with pytest.raises(ValueError, match="canonical JSONL"):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, content)
+
+
+def test_schema_golden_validator_accepts_not_selected_cache_status_object() -> None:
+    """Objects with cache_status != 'verified' skip the cache identity check
+    (line 440 continue branch).  Adding a not_selected object to the golden
+    row exercises the continue branch without breaking the selected chart or
+    set.def identity checks."""
+    rows = _schema_golden_rows()
+    extra_object = {
+        "cache_path": None,
+        "cache_status": "not_selected",
+        "content_type": "text/plain",
+        "etag": "extra-etag",
+        "etag_is_weak": False,
+        "key": "42/extra.txt",
+        "last_modified": "2026-08-05T00:00:01Z",
+        "sha256": None,
+        "size": 10,
+        "version": None,
+    }
+    rows[0]["objects"].append(extra_object)
+    # Re-render with the mutated rows so the corpus_version and content
+    # match what validate_schema_golden expects.
+    normalized = tuple({k: v for k, v in row.items() if k != "corpus_version"} for row in rows)
+    rendered = render_manifest(normalized)
+    # Should not raise — not_selected objects skip the cache identity check.
+    validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, rendered.content)
+
+
+def test_schema_golden_validator_rejects_selected_row_with_non_string_title() -> None:
+    rows = _schema_golden_rows()
+    rows[0]["title"] = 42
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+def test_schema_golden_validator_rejects_duplicate_selected_rows() -> None:
+    rows = _schema_golden_rows()
+    rows[1] = deepcopy(rows[0])
+    with pytest.raises(ValueError, match="one selected and one quarantined"):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+def test_schema_golden_validator_rejects_mixed_source_identity() -> None:
+    rows = _schema_golden_rows()
+    rows[1]["source_endpoint_sha256"] = "e" * 64
+    with pytest.raises(ValueError, match="mixed source identity"):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+def test_schema_golden_validator_rejects_derived_corpus_version_drift() -> None:
+    rows = _schema_golden_rows()
+    new_version = "sha256:" + "a" * 64
+    rows[0]["corpus_version"] = new_version
+    rows[1]["corpus_version"] = new_version
+    with pytest.raises(ValueError, match="invalid derived corpus version"):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+# ---------------------------------------------------------------------------
+# validate_schema_golden: _validate_reference_row field-level errors
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda r: r.pop("title"),
+        lambda r: r.__setitem__("schema_version", "crux.wrong/v1"),
+        lambda r: r.__setitem__("source_corpus_version", "not-sha256"),
+        lambda r: r.__setitem__("corpus_version", "not-sha256"),
+    ],
+    ids=[
+        "invalid-key-set",
+        "unsupported-schema",
+        "invalid-source-corpus-version",
+        "invalid-corpus-version",
+    ],
+)
+def test_schema_golden_validator_rejects_invalid_reference_row_contract(mutation) -> None:
+    rows = _schema_golden_rows()
+    mutation(rows[0])
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+def test_schema_golden_validator_rejects_verified_object_without_cache_identity() -> None:
+    rows = _schema_golden_rows()
+    rows[0]["objects"][0]["sha256"] = None
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+def test_schema_golden_validator_rejects_invalid_object_cache_path() -> None:
+    rows = _schema_golden_rows()
+    rows[0]["objects"][0]["cache_path"] = 42
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+def test_schema_golden_validator_rejects_object_cache_path_escape() -> None:
+    rows = _schema_golden_rows()
+    rows[0]["objects"][0]["cache_path"] = "../escape"
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda r: r.__setitem__("selection_status", "pending"),
+        lambda r: r.__setitem__("selection_warnings", "not-a-list"),
+        lambda r: r.__setitem__("selection_warnings", [42]),
+    ],
+    ids=["invalid-status", "non-list-warnings", "non-string-warning"],
+)
+def test_schema_golden_validator_rejects_invalid_selection_status_or_warnings(mutation) -> None:
+    rows = _schema_golden_rows()
+    mutation(rows[0])
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+def test_schema_golden_validator_rejects_selected_row_with_reason_codes() -> None:
+    rows = _schema_golden_rows()
+    rows[0]["selection_reason_codes"] = ["source_inventory_unusable"]
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+@pytest.mark.parametrize(
+    "reason_codes",
+    [
+        "not-a-list",
+        ["unknown_reason"],
+        [42],
+    ],
+    ids=["non-list", "unknown-code", "non-string-code"],
+)
+def test_schema_golden_validator_rejects_invalid_reason_codes(reason_codes: object) -> None:
+    rows = _schema_golden_rows()
+    rows[1]["selection_reason_codes"] = reason_codes
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "not-a-dict",
+        {"chart_key": "42/real.dtx"},
+        {"chart_key": "", "reason": "audit"},
+        {"chart_key": "42/real.dtx", "reason": ""},
+        {"chart_key": 42, "reason": "audit"},
+    ],
+    ids=["non-dict", "missing-key", "empty-chart-key", "empty-reason", "non-string-chart-key"],
+)
+def test_schema_golden_validator_rejects_invalid_selection_override(override: object) -> None:
+    rows = _schema_golden_rows()
+    rows[0]["selection_override"] = override
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda r: r.__setitem__("selected_level_slot", "L6"),
+        lambda r: r.__setitem__("selected_level_label", 42),
+        lambda r: r.__setitem__("dlevel_raw", 42),
+        lambda r: r.__setitem__("dlevel_normalized", True),
+        lambda r: r.__setitem__("dlevel_normalized", 101),
+    ],
+    ids=[
+        "invalid-slot",
+        "invalid-label",
+        "invalid-dlevel-raw",
+        "bool-dlevel",
+        "dlevel-out-of-range",
+    ],
+)
+def test_schema_golden_validator_rejects_invalid_level_metadata(mutation) -> None:
+    rows = _schema_golden_rows()
+    mutation(rows[0])
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+def test_schema_golden_validator_rejects_invalid_set_def_identity() -> None:
+    rows = _schema_golden_rows()
+    rows[0]["set_def_key"] = "42/not-a-set-def"
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+def test_schema_golden_validator_rejects_inconsistent_set_def_identity() -> None:
+    rows = _schema_golden_rows()
+    rows[0]["set_def_content_hash"] = "a" * 64
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+def test_schema_golden_validator_rejects_invalid_selected_chart_identity() -> None:
+    rows = _schema_golden_rows()
+    rows[0]["selected_chart_key"] = "42/not-a-chart"
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+def test_schema_golden_validator_rejects_inconsistent_selected_chart_identity() -> None:
+    rows = _schema_golden_rows()
+    new_hash = "b" * 64
+    rows[0]["selected_chart_content_hash"] = new_hash
+    rows[0]["selected_chart_cache_path"] = f"sha256/bb/{new_hash}"
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["source_manifest_sha256", "override_document_sha256"],
+)
+def test_schema_golden_validator_rejects_non_string_sha256(field: str) -> None:
+    rows = _schema_golden_rows()
+    rows[0][field] = 42
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["source_manifest_sha256", "override_document_sha256"],
+)
+def test_schema_golden_validator_rejects_uppercase_sha256(field: str) -> None:
+    rows = _schema_golden_rows()
+    rows[0][field] = "F" * 64
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+def test_schema_golden_validator_rejects_non_sha256_corpus_version() -> None:
+    rows = _schema_golden_rows()
+    rows[0]["source_corpus_version"] = "sha256:short"
+    rows[1]["source_corpus_version"] = "sha256:short"
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
