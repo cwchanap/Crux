@@ -17,9 +17,12 @@ from src.benchmark.reference_timing import (
     TIMING_REASON_CODES,
     BgmReferenceGroup,
     BgmReferenceSet,
+    BgmResolution,
     TimingReasonCode,
     resolve_bgm_reference_groups,
+    select_bgm_reference,
 )
+from src.benchmark.timing import DtxTimingMap, build_dtx_timing_map
 
 _FIXED_TIME = datetime(2026, 8, 5, tzinfo=timezone.utc)
 _CHART_ID = "42/real.dtx"
@@ -344,3 +347,107 @@ def test_partial_failure_keeps_resolved_groups_and_records_reasons() -> None:
     (group,) = result.groups
     assert group.remote is audio
     assert group.events == (events[0],)
+
+
+# ---------------------------------------------------------------------------
+# Frozen conservative selector: select_bgm_reference / BgmResolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_for_select(
+    chart: ParsedDtxChart, row: ReferenceChartRowView, *, allow_root_fallback: bool = True
+) -> tuple[BgmReferenceSet, DtxTimingMap]:
+    references = resolve_bgm_reference_groups(
+        chart,
+        selected_chart_key="42/real.dtx",
+        row=row,
+        allow_root_fallback=allow_root_fallback,
+    )
+    return references, build_dtx_timing_map(chart)
+
+
+def test_select_bgm_reference_zero_groups_returns_bgm_event_missing() -> None:
+    chart = _chart([], {"01": "bgm.ogg"})
+    row = _row_view((_remote("real.dtx"),))
+    references, timing_map = _resolve_for_select(chart, row)
+
+    resolution = select_bgm_reference(references, timing_map)
+
+    assert isinstance(resolution, BgmResolution)
+    assert resolution.selected_event is None
+    assert resolution.chart_time_sec is None
+    assert resolution.reason_codes == ("bgm_event_missing",)
+    assert resolution.warnings == ()
+    assert set(resolution.reason_codes) <= TIMING_REASON_CODES
+
+
+def test_select_bgm_reference_one_group_picks_lowest_source_order_event() -> None:
+    event = _bgm(1, 0.5, "01", order=3)
+    chart = _chart([event], {"01": "bgm.ogg"})
+    audio = _remote("bgm.ogg")
+    row = _row_view((_remote("real.dtx"), audio))
+    references, timing_map = _resolve_for_select(chart, row)
+
+    resolution = select_bgm_reference(references, timing_map)
+
+    assert resolution.reason_codes == ()
+    assert resolution.warnings == ()
+    assert resolution.selected_event is event
+    # Measure 1, position 0.5, default 1.0 measure length, 120 BPM -> 3.0s.
+    assert resolution.chart_time_sec == timing_map.time_sec(event)
+    assert resolution.chart_time_sec == 3.0
+
+
+def test_select_bgm_reference_repeated_tokens_emit_one_deterministic_warning() -> None:
+    # Two tokens at the same identity collapse to one group retaining both.
+    low = _bgm(0, 0.0, "01", order=1)
+    high = _bgm(0, 0.0, "02", order=2)
+    chart = _chart([high, low], {"01": "bgm.ogg", "02": "bgm.ogg"})
+    audio = _remote("bgm.ogg")
+    row = _row_view((_remote("real.dtx"), audio))
+    references, timing_map = _resolve_for_select(chart, row)
+    (group,) = references.groups
+    assert len(group.events) == 2
+
+    resolution = select_bgm_reference(references, timing_map)
+
+    assert resolution.reason_codes == ()
+    # Lowest source_order wins.
+    assert resolution.selected_event is low
+    assert resolution.chart_time_sec == timing_map.time_sec(low)
+    # Exactly one deterministic warning summarizing the repeated tokens.
+    assert len(resolution.warnings) == 1
+    assert resolution.warnings == ("repeated_bgm_tokens:01,02:count=2",)
+
+
+def test_select_bgm_reference_multiple_groups_returns_ambiguous_bgm_start() -> None:
+    # Same file at two positions -> two groups (no winner chosen).
+    events = [_bgm(0, 0.0, "01", order=0), _bgm(1, 0.5, "01", order=1)]
+    chart = _chart(events, {"01": "bgm.ogg"})
+    audio = _remote("bgm.ogg")
+    row = _row_view((_remote("real.dtx"), audio))
+    references, timing_map = _resolve_for_select(chart, row)
+    assert len(references.groups) > 1
+
+    resolution = select_bgm_reference(references, timing_map)
+
+    assert resolution.selected_event is None
+    assert resolution.chart_time_sec is None
+    assert resolution.reason_codes == ("ambiguous_bgm_start",)
+    assert resolution.warnings == ()
+    assert set(resolution.reason_codes) <= TIMING_REASON_CODES
+
+
+def test_select_bgm_reference_is_deterministic_across_calls() -> None:
+    low = _bgm(0, 0.0, "01", order=1)
+    high = _bgm(0, 0.0, "02", order=2)
+    chart = _chart([high, low], {"01": "bgm.ogg", "02": "bgm.ogg"})
+    audio = _remote("bgm.ogg")
+    row = _row_view((_remote("real.dtx"), audio))
+    references, timing_map = _resolve_for_select(chart, row)
+
+    first = select_bgm_reference(references, timing_map)
+    second = select_bgm_reference(references, timing_map)
+
+    assert first == second
+    assert first.selected_event is low
