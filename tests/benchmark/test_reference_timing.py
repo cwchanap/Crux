@@ -974,15 +974,49 @@ def test_validate_reference_event_golden_rejects_non_finite_time() -> None:
         validate_schema_golden(REFERENCE_EVENT_SCHEMA, nonfinite)
 
 
-def test_validate_reference_event_golden_rejects_wrong_type_time() -> None:
-    # The structural-mutation harness sets the first sorted key (audio_time_sec)
-    # to integer 0; a Decimal-only time check must reject it.
+@pytest.mark.parametrize("invalid", ["soon", True])
+def test_validate_reference_event_golden_rejects_wrong_type_time(invalid: object) -> None:
+    # Whole-number times legitimately render to integer tokens that parse back
+    # as ``int`` (see the acceptance test below), so a wrong-type time is probed
+    # with a string and a bool rather than an integer.  Both must be rejected.
     row = _golden_event_row()
-    row["audio_time_sec"] = 0
+    row["audio_time_sec"] = invalid
     content = canonical_json_bytes(row, trailing_newline=True)
 
     with pytest.raises(ValueError):
         validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)
+
+
+def test_validate_reference_event_golden_accepts_whole_number_times() -> None:
+    # Regression: the canonical renderer collapses whole-number Decimals to
+    # bare-integer tokens (Decimal("0.0") -> "0"), which strict_json_loads parses
+    # back as ``int``.  build_audio_relative_events realistically emits such
+    # whole-number times — the COMMON clamp-to-zero outcome (audio_time_sec=0.0),
+    # the exact-duration outcome (audio_time_sec=duration_sec), position=0.0, and
+    # whole-number chart_time_sec.  A byte stream produced by
+    # render_reference_events must therefore PASS validate_schema_golden.
+    chart = _chart_with_events(
+        [_note(0, measure=0, position=0.0), _note(1, measure=0, position=0.0)]
+    )
+    timing_map = _FakeTimingMap({0: 5.0, 1: 15.0})
+    result = build_audio_relative_events(
+        chart,
+        timing_map,
+        bgm_chart_time_sec=5.0,
+        audio=_audio(duration_sec=10.0, sample_rate=100),
+        **_IDENTITY_KWARGS,
+    )
+
+    # Sanity: the realistic whole-number outcomes the renderer collapses.
+    audio_times = sorted(event.audio_time_sec for event in result.events)
+    assert audio_times == [0.0, 10.0]
+    assert any(event.position == 0.0 for event in result.events)
+    assert any(float(event.chart_time_sec).is_integer() for event in result.events)
+
+    rendered = render_reference_events(result.events)
+
+    # Must not raise: the rendered byte stream validates end-to-end.
+    validate_schema_golden(REFERENCE_EVENT_SCHEMA, rendered)
 
 
 def test_validate_reference_event_golden_rejects_non_canonical_bytes() -> None:

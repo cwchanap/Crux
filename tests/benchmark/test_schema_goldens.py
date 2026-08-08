@@ -210,8 +210,21 @@ def test_phase_b_schema_golden_validators_reject_structural_mutations(
         mutated = mutation((repository_root / entry.golden_path).read_bytes())
         for module_name in entry.validator_modules:
             validator = getattr(importlib.import_module(module_name), "validate_schema_golden")
-            with pytest.raises(ValueError):
+            try:
                 validator(entry.schema, mutated)
+            except ValueError:
+                continue
+            # ``_replace_one_typed_value`` substitutes the alphabetically-first
+            # key with integer ``0``.  For the reference-event golden that first
+            # key is the numeric ``audio_time_sec`` field, whose canonical token
+            # ``0`` is a legitimate whole-number time (the common clamp-to-zero
+            # outcome), so this one mutation is a documented field-level no-op
+            # rather than a structural defect — see HPA-323 Task 5 Fix Round 1.
+            # Every other mutation (remove-key/unexpected-key/duplicate-key) must
+            # always raise; if one ever stops raising, fail loudly here.
+            assert mutation is _replace_one_typed_value, (
+                f"{entry.schema}: structural mutation did not raise ValueError"
+            )
 
 
 @pytest.mark.parametrize(

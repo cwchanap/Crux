@@ -18,6 +18,7 @@ from src.benchmark.corpus_manifest import (
     canonical_json_line,
     inventory_from_manifest_row,
     manifest_row_view_from_row,
+    publish_immutable_bytes,
     publish_latest_manifest,
     publish_manifest,
     render_manifest,
@@ -141,6 +142,23 @@ def test_canonical_json_line_rejects_non_json_numbers(value: float) -> None:
 def test_canonical_json_line_rejects_strings_that_are_not_utf8_encodable() -> None:
     with pytest.raises(UnicodeEncodeError):
         canonical_json_line({"unsafe": "\ud800"})
+
+
+def test_publish_immutable_bytes_is_the_public_publisher_entrypoint(tmp_path: Path) -> None:
+    # Cross-module callers (e.g. reference_timing.publish_immutable_content) go
+    # through this public name rather than the leading-underscore internals.  It
+    # must expose the same hash-checked, durable publication as _publish_immutable.
+    path = tmp_path / "payload.jsonl"
+    content = b'{"a":1}\n'
+
+    publish_immutable_bytes(path, content, sha256(content).hexdigest())
+
+    assert path.read_bytes() == content
+
+    # A hash mismatch surfaces as ManifestPublicationError — the full durability
+    # / conflict path of _publish_immutable is delegated, not duplicated.
+    with pytest.raises(ManifestPublicationError):
+        publish_immutable_bytes(path, content, "0" * 64)
 
 
 def test_render_manifest_is_order_independent_for_inputs() -> None:
