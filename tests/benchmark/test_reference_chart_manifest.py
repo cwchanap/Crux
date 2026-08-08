@@ -17,10 +17,12 @@ from src.benchmark.corpus_manifest import (
 from src.benchmark.r2_corpus_models import RemoteObject, SimfileInventory, SyncError
 from src.benchmark.reference_chart_manifest import (
     REFERENCE_CHART_MANIFEST_SCHEMA,
+    ReferenceChartRowView,
     SelectionOutcome,
     SelectionRequest,
     _build_selection_row,
     _load_source_manifest,
+    reference_chart_row_view_from_row,
     select_reference_manifest,
     validate_schema_golden,
 )
@@ -1080,3 +1082,85 @@ def test_schema_golden_validator_rejects_non_sha256_corpus_version() -> None:
     rows[1]["source_corpus_version"] = "sha256:short"
     with pytest.raises(ValueError):
         validate_schema_golden(REFERENCE_CHART_MANIFEST_SCHEMA, _canonical_jsonl(rows))
+
+
+# ---------------------------------------------------------------------------
+# reference_chart_row_view_from_row: typed view over merged HPA-322 rows
+# ---------------------------------------------------------------------------
+
+
+def test_row_view_exposes_the_selected_golden_row(tmp_path: Path) -> None:
+    remote = _remote(42, "real.dtx", _CHART_BODY)
+    source_row = _source_row(objects=(remote,))
+    manifest_path, _ = _write_source_manifest(tmp_path, (source_row,))
+    cache_dir = tmp_path / "cache"
+    _install_cached_bodies(cache_dir, ((remote, _CHART_BODY),))
+
+    selected_row = _render_selection_row(manifest_path, cache_dir)
+    view = reference_chart_row_view_from_row(selected_row)
+
+    assert isinstance(view, ReferenceChartRowView)
+    assert view.selection_status == "selected"
+    assert view.selected_chart is not None
+    assert view.selected_chart.key == selected_row["selected_chart_key"]
+    assert view.selected_chart_content_hash == selected_row["selected_chart_content_hash"]
+    assert view.selected_chart.key == remote.key
+    assert view.selected_chart.sha256 == remote.sha256
+    assert view.selection_reason_codes == ()
+    assert view.selection_warnings == ()
+    assert view.corpus_version == selected_row["corpus_version"]
+    assert view.source.corpus_version == selected_row["source_corpus_version"]
+    assert view.simfile_id == 42
+    assert view.simfile_id == view.source.inventory.simfile_id
+
+
+def test_row_view_exposes_the_quarantined_golden_row(tmp_path: Path) -> None:
+    source_row = _source_row(empty=True)
+    manifest_path, _ = _write_source_manifest(tmp_path, (source_row,))
+
+    quarantined_row = _render_selection_row(manifest_path, tmp_path / "cache")
+    view = reference_chart_row_view_from_row(quarantined_row)
+
+    assert view.selection_status == "quarantined"
+    assert view.selected_chart is None
+    assert view.selected_chart_content_hash is None
+    assert view.selection_reason_codes == ("source_inventory_unusable",)
+    assert view.selection_warnings == ()
+    assert view.simfile_id == view.source.inventory.simfile_id
+
+
+def test_row_view_resolves_selected_chart_from_the_validated_inventory(tmp_path: Path) -> None:
+    remote = _remote(42, "real.dtx", _CHART_BODY)
+    source_row = _source_row(objects=(remote,))
+    manifest_path, _ = _write_source_manifest(tmp_path, (source_row,))
+    cache_dir = tmp_path / "cache"
+    _install_cached_bodies(cache_dir, ((remote, _CHART_BODY),))
+
+    selected_row = _render_selection_row(manifest_path, cache_dir)
+    view = reference_chart_row_view_from_row(selected_row)
+
+    assert view.selected_chart is not None
+    assert view.selected_chart in view.source.inventory.objects
+    assert view.selected_chart is view.source.inventory.objects[0]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda row: row.pop("selected_chart_key"),
+        lambda row: row.__setitem__("schema_version", "crux.unsupported/v1"),
+        lambda row: row.__setitem__("selection_status", "pending"),
+    ],
+    ids=["invalid-key-set", "unsupported-schema", "invalid-status"],
+)
+def test_row_view_fails_through_the_merged_reference_validator(tmp_path: Path, mutation) -> None:
+    remote = _remote(42, "real.dtx", _CHART_BODY)
+    source_row = _source_row(objects=(remote,))
+    manifest_path, _ = _write_source_manifest(tmp_path, (source_row,))
+    cache_dir = tmp_path / "cache"
+    _install_cached_bodies(cache_dir, ((remote, _CHART_BODY),))
+    selected_row = _render_selection_row(manifest_path, cache_dir)
+    mutation(selected_row)
+
+    with pytest.raises(ValueError):
+        reference_chart_row_view_from_row(selected_row)
