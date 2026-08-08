@@ -4,31 +4,39 @@
 
 **Goal:** Consume the merged HPA-322 `crux.reference-chart-manifest/v1`, derive trustworthy audio-relative native DTX events, and publish immutable artifacts for HPA-324.
 
-**Architecture:** Measure real BGM layouts first, extend the existing parser/timing engine with evidence-backed DTX semantics and explicit clock names, expose one thin public HPA-322 row view over the merged validator, reuse all merged cache/key contracts, cache only exact selected audio misses, and publish content-addressed native event JSONL plus a derived manifest.
+**Architecture:** Extend the existing parser/timing engine, expose one thin typed view over HPA-322's merged row validator, use a closed timing-reason contract, reuse HPA-322's cache/key machinery, add exact-key audio cache fill, run a committed corpus diagnostic over the real production helpers, freeze BGM/format policy from that evidence, then publish native events and a derived timing manifest.
 
 **Tech Stack:** Python 3.12, dataclasses, pathlib, strict canonical JSONL, Click, soundfile, existing R2/boto3 adapter, pytest, Ruff, Pylint.
 
 ## Global Constraints
 
-- HPA-322 is merged as PR #10; do not code against the old planning-only shape.
+- HPA-322 is merged as PR #10; code against merged `main`, not the old planning branch.
 - Reuse `ManifestRowView`, `read_verified_cache_body`, `resolve_verified_cache_body`,
-  `resolve_inventory_object_key`, `parse_dtx_bytes`, and the existing manifest publishers.
+  `resolve_inventory_object_key`, `parse_dtx_bytes`, and existing manifest publishers.
 - Do not call `manifest_row_view_from_row` directly on an HPA-322 reference-chart row;
   its key set is intentionally HPA-321-only.
-- Expose one `ReferenceChartRowView` from `reference_chart_manifest.py`; do not create
-  another manifest/inventory module or source-object class.
+- Expose one `ReferenceChartRowView` from `reference_chart_manifest.py`; do not add a
+  second manifest/inventory module or source-object class.
+- Expose `selected_chart_content_hash` on that typed view; use
+  `row.source.inventory.simfile_id` / `row.simfile_id` property instead of duplicating
+  simfile ID storage.
+- Define `TimingReasonCode = Literal[...]` and validate stable reason arrays from that
+  closed type.
 - DTX channel `02` is sticky until superseded; this is backed by DTXManiaXG source.
 - Channel `01` becomes typed BGM control data and never enters native playable events.
-- Measure real BGM group/root-fallback distribution before freezing multi-group policy.
-- Rename chart-time APIs; keep no ambiguous `dtx_events_to_timed_events` alias.
-- Require `--cache-dir` explicitly.
+- Keep BGM grouping policy-neutral until the corpus diagnostic is run.
+- Group by `(remote.key, measure, position)`, never floating-point time.
+- Rename chart-time APIs; keep no `dtx_events_to_timed_events` compatibility alias.
+- Require `--cache-dir` explicitly; do not inherit HPA-322's manifest-relative default.
 - Verify selected DTX bytes once through `read_verified_cache_body`.
-- Verify each selected audio body once unless targeted fill changes its inventory record.
+- Verify each selected audio body once unless exact-key fill changes its inventory record.
 - Preserve HPA-321's global `is_selected` / `CACHE_PROFILE` behavior.
 - Preserve every HPA-322 lineage/selection field; do not overwrite
   `source_manifest_sha256` or `source_corpus_version`.
 - Follow the merged schema-golden convention for new stable schemas.
-- Run the full test suite immediately after the timing-semantics change.
+- Keep the corpus diagnostic committed and reproducible; do not use an uncommitted
+  throwaway resolver/parser path.
+- Split pure manifest contract work from cache/R2 orchestration.
 
 ## Primary Timing Evidence
 
@@ -51,6 +59,8 @@ not DTX:
 - `tests/benchmark/test_reference_timing_acceptance.py`
 - `tests/benchmark/schema_goldens/crux.dtx-reference-event-v1.jsonl`
 - `tests/benchmark/schema_goldens/crux.reference-timing-manifest-v1.jsonl`
+- `tools/hpa323/analyze_reference_timing.py`
+- `tests/tools/test_hpa323_analyze_reference_timing.py`
 
 ### Modify
 
@@ -74,84 +84,7 @@ not DTX:
 
 ---
 
-### Task 0: Measure real BGM group and fallback distribution
-
-**Files:**
-- No committed production files.
-- Local output: `artifacts/benchmark/reference-timing-analysis/bgm-layout.json`
-
-**Consumes:** merged HPA-322 manifest/cache, `_validate_reference_row` for temporary
-analysis only, `read_verified_cache_body`, `parse_dtx_bytes`, and
-`resolve_inventory_object_key`.
-
-- [ ] **Step 1: Run a read-only analysis over a real HPA-322 manifest**
-
-For each canonical JSONL row:
-
-1. require `schema_version == "crux.reference-chart-manifest/v1"`;
-2. call the existing private `_validate_reference_row(row)` only in this temporary
-   uncommitted script to obtain the embedded `ManifestRowView`;
-3. skip `selection_status != "selected"` except for total counts;
-4. locate the exact selected `RemoteObject` using `selected_chart_key`;
-5. read it with:
-
-```python
-chart_bytes = read_verified_cache_body(
-    cache_dir,
-    selected_remote,
-    source_endpoint_sha256=source_view.source_endpoint_sha256,
-    bucket=source_view.source_bucket,
-    expected_sha256=row["selected_chart_content_hash"],
-)
-chart = parse_dtx_bytes(
-    chart_bytes,
-    chart_id=str(row["simfile_id"]),
-    source_name=str(row["selected_chart_key"]),
-)
-```
-
-6. before Task 1 lands, treat current generic events with `lane_id == "01"` as the BGM
-   observations;
-7. resolve each observation's `#WAVxx` value using `resolve_inventory_object_key` relative
-   to the selected-chart directory;
-8. after a relative `missing`, call the same resolver from the simfile root and record
-   whether that compatibility fallback is actually needed;
-9. group resolved observations by `(remote.key, measure, position)`.
-
-Do not implement another path normalizer, traversal check, exact matcher, or casefold
-index in the analysis script.
-
-- [ ] **Step 2: Write the measurement report**
-
-```json
-{
-  "selected_rows": 0,
-  "rows_with_0_bgm_groups": 0,
-  "rows_with_1_bgm_group": 0,
-  "rows_with_multiple_bgm_groups": 0,
-  "rows_with_unresolved_wav": 0,
-  "rows_needing_case_insensitive_match": 0,
-  "rows_needing_simfile_root_fallback": 0,
-  "multi_group_examples": []
-}
-```
-
-Cap examples at 25 and retain only simfile ID, chart key, object keys, note IDs,
-measures, and positions. Do not copy source bodies into the report.
-
-- [ ] **Step 3: Freeze policy before Task 2**
-
-- exceptional multi-group rows -> retain `ambiguous_bgm_start` quarantine;
-- common multi-group rows -> inspect representative authored charts and amend the design
-  before implementing BGM selection;
-- zero root-fallback rows -> remove the root fallback entirely;
-- do not choose the earliest group without authored-chart evidence.
-
-Record counts and the frozen policy in HPA-323 and the implementation PR.
-
----
-
-### Task 1: Typed BGM events, sticky timing, and explicit clock names
+## Task 1: Typed BGM events, sticky timing, and explicit clock names
 
 **Files:**
 - Modify: `src/benchmark/models.py`
@@ -208,19 +141,29 @@ def test_channel_01_is_typed_bgm_not_native_event() -> None:
 Add one test proving monotonic `source_order` across non-zero channel `01` and playable
 pattern tokens.
 
-- [ ] **Step 2: Verify parser tests fail**
+- [ ] **Step 2: Add regression proof that channel `01` was never playable**
+
+Cover the existing behavior explicitly:
+
+- `render_audio` ignores lane `01` because it is absent from `DEFAULT_DTX_LANE_MAP`;
+- mapping classifies lane `01` only as unmapped diagnostics.
+
+The purpose is to prove that removing `01` from `chart.events` changes control-data
+visibility, not playable drum output.
+
+- [ ] **Step 3: Verify parser tests fail before implementation**
 
 ```bash
 uv run pytest tests/benchmark/test_dtx_parser.py -k "channel_01 or source_order" -q
 ```
 
-- [ ] **Step 3: Implement typed pattern parsing**
+- [ ] **Step 4: Implement typed pattern parsing**
 
 Add `source_order` to `DtxEvent`. Add `DtxBgmEvent` next to `DtxBpmEvent`. Route channel
 `01` into `bgm_events`; all other non-control pattern channels remain `DtxEvent`.
 Keep pattern source order separate from BPM source order.
 
-- [ ] **Step 4: Replace the incorrect channel `02` fixture**
+- [ ] **Step 5: Replace the incorrect channel `02` fixture**
 
 ```python
 def test_dtx_measure_length_persists_until_superseded() -> None:
@@ -249,15 +192,20 @@ Also add:
 
 - multiple sticky changes `0.5 -> 1.5 -> 1.0`;
 - BPM change inside a sticky shortened measure with expected `4.5` seconds;
-- BGM and playable event parity through one timing map.
+- BGM and playable event parity through one timing map;
+- unchanged base BPM/channel `03`/channel `08`/fractional-position fixtures.
 
-- [ ] **Step 5: Implement `DtxTimingMap`**
+- [ ] **Step 6: Implement `DtxTimingMap` by extending existing helpers**
 
-Carry the active measure length forward. Use the resolved length for measure starts and
+Carry active measure length forward. Use the resolved length for measure starts and
 in-measure positions of BPM, BGM, and native events. Extend max-measure discovery with
 BGM events. Preserve existing tempo tie behavior.
 
-- [ ] **Step 6: Rename the chart-time API**
+Do not create a second timing engine; factor the existing
+`_measure_lengths_by_measure`, `_measure_start_beats`, `_event_beat`, `_tempo_points`,
+and `_time_at_beat` logic behind `DtxTimingMap`.
+
+- [ ] **Step 7: Rename the chart-time API**
 
 Rename `dtx_events_to_timed_events` to `dtx_events_to_chart_time_events` with no alias.
 Update every caller and import.
@@ -269,7 +217,7 @@ Add to legacy scoring:
 # audio-time reference artifacts and must not use this path.
 ```
 
-- [ ] **Step 7: Run the full blast-radius checks**
+- [ ] **Step 8: Run the full blast-radius checks**
 
 ```bash
 uv run pytest -q
@@ -278,8 +226,10 @@ uv run ruff format --check src tests
 ```
 
 Any changed score/golden expectation must be investigated rather than blindly rewritten.
+The real-corpus magnitude of the channel-`02` change is measured later by the committed
+Task 4 diagnostic; this step proves repository behavior remains internally coherent.
 
-- [ ] **Step 8: Commit Task 1**
+- [ ] **Step 9: Commit Task 1**
 
 ```bash
 git add src/benchmark/models.py src/benchmark/dtx_parser.py src/benchmark/timing.py \
@@ -289,7 +239,7 @@ git commit -m "fix: distinguish DTX chart and BGM timing"
 
 ---
 
-### Task 2: Expose the merged HPA-322 row view and resolve BGM identity
+## Task 2: Expose the HPA-322 row view, close reason codes, and resolve BGM groups
 
 **Files:**
 - Modify: `src/benchmark/reference_chart_manifest.py`
@@ -297,7 +247,7 @@ git commit -m "fix: distinguish DTX chart and BGM timing"
 - Create: `src/benchmark/reference_timing.py`
 - Create: `tests/benchmark/test_reference_timing.py`
 
-**Interfaces:**
+### Interfaces
 
 ```python
 @dataclass(frozen=True)
@@ -308,6 +258,11 @@ class ReferenceChartRowView:
     selection_reason_codes: tuple[str, ...]
     selection_warnings: tuple[str, ...]
     selected_chart: RemoteObject | None
+    selected_chart_content_hash: str | None
+
+    @property
+    def simfile_id(self) -> int:
+        return self.source.inventory.simfile_id
 
 
 def reference_chart_row_view_from_row(
@@ -315,40 +270,78 @@ def reference_chart_row_view_from_row(
 ) -> ReferenceChartRowView: ...
 ```
 
-and:
+Use the typed property for simfile ID; do not store a second integer field.
+
+Define the stable reason-code contract:
+
+```python
+TimingReasonCode = Literal[
+    "upstream_chart_selection_unavailable",
+    "selected_chart_cache_invalid",
+    "selected_chart_parse_failed",
+    "timing_map_invalid",
+    "bgm_event_missing",
+    "unresolved_bgm_wav",
+    "unsafe_bgm_audio_path",
+    "source_audio_missing",
+    "source_audio_key_ambiguous",
+    "ambiguous_bgm_start",
+    "source_audio_download_failed",
+    "source_audio_cache_invalid",
+    "source_audio_decode_failed",
+    "non_finite_reference_time",
+    "no_in_bounds_reference_events",
+]
+```
+
+Policy-neutral BGM grouping:
 
 ```python
 @dataclass(frozen=True)
-class ResolvedBgm:
+class BgmReferenceGroup:
     remote: RemoteObject
-    event: DtxBgmEvent
-    chart_time_sec: float
-    used_root_fallback: bool
+    measure: int
+    position: float
+    events: tuple[DtxBgmEvent, ...]
+
 
 @dataclass(frozen=True)
-class BgmResolution:
-    status: Literal["resolved", "quarantined"]
-    selected: ResolvedBgm | None
-    reason_codes: tuple[str, ...]
+class BgmReferenceSet:
+    groups: tuple[BgmReferenceGroup, ...]
+    reason_codes: tuple[TimingReasonCode, ...]
     warnings: tuple[str, ...]
     bgm_event_count: int
-    bgm_group_count: int
+
+
+def resolve_bgm_reference_groups(
+    chart: ParsedDtxChart,
+    *,
+    selected_chart_key: str,
+    row: ReferenceChartRowView,
+    allow_root_fallback: bool,
+) -> BgmReferenceSet: ...
 ```
+
+`ResolvedBgm.used_root_fallback` is deliberately absent until Task 4 proves that root
+fallback should survive. If retained, production communicates its use through a stable
+warning rather than precommitting to an unnecessary field.
 
 - [ ] **Step 1: Write failing `ReferenceChartRowView` tests**
 
-Use the merged HPA-322 golden rows. Assert:
+Use the merged HPA-322 golden rows. Assert selected and quarantined views, including:
 
 ```python
 selected = reference_chart_row_view_from_row(selected_row)
 assert selected.selection_status == "selected"
 assert selected.selected_chart is not None
 assert selected.selected_chart.key == selected_row["selected_chart_key"]
-assert selected.source.inventory.simfile_id == selected_row["simfile_id"]
+assert selected.selected_chart_content_hash == selected_row["selected_chart_content_hash"]
+assert selected.simfile_id == selected.source.inventory.simfile_id
 
 quarantined = reference_chart_row_view_from_row(quarantined_row)
 assert quarantined.selection_status == "quarantined"
 assert quarantined.selected_chart is None
+assert quarantined.selected_chart_content_hash is None
 ```
 
 Also assert malformed/identity-inconsistent rows still fail through the existing HPA-322
@@ -356,36 +349,51 @@ validator.
 
 - [ ] **Step 2: Implement the adapter by reusing merged validation**
 
-`reference_chart_row_view_from_row` must call the existing `_validate_reference_row`.
-For a selected row, find the exact `RemoteObject` by the already-validated
-`selected_chart_key`. Convert reason/warning lists to tuples. Do not duplicate key-set,
-cache-path, digest, DLEVEL, or selected/nullability validation.
+`reference_chart_row_view_from_row` must call the existing HPA-322 reference-row
+validator. Resolve the selected `RemoteObject` from the already-validated inventory and
+narrow the selected hash to `str` for selected rows.
 
-- [ ] **Step 3: Write BGM resolver-status tests**
+Do not duplicate key-set, cache-path, digest, DLEVEL, or selected/nullability validation.
 
-Test mapping of shared `resolve_inventory_object_key` outcomes:
+- [ ] **Step 3: Write and implement the closed reason-code contract**
+
+Tests should assert:
+
+```python
+TIMING_REASON_CODES == frozenset(get_args(TimingReasonCode))
+```
+
+All `BgmReferenceSet` reason codes must be `TimingReasonCode`; no free-form strings.
+
+- [ ] **Step 4: Write shared-resolver mapping tests**
+
+Test mapping of `resolve_inventory_object_key` outcomes:
 
 - `exact` / `casefold` -> use `result.remote`;
 - `invalid_path` -> `unsafe_bgm_audio_path`;
 - `ambiguous` -> `source_audio_key_ambiguous`;
-- `missing` -> optional measured root retry, then `source_audio_missing`.
+- `missing` -> optional root retry, then `source_audio_missing`.
 
 Do not repeat HPA-322's normalization/casefold matrix.
 
-- [ ] **Step 4: Write group-policy tests from Task 0**
+- [ ] **Step 5: Write grouping tests without freezing multi-group selection**
 
-Always group by `(remote.key, event.measure, event.position)`, never float time. Cover
-repeated tokens at one identity and multiple distinct groups according to the policy
-frozen in Task 0.
+Always group by `(remote.key, event.measure, event.position)`, never float time. Cover:
 
-- [ ] **Step 5: Implement pure BGM resolution**
+- repeated tokens at one identity collapse to one group and retain source events;
+- same file at two positions yields two groups;
+- different files at one position yields two groups;
+- unresolved WAV note ID -> `unresolved_bgm_wav`;
+- zero BGM events -> `bgm_event_missing`.
 
-`resolve_bgm_reference` receives `ReferenceChartRowView`, the parsed chart, timing map,
-and selected chart key. Resolve all BGM note IDs through `wav_table`, call only the
-shared object-key resolver, preserve event/group counts, and compute chart time only for
-the selected event.
+Do **not** yet choose a winner for multiple groups.
 
-- [ ] **Step 6: Validate and commit Task 2**
+- [ ] **Step 6: Implement policy-neutral group collection**
+
+`resolve_bgm_reference_groups` receives only the typed row view and parsed chart. It uses
+`row.source.inventory` and `row.selected_chart` and never indexes the raw HPA-322 mapping.
+
+- [ ] **Step 7: Validate and commit Task 2**
 
 ```bash
 uv run pytest \
@@ -406,12 +414,12 @@ git add \
   src/benchmark/reference_timing.py \
   tests/benchmark/test_reference_chart_manifest.py \
   tests/benchmark/test_reference_timing.py
-git commit -m "feat: expose reference chart timing input"
+git commit -m "feat: expose reference chart timing inputs"
 ```
 
 ---
 
-### Task 3: Fill only exact selected source-audio cache keys
+## Task 3: Fill only exact selected audio cache keys
 
 **Files:**
 - Modify: `src/benchmark/corpus_cache.py`
@@ -430,26 +438,38 @@ def sync_explicit_cache_keys(
 ) -> CacheSyncResult: ...
 ```
 
-- [ ] **Step 1: Write failing explicit-key tests**
+- [ ] **Step 1: Write selector-preservation tests**
 
-Use one inventory containing `real.dtx`, `bgm.ogg`, and `preview.ogg`; select only
-`bgm.ogg`. Assert only the requested key is opened or mutated. Cover cache hit, download,
-failed download, absent requested key, empty key, and unrelated object preservation.
+Assert existing `sync_cache` still selects exactly the HPA-321 profile: `set.def`,
+`.dtx`, and `.txt`. Audio remains outside `is_selected` and `CACHE_PROFILE`.
 
-- [ ] **Step 2: Verify failure**
+- [ ] **Step 2: Write explicit-key tests**
+
+Cover:
+
+- one selected audio key while unrelated objects remain unchanged;
+- multiple exact keys including candidates from a multi-group chart;
+- selected key absent from supplied inventory -> usage/invariant failure;
+- cache hit;
+- conditional remote change;
+- download/install success;
+- partial download failure;
+- empty selected-key set.
+
+- [ ] **Step 3: Verify tests fail before implementation**
 
 ```bash
 uv run pytest tests/benchmark/test_corpus_cache.py -k explicit_cache -q
 ```
 
-- [ ] **Step 3: Extract one selector-driven internal worker**
+- [ ] **Step 4: Extract one internal selector-driven cache path**
 
-Keep public `sync_cache` unchanged and have it delegate with the existing `is_selected`.
-Have `sync_explicit_cache_keys` delegate with exact key membership. Do not duplicate
-locking, conditional GET, download validation, hashing, index publication, installation,
-or inventory rebuilding.
+Make `sync_cache` delegate to the existing body with `is_selected`; make
+`sync_explicit_cache_keys` delegate with exact membership. Do not duplicate locking,
+conditional GET, verification, hashing, install, progress, index, or inventory rebuild
+logic.
 
-- [ ] **Step 4: Validate and commit Task 3**
+- [ ] **Step 5: Validate and commit Task 3**
 
 ```bash
 uv run pytest tests/benchmark/test_corpus_cache.py -q
@@ -461,7 +481,175 @@ git commit -m "feat: cache exact benchmark audio keys"
 
 ---
 
-### Task 4: Build and publish bounded native event artifacts
+## Task 4: Commit the corpus diagnostic and freeze timing/BGM/format policy
+
+This task replaces the old throwaway Task 0. It runs **after** Tasks 1-3 so it can use
+the real typed parser, timing map, HPA-322 adapter, BGM group resolver, and exact-key
+cache fill.
+
+**Files:**
+- Create: `tools/hpa323/analyze_reference_timing.py`
+- Create: `tests/tools/test_hpa323_analyze_reference_timing.py`
+- Modify: `src/benchmark/reference_timing.py` only if the frozen BGM policy needs a
+  small selection helper/warning.
+- Modify: `tests/benchmark/test_reference_timing.py` for the frozen policy.
+
+**Command shape:**
+
+```bash
+uv run python tools/hpa323/analyze_reference_timing.py \
+  --manifest artifacts/benchmark/reference-charts/manifests/<sha>.jsonl \
+  --cache-dir artifacts/benchmark/r2-corpus/cache \
+  --output artifacts/benchmark/reference-timing-analysis/bgm-layout.json \
+  --audio-sample-limit 50
+```
+
+The tool may fill the **local** cache for sampled exact audio keys through
+`sync_explicit_cache_keys`; it never changes R2 or broadens the default cache profile.
+
+- [ ] **Step 1: Write diagnostic-unit tests around production seams**
+
+Use fixture rows and fake store/cache. Assert the tool calls:
+
+- `reference_chart_row_view_from_row`;
+- `read_verified_cache_body` + `parse_dtx_bytes` for selected charts;
+- `resolve_bgm_reference_groups` for BGM grouping;
+- `sync_explicit_cache_keys` for sampled missing audio;
+- `resolve_verified_cache_body` before `sf.info`;
+- `build_dtx_timing_map` for both corrected and diagnostic-legacy comparisons.
+
+No private HPA-322 validator or private path/casefold helper is allowed.
+
+- [ ] **Step 2: Report BGM group and path-resolution distribution**
+
+Write canonical sorted JSON containing:
+
+```text
+selected_rows
+upstream_quarantined_rows
+rows_with_0_bgm_groups
+rows_with_1_bgm_group
+rows_with_multiple_bgm_groups
+rows_with_unresolved_wav
+rows_needing_case_insensitive_match
+rows_needing_simfile_root_fallback
+multi_group_examples[]
+```
+
+Cap examples at 25 and retain simfile ID, chart key, object keys, note IDs, measures,
+and positions only.
+
+- [ ] **Step 3: Report authored audio extension distribution**
+
+Count extension values from the selected charts' referenced BGM `#WAVxx` strings:
+
+```text
+bgm_extension_counts
+```
+
+Normalize extension case for counting only. Do not use extensions to decide decodability.
+
+- [ ] **Step 4: Sample actual audio decodability**
+
+For up to `--audio-sample-limit` unique resolved candidate audio objects:
+
+1. fill the exact key if its verified body is unavailable;
+2. verify the installed body;
+3. call `soundfile.info(path)` on the content-addressed, extensionless body;
+4. catch `(OSError, RuntimeError, ValueError, sf.LibsndfileError)`;
+5. record:
+
+```text
+sampled_audio_count
+sampled_audio_decodable_count
+sampled_audio_undecodable_count
+sampled_audio_undecodable_by_extension
+```
+
+The report distinguishes authored filename extension from actual decoder result.
+
+- [ ] **Step 5: Measure real channel-`02` blast radius**
+
+Record:
+
+```text
+charts_with_channel_02
+charts_with_multiple_channel_02_changes
+max_channel_02_time_delta_sec
+channel_02_delta_examples[]
+```
+
+For each selected chart:
+
+1. build the corrected `DtxTimingMap`;
+2. construct a diagnostic chart copy where every measure up to the chart max has an
+   explicit length `chart.measure_lengths.get(measure, 1.0)`;
+3. run the **same corrected timing map** on that copy; explicit `1.0` values reproduce
+   the old per-measure reset behavior without preserving a second timing engine;
+4. compare native event times by `source_order`;
+5. record the maximum absolute delta and a bounded set of affected examples.
+
+- [ ] **Step 6: Verify deterministic diagnostics**
+
+Run the tool twice against the same fixture and assert byte-identical report output.
+The diagnostic is committed/re-runnable but is not a stable schema golden.
+
+- [ ] **Step 7: Run the real corpus diagnostic**
+
+Run against the actual HPA-322 output/cache and review:
+
+- multiple BGM group frequency;
+- root fallback frequency;
+- extension distribution;
+- `sf.info` failure rate and representative extensions;
+- channel-`02` affected-row count and largest timing deltas.
+
+- [ ] **Step 8: Freeze policy before Task 5**
+
+Decision rules:
+
+- exceptional multi-group rows -> `ambiguous_bgm_start` quarantine;
+- common multi-group rows -> inspect representative authored charts and amend the
+  design before selecting a rule;
+- zero root-fallback rows -> remove the root retry branch entirely;
+- material decoder failures -> freeze supported-format/quarantine behavior before
+  native event publication;
+- material channel-`02` deltas -> inspect representative charts before landing;
+- never choose the earliest BGM group merely to increase yield.
+
+If conservative multi-group quarantine is retained, add a small pure selector:
+
+```python
+def select_bgm_reference(
+    references: BgmReferenceSet,
+    timing_map: DtxTimingMap,
+) -> BgmResolution: ...
+```
+
+One group selects its lowest-source-order event; repeated tokens in the same group emit a
+warning. Multiple groups emit `ambiguous_bgm_start`.
+
+If root fallback survives, add only the measured compatibility branch and a deterministic
+warning. Keep `ResolvedBgm.used_root_fallback` out unless a later consumer actually needs
+that boolean.
+
+- [ ] **Step 9: Record evidence and commit Task 4**
+
+Add the real report counts/policy to HPA-323 and the implementation PR description.
+Commit the tool and frozen policy code/tests:
+
+```bash
+git add \
+  tools/hpa323/analyze_reference_timing.py \
+  tests/tools/test_hpa323_analyze_reference_timing.py \
+  src/benchmark/reference_timing.py \
+  tests/benchmark/test_reference_timing.py
+git commit -m "test: measure reference timing corpus behavior"
+```
+
+---
+
+## Task 5: Audio metadata, bounded native events, and event schema golden
 
 **Files:**
 - Modify: `src/benchmark/reference_timing.py`
@@ -483,12 +671,16 @@ class SourceAudioInfo:
 
 @dataclass(frozen=True)
 class NativeReferenceEvent:
-    chart_id: str
-    lane_id: str
-    note_id: str
+    simfile_id: int
+    selected_chart_key: str
+    selected_chart_content_hash: str
+    source_audio_key: str
+    source_audio_content_hash: str
+    source_order: int
     measure: int
     position: float
-    source_order: int
+    lane_id: str
+    note_id: str
     chart_time_sec: float
     audio_time_sec: float
 
@@ -502,34 +694,51 @@ class AudioRelativeReference:
 def inspect_source_audio(path: Path) -> SourceAudioInfo: ...
 
 
-def build_audio_relative_events(...) -> AudioRelativeReference: ...
-
-
-def render_reference_event_jsonl(...) -> bytes: ...
+def build_audio_relative_events(
+    chart: ParsedDtxChart,
+    timing_map: DtxTimingMap,
+    *,
+    simfile_id: int,
+    selected_chart_key: str,
+    selected_chart_content_hash: str,
+    source_audio_key: str,
+    source_audio_content_hash: str,
+    bgm_chart_time_sec: float,
+    audio: SourceAudioInfo,
+) -> AudioRelativeReference: ...
 ```
 
-- [ ] **Step 1: Write source-audio metadata tests**
+- [ ] **Step 1: Write metadata tests**
 
-Generate a small WAV and assert duration, samplerate, channels, and frames from
-`soundfile.info`. Cover undecodable and zero-frame files.
+Use small generated WAV fixtures. Cover valid metadata, zero frames, and an unreadable
+body.
 
-- [ ] **Step 2: Write bounds tests**
+Use the same expected exception family as `render_audio.py`:
+`OSError`, `RuntimeError`, `ValueError`, `sf.LibsndfileError`.
 
-Cover BGM subtraction, exact boundaries, one-frame clamps, larger pre/post exclusions,
-non-finite time, zero retained events, and source-order preservation.
+- [ ] **Step 2: Write audio-relative bounds tests**
 
-- [ ] **Step 3: Implement audio-time events**
+Cover:
 
-Use:
+- BGM shift;
+- exact zero and exact duration;
+- one-frame negative/late clamp;
+- materially negative/late exclusions and counters;
+- non-finite time -> `non_finite_reference_time`;
+- zero retained events -> `no_in_bounds_reference_events`;
+- source-order and native identity preservation.
 
-```text
-chart_time_sec = timing_map.time_sec(event)
-audio_time_sec = chart_time_sec - selected_bgm_chart_time_sec
-```
+- [ ] **Step 3: Implement metadata and event construction**
 
-Do not map lanes or deduplicate hits. Sort deterministically before rendering.
+Use `soundfile.info` without waveform decode. One audio frame is the tolerance.
 
-- [ ] **Step 4: Expose the corpus immutable-byte publisher**
+- [ ] **Step 4: Render deterministic event JSONL**
+
+Define `REFERENCE_EVENT_SCHEMA = "crux.dtx-reference-event/v1"`. Use the existing
+canonical JSON helper per event. Sort by deterministic native identity and verify repeated
+rendering produces byte-identical output/hash.
+
+- [ ] **Step 5: Expose the existing immutable byte publisher**
 
 Add only:
 
@@ -542,19 +751,17 @@ def publish_immutable_content(
     _publish_immutable(path, content, expected_sha256)
 ```
 
-Test new publication, identical reuse, wrong expected hash, and conflicting existing
-bytes. Do not create another publication implementation.
+Do not duplicate durability/conflict logic.
 
-- [ ] **Step 5: Add the event schema golden**
+- [ ] **Step 6: Add and register the event schema golden**
 
-Define `REFERENCE_EVENT_SCHEMA = "crux.dtx-reference-event/v1"` and
-`validate_schema_golden(schema, content)` in `reference_timing.py`. Register
-`tests/benchmark/schema_goldens/crux.dtx-reference-event-v1.jsonl` in the central
-schema-golden manifest.
+Create `crux.dtx-reference-event-v1.jsonl`, add it to the schema-golden registry, and
+implement `validate_schema_golden` support in `reference_timing.py`.
 
-The golden must be canonical JSONL and include all stable event identity/timing fields.
+The validator must reject unknown/missing keys, invalid timing reason-independent
+identity fields, non-finite times, and invalid SHA-256 values.
 
-- [ ] **Step 6: Validate and commit Task 4**
+- [ ] **Step 7: Validate and commit Task 5**
 
 ```bash
 uv run pytest \
@@ -562,33 +769,45 @@ uv run pytest \
   tests/benchmark/test_corpus_manifest.py \
   tests/benchmark/test_schema_goldens.py -q
 uv run ruff check \
-  src/benchmark/reference_timing.py src/benchmark/corpus_manifest.py \
-  tests/benchmark/test_reference_timing.py tests/benchmark/test_corpus_manifest.py
+  src/benchmark/reference_timing.py \
+  src/benchmark/corpus_manifest.py \
+  tests/benchmark/test_reference_timing.py \
+  tests/benchmark/test_corpus_manifest.py \
+  tests/benchmark/test_schema_goldens.py
 uv run ruff format --check \
-  src/benchmark/reference_timing.py src/benchmark/corpus_manifest.py \
-  tests/benchmark/test_reference_timing.py tests/benchmark/test_corpus_manifest.py
+  src/benchmark/reference_timing.py \
+  src/benchmark/corpus_manifest.py \
+  tests/benchmark/test_reference_timing.py \
+  tests/benchmark/test_corpus_manifest.py \
+  tests/benchmark/test_schema_goldens.py
 git add \
-  src/benchmark/reference_timing.py src/benchmark/corpus_manifest.py \
-  tests/benchmark/test_reference_timing.py tests/benchmark/test_corpus_manifest.py \
+  src/benchmark/reference_timing.py \
+  src/benchmark/corpus_manifest.py \
+  tests/benchmark/test_reference_timing.py \
+  tests/benchmark/test_corpus_manifest.py \
   tests/benchmark/schema_goldens/crux.dtx-reference-event-v1.jsonl \
   tests/benchmark/schema_goldens/manifest.json
-git commit -m "feat: publish native DTX reference events"
+git commit -m "feat: publish bounded reference events"
 ```
 
 ---
 
-### Task 5: Orchestrate the derived timing manifest
+## Task 6a: Pure timing-manifest contract, lineage, rendering, and golden
+
+This task is intentionally offline and reviewable without R2/cache orchestration.
 
 **Files:**
 - Create: `src/benchmark/reference_timing_manifest.py`
 - Create: `tests/benchmark/test_reference_timing_manifest.py`
-- Create: `tests/benchmark/test_reference_timing_acceptance.py`
 - Create: `tests/benchmark/schema_goldens/crux.reference-timing-manifest-v1.jsonl`
 - Modify: `tests/benchmark/schema_goldens/manifest.json`
 
 **Interfaces:**
 
 ```python
+REFERENCE_TIMING_MANIFEST_SCHEMA = "crux.reference-timing-manifest/v1"
+TIMING_SEMANTICS_VERSION = "crux.dtx-audio-timing/v1"
+
 @dataclass(frozen=True)
 class ReferenceTimingRequest:
     manifest_path: Path
@@ -602,34 +821,28 @@ class ReferenceTimingOutcome:
     manifest: PublishedManifest | None
     ready_count: int
     quarantined_count: int
+    upstream_quarantined_count: int
     events_published: int
-
-
-def build_reference_timing_manifest(
-    request: ReferenceTimingRequest,
-    *,
-    environ: Mapping[str, str] | None = None,
-    dependency_check: Callable[[], None] = ensure_r2_dependency,
-    store_factory: StoreFactory = create_boto3_store,
-) -> ReferenceTimingOutcome: ...
 ```
+
+No `report_path`.
 
 - [ ] **Step 1: Write canonical HPA-322 source-loading tests**
 
-Read exact bytes once. For every non-empty line use `strict_json_loads(...,
-require_canonical=True)` and `reference_chart_row_view_from_row`.
+Require:
 
-Reject:
+- canonical JSONL with one final newline;
+- `crux.reference-chart-manifest/v1` rows;
+- validation through `reference_chart_row_view_from_row`;
+- unique simfile IDs;
+- one shared HPA-322 input `corpus_version` and source identity;
+- exact input-byte SHA-256;
+- input `corpus_version` reproducible via `render_manifest` after removing that field.
 
-- empty/non-canonical JSONL;
-- wrong schema;
-- duplicate simfile IDs;
-- mixed HPA-322 derived `corpus_version`;
-- mixed embedded source endpoint/bucket/cache/discovery identity;
-- a file whose rows do not reproduce the same bytes and derived corpus version through
-  `render_manifest`.
+Reject malformed schema, duplicate IDs, mixed source identities, invalid selected/null
+shape, and inconsistent derived corpus version.
 
-Do not call `manifest_row_view_from_row` directly on HPA-322 rows.
+Do not call `manifest_row_view_from_row(hpa322_row)` directly.
 
 - [ ] **Step 2: Test lineage preservation and field naming**
 
@@ -641,160 +854,284 @@ source_reference_chart_manifest_sha256
 source_reference_chart_version
 ```
 
-where the first is SHA-256 of the exact HPA-322 input bytes and the second is the common
-HPA-322 derived `corpus_version`.
+The first equals the exact HPA-322 input-byte SHA-256. The second equals the HPA-322
+input `corpus_version`.
 
-Assert no upstream field is overwritten.
+- [ ] **Step 3: Write pure derived-row tests**
 
-- [ ] **Step 3: Write first-pass tests**
+Without any R2/store/cache behavior, test rendering of:
 
-For selected rows:
+- ready row with complete source-audio/event metadata;
+- upstream HPA-322 quarantined row ->
+  `upstream_chart_selection_unavailable`;
+- HPA-323 quarantined row with source/event fields null;
+- exact pass-through of all other HPA-322 fields;
+- deterministic warning/reason ordering;
+- `TimingReasonCode` rejection for unknown strings.
 
-1. read selected chart bytes with `read_verified_cache_body`, using the selected
-   `RemoteObject` from `ReferenceChartRowView` and the row's selected chart hash;
-2. parse via `parse_dtx_bytes`;
-3. build `DtxTimingMap`;
-4. resolve BGM/audio identity;
-5. call `resolve_verified_cache_body` once for selected audio;
-6. retain verified paths and queue only unavailable audio for targeted fill.
+- [ ] **Step 4: Add outcome accounting semantics**
 
-Upstream quarantined rows must receive `upstream_chart_selection_unavailable` and do no
-chart parsing or R2 work.
-
-Map chart body/parser failures to `selected_chart_cache_invalid` /
-`selected_chart_parse_failed`; map timing construction errors to `timing_map_invalid`.
-
-- [ ] **Step 4: Write targeted-fill tests**
-
-Prove:
-
-- complete cache never calls dependency/store factories;
-- missing audio creates/validates R2 config only when needed;
-- source bucket/endpoint must match the embedded HPA-322 source identity;
-- only exact selected keys are passed to `sync_explicit_cache_keys`;
-- returned inventories merge by simfile ID;
-- only rows whose inventory changed are verified after the merge;
-- unrelated object records are preserved.
-
-- [ ] **Step 5: Write event and derived-row tests**
-
-Ready rows publish `events/<sha256>.jsonl` through `publish_immutable_content`. Derived
-rows preserve every HPA-322 field and add the timing fields from the design.
-
-Require:
+Pure counters must support:
 
 ```text
-ready_count + quarantined_count = input row count
-events_published = ready_count
+ready + quarantined = input rows
+upstream_quarantined_count <= quarantined_count
+events_published = ready
 ```
 
-All ready -> `complete`, exit `0`; any row quarantine -> `partial`, exit `1`; fatal
-input/config/publication -> `failed`, exit `2` with `manifest is None`.
+Exit convention remains:
 
-- [ ] **Step 6: Implement immutable timing-manifest publication**
+- no quarantines -> `0`;
+- any upstream or HPA-323 quarantine with published manifest -> `1`;
+- fatal loading/publication preparation -> `2`.
 
-Use `render_manifest`, `publish_manifest`, and `publish_latest_manifest`. Do not add a
-separate report artifact or `report_path` field.
+The separate `upstream_quarantined_count` provides signal without changing the existing
+exit-code convention.
 
-- [ ] **Step 7: Add the timing-manifest schema golden**
+- [ ] **Step 5: Add timing-manifest schema golden**
 
-Define `REFERENCE_TIMING_MANIFEST_SCHEMA = "crux.reference-timing-manifest/v1"` and
-`validate_schema_golden`. Add a canonical golden with one ready and one quarantined row,
-and register it in `tests/benchmark/schema_goldens/manifest.json`.
+Register `crux.reference-timing-manifest/v1` in the shared schema-golden registry.
+Create a canonical golden with one ready and one quarantined row and a valid derived
+corpus version.
 
-The validator must verify the exact key set, status-dependent nullability, reason codes,
-embedded HPA-322 reference row consistency, and the derived corpus version.
+`validate_schema_golden` must use `get_args(TimingReasonCode)` for reason validation.
 
-- [ ] **Step 8: Build the offline acceptance fixture**
-
-Cover:
-
-- selected chart read through the merged HPA-322 cache contract;
-- complete audio cache requiring no R2;
-- one exact-key audio fill using a fake store;
-- one upstream HPA-322 quarantine;
-- one BGM/timing quarantine;
-- deterministic second-run event and manifest identities.
-
-- [ ] **Step 9: Validate and commit Task 5**
+- [ ] **Step 6: Validate and commit Task 6a**
 
 ```bash
 uv run pytest \
-  tests/benchmark/test_reference_chart_manifest.py \
-  tests/benchmark/test_reference_timing.py \
   tests/benchmark/test_reference_timing_manifest.py \
-  tests/benchmark/test_reference_timing_acceptance.py \
   tests/benchmark/test_schema_goldens.py -q
 uv run ruff check \
   src/benchmark/reference_timing_manifest.py \
   tests/benchmark/test_reference_timing_manifest.py \
-  tests/benchmark/test_reference_timing_acceptance.py
+  tests/benchmark/test_schema_goldens.py
 uv run ruff format --check \
   src/benchmark/reference_timing_manifest.py \
   tests/benchmark/test_reference_timing_manifest.py \
-  tests/benchmark/test_reference_timing_acceptance.py
+  tests/benchmark/test_schema_goldens.py
 git add \
   src/benchmark/reference_timing_manifest.py \
   tests/benchmark/test_reference_timing_manifest.py \
-  tests/benchmark/test_reference_timing_acceptance.py \
   tests/benchmark/schema_goldens/crux.reference-timing-manifest-v1.jsonl \
   tests/benchmark/schema_goldens/manifest.json
-git commit -m "feat: publish audio-relative reference manifest"
+git commit -m "feat: define reference timing manifest contract"
 ```
 
 ---
 
-### Task 6: Wire CLI and final verification
+## Task 6b: Cache/R2 orchestration, event publication, and acceptance
+
+**Files:**
+- Modify: `src/benchmark/reference_timing_manifest.py`
+- Modify: `tests/benchmark/test_reference_timing_manifest.py`
+- Create: `tests/benchmark/test_reference_timing_acceptance.py`
+
+- [ ] **Step 1: Write first-pass verification tests**
+
+For a selected HPA-322 row:
+
+1. `ReferenceChartRowView.selected_chart` must be present;
+2. call `read_verified_cache_body` exactly once with
+   `expected_sha256=row.selected_chart_content_hash`;
+3. parse those exact bytes with `parse_dtx_bytes`;
+4. build `DtxTimingMap`;
+5. resolve BGM groups and apply the Task 4 frozen selection policy;
+6. resolve selected source-audio cache body once if already verified;
+7. queue only missing/unverified selected audio.
+
+Map row-local chart/cache/parse/timing/BGM failures to `TimingReasonCode` without aborting
+valid sibling rows.
+
+- [ ] **Step 2: Write no-R2-on-complete-cache tests**
+
+When every selected audio body is already verified:
+
+- optional R2 module import is not triggered;
+- config/credential/store factories are not called;
+- exact-key sync is not called.
+
+- [ ] **Step 3: Write targeted-fill tests**
+
+When misses exist:
+
+- validate R2 config identity against the embedded source endpoint/bucket;
+- load the existing cache index;
+- create the existing store and lock through existing machinery;
+- call `sync_explicit_cache_keys` with only exact selected audio keys/inventories;
+- merge returned inventories by simfile ID;
+- reverify only rows whose inventory changed;
+- map failed selected audio downloads to `source_audio_download_failed` or
+  `source_audio_cache_invalid` as appropriate;
+- preserve unrelated object records exactly.
+
+- [ ] **Step 4: Write metadata/event publication tests**
+
+For resolved audio:
+
+- inspect metadata;
+- build bounded audio-relative native events;
+- render event JSONL;
+- publish `events/<sha256>.jsonl` through `publish_immutable_content`;
+- identical second run reuses/verifies the existing immutable artifact;
+- event publication failure is fatal because a ready manifest row cannot safely point to
+  a missing/conflicting immutable artifact.
+
+- [ ] **Step 5: Write orchestration accounting tests**
+
+Cover combinations:
+
+- all ready -> exit `0`;
+- only upstream quarantines -> exit `1`, `upstream_quarantined_count > 0`;
+- HPA-323-specific quarantine -> exit `1`, distinguishable as
+  `quarantined_count - upstream_quarantined_count`;
+- mixed upstream + HPA-323 quarantine;
+- fatal config/index/publication -> exit `2`, `manifest is None`.
+
+- [ ] **Step 6: Implement orchestration and immutable timing-manifest publication**
+
+Use `render_manifest`, `publish_manifest`, and `publish_latest_manifest`. Do not add a
+separate report artifact.
+
+- [ ] **Step 7: Build the end-to-end offline acceptance fixture**
+
+Cover at least:
+
+1. selected chart + already-cached source audio -> ready;
+2. selected chart + exact-key audio fill through fake store -> ready;
+3. upstream HPA-322 quarantine -> preserved timing quarantine;
+4. unresolved/ambiguous BGM row -> HPA-323 quarantine;
+5. unreadable source audio -> `source_audio_decode_failed`;
+6. repeated second run -> deterministic manifest/event identities.
+
+Assert complete-cache acceptance does not require R2 extras.
+
+- [ ] **Step 8: Validate and commit Task 6b**
+
+```bash
+uv run pytest \
+  tests/benchmark/test_reference_timing.py \
+  tests/benchmark/test_reference_timing_manifest.py \
+  tests/benchmark/test_reference_timing_acceptance.py -q
+uv run ruff check \
+  src/benchmark/reference_timing.py \
+  src/benchmark/reference_timing_manifest.py \
+  tests/benchmark/test_reference_timing.py \
+  tests/benchmark/test_reference_timing_manifest.py \
+  tests/benchmark/test_reference_timing_acceptance.py
+uv run ruff format --check \
+  src/benchmark/reference_timing.py \
+  src/benchmark/reference_timing_manifest.py \
+  tests/benchmark/test_reference_timing.py \
+  tests/benchmark/test_reference_timing_manifest.py \
+  tests/benchmark/test_reference_timing_acceptance.py
+git add \
+  src/benchmark/reference_timing.py \
+  src/benchmark/reference_timing_manifest.py \
+  tests/benchmark/test_reference_timing.py \
+  tests/benchmark/test_reference_timing_manifest.py \
+  tests/benchmark/test_reference_timing_acceptance.py
+git commit -m "feat: build audio-relative reference corpus"
+```
+
+---
+
+## Task 7: CLI and final CI-equivalent verification
 
 **Files:**
 - Modify: `src/cli/benchmark.py`
 - Modify: `tests/test_cli_benchmark.py`
 
-- [ ] **Step 1: Write CLI contract tests**
+- [ ] **Step 1: Write CLI path-contract tests**
 
-Require `--manifest` and `--cache-dir`; default only `--output-dir`. Cover complete `0`,
-partial `1`, fatal `2`, one sorted JSON summary, and no R2 import/store construction on a
-complete cache.
-
-Expected summary keys:
+Require:
 
 ```text
-corpus_version
-events_published
-exit_code
-manifest_path
-quarantined
-ready
-status
+--manifest PATH
+--cache-dir PATH
 ```
 
-- [ ] **Step 2: Implement lazy CLI wiring**
+Default only `--output-dir`.
 
-Add `build-reference-timing`, construct `ReferenceTimingRequest`, emit one sorted JSON
-summary, and exit through `click.Context.exit` when non-zero.
+Add a test showing why `--cache-dir` cannot inherit `select-reference-charts` behavior:
+for `.../reference-charts/manifests/<sha>.jsonl`,
+`manifest.parent.parent / "cache"` points at `reference-charts/cache`, not
+`r2-corpus/cache`.
 
-- [ ] **Step 3: Run CI-equivalent verification**
+- [ ] **Step 2: Write CLI summary tests**
+
+Summary contains at least:
+
+```text
+status
+exit_code
+manifest_path
+manifest_sha256
+corpus_version
+ready_count
+quarantined_count
+upstream_quarantined_count
+events_published
+```
+
+Assert sorted canonical JSON output and exits `0`, `1`, and `2`.
+
+One test should demonstrate the operational signal:
+
+```text
+quarantined_count = 7
+upstream_quarantined_count = 5
+```
+
+so the operator can see two timing-stage quarantines despite exit `1` being shared with
+upstream gaps.
+
+- [ ] **Step 3: Implement lazy CLI wiring**
+
+Add `build-reference-timing`, construct `ReferenceTimingRequest`, emit one summary, and
+exit through `click.Context.exit`.
+
+A complete-cache path must not import/create the optional R2 store.
+
+- [ ] **Step 4: Run final validation**
+
+Use the same checks as merged HPA-322 implementation PR #10:
 
 ```bash
-uv run pytest -q
+uv run --extra r2 pytest -q
 uv run ruff check .
 uv run ruff format --check src tests
 uv run pylint --errors-only --disable=E1120,E0401 src
 ```
 
-- [ ] **Step 4: Verify the planning assumptions against the implementation diff**
+Also run:
 
-Confirm there is no:
+```bash
+git diff --check main...HEAD
+```
+
+Verify the committed corpus diagnostic still reproduces byte-identical output for its
+fixture.
+
+- [ ] **Step 5: Final review checklist**
+
+Reject the implementation if any of these remain:
 
 - direct `manifest_row_view_from_row(hpa322_row)` call;
-- new path/casefold resolver;
+- raw HPA-322 dict lookup for selected chart hash or simfile ID in production timing
+  code;
+- free-form timing reason strings outside `TimingReasonCode`;
+- private path/casefold resolver;
 - second cache verifier;
-- widening of `is_selected`;
+- widened `is_selected` / `CACHE_PROFILE`;
 - second verification of already-cached audio;
 - overwrite of HPA-322 `source_manifest_sha256` or `source_corpus_version`;
-- `report_path` field without a report artifact.
+- `report_path` field without a report artifact;
+- uncommitted/throwaway corpus policy script;
+- unconditional `used_root_fallback` field before evidence;
+- one giant manifest+R2 orchestration commit.
 
-- [ ] **Step 5: Commit Task 6**
+- [ ] **Step 6: Commit Task 7**
 
 ```bash
 git add src/cli/benchmark.py tests/test_cli_benchmark.py
@@ -807,30 +1144,32 @@ git commit -m "feat: expose reference timing build"
 
 | Risk | Required proof |
 |---|---|
-| HPA-322 derived row fed to HPA-321 parser | All production loads use `reference_chart_row_view_from_row` |
-| Immediate lineage overwrites HPA-321 lineage | Dedicated `source_reference_chart_*` fields + preservation test |
-| Incorrect DTX channel `02` semantics | Primary DTXMania source + sticky/replacement fixtures |
-| BGM policy quarantines too much corpus | Task 0 distribution + sampled multi-group review |
-| HPA-323 forks object-key behavior | All lookups use `resolve_inventory_object_key` |
-| Timing rename breaks legacy consumers | Full repository suite immediately after Task 1 |
+| HPA-322 row fed directly to HPA-321 parser | Production loader uses `ReferenceChartRowView` |
+| Selected-chart identity leaks back to raw dicts | Typed selected hash + typed simfile property |
+| Timing reason typo enters stable schema | `TimingReasonCode = Literal[...]` + validator uses `get_args` |
+| Immediate lineage overwrites HPA-321 lineage | Dedicated `source_reference_chart_*` fields |
+| Incorrect channel `02` semantics | Primary source + fixtures + committed corpus delta report |
+| Timing change materially shifts many real charts unnoticed | `charts_with_*channel_02*` + max delta examples |
+| BGM policy quarantines too much corpus | Committed group-distribution diagnostic + sampled review |
+| Unsupported/corrupt source audio sinks yield late | Extension distribution + sampled verified-body `sf.info` |
+| BGM diagnostic diverges from production resolver | Diagnostic imports production adapter/group resolver |
+| HPA-323 forks object-key behavior | All object lookup uses `resolve_inventory_object_key` |
+| Timing rename breaks legacy consumers | No alias + full repository suite immediately after rename |
 | Existing audio is hashed twice | Already-verified rows bypass post-fill verification |
 | Targeted fill mutates unrelated objects | Before/after inventory equality tests |
 | Complete cache still requires R2 | Dependency/store factories are not called |
-| Row failure aborts corpus | Valid sibling still publishes with exit `1` |
-| Stable artifact contract drifts | Event and timing-manifest schema goldens |
+| Upstream gaps hide HPA-323 health | `upstream_quarantined_count` in outcome/CLI |
+| Stable artifact contract drifts | Event + timing schema goldens |
+| Manifest orchestration becomes unreviewable | Task 6a pure contract split from Task 6b R2/orchestration |
 
-## Final Review Checklist
+## Final Sequence
 
-- [ ] Task 0 measured the real selected corpus and froze BGM policy.
-- [ ] HPA-322 rows use `ReferenceChartRowView`, not the HPA-321-only parser directly.
-- [ ] Selected chart bytes use `read_verified_cache_body` + `parse_dtx_bytes`.
-- [ ] No private object-key normalization/matching logic exists in HPA-323.
-- [ ] Channel `01` is typed and excluded from native playable events.
-- [ ] Channel `02` remains sticky until superseded.
-- [ ] Chart-time APIs are explicitly named and return `BenchmarkEvent`.
-- [ ] Complete-cache audio is verified once.
-- [ ] Only exact selected audio keys are downloaded.
-- [ ] HPA-322 lineage fields survive unchanged.
-- [ ] Native event and timing-manifest schemas have registered goldens.
-- [ ] Ready plus quarantined equals input count.
-- [ ] Full tests, Ruff, Ruff format, and enabled Pylint pass.
+1. **Task 1** — typed BGM, `source_order`, sticky timing, clock rename.
+2. **Task 2** — typed HPA-322 row view, `TimingReasonCode`, policy-neutral BGM groups.
+3. **Task 3** — exact-key source-audio cache fill.
+4. **Task 4** — committed real-corpus diagnostic; freeze multi-group, fallback, audio
+   support, and inspect channel-`02` blast radius.
+5. **Task 5** — audio metadata, bounded native events, immutable event artifact/golden.
+6. **Task 6a** — pure timing-manifest loading, lineage, row rendering, manifest golden.
+7. **Task 6b** — cache/R2 orchestration, event publication, acceptance fixture.
+8. **Task 7** — CLI with upstream quarantine visibility and CI-equivalent verification.
