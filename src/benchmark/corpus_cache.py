@@ -348,12 +348,55 @@ def sync_cache(
     dry_run: bool,
     item_progress: Callable[[int, int, int], None] | None = None,
 ) -> CacheSyncResult:
+    return _sync_selected_objects(
+        simfiles, store, index, config, is_selected, dry_run, item_progress
+    )
+
+
+def sync_explicit_cache_keys(
+    simfiles: tuple[SimfileInventory, ...],
+    store: R2ObjectStore,
+    index: CacheIndexStore,
+    config: R2Config,
+    selected_keys: frozenset[str],
+    item_progress: Callable[[int, int, int], None] | None = None,
+) -> CacheSyncResult:
+    """Fill only the exact selected cache keys.
+
+    Unlike :func:`sync_cache`, this always materializes the selected bodies
+    (there is no ``dry_run``) and admits any object key supplied by the caller
+    (e.g. audio). HPA-321's global :func:`is_selected` and ``CACHE_PROFILE`` are
+    intentionally left untouched: selection here is exact-key membership only.
+    A selected key absent from the supplied inventory is a usage error.
+    """
+    inventory_keys = {remote.key for simfile in simfiles for remote in simfile.objects}
+    missing = selected_keys - inventory_keys
+    if missing:
+        raise ValueError(f"{len(missing)} selected key(s) absent from supplied inventory")
+    return _sync_selected_objects(
+        simfiles,
+        store,
+        index,
+        config,
+        selected_keys.__contains__,
+        False,
+        item_progress,
+    )
+
+
+def _sync_selected_objects(
+    simfiles: tuple[SimfileInventory, ...],
+    store: R2ObjectStore,
+    index: CacheIndexStore,
+    config: R2Config,
+    selects: Callable[[str], bool],
+    dry_run: bool,
+    item_progress: Callable[[int, int, int], None] | None = None,
+) -> CacheSyncResult:
     object_results: dict[tuple[int, int], RemoteObject] = {}
     actions: dict[tuple[int, int], CacheAction] = {}
     misses: list[tuple[int, int, RemoteObject, CacheValidation]] = []
-    total_selected = sum(
-        is_selected(remote.key) for simfile in simfiles for remote in simfile.objects
-    )
+    total_selected = sum(selects(remote.key) for simfile in simfiles for remote in simfile.objects)
     completed_selected = 0
     completed_bytes = 0
     progressed: set[tuple[int, int]] = set()
@@ -371,7 +414,7 @@ def sync_cache(
     for simfile_index, simfile in enumerate(simfiles):
         for object_index, remote in enumerate(simfile.objects):
             identity = (simfile_index, object_index)
-            if not is_selected(remote.key):
+            if not selects(remote.key):
                 object_results[identity] = remote
                 continue
             if any(error.code in _HEAD_ERROR_CODES for error in remote.errors):

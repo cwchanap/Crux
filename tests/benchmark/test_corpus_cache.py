@@ -25,8 +25,10 @@ from src.benchmark.corpus_cache import (
     is_set_def_key,
     resolve_verified_cache_body,
     sync_cache,
+    sync_explicit_cache_keys,
 )
 from src.benchmark.r2_corpus_models import (
+    CACHE_PROFILE,
     R2Config,
     RemoteObject,
     SimfileInventory,
@@ -2954,3 +2956,280 @@ def test_installed_content_hash_mismatch_after_repair_rejects_download(
     # The index file pre-exists from index_with_local_state; the failed install
     # must not have updated it with the rejected content.
     assert result.actions[0].action == "failed"
+
+
+# ---------------------------------------------------------------------------
+# HPA-323 Task 3: exact selected audio cache keys
+# ---------------------------------------------------------------------------
+
+
+def test_hpa321_cache_profile_and_is_selected_exclude_audio_extensions() -> None:
+    """sync_cache's selection contract pins set.def/.dtx/.txt; audio stays out."""
+    assert CACHE_PROFILE == "setdef_dtx_txt_v1"
+    assert is_selected("42/set.def")
+    assert is_selected("42/mas.DTX")
+    assert is_selected("42/readme.TXT")
+    for audio_key in (
+        "42/audio/song.ogg",
+        "42/audio/preview.mp3",
+        "42/audio/bgm.wav",
+        "42/audio/cut.m4a",
+    ):
+        assert not is_selected(audio_key), audio_key
+
+
+def test_sync_cache_leaves_audio_outside_the_selected_profile(tmp_path: Path) -> None:
+    """sync_cache still produces no action for audio and does not read it."""
+    objects = (
+        remote_object("42/SET.DEF"),
+        remote_object("42/audio/song.ogg"),
+        remote_object("42/audio/preview.mp3"),
+    )
+    store = FakeStore()
+
+    result = sync_cache((simfile(*objects),), store, empty_index(tmp_path), config(), True)
+
+    assert [action.object_key for action in result.actions] == ["42/SET.DEF"]
+    assert [action.action for action in result.actions] == ["planned"]
+    assert result.simfiles == (simfile(*objects),)
+    assert store.open_calls == []
+
+
+def test_explicit_cache_keys_fills_one_audio_key_and_leaves_others_unchanged(
+    tmp_path: Path,
+) -> None:
+    audio_body = b"sound"
+    audio = remote_object("42/audio/song.ogg", size=len(audio_body))
+    chart = remote_object("42/chart.dtx")
+    setdef = remote_object("42/set.def")
+
+    result = sync_explicit_cache_keys(
+        (simfile(setdef, chart, audio),),
+        FakeStore(body=audio_body),
+        empty_index(tmp_path),
+        config(),
+        frozenset({"42/audio/song.ogg"}),
+    )
+
+    assert [action.object_key for action in result.actions] == ["42/audio/song.ogg"]
+    assert result.actions[0].action == "downloaded"
+    rebuilt_objects = result.simfiles[0].objects
+    assert rebuilt_objects[0] == setdef
+    assert rebuilt_objects[1] == chart
+    assert rebuilt_objects[2].cache_status == "verified"
+    digest = sha256(audio_body).hexdigest()
+    assert rebuilt_objects[2].cache_path == f"sha256/{digest[:2]}/{digest}"
+
+
+def test_explicit_cache_keys_fills_multiple_keys_across_digest_groups(
+    tmp_path: Path,
+) -> None:
+    shared_body = b"shared-audio"
+    distinct_body = b"distinct"
+    shared_a = remote_object("42/audio/a.ogg", size=len(shared_body))
+    shared_b = remote_object("42/audio/b.ogg", size=len(shared_body))
+    distinct = remote_object("42/audio/c.mp3", size=len(distinct_body))
+    chart = remote_object("42/chart.dtx")
+    bodies = {
+        shared_a.key: shared_body,
+        shared_b.key: shared_body,
+        distinct.key: distinct_body,
+    }
+
+    class KeyedBodyStore:
+        @contextmanager
+        def open_object(self, key: str, if_match: str | None) -> Iterator[ObjectDownload]:
+            del if_match
+            body = bodies[key]
+            yield ObjectDownload(
+                body=BytesIO(body),
+                size=len(body),
+                etag="etag",
+                etag_is_weak=False,
+                last_modified=FIXED_MTIME,
+            )
+
+    result = sync_explicit_cache_keys(
+        (simfile(shared_a, shared_b, distinct, chart),),
+        KeyedBodyStore(),
+        empty_index(tmp_path),
+        config(),
+        frozenset({shared_a.key, shared_b.key, distinct.key}),
+    )
+
+    actions = {action.object_key: action for action in result.actions}
+    assert set(actions) == {shared_a.key, shared_b.key, distinct.key}
+    assert all(action.action == "downloaded" for action in actions.values())
+    rebuilt = result.simfiles[0].objects
+    # The two same-digest bodies share one content address; both are verified.
+    shared_digest = sha256(shared_body).hexdigest()
+    distinct_digest = sha256(distinct_body).hexdigest()
+    assert rebuilt[0].cache_path == f"sha256/{shared_digest[:2]}/{shared_digest}"
+    assert rebuilt[1].cache_path == rebuilt[0].cache_path
+    assert rebuilt[2].cache_path == f"sha256/{distinct_digest[:2]}/{distinct_digest}"
+    # The unselected chart passes through untouched.
+    assert rebuilt[3] == chart
+
+
+def test_explicit_cache_keys_rejects_keys_absent_from_supplied_inventory(
+    tmp_path: Path,
+) -> None:
+    audio = remote_object("42/audio/song.ogg")
+
+    with pytest.raises(ValueError):
+        sync_explicit_cache_keys(
+            (simfile(audio),),
+            FakeStore(),
+            empty_index(tmp_path),
+            config(),
+            frozenset({"42/audio/song.ogg", "42/audio/missing.ogg"}),
+        )
+
+
+def test_explicit_cache_keys_cache_hit_reads_no_remote_body(tmp_path: Path) -> None:
+    body = b"sound"
+    audio = remote_object("42/audio/song.ogg", size=len(body))
+    digest = sha256(body).hexdigest()
+    cache_path = tmp_path / "sha256" / digest[:2] / digest
+    index = seeded_index(tmp_path, audio, cache_path, body=body)
+    store = FakeStore()
+
+    result = sync_explicit_cache_keys(
+        (simfile(audio),),
+        store,
+        index,
+        config(),
+        frozenset({"42/audio/song.ogg"}),
+    )
+
+    assert store.open_calls == []
+    assert result.actions[0].action == "cache_hit"
+    assert result.actions[0].miss_reason is None
+    rebuilt = result.simfiles[0].objects[0]
+    assert rebuilt.cache_status == "verified"
+    assert rebuilt.sha256 == digest
+    assert rebuilt.cache_path == f"sha256/{digest[:2]}/{digest}"
+
+
+def test_explicit_cache_keys_forwards_strong_if_match_and_reports_source_change(
+    tmp_path: Path,
+) -> None:
+    audio = remote_object("42/audio/song.ogg", etag="etag", etag_is_weak=False)
+    store = FakeStore(
+        error=R2StoreError(
+            "source_changed_during_sync",
+            "private SDK response and request ID",
+            audio.key,
+        )
+    )
+
+    result = sync_explicit_cache_keys(
+        (simfile(audio),),
+        store,
+        empty_index(tmp_path),
+        config(),
+        frozenset({"42/audio/song.ogg"}),
+    )
+
+    assert store.open_calls == [OpenCall("42/audio/song.ogg", "etag")]
+    assert result.actions[0].action == "failed"
+    error = result.actions[0].errors[0]
+    assert error.code == "source_changed_during_sync"
+    assert error.message == "Object metadata changed after inventory."
+    assert "private" not in error.message
+
+
+def test_explicit_cache_keys_downloads_then_hits_on_restart(tmp_path: Path) -> None:
+    body = b"sound"
+    audio = remote_object("42/audio/song.ogg", size=len(body))
+    digest = sha256(body).hexdigest()
+
+    first = sync_explicit_cache_keys(
+        (simfile(audio),),
+        FakeStore(body=body),
+        empty_index(tmp_path),
+        config(),
+        frozenset({"42/audio/song.ogg"}),
+    )
+
+    assert first.actions[0].action == "downloaded"
+    assert (tmp_path / "sha256" / digest[:2] / digest).read_bytes() == body
+
+    restarted_index = CacheIndexStore.load(tmp_path)
+    second_store = FakeStore(error=R2StoreError("object_get_failed", "must not be read", audio.key))
+
+    second = sync_explicit_cache_keys(
+        (simfile(audio),),
+        second_store,
+        restarted_index,
+        config(),
+        frozenset({"42/audio/song.ogg"}),
+    )
+
+    assert second.actions[0].action == "cache_hit"
+    assert second_store.open_calls == []
+    assert first.simfiles == second.simfiles
+
+
+def test_explicit_cache_keys_partial_failure_keeps_successful_downloads(
+    tmp_path: Path,
+) -> None:
+    ok_body = b"sound"
+    ok = remote_object("42/audio/ok.ogg", size=len(ok_body))
+    bad = remote_object("42/audio/bad.ogg", size=len(ok_body))
+
+    class MixedStore:
+        @contextmanager
+        def open_object(self, key: str, if_match: str | None) -> Iterator[ObjectDownload]:
+            del if_match
+            if key == bad.key:
+                raise R2StoreError("object_get_failed", "private SDK detail", key)
+            yield ObjectDownload(
+                body=BytesIO(ok_body),
+                size=len(ok_body),
+                etag="etag",
+                etag_is_weak=False,
+                last_modified=FIXED_MTIME,
+            )
+
+    result = sync_explicit_cache_keys(
+        (simfile(ok, bad),),
+        MixedStore(),
+        empty_index(tmp_path),
+        config(),
+        frozenset({ok.key, bad.key}),
+    )
+
+    actions = {action.object_key: action for action in result.actions}
+    assert actions[ok.key].action == "downloaded"
+    assert actions[bad.key].action == "failed"
+    assert [error.code for error in actions[bad.key].errors] == ["object_get_failed"]
+    assert "private" not in actions[bad.key].errors[0].message
+    rebuilt = result.simfiles[0].objects
+    assert rebuilt[0].cache_status == "verified"
+    assert rebuilt[1].cache_status == "failed"
+    # The successful download is checkpointed; the failed one is not.
+    restarted = CacheIndexStore.load(tmp_path)
+    assert restarted.get("a" * 64, "simfile-dtx", ok.key) is not None
+    assert restarted.get("a" * 64, "simfile-dtx", bad.key) is None
+
+
+def test_explicit_cache_keys_empty_set_changes_nothing(tmp_path: Path) -> None:
+    objects = (
+        remote_object("42/set.def"),
+        remote_object("42/chart.dtx"),
+        remote_object("42/audio/song.ogg"),
+    )
+    store = FakeStore()
+
+    result = sync_explicit_cache_keys(
+        (simfile(*objects),),
+        store,
+        empty_index(tmp_path),
+        config(),
+        frozenset(),
+    )
+
+    assert result.actions == ()
+    assert result.simfiles == (simfile(*objects),)
+    assert store.open_calls == []
