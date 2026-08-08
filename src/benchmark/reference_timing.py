@@ -21,6 +21,7 @@ from src.benchmark.dtx_parser import DtxBgmEvent, ParsedDtxChart
 from src.benchmark.inventory_object_keys import resolve_inventory_object_key
 from src.benchmark.r2_corpus_models import RemoteObject
 from src.benchmark.reference_chart_manifest import ReferenceChartRowView
+from src.benchmark.timing import DtxTimingMap
 
 TimingReasonCode = Literal[
     "upstream_chart_selection_unavailable",
@@ -213,3 +214,70 @@ def _chart_object_dir(selected_chart_key: str) -> str:
     separating ``/`` is always present.
     """
     return selected_chart_key.rsplit("/", 1)[0]
+
+
+@dataclass(frozen=True)
+class BgmResolution:
+    """Frozen result of reducing a :class:`BgmReferenceSet` to one reference.
+
+    Carries the selected BGM event (``None`` when no winner could be chosen),
+    its chart time in seconds (``None`` when no event is selected), and a
+    closed-set ``reason_codes`` / ``warnings`` payload.  ``reason_codes`` only
+    ever holds values from :data:`TimingReasonCode`; ``warnings`` are stable,
+    deterministic strings.
+    """
+
+    selected_event: DtxBgmEvent | None
+    chart_time_sec: float | None
+    reason_codes: tuple[TimingReasonCode, ...]
+    warnings: tuple[str, ...]
+
+
+def select_bgm_reference(
+    references: BgmReferenceSet,
+    timing_map: DtxTimingMap,
+) -> BgmResolution:
+    """Conservatively reduce resolved BGM groups to a single reference point.
+
+    Frozen conservative policy (HPA-323 Task 4 default):
+
+    * **zero groups**  -> ``bgm_event_missing`` (no event selected);
+    * **one group**    -> the lowest-``source_order`` event in that group, with
+      ``chart_time_sec`` resolved through ``timing_map``; repeated tokens at
+      the same identity emit exactly one deterministic warning;
+    * **many groups**  -> ``ambiguous_bgm_start`` (no event selected; the row
+      is quarantined for inspection).
+
+    The earliest group is never chosen merely to raise yield.  Root-fallback
+    handling stays gated on :func:`resolve_bgm_reference_groups`'s
+    ``allow_root_fallback`` flag; no unconditional ``used_root_fallback`` field
+    is introduced here.  Evidence-based finalization (a real corpus run) may
+    revisit this default; until then the conservative quarantine is retained.
+    """
+    group_count = len(references.groups)
+    if group_count == 0:
+        return BgmResolution(
+            selected_event=None,
+            chart_time_sec=None,
+            reason_codes=("bgm_event_missing",),
+            warnings=(),
+        )
+    if group_count > 1:
+        return BgmResolution(
+            selected_event=None,
+            chart_time_sec=None,
+            reason_codes=("ambiguous_bgm_start",),
+            warnings=(),
+        )
+    group = references.groups[0]
+    selected = min(group.events, key=lambda event: event.source_order)
+    warnings: tuple[str, ...] = ()
+    if len(group.events) > 1:
+        token_summary = ",".join(sorted({event.note_id for event in group.events}))
+        warnings = (f"repeated_bgm_tokens:{token_summary}:count={len(group.events)}",)
+    return BgmResolution(
+        selected_event=selected,
+        chart_time_sec=timing_map.time_sec(selected),
+        reason_codes=(),
+        warnings=warnings,
+    )
