@@ -10,18 +10,54 @@ This module is policy-neutral on purpose.  It exposes:
 
 Group selection (choosing a single BGM group when several qualify) is deferred
 to the corpus diagnostic (HPA-323 Task 4).  No winner is picked here.
+
+HPA-323 Task 5 adds:
+
+* :func:`inspect_source_audio` — header-only source-audio metadata via
+  ``soundfile.info`` (no waveform decode);
+* :func:`build_audio_relative_events` — bounded audio-relative native reference
+  events with a one-frame tolerance band; and
+* :func:`render_reference_events` / :data:`REFERENCE_EVENT_SCHEMA` plus
+  :func:`validate_schema_golden` for the ``crux.dtx-reference-event/v1``
+  canonical JSONL schema golden.
 """
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass
+from decimal import Decimal
+from pathlib import Path
 from typing import Literal, get_args
 
+import soundfile as sf
+
+from src.benchmark.backend_identity import (
+    StrictJsonError,
+    canonical_json_bytes,
+    strict_json_loads,
+)
+from src.benchmark.corpus_manifest import _publish_immutable
 from src.benchmark.dtx_parser import DtxBgmEvent, ParsedDtxChart
 from src.benchmark.inventory_object_keys import resolve_inventory_object_key
 from src.benchmark.r2_corpus_models import RemoteObject
 from src.benchmark.reference_chart_manifest import ReferenceChartRowView
 from src.benchmark.timing import DtxTimingMap
+
+#: Canonical schema id for one bounded native reference event per JSONL row.
+REFERENCE_EVENT_SCHEMA = "crux.dtx-reference-event/v1"
+
+#: The exception family ``soundfile.info`` raises for an unreadable body.
+#: Mirrors :mod:`src.benchmark.render_audio` so audio probing is uniform.
+_AUDIO_PROBE_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,
+    RuntimeError,
+    ValueError,
+    sf.LibsndfileError,
+)
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 TimingReasonCode = Literal[
     "upstream_chart_selection_unavailable",
@@ -281,3 +317,325 @@ def select_bgm_reference(
         reason_codes=(),
         warnings=warnings,
     )
+
+
+# ---------------------------------------------------------------------------
+# HPA-323 Task 5: source-audio metadata + bounded audio-relative events
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SourceAudioInfo:
+    """Header-only metadata for one source-audio file (no waveform decode).
+
+    ``duration_sec`` is derived as ``frames / sample_rate`` so one audio frame
+    is exactly ``1.0 / sample_rate`` seconds — that frame is the tolerance band
+    used by :func:`build_audio_relative_events`.
+    """
+
+    duration_sec: float
+    sample_rate: int
+    channels: int
+    frames: int
+
+
+@dataclass(frozen=True)
+class NativeReferenceEvent:
+    """One bounded native reference event expressed in the source-audio clock.
+
+    Identity fields (``simfile_id`` ... ``note_id``) are preserved verbatim from
+    the source chart.  ``chart_time_sec`` is the event's resolved chart time;
+    ``audio_time_sec`` is the BGM-anchored, clamped time in the source-audio
+    frame (``chart_time_sec - bgm_chart_time_sec``, clamped to one-frame of
+    ``[0, duration_sec]``).
+    """
+
+    simfile_id: int
+    selected_chart_key: str
+    selected_chart_content_hash: str
+    source_audio_key: str
+    source_audio_content_hash: str
+    source_order: int
+    measure: int
+    position: float
+    lane_id: str
+    note_id: str
+    chart_time_sec: float
+    audio_time_sec: float
+
+
+@dataclass(frozen=True)
+class AudioRelativeReference:
+    """Bounded audio-relative reference events plus exclusion bookkeeping.
+
+    ``events`` holds only in-bounds (clamped) events in deterministic native
+    identity order.  ``pre_audio_event_count`` / ``post_audio_event_count``
+    count the events that fell materially outside ``[0, duration_sec]``.
+
+    ``reason_codes`` is the minimal carrier for the two conditions a caller must
+    be able to detect without re-scanning ``events``:
+
+    * ``non_finite_reference_time`` — at least one event had a non-finite audio
+      time (it is dropped, not counted in the pre/post counters);
+    * ``no_in_bounds_reference_events`` — zero events were retained and no
+      non-finite failure was recorded.
+    """
+
+    events: tuple[NativeReferenceEvent, ...]
+    pre_audio_event_count: int
+    post_audio_event_count: int
+    reason_codes: tuple[TimingReasonCode, ...]
+
+
+def inspect_source_audio(path: Path) -> SourceAudioInfo:
+    """Return header-only metadata for ``path`` via :func:`soundfile.info`.
+
+    No waveform is decoded.  The unreadable-body failure family is the same as
+    :mod:`src.benchmark.render_audio`:
+    ``(OSError, RuntimeError, ValueError, soundfile.LibsndfileError)``.
+    ``duration_sec`` is ``frames / sample_rate``.
+    """
+    info = sf.info(str(path))
+    frames = int(info.frames)
+    sample_rate = int(info.samplerate)
+    channels = int(info.channels)
+    duration_sec = frames / sample_rate if sample_rate else 0.0
+    return SourceAudioInfo(
+        duration_sec=duration_sec,
+        sample_rate=sample_rate,
+        channels=channels,
+        frames=frames,
+    )
+
+
+def build_audio_relative_events(
+    chart: ParsedDtxChart,
+    timing_map: DtxTimingMap,
+    *,
+    simfile_id: int,
+    selected_chart_key: str,
+    selected_chart_content_hash: str,
+    source_audio_key: str,
+    source_audio_content_hash: str,
+    bgm_chart_time_sec: float,
+    audio: SourceAudioInfo,
+) -> AudioRelativeReference:
+    """Build bounded, audio-relative native reference events for one chart.
+
+    For each playable event in ``chart.events`` the chart time is resolved
+    through ``timing_map`` and shifted by the BGM anchor into the source-audio
+    frame: ``audio_time_sec = chart_time_sec - bgm_chart_time_sec``.  One audio
+    frame (``1.0 / audio.sample_rate``) is the tolerance band:
+
+    * non-finite ``audio_time_sec``  -> ``non_finite_reference_time``, dropped
+      (not counted in the pre/post counters);
+    * ``audio_time_sec`` within one frame below ``0``  -> clamped to ``0.0``;
+    * ``audio_time_sec`` within one frame above ``duration_sec`` -> clamped to
+      ``duration_sec``;
+    * materially below ``0`` (``< -one_frame``) -> dropped, ``pre_audio``++;
+    * materially above ``duration_sec`` (``> duration_sec + one_frame``) ->
+      dropped, ``post_audio``++;
+    * zero events retained and no non-finite failure -> ``no_in_bounds``.
+
+    Retained events preserve ``source_order`` and every native identity field;
+    ``chart_time_sec`` is untouched and ``audio_time_sec`` is the clamped value.
+    Retained events are sorted by ``(measure, position, source_order)`` — a
+    deterministic native-identity key (ties are stable against ``chart.events``
+    order).
+    """
+    one_frame = 1.0 / audio.sample_rate if audio.sample_rate else 0.0
+    duration_sec = audio.duration_sec
+
+    reason_codes: set[TimingReasonCode] = set()
+    retained: list[NativeReferenceEvent] = []
+    pre_count = 0
+    post_count = 0
+
+    for event in chart.events:
+        chart_time_sec = timing_map.time_sec(event)
+        audio_time_sec = chart_time_sec - bgm_chart_time_sec
+
+        if not math.isfinite(audio_time_sec):
+            reason_codes.add("non_finite_reference_time")
+            continue
+        if audio_time_sec < -one_frame:
+            pre_count += 1
+            continue
+        if audio_time_sec > duration_sec + one_frame:
+            post_count += 1
+            continue
+        clamped = max(0.0, min(duration_sec, audio_time_sec))
+        retained.append(
+            NativeReferenceEvent(
+                simfile_id=simfile_id,
+                selected_chart_key=selected_chart_key,
+                selected_chart_content_hash=selected_chart_content_hash,
+                source_audio_key=source_audio_key,
+                source_audio_content_hash=source_audio_content_hash,
+                source_order=event.source_order,
+                measure=event.measure,
+                position=event.position,
+                lane_id=event.lane_id,
+                note_id=event.note_id,
+                chart_time_sec=chart_time_sec,
+                audio_time_sec=clamped,
+            )
+        )
+
+    if not retained and "non_finite_reference_time" not in reason_codes:
+        reason_codes.add("no_in_bounds_reference_events")
+
+    events = tuple(
+        sorted(retained, key=lambda item: (item.measure, item.position, item.source_order))
+    )
+    return AudioRelativeReference(
+        events=events,
+        pre_audio_event_count=pre_count,
+        post_audio_event_count=post_count,
+        reason_codes=tuple(sorted(reason_codes)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Canonical JSONL rendering + immutable publication
+# ---------------------------------------------------------------------------
+
+
+def _event_native_identity(event: NativeReferenceEvent) -> tuple[int, float, int]:
+    return (event.measure, event.position, event.source_order)
+
+
+def _event_to_canonical_row(event: NativeReferenceEvent) -> dict[str, object]:
+    """Render one event as a canonical-JSON-ready row.
+
+    Float fields are converted to :class:`~decimal.Decimal` so the row renders
+    through :func:`canonical_json_bytes` in the exact canonical form that
+    :func:`strict_json_loads` (``require_canonical=True``) expects — whole-number
+    floats collapse to their bare-integer canonical text (``3.0`` -> ``3``).
+    """
+    return {
+        "simfile_id": event.simfile_id,
+        "selected_chart_key": event.selected_chart_key,
+        "selected_chart_content_hash": event.selected_chart_content_hash,
+        "source_audio_key": event.source_audio_key,
+        "source_audio_content_hash": event.source_audio_content_hash,
+        "source_order": event.source_order,
+        "measure": event.measure,
+        "position": Decimal(str(event.position)),
+        "lane_id": event.lane_id,
+        "note_id": event.note_id,
+        "chart_time_sec": Decimal(str(event.chart_time_sec)),
+        "audio_time_sec": Decimal(str(event.audio_time_sec)),
+    }
+
+
+def render_reference_events(
+    events: tuple[NativeReferenceEvent, ...] | list[NativeReferenceEvent],
+) -> bytes:
+    """Render events as canonical JSONL (one event per line, one final newline).
+
+    Events are sorted by deterministic native identity
+    (``measure, position, source_order``).  Each row is encoded through the
+    shared canonical JSON helper (:func:`canonical_json_bytes`), so repeated
+    rendering of the same events is byte-identical and SHA-256-stable.
+    """
+    ordered = sorted(events, key=_event_native_identity)
+    return b"".join(
+        canonical_json_bytes(_event_to_canonical_row(event), trailing_newline=True)
+        for event in ordered
+    )
+
+
+def publish_immutable_content(path: Path, content: bytes, expected_sha256: str) -> None:
+    """Publish ``content`` at ``path`` immutably, delegating all durability.
+
+    Thin delegation to :func:`corpus_manifest._publish_immutable` — the existing
+    hash-checked, fsync + hardlink + verify publisher.  No durability or
+    conflict-handling logic is duplicated here.  Raises
+    :class:`~src.benchmark.corpus_manifest.ManifestPublicationError` on failure.
+    """
+    _publish_immutable(path, content, expected_sha256)
+
+
+# ---------------------------------------------------------------------------
+# Schema-golden support for crux.dtx-reference-event/v1
+# ---------------------------------------------------------------------------
+
+_REFERENCE_EVENT_KEYS: frozenset[str] = frozenset(
+    {
+        "simfile_id",
+        "selected_chart_key",
+        "selected_chart_content_hash",
+        "source_audio_key",
+        "source_audio_content_hash",
+        "source_order",
+        "measure",
+        "position",
+        "lane_id",
+        "note_id",
+        "chart_time_sec",
+        "audio_time_sec",
+    }
+)
+_REFERENCE_EVENT_INT_KEYS: frozenset[str] = frozenset({"simfile_id", "source_order", "measure"})
+_REFERENCE_EVENT_STRING_KEYS: frozenset[str] = frozenset(
+    {"selected_chart_key", "source_audio_key", "lane_id", "note_id"}
+)
+_REFERENCE_EVENT_HASH_KEYS: frozenset[str] = frozenset(
+    {"selected_chart_content_hash", "source_audio_content_hash"}
+)
+_REFERENCE_EVENT_TIME_KEYS: frozenset[str] = frozenset(
+    {"position", "chart_time_sec", "audio_time_sec"}
+)
+
+
+def validate_schema_golden(schema: str, content: bytes) -> None:
+    """Validate a ``crux.dtx-reference-event/v1`` canonical JSONL golden.
+
+    Asserts canonical JSONL (one final newline, no blank lines, each line
+    canonical via :func:`strict_json_loads` with ``require_canonical=True``),
+    the exact 12-key row set, finite ``Decimal`` time fields, integer identity
+    counters, lowercase-SHA-256 hash fields, and byte-identity against a
+    re-render through the canonical JSON helper.  Raises :class:`ValueError`
+    (or its :class:`StrictJsonError` subclass) on any drift.
+    """
+    if schema != REFERENCE_EVENT_SCHEMA:
+        raise ValueError("unsupported schema golden")
+    if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+        raise ValueError("reference event golden must be canonical JSONL with one final newline")
+
+    lines = content.splitlines(keepends=True)
+    if not lines or any(not line.endswith(b"\n") or line == b"\n" for line in lines):
+        raise ValueError("reference event golden must contain one record per line")
+
+    try:
+        rows = tuple(strict_json_loads(line[:-1], require_canonical=True) for line in lines)
+    except StrictJsonError:
+        raise ValueError("reference event golden must be canonical JSONL") from None
+
+    for row in rows:
+        _validate_reference_event_row(row)
+
+    regenerated = b"".join(canonical_json_bytes(row, trailing_newline=True) for row in rows)
+    if regenerated != content:
+        raise ValueError("reference event golden is not byte-identical to its canonical render")
+
+
+def _validate_reference_event_row(row: object) -> None:
+    if not isinstance(row, dict) or set(row) != _REFERENCE_EVENT_KEYS:
+        raise ValueError("reference event row has an invalid key set")
+    for key in _REFERENCE_EVENT_INT_KEYS:
+        value = row[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{key} must be an integer")
+    for key in _REFERENCE_EVENT_STRING_KEYS:
+        if not isinstance(row[key], str) or not row[key]:
+            raise ValueError(f"{key} must be a non-empty string")
+    for key in _REFERENCE_EVENT_HASH_KEYS:
+        value = row[key]
+        if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
+            raise ValueError(f"{key} must be a lowercase SHA-256")
+    for key in _REFERENCE_EVENT_TIME_KEYS:
+        value = row[key]
+        if not isinstance(value, Decimal) or not value.is_finite():
+            raise ValueError(f"{key} must be a finite number")

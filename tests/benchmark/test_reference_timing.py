@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
+from decimal import Decimal
 from hashlib import sha256
+from pathlib import Path
 from typing import get_args
 
+import numpy as np
+import pytest
+import soundfile as sf
+
+from src.benchmark.backend_identity import canonical_json_bytes, strict_json_loads
 from src.benchmark.corpus_manifest import ManifestRowView
 from src.benchmark.dtx_parser import DtxBgmEvent, ParsedDtxChart
+from src.benchmark.models import DtxEvent
 from src.benchmark.r2_corpus_models import (
     CACHE_PROFILE,
     ProvenanceRecord,
@@ -14,13 +23,22 @@ from src.benchmark.r2_corpus_models import (
 )
 from src.benchmark.reference_chart_manifest import ReferenceChartRowView
 from src.benchmark.reference_timing import (
+    REFERENCE_EVENT_SCHEMA,
     TIMING_REASON_CODES,
+    AudioRelativeReference,
     BgmReferenceGroup,
     BgmReferenceSet,
     BgmResolution,
+    NativeReferenceEvent,
+    SourceAudioInfo,
     TimingReasonCode,
+    build_audio_relative_events,
+    inspect_source_audio,
+    publish_immutable_content,
+    render_reference_events,
     resolve_bgm_reference_groups,
     select_bgm_reference,
+    validate_schema_golden,
 )
 from src.benchmark.timing import DtxTimingMap, build_dtx_timing_map
 
@@ -451,3 +469,536 @@ def test_select_bgm_reference_is_deterministic_across_calls() -> None:
 
     assert first == second
     assert first.selected_event is low
+
+
+# ===========================================================================
+# HPA-323 Task 5: source-audio metadata, bounded events, schema golden
+# ===========================================================================
+
+
+_AUDIO_PROBE_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,
+    RuntimeError,
+    ValueError,
+    sf.LibsndfileError,
+)
+
+_IDENTITY_KWARGS = {
+    "simfile_id": 42,
+    "selected_chart_key": "42/real.dtx",
+    "selected_chart_content_hash": "a" * 64,
+    "source_audio_key": "42/bgm.ogg",
+    "source_audio_content_hash": "b" * 64,
+}
+
+
+class _FakeTimingMap:
+    """Minimal stand-in for :class:`DtxTimingMap` with per-event chart times.
+
+    lets the bounds tests control ``chart_time_sec`` exactly (keyed by
+    ``source_order``) instead of depending on the BPM/measure math.
+    """
+
+    def __init__(self, times: dict[int, float]) -> None:
+        self._times = times
+
+    def time_sec(self, event: DtxEvent) -> float:
+        return self._times[event.source_order]
+
+
+def _note(source_order: int, *, measure: int = 0, position: float = 0.0) -> DtxEvent:
+    return DtxEvent(_CHART_ID, measure, position, "11", "01", source_order)
+
+
+def _chart_with_events(events: list[DtxEvent]) -> ParsedDtxChart:
+    return ParsedDtxChart(chart_id=_CHART_ID, events=events)
+
+
+def _audio(
+    *, duration_sec: float = 10.0, sample_rate: int = 100, frames: int | None = None
+) -> SourceAudioInfo:
+    resolved_frames = int(duration_sec * sample_rate) if frames is None else frames
+    return SourceAudioInfo(
+        duration_sec=duration_sec,
+        sample_rate=sample_rate,
+        channels=2,
+        frames=resolved_frames,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 1: inspect_source_audio metadata
+# ---------------------------------------------------------------------------
+
+
+def test_inspect_source_audio_returns_header_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "clip.wav"
+    sf.write(path, np.zeros(22050, dtype=np.float32), 22050, format="WAV", subtype="FLOAT")
+
+    info = inspect_source_audio(path)
+
+    assert isinstance(info, SourceAudioInfo)
+    assert info.frames == 22050
+    assert info.sample_rate == 22050
+    assert info.channels == 1
+    assert info.duration_sec == pytest.approx(1.0)
+
+
+def test_inspect_source_audio_reports_zero_frame_file(tmp_path: Path) -> None:
+    path = tmp_path / "empty.wav"
+    sf.write(path, np.zeros(0, dtype=np.float32), 8000, format="WAV", subtype="FLOAT")
+
+    info = inspect_source_audio(path)
+
+    assert info.frames == 0
+    assert info.sample_rate == 8000
+    assert info.duration_sec == 0.0
+
+
+def test_inspect_source_audio_raises_for_unreadable_body(tmp_path: Path) -> None:
+    path = tmp_path / "garbage.wav"
+    path.write_bytes(b"not a wav file at all")
+
+    with pytest.raises(_AUDIO_PROBE_ERRORS):
+        inspect_source_audio(path)
+
+
+# ---------------------------------------------------------------------------
+# Step 2: build_audio_relative_events bounds logic
+# ---------------------------------------------------------------------------
+
+
+def test_build_audio_relative_events_shifts_by_bgm_anchor_with_real_timing() -> None:
+    # base_bpm=120, default measure length -> time_sec = 2 * (measure + position).
+    event = DtxEvent(_CHART_ID, 2, 0.5, "11", "01", 0)
+    chart = ParsedDtxChart(chart_id=_CHART_ID, events=[event])
+    timing_map = build_dtx_timing_map(chart)
+
+    result = build_audio_relative_events(
+        chart,
+        timing_map,
+        bgm_chart_time_sec=2.0,
+        audio=_audio(duration_sec=10.0, sample_rate=100),
+        **_IDENTITY_KWARGS,
+    )
+
+    assert result.pre_audio_event_count == 0
+    assert result.post_audio_event_count == 0
+    assert result.reason_codes == ()
+    (kept,) = result.events
+    assert kept.chart_time_sec == 5.0  # 2 * (2 + 0.5)
+    assert kept.audio_time_sec == 3.0  # 5.0 - 2.0 bgm shift
+
+
+def test_build_audio_relative_events_exact_zero_and_exact_duration_are_in_bounds() -> None:
+    chart = _chart_with_events([_note(0), _note(1)])
+    timing_map = _FakeTimingMap({0: 5.0, 1: 15.0})
+
+    result = build_audio_relative_events(
+        chart,
+        timing_map,
+        bgm_chart_time_sec=5.0,
+        audio=_audio(duration_sec=10.0, sample_rate=100),
+        **_IDENTITY_KWARGS,
+    )
+
+    times = sorted(event.audio_time_sec for event in result.events)
+    assert times == [0.0, 10.0]
+    assert result.pre_audio_event_count == 0
+    assert result.post_audio_event_count == 0
+    assert result.reason_codes == ()
+
+
+def test_build_audio_relative_events_clamps_one_frame_below_zero() -> None:
+    # one_frame = 1/100 = 0.01; -0.005 is within the band -> clamp to 0.0.
+    chart = _chart_with_events([_note(0)])
+    timing_map = _FakeTimingMap({0: 4.995})
+
+    result = build_audio_relative_events(
+        chart,
+        timing_map,
+        bgm_chart_time_sec=5.0,
+        audio=_audio(duration_sec=10.0, sample_rate=100),
+        **_IDENTITY_KWARGS,
+    )
+
+    (kept,) = result.events
+    assert kept.audio_time_sec == 0.0
+    assert result.pre_audio_event_count == 0
+
+
+def test_build_audio_relative_events_clamps_one_frame_above_duration() -> None:
+    chart = _chart_with_events([_note(0)])
+    timing_map = _FakeTimingMap({0: 15.005})
+
+    result = build_audio_relative_events(
+        chart,
+        timing_map,
+        bgm_chart_time_sec=5.0,
+        audio=_audio(duration_sec=10.0, sample_rate=100),
+        **_IDENTITY_KWARGS,
+    )
+
+    (kept,) = result.events
+    assert kept.audio_time_sec == 10.0
+    assert result.post_audio_event_count == 0
+
+
+def test_build_audio_relative_events_excludes_materially_negative_with_pre_counter() -> None:
+    # -0.02 < -one_frame (0.01) -> excluded, pre counter incremented.  A second
+    # in-bounds event keeps the retained set non-empty so this isolates the
+    # pre-counter from the zero-retained (no_in_bounds) rule.
+    chart = _chart_with_events([_note(0), _note(1)])
+    timing_map = _FakeTimingMap({0: 4.98, 1: 5.0})
+
+    result = build_audio_relative_events(
+        chart,
+        timing_map,
+        bgm_chart_time_sec=5.0,
+        audio=_audio(duration_sec=10.0, sample_rate=100),
+        **_IDENTITY_KWARGS,
+    )
+
+    assert len(result.events) == 1
+    assert result.pre_audio_event_count == 1
+    assert result.post_audio_event_count == 0
+    assert result.reason_codes == ()
+
+
+def test_build_audio_relative_events_excludes_materially_late_with_post_counter() -> None:
+    # duration + 0.02 > duration + one_frame -> excluded, post counter incremented.
+    chart = _chart_with_events([_note(0), _note(1)])
+    timing_map = _FakeTimingMap({0: 15.02, 1: 5.0})
+
+    result = build_audio_relative_events(
+        chart,
+        timing_map,
+        bgm_chart_time_sec=5.0,
+        audio=_audio(duration_sec=10.0, sample_rate=100),
+        **_IDENTITY_KWARGS,
+    )
+
+    assert len(result.events) == 1
+    assert result.post_audio_event_count == 1
+    assert result.pre_audio_event_count == 0
+    assert result.reason_codes == ()
+
+
+def test_build_audio_relative_events_non_finite_time_records_reason_without_counters() -> None:
+    chart = _chart_with_events([_note(0)])
+    timing_map = _FakeTimingMap({0: float("nan")})
+
+    result = build_audio_relative_events(
+        chart,
+        timing_map,
+        bgm_chart_time_sec=5.0,
+        audio=_audio(duration_sec=10.0, sample_rate=100),
+        **_IDENTITY_KWARGS,
+    )
+
+    assert isinstance(result, AudioRelativeReference)
+    assert result.events == ()
+    assert result.pre_audio_event_count == 0
+    assert result.post_audio_event_count == 0
+    assert result.reason_codes == ("non_finite_reference_time",)
+    assert set(result.reason_codes) <= TIMING_REASON_CODES
+
+
+def test_build_audio_relative_events_zero_retained_records_no_in_bounds() -> None:
+    chart = _chart_with_events([_note(0), _note(1)])
+    timing_map = _FakeTimingMap({0: 0.0, 1: 100.0})  # one far pre, one far post.
+
+    result = build_audio_relative_events(
+        chart,
+        timing_map,
+        bgm_chart_time_sec=50.0,
+        audio=_audio(duration_sec=10.0, sample_rate=100),
+        **_IDENTITY_KWARGS,
+    )
+
+    assert result.events == ()
+    assert result.pre_audio_event_count == 1
+    assert result.post_audio_event_count == 1
+    assert result.reason_codes == ("no_in_bounds_reference_events",)
+    assert set(result.reason_codes) <= TIMING_REASON_CODES
+
+
+def test_build_audio_relative_events_non_finite_suppresses_no_in_bounds_reason() -> None:
+    # A non-finite failure with zero retained must not also raise no_in_bounds.
+    chart = _chart_with_events([_note(0)])
+    timing_map = _FakeTimingMap({0: float("inf")})
+
+    result = build_audio_relative_events(
+        chart,
+        timing_map,
+        bgm_chart_time_sec=float("inf"),
+        audio=_audio(duration_sec=10.0, sample_rate=100),
+        **_IDENTITY_KWARGS,
+    )
+
+    assert result.events == ()
+    assert result.reason_codes == ("non_finite_reference_time",)
+
+
+def test_build_audio_relative_events_preserves_identity_and_sorts_native_order() -> None:
+    # Out-of-(measure, position, source_order) entry order; retained set must be
+    # sorted and preserve every native identity field verbatim.
+    events = [
+        DtxEvent(_CHART_ID, 5, 0.5, "18", "AA", 2),
+        DtxEvent(_CHART_ID, 1, 0.25, "11", "01", 0),
+        DtxEvent(_CHART_ID, 1, 0.5, "12", "02", 1),
+    ]
+    chart = _chart_with_events(events)
+    timing_map = _FakeTimingMap({0: 6.0, 1: 6.5, 2: 7.0})
+
+    result = build_audio_relative_events(
+        chart,
+        timing_map,
+        bgm_chart_time_sec=5.0,
+        audio=_audio(duration_sec=10.0, sample_rate=100),
+        **_IDENTITY_KWARGS,
+    )
+
+    assert [kept.source_order for kept in result.events] == [0, 1, 2]
+    assert [(kept.measure, kept.position) for kept in result.events] == [
+        (1, 0.25),
+        (1, 0.5),
+        (5, 0.5),
+    ]
+    source = {e.source_order: e for e in events}
+    for kept in result.events:
+        original = source[kept.source_order]
+        assert kept.measure == original.measure
+        assert kept.position == original.position
+        assert kept.lane_id == original.lane_id
+        assert kept.note_id == original.note_id
+        assert kept.simfile_id == _IDENTITY_KWARGS["simfile_id"]
+        assert kept.selected_chart_key == _IDENTITY_KWARGS["selected_chart_key"]
+        assert kept.selected_chart_content_hash == _IDENTITY_KWARGS["selected_chart_content_hash"]
+        assert kept.source_audio_key == _IDENTITY_KWARGS["source_audio_key"]
+        assert kept.source_audio_content_hash == _IDENTITY_KWARGS["source_audio_content_hash"]
+        assert kept.chart_time_sec == timing_map.time_sec(original)
+
+
+# ---------------------------------------------------------------------------
+# Step 4: deterministic canonical JSONL rendering
+# ---------------------------------------------------------------------------
+
+
+def _sample_events() -> tuple[NativeReferenceEvent, ...]:
+    return (
+        NativeReferenceEvent(
+            source_order=1,
+            measure=2,
+            position=0.5,
+            lane_id="12",
+            note_id="02",
+            chart_time_sec=4.0,
+            audio_time_sec=3.0,
+            **_IDENTITY_KWARGS,  # type: ignore[arg-type]
+        ),
+        NativeReferenceEvent(
+            source_order=0,
+            measure=1,
+            position=0.0,
+            lane_id="11",
+            note_id="01",
+            chart_time_sec=2.0,
+            audio_time_sec=1.0,
+            **_IDENTITY_KWARGS,  # type: ignore[arg-type]
+        ),
+    )
+
+
+def test_render_reference_events_is_byte_identical_across_renders() -> None:
+    events = _sample_events()
+
+    first = render_reference_events(events)
+    second = render_reference_events(events)
+
+    assert first == second
+    assert hashlib.sha256(first).hexdigest() == hashlib.sha256(second).hexdigest()
+    assert first.endswith(b"\n")
+    assert not first.endswith(b"\n\n")
+
+
+def test_render_reference_events_sorts_by_deterministic_native_identity() -> None:
+    events = _sample_events()
+
+    content = render_reference_events(events)
+
+    lines = content.splitlines(keepends=True)
+    assert len(lines) == 2
+    rows = [strict_json_loads(line[:-1], require_canonical=True) for line in lines]
+    # Sorted by (measure, position, source_order) -> source_order 0 first.
+    assert rows[0]["source_order"] == 0
+    assert rows[1]["source_order"] == 1
+    assert rows[0]["measure"] == 1
+    assert rows[1]["measure"] == 2
+
+
+def test_render_reference_events_emits_canonical_jsonl_each_line() -> None:
+    content = render_reference_events(_sample_events())
+
+    for line in content.splitlines(keepends=True):
+        assert line.endswith(b"\n")
+        strict_json_loads(line[:-1], require_canonical=True)
+
+
+# ---------------------------------------------------------------------------
+# Step 5: publish_immutable_content delegates to the existing publisher
+# ---------------------------------------------------------------------------
+
+
+def test_publish_immutable_content_writes_immutable_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    content = render_reference_events(_sample_events())
+    expected_sha256 = hashlib.sha256(content).hexdigest()
+
+    publish_immutable_content(path, content, expected_sha256)
+
+    assert path.read_bytes() == content
+
+
+def test_publish_immutable_content_rejects_hash_mismatch(tmp_path: Path) -> None:
+    from src.benchmark.corpus_manifest import ManifestPublicationError
+
+    path = tmp_path / "events.jsonl"
+    content = render_reference_events(_sample_events())
+
+    with pytest.raises(ManifestPublicationError):
+        publish_immutable_content(path, content, "0" * 64)
+
+
+# ---------------------------------------------------------------------------
+# Step 6: schema-golden registration + validator behavior
+# ---------------------------------------------------------------------------
+
+_GOLDEN_PATH = Path(__file__).parent / "schema_goldens" / "crux.dtx-reference-event-v1.jsonl"
+
+
+def _golden_event_row() -> dict[str, object]:
+    return {
+        "simfile_id": 42,
+        "selected_chart_key": "42/real.dtx",
+        "selected_chart_content_hash": "a" * 64,
+        "source_audio_key": "42/bgm.ogg",
+        "source_audio_content_hash": "b" * 64,
+        "source_order": 0,
+        "measure": 1,
+        "position": Decimal("0.25"),
+        "lane_id": "11",
+        "note_id": "01",
+        "chart_time_sec": Decimal("2.5"),
+        "audio_time_sec": Decimal("1.5"),
+    }
+
+
+def test_reference_event_schema_golden_is_registered_and_valid() -> None:
+    from tests.benchmark.test_schema_goldens import (
+        load_schema_golden_manifest,
+        validate_schema_golden_entry,
+    )
+
+    repository_root = Path(__file__).parents[2]
+    entries = load_schema_golden_manifest(repository_root)
+    entry = next(item for item in entries if item.schema == "crux.dtx-reference-event/v1")
+    assert entry.golden_path.as_posix() == (
+        "tests/benchmark/schema_goldens/crux.dtx-reference-event-v1.jsonl"
+    )
+    assert entry.validator_modules == ("src.benchmark.reference_timing",)
+
+    validate_schema_golden_entry(entry, repository_root)
+
+
+def test_reference_event_golden_was_generated_by_render_reference_events() -> None:
+    # Proves the on-disk golden is byte-identical to the canonical renderer.
+    events = (
+        NativeReferenceEvent(
+            source_order=0,
+            measure=1,
+            position=0.25,
+            lane_id="11",
+            note_id="01",
+            chart_time_sec=2.5,
+            audio_time_sec=1.5,
+            **_IDENTITY_KWARGS,  # type: ignore[arg-type]
+        ),
+        NativeReferenceEvent(
+            source_order=1,
+            measure=2,
+            position=0.5,
+            lane_id="12",
+            note_id="02",
+            chart_time_sec=4.5,
+            audio_time_sec=3.5,
+            **_IDENTITY_KWARGS,  # type: ignore[arg-type]
+        ),
+    )
+
+    assert _GOLDEN_PATH.read_bytes() == render_reference_events(events)
+
+
+def test_validate_reference_event_golden_rejects_unknown_key() -> None:
+    row = _golden_event_row()
+    row["unexpected"] = "unexpected"
+    content = canonical_json_bytes(row, trailing_newline=True)
+
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)
+
+
+def test_validate_reference_event_golden_rejects_missing_key() -> None:
+    row = _golden_event_row()
+    del row["audio_time_sec"]
+    content = canonical_json_bytes(row, trailing_newline=True)
+
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)
+
+
+def test_validate_reference_event_golden_rejects_bad_sha256() -> None:
+    row = _golden_event_row()
+    row["source_audio_content_hash"] = "not-a-sha256"
+    content = canonical_json_bytes(row, trailing_newline=True)
+
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)
+
+
+def test_validate_reference_event_golden_rejects_non_finite_time() -> None:
+    valid = canonical_json_bytes(_golden_event_row(), trailing_newline=True)
+    nonfinite = valid.replace(b'"audio_time_sec":1.5', b'"audio_time_sec":Infinity')
+
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, nonfinite)
+
+
+def test_validate_reference_event_golden_rejects_wrong_type_time() -> None:
+    # The structural-mutation harness sets the first sorted key (audio_time_sec)
+    # to integer 0; a Decimal-only time check must reject it.
+    row = _golden_event_row()
+    row["audio_time_sec"] = 0
+    content = canonical_json_bytes(row, trailing_newline=True)
+
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)
+
+
+def test_validate_reference_event_golden_rejects_non_canonical_bytes() -> None:
+    valid = canonical_json_bytes(_golden_event_row(), trailing_newline=True)
+    # Swap two sorted-adjacent keys -> valid JSON, non-canonical ordering.
+    noncanonical = valid.replace(
+        b'"audio_time_sec":1.5,"chart_time_sec":2.5',
+        b'"chart_time_sec":2.5,"audio_time_sec":1.5',
+    )
+
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, noncanonical)
+
+
+def test_validate_reference_event_golden_rejects_unsupported_schema() -> None:
+    content = canonical_json_bytes(_golden_event_row(), trailing_newline=True)
+
+    with pytest.raises(ValueError):
+        validate_schema_golden("crux.other/v1", content)
