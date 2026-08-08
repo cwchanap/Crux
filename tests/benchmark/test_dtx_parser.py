@@ -431,3 +431,60 @@ def test_parse_note_channel_with_empty_value_produces_no_events() -> None:
     chart = parse_dtx_text(text, chart_id="empty-notes")
 
     assert chart.events == []
+
+
+def test_channel_01_is_typed_bgm_not_native_event() -> None:
+    """Channel 01 is BGM control data: it must land in ``bgm_events`` as a
+    typed ``DtxBgmEvent`` and never enter the native playable ``events``."""
+    chart = parse_dtx_text(
+        "#WAV01: bgm.ogg\n#00101: 0100\n#00111: 0001\n",
+        "song",
+    )
+
+    assert [(e.measure, e.position, e.note_id) for e in chart.bgm_events] == [(1, 0.0, "01")]
+    assert [(e.lane_id, e.note_id) for e in chart.events] == [("11", "01")]
+
+
+def test_pattern_source_order_is_monotonic_across_bgm_and_playable_tokens() -> None:
+    """BGM channel 01 tokens and other playable pattern tokens share one
+    monotonic pattern source-order counter, kept separate from the BPM
+    source-order counter."""
+    text = "\n".join(
+        [
+            "#BPM: 120",
+            "#00001: 0100",  # channel 01 BGM,  pattern source order 0
+            "#00011: 0100",  # channel 11 note, pattern source order 1
+            "#00001: 0200",  # channel 01 BGM,  pattern source order 2
+            "#00012: 0100",  # channel 12 note, pattern source order 3
+        ]
+    )
+
+    chart = parse_dtx_text(text, chart_id="pattern-order")
+
+    # BGM events sort by (measure, position, source_order); both are at
+    # measure 0 position 0, so source order preserves file order.
+    assert [event.source_order for event in chart.bgm_events] == [0, 2]
+    # Playable events share the same interleaved monotonic counter.
+    assert [event.source_order for event in chart.events] == [1, 3]
+
+
+def test_pattern_source_order_is_independent_of_bpm_source_order() -> None:
+    """The pattern source-order counter and the BPM source-order counter are
+    independent: interleaving BPM lines (channel 03/08) with pattern lines
+    must not perturb either counter's sequence."""
+    text = "\n".join(
+        [
+            "#BPM: 120",
+            "#BPM01: 180",
+            "#00001: 0100",  # BGM,    pattern order 0
+            "#00008: 0100",  # BPM 08, bpm order 0
+            "#00011: 0100",  # note,   pattern order 1
+            "#00003: 3C00",  # BPM 03, bpm order 1
+        ]
+    )
+
+    chart = parse_dtx_text(text, chart_id="independent-order")
+
+    assert [event.source_order for event in chart.bgm_events] == [0]
+    assert [event.source_order for event in chart.events] == [1]
+    assert [event.source_order for event in chart.bpm_events] == [0, 1]

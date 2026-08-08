@@ -17,7 +17,7 @@ from src.benchmark.mapping import DEFAULT_MIDI_NOTE_MAP, map_dtx_events
 from src.benchmark.models import BenchmarkEvent, ScoreSummary
 from src.benchmark.prepare import CHART_SUFFIXES
 from src.benchmark.scoring import score_events_with_alignment
-from src.benchmark.timing import dtx_events_to_timed_events
+from src.benchmark.timing import dtx_events_to_chart_time_events
 
 DEFAULT_OUTPUT_DIR = Path("artifacts/benchmark/mapping-calibration")
 DEFAULT_TOLERANCE_MS = 50
@@ -244,7 +244,7 @@ def find_audio(audio_dir: Path, chart_id: str) -> Path:
 
 def load_ground_truth(dtx_path: Path) -> list[BenchmarkEvent]:
     chart = parse_dtx_file(dtx_path, chart_id=dtx_path.stem)
-    timed_events = dtx_events_to_timed_events(chart)
+    timed_events = dtx_events_to_chart_time_events(chart)
     ground_truth, diagnostics = map_dtx_events(timed_events)
     if diagnostics.unmapped:
         raise ValueError(f"unmapped DTX lanes in {dtx_path}: {diagnostics.unmapped}")

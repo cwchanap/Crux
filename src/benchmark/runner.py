@@ -13,7 +13,7 @@ from src.benchmark.midi_io import parse_prediction_midi, write_reference_midi
 from src.benchmark.prepare import CHART_SUFFIXES
 from src.benchmark.reports import ChartReport, write_reports
 from src.benchmark.scoring import score_events, score_events_with_alignment
-from src.benchmark.timing import dtx_events_to_timed_events
+from src.benchmark.timing import dtx_events_to_chart_time_events
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ def run_score_midi(
     for item in validation.valid_items:
         try:
             chart = parse_dtx_file(item.dtx_path, chart_id=item.chart_id)
-            ground_truth, gt_diag = map_dtx_events(dtx_events_to_timed_events(chart))
+            ground_truth, gt_diag = map_dtx_events(dtx_events_to_chart_time_events(chart))
             predictions, pred_diag = map_midi_events(
                 parse_prediction_midi(item.prediction_midi_path, item.chart_id)
             )
@@ -93,7 +93,7 @@ def export_reference_midis(charts_dir: Path, output_dir: Path) -> int:
     ):
         try:
             chart = parse_dtx_file(dtx_path, chart_id=dtx_path.stem)
-            ground_truth, gt_diag = map_dtx_events(dtx_events_to_timed_events(chart))
+            ground_truth, gt_diag = map_dtx_events(dtx_events_to_chart_time_events(chart))
             if gt_diag.unmapped:
                 logger.warning(
                     "chart %r has %d unmapped ground-truth events: %s",

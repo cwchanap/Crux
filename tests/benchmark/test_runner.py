@@ -363,8 +363,9 @@ def test_run_score_midi_warns_on_unmapped_ground_truth_events(tmp_path: Path, ca
     output = tmp_path / "out"
     charts.mkdir()
     predictions.mkdir()
-    # Channel "01" is a BGM lane — not in DEFAULT_DTX_LANE_MAP
-    (charts / "bar.dtx").write_text("#BPM: 120\n#00001: 0100\n", encoding="utf-8")
+    # Channel "1F" is a playable pattern lane not in DEFAULT_DTX_LANE_MAP.
+    # (Channel 01 is BGM control data and no longer enters the playable path.)
+    (charts / "bar.dtx").write_text("#BPM: 120\n#0001F: 0100\n", encoding="utf-8")
     write_prediction(predictions / "bar.mid")
 
     with caplog.at_level(logging.WARNING, logger="src.benchmark.runner"):
@@ -381,8 +382,9 @@ def test_export_reference_midis_warns_on_unmapped_events(tmp_path: Path, caplog)
     charts = tmp_path / "charts"
     output = tmp_path / "out"
     charts.mkdir()
-    # Channel "01" is not in DEFAULT_DTX_LANE_MAP
-    (charts / "bgm.dtx").write_text("#BPM: 120\n#00001: 0100\n", encoding="utf-8")
+    # Channel "1F" is a playable pattern lane not in DEFAULT_DTX_LANE_MAP.
+    # (Channel 01 is BGM control data and no longer enters the playable path.)
+    (charts / "bgm.dtx").write_text("#BPM: 120\n#0001F: 0100\n", encoding="utf-8")
 
     with caplog.at_level(logging.WARNING, logger="src.benchmark.runner"):
         count = export_reference_midis(charts, output)
