@@ -23,6 +23,23 @@ class DtxBpmEvent:
 
 
 @dataclass(frozen=True)
+class DtxBgmEvent:
+    """Typed DTX channel 01 BGM control data.
+
+    Channel 01 carries background-music trigger tokens.  It is not a playable
+    drum lane, so it never enters ``ParsedDtxChart.events``; consumers that
+    need BGM timing (e.g. reference audio alignment) resolve it through the
+    shared :class:`DtxTimingMap`.
+    """
+
+    chart_id: str
+    measure: int
+    position: float
+    note_id: str
+    source_order: int = 0
+
+
+@dataclass(frozen=True)
 class ParsedDtxChart:
     chart_id: str
     title: str = ""
@@ -36,6 +53,7 @@ class ParsedDtxChart:
     position_table: dict[str, float] = field(default_factory=dict)
     measure_lengths: dict[int, float] = field(default_factory=dict)
     events: list[DtxEvent] = field(default_factory=list)
+    bgm_events: list[DtxBgmEvent] = field(default_factory=list)
     bpm_events: list[DtxBpmEvent] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -71,10 +89,16 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
     position_table: dict[str, float] = {}
     measure_lengths: dict[int, float] = {}
     events: list[DtxEvent] = []
+    bgm_events: list[DtxBgmEvent] = []
     bpm_events: list[DtxBpmEvent] = []
     pending_table_bpm_events: list[tuple[int, str, int]] = []
     warnings: list[str] = []
+    # BPM source order (channels 03/08) and pattern source order
+    # (channel 01 BGM and other playable pattern channels) are tracked by
+    # separate monotonic counters so that tempo ordering is never perturbed
+    # by pattern interleaving and vice versa.
     source_counter = 0
+    pattern_source_counter = 0
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -103,8 +127,17 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
             elif channel == "08":
                 pending_table_bpm_events.append((measure, value, source_counter))
                 source_counter += 1
+            elif channel == "01":
+                # Channel 01 is BGM control data, never a playable drum lane.
+                bgm_events.extend(
+                    _parse_bgm_events(chart_id, measure, value, pattern_source_counter)
+                )
+                pattern_source_counter += 1
             else:
-                events.extend(_parse_note_events(chart_id, measure, channel, value))
+                events.extend(
+                    _parse_note_events(chart_id, measure, channel, value, pattern_source_counter)
+                )
+                pattern_source_counter += 1
             continue
 
         header = HEADER_RE.match(value_without_comment)
@@ -154,6 +187,9 @@ def parse_dtx_text(text: str, chart_id: str) -> ParsedDtxChart:
         position_table=position_table,
         measure_lengths=measure_lengths,
         events=sorted(events, key=lambda event: (event.measure, event.position, event.lane_id)),
+        bgm_events=sorted(
+            bgm_events, key=lambda event: (event.measure, event.position, event.source_order)
+        ),
         bpm_events=sorted(
             bpm_events, key=lambda event: (event.measure, event.position, event.source_order)
         ),
@@ -184,12 +220,28 @@ def _chunks(value: str) -> list[str]:
     return [value[index : index + 2].upper() for index in range(0, len(value), 2)]
 
 
-def _parse_note_events(chart_id: str, measure: int, channel: str, value: str) -> list[DtxEvent]:
+def _parse_note_events(
+    chart_id: str, measure: int, channel: str, value: str, source_order: int = 0
+) -> list[DtxEvent]:
     chunks = _chunks(value)
     if not chunks:
         return []
     return [
-        DtxEvent(chart_id, measure, index / len(chunks), channel, note_id)
+        DtxEvent(chart_id, measure, index / len(chunks), channel, note_id, source_order)
+        for index, note_id in enumerate(chunks)
+        if note_id != "00"
+    ]
+
+
+def _parse_bgm_events(
+    chart_id: str, measure: int, value: str, source_order: int = 0
+) -> list[DtxBgmEvent]:
+    """Parse DTX channel 01 BGM control-data tokens into typed BGM events."""
+    chunks = _chunks(value)
+    if not chunks:
+        return []
+    return [
+        DtxBgmEvent(chart_id, measure, index / len(chunks), note_id, source_order)
         for index, note_id in enumerate(chunks)
         if note_id != "00"
     ]

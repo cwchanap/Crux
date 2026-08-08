@@ -12,6 +12,7 @@ class DtxEvent:
     position: float
     lane_id: str
     note_id: str
+    source_order: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "lane_id", self.lane_id.upper())

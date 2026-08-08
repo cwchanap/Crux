@@ -13,7 +13,7 @@ from src.benchmark.dtx_parser import parse_dtx_file
 from src.benchmark.mapping import DEFAULT_DTX_LANE_MAP
 from src.benchmark.models import BenchmarkEvent
 from src.benchmark.prepare import _select_chart
-from src.benchmark.timing import dtx_events_to_timed_events
+from src.benchmark.timing import dtx_events_to_chart_time_events
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +129,7 @@ def _plan_render_selection(
 ) -> tuple[RenderPlanItem | None, InvalidRenderPlanItem | None]:
     try:
         chart = parse_dtx_file(selected_chart, chart_id=song_dir.name)
-        timed_events = dtx_events_to_timed_events(chart)
+        timed_events = dtx_events_to_chart_time_events(chart)
     except (OSError, ValueError) as exc:
         return None, InvalidRenderPlanItem(
             raw_folder=song_dir,

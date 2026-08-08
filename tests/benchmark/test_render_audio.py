@@ -8,6 +8,7 @@ import pytest
 import soundfile as sf
 
 import src.benchmark.render_audio as render_audio
+from src.benchmark.mapping import DEFAULT_DTX_LANE_MAP, map_dtx_events
 from src.benchmark.models import BenchmarkEvent
 from src.benchmark.render_audio import (
     plan_render_corpus,
@@ -276,7 +277,7 @@ def test_plan_render_song_marks_missing_note_id_metadata_invalid(
 
     monkeypatch.setattr(
         render_audio,
-        "dtx_events_to_timed_events",
+        "dtx_events_to_chart_time_events",
         lambda _chart: [
             BenchmarkEvent(
                 chart_id="Song Six",
@@ -680,3 +681,54 @@ def test_plan_render_song_resolves_windows_backslash_sample_paths(tmp_path: Path
     assert plan is not None
     assert len(plan.placements) == 1
     assert plan.placements[0].sample_path.name == "snare.wav"
+
+
+def test_bgm_channel_01_is_not_a_renderable_lane():
+    """Channel 01 is BGM control data, never a playable drum lane.
+
+    This is the regression proof that moving channel 01 out of
+    ``chart.events`` changes control-data visibility, not playable drum
+    output: ``render_audio`` already excluded lane 01 because it is absent
+    from ``DEFAULT_DTX_LANE_MAP``, and the mapping classifies it only as
+    unmapped diagnostics.
+    """
+    # Lane 01 is not part of the playable drum lane map, so render_audio's
+    # ``if lane_id not in DEFAULT_DTX_LANE_MAP: continue`` skips it.
+    assert "01" not in DEFAULT_DTX_LANE_MAP
+
+    bgm_event = BenchmarkEvent(
+        chart_id="song",
+        time_sec=0.0,
+        canonical_class="01",
+        source="ground_truth",
+        metadata={"lane_id": "01"},
+    )
+
+    mapped, diagnostics = map_dtx_events([bgm_event])
+
+    assert mapped == []
+    assert diagnostics.unmapped == {"01": 1}
+
+
+def test_plan_render_song_skips_bgm_only_chart(tmp_path: Path):
+    """A chart whose only pattern token is channel 01 BGM yields no playable
+    placements, confirming BGM never reaches the rendered drum output."""
+    song = tmp_path / "BgmOnly"
+    song.mkdir()
+    (song / "mas.dtx").write_text(
+        "\n".join(
+            [
+                "#BPM: 120",
+                "#WAV01: bgm.wav",
+                "#00101: 01",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (song / "bgm.wav").write_bytes(b"bgm")
+
+    plan, invalid = plan_render_song(song)
+
+    assert plan is None
+    assert invalid is not None
+    assert invalid.reason == "no renderable note events"
