@@ -38,7 +38,7 @@ from src.benchmark.backend_identity import (
     canonical_json_bytes,
     strict_json_loads,
 )
-from src.benchmark.corpus_manifest import _publish_immutable
+from src.benchmark.corpus_manifest import publish_immutable_bytes
 from src.benchmark.dtx_parser import DtxBgmEvent, ParsedDtxChart
 from src.benchmark.inventory_object_keys import resolve_inventory_object_key
 from src.benchmark.r2_corpus_models import RemoteObject
@@ -549,12 +549,13 @@ def render_reference_events(
 def publish_immutable_content(path: Path, content: bytes, expected_sha256: str) -> None:
     """Publish ``content`` at ``path`` immutably, delegating all durability.
 
-    Thin delegation to :func:`corpus_manifest._publish_immutable` — the existing
-    hash-checked, fsync + hardlink + verify publisher.  No durability or
-    conflict-handling logic is duplicated here.  Raises
+    Thin delegation to :func:`corpus_manifest.publish_immutable_bytes` — the
+    public surface of the existing hash-checked, fsync + hardlink + verify
+    publisher.  No durability or conflict-handling logic is duplicated here, and
+    no leading-underscore symbol is imported across the module boundary.  Raises
     :class:`~src.benchmark.corpus_manifest.ManifestPublicationError` on failure.
     """
-    _publish_immutable(path, content, expected_sha256)
+    publish_immutable_bytes(path, content, expected_sha256)
 
 
 # ---------------------------------------------------------------------------
@@ -594,10 +595,11 @@ def validate_schema_golden(schema: str, content: bytes) -> None:
 
     Asserts canonical JSONL (one final newline, no blank lines, each line
     canonical via :func:`strict_json_loads` with ``require_canonical=True``),
-    the exact 12-key row set, finite ``Decimal`` time fields, integer identity
-    counters, lowercase-SHA-256 hash fields, and byte-identity against a
-    re-render through the canonical JSON helper.  Raises :class:`ValueError`
-    (or its :class:`StrictJsonError` subclass) on any drift.
+    the exact 12-key row set, finite ``int``/``Decimal`` time fields (both
+    canonical tokens the renderer emits for whole- and fractional-number times),
+    integer identity counters, lowercase-SHA-256 hash fields, and byte-identity
+    against a re-render through the canonical JSON helper.  Raises
+    :class:`ValueError` (or its :class:`StrictJsonError` subclass) on any drift.
     """
     if schema != REFERENCE_EVENT_SCHEMA:
         raise ValueError("unsupported schema golden")
@@ -637,5 +639,13 @@ def _validate_reference_event_row(row: object) -> None:
             raise ValueError(f"{key} must be a lowercase SHA-256")
     for key in _REFERENCE_EVENT_TIME_KEYS:
         value = row[key]
-        if not isinstance(value, Decimal) or not value.is_finite():
+        # The canonical renderer (backend_identity._render_decimal) collapses
+        # whole-number Decimals to bare-integer tokens (Decimal("0.0") -> "0"),
+        # and strict_json_loads parses integer tokens back as ``int`` (float
+        # tokens come back as ``Decimal`` via parse_float).  Both representations
+        # are legitimate for a time field, so accept ``int`` and ``Decimal``
+        # (rejecting ``bool``, which is an ``int`` subclass) and require finite.
+        if isinstance(value, bool) or not isinstance(value, (int, Decimal)):
+            raise ValueError(f"{key} must be a finite number")
+        if not math.isfinite(float(value)):
             raise ValueError(f"{key} must be a finite number")

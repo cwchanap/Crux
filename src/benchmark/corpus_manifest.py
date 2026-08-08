@@ -532,6 +532,17 @@ def _publish_immutable(path: Path, content: bytes, expected_sha256: str) -> None
         raise ManifestPublicationError(_PUBLICATION_ERROR) from None
 
 
+def publish_immutable_bytes(path: Path, content: bytes, expected_sha256: str) -> None:
+    """Publish ``content`` at ``path`` immutably.
+
+    Public entry point for cross-module callers.  Thin delegation to the
+    internal :func:`_publish_immutable` publisher — the existing hash-checked,
+    fsync + hardlink + verify implementation.  No durability or conflict-handling
+    logic is duplicated.  Raises :class:`ManifestPublicationError` on failure.
+    """
+    _publish_immutable(path, content, expected_sha256)
+
+
 def _verify_existing_manifest(path: Path, expected_content: bytes) -> None:
     descriptor: int | None = None
     try:
