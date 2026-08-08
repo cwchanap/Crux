@@ -574,3 +574,70 @@ def _is_corpus_version(value: object) -> bool:
     except ValueError:
         return False
     return True
+
+
+@dataclass(frozen=True)
+class ReferenceChartRowView:
+    """Typed, type-narrowed view over a validated HPA-322 reference-chart row.
+
+    Adapts the merged reference-row validator into timing-consumer inputs.
+    ``source`` is the HPA-321 :class:`ManifestRowView` reconstructed and validated
+    by :func:`_validate_reference_row`; the selection fields are narrowed to the
+    shapes that validator guarantees.  ``simfile_id`` is exposed through the
+    typed property rather than a duplicated integer field.
+    """
+
+    source: ManifestRowView
+    corpus_version: str
+    selection_status: Literal["selected", "quarantined"]
+    selection_reason_codes: tuple[str, ...]
+    selection_warnings: tuple[str, ...]
+    selected_chart: RemoteObject | None
+    selected_chart_content_hash: str | None
+
+    @property
+    def simfile_id(self) -> int:
+        return self.source.inventory.simfile_id
+
+
+def reference_chart_row_view_from_row(row: Mapping[str, object]) -> ReferenceChartRowView:
+    """Build a typed reference-chart row view by reusing the merged validator.
+
+    Delegates the entire key-set, schema, digest, cache-path, DLEVEL, and
+    selected/nullability contract to :func:`_validate_reference_row`, so
+    malformed or identity-inconsistent rows still fail through that validator
+    with a ``ValueError``.  After it succeeds, the selection fields are
+    type-narrowed and the selected chart is resolved from the already-validated
+    inventory objects rather than re-read from disk.
+    """
+    view = _validate_reference_row(row)
+    corpus_version = row["corpus_version"]
+    status = row["selection_status"]
+    reasons = row["selection_reason_codes"]
+    warnings = row["selection_warnings"]
+    assert isinstance(corpus_version, str)
+    assert isinstance(status, str)
+    assert isinstance(reasons, list)
+    assert isinstance(warnings, list)
+    assert all(isinstance(reason, str) for reason in reasons)
+    assert all(isinstance(warning, str) for warning in warnings)
+    if status == "selected":
+        selected_key = row["selected_chart_key"]
+        selected_hash = row["selected_chart_content_hash"]
+        assert isinstance(selected_key, str)
+        assert isinstance(selected_hash, str)
+        selected_chart = _remote_by_key(view, selected_key)
+        assert selected_chart is not None
+        selected_chart_content_hash: str | None = selected_hash
+    else:
+        selected_chart = None
+        selected_chart_content_hash = None
+    return ReferenceChartRowView(
+        source=view,
+        corpus_version=corpus_version,
+        selection_status=status,
+        selection_reason_codes=tuple(reasons),
+        selection_warnings=tuple(warnings),
+        selected_chart=selected_chart,
+        selected_chart_content_hash=selected_chart_content_hash,
+    )
