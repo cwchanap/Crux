@@ -23,7 +23,6 @@ validator or private path/casefold helper is reachable from here.
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -48,12 +47,20 @@ from src.benchmark.r2_corpus_models import (
     RemoteObject,
     SimfileInventory,
 )
-from src.benchmark.r2_inventory import R2ObjectStore, create_boto3_store
+from src.benchmark.r2_inventory import (
+    R2ObjectStore,
+    create_boto3_store,
+    ensure_r2_dependency,
+)
 from src.benchmark.reference_chart_manifest import (
     ReferenceChartRowView,
     reference_chart_row_view_from_row,
 )
 from src.benchmark.reference_timing import BgmReferenceSet, resolve_bgm_reference_groups
+from src.benchmark.reference_timing_manifest import (
+    LoadedReferenceChartManifest,
+    load_reference_chart_manifest,
+)
 from src.benchmark.timing import DtxTimingMap, build_dtx_timing_map
 
 #: Channel-``02`` measures below this absolute delta (seconds) are treated as
@@ -117,9 +124,6 @@ class AnalysisDeps:
     fields with offline fakes and assert each seam is invoked.
     """
 
-    r2_config: R2Config
-    store: R2ObjectStore
-    index: CacheIndexStore
     build_row_view: Callable[..., ReferenceChartRowView] = reference_chart_row_view_from_row
     read_chart_body: Callable[..., bytes] = read_verified_cache_body
     parse_chart: Callable[..., ParsedDtxChart] = parse_dtx_bytes
@@ -128,6 +132,13 @@ class AnalysisDeps:
     resolve_audio_body: Callable[..., Path] = resolve_verified_cache_body
     probe_audio: Callable[[Path], AudioProbeOutcome] = _default_probe_audio
     sync_explicit: Callable[..., CacheSyncResult] = sync_explicit_cache_keys
+    r2_config: R2Config | None = None
+    store: R2ObjectStore | None = None
+    index: CacheIndexStore | None = None
+    dependency_check: Callable[[], object] | None = None
+    r2_config_factory: Callable[[], R2Config] | None = None
+    store_factory: Callable[[R2Config], R2ObjectStore] | None = None
+    index_factory: Callable[[Path], CacheIndexStore] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -135,37 +146,12 @@ class AnalysisDeps:
 # ---------------------------------------------------------------------------
 
 
-def _load_row_views(
+def _load_manifest(
     manifest_path: Path,
     build_row_view: Callable[..., ReferenceChartRowView],
-) -> tuple[ReferenceChartRowView, ...]:
-    """Read canonical JSONL and build a typed view per row.
-
-    Rows are returned in manifest order (already canonical / deterministic).
-    Malformed records fail loudly through the row validator.
-    """
-    content = manifest_path.read_bytes()
-    if not content.endswith(b"\n"):
-        raise ValueError("reference-chart manifest must be canonical JSONL")
-    views: list[ReferenceChartRowView] = []
-    for line in content.splitlines(keepends=True):
-        if not line.endswith(b"\n"):
-            raise ValueError("reference-chart manifest must be canonical JSONL")
-        row = _json_object(line[:-1])
-        views.append(build_row_view(row))
-    if not views:
-        raise ValueError("reference-chart manifest contains no records")
-    return tuple(views)
-
-
-def _json_object(raw: bytes) -> dict[str, Any]:
-    try:
-        value = json.loads(raw.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        raise ValueError("reference-chart manifest must be canonical JSONL") from None
-    if not isinstance(value, dict):
-        raise ValueError("reference-chart manifest must be canonical JSONL")
-    return value
+) -> LoadedReferenceChartManifest:
+    """Load the manifest through the production HPA-322 loader."""
+    return load_reference_chart_manifest(manifest_path, row_view_builder=build_row_view)
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +321,8 @@ def run_reference_timing_analysis(
     byte-stable across re-runs against the same fixture (all collections are
     deterministically ordered; floats are quantized to six places).
     """
-    row_views = _load_row_views(config.manifest_path, deps.build_row_view)
+    loaded = _load_manifest(config.manifest_path, deps.build_row_view)
+    row_views = tuple(validated.view for validated in loaded.rows)
     selected_rows = tuple(view for view in row_views if view.selection_status == "selected")
     quarantined_rows = tuple(view for view in row_views if view.selection_status == "quarantined")
     # Process selected rows in simfile-id order for deterministic output.
@@ -359,8 +346,9 @@ def run_reference_timing_analysis(
     # Simfile inventories captured per simfile-id for exact-key cache fills.
     inventories_by_simfile: dict[int, SimfileInventory] = {}
 
-    endpoint_sha = deps.r2_config.source_endpoint_sha256
-    bucket = deps.r2_config.bucket
+    source = loaded.rows[0].view.source
+    endpoint_sha = source.source_endpoint_sha256
+    bucket = source.source_bucket
 
     for row in selected_rows:
         assert row.selected_chart is not None
@@ -462,6 +450,8 @@ def run_reference_timing_analysis(
         sampled_audio_decodable_count,
         sampled_audio_undecodable_count,
         sampled_audio_undecodable_by_extension,
+        sampled_audio_cache_failure_count,
+        sampled_audio_cache_failure_by_extension,
     ) = sampled
 
     return {
@@ -479,6 +469,14 @@ def run_reference_timing_analysis(
         "rows_with_unresolved_wav": rows_with_unresolved_wav,
         "sampled_audio_count": sampled_audio_count,
         "sampled_audio_decodable_count": sampled_audio_decodable_count,
+        "sampled_audio_cache_failure_by_extension": _sorted_counts(
+            sampled_audio_cache_failure_by_extension
+        ),
+        "sampled_audio_cache_failure_count": sampled_audio_cache_failure_count,
+        "sampled_audio_decoder_failure_by_extension": _sorted_counts(
+            sampled_audio_undecodable_by_extension
+        ),
+        "sampled_audio_decoder_failure_count": sampled_audio_undecodable_count,
         "sampled_audio_undecodable_by_extension": _sorted_counts(
             sampled_audio_undecodable_by_extension
         ),
@@ -505,7 +503,7 @@ def _probe_sampled_audio(
     endpoint_sha: str,
     bucket: str,
     inventories_by_simfile: dict[int, SimfileInventory],
-) -> tuple[int, int, int, dict[str, int]]:
+) -> tuple[int, int, int, dict[str, int], int, dict[str, int]]:
     """Fill missing verified bodies, then probe decodability.
 
     Ordering is strict: every sampled body is resolved (filling missing exact
@@ -514,7 +512,7 @@ def _probe_sampled_audio(
     precedes ``soundfile.info``.
     """
     if not audio_sample:
-        return 0, 0, 0, {}
+        return 0, 0, 0, {}, 0, {}
 
     resolved_paths: dict[str, Path | None] = {}
     for key, (remote, _ext, _simfile_id, _chart_key) in audio_sample:
@@ -534,20 +532,47 @@ def _probe_sampled_audio(
         inventories = tuple(
             inventories_by_simfile[simfile_id] for simfile_id in sorted(simfile_ids)
         )
-        deps.sync_explicit(
-            inventories,
-            deps.store,
-            deps.index,
-            deps.r2_config,
-            missing_keys,
+        fill_config, fill_store, fill_index = _prepare_fill_dependencies(
+            deps,
+            cache_dir=config.cache_dir,
+            endpoint_sha=endpoint_sha,
+            bucket=bucket,
         )
-        for key, (remote, _ext, _simfile_id, _chart_key) in audio_sample:
+        try:
+            result = deps.sync_explicit(
+                inventories,
+                fill_store,
+                fill_index,
+                fill_config,
+                missing_keys,
+            )
+        except (OSError, RuntimeError, ValueError):
+            result = None
+
+        rebuilt_by_id = (
+            {simfile.simfile_id: simfile for simfile in result.simfiles}
+            if result is not None
+            else {}
+        )
+        for key, (remote, _ext, simfile_id, _chart_key) in audio_sample:
             if key not in missing_keys:
+                continue
+            rebuilt_inventory = rebuilt_by_id.get(simfile_id)
+            rebuilt_remote = (
+                next(
+                    (candidate for candidate in rebuilt_inventory.objects if candidate.key == key),
+                    None,
+                )
+                if rebuilt_inventory is not None
+                else None
+            )
+            if rebuilt_remote is None or rebuilt_remote.cache_status != "verified":
+                resolved_paths[key] = None
                 continue
             try:
                 resolved_paths[key] = deps.resolve_audio_body(
                     config.cache_dir,
-                    remote,
+                    rebuilt_remote,
                     source_endpoint_sha256=endpoint_sha,
                     bucket=bucket,
                 )
@@ -558,13 +583,19 @@ def _probe_sampled_audio(
     sampled_audio_decodable_count = 0
     sampled_audio_undecodable_count = 0
     sampled_audio_undecodable_by_extension: dict[str, int] = {}
+    sampled_audio_cache_failure_count = 0
+    sampled_audio_cache_failure_by_extension: dict[str, int] = {}
     for key, (_remote, extension, _simfile_id, _chart_key) in audio_sample:
         sampled_audio_count += 1
         path = resolved_paths[key]
         if path is None:
-            outcome = AudioProbeOutcome(decodable=False, error="verified body unavailable")
-        else:
-            outcome = deps.probe_audio(path)
+            label = extension or "<none>"
+            sampled_audio_cache_failure_count += 1
+            sampled_audio_cache_failure_by_extension[label] = (
+                sampled_audio_cache_failure_by_extension.get(label, 0) + 1
+            )
+            continue
+        outcome = deps.probe_audio(path)
         if outcome.decodable:
             sampled_audio_decodable_count += 1
         else:
@@ -578,7 +609,43 @@ def _probe_sampled_audio(
         sampled_audio_decodable_count,
         sampled_audio_undecodable_count,
         sampled_audio_undecodable_by_extension,
+        sampled_audio_cache_failure_count,
+        sampled_audio_cache_failure_by_extension,
     )
+
+
+def _prepare_fill_dependencies(
+    deps: AnalysisDeps,
+    *,
+    cache_dir: Path,
+    endpoint_sha: str,
+    bucket: str,
+) -> tuple[R2Config, R2ObjectStore, CacheIndexStore]:
+    """Resolve and validate R2 dependencies only when a sampled fill is needed."""
+    config = deps.r2_config
+    if config is None:
+        if deps.r2_config_factory is None:
+            raise ValueError("R2 configuration is unavailable for the requested fill")
+        config = deps.r2_config_factory()
+    if config.source_endpoint_sha256 != endpoint_sha or config.bucket != bucket:
+        raise ValueError("R2 config identity does not match the reference chart source")
+
+    if deps.dependency_check is not None:
+        deps.dependency_check()
+    elif deps.store is None:
+        ensure_r2_dependency()
+
+    store = deps.store
+    if store is None:
+        store_factory = deps.store_factory or create_boto3_store
+        store = store_factory(config)
+    index = deps.index
+    if index is None:
+        index_factory = deps.index_factory or CacheIndexStore.load
+        index = index_factory(cache_dir)
+    if index is None:
+        raise ValueError("cache index is unavailable for the requested fill")
+    return config, store, index
 
 
 def render_report(report: dict[str, Any]) -> bytes:
@@ -634,10 +701,12 @@ def main(
     disallow_root_fallback: bool,
 ) -> None:
     """Measure reference-timing corpus behavior and freeze the diagnostic."""
-    r2_config = R2Config.from_environ(os.environ)
-    store = create_boto3_store(r2_config)
-    index = CacheIndexStore.load(Path(cache_dir))
-    deps = AnalysisDeps(r2_config=r2_config, store=store, index=index)
+    deps = AnalysisDeps(
+        dependency_check=ensure_r2_dependency,
+        r2_config_factory=lambda: R2Config.from_environ(os.environ),
+        store_factory=create_boto3_store,
+        index_factory=CacheIndexStore.load,
+    )
     analysis_config = AnalysisConfig(
         manifest_path=Path(manifest_path),
         cache_dir=Path(cache_dir),

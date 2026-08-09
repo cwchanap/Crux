@@ -43,6 +43,7 @@ unchanged.  Two new fields record the HPA-322 manifest identity itself:
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -145,6 +146,7 @@ _AUDIO_PROBE_ERRORS: tuple[type[BaseException], ...] = (
 #: The directory (under ``output_dir``) that holds the immutable events
 #: artifacts, and the manifest row prefix that points at them.
 _EVENTS_DIR_NAME = "events"
+_EVENT_ARTIFACT_PATH_RE = re.compile(r"events/[0-9a-f]{64}\.jsonl\Z")
 
 StoreFactory = Callable[[R2Config], R2ObjectStore]
 Clock = Callable[[], datetime]
@@ -216,13 +218,17 @@ class _ValidatedReferenceChartRow:
 
 
 @dataclass(frozen=True)
-class _LoadedReferenceChartManifest:
+class LoadedReferenceChartManifest:
     source_reference_chart_manifest_sha256: str
     source_reference_chart_version: str
     rows: tuple[_ValidatedReferenceChartRow, ...]
 
 
-def load_reference_chart_manifest(path: Path) -> _LoadedReferenceChartManifest:
+def load_reference_chart_manifest(
+    path: Path,
+    *,
+    row_view_builder: Callable[[Mapping[str, object]], ReferenceChartRowView] | None = None,
+) -> LoadedReferenceChartManifest:
     """Load and validate a canonical HPA-322 reference-chart manifest.
 
     Mirrors the canonical-JSONL loader used for HPA-321 source manifests but
@@ -240,6 +246,9 @@ def load_reference_chart_manifest(path: Path) -> _LoadedReferenceChartManifest:
         raise ValueError("reference chart manifest must contain canonical JSONL records")
 
     rows: list[_ValidatedReferenceChartRow] = []
+    build_row_view = (
+        reference_chart_row_view_from_row if row_view_builder is None else row_view_builder
+    )
     simfile_ids: set[int] = set()
     source_identity: tuple[str, str, str, str, str] | None = None
     for line in content.splitlines(keepends=True):
@@ -257,7 +266,7 @@ def load_reference_chart_manifest(path: Path) -> _LoadedReferenceChartManifest:
         ):
             raise ValueError("reference chart manifest contains an unsupported row")
         try:
-            view = reference_chart_row_view_from_row(source_row)
+            view = build_row_view(source_row)
         except ValueError:
             raise ValueError(
                 "reference chart manifest contains an invalid reference chart row"
@@ -289,7 +298,7 @@ def load_reference_chart_manifest(path: Path) -> _LoadedReferenceChartManifest:
     assert source_identity is not None
     if rendered.content != content or rendered.corpus_version != source_identity[0]:
         raise ValueError("reference chart manifest has an invalid derived corpus version")
-    return _LoadedReferenceChartManifest(
+    return LoadedReferenceChartManifest(
         source_reference_chart_manifest_sha256=sha256(content).hexdigest(),
         source_reference_chart_version=source_identity[0],
         rows=tuple(rows),
@@ -418,13 +427,13 @@ class _RowTimingState:
 
 
 def _timing_quarantine(
-    reason_codes: tuple[TimingReasonCode, ...] | tuple[str, ...],
+    reason_codes: tuple[TimingReasonCode, ...],
     *,
     warnings: tuple[str, ...] = (),
 ) -> TimingRowResolution:
     return TimingRowResolution(
         status="quarantined",
-        reason_codes=tuple(reason_codes),  # type: ignore[arg-type]
+        reason_codes=reason_codes,
         warnings=warnings,
         source_audio_key=None,
         source_audio_content_hash=None,
@@ -472,7 +481,7 @@ def run_reference_timing(
 
 def _run_reference_timing(
     *,
-    loaded: _LoadedReferenceChartManifest,
+    loaded: LoadedReferenceChartManifest,
     request: ReferenceTimingRequest,
     environ: Mapping[str, str],
     dependency_check: Callable[[], None],
@@ -604,7 +613,7 @@ def _first_pass_row(
         chart,
         selected_chart_key=view.selected_chart.key,
         row=view,
-        allow_root_fallback=True,
+        allow_root_fallback=False,
     )
     bgm = select_bgm_reference(references, timing_map)
     combined_reasons = tuple(sorted(set(references.reason_codes) | set(bgm.reason_codes)))
@@ -639,7 +648,7 @@ def _first_pass_row(
 def _fill_pending_audio(
     pending: list[_RowTimingState],
     *,
-    loaded: _LoadedReferenceChartManifest,
+    loaded: LoadedReferenceChartManifest,
     cache_dir: Path,
     environ: Mapping[str, str],
     dependency_check: Callable[[], None],
@@ -932,6 +941,9 @@ def _validate_timing_status_shape(row: Mapping[str, object]) -> None:
             if not isinstance(value, str) or not value:
                 raise ValueError("ready reference timing row is missing source audio identity")
         _require_sha256_value(row["source_audio_content_hash"], "source_audio_content_hash")
+        event_path = row["reference_events_cache_path"]
+        if not isinstance(event_path, str) or _EVENT_ARTIFACT_PATH_RE.fullmatch(event_path) is None:
+            raise ValueError("ready reference timing row has an invalid event artifact path")
         return
     if not row["timing_reason_codes"]:
         raise ValueError("quarantined reference timing row must carry reason codes")
