@@ -28,7 +28,7 @@ import math
 import re
 from dataclasses import dataclass
 from decimal import Decimal
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal, get_args
 
 import soundfile as sf
@@ -41,7 +41,7 @@ from src.benchmark.backend_identity import (
 from src.benchmark.corpus_manifest import publish_immutable_bytes
 from src.benchmark.dtx_parser import DtxBgmEvent, ParsedDtxChart
 from src.benchmark.inventory_object_keys import resolve_inventory_object_key
-from src.benchmark.r2_corpus_models import RemoteObject
+from src.benchmark.r2_corpus_models import MAX_SIMFILE_ID, RemoteObject
 from src.benchmark.reference_chart_manifest import ReferenceChartRowView
 from src.benchmark.timing import DtxTimingMap
 
@@ -58,6 +58,7 @@ _AUDIO_PROBE_ERRORS: tuple[type[BaseException], ...] = (
 )
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_DTX_ID_RE = re.compile(r"[0-9A-F]{2}")
 
 TimingReasonCode = Literal[
     "upstream_chart_selection_unavailable",
@@ -501,8 +502,14 @@ def build_audio_relative_events(
 # ---------------------------------------------------------------------------
 
 
-def _event_native_identity(event: NativeReferenceEvent) -> tuple[int, float, int]:
-    return (event.measure, event.position, event.source_order)
+def _event_native_identity(event: NativeReferenceEvent) -> tuple[int, float, int, str, str]:
+    return (
+        event.measure,
+        event.position,
+        event.source_order,
+        event.lane_id,
+        event.note_id,
+    )
 
 
 def _event_to_canonical_row(event: NativeReferenceEvent) -> dict[str, object]:
@@ -618,6 +625,8 @@ def validate_schema_golden(schema: str, content: bytes) -> None:
     for row in rows:
         _validate_reference_event_row(row)
 
+    _validate_reference_event_sequence(rows)
+
     regenerated = b"".join(canonical_json_bytes(row, trailing_newline=True) for row in rows)
     if regenerated != content:
         raise ValueError("reference event golden is not byte-identical to its canonical render")
@@ -630,9 +639,22 @@ def _validate_reference_event_row(row: object) -> None:
         value = row[key]
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"{key} must be an integer")
+    simfile_id = row["simfile_id"]
+    if not 0 <= simfile_id <= MAX_SIMFILE_ID:
+        raise ValueError("simfile_id is outside the repository bounds")
+    for key in ("source_order", "measure"):
+        if row[key] < 0:
+            raise ValueError(f"{key} must be non-negative")
     for key in _REFERENCE_EVENT_STRING_KEYS:
         if not isinstance(row[key], str) or not row[key]:
             raise ValueError(f"{key} must be a non-empty string")
+    for key in ("lane_id", "note_id"):
+        value = row[key]
+        if _DTX_ID_RE.fullmatch(value) is None:
+            raise ValueError(f"{key} must be a two-digit uppercase hexadecimal ID")
+    for key in ("selected_chart_key", "source_audio_key"):
+        if not _is_safe_event_object_key(row[key], simfile_id):
+            raise ValueError(f"{key} must be a safe simfile object key")
     for key in _REFERENCE_EVENT_HASH_KEYS:
         value = row[key]
         if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
@@ -649,3 +671,51 @@ def _validate_reference_event_row(row: object) -> None:
             raise ValueError(f"{key} must be a finite number")
         if not math.isfinite(float(value)):
             raise ValueError(f"{key} must be a finite number")
+    position = row["position"]
+    if not 0 <= position < 1:
+        raise ValueError("position must be in the half-open range [0, 1)")
+
+
+def _is_safe_event_object_key(value: object, simfile_id: int) -> bool:
+    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
+        return False
+    path = PurePosixPath(value)
+    if path.is_absolute() or path.as_posix() != value:
+        return False
+    if any(part in {"", ".", ".."} for part in path.parts) or len(path.parts) < 2:
+        return False
+    first_segment = path.parts[0]
+    return (
+        first_segment.isascii() and first_segment.isdecimal() and int(first_segment) == simfile_id
+    )
+
+
+def _validate_reference_event_sequence(rows: tuple[object, ...]) -> None:
+    typed_rows = tuple(row for row in rows if isinstance(row, dict))
+    identity_prefixes = {
+        (
+            row["simfile_id"],
+            row["selected_chart_key"],
+            row["selected_chart_content_hash"],
+            row["source_audio_key"],
+            row["source_audio_content_hash"],
+        )
+        for row in typed_rows
+    }
+    if len(identity_prefixes) != 1:
+        raise ValueError("reference event rows have mixed source identity")
+
+    ordered_keys = tuple(
+        (
+            row["measure"],
+            row["position"],
+            row["source_order"],
+            row["lane_id"],
+            row["note_id"],
+        )
+        for row in typed_rows
+    )
+    if ordered_keys != tuple(sorted(ordered_keys)):
+        raise ValueError("reference event rows are out of order")
+    if len(ordered_keys) != len(set(ordered_keys)):
+        raise ValueError("reference event rows contain a duplicate native identity")

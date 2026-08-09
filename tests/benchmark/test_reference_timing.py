@@ -17,6 +17,7 @@ from src.benchmark.dtx_parser import DtxBgmEvent, ParsedDtxChart
 from src.benchmark.models import DtxEvent
 from src.benchmark.r2_corpus_models import (
     CACHE_PROFILE,
+    MAX_SIMFILE_ID,
     ProvenanceRecord,
     RemoteObject,
     SimfileInventory,
@@ -1029,6 +1030,55 @@ def test_validate_reference_event_golden_rejects_non_canonical_bytes() -> None:
 
     with pytest.raises(ValueError):
         validate_schema_golden(REFERENCE_EVENT_SCHEMA, noncanonical)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("simfile_id", -1),
+        ("simfile_id", MAX_SIMFILE_ID + 1),
+        ("source_order", -1),
+        ("measure", -1),
+        ("position", Decimal("-0.1")),
+        ("position", Decimal("1.0")),
+        ("lane_id", "1"),
+        ("lane_id", "GG"),
+        ("note_id", "000"),
+        ("note_id", "GG"),
+        ("selected_chart_key", "../escape.dtx"),
+        ("selected_chart_key", "/42/real.dtx"),
+        ("selected_chart_key", "42\\real.dtx"),
+        ("source_audio_key", "42/../audio.ogg"),
+        ("source_audio_key", "42/audio.ogg\x00"),
+    ],
+)
+def test_validate_reference_event_golden_rejects_invalid_identity_fields(
+    field: str,
+    value: object,
+) -> None:
+    row = _golden_event_row()
+    row[field] = value
+    content = canonical_json_bytes(row, trailing_newline=True)
+
+    with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)
+
+
+def test_validate_reference_event_golden_rejects_duplicate_native_identity() -> None:
+    row = _golden_event_row()
+    content = b"".join(canonical_json_bytes(row, trailing_newline=True) for _ in range(2))
+
+    with pytest.raises(ValueError, match="duplicate"):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)
+
+
+def test_validate_reference_event_golden_rejects_out_of_order_rows() -> None:
+    content = render_reference_events(_sample_events())
+    lines = content.splitlines(keepends=True)
+    out_of_order = lines[1] + lines[0]
+
+    with pytest.raises(ValueError, match="order"):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, out_of_order)
 
 
 def test_validate_reference_event_golden_rejects_unsupported_schema() -> None:

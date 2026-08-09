@@ -9,12 +9,14 @@ private HPA-322 validator or path/casefold helper.
 from __future__ import annotations
 
 from dataclasses import fields as dataclass_fields
+from dataclasses import replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 
 import pytest
 
+import tools.hpa323.analyze_reference_timing as analyze_reference_timing
 from src.benchmark.backend_identity import canonical_json_bytes
 from src.benchmark.corpus_cache import CacheIndexStore
 from src.benchmark.corpus_manifest import build_manifest_rows, render_manifest
@@ -248,10 +250,13 @@ def _selected_fixture(
     *,
     audio_name: str = "bgm.ogg",
     simfile_id: int = 42,
+    audio_verified: bool = True,
 ) -> tuple[Path, str, str]:
     """Build a published manifest with one selected chart + one quarantined row."""
     chart = _remote(simfile_id, "real.dtx", chart_body)
     audio = _remote(simfile_id, audio_name, b"audio-body")
+    if not audio_verified:
+        audio = replace(audio, cache_status="not_selected", sha256=None, cache_path=None)
     selected_inventory = SimfileInventory(simfile_id, f"{simfile_id}/", (chart, audio), "complete")
     quarantined_inventory = SimfileInventory(simfile_id + 1, f"{simfile_id + 1}/", (), "empty")
     manifest_path = _publish_reference_manifest(
@@ -276,6 +281,66 @@ def test_default_deps_bind_to_public_production_seams_only() -> None:
     assert defaults["build_timing_map"] is build_dtx_timing_map
     assert defaults["resolve_audio_body"].__name__ == "resolve_verified_cache_body"
     assert defaults["sync_explicit"].__name__ == "sync_explicit_cache_keys"
+
+
+def test_diagnostic_uses_the_shared_production_manifest_loader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_path, _chart_key, _audio_key = _selected_fixture(tmp_path, _CH02_CHART)
+    deps, _calls, _sync_keys = _build_deps(
+        tmp_path,
+        chart_body=_CH02_CHART,
+        audio_key="42/bgm.ogg",
+    )
+    real_loader = analyze_reference_timing.load_reference_chart_manifest
+    loaded_paths: list[Path] = []
+
+    def loader(path: Path, **kwargs):
+        loaded_paths.append(path)
+        return real_loader(path, **kwargs)
+
+    monkeypatch.setattr(analyze_reference_timing, "load_reference_chart_manifest", loader)
+
+    _run(_make_config(tmp_path, manifest_path), deps)
+
+    assert loaded_paths == [manifest_path]
+
+
+def test_diagnostic_does_not_require_r2_dependencies_without_a_fill(tmp_path: Path) -> None:
+    manifest_path, _chart_key, _audio_key = _selected_fixture(tmp_path, _CH02_CHART)
+    deps, _calls, _sync_keys = _build_deps(
+        tmp_path,
+        chart_body=_CH02_CHART,
+        audio_key="42/bgm.ogg",
+    )
+    deps = replace(deps, r2_config=None, store=None, index=None)
+
+    report = _run(_make_config(tmp_path, manifest_path), deps)
+
+    assert report["sampled_audio_decodable_count"] == 1
+
+
+def test_diagnostic_rejects_r2_identity_mismatch_before_filling(tmp_path: Path) -> None:
+    manifest_path, _chart_key, audio_key = _selected_fixture(
+        tmp_path,
+        _CH02_CHART,
+        audio_verified=False,
+    )
+    deps, _calls, _sync_keys = _build_deps(
+        tmp_path,
+        chart_body=_CH02_CHART,
+        audio_key=audio_key,
+        audio_present_first=False,
+    )
+    assert deps.r2_config is not None
+    deps = replace(
+        deps,
+        r2_config=replace(deps.r2_config, source_endpoint_sha256="0" * 64),
+    )
+
+    with pytest.raises(ValueError, match="identity"):
+        _run(_make_config(tmp_path, manifest_path), deps)
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +401,97 @@ def test_missing_audio_is_filled_via_sync_explicit_cache_keys_before_probe(tmp_p
     assert sync_index < probe_index
     assert report["sampled_audio_count"] == 1
     assert report["sampled_audio_decodable_count"] == 1
+
+
+def test_missing_audio_uses_the_rebuilt_remote_and_separates_decoder_failures(
+    tmp_path: Path,
+) -> None:
+    manifest_path, _chart_key, audio_key = _selected_fixture(
+        tmp_path,
+        _CH02_CHART,
+        audio_verified=False,
+    )
+    deps, calls, _sync_keys = _build_deps(
+        tmp_path,
+        chart_body=_CH02_CHART,
+        audio_key=audio_key,
+        audio_present_first=False,
+    )
+    rebuilt_digest = sha256(b"audio-body").hexdigest()
+    rebuilt_remote = _remote(42, "bgm.ogg", b"audio-body")
+    seen_remotes: list[RemoteObject] = []
+
+    def resolve_audio_body(cache_dir, remote, **kwargs):
+        del cache_dir, kwargs
+        seen_remotes.append(remote)
+        if remote.sha256 != rebuilt_digest or remote.cache_status != "verified":
+            raise ValueError("verified cache body unavailable")
+        return tmp_path / "bodies" / "42_bgm.ogg"
+
+    def sync_explicit(simfiles, store, index, config, selected_keys, item_progress=None):
+        del store, index, config, selected_keys, item_progress
+        from src.benchmark.r2_corpus_models import CacheSyncResult
+
+        rebuilt = tuple(
+            replace(
+                simfile,
+                objects=tuple(
+                    rebuilt_remote if remote.key == audio_key else remote
+                    for remote in simfile.objects
+                ),
+            )
+            for simfile in simfiles
+        )
+        return CacheSyncResult(simfiles=rebuilt, actions=())
+
+    deps = replace(
+        deps,
+        resolve_audio_body=resolve_audio_body,
+        sync_explicit=sync_explicit,
+    )
+
+    report = _run(_make_config(tmp_path, manifest_path), deps)
+
+    assert [remote.cache_status for remote in seen_remotes] == ["not_selected", "verified"]
+    assert [remote.sha256 for remote in seen_remotes] == [None, rebuilt_digest]
+    assert report["sampled_audio_count"] == 1
+    assert report["sampled_audio_decodable_count"] == 1
+    assert report["sampled_audio_cache_failure_count"] == 0
+    assert report["sampled_audio_decoder_failure_count"] == 0
+    assert report["sampled_audio_undecodable_count"] == 0
+    assert any(seam == "probe_audio" for seam, _key in calls)
+
+
+def test_missing_audio_cache_failure_is_not_reported_as_decoder_failure(tmp_path: Path) -> None:
+    manifest_path, _chart_key, audio_key = _selected_fixture(
+        tmp_path,
+        _CH02_CHART,
+        audio_verified=False,
+    )
+    deps, _calls, _sync_keys = _build_deps(
+        tmp_path,
+        chart_body=_CH02_CHART,
+        audio_key=audio_key,
+        audio_present_first=False,
+    )
+
+    def unavailable(*_args, **_kwargs):
+        raise ValueError("verified cache body unavailable")
+
+    def no_rebuild(simfiles, *_args, **_kwargs):
+        from src.benchmark.r2_corpus_models import CacheSyncResult
+
+        return CacheSyncResult(simfiles=simfiles, actions=())
+
+    deps = replace(deps, resolve_audio_body=unavailable, sync_explicit=no_rebuild)
+
+    report = _run(_make_config(tmp_path, manifest_path), deps)
+
+    assert report["sampled_audio_count"] == 1
+    assert report["sampled_audio_cache_failure_count"] == 1
+    assert report["sampled_audio_decoder_failure_count"] == 0
+    assert report["sampled_audio_decodable_count"] == 0
+    assert report["sampled_audio_undecodable_count"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +604,8 @@ def test_undecodable_audio_is_counted_by_authored_extension(tmp_path: Path) -> N
 
     assert report["sampled_audio_undecodable_count"] == 1
     assert report["sampled_audio_undecodable_by_extension"] == {".ogg": 1}
+    assert report["sampled_audio_decoder_failure_count"] == 1
+    assert report["sampled_audio_decoder_failure_by_extension"] == {".ogg": 1}
 
 
 # ---------------------------------------------------------------------------

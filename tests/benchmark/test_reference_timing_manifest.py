@@ -69,7 +69,7 @@ _source_manifest_bytes = _hpa322._source_manifest_bytes
 
 _AUDIO_HASH = "c" * 64
 _AUDIO_KEY = "42/bgm.wav"
-_EVENTS_CACHE_PATH = f"sha256/cc/{_AUDIO_HASH}"
+_EVENTS_CACHE_PATH = f"events/{_AUDIO_HASH}.jsonl"
 _TIMING_GOLDEN_PATH = (
     Path(__file__).parent / "schema_goldens/crux.reference-timing-manifest-v1.jsonl"
 )
@@ -639,6 +639,31 @@ def test_golden_validator_rejects_unknown_reason_string() -> None:
         validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, content)
 
 
+def test_golden_validator_rejects_non_event_artifact_path() -> None:
+    rows = _golden_rows()
+    rows[0]["reference_events_cache_path"] = f"sha256/cc/{_AUDIO_HASH}"
+    content = b"".join(canonical_json_bytes(row, trailing_newline=True) for row in rows)
+
+    with pytest.raises(ValueError, match="event"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, content)
+
+
+def test_timing_builder_and_golden_use_the_event_artifact_contract(tmp_path: Path) -> None:
+    fixture = _published_hpa322(tmp_path)
+    loaded = load_reference_chart_manifest(fixture.manifest_path)
+    built = build_timing_row(
+        loaded.rows[0],
+        source_reference_chart_manifest_sha256=loaded.source_reference_chart_manifest_sha256,
+        source_reference_chart_version=loaded.source_reference_chart_version,
+        timing=_ready_resolution(),
+    )
+    rendered = render_manifest((built,))
+    golden_ready = next(row for row in _golden_rows() if row["timing_status"] == "ready")
+
+    assert rendered.rows[0]["reference_events_cache_path"] == _EVENTS_CACHE_PATH
+    assert golden_ready["reference_events_cache_path"] == _EVENTS_CACHE_PATH
+
+
 def test_golden_validator_rejects_non_canonical_json_line() -> None:
     rows = _golden_rows()
     first = canonical_json_bytes(rows[0])
@@ -862,6 +887,26 @@ def test_first_pass_verifies_selected_chart_once_and_reaches_ready(tmp_path, mon
     assert outcome.ready_count == 1
     # The selected DTX body is verified exactly once through read_verified_cache_body.
     assert chart_reads == ["42/real.dtx"]
+
+
+def test_production_reference_timing_disables_unmeasured_root_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _publish_timing_manifest(tmp_path, selected=(_ready_audio_spec(),))
+    real_resolve = reference_timing_manifest.resolve_bgm_reference_groups
+    fallback_values: list[bool] = []
+
+    def resolve(*args: object, **kwargs: object):
+        fallback_values.append(kwargs["allow_root_fallback"])
+        return real_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(reference_timing_manifest, "resolve_bgm_reference_groups", resolve)
+
+    outcome = run_reference_timing(_timing_request(fixture))
+
+    assert outcome.exit_code == 0
+    assert fallback_values == [False]
 
 
 def test_first_pass_maps_row_local_failures_without_aborting_siblings(tmp_path):
