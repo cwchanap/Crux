@@ -293,10 +293,21 @@ def select_bgm_reference(
     """
     group_count = len(references.groups)
     if group_count == 0:
+        if references.bgm_event_count == 0:
+            return BgmResolution(
+                selected_event=None,
+                chart_time_sec=None,
+                reason_codes=("bgm_event_missing",),
+                warnings=(),
+            )
+        # BGM events existed but none survived resolution — let the resolver's
+        # existing failure reasons (source_audio_missing, unresolved_bgm_wav,
+        # etc.) describe why no group survived, rather than falsely claiming no
+        # BGM event exists.
         return BgmResolution(
             selected_event=None,
             chart_time_sec=None,
-            reason_codes=("bgm_event_missing",),
+            reason_codes=(),
             warnings=(),
         )
     if group_count > 1:
