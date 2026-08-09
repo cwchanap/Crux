@@ -533,7 +533,9 @@ def _run_reference_timing(
         timing_rows.append(
             build_timing_row(
                 state.validated,
-                source_reference_chart_manifest_sha256=loaded.source_reference_chart_manifest_sha256,
+                source_reference_chart_manifest_sha256=(
+                    loaded.source_reference_chart_manifest_sha256
+                ),
                 source_reference_chart_version=loaded.source_reference_chart_version,
                 timing=state.resolution,
             )
@@ -542,6 +544,7 @@ def _run_reference_timing(
     # Phase 5/6: render + publish the timing manifest and the latest pointer.
     rendered = render_manifest(tuple(timing_rows))
     published = publish_manifest(output_dir, rendered)
+    _prune_unreferenced_event_artifacts(output_dir, timing_rows)
     overall_status: Literal["complete", "partial"] = (
         "complete" if quarantined_count == 0 else "partial"
     )
@@ -802,6 +805,37 @@ def _finalise_row_state(state: _RowTimingState, *, output_dir: Path) -> None:
         source_audio_content_hash=audio_content_hash,
         reference_events_cache_path=events_relative_path,
     )
+
+
+def _prune_unreferenced_event_artifacts(
+    output_dir: Path,
+    timing_rows: list[dict[str, object]],
+) -> None:
+    """Remove ``events/*.jsonl`` artifacts no longer referenced by this run.
+
+    Each ready row's ``reference_events_cache_path`` is ``events/<sha256>.jsonl``.
+    After the timing manifest is published, any previously-written event artifact
+    whose hash is absent from the just-published rows is stale (superseded by a
+    re-run that re-derived different events) and is pruned.  Referenced artifacts
+    are always preserved; only ``events/*.jsonl`` files are ever considered.
+    """
+    events_dir = output_dir / _EVENTS_DIR_NAME
+    if not events_dir.is_dir():
+        return
+    referenced: set[str] = set()
+    for row in timing_rows:
+        relative = row.get("reference_events_cache_path")
+        if isinstance(relative, str) and relative.startswith(f"{_EVENTS_DIR_NAME}/"):
+            referenced.add(Path(relative).stem)
+    if not referenced:
+        # No ready rows in this run: do not blindly delete every artifact, since
+        # a fully-quarantined re-run should not discard another run's events.
+        return
+    for entry in events_dir.iterdir():
+        if not entry.is_file() or entry.suffix != ".jsonl":
+            continue
+        if entry.stem not in referenced:
+            entry.unlink()
 
 
 # ---------------------------------------------------------------------------

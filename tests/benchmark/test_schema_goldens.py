@@ -215,16 +215,19 @@ def test_phase_b_schema_golden_validators_reject_structural_mutations(
             except ValueError:
                 continue
             # ``_replace_one_typed_value`` substitutes the alphabetically-first
-            # key with integer ``0``.  For the reference-event golden that first
-            # key is the numeric ``audio_time_sec`` field, whose canonical token
-            # ``0`` is a legitimate whole-number time (the common clamp-to-zero
-            # outcome), so this one mutation is a documented field-level no-op
-            # rather than a structural defect — see HPA-323 Task 5 Fix Round 1.
-            # Every other mutation (remove-key/unexpected-key/duplicate-key) must
-            # always raise; if one ever stops raising, fail loudly here.
-            assert mutation is _replace_one_typed_value, (
-                f"{entry.schema}: structural mutation did not raise ValueError"
-            )
+            # key with integer ``0``.  For the ``crux.dtx-reference-event/v1``
+            # golden that first key is the numeric ``audio_time_sec`` field,
+            # whose canonical token ``0`` is a legitimate whole-number time (the
+            # common clamp-to-zero outcome), so this one mutation is a documented
+            # field-level no-op rather than a structural defect — see HPA-323
+            # Task 5 Fix Round 1.  The exemption is schema-specific: every
+            # mutation (including ``_replace_one_typed_value``) must raise for
+            # every other schema, so fail loudly if a non-raising outcome ever
+            # escapes this single golden.
+            assert (
+                mutation is _replace_one_typed_value
+                and entry.schema == "crux.dtx-reference-event/v1"
+            ), f"{entry.schema}: structural mutation did not raise ValueError"
 
 
 @pytest.mark.parametrize(

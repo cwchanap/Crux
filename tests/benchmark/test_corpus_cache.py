@@ -3208,6 +3208,10 @@ def test_explicit_cache_keys_partial_failure_keeps_successful_downloads(
     rebuilt = result.simfiles[0].objects
     assert rebuilt[0].cache_status == "verified"
     assert rebuilt[1].cache_status == "failed"
+    # One successful and one failed explicit audio download -> the rebuilt
+    # simfile's sync_status reflects the partial outcome (the explicit-selects
+    # callback, not the global chart-key filter, drives the selected set).
+    assert result.simfiles[0].sync_status == "partial"
     # The successful download is checkpointed; the failed one is not.
     restarted = CacheIndexStore.load(tmp_path)
     assert restarted.get("a" * 64, "simfile-dtx", ok.key) is not None

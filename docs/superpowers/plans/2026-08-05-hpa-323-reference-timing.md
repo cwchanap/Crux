@@ -6,7 +6,7 @@
 
 **Architecture:** Extend the existing parser/timing engine, expose one thin typed view over HPA-322's merged row validator, use a closed timing-reason contract, reuse HPA-322's cache/key machinery, add exact-key audio cache fill, run a committed corpus diagnostic over the real production helpers, freeze BGM/format policy from that evidence, then publish native events and a derived timing manifest.
 
-**Tech Stack:** Python 3.12, dataclasses, pathlib, strict canonical JSONL, Click, soundfile, existing R2/boto3 adapter, pytest, Ruff, Pylint.
+**Tech Stack:** Python 3.13, dataclasses, pathlib, strict canonical JSONL, Click, soundfile, existing R2/boto3 adapter, pytest, Ruff, Pylint. Implementation and validation guidance targets Python 3.13 with 4-space indentation throughout.
 
 ## Global Constraints
 
@@ -60,7 +60,7 @@ not DTX:
 - `tests/benchmark/schema_goldens/crux.dtx-reference-event-v1.jsonl`
 - `tests/benchmark/schema_goldens/crux.reference-timing-manifest-v1.jsonl`
 - `tools/hpa323/analyze_reference_timing.py`
-- `tests/tools/test_hpa323_analyze_reference_timing.py`
+- `tests/tools/hpa323/test_analyze_reference_timing.py`
 
 ### Modify
 
@@ -489,7 +489,7 @@ cache fill.
 
 **Files:**
 - Create: `tools/hpa323/analyze_reference_timing.py`
-- Create: `tests/tools/test_hpa323_analyze_reference_timing.py`
+- Create: `tests/tools/hpa323/test_analyze_reference_timing.py`
 - Modify: `src/benchmark/reference_timing.py` only if the frozen BGM policy needs a
   small selection helper/warning.
 - Modify: `tests/benchmark/test_reference_timing.py` for the frozen policy.
@@ -562,8 +562,8 @@ For up to `--audio-sample-limit` unique resolved candidate audio objects:
 ```text
 sampled_audio_count
 sampled_audio_decodable_count
-sampled_audio_undecodable_count
-sampled_audio_undecodable_by_extension
+sampled_audio_decoder_failure_count
+sampled_audio_decoder_failure_by_extension
 ```
 
 The report distinguishes authored filename extension from actual decoder result.
@@ -641,7 +641,7 @@ Commit the tool and frozen policy code/tests:
 ```bash
 git add \
   tools/hpa323/analyze_reference_timing.py \
-  tests/tools/test_hpa323_analyze_reference_timing.py \
+  tests/tools/hpa323/test_analyze_reference_timing.py \
   src/benchmark/reference_timing.py \
   tests/benchmark/test_reference_timing.py
 git commit -m "test: measure reference timing corpus behavior"

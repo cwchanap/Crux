@@ -23,10 +23,12 @@ validator or private path/casefold helper is reachable from here.
 
 from __future__ import annotations
 
+import heapq
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from hashlib import sha256
+from itertools import count
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +70,33 @@ from src.benchmark.timing import DtxTimingMap, build_dtx_timing_map
 _CHANNEL_02_DELTA_EPSILON = 1e-9
 #: Maximum number of multi-group and channel-``02`` examples retained.
 _MAX_EXAMPLES = 25
+
+
+class _Reversed:
+    """Wrap a value so a min-heap tiebreaker sorts it in descending order.
+
+    Used to bound :py:data:`channel_02_delta_examples` during accumulation:
+    the eviction key keeps the worst entry at the heap root, so larger wrapped
+    values are treated as smaller and are popped first.  ``__eq__`` compares the
+    wrapped value so tuple comparison chains to the next component when a
+    ``chart_key`` ties (events in one chart share ``simfile_id`` and
+    ``chart_key`` but differ on ``source_order``).
+    """
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: object) -> None:
+        self._value = value
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _Reversed):
+            return NotImplemented
+        return self._value == other._value
+
+    def __lt__(self, other: "_Reversed") -> bool:
+        return self._value > other._value
+
+
 #: BGM resolution reason codes that indicate at least one BGM event's source
 #: audio could not be resolved to a remote object.
 _BGM_RESOLUTION_FAILURE_CODES = frozenset(
@@ -339,7 +368,12 @@ def run_reference_timing_analysis(
     charts_with_channel_02 = 0
     charts_with_multiple_channel_02_changes = 0
     max_channel_02_time_delta_sec = 0.0
-    channel_02_delta_examples: list[dict[str, Any]] = []
+    # Bounded min-heap (worst entry at the root) retaining the top
+    # ``_MAX_EXAMPLES`` channel-``02`` deltas seen so far; materialised into the
+    # final ordering after the loop.  Each entry is
+    # ``(delta_sec, -simfile_id, _Reversed(chart_key), -source_order, counter, example)``.
+    channel_02_heap: list[tuple[Any, ...]] = []
+    channel_02_counter = count()
 
     # Resolved candidate audio objects keyed by remote.key for stable sampling.
     candidate_audio: dict[str, tuple[RemoteObject, str, int, str]] = {}
@@ -420,26 +454,40 @@ def run_reference_timing_analysis(
             if delta_sec > max_channel_02_time_delta_sec:
                 max_channel_02_time_delta_sec = delta_sec
             if delta_sec > _CHANNEL_02_DELTA_EPSILON:
-                channel_02_delta_examples.append(
-                    {
-                        "chart_key": chart_key,
-                        "corrected_sec": _q6(corrected_sec),
-                        "delta_sec": _q6(delta_sec),
-                        "legacy_sec": _q6(legacy_sec),
-                        "simfile_id": row.simfile_id,
-                        "source_order": event.source_order,
-                    }
+                example = {
+                    "chart_key": chart_key,
+                    "corrected_sec": _q6(corrected_sec),
+                    "delta_sec": _q6(delta_sec),
+                    "legacy_sec": _q6(legacy_sec),
+                    "simfile_id": row.simfile_id,
+                    "source_order": event.source_order,
+                }
+                # Eviction key is worst-first so the heap root is the entry to
+                # drop: ascending quantised delta, then descending simfile_id /
+                # chart_key / source_order (ints negated, chart_key wrapped).
+                heapq.heappush(
+                    channel_02_heap,
+                    (
+                        float(example["delta_sec"]),
+                        -row.simfile_id,
+                        _Reversed(chart_key),
+                        -event.source_order,
+                        next(channel_02_counter),
+                        example,
+                    ),
                 )
+                if len(channel_02_heap) > _MAX_EXAMPLES:
+                    heapq.heappop(channel_02_heap)
 
-    channel_02_delta_examples.sort(
+    channel_02_delta_examples = sorted(
+        (entry[-1] for entry in channel_02_heap),
         key=lambda item: (
             -float(item["delta_sec"]),
             item["simfile_id"],
             item["chart_key"],
             item["source_order"],
-        )
+        ),
     )
-    channel_02_delta_examples = channel_02_delta_examples[:_MAX_EXAMPLES]
 
     audio_sample = _sample_audio(candidate_audio, config.audio_sample_limit)
     sampled = _probe_sampled_audio(
@@ -477,10 +525,6 @@ def run_reference_timing_analysis(
             sampled_audio_undecodable_by_extension
         ),
         "sampled_audio_decoder_failure_count": sampled_audio_undecodable_count,
-        "sampled_audio_undecodable_by_extension": _sorted_counts(
-            sampled_audio_undecodable_by_extension
-        ),
-        "sampled_audio_undecodable_count": sampled_audio_undecodable_count,
         "selected_rows": len(selected_rows),
         "upstream_quarantined_rows": len(quarantined_rows),
     }
@@ -532,13 +576,13 @@ def _probe_sampled_audio(
         inventories = tuple(
             inventories_by_simfile[simfile_id] for simfile_id in sorted(simfile_ids)
         )
-        fill_config, fill_store, fill_index = _prepare_fill_dependencies(
-            deps,
-            cache_dir=config.cache_dir,
-            endpoint_sha=endpoint_sha,
-            bucket=bucket,
-        )
         try:
+            fill_config, fill_store, fill_index = _prepare_fill_dependencies(
+                deps,
+                cache_dir=config.cache_dir,
+                endpoint_sha=endpoint_sha,
+                bucket=bucket,
+            )
             result = deps.sync_explicit(
                 inventories,
                 fill_store,
@@ -546,7 +590,11 @@ def _probe_sampled_audio(
                 fill_config,
                 missing_keys,
             )
-        except (OSError, RuntimeError, ValueError):
+        except ValueError as error:
+            if "identity does not match" in str(error):
+                raise
+            result = None
+        except (OSError, RuntimeError):
             result = None
 
         rebuilt_by_id = (
@@ -714,13 +762,17 @@ def main(
         audio_sample_limit=audio_sample_limit,
         allow_root_fallback=not disallow_root_fallback,
     )
-    report = run_reference_timing_analysis(analysis_config, deps)
+    try:
+        report = run_reference_timing_analysis(analysis_config, deps)
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
     output_bytes = render_report(report)
-    destination = Path(output_path)
+    destination = analysis_config.output_path
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(output_bytes)
     click.echo(f"reference_timing_report_sha256={sha256(output_bytes).hexdigest()}")
 
 
 if __name__ == "__main__":
+    # pylint: disable=E1120
     main()

@@ -1079,7 +1079,7 @@ def test_fill_maps_failed_download_to_source_audio_download_failed(tmp_path):
         selected=(spec,),
         endpoint_sha256=_FILL_ENDPOINT_HASH,
     )
-    # No body served for the audio key -> the fake store raises KeyError,
+    # No body served for the audio key -> the fake store raises R2StoreError,
     # which sync_explicit_cache_keys turns into a failed download.
     store = _AudioFakeStore({})
 
@@ -1486,7 +1486,9 @@ def test_golden_validator_rejects_mixed_corpus_version() -> None:
         validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
 
 
-def test_golden_validator_rejects_invalid_corpus_version() -> None:
+def test_golden_validator_rejects_invalid_corpus_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Line 866: both rows share a corpus_version that is not a valid sha256: value.
     # The per-row check in _validate_timing_manifest_row (line 918) normally
     # catches this first, so the per-row validator is stubbed to let the
@@ -1497,13 +1499,9 @@ def test_golden_validator_rejects_invalid_corpus_version() -> None:
 
     import src.benchmark.reference_timing_manifest as rtm
 
-    original = rtm._validate_timing_manifest_row
-    rtm._validate_timing_manifest_row = lambda row: None
-    try:
-        with pytest.raises(ValueError, match="invalid corpus version"):
-            validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
-    finally:
-        rtm._validate_timing_manifest_row = original
+    monkeypatch.setattr(rtm, "_validate_timing_manifest_row", lambda row: None)
+    with pytest.raises(ValueError, match="invalid corpus version"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
 
 
 def test_golden_validator_rejects_invalid_derived_corpus_version() -> None:
