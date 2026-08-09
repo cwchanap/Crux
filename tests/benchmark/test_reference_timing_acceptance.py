@@ -145,6 +145,70 @@ def test_acceptance_exact_key_fill_through_fake_store_reaches_ready(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Scenario 2b: fill once via R2, then rerun fully offline (no R2 env, fatal
+# dependency/store spies) — the cache-index rehydration must resolve the audio
+# without touching R2 even though the immutable HPA-322 manifest still says
+# not_selected.
+# ---------------------------------------------------------------------------
+
+
+def test_acceptance_fill_once_then_rerun_offline_succeeds(tmp_path):
+    spec = _SelectedSimfile(42, _READY_CHART_BODY, _wav_bytes(), audio_verified=False)
+    fixture = _publish_timing_manifest(
+        tmp_path,
+        selected=(spec,),
+        endpoint_sha256=_FILL_ENDPOINT_HASH,
+    )
+    store = _AudioFakeStore({"42/bgm.wav": spec.audio_body})
+    audio_digest = sha256(spec.audio_body).hexdigest()
+
+    # Run 1: fill the missing audio through the fake R2 store.
+    first = run_reference_timing(
+        _timing_request(fixture),
+        environ={"CRUX_R2_ENDPOINT_URL": _FILL_ENDPOINT, "CRUX_R2_BUCKET": "simfile-dtx"},
+        dependency_check=lambda: None,
+        store_factory=lambda config: store,
+    )
+    assert first.exit_code == 0
+    assert first.ready_count == 1
+    assert [call[0] for call in store.open_calls] == ["42/bgm.wav"]
+
+    # Run 2: the HPA-322 manifest is immutable and still says not_selected, but
+    # the cache index now records the filled body.  The second run must resolve
+    # the audio from the cache index without touching R2 — empty environ and
+    # fatal dependency/store spies prove the run is fully offline.
+    dependency_calls = _RecordingCall()
+
+    def fatal_dependency() -> None:
+        dependency_calls.calls.append(1)
+        raise AssertionError("R2 dependency check must not be called on a rehydrated cache")
+
+    def fatal_factory(config: object) -> object:
+        raise AssertionError("store factory must not be called on a rehydrated cache")
+
+    second = run_reference_timing(
+        _timing_request(fixture),
+        environ={},
+        dependency_check=fatal_dependency,
+        store_factory=fatal_factory,
+    )
+
+    assert second.exit_code == 0
+    assert second.status == "complete"
+    assert second.ready_count == 1
+    assert second.events_published == 1
+    assert not dependency_calls
+    (row,) = _ready_rows(second)
+    assert row["timing_status"] == "ready"
+    assert row["source_audio_key"] == "42/bgm.wav"
+    assert row["source_audio_content_hash"] == audio_digest
+    # The second run's manifest is byte-identical to the first (deterministic).
+    assert second.manifest is not None
+    assert first.manifest is not None
+    assert second.manifest.manifest_sha256 == first.manifest.manifest_sha256
+
+
+# ---------------------------------------------------------------------------
 # Scenario 3: upstream HPA-322 quarantine -> preserved timing quarantine
 # ---------------------------------------------------------------------------
 

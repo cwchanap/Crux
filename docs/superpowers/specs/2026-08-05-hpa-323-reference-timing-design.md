@@ -417,6 +417,16 @@ derived corpus version. Timing reason codes are validated against
 
 Output schema: `crux.reference-timing-manifest/v1`.
 
+The v1 timing row carries a minimal timing-specific payload on top of the
+preserved HPA-322 row.  The richer per-event audit data (source-audio header
+metadata, BGM anchor identity, pre/post exclusion counts, event SHA-256) is
+already computed by `SourceAudioInfo`, `BgmResolution`, and
+`AudioRelativeReference` and is published immutably in the
+`events/<sha256>.jsonl` artifact; the manifest row points at that artifact via
+`reference_events_cache_path` rather than duplicating every field inline.  This
+keeps the manifest row compact and avoids freezing a wide schema before
+downstream consumers have concrete requirements for the extra columns.
+
 Add to the preserved HPA-322 row:
 
 ```text
@@ -428,6 +438,14 @@ timing_reason_codes[]
 timing_warnings[]
 source_audio_key
 source_audio_content_hash
+reference_events_cache_path
+```
+
+The following fields were considered for v1 but are deferred to a future schema
+revision when downstream consumers need them surfaced on the manifest row
+(rather than parsed from the events artifact):
+
+```text
 source_audio_duration_sec
 source_audio_sample_rate
 source_audio_channels

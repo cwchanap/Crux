@@ -400,6 +400,27 @@ def test_select_bgm_reference_zero_groups_returns_bgm_event_missing() -> None:
     assert set(resolution.reason_codes) <= TIMING_REASON_CODES
 
 
+def test_select_bgm_reference_zero_groups_with_events_does_not_add_bgm_event_missing() -> None:
+    # A BGM event exists but its WAV note_id is absent from the wav_table, so
+    # zero groups survive and the resolver emits unresolved_bgm_wav.  The
+    # selector must NOT additionally emit bgm_event_missing — the event exists,
+    # it just failed to resolve.
+    chart = _chart([_bgm(0, 0.0, "99")], {"01": "bgm.ogg"})
+    row = _row_view((_remote("real.dtx"), _remote("bgm.ogg")))
+    references, timing_map = _resolve_for_select(chart, row)
+
+    assert references.groups == ()
+    assert references.bgm_event_count == 1
+
+    resolution = select_bgm_reference(references, timing_map)
+
+    assert isinstance(resolution, BgmResolution)
+    assert resolution.selected_event is None
+    assert resolution.chart_time_sec is None
+    assert resolution.reason_codes == ()
+    assert resolution.warnings == ()
+
+
 def test_select_bgm_reference_one_group_picks_lowest_source_order_event() -> None:
     event = _bgm(1, 0.5, "01", order=3)
     chart = _chart([event], {"01": "bgm.ogg"})

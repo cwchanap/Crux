@@ -974,7 +974,10 @@ def test_complete_cache_run_never_touches_r2(tmp_path, monkeypatch):
     assert not dependency_calls
     assert not factory_calls
     assert not sync_calls
-    assert not index_load_calls
+    # The cache index IS loaded once in the first pass for rehydration (a
+    # read-only local JSON operation, no R2/boto3 dependency), but the R2
+    # dependency check, store factory, and sync are never touched.
+    assert len(index_load_calls.calls) == 1
 
 
 # ---------------------------------------------------------------------------

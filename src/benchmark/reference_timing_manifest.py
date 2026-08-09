@@ -12,13 +12,15 @@ those rows with real chart / audio / event data.  The flow is:
 1. load the HPA-322 manifest once through :func:`load_reference_chart_manifest`;
 2. first pass per row — verify the selected DTX body once, parse it, build the
    timing map, resolve BGM groups and apply the Task 4 frozen selection policy,
-   then resolve the selected source-audio cache body when already verified or
-   queue the exact audio key for a targeted R2 fill;
-3. targeted fill — only when audio misses exist, lazily touch the optional R2
-   dependency, validate the resolved config identity against the embedded
-   source endpoint/bucket, fill the exact selected audio keys, merge the
-   returned inventories by simfile ID, and reverify only rows whose inventory
-   changed;
+   then resolve the selected source-audio cache body when already verified in
+   the HPA-322 manifest, or rehydrate it from the local cache index when a
+   previous run filled it (the immutable HPA-322 manifest cannot record that
+   fill), or queue the exact audio key for a targeted R2 fill;
+3. targeted fill — only when audio misses remain after cache-index rehydration,
+   lazily touch the optional R2 dependency, validate the resolved config
+   identity against the embedded source endpoint/bucket, fill the exact
+   selected audio keys, merge the returned inventories by simfile ID, and
+   reverify only rows whose inventory changed;
 4. metadata + event publication — inspect the resolved audio, build the bounded
    audio-relative native events, and publish ``events/<sha256>.jsonl``
    immutably (event publication failure is fatal);
@@ -26,9 +28,11 @@ those rows with real chart / audio / event data.  The flow is:
    :class:`ReferenceTimingOutcome`.
 
 A complete-cache run never touches the optional R2 store: the dependency check,
-config resolution, store factory, cache-index load, and exact-key sync are all
-gated behind the audio-miss branch, so the offline acceptance path stays free
-of the ``boto3`` extra.
+config resolution, store factory, and exact-key sync are all gated behind the
+audio-miss branch.  The cache index is loaded once as a read-only local JSON
+operation (no R2/boto3 dependency) so the first pass can rehydrate bodies that
+a previous run filled locally; the offline acceptance path stays free of the
+``boto3`` extra.
 
 Lineage (Brief Step 2):  every HPA-322 field is carried through verbatim
 except the top-level ``corpus_version`` (re-derived by ``render_manifest``).
@@ -46,6 +50,7 @@ import os
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
@@ -61,6 +66,7 @@ from src.benchmark.corpus_cache import (
     read_verified_cache_body,
     resolve_verified_cache_body,
     sync_explicit_cache_keys,
+    validate_cached_body,
 )
 from src.benchmark.corpus_manifest import (
     ManifestPublicationError,
@@ -491,16 +497,25 @@ def _run_reference_timing(
     cache_dir = request.cache_dir
     output_dir = request.output_dir
 
+    # The cache index is loaded once for the whole run so that the first pass
+    # can rehydrate audio bodies that a previous run filled locally even when
+    # the immutable HPA-322 manifest still reports them as not_selected.  This
+    # is a read-only local JSON load — no R2/boto3 dependency — so the offline
+    # acceptance path stays free of the boto3 extra.
+    cache_index = CacheIndexStore.load(cache_dir)
+
     # Phase 1: first pass per row — verify chart bytes once, parse, build the
     # timing map, resolve BGM groups, and resolve already-verified audio or
     # queue the exact audio key for a targeted fill.
     states: list[_RowTimingState] = [
-        _first_pass_row(validated, cache_dir=cache_dir) for validated in loaded.rows
+        _first_pass_row(validated, cache_dir=cache_dir, cache_index=cache_index)
+        for validated in loaded.rows
     ]
 
-    # Phase 2/3: targeted R2 fill — only when audio misses exist.  A complete
-    # cache never reaches this block, so the optional R2 dependency, config,
-    # store factory, cache-index load, and exact-key sync all stay untouched.
+    # Phase 2/3: targeted R2 fill — only when audio misses exist after the
+    # first pass (including cache-index rehydration).  A complete cache never
+    # reaches this block, so the optional R2 dependency, config, store factory,
+    # and exact-key sync all stay untouched.
     pending = [state for state in states if state.pending_audio_key is not None]
     if pending:
         _fill_pending_audio(
@@ -544,7 +559,6 @@ def _run_reference_timing(
     # Phase 5/6: render + publish the timing manifest and the latest pointer.
     rendered = render_manifest(tuple(timing_rows))
     published = publish_manifest(output_dir, rendered)
-    _prune_unreferenced_event_artifacts(output_dir, timing_rows)
     overall_status: Literal["complete", "partial"] = (
         "complete" if quarantined_count == 0 else "partial"
     )
@@ -563,6 +577,7 @@ def _first_pass_row(
     validated: _ValidatedReferenceChartRow,
     *,
     cache_dir: Path,
+    cache_index: CacheIndexStore,
 ) -> _RowTimingState:
     """Run the first-pass timing analysis for one row.
 
@@ -570,9 +585,12 @@ def _first_pass_row(
     ``upstream_chart_selection_unavailable``.  Selected rows verify the chart
     bytes once through :func:`read_verified_cache_body`, parse them, build the
     timing map, resolve BGM groups, and apply the frozen selection policy.  The
-    selected source-audio body is resolved once when already verified, else
-    queued for fill.  Row-local failures map to :data:`TimingReasonCode`
-    without aborting sibling rows.
+    selected source-audio body is resolved once when already verified in the
+    HPA-322 manifest; otherwise the cache index is consulted to rehydrate a
+    body that a previous run filled locally (the immutable HPA-322 manifest
+    cannot record that fill).  Only when rehydration also fails is the exact
+    audio key queued for a targeted R2 fill.  Row-local failures map to
+    :data:`TimingReasonCode` without aborting sibling rows.
     """
     view = validated.view
     state = _RowTimingState(validated=validated, is_upstream=view.selection_status != "selected")
@@ -644,8 +662,61 @@ def _first_pass_row(
         except ValueError:
             state.resolution = _timing_quarantine(("source_audio_cache_invalid",))
     else:
-        state.pending_audio_key = audio_remote.key
+        _resolve_or_queue_audio(
+            state,
+            audio_remote,
+            cache_dir=cache_dir,
+            cache_index=cache_index,
+            endpoint=endpoint,
+            bucket=bucket,
+        )
     return state
+
+
+def _resolve_or_queue_audio(
+    state: _RowTimingState,
+    audio_remote: RemoteObject,
+    *,
+    cache_dir: Path,
+    cache_index: CacheIndexStore,
+    endpoint: str,
+    bucket: str,
+) -> None:
+    """Resolve an upstream-unverified audio remote from the local cache index.
+
+    The immutable HPA-322 manifest cannot record a fill performed by a previous
+    HPA-323 run, so a second run still sees ``cache_status != "verified"`` even
+    when the body is present and valid in the local cache.  This helper consults
+    the cache index using the immutable ``(endpoint, bucket, key)`` identity and,
+    when the indexed body validates, rebuilds a verified remote so the row
+    resolves without touching the optional R2 store.  Only genuinely
+    absent/invalid local bodies fall through to ``pending_audio_key`` for a
+    targeted R2 fill.
+    """
+    entry = cache_index.get(endpoint, bucket, audio_remote.key)
+    if entry is None:
+        state.pending_audio_key = audio_remote.key
+        return
+    validation = validate_cached_body(cache_dir, entry)
+    if validation.state != "verified":
+        state.pending_audio_key = audio_remote.key
+        return
+    verified_remote = dataclass_replace(
+        audio_remote,
+        cache_status="verified",
+        sha256=entry.sha256,
+        cache_path=entry.cache_path,
+    )
+    try:
+        state.audio_path = resolve_verified_cache_body(
+            cache_dir,
+            verified_remote,
+            source_endpoint_sha256=endpoint,
+            bucket=bucket,
+        )
+        state.audio_remote = verified_remote
+    except ValueError:
+        state.pending_audio_key = audio_remote.key
 
 
 def _fill_pending_audio(
@@ -805,37 +876,6 @@ def _finalise_row_state(state: _RowTimingState, *, output_dir: Path) -> None:
         source_audio_content_hash=audio_content_hash,
         reference_events_cache_path=events_relative_path,
     )
-
-
-def _prune_unreferenced_event_artifacts(
-    output_dir: Path,
-    timing_rows: list[dict[str, object]],
-) -> None:
-    """Remove ``events/*.jsonl`` artifacts no longer referenced by this run.
-
-    Each ready row's ``reference_events_cache_path`` is ``events/<sha256>.jsonl``.
-    After the timing manifest is published, any previously-written event artifact
-    whose hash is absent from the just-published rows is stale (superseded by a
-    re-run that re-derived different events) and is pruned.  Referenced artifacts
-    are always preserved; only ``events/*.jsonl`` files are ever considered.
-    """
-    events_dir = output_dir / _EVENTS_DIR_NAME
-    if not events_dir.is_dir():
-        return
-    referenced: set[str] = set()
-    for row in timing_rows:
-        relative = row.get("reference_events_cache_path")
-        if isinstance(relative, str) and relative.startswith(f"{_EVENTS_DIR_NAME}/"):
-            referenced.add(Path(relative).stem)
-    if not referenced:
-        # No ready rows in this run: do not blindly delete every artifact, since
-        # a fully-quarantined re-run should not discard another run's events.
-        return
-    for entry in events_dir.iterdir():
-        if not entry.is_file() or entry.suffix != ".jsonl":
-            continue
-        if entry.stem not in referenced:
-            entry.unlink()
 
 
 # ---------------------------------------------------------------------------
