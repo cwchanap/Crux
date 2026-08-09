@@ -40,6 +40,10 @@ from src.benchmark.r2_corpus_models import (
 )
 from src.benchmark.r2_corpus_sync import ProgressEvent
 from src.benchmark.reference_chart_manifest import SelectionOutcome, SelectionRequest
+from src.benchmark.reference_timing_manifest import (
+    ReferenceTimingOutcome,
+    ReferenceTimingRequest,
+)
 from src.benchmark.transcription import (
     TranscribeOneOutcome,
     TranscribeOneRequest,
@@ -1799,4 +1803,383 @@ def test_installed_select_reference_charts_help_is_silent_and_avoids_optional_im
     assert "--manifest" in result.stdout
     assert "--cache-dir" in result.stdout
     assert "--overrides-file" in result.stdout
+    assert "--output-dir" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# build-reference-timing (HPA-323 Task 7)
+# ---------------------------------------------------------------------------
+
+
+def _make_timing_published(tmp_path: Path) -> PublishedManifest:
+    published_path = tmp_path / "reference-timing" / "manifests" / ("b" * 64 + ".jsonl")
+    published_path.parent.mkdir(parents=True, exist_ok=True)
+    return PublishedManifest(
+        corpus_version="sha256:" + "a" * 64,
+        manifest_sha256="b" * 64,
+        relative_path="manifests/" + "b" * 64 + ".jsonl",
+        path=published_path,
+        latest_path=tmp_path / "reference-timing" / "latest.json",
+    )
+
+
+def _make_timing_outcome(
+    *,
+    status: str,
+    exit_code: int,
+    tmp_path: Path,
+    published: PublishedManifest | None = None,
+    ready_count: int = 0,
+    quarantined_count: int = 0,
+    upstream_quarantined_count: int = 0,
+    events_published: int = 0,
+) -> ReferenceTimingOutcome:
+    return ReferenceTimingOutcome(
+        status=status,  # type: ignore[arg-type]
+        exit_code=exit_code,  # type: ignore[arg-type]
+        manifest=published,
+        ready_count=ready_count,
+        quarantined_count=quarantined_count,
+        upstream_quarantined_count=upstream_quarantined_count,
+        events_published=events_published,
+    )
+
+
+def test_build_reference_timing_help_lists_exact_options_and_defaults() -> None:
+    result = runner.invoke(main, ["benchmark", "build-reference-timing", "--help"])
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    output = result.stdout
+    # Exactly the three path options, in declaration order, with no overrides-file.
+    option_lines = [line.strip() for line in output.splitlines() if line.startswith("  --")]
+    assert [line.split()[0] for line in option_lines] == [
+        "--manifest",
+        "--cache-dir",
+        "--output-dir",
+    ]
+    assert "--overrides-file" not in output
+    # manifest and cache-dir are required; only output-dir carries a default.
+    # Whitespace is normalized because the default value wraps in the terminal.
+    normalized = " ".join(output.split())
+    assert normalized.count("[required]") == 2
+    assert "[default: artifacts/benchmark/reference-timing]" in normalized
+    assert normalized.count("[default:") == 1
+
+
+def test_build_reference_timing_cache_dir_cannot_inherit_manifest_relative_default(
+    tmp_path: Path,
+) -> None:
+    """The manifest-relative default would point away from the audio cache.
+
+    ``select-reference-charts`` defaults ``cache_dir`` to
+    ``manifest.parent.parent / "cache"``.  For an HPA-322 reference-chart
+    manifest at ``.../reference-charts/manifests/<sha>.jsonl`` that resolves to
+    ``reference-charts/cache``, NOT ``r2-corpus/cache`` where the verified
+    source-audio bodies live.  ``--cache-dir`` is therefore required rather
+    than inherited.
+    """
+    manifest_path = tmp_path / "reference-charts" / "manifests" / ("a" * 64 + ".jsonl")
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text("{}\n", encoding="utf-8")
+    audio_cache = tmp_path / "r2-corpus" / "cache"
+
+    inherited_default = manifest_path.parent.parent / "cache"
+
+    assert inherited_default == tmp_path / "reference-charts" / "cache"
+    assert inherited_default != audio_cache
+    assert inherited_default.parent.name == "reference-charts"
+    assert audio_cache.parent.name == "r2-corpus"
+
+
+@pytest.mark.parametrize(
+    "missing_args",
+    [
+        [],
+        ["--cache-dir", "cache"],
+        ["--manifest", "manifest.jsonl"],
+    ],
+)
+def test_build_reference_timing_requires_manifest_and_cache_dir(
+    missing_args: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "src.benchmark.reference_timing_manifest.run_reference_timing",
+        lambda *args, **kwargs: pytest.fail("missing required option reached orchestration"),
+    )
+
+    result = runner.invoke(main, ["benchmark", "build-reference-timing", *missing_args])
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert "Missing option" in result.stderr
+
+
+def test_build_reference_timing_defaults_only_output_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: list[ReferenceTimingRequest] = []
+    manifest_path = tmp_path / "manifest.jsonl"
+    cache_dir = tmp_path / "cache"
+
+    def fake_run(request: ReferenceTimingRequest) -> ReferenceTimingOutcome:
+        captured.append(request)
+        return _make_timing_outcome(
+            status="complete",
+            exit_code=0,
+            tmp_path=tmp_path,
+            published=_make_timing_published(tmp_path),
+            ready_count=1,
+            events_published=1,
+        )
+
+    monkeypatch.setattr("src.benchmark.reference_timing_manifest.run_reference_timing", fake_run)
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "build-reference-timing",
+            "--manifest",
+            str(manifest_path),
+            "--cache-dir",
+            str(cache_dir),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured == [
+        ReferenceTimingRequest(
+            manifest_path=manifest_path,
+            cache_dir=cache_dir,
+            output_dir=Path("artifacts/benchmark/reference-timing"),
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "exit_code", "exception_type"),
+    [("complete", 0, None), ("partial", 1, SystemExit), ("failed", 2, SystemExit)],
+)
+def test_build_reference_timing_maps_outcome_to_explicit_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    status: str,
+    exit_code: int,
+    exception_type: type[BaseException] | None,
+) -> None:
+    published = _make_timing_published(tmp_path) if exit_code != 2 else None
+    outcome = _make_timing_outcome(
+        status=status,
+        exit_code=exit_code,
+        tmp_path=tmp_path,
+        published=published,
+        ready_count=1 if exit_code == 0 else 0,
+        quarantined_count=1 if exit_code == 1 else 0,
+        upstream_quarantined_count=0,
+        events_published=1 if exit_code == 0 else 0,
+    )
+    monkeypatch.setattr(
+        "src.benchmark.reference_timing_manifest.run_reference_timing",
+        lambda request: outcome,
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "build-reference-timing",
+            "--manifest",
+            str(tmp_path / "manifest.jsonl"),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+        ],
+    )
+
+    assert result.exit_code == exit_code
+    if exception_type is None:
+        assert result.exception is None
+    else:
+        assert type(result.exception) is exception_type
+
+
+def test_build_reference_timing_emits_sorted_canonical_summary_with_nine_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    published = _make_timing_published(tmp_path)
+    outcome = _make_timing_outcome(
+        status="partial",
+        exit_code=1,
+        tmp_path=tmp_path,
+        published=published,
+        ready_count=3,
+        quarantined_count=1,
+        upstream_quarantined_count=0,
+        events_published=3,
+    )
+    monkeypatch.setattr(
+        "src.benchmark.reference_timing_manifest.run_reference_timing",
+        lambda request: outcome,
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "build-reference-timing",
+            "--manifest",
+            str(tmp_path / "manifest.jsonl"),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert result.stderr_bytes == b""
+    assert result.stdout_bytes == (
+        '{"corpus_version":"sha256:' + "a" * 64 + '",'
+        '"events_published":3,"exit_code":1,'
+        f'"manifest_path":"{published.path}",'
+        '"manifest_sha256":"' + "b" * 64 + '",'
+        '"quarantined_count":1,"ready_count":3,'
+        '"status":"partial","upstream_quarantined_count":0}\n'
+    ).encode("utf-8")
+    assert set(json.loads(result.stdout)) == {
+        "status",
+        "exit_code",
+        "manifest_path",
+        "manifest_sha256",
+        "corpus_version",
+        "ready_count",
+        "quarantined_count",
+        "upstream_quarantined_count",
+        "events_published",
+    }
+    assert result.stdout_bytes.count(b"\n") == 1
+
+
+def test_build_reference_timing_failed_outcome_nulls_manifest_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    outcome = _make_timing_outcome(
+        status="failed",
+        exit_code=2,
+        tmp_path=tmp_path,
+        published=None,
+    )
+    monkeypatch.setattr(
+        "src.benchmark.reference_timing_manifest.run_reference_timing",
+        lambda request: outcome,
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "build-reference-timing",
+            "--manifest",
+            str(tmp_path / "manifest.jsonl"),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "status": "failed",
+        "exit_code": 2,
+        "manifest_path": None,
+        "manifest_sha256": None,
+        "corpus_version": None,
+        "ready_count": 0,
+        "quarantined_count": 0,
+        "upstream_quarantined_count": 0,
+        "events_published": 0,
+    }
+
+
+def test_build_reference_timing_summary_surfaces_upstream_quarantine_signal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An operator can see timing-stage quarantines despite a shared exit 1.
+
+    ``quarantined_count=7`` with ``upstream_quarantined_count=5`` means two
+    rows were quarantined by the timing stage itself, even though exit ``1`` is
+    shared with the five upstream HPA-322 gaps.
+    """
+    published = _make_timing_published(tmp_path)
+    outcome = _make_timing_outcome(
+        status="partial",
+        exit_code=1,
+        tmp_path=tmp_path,
+        published=published,
+        ready_count=3,
+        quarantined_count=7,
+        upstream_quarantined_count=5,
+        events_published=3,
+    )
+    monkeypatch.setattr(
+        "src.benchmark.reference_timing_manifest.run_reference_timing",
+        lambda request: outcome,
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "build-reference-timing",
+            "--manifest",
+            str(tmp_path / "manifest.jsonl"),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    summary = json.loads(result.stdout)
+    assert summary["quarantined_count"] == 7
+    assert summary["upstream_quarantined_count"] == 5
+    assert summary["quarantined_count"] - summary["upstream_quarantined_count"] == 2
+
+
+def test_installed_build_reference_timing_help_is_silent_and_avoids_optional_imports(
+    tmp_path: Path,
+) -> None:
+    """The complete-cache path must not eagerly import the optional R2 stack.
+
+    ``--help`` never executes the lazy orchestration import inside the command
+    body, so neither ``boto3`` nor ``pretty_midi`` may be imported.  The
+    orchestration's no-R2 property (a complete cache never calls the dependency
+    check / store factory) is already covered by the Task 6b acceptance suite.
+    """
+    import_spies = tmp_path / "import_spies"
+    import_spies.mkdir()
+    for module_name in ("pretty_midi", "boto3"):
+        (import_spies / f"{module_name}.py").write_text(
+            f'raise RuntimeError("{module_name} must not be imported for timing help")\n',
+            encoding="utf-8",
+        )
+
+    command = shutil.which("crux")
+    if command is None:
+        pytest.skip("crux executable is not installed on PATH")
+    result = subprocess.run(
+        [command, "benchmark", "build-reference-timing", "--help"],
+        capture_output=True,
+        check=False,
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(import_spies)},
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert "--manifest" in result.stdout
+    assert "--cache-dir" in result.stdout
     assert "--output-dir" in result.stdout

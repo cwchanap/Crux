@@ -389,6 +389,40 @@ def _emit_reference_chart_selection_summary(
     standard_output.flush()
 
 
+def _emit_reference_timing_summary(
+    *,
+    status: str,
+    exit_code: int,
+    manifest_path: Path | None,
+    manifest_sha256: str | None,
+    corpus_version: str | None,
+    ready_count: int,
+    quarantined_count: int,
+    upstream_quarantined_count: int,
+    events_published: int,
+) -> None:
+    """Write the sole machine-readable result after a reference-timing build.
+
+    Surfaces ``upstream_quarantined_count`` so an operator can distinguish
+    timing-stage quarantines from HPA-322 upstream gaps even though both share
+    the exit-``1`` partial outcome.
+    """
+    payload = {
+        "corpus_version": corpus_version,
+        "events_published": events_published,
+        "exit_code": exit_code,
+        "manifest_path": None if manifest_path is None else str(manifest_path),
+        "manifest_sha256": manifest_sha256,
+        "quarantined_count": quarantined_count,
+        "ready_count": ready_count,
+        "status": status,
+        "upstream_quarantined_count": upstream_quarantined_count,
+    }
+    standard_output = click.get_binary_stream("stdout")
+    standard_output.write(canonical_json_bytes(payload, trailing_newline=True))
+    standard_output.flush()
+
+
 @benchmark.command("select-reference-charts")
 @click.option(
     "--manifest",
@@ -451,6 +485,63 @@ def select_reference_charts_command(
         corpus_version=None if published is None else published.corpus_version,
         selected_count=outcome.selected_count,
         quarantined_count=outcome.quarantined_count,
+    )
+    if outcome.exit_code:
+        ctx.exit(outcome.exit_code)
+
+
+@benchmark.command("build-reference-timing")
+@click.option(
+    "--manifest",
+    "manifest_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required path to an immutable local HPA-322 reference-chart manifest (JSONL).",
+)
+@click.option(
+    "--cache-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+    help="Required local cache root holding the verified chart and audio bodies.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=Path("artifacts/benchmark/reference-timing"),
+    show_default=True,
+    help="Directory where the published reference-timing manifest and events are written.",
+)
+@click.pass_context
+def build_reference_timing_command(
+    ctx: click.Context,
+    manifest_path: Path,
+    cache_dir: Path,
+    output_dir: Path,
+) -> None:
+    """Build and publish the reference-timing manifest and bounded events."""
+    from src.benchmark.reference_timing_manifest import (
+        ReferenceTimingRequest,
+        run_reference_timing,
+    )
+
+    outcome = run_reference_timing(
+        ReferenceTimingRequest(
+            manifest_path=manifest_path.absolute(),
+            cache_dir=cache_dir,
+            output_dir=output_dir,
+        )
+    )
+    published = outcome.manifest
+    _emit_reference_timing_summary(
+        status=outcome.status,
+        exit_code=outcome.exit_code,
+        manifest_path=None if published is None else published.path,
+        manifest_sha256=None if published is None else published.manifest_sha256,
+        corpus_version=None if published is None else published.corpus_version,
+        ready_count=outcome.ready_count,
+        quarantined_count=outcome.quarantined_count,
+        upstream_quarantined_count=outcome.upstream_quarantined_count,
+        events_published=outcome.events_published,
     )
     if outcome.exit_code:
         ctx.exit(outcome.exit_code)
