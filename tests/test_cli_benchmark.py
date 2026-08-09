@@ -1867,31 +1867,6 @@ def test_build_reference_timing_help_lists_exact_options_and_defaults() -> None:
     assert normalized.count("[default:") == 1
 
 
-def test_build_reference_timing_cache_dir_cannot_inherit_manifest_relative_default(
-    tmp_path: Path,
-) -> None:
-    """The manifest-relative default would point away from the audio cache.
-
-    ``select-reference-charts`` defaults ``cache_dir`` to
-    ``manifest.parent.parent / "cache"``.  For an HPA-322 reference-chart
-    manifest at ``.../reference-charts/manifests/<sha>.jsonl`` that resolves to
-    ``reference-charts/cache``, NOT ``r2-corpus/cache`` where the verified
-    source-audio bodies live.  ``--cache-dir`` is therefore required rather
-    than inherited.
-    """
-    manifest_path = tmp_path / "reference-charts" / "manifests" / ("a" * 64 + ".jsonl")
-    manifest_path.parent.mkdir(parents=True)
-    manifest_path.write_text("{}\n", encoding="utf-8")
-    audio_cache = tmp_path / "r2-corpus" / "cache"
-
-    inherited_default = manifest_path.parent.parent / "cache"
-
-    assert inherited_default == tmp_path / "reference-charts" / "cache"
-    assert inherited_default != audio_cache
-    assert inherited_default.parent.name == "reference-charts"
-    assert audio_cache.parent.name == "r2-corpus"
-
-
 @pytest.mark.parametrize(
     "missing_args",
     [
@@ -1905,6 +1880,16 @@ def test_build_reference_timing_requires_manifest_and_cache_dir(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    # ``--cache-dir`` is intentionally required rather than inherited from
+    # ``select-reference-charts``'s manifest-relative default
+    # (``manifest.parent.parent / "cache"``).  For an HPA-322 manifest at
+    # ``.../reference-charts/manifests/<sha>.jsonl`` that default resolves to
+    # ``reference-charts/cache`` — NOT ``r2-corpus/cache`` where the verified
+    # source-audio bodies live — so inheriting it would point the build away
+    # from the audio cache.  This is enforced structurally by Click's
+    # ``required=True`` on ``--cache-dir`` (exercised below), not by a separate
+    # path-arithmetic unit test, since only the live CLI surface detects real
+    # regressions in the option contract.
     monkeypatch.setattr(
         "src.benchmark.reference_timing_manifest.run_reference_timing",
         lambda *args, **kwargs: pytest.fail("missing required option reached orchestration"),

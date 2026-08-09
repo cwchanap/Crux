@@ -522,7 +522,7 @@ def _sync_selected_objects(
                 record_progress(identity, result.action.bytes)
 
     rebuilt_simfiles = tuple(
-        _rebuild_simfile(simfile, simfile_index, object_results)
+        _rebuild_simfile(simfile, simfile_index, object_results, selects)
         for simfile_index, simfile in enumerate(simfiles)
     )
     ordered_actions = tuple(action for _, action in sorted(actions.items()))
@@ -910,11 +910,12 @@ def _rebuild_simfile(
     source: SimfileInventory,
     simfile_index: int,
     object_results: dict[tuple[int, int], RemoteObject],
+    selects: Callable[[str], bool],
 ) -> SimfileInventory:
     objects = tuple(
         object_results[(simfile_index, object_index)] for object_index in range(len(source.objects))
     )
-    selected = tuple(remote for remote in objects if is_selected(remote.key))
+    selected = tuple(remote for remote in objects if selects(remote.key))
     failed = tuple(remote for remote in selected if remote.cache_status == "failed")
     if source.sync_status == "empty":
         status = "empty"

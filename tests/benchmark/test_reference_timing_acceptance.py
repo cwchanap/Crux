@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
@@ -65,7 +65,7 @@ _AMBIGUOUS_BGM_CHART_BODY = (
 
 
 @contextmanager
-def _fatal_factory() -> Iterator[list[object]]:
+def _fatal_factory() -> Iterator[tuple[list[object], Callable[[object], object]]]:
     calls: list[object] = []
 
     def factory(config: object) -> object:

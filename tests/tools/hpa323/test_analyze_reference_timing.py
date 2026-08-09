@@ -17,11 +17,15 @@ from pathlib import Path
 import pytest
 
 import tools.hpa323.analyze_reference_timing as analyze_reference_timing
-from src.benchmark.backend_identity import canonical_json_bytes
-from src.benchmark.corpus_cache import CacheIndexStore
+from src.benchmark.corpus_cache import (
+    CacheIndexStore,
+    read_verified_cache_body,
+    resolve_verified_cache_body,
+    sync_explicit_cache_keys,
+)
 from src.benchmark.corpus_manifest import build_manifest_rows, render_manifest
 from src.benchmark.dtx_parser import parse_dtx_bytes
-from src.benchmark.r2_corpus_models import R2Config, RemoteObject, SimfileInventory
+from src.benchmark.r2_corpus_models import CacheSyncResult, R2Config, RemoteObject, SimfileInventory
 from src.benchmark.reference_chart_manifest import (
     SelectionOutcome,
     SelectionRequest,
@@ -34,6 +38,7 @@ from tools.hpa323.analyze_reference_timing import (
     AnalysisConfig,
     AnalysisDeps,
     AudioProbeOutcome,
+    render_report,
     run_reference_timing_analysis,
 )
 
@@ -74,13 +79,13 @@ def _install_cached_bodies(
 
 def _source_rows(
     inventories: tuple[SimfileInventory, ...],
-) -> tuple[dict[str, object], ...]:
-    return render_manifest(build_manifest_rows(inventories, {}, "f" * 64, "simfile-dtx")).rows
+):
+    return render_manifest(build_manifest_rows(inventories, {}, "f" * 64, "simfile-dtx"))
 
 
-def _write_manifest(tmp_path: Path, rows: tuple[dict[str, object], ...]) -> Path:
+def _write_manifest(tmp_path: Path, rendered) -> Path:
     path = tmp_path / "source.jsonl"
-    path.write_bytes(b"".join(canonical_json_bytes(row, trailing_newline=True) for row in rows))
+    path.write_bytes(rendered.content)
     return path
 
 
@@ -178,7 +183,6 @@ def _build_deps(
     def sync_explicit(simfiles, store, idx, config, selected_keys, item_progress=None):
         sync_keys.extend(sorted(selected_keys))
         calls.append(("sync_explicit", ",".join(sorted(selected_keys))))
-        from src.benchmark.r2_corpus_models import CacheSyncResult
 
         return CacheSyncResult(simfiles=simfiles, actions=())
 
@@ -251,9 +255,10 @@ def _selected_fixture(
     audio_name: str = "bgm.ogg",
     simfile_id: int = 42,
     audio_verified: bool = True,
+    chart_path: str = "real.dtx",
 ) -> tuple[Path, str, str]:
     """Build a published manifest with one selected chart + one quarantined row."""
-    chart = _remote(simfile_id, "real.dtx", chart_body)
+    chart = _remote(simfile_id, chart_path, chart_body)
     audio = _remote(simfile_id, audio_name, b"audio-body")
     if not audio_verified:
         audio = replace(audio, cache_status="not_selected", sha256=None, cache_path=None)
@@ -275,12 +280,12 @@ def _selected_fixture(
 def test_default_deps_bind_to_public_production_seams_only() -> None:
     defaults = {field.name: field.default for field in dataclass_fields(AnalysisDeps)}
     assert defaults["build_row_view"] is reference_chart_row_view_from_row
-    assert defaults["read_chart_body"].__name__ == "read_verified_cache_body"
+    assert defaults["read_chart_body"] is read_verified_cache_body
     assert defaults["parse_chart"] is parse_dtx_bytes
     assert defaults["resolve_bgm_groups"] is resolve_bgm_reference_groups
     assert defaults["build_timing_map"] is build_dtx_timing_map
-    assert defaults["resolve_audio_body"].__name__ == "resolve_verified_cache_body"
-    assert defaults["sync_explicit"].__name__ == "sync_explicit_cache_keys"
+    assert defaults["resolve_audio_body"] is resolve_verified_cache_body
+    assert defaults["sync_explicit"] is sync_explicit_cache_keys
 
 
 def test_diagnostic_uses_the_shared_production_manifest_loader(
@@ -430,7 +435,6 @@ def test_missing_audio_uses_the_rebuilt_remote_and_separates_decoder_failures(
 
     def sync_explicit(simfiles, store, index, config, selected_keys, item_progress=None):
         del store, index, config, selected_keys, item_progress
-        from src.benchmark.r2_corpus_models import CacheSyncResult
 
         rebuilt = tuple(
             replace(
@@ -458,7 +462,6 @@ def test_missing_audio_uses_the_rebuilt_remote_and_separates_decoder_failures(
     assert report["sampled_audio_decodable_count"] == 1
     assert report["sampled_audio_cache_failure_count"] == 0
     assert report["sampled_audio_decoder_failure_count"] == 0
-    assert report["sampled_audio_undecodable_count"] == 0
     assert any(seam == "probe_audio" for seam, _key in calls)
 
 
@@ -479,8 +482,6 @@ def test_missing_audio_cache_failure_is_not_reported_as_decoder_failure(tmp_path
         raise ValueError("verified cache body unavailable")
 
     def no_rebuild(simfiles, *_args, **_kwargs):
-        from src.benchmark.r2_corpus_models import CacheSyncResult
-
         return CacheSyncResult(simfiles=simfiles, actions=())
 
     deps = replace(deps, resolve_audio_body=unavailable, sync_explicit=no_rebuild)
@@ -491,7 +492,6 @@ def test_missing_audio_cache_failure_is_not_reported_as_decoder_failure(tmp_path
     assert report["sampled_audio_cache_failure_count"] == 1
     assert report["sampled_audio_decoder_failure_count"] == 0
     assert report["sampled_audio_decodable_count"] == 0
-    assert report["sampled_audio_undecodable_count"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -590,8 +590,8 @@ def test_authored_extension_counts_and_decodability_are_reported_separately(tmp_
     assert report["bgm_extension_counts"] == {".ogg": 1}
     assert report["sampled_audio_count"] == 1
     assert report["sampled_audio_decodable_count"] == 1
-    assert report["sampled_audio_undecodable_count"] == 0
-    assert report["sampled_audio_undecodable_by_extension"] == {}
+    assert report["sampled_audio_decoder_failure_count"] == 0
+    assert report["sampled_audio_decoder_failure_by_extension"] == {}
 
 
 def test_undecodable_audio_is_counted_by_authored_extension(tmp_path: Path) -> None:
@@ -602,8 +602,6 @@ def test_undecodable_audio_is_counted_by_authored_extension(tmp_path: Path) -> N
 
     report = _run(_make_config(tmp_path, manifest_path), deps)
 
-    assert report["sampled_audio_undecodable_count"] == 1
-    assert report["sampled_audio_undecodable_by_extension"] == {".ogg": 1}
     assert report["sampled_audio_decoder_failure_count"] == 1
     assert report["sampled_audio_decoder_failure_by_extension"] == {".ogg": 1}
 
@@ -627,6 +625,49 @@ def test_case_insensitive_match_is_reported(tmp_path: Path) -> None:
     assert report["rows_with_unresolved_wav"] == 0
 
 
+def test_simfile_root_fallback_is_reported_for_subdir_chart(tmp_path: Path) -> None:
+    # Chart lives in a subdirectory (``42/sub/real.dtx``) and the authored
+    # ``#WAV01`` path resolves only from the simfile root (``42/bgm.ogg``), not
+    # from the chart's own directory (``42/sub/bgm.ogg`` is absent) -> the
+    # root-relative retry is what resolves it.
+    manifest_path, _chart_key, _audio_key = _selected_fixture(
+        tmp_path, _CH02_CHART, audio_name="bgm.ogg", chart_path="sub/real.dtx"
+    )
+    deps, _calls, _sync_keys = _build_deps(tmp_path, chart_body=_CH02_CHART, audio_key="42/bgm.ogg")
+
+    report = _run(_make_config(tmp_path, manifest_path), deps)
+
+    assert report["rows_needing_simfile_root_fallback"] == 1
+    assert report["rows_needing_case_insensitive_match"] == 0
+    assert report["rows_with_unresolved_wav"] == 0
+
+
+def test_unresolved_wav_is_reported_when_authored_path_is_absent(tmp_path: Path) -> None:
+    # The authored ``#WAV01`` path (``ghost.ogg``) has no matching object in the
+    # inventory (only ``42/bgm.ogg`` is present) -> the BGM resolver emits a
+    # ``source_audio_missing`` reason, which the diagnostic counts as unresolved.
+    unresolved_chart = (
+        b"#TITLE: Unresolved BGM\n"
+        b"#ARTIST: Tester\n"
+        b"#DLEVEL: 50\n"
+        b"#WAV01: ghost.ogg\n"
+        b"#00001: 01\n"
+        b"#00011: 01\n"
+    )
+    manifest_path, _chart_key, _audio_key = _selected_fixture(
+        tmp_path, unresolved_chart, audio_name="bgm.ogg"
+    )
+    deps, _calls, _sync_keys = _build_deps(
+        tmp_path, chart_body=unresolved_chart, audio_key="42/bgm.ogg"
+    )
+
+    report = _run(_make_config(tmp_path, manifest_path), deps)
+
+    assert report["rows_with_unresolved_wav"] == 1
+    assert report["rows_needing_case_insensitive_match"] == 0
+    assert report["rows_needing_simfile_root_fallback"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Determinism (Step 6): byte-identical report on re-run
 # ---------------------------------------------------------------------------
@@ -641,8 +682,6 @@ def test_report_is_byte_identical_on_re_run(tmp_path: Path) -> None:
     deps_b, _calls_b, _sync_b = _build_deps(
         tmp_path, chart_body=_CH02_CHART, audio_key="42/bgm.ogg"
     )
-
-    from tools.hpa323.analyze_reference_timing import render_report
 
     config = _make_config(tmp_path, manifest_path)
     bytes_a = render_report(_run(config, deps_a))
