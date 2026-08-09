@@ -1086,3 +1086,111 @@ def test_validate_reference_event_golden_rejects_unsupported_schema() -> None:
 
     with pytest.raises(ValueError):
         validate_schema_golden("crux.other/v1", content)
+
+
+# ---------------------------------------------------------------------------
+# Coverage: remaining validate_schema_golden rejection paths
+# ---------------------------------------------------------------------------
+
+
+def test_validate_reference_event_golden_rejects_content_without_trailing_newline() -> None:
+    # Line 614: content that does not end with a newline.
+    content = canonical_json_bytes(_golden_event_row())  # no trailing newline
+
+    with pytest.raises(ValueError, match="one final newline"):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)
+
+
+def test_validate_reference_event_golden_rejects_double_trailing_newline() -> None:
+    # Line 614: content that ends with a double newline.
+    content = canonical_json_bytes(_golden_event_row(), trailing_newline=True) + b"\n"
+
+    with pytest.raises(ValueError, match="one final newline"):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)
+
+
+def test_validate_reference_event_golden_rejects_blank_line() -> None:
+    # Line 618: a blank line in the content.
+    valid = canonical_json_bytes(_golden_event_row(), trailing_newline=True)
+    content = valid + b"\n" + valid
+
+    with pytest.raises(ValueError, match="one record per line"):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)
+
+
+def test_validate_reference_event_golden_rejects_non_byte_identical_render(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Line 632: content that passes strict_json_loads but is not byte-identical
+    # to the canonical re-render.  We bypass the canonical check in
+    # strict_json_loads so a non-canonical-but-valid-JSON line reaches the
+    # byte-identity guard.
+    import src.benchmark.reference_timing as rt
+
+    real_loads = rt.strict_json_loads
+
+    def lenient_loads(content: bytes, *, require_canonical: bool = False) -> object:
+        return real_loads(content, require_canonical=False)
+
+    monkeypatch.setattr(rt, "strict_json_loads", lenient_loads)
+
+    valid = canonical_json_bytes(_golden_event_row())
+    non_canonical = valid.replace(b'":', b'" :', 1) + b"\n"
+
+    with pytest.raises(ValueError, match="byte-identical"):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, non_canonical)
+
+
+@pytest.mark.parametrize("field", ["simfile_id", "source_order", "measure"])
+def test_validate_reference_event_golden_rejects_non_integer_identity_field(
+    field: str,
+) -> None:
+    # Line 641: an int-key field that parses as Decimal (float in JSON) is not
+    # an int and must be rejected.
+    row = _golden_event_row()
+    row[field] = Decimal("1.5")
+    content = canonical_json_bytes(row, trailing_newline=True)
+
+    with pytest.raises(ValueError, match="must be an integer"):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)
+
+
+@pytest.mark.parametrize("field", ["selected_chart_key", "source_audio_key", "lane_id", "note_id"])
+def test_validate_reference_event_golden_rejects_empty_string_field(field: str) -> None:
+    # Line 650: a string-key field that is empty must be rejected.
+    row = _golden_event_row()
+    row[field] = ""
+    content = canonical_json_bytes(row, trailing_newline=True)
+
+    with pytest.raises(ValueError, match="must be a non-empty string"):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)
+
+
+def test_validate_reference_event_row_rejects_non_finite_decimal_time() -> None:
+    # Line 673: a time field that is a non-finite Decimal passes the type check
+    # (int/Decimal) but fails the isfinite guard.  This cannot be reached
+    # through validate_schema_golden because strict_json_loads rejects
+    # non-finite JSON constants, so the internal validator is exercised directly.
+    from src.benchmark.reference_timing import _validate_reference_event_row
+
+    row = _golden_event_row()
+    row["audio_time_sec"] = Decimal("Infinity")
+
+    with pytest.raises(ValueError, match="must be a finite number"):
+        _validate_reference_event_row(row)
+
+
+def test_validate_reference_event_golden_rejects_mixed_source_identity() -> None:
+    # Line 706: two valid rows with different simfile_id (and therefore
+    # different identity prefixes) must be rejected.
+    row_a = _golden_event_row()
+    row_b = _golden_event_row()
+    row_b["simfile_id"] = 43
+    row_b["selected_chart_key"] = "43/real.dtx"
+    row_b["source_audio_key"] = "43/bgm.ogg"
+    # Use a different measure so the native-identity ordering check passes.
+    row_b["measure"] = 2
+    content = b"".join(canonical_json_bytes(row, trailing_newline=True) for row in (row_a, row_b))
+
+    with pytest.raises(ValueError, match="mixed source identity"):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)

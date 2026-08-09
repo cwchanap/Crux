@@ -1214,3 +1214,490 @@ def test_accounting_fatal_failure_exits_two_without_manifest(tmp_path):
     assert outcome.status == "failed"
     assert outcome.manifest is None
     assert outcome.events_published == 0
+
+
+# ===========================================================================
+# Coverage: remaining loader rejection paths
+# ===========================================================================
+
+
+def test_loader_rejects_blank_line_between_records(tmp_path: Path) -> None:
+    # Line 256: a blank line inside the manifest (content ends with \n, not \n\n,
+    # but splitlines yields a blank line in the middle).
+    fixture = _published_hpa322(tmp_path)
+    lines = fixture.manifest_content.splitlines(keepends=True)
+    content = lines[0] + b"\n" + lines[1]
+    manifest_path = tmp_path / "hpa322.jsonl"
+    manifest_path.write_bytes(content)
+    with pytest.raises(ValueError):
+        load_reference_chart_manifest(manifest_path)
+
+
+def test_loader_rejects_noncanonical_line_with_trailing_newline(tmp_path: Path) -> None:
+    # Lines 259-260: a non-canonical JSON line in a manifest that otherwise
+    # passes the initial trailing-newline check.
+    fixture = _published_hpa322(tmp_path)
+    first = canonical_json_bytes(fixture.rows[0], trailing_newline=True)
+    non_canonical = first.replace(b'":', b'" :', 1)
+    second = canonical_json_bytes(fixture.rows[1], trailing_newline=True)
+    manifest_path = tmp_path / "hpa322.jsonl"
+    manifest_path.write_bytes(non_canonical + second)
+    with pytest.raises(ValueError):
+        load_reference_chart_manifest(manifest_path)
+
+
+def test_loader_rejects_duplicate_simfile_ids_in_valid_rows(tmp_path: Path) -> None:
+    # Line 287: two otherwise-valid rows with the same simfile_id.  Duplicating
+    # the first line of a valid manifest ensures both rows pass per-row
+    # validation before the duplicate check fires.
+    fixture = _published_hpa322(tmp_path)
+    first_line = fixture.manifest_content.splitlines(keepends=True)[0]
+    manifest_path = tmp_path / "hpa322.jsonl"
+    manifest_path.write_bytes(first_line + first_line)
+    with pytest.raises(ValueError, match="duplicate"):
+        load_reference_chart_manifest(manifest_path)
+
+
+def test_loader_rejects_empty_record_set(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Line 292: defensive guard for an empty record set after the loop.
+    # Unreachable through normal execution (any content ending with \n has at
+    # least one splitline), so a bytes subclass that returns [] from
+    # splitlines is used to exercise the guard.
+    fixture = _published_hpa322(tmp_path)
+
+    class _EmptySplitlinesBytes(bytes):
+        def splitlines(self, keepends: bool = False) -> list[bytes]:
+            return []
+
+    empty_content = _EmptySplitlinesBytes(fixture.manifest_content)
+    real_read_bytes = Path.read_bytes
+
+    def stub_read_bytes(self: Path) -> bytes:
+        if self == fixture.manifest_path:
+            return empty_content
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", stub_read_bytes)
+
+    with pytest.raises(ValueError, match="no records"):
+        load_reference_chart_manifest(fixture.manifest_path)
+
+
+# ===========================================================================
+# Coverage: remaining orchestration rejection paths
+# ===========================================================================
+
+
+# A chart with a BGM event at measure 0 and a playable note at measure 10,
+# used to force all events outside a very short audio clip.
+_SHORT_AUDIO_CHART_BODY = (
+    b"#TITLE: Example Song\n#ARTIST: Example Artist\n#DLEVEL: 99\n"
+    b"#WAV01: bgm.wav\n#00001: 01\n#01011: 01\n"
+)
+
+
+def test_first_pass_quarantines_selected_chart_cache_invalid(tmp_path: Path) -> None:
+    # Lines 592-594: the cached chart body is corrupted after HPA-322
+    # publication, so read_verified_cache_body raises ValueError.
+    spec = _ready_audio_spec()
+    fixture = _publish_timing_manifest(tmp_path, selected=(spec,))
+    chart_hash = sha256(spec.chart_body).hexdigest()
+    chart_cache_path = fixture.cache_dir / "sha256" / chart_hash[:2] / chart_hash
+    chart_cache_path.write_bytes(b"corrupted chart body")
+
+    outcome = run_reference_timing(_timing_request(fixture))
+
+    assert outcome.exit_code == 1
+    (row,) = _ready_rows(outcome)
+    assert row["timing_reason_codes"] == ["selected_chart_cache_invalid"]
+
+
+def test_first_pass_quarantines_selected_chart_parse_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Lines 602-604: parse_dtx_bytes raises (simulated).  The HPA-322 selection
+    # also parses the chart, so a genuinely unparseable body would be
+    # quarantined upstream; monkeypatching isolates the timing-level path.
+    fixture = _publish_timing_manifest(tmp_path, selected=(_ready_audio_spec(),))
+
+    def failing_parse(*args: object, **kwargs: object) -> None:
+        raise ValueError("simulated parse failure")
+
+    monkeypatch.setattr(reference_timing_manifest, "parse_dtx_bytes", failing_parse)
+
+    outcome = run_reference_timing(_timing_request(fixture))
+
+    assert outcome.exit_code == 1
+    (row,) = _ready_rows(outcome)
+    assert row["timing_reason_codes"] == ["selected_chart_parse_failed"]
+
+
+def test_first_pass_quarantines_timing_map_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Lines 608-610: build_dtx_timing_map raises (simulated), quarantining
+    # the row with timing_map_invalid.
+    fixture = _publish_timing_manifest(tmp_path, selected=(_ready_audio_spec(),))
+
+    def failing_build(chart: object) -> None:
+        raise ValueError("simulated timing map failure")
+
+    monkeypatch.setattr(reference_timing_manifest, "build_dtx_timing_map", failing_build)
+
+    outcome = run_reference_timing(_timing_request(fixture))
+
+    assert outcome.exit_code == 1
+    (row,) = _ready_rows(outcome)
+    assert row["timing_reason_codes"] == ["timing_map_invalid"]
+
+
+def test_first_pass_quarantines_source_audio_cache_invalid(tmp_path: Path) -> None:
+    # Lines 641-642: the verified audio body is deleted from the cache after
+    # HPA-322 publication, so resolve_verified_cache_body raises ValueError.
+    spec = _ready_audio_spec()
+    fixture = _publish_timing_manifest(tmp_path, selected=(spec,))
+    audio_hash = sha256(spec.audio_body).hexdigest()
+    audio_cache_path = fixture.cache_dir / "sha256" / audio_hash[:2] / audio_hash
+    audio_cache_path.unlink()
+
+    outcome = run_reference_timing(_timing_request(fixture))
+
+    assert outcome.exit_code == 1
+    (row,) = _ready_rows(outcome)
+    assert row["timing_reason_codes"] == ["source_audio_cache_invalid"]
+
+
+def test_fill_maps_cache_resolve_failure_to_source_audio_cache_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Lines 734-735: after a successful fill download, the re-resolve of the
+    # verified audio body fails, mapping to source_audio_cache_invalid.
+    spec = _SelectedSimfile(42, _READY_CHART_BODY, _wav_bytes(), audio_verified=False)
+    fixture = _publish_timing_manifest(
+        tmp_path, selected=(spec,), endpoint_sha256=_FILL_ENDPOINT_HASH
+    )
+    store = _AudioFakeStore({"42/bgm.wav": spec.audio_body})
+
+    def failing_resolve(*args: object, **kwargs: object) -> None:
+        raise ValueError("simulated cache resolve failure")
+
+    monkeypatch.setattr(reference_timing_manifest, "resolve_verified_cache_body", failing_resolve)
+
+    outcome = run_reference_timing(
+        _timing_request(fixture),
+        environ={"CRUX_R2_ENDPOINT_URL": _FILL_ENDPOINT, "CRUX_R2_BUCKET": "simfile-dtx"},
+        dependency_check=lambda: None,
+        store_factory=lambda config: store,
+    )
+
+    assert outcome.exit_code == 1
+    (row,) = _ready_rows(outcome)
+    assert row["timing_reason_codes"] == ["source_audio_cache_invalid"]
+
+
+def test_finalise_row_state_quarantines_defensive_null_audio(tmp_path: Path) -> None:
+    # Lines 752-753: a row state with no resolution and no audio path is
+    # defensively quarantined rather than crashing the run.
+    from src.benchmark.reference_timing_manifest import _finalise_row_state, _RowTimingState
+
+    fixture = _published_hpa322(tmp_path)
+    loaded = load_reference_chart_manifest(fixture.manifest_path)
+    state = _RowTimingState(validated=loaded.rows[0], is_upstream=False)
+
+    _finalise_row_state(state, output_dir=tmp_path / "out")
+
+    assert state.resolution is not None
+    assert state.resolution.status == "quarantined"
+    assert state.resolution.reason_codes == ("source_audio_download_failed",)
+
+
+def test_finalise_quarantines_when_no_in_bounds_reference_events(tmp_path: Path) -> None:
+    # Lines 784-785: all playable events fall outside the (very short) audio
+    # duration, so build_audio_relative_events returns no_in_bounds_reference_events
+    # and the row is quarantined.
+    spec = _SelectedSimfile(
+        42,
+        _SHORT_AUDIO_CHART_BODY,
+        _wav_bytes(seconds=0.001, sample_rate=8000),
+        audio_verified=True,
+    )
+    fixture = _publish_timing_manifest(tmp_path, selected=(spec,))
+
+    outcome = run_reference_timing(_timing_request(fixture))
+
+    assert outcome.exit_code == 1
+    (row,) = _ready_rows(outcome)
+    assert row["timing_reason_codes"] == ["no_in_bounds_reference_events"]
+
+
+# ===========================================================================
+# Coverage: remaining schema-golden validator rejection paths
+# ===========================================================================
+
+
+def _golden_content(modifier=None) -> bytes:
+    rows = _golden_rows()
+    if modifier is not None:
+        modifier(rows)
+    return b"".join(canonical_json_bytes(row, trailing_newline=True) for row in rows)
+
+
+def test_golden_validator_rejects_wrong_record_count() -> None:
+    # Line 830: content with only one record (golden requires exactly two).
+    rows = _golden_rows()
+    content = canonical_json_bytes(rows[0], trailing_newline=True)
+    with pytest.raises(ValueError, match="exactly two records"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, content)
+
+
+def test_golden_validator_rejects_noncanonical_json_line() -> None:
+    # Lines 833-834: a non-canonical JSON line in the golden content.
+    rows = _golden_rows()
+    first = canonical_json_bytes(rows[0])
+    non_canonical = first.replace(b'":', b'" :', 1) + b"\n"
+    second = canonical_json_bytes(rows[1], trailing_newline=True)
+    with pytest.raises(ValueError, match="canonical JSONL"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, non_canonical + second)
+
+
+def test_golden_validator_rejects_non_object_row() -> None:
+    # Line 836: a row that is valid JSON but not an object (e.g. an array).
+    rows = _golden_rows()
+    content = b"[]\n" + canonical_json_bytes(rows[1], trailing_newline=True)
+    with pytest.raises(ValueError, match="must be objects"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, content)
+
+
+def test_golden_validator_rejects_mixed_source_identity() -> None:
+    # Line 859: two rows with different source_reference_chart_manifest_sha256.
+    def modifier(rows):
+        rows[1]["source_reference_chart_manifest_sha256"] = "d" * 64
+
+    with pytest.raises(ValueError, match="mixed source identity"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+def test_golden_validator_rejects_mixed_corpus_version() -> None:
+    # Line 863: two rows with different corpus_version values.
+    def modifier(rows):
+        rows[1]["corpus_version"] = "sha256:" + "e" * 64
+
+    with pytest.raises(ValueError, match="mixed corpus version"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+def test_golden_validator_rejects_invalid_corpus_version() -> None:
+    # Line 866: both rows share a corpus_version that is not a valid sha256: value.
+    # The per-row check in _validate_timing_manifest_row (line 918) normally
+    # catches this first, so the per-row validator is stubbed to let the
+    # golden-level derived-version check fire.
+    def modifier(rows):
+        for row in rows:
+            row["corpus_version"] = "not-a-corpus-version"
+
+    import src.benchmark.reference_timing_manifest as rtm
+
+    original = rtm._validate_timing_manifest_row
+    rtm._validate_timing_manifest_row = lambda row: None
+    try:
+        with pytest.raises(ValueError, match="invalid corpus version"):
+            validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+    finally:
+        rtm._validate_timing_manifest_row = original
+
+
+def test_golden_validator_rejects_invalid_derived_corpus_version() -> None:
+    # Line 872: both rows share a valid-but-wrong corpus_version that does not
+    # round-trip through render_manifest.
+    def modifier(rows):
+        for row in rows:
+            row["corpus_version"] = "sha256:" + "d" * 64
+
+    with pytest.raises(ValueError, match="invalid derived corpus version"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+def test_golden_validator_rejects_row_missing_timing_keys() -> None:
+    # Line 879: a row missing one of the timing-specific keys.
+    def modifier(rows):
+        del rows[0]["timing_semantics_version"]
+
+    with pytest.raises(ValueError, match="invalid key set"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+def test_golden_validator_rejects_row_missing_schema_version() -> None:
+    # Line 881: a row missing schema_version.
+    def modifier(rows):
+        del rows[0]["schema_version"]
+
+    with pytest.raises(ValueError, match="invalid key set"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+def test_golden_validator_rejects_row_missing_corpus_version() -> None:
+    # Line 881: a row missing corpus_version.
+    def modifier(rows):
+        del rows[0]["corpus_version"]
+
+    with pytest.raises(ValueError, match="invalid key set"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+def test_golden_validator_rejects_invalid_reference_chart_payload() -> None:
+    # Lines 898-899: the reconstructed HPA-322 row fails validation because the
+    # ready row's selected_chart_key is null (violates the selected/null shape).
+    def modifier(rows):
+        rows[0]["selected_chart_key"] = None
+
+    with pytest.raises(ValueError, match="invalid reference chart payload"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+def test_golden_validator_rejects_unsupported_timing_schema() -> None:
+    # Line 904: the timing row's schema_version is wrong.
+    def modifier(rows):
+        rows[0]["schema_version"] = "crux.wrong/v1"
+
+    with pytest.raises(ValueError, match="unsupported schema"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+def test_golden_validator_rejects_unsupported_timing_semantics_version() -> None:
+    # Line 906: the timing_semantics_version is wrong.
+    def modifier(rows):
+        rows[0]["timing_semantics_version"] = "crux.wrong/v1"
+
+    with pytest.raises(ValueError, match="unsupported timing semantics"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+def test_golden_validator_rejects_invalid_corpus_version_in_row() -> None:
+    # Line 918: the per-row corpus_version is not a valid sha256: value.  Both
+    # rows share the same invalid value so the mixed-version check (863) does
+    # not fire first.
+    def modifier(rows):
+        for row in rows:
+            row["corpus_version"] = "not-sha256"
+
+    with pytest.raises(ValueError, match="invalid corpus version"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+def test_golden_validator_rejects_invalid_timing_warnings() -> None:
+    # Line 921: timing_warnings is not a list of strings.
+    def modifier(rows):
+        rows[0]["timing_warnings"] = "not-a-list"
+
+    with pytest.raises(ValueError, match="invalid timing warnings"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+def test_golden_validator_rejects_invalid_timing_status() -> None:
+    # Line 929: timing_status is not "ready" or "quarantined".
+    def modifier(rows):
+        rows[0]["timing_status"] = "invalid"
+
+    with pytest.raises(ValueError, match="invalid timing status"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+def test_golden_validator_rejects_ready_row_with_reason_codes() -> None:
+    # Line 938: a ready row must not carry reason codes.
+    def modifier(rows):
+        rows[0]["timing_reason_codes"] = ["bgm_event_missing"]
+
+    with pytest.raises(ValueError, match="must not carry reason codes"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+def test_golden_validator_rejects_ready_row_missing_source_audio_identity() -> None:
+    # Line 942: a ready row must have non-empty source audio identity fields.
+    def modifier(rows):
+        rows[0]["source_audio_key"] = None
+
+    with pytest.raises(ValueError, match="missing source audio identity"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+def test_golden_validator_rejects_quarantined_row_without_reason_codes() -> None:
+    # Line 949: a quarantined row must carry reason codes.
+    def modifier(rows):
+        rows[1]["timing_reason_codes"] = []
+
+    with pytest.raises(ValueError, match="must carry reason codes"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+def test_golden_validator_rejects_quarantined_row_with_non_null_source_audio() -> None:
+    # Line 952: a quarantined row must null its source audio identity.
+    def modifier(rows):
+        rows[1]["source_audio_key"] = "42/bgm.wav"
+
+    with pytest.raises(ValueError, match="null source audio identity"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+def test_golden_validator_rejects_non_string_manifest_sha256() -> None:
+    # Line 964: source_reference_chart_manifest_sha256 is not a string.
+    def modifier(rows):
+        rows[0]["source_reference_chart_manifest_sha256"] = 42
+
+    with pytest.raises(ValueError, match="must be lowercase SHA-256"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+def test_golden_validator_rejects_invalid_manifest_sha256_string() -> None:
+    # Lines 967-968: source_reference_chart_manifest_sha256 is a string but
+    # not a valid 64-character lowercase hex SHA-256.
+    def modifier(rows):
+        rows[0]["source_reference_chart_manifest_sha256"] = "not-a-sha256"
+
+    with pytest.raises(ValueError, match="must be lowercase SHA-256"):
+        validate_schema_golden(REFERENCE_TIMING_MANIFEST_SCHEMA, _golden_content(modifier))
+
+
+# ---------------------------------------------------------------------------
+# Coverage: _is_corpus_version and _validate_timing_manifest_row direct tests
+# ---------------------------------------------------------------------------
+
+
+def test_is_corpus_version_rejects_non_string() -> None:
+    # Line 973: a non-string value is not a corpus version.
+    from src.benchmark.reference_timing_manifest import _is_corpus_version
+
+    assert _is_corpus_version(42) is False
+
+
+def test_is_corpus_version_rejects_non_sha256_prefix() -> None:
+    # Line 973: a string without the sha256: prefix is not a corpus version.
+    from src.benchmark.reference_timing_manifest import _is_corpus_version
+
+    assert _is_corpus_version("not-sha256") is False
+
+
+def test_is_corpus_version_rejects_invalid_sha256_after_prefix() -> None:
+    # Lines 976-977: a string with the sha256: prefix but an invalid hash.
+    from src.benchmark.reference_timing_manifest import _is_corpus_version
+
+    assert _is_corpus_version("sha256:abc") is False
+
+
+def test_validate_timing_manifest_row_rejects_invalid_source_reference_chart_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Line 914: source_reference_chart_version is not a valid corpus version.
+    # This is normally caught earlier by the HPA-322 reconstruction (which uses
+    # source_reference_chart_version as the HPA-322 corpus_version), so the
+    # HPA-322 validator is stubbed to let the per-row check fire.
+    from src.benchmark.reference_timing_manifest import _validate_timing_manifest_row
+
+    def stub_view(_row: object) -> None:
+        return None
+
+    monkeypatch.setattr(reference_timing_manifest, "reference_chart_row_view_from_row", stub_view)
+
+    rows = _golden_rows()
+    rows[0]["source_reference_chart_version"] = "not-a-corpus-version"
+    with pytest.raises(ValueError, match="invalid source reference chart version"):
+        _validate_timing_manifest_row(rows[0])
