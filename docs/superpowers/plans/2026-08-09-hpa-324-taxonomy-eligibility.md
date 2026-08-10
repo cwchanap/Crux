@@ -56,7 +56,7 @@
 - `src/cli/benchmark.py`
 - `scripts/calibrate_egmd_mapping.py` only if taxonomy grep finds an active old-name assumption rather than a passive import
 - `tests/benchmark/test_mapping.py`
-- `tests/benchmark/test_midi_io.py` if present; otherwise add the reverse-MIDI regression to the nearest existing MIDI test file
+- `tests/benchmark/test_midi_io.py`
 - `tests/benchmark/test_reference_timing.py`
 - `tests/benchmark/test_reference_timing_manifest.py`
 - `tests/benchmark/test_render_audio.py`
@@ -75,7 +75,8 @@
 - Modify: `src/benchmark/midi_io.py`
 - Modify: `src/benchmark/render_audio.py`
 - Modify: `tests/benchmark/test_mapping.py`
-- Modify: MIDI/render tests covering changed consumers
+- Modify: `tests/benchmark/test_midi_io.py`
+- Modify: `tests/benchmark/test_render_audio.py`
 
 **Interfaces:**
 
@@ -225,10 +226,11 @@ If no active producer emits `mid_tom`, remove it from `REFERENCE_CLASS_TO_MIDI`;
 - [ ] **Step 5: Run tests and verify RED**
 
 ```bash
-uv run pytest tests/benchmark/test_taxonomy.py tests/benchmark/test_mapping.py -q
+uv run pytest tests/benchmark/test_taxonomy.py tests/benchmark/test_mapping.py \
+  tests/benchmark/test_midi_io.py -q
 ```
 
-Run the existing MIDI test file that covers `write_reference_midi`; expected RED is missing taxonomy/new-name behavior.
+Expected RED is missing taxonomy/new-name behavior.
 
 - [ ] **Step 6: Implement `taxonomy.py` with immutable maps**
 
@@ -270,7 +272,7 @@ if event.lane_id not in DRUM_LANE_IDS:
     continue
 ```
 
-Update `REFERENCE_CLASS_TO_MIDI` in `midi_io.py` in the same task.
+Update `REFERENCE_CLASS_TO_MIDI` in `midi_io.py` in the same task and extend `test_write_reference_midi_handles_simultaneous_hits` or add a focused `low_or_floor_tom` test in `tests/benchmark/test_midi_io.py`.
 
 - [ ] **Step 9: Check the calibration script blast radius**
 
@@ -283,20 +285,23 @@ If the script only consumes the maps dynamically, no code change is needed. If i
 - [ ] **Step 10: Run focused validation**
 
 ```bash
-uv run pytest tests/benchmark/test_taxonomy.py tests/benchmark/test_mapping.py tests/benchmark/test_render_audio.py -q
-uv run ruff check src/benchmark/taxonomy.py src/benchmark/mapping.py src/benchmark/midi_io.py src/benchmark/render_audio.py tests/benchmark
+uv run pytest tests/benchmark/test_taxonomy.py tests/benchmark/test_mapping.py \
+  tests/benchmark/test_midi_io.py tests/benchmark/test_render_audio.py -q
+uv run ruff check src/benchmark/taxonomy.py src/benchmark/mapping.py src/benchmark/midi_io.py \
+  src/benchmark/render_audio.py tests/benchmark
 ```
-
-Also run the existing MIDI test file.
 
 - [ ] **Step 11: Commit Task 1**
 
 ```bash
 git add src/benchmark/taxonomy.py src/benchmark/mapping.py src/benchmark/midi_io.py \
-  src/benchmark/render_audio.py tests/benchmark
-git add scripts/calibrate_egmd_mapping.py  # only when Step 9 required a real edit
+  src/benchmark/render_audio.py tests/benchmark/test_taxonomy.py \
+  tests/benchmark/test_mapping.py tests/benchmark/test_midi_io.py \
+  tests/benchmark/test_render_audio.py
 git commit -m "feat: freeze benchmark drum taxonomy"
 ```
+
+If Step 9 required an actual calibration-script edit, stage `scripts/calibrate_egmd_mapping.py` in this same commit.
 
 ---
 
@@ -1040,7 +1045,7 @@ Also run the exact HPA-423 mapper/scorer-input test files discovered after rebas
 
 - [ ] **Step 6: Commit the seam verification**
 
-Stage only HPA-324 taxonomy/tests plus any minimal HPA-423 seam adaptation:
+Stage only HPA-324 taxonomy/tests plus any minimal HPA-423 seam adaptation and commit:
 
 ```bash
 git commit -m "test: bind OaF group map to benchmark taxonomy"
@@ -1107,12 +1112,15 @@ git diff --check origin/main...HEAD
 
 Confirm the implementation did not add guessed MuScriptor/IDM tables, velocity scoring, DTX/audio/R2 reprocessing, scoring tolerances, generic mapping frameworks, or result-driven mapping changes.
 
-- [ ] **Step 7: Commit mechanical cleanup only if Steps 4-6 found real issues**
+- [ ] **Step 7: Commit mechanical cleanup only when Steps 4-6 found concrete files to change**
+
+Stage those concrete paths individually rather than using `git add -A`, then commit:
 
 ```bash
-git add <exact-files-found-by-the-checks>
 git commit -m "chore: finalize benchmark taxonomy contracts"
 ```
+
+If Steps 4-6 find no cleanup, do not create an empty commit.
 
 ---
 
