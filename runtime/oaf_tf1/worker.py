@@ -17,6 +17,16 @@ except ImportError:  # pragma: no cover - direct execution in the runtime image
 DEFAULT_BACKEND_ID = "magenta-egmd-tf1-94529798-8hit-v1"
 
 
+def _add_vendor_import_root() -> None:
+    """Make the sibling patched Magenta tree importable in the runtime image."""
+    vendor_root = Path(__file__).with_name("vendor")
+    if vendor_root.is_dir() and os.fspath(vendor_root) not in sys.path:
+        sys.path.insert(0, os.fspath(vendor_root))
+
+
+_add_vendor_import_root()
+
+
 def _event_payload(event: Any) -> dict[str, Any]:
     if isinstance(event, OafNativeEvent):
         return {

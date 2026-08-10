@@ -29,25 +29,6 @@ def benchmark() -> None:
     """Benchmark drum transcription against DTX ground truth."""
 
 
-def _emit_backend_summary(
-    *,
-    status: str,
-    exit_code: int,
-    report_path: Path | None,
-    report_sha256: str | None,
-) -> None:
-    """Write the sole machine-readable result after a backend command has parsed."""
-    payload = {
-        "exit_code": exit_code,
-        "report_path": None if report_path is None else str(report_path),
-        "report_sha256": report_sha256,
-        "status": status,
-    }
-    standard_output = click.get_binary_stream("stdout")
-    standard_output.write(canonical_json_bytes(payload, trailing_newline=True))
-    standard_output.flush()
-
-
 @benchmark.command("prepare-backend")
 @click.option("--backend", type=str, default="oaf", show_default=True)
 @click.option("--download", is_flag=True)
@@ -138,8 +119,7 @@ def _validate_verification_backend_id(
     value: str,
 ) -> str:
     supported = {
-        "magenta-egmd-tf1-94529798-8hit-v1",
-        "heuristic-onset-v1",
+        "oaf",
     }
     if value not in supported:
         raise click.BadParameter("must select a supported verification backend")
@@ -150,7 +130,7 @@ def _validate_verification_backend_id(
 @click.option(
     "--backend",
     type=str,
-    default="magenta-egmd-tf1-94529798-8hit-v1",
+    default="oaf",
     show_default=True,
     callback=_validate_verification_backend_id,
 )
@@ -168,52 +148,8 @@ def verify_backend_command(
     reports_root: Path,
     allow_emulated_diagnostics: bool,
 ) -> None:
-    """Verify a frozen transcription backend and publish its sealed evidence."""
-    from src.benchmark.backend_registry import default_backend_registry
-    from src.benchmark.backend_reports import OperationalReportPublicationError
-    from src.benchmark.transcription import VerifyBackendRequest, run_verify_backend
-
-    try:
-        outcome = run_verify_backend(
-            VerifyBackendRequest(
-                backend_id=backend,
-                reports_root=reports_root,
-                allow_emulated_diagnostics=allow_emulated_diagnostics,
-            ),
-            registry=default_backend_registry(),
-        )
-    except OperationalReportPublicationError:
-        click.echo(
-            "report_publication_failed: Operational report could not be published.",
-            err=True,
-        )
-        ctx.exit(2)
-
-    _emit_backend_summary(
-        status=outcome.status,
-        exit_code=outcome.exit_code,
-        report_path=outcome.report_artifact.path,
-        report_sha256=outcome.report_artifact.sha256,
-    )
-    if outcome.exit_code:
-        ctx.exit(outcome.exit_code)
-
-
-def _validate_transcribe_one_provenance(
-    source_audio_id: str | None,
-    input_view_id: str | None,
-    input_view_manifest: Path | None,
-) -> None:
-    direct_mode = (
-        source_audio_id is not None and input_view_id is not None and input_view_manifest is None
-    )
-    derived_mode = (
-        source_audio_id is None and input_view_id is None and input_view_manifest is not None
-    )
-    if not (direct_mode or derived_mode):
-        raise click.UsageError(
-            "Provide exactly one provenance mode: direct IDs or an input-view manifest."
-        )
+    del ctx, backend, reports_root, allow_emulated_diagnostics
+    raise click.ClickException("verify-backend was removed; use the Task E smoke command")
 
 
 # Click owns this fixed external signature, and backend imports must remain lazy.
@@ -261,44 +197,18 @@ def transcribe_one(
     midi_output: Path | None,
     reports_root: Path,
 ) -> None:
-    """Transcribe one canonical audio input to authoritative native JSONL."""
-    _validate_transcribe_one_provenance(
+    del (
+        ctx,
+        backend,
+        audio,
         source_audio_id,
         input_view_id,
         input_view_manifest,
+        output,
+        midi_output,
+        reports_root,
     )
-
-    from src.benchmark.backend_registry import default_backend_registry
-    from src.benchmark.backend_reports import OperationalReportPublicationError
-    from src.benchmark.transcription import TranscribeOneRequest, run_transcribe_one
-
-    request = TranscribeOneRequest(
-        backend_id=backend,
-        audio_path=audio,
-        output_path=output,
-        source_audio_id=source_audio_id,
-        input_view_id=input_view_id,
-        input_view_manifest=input_view_manifest,
-        midi_output_path=midi_output,
-        reports_root=reports_root,
-    )
-    try:
-        outcome = run_transcribe_one(request, registry=default_backend_registry())
-    except OperationalReportPublicationError:
-        click.echo(
-            "report_publication_failed: Operational report could not be published.",
-            err=True,
-        )
-        ctx.exit(2)
-
-    _emit_backend_summary(
-        status=outcome.status,
-        exit_code=outcome.exit_code,
-        report_path=outcome.report_artifact.path,
-        report_sha256=outcome.report_artifact.sha256,
-    )
-    if outcome.exit_code:
-        ctx.exit(outcome.exit_code)
+    raise click.ClickException("transcribe-one was removed; use the Task E smoke command")
 
 
 # pylint: enable=too-many-arguments,too-many-positional-arguments

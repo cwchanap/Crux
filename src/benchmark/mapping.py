@@ -2,10 +2,23 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
+from src.benchmark.backends import NativePrediction
 from src.benchmark.models import BenchmarkEvent
-from src.benchmark.taxonomy import DRUM_LANE_IDS as _DRUM_LANE_IDS
-from src.benchmark.taxonomy import DTX_LANE_MAP, ClassMapping, DetailedDrumClass
+from src.benchmark.taxonomy import (
+    DRUM_LANE_IDS as _DRUM_LANE_IDS,
+)
+from src.benchmark.taxonomy import (
+    DTX_LANE_MAP,
+    OAF_PREDICTION_MAP,
+    ClassMapping,
+    DetailedDrumClass,
+    PredictionMap,
+)
+
+if TYPE_CHECKING:
+    from src.benchmark.prediction_artifact import MappedPrediction
 
 DRUM_LANE_IDS = _DRUM_LANE_IDS
 
@@ -73,3 +86,42 @@ def map_midi_events(
             continue
         mapped.append(replace(event, canonical_class=canonical_class))
     return mapped, MappingDiagnostics(unmapped=unmapped)
+
+
+def map_oaf_prediction(
+    prediction: NativePrediction,
+    prediction_map: PredictionMap = OAF_PREDICTION_MAP,
+) -> tuple["MappedPrediction", MappingDiagnostics]:
+    """Map OaF native groups to the shared detailed/common drum taxonomy."""
+    from src.benchmark.prediction_artifact import MappedPrediction, MappedPredictionEvent
+
+    if prediction.descriptor.payload.get("backend_id") != prediction_map.backend_id:
+        raise ValueError("prediction backend_id does not match prediction map")
+    if prediction.descriptor.payload.get("native_output_space_id") != (
+        prediction_map.native_output_space_id
+    ):
+        raise ValueError("prediction native_output_space_id does not match prediction map")
+
+    mapped_events: list[MappedPredictionEvent] = []
+    unmapped: dict[str, int] = {}
+    for native in prediction.events:
+        group = native.native_metadata["upstream_8hit_group_id"]
+        key = "null" if group is None else str(group)
+        class_mapping = prediction_map.classes.get(key)
+        is_mapped = class_mapping is not None and class_mapping.common_class is not None
+        if not is_mapped:
+            unmapped[key] = unmapped.get(key, 0) + 1
+        mapped_events.append(
+            MappedPredictionEvent(
+                native=native,
+                canonical_class=(class_mapping.canonical_class if is_mapped else None),
+                common_class=(class_mapping.common_class if is_mapped else None),
+                mapping_status="mapped" if is_mapped else "unmapped",
+                prediction_map_version=prediction_map.map_id,
+            )
+        )
+    return MappedPrediction(
+        audio=prediction.audio,
+        descriptor=prediction.descriptor,
+        events=tuple(mapped_events),
+    ), MappingDiagnostics(unmapped=unmapped)

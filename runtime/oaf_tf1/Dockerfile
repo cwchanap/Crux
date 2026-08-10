@@ -13,15 +13,8 @@ RUN set -eu; \
     useradd --uid "${RUNTIME_UID}" --gid "${RUNTIME_GID}" \
       --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin crux
 
-ENV HOME=/tmp \
-    LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8 \
-    OMP_NUM_THREADS=1 \
-    MKL_NUM_THREADS=1 \
-    PYTHONHASHSEED=0 \
-    TF_NUM_INTEROP_THREADS=1 \
-    TF_NUM_INTRAOP_THREADS=1 \
-    TZ=UTC
+ENV CUDA_VISIBLE_DEVICES=-1 \
+    PYTHONHASHSEED=0
 
 FROM runtime-base AS runtime-build
 
@@ -43,42 +36,13 @@ RUN python /opt/crux/runtime/apply_instrumentation_patch.py \
       --patch /opt/crux/runtime/patches/capture-emitted-frame.patch \
       --manifest /opt/crux/runtime/instrumented-source-manifest.json
 
-FROM runtime-build AS test
-
-ENV PYTEST_ADDOPTS="-p no:cacheprovider"
-
-COPY runtime/oaf_tf1/requirements-test.lock /opt/crux/requirements-test.lock
-COPY runtime/oaf_tf1/wheelhouse/test/ /opt/crux/test-wheelhouse/
-RUN /opt/crux/venv/bin/pip install --no-index --require-hashes --only-binary=:all: \
-      --find-links=/opt/crux/test-wheelhouse \
-      --requirement /opt/crux/requirements-test.lock
-COPY --from=instrumented-source /opt/crux/vendor/ /opt/crux/vendor/
-COPY --from=instrumented-source /opt/crux/upstream/ /opt/crux/upstream/
-COPY --from=instrumented-source /opt/crux/runtime/instrumented-source-manifest.json \
-  /opt/crux/runtime/instrumented-source-manifest.json
-COPY runtime/oaf_tf1/source-manifest.json /opt/crux/vendor/source-manifest.json
-COPY runtime/oaf_tf1/*.py /opt/crux/runtime/oaf_tf1/
-COPY runtime/oaf_tf1/patches/ /opt/crux/runtime/oaf_tf1/patches/
-COPY runtime/oaf_tf1/tests/ /opt/crux/runtime/tests/
-# Preserve the manifest-addressed repository layout in the test image too.
-COPY runtime/oaf_tf1/ /opt/crux/runtime/oaf_tf1/
-COPY runtime/oaf_tf1/runner-source-manifest.json /opt/crux/runtime/runner-source-manifest.json
-WORKDIR /opt/crux
-USER "${RUNTIME_UID}:${RUNTIME_GID}"
-
 FROM runtime-build AS runtime
 
 COPY --from=runtime-build /opt/crux/venv /opt/crux/venv
-COPY --from=instrumented-source /opt/crux/vendor/ /opt/crux/vendor/
+COPY --from=instrumented-source /opt/crux/vendor/ /opt/crux/runtime/vendor/
 COPY --from=instrumented-source /opt/crux/upstream/ /opt/crux/upstream/
-COPY --from=instrumented-source /opt/crux/runtime/instrumented-source-manifest.json \
-  /opt/crux/runtime/instrumented-source-manifest.json
-COPY runtime/oaf_tf1/source-manifest.json /opt/crux/vendor/source-manifest.json
 COPY runtime/oaf_tf1/*.py /opt/crux/runtime/
 COPY runtime/oaf_tf1/patches/ /opt/crux/runtime/patches/
-# Preserve the manifest-addressed repository layout solely for fail-closed source attestation.
-COPY runtime/oaf_tf1/ /opt/crux/runtime/oaf_tf1/
-COPY runtime/oaf_tf1/runner-source-manifest.json /opt/crux/runtime/runner-source-manifest.json
 WORKDIR /opt/crux
 USER "${RUNTIME_UID}:${RUNTIME_GID}"
-ENTRYPOINT ["/usr/bin/env", "-i", "CUDA_VISIBLE_DEVICES=-1", "MKL_NUM_THREADS=1", "OMP_NUM_THREADS=1", "OPENBLAS_NUM_THREADS=1", "PYTHONHASHSEED=0", "PYTHONCOERCECLOCALE=0", "TF_NUM_INTEROP_THREADS=1", "TF_NUM_INTRAOP_THREADS=1", "/opt/crux/venv/bin/python", "-s", "/opt/crux/runtime/entrypoint.py"]
+ENTRYPOINT ["/opt/crux/venv/bin/python", "-s", "/opt/crux/runtime/worker.py"]

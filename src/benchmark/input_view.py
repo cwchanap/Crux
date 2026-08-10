@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
+from src.benchmark.artifact_io import read_regular_file_no_follow
 from src.benchmark.backend_identity import require_sha256, sha256_hex, strict_json_loads
-from src.benchmark.backend_publication import DirectoryAnchor, read_regular_file_no_follow
 from src.benchmark.backends import CanonicalAudio
 
 _MANIFEST_SCHEMA = "crux.input-view-manifest/v1"
@@ -133,9 +133,8 @@ def load_direct_audio(
     source_audio_id: str,
     input_view_id: str,
     max_input_audio_frames: int | None,
-    anchor: DirectoryAnchor | None = None,
 ) -> CanonicalAudio:
-    content = read_regular_file_no_follow(audio_path, anchor=anchor)
+    content = read_regular_file_no_follow(audio_path)
     return load_direct_audio_bytes(
         audio_path,
         content,
@@ -176,23 +175,8 @@ def load_derived_audio(
     manifest_path: Path,
     *,
     max_input_audio_frames: int | None,
-    anchor: DirectoryAnchor | None = None,
 ) -> CanonicalAudio:
-    manifest = _load_manifest(manifest_path, anchor=anchor)
-    if anchor is not None:
-        source_path, input_path = input_view_artifact_paths(manifest_path, manifest)
-        candidate_audio_path = audio_path if audio_path.is_absolute() else anchor.path / audio_path
-        if candidate_audio_path != input_path:
-            raise ValueError("audio_path does not match manifest input_audio_path")
-        source_content = read_regular_file_no_follow(source_path, anchor=anchor)
-        input_content = read_regular_file_no_follow(input_path, anchor=anchor)
-        return load_derived_audio_bytes(
-            input_path,
-            manifest,
-            source_content=source_content,
-            input_content=input_content,
-            max_input_audio_frames=max_input_audio_frames,
-        )
+    manifest = _load_manifest(manifest_path)
 
     manifest_root = manifest_path.parent.resolve(strict=True)
     try:
@@ -277,10 +261,8 @@ def _canonical_audio(
 
 def _load_manifest(
     manifest_path: Path,
-    *,
-    anchor: DirectoryAnchor | None = None,
 ) -> InputViewManifest:
-    return parse_input_view_manifest(read_regular_file_no_follow(manifest_path, anchor=anchor))
+    return parse_input_view_manifest(read_regular_file_no_follow(manifest_path))
 
 
 def parse_input_view_manifest(content: bytes) -> InputViewManifest:

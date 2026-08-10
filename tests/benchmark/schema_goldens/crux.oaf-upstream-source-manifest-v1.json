@@ -1,1 +1,0 @@
-{"covered_roots":["fixtures/upstream.txt"],"files":[{"path":"fixtures/upstream.txt","sha256":"43b1e4f09be46abc7f856fa43e33b0be797fa794ef804aa2a883700002a217dc"}],"schema":"crux.oaf-upstream-source-manifest/v1","upstream_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","upstream_repository":"https://example.invalid/source"}

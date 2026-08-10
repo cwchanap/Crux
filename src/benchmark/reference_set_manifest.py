@@ -16,8 +16,8 @@ from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Literal, get_args
 
+from src.benchmark.artifact_io import read_regular_file_no_follow
 from src.benchmark.backend_identity import StrictJsonError, require_sha256, strict_json_loads
-from src.benchmark.backend_publication import read_regular_file_no_follow
 from src.benchmark.corpus_manifest import (
     ManifestPublicationError,
     publish_latest_manifest,
