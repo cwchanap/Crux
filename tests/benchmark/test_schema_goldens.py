@@ -56,6 +56,7 @@ def test_schema_golden_manifest_contains_only_task_d_rows() -> None:
         "crux.reference-chart-manifest/v1",
         "crux.reference-timing-manifest/v1",
         "crux.benchmark-reference-manifest/v1",
+        "crux.oaf-smoke-oracle/v2",
     ]
 
 

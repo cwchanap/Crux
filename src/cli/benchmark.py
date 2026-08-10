@@ -3,12 +3,24 @@ from __future__ import annotations
 # Commands keep optional and heavy implementation modules behind their Click boundary.
 # pylint: disable=import-outside-toplevel
 import json
+import time
 from dataclasses import asdict
 from pathlib import Path
 
 import click
 
-from src.benchmark.backend_identity import canonical_json_bytes
+from runtime.oaf_tf1.model import load_model_config
+from src.benchmark.artifact_io import read_regular_file_no_follow
+from src.benchmark.backend_identity import canonical_json_bytes, quantize_six
+from src.benchmark.backend_registry import default_backend_registry
+from src.benchmark.backends.oaf import RESTORED_TENSOR_COUNT
+from src.benchmark.input_view import load_direct_audio
+from src.benchmark.mapping import map_oaf_prediction
+from src.benchmark.oaf_smoke_oracle import (
+    assert_smoke_oracle_matches,
+    read_smoke_oracle,
+)
+from src.benchmark.prediction_artifact import publish_prediction_artifact
 from src.benchmark.r2_corpus_models import MAX_SIMFILE_ID, SyncOutcome, SyncRequest
 from src.benchmark.r2_corpus_sync import ProgressEvent, sync_r2_corpus
 from src.cli.options import (
@@ -211,6 +223,94 @@ def transcribe_one(
 
 # pylint: enable=too-many-arguments,too-many-positional-arguments
 # pylint: enable=too-many-locals
+
+
+@benchmark.command("smoke-backend")
+@click.option(
+    "--backend",
+    type=str,
+    default="oaf",
+    show_default=True,
+    callback=_validate_verification_backend_id,
+)
+@click.option(
+    "--oracle",
+    type=click.Path(exists=True, path_type=Path, dir_okay=False),
+    default=None,
+    help="Optional exact native-event oracle JSON path.",
+)
+def smoke_backend(backend: str, oracle: Path | None) -> None:
+    """Run one OaF inference against the checked-in canonical smoke fixture."""
+    fixture_path = Path("tests/fixtures/oaf_tf1_smoke/canonical.wav").resolve()
+    prediction_path = Path("artifacts/benchmark/oaf-smoke/prediction.jsonl")
+    config = load_model_config()
+    checkpoint_dir = (
+        Path("artifacts/benchmark/model-cache").resolve()
+        / "sha256"
+        / config.checkpoint.archive_sha256
+    )
+    try:
+        audio = load_direct_audio(
+            fixture_path,
+            source_audio_id="oaf-smoke-canonical-v1",
+            input_view_id="oaf-smoke-canonical-v1",
+            max_input_audio_frames=config.max_input_audio_frames,
+        )
+        backend_instance = default_backend_registry().create(
+            backend,
+            checkpoint_dir=checkpoint_dir,
+            input_root=fixture_path.parent,
+            image="crux-oaf-tf1:local",
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+
+    try:
+        started = time.perf_counter()
+        native_prediction = backend_instance.transcribe(audio)
+        inference_elapsed_seconds = time.perf_counter() - started
+
+        mapped_prediction, diagnostics = map_oaf_prediction(native_prediction)
+        mapped_event_count = sum(
+            event.mapping_status == "mapped" for event in mapped_prediction.events
+        )
+        unmapped_event_count = sum(diagnostics.unmapped.values())
+        if mapped_event_count == 0:
+            raise click.ClickException("smoke inference produced no mapped events")
+        published = publish_prediction_artifact(prediction_path, mapped_prediction)
+
+        oracle_status = "not_checked"
+        if oracle is not None:
+            try:
+                oracle_content = read_regular_file_no_follow(oracle)
+                assert_smoke_oracle_matches(mapped_prediction, read_smoke_oracle(oracle_content))
+            except (AssertionError, OSError, TypeError, ValueError) as error:
+                raise click.ClickException(str(error)) from error
+            oracle_status = "matched"
+
+        duration_seconds = audio.audio_frame_count / audio.sample_rate
+        summary = {
+            "backend_id": native_prediction.descriptor.payload["backend_id"],
+            "checkpoint_archive_sha256": config.checkpoint.archive_sha256,
+            "fixture_sha256": audio.input_audio_sha256,
+            "inference_elapsed_seconds": quantize_six(inference_elapsed_seconds),
+            "mapped_event_count": mapped_event_count,
+            "oracle_status": oracle_status,
+            "prediction_path": str(prediction_path),
+            "prediction_sha256": published.sha256,
+            "real_time_factor": quantize_six(inference_elapsed_seconds / duration_seconds),
+            "restored_tensor_count": RESTORED_TENSOR_COUNT,
+            "status": "ok",
+            "unmapped_event_count": unmapped_event_count,
+            "upstream_source_commit": native_prediction.descriptor.payload[
+                "upstream_source_commit"
+            ],
+        }
+        standard_output = click.get_binary_stream("stdout")
+        standard_output.write(canonical_json_bytes(summary, trailing_newline=True))
+        standard_output.flush()
+    finally:
+        backend_instance.close()
 
 
 def _emit_progress(event: ProgressEvent) -> None:
