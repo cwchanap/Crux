@@ -12,7 +12,6 @@ from src.benchmark.backend_identity import canonical_json_bytes
 from src.benchmark.r2_corpus_models import MAX_SIMFILE_ID, SyncOutcome, SyncRequest
 from src.benchmark.r2_corpus_sync import ProgressEvent, sync_r2_corpus
 from src.cli.options import (
-    audio_dir_option,
     charts_dir_option,
     output_dir_option,
     predictions_dir_option,
@@ -20,7 +19,6 @@ from src.cli.options import (
     resolve_benchmark_output_dir,
     run_name_option,
     song_dir_option,
-    tolerance_option,
 )
 
 
@@ -584,50 +582,6 @@ def prepare_benchmark_corpus(raw_dir: Path, run_name: str | None, output_dir: Pa
     )
 
 
-@benchmark.command("score-midi")
-@charts_dir_option
-@predictions_dir_option
-@run_name_option
-@output_dir_option
-@tolerance_option
-@click.option(
-    "--align/--no-align",
-    default=True,
-    show_default=True,
-    help="Compute and apply a global time-offset correction. Emits both raw and aligned report rows when enabled.",
-)
-@click.option(
-    "--export-reference-midi/--no-export-reference-midi", default=False, show_default=True
-)
-def score_midi(
-    charts_dir: Path,
-    predictions_dir: Path,
-    run_name: str | None,
-    output_dir: Path | None,
-    tolerance_ms: tuple[int, ...],
-    align: bool,
-    export_reference_midi: bool,
-) -> None:
-    """Score precomputed prediction MIDI files."""
-    from src.benchmark.runner import run_score_midi
-
-    resolved_output_dir = resolve_benchmark_output_dir(output_dir, run_name, charts_dir.parent)
-    try:
-        reports = run_score_midi(
-            charts_dir=charts_dir,
-            predictions_dir=predictions_dir,
-            output_dir=resolved_output_dir,
-            tolerance_ms=list(tolerance_ms),
-            align=align,
-            export_reference_midi=export_reference_midi,
-        )
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
-    click.echo(
-        f"Wrote benchmark reports for {len({report.chart_id for report in reports})} chart(s)"
-    )
-
-
 @benchmark.command("validate-corpus")
 @charts_dir_option
 @predictions_dir_option
@@ -658,20 +612,6 @@ def inspect_dtx(dtx_path: Path) -> None:
     click.echo(f"bpm_events: {len(chart.bpm_events)}")
     click.echo(f"measure_length_changes: {len(chart.measure_lengths)}")
     click.echo(f"lanes: {','.join(lanes)}")
-
-
-@benchmark.command("export-reference-midi")
-@charts_dir_option
-@run_name_option
-@output_dir_option
-def export_reference_midi(charts_dir: Path, run_name: str | None, output_dir: Path | None) -> None:
-    """Export MIDI files derived from DTX charts for manual inspection (not used for scoring)."""
-    from src.benchmark.runner import export_reference_midis
-
-    count = export_reference_midis(
-        charts_dir, resolve_benchmark_output_dir(output_dir, run_name, charts_dir.parent)
-    )
-    click.echo(f"Wrote {count} reference MIDI file(s)")
 
 
 @benchmark.command("render-audio")
@@ -709,30 +649,3 @@ def render_audio(
     if result.invalid_items:
         click.echo(f"Skipped {len(result.invalid_items)} invalid song folder(s)", err=True)
     click.echo(f"Rendered {len(result.valid_items)} song(s) to {resolved_output_dir / 'audio'}")
-
-
-@benchmark.command("transcribe-and-score")
-@charts_dir_option
-@audio_dir_option
-@run_name_option
-@output_dir_option
-@tolerance_option
-def transcribe_and_score(
-    charts_dir: Path,
-    audio_dir: Path,
-    run_name: str | None,
-    output_dir: Path | None,
-    tolerance_ms: tuple[int, ...],
-) -> None:
-    """Run transcription and score generated MIDI."""
-    from src.benchmark.runner import run_transcribe_and_score
-
-    reports = run_transcribe_and_score(
-        charts_dir,
-        audio_dir,
-        resolve_benchmark_output_dir(output_dir, run_name, charts_dir.parent),
-        list(tolerance_ms),
-    )
-    click.echo(
-        f"Wrote benchmark reports for {len({report.chart_id for report in reports})} chart(s)"
-    )

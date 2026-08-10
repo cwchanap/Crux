@@ -85,7 +85,7 @@ def serve_requests(
 ) -> int:
     """Load one model and process newline-delimited requests until EOF."""
     checkpoint_dir = Path(checkpoint_dir or os.environ.get("OAF_CHECKPOINT_DIR", "/model"))
-    loaded_config = config or load_model_config()
+    loaded_config = config or load_model_config(Path(__file__).with_name("model.json"))
     model = model_factory(checkpoint_dir, loaded_config)
     _write(
         stdout,

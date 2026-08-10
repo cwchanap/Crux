@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import inspect
+import io
 import struct
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 from src.benchmark.backend_identity import (
     OAF_BACKEND_ID,
@@ -21,6 +24,7 @@ from src.benchmark.prediction_artifact import (
     render_prediction_artifact,
 )
 from src.benchmark.scorer_input import read_scorer_events
+from src.cli.main import main
 
 
 def _descriptor() -> object:
@@ -146,13 +150,53 @@ def test_task_d_oaf_adapter_validates_ready_reuses_worker_and_closes(tmp_path: P
         checkpoint,
         input_root,
         process_factory=lambda *_args, **_kwargs: worker,
-        ready=worker.ready,
     )
     assert backend.transcribe(audio).events[0].native_class_id == "midi_38"
     assert backend.transcribe(audio).events[0].native_metadata["upstream_8hit_group_id"] == "snare"
     assert worker.requests == ["song.wav", "song.wav"]
     backend.close()
     backend.close()
+    assert worker.close_count == 1
+
+
+def test_task_d_oaf_adapter_rejects_ready_override_keyword() -> None:
+    assert "ready" not in inspect.signature(OafBackend).parameters
+
+
+@pytest.mark.parametrize(
+    ("backend_id", "restored_tensor_count", "error_code"),
+    [
+        ("wrong-backend", 78, "worker_identity_invalid"),
+        (OAF_BACKEND_ID, 77, "worker_identity_invalid"),
+    ],
+)
+def test_task_d_oaf_adapter_rejects_process_ready_identity(
+    tmp_path: Path,
+    backend_id: str,
+    restored_tensor_count: int,
+    error_code: str,
+) -> None:
+    input_root = tmp_path / "input"
+    checkpoint = tmp_path / "checkpoint"
+    input_root.mkdir()
+    checkpoint.mkdir()
+    audio = _audio(input_root / "song.wav")
+    worker = _FakeWorker(
+        {
+            "type": "ready",
+            "backend_id": backend_id,
+            "restored_tensor_count": restored_tensor_count,
+        },
+        {"events": []},
+    )
+    backend = OafBackend(
+        checkpoint,
+        input_root,
+        process_factory=lambda *_args, **_kwargs: worker,
+    )
+    with pytest.raises(OafBackendError) as raised:
+        backend.transcribe(audio)
+    assert raised.value.code == error_code
     assert worker.close_count == 1
 
 
@@ -163,7 +207,7 @@ def test_task_d_oaf_adapter_rejects_outside_input(tmp_path: Path) -> None:
     checkpoint.mkdir()
     outside = _audio(tmp_path / "outside.wav")
     with pytest.raises(OafBackendError, match="input root"):
-        OafBackend(checkpoint, root, ready={"type": "ready"}).transcribe(outside)
+        OafBackend(checkpoint, root).transcribe(outside)
 
 
 def test_task_d_oaf_launch_command_is_read_only_and_networkless(tmp_path: Path) -> None:
@@ -171,6 +215,7 @@ def test_task_d_oaf_launch_command_is_read_only_and_networkless(tmp_path: Path) 
     assert command[:6] == ["docker", "run", "--rm", "-i", "--network=none", "--read-only"]
     assert f"--mount=type=bind,src={tmp_path / 'checkpoint'},dst=/model,readonly" in command
     assert f"--mount=type=bind,src={tmp_path / 'input'},dst=/input,readonly" in command
+    assert "--workdir=/input" in command
     assert command[-1] == "crux-oaf-tf1:local"
 
 
@@ -182,3 +227,45 @@ def test_task_d_docker_drops_retained_runner_manifest_consumer() -> None:
     assert (
         "COPY --from=instrumented-source /opt/crux/vendor/ /opt/crux/runtime/vendor/" in dockerfile
     )
+
+
+def test_task_d_docker_copies_model_config_to_worker_runtime_path() -> None:
+    repository = Path(__file__).parents[2]
+    dockerfile = (repository / "runtime/oaf_tf1/Dockerfile").read_text(encoding="utf-8")
+    assert "COPY runtime/oaf_tf1/model.json /opt/crux/runtime/model.json" in dockerfile
+
+
+def test_task_d_worker_loads_model_config_from_runtime_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from runtime.oaf_tf1 import worker
+
+    class Config:
+        backend_id = OAF_BACKEND_ID
+
+    class Model:
+        restored_tensor_count = 78
+
+    captured: list[Path] = []
+
+    def load_config(path: Path) -> Config:
+        captured.append(path)
+        return Config()
+
+    monkeypatch.setattr(worker, "load_model_config", load_config)
+    output = io.StringIO()
+    assert (
+        worker.serve_requests(
+            io.StringIO(), output, model_factory=lambda *_args, **_kwargs: Model()
+        )
+        == 0
+    )
+    assert captured == [Path(worker.__file__).with_name("model.json")]
+
+
+def test_task_d_removes_legacy_runner_commands() -> None:
+    runner = CliRunner()
+    for command in ("score-midi", "export-reference-midi", "transcribe-and-score"):
+        result = runner.invoke(main, ["benchmark", command, "--help"])
+        assert result.exit_code != 0
+        assert f"No such command '{command}'" in result.output

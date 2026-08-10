@@ -45,7 +45,6 @@ class OafBackend:
         image: str = IMAGE,
         process_factory: ProcessFactory = WorkerProcess.start,
         timeout_seconds: float = 30.0,
-        ready: Mapping[str, object] | None = None,
         descriptor: BackendDescriptor | None = None,
     ) -> None:
         if not isinstance(checkpoint_dir, Path) or not isinstance(input_root, Path):
@@ -59,7 +58,6 @@ class OafBackend:
         self._image = image
         self._process_factory = process_factory
         self._timeout_seconds = timeout_seconds
-        self._ready_override = None if ready is None else dict(ready)
         self._process: Any | None = None
         self._closed = False
         self._descriptor = descriptor or _load_descriptor()
@@ -126,8 +124,7 @@ class OafBackend:
                 "worker could not be started", code="worker_start_failed"
             ) from error
         try:
-            ready = self._ready_override if self._ready_override is not None else process.ready
-            _validate_ready(ready)
+            _validate_ready(process.ready)
         except OafBackendError:
             try:
                 process.close()
@@ -175,6 +172,7 @@ def build_docker_command(
         "--read-only",
         f"--mount=type=bind,src={checkpoint_dir},dst=/model,readonly",
         f"--mount=type=bind,src={input_root},dst=/input,readonly",
+        "--workdir=/input",
         image,
     ]
 

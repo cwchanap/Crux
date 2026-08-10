@@ -42,6 +42,7 @@ COPY --from=runtime-build /opt/crux/venv /opt/crux/venv
 COPY --from=instrumented-source /opt/crux/vendor/ /opt/crux/runtime/vendor/
 COPY --from=instrumented-source /opt/crux/upstream/ /opt/crux/upstream/
 COPY runtime/oaf_tf1/*.py /opt/crux/runtime/
+COPY runtime/oaf_tf1/model.json /opt/crux/runtime/model.json
 COPY runtime/oaf_tf1/patches/ /opt/crux/runtime/patches/
 WORKDIR /opt/crux
 USER "${RUNTIME_UID}:${RUNTIME_GID}"
