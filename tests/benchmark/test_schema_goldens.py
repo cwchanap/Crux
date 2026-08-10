@@ -100,13 +100,6 @@ def test_phase_a_and_b_schema_goldens_are_complete_and_strict(repository_root: P
         "crux.backend-seal-evidence/v2",
         "crux.legacy-tf2-conversion-coverage/v1",
         "crux.oaf-checkpoint-acquisition-request/v1",
-        "crux.oaf-base-system-package-request/v1",
-        "crux.oaf-build-context-manifest/v1",
-        "crux.oaf-calibration-bootstrap-evidence/v2",
-        "crux.oaf-calibration-bootstrap-request/v1",
-        "crux.oaf-calibration-measurement-request/v1",
-        "crux.oaf-native-host-attestation-bundle/v2",
-        "crux.oaf-seal-profile-request/v1",
         "crux.transcription-runner/v1",
         "crux.transcription-runner-response/v1",
     }.issubset(schemas)
@@ -120,6 +113,20 @@ def test_reference_chart_schema_golden_is_registered_and_valid(repository_root: 
         for item in load_schema_golden_manifest(repository_root)
         if item.schema == "crux.reference-chart-manifest/v1"
     )
+
+    validate_schema_golden_entry(entry, repository_root)
+
+
+def test_oaf_native_schema_goldens_validate_without_seal_tool(
+    repository_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = next(
+        item
+        for item in load_schema_golden_manifest(repository_root)
+        if item.schema == "crux.oaf-smoke-oracle/v1"
+    )
+    monkeypatch.setitem(__import__("sys").modules, "tools.hpa320", None)
 
     validate_schema_golden_entry(entry, repository_root)
 
@@ -263,9 +270,6 @@ def test_phase_a_schema_golden_validators_reject_important_hash_type_drift(
 @pytest.mark.parametrize(
     ("schema", "field"),
     [
-        ("crux.oaf-calibration-measurement-evidence/v2", "base_system_package_evidence_sha256"),
-        ("crux.oaf-seal-candidate/v2", "seal_profile_request_sha256"),
-        ("crux.oaf-oci-layout-manifest/v1", "config_digest"),
         ("crux.oaf-smoke-oracle/v1", "source_audio_sha256"),
     ],
 )
@@ -287,8 +291,6 @@ def test_phase_a_schema_goldens_reject_nonfirst_critical_field_drift(
 @pytest.mark.parametrize(
     ("schema", "field"),
     [
-        ("crux.oaf-calibration-bootstrap-evidence/v2", "runtime_image_layer_digests"),
-        ("crux.oaf-oci-layout-manifest/v1", "layer_digests"),
         ("crux.backend-seal-evidence/v2", "runtime_image_layer_digests"),
     ],
 )

@@ -24,17 +24,11 @@ from runtime.oaf_tf1.oaf_backend import (
     native_event_from_capture,
     velocity_to_midi,
 )
-from tools.hpa320 import generate_runner_source_manifest as runner_manifest
-from tools.hpa320.generate_runner_source_manifest import (
-    build_runner_source_manifest,
-    write_runner_source_manifest,
-)
 
 _IMAGE_RUNTIME_ROOT = Path("/opt/crux/runtime/oaf_tf1")
 RUNTIME_ROOT = (
     _IMAGE_RUNTIME_ROOT if _IMAGE_RUNTIME_ROOT.is_dir() else Path(__file__).resolve().parents[1]
 )
-REPOSITORY_ROOT = RUNTIME_ROOT.parents[1]
 UPSTREAM_ROOT = (
     Path("/opt/crux/upstream") if Path("/opt/crux/upstream").is_dir() else RUNTIME_ROOT / "vendor"
 )
@@ -195,40 +189,6 @@ def test_patch_applier_rejects_preimage_drift_and_crlf_changes(tmp_path: Path) -
 
     with pytest.raises(InstrumentationPatchError, match="preimage"):
         apply_reviewed_patch(source, tmp_path / "output", PATCH_PATH)
-
-
-def test_runner_source_manifest_is_deterministic_and_excludes_itself() -> None:
-    if not (REPOSITORY_ROOT / "runtime/oaf_tf1/Dockerfile").is_file():
-        pytest.skip("repository-layout manifest generation is a host-side check")
-    first = build_runner_source_manifest(REPOSITORY_ROOT)
-    second = build_runner_source_manifest(REPOSITORY_ROOT)
-
-    assert first == second
-    assert first["schema"] == "crux.oaf-runner-source-manifest/v1"
-    paths = [entry["path"] for entry in first["files"]]
-    assert paths == sorted(paths, key=lambda path: path.encode("utf-8"))
-    assert "runtime/oaf_tf1/runner-source-manifest.json" not in paths
-    assert "runtime/oaf_tf1/Dockerfile" in paths
-    assert "runtime/oaf_tf1/apply_instrumentation_patch.py" in paths
-    assert "runtime/oaf_tf1/patches/capture-emitted-frame.patch" in paths
-    assert "tools/hpa320/generate_runner_source_manifest.py" in paths
-
-
-def test_written_runner_source_manifest_is_world_readable(tmp_path: Path, monkeypatch) -> None:
-    repository = tmp_path / "repository"
-    source = repository / "runtime" / "oaf_tf1" / "Dockerfile"
-    source.parent.mkdir(parents=True)
-    source.write_bytes(b"FROM scratch\n")
-    monkeypatch.setattr(
-        runner_manifest,
-        "SOURCE_PATHS",
-        ("runtime/oaf_tf1/Dockerfile",),
-    )
-    output = tmp_path / "runner-source-manifest.json"
-
-    write_runner_source_manifest(repository, output)
-
-    assert stat.S_IMODE(output.stat().st_mode) == 0o644
 
 
 def test_frame_time_uses_locked_binary64_evaluation_order() -> None:

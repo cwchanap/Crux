@@ -19,6 +19,7 @@ from runtime.oaf_tf1.protocol import (
     AuthenticatedObject,
     ProtocolFailure,
     VerifiedWav,
+    canonical_json_bytes,
 )
 
 
@@ -39,61 +40,6 @@ def _inventories():
     ]
     graph = required
     return checkpoint, required, non_inference, graph
-
-
-def _final_stage_copy_mappings(repository: Path) -> list[tuple[str, str]]:
-    dockerfile = (repository / "runtime/oaf_tf1/Dockerfile").read_text()
-    marker = "FROM runtime-build AS runtime\n"
-    assert marker in dockerfile
-    final_stage = dockerfile.split(marker, maxsplit=1)[1]
-    mappings: list[tuple[str, str]] = []
-    instruction = ""
-    for line in final_stage.splitlines():
-        stripped = line.strip()
-        instruction += stripped[:-1] if stripped.endswith("\\") else stripped
-        if line.rstrip().endswith("\\"):
-            instruction += " "
-            continue
-        fields = instruction.split()
-        instruction = ""
-        if not fields or fields[0] != "COPY" or fields[1].startswith("--from="):
-            continue
-        assert len(fields) == 3
-        mappings.append((fields[1], fields[2]))
-    assert not instruction
-    return mappings
-
-
-def _final_stage_destinations(mappings: list[tuple[str, str]], source_path: str) -> set[str]:
-    destinations = set()
-    for copied_source, destination in mappings:
-        if source_path == copied_source:
-            destinations.add(
-                destination + source_path.rsplit("/", maxsplit=1)[-1]
-                if destination.endswith("/")
-                else destination
-            )
-        if copied_source.endswith("/") and source_path.startswith(copied_source):
-            destinations.add(destination + source_path[len(copied_source) :])
-    return destinations
-
-
-def _stage_final_image_file(
-    *,
-    repository: Path,
-    staged_root: Path,
-    mappings: list[tuple[str, str]],
-    source_path: str,
-    destination: str | None = None,
-) -> Path:
-    final_destination = destination or f"/opt/crux/{source_path}"
-    assert final_destination in _final_stage_destinations(mappings, source_path)
-    prefix = "/opt/crux/"
-    assert final_destination.startswith(prefix)
-    staged = staged_root / final_destination[len(prefix) :]
-    staged.parent.mkdir(parents=True, exist_ok=True)
-    staged.write_bytes((repository / source_path).read_bytes())
-    return staged
 
 
 def test_mounted_source_manifest_accepts_roots_top_level_and_package_ancestors(
@@ -195,16 +141,6 @@ def test_mounted_source_manifest_requires_each_declared_root(tmp_path: Path) -> 
         oaf_backend._validate_mounted_source_manifest(payload, tmp_path)
 
 
-def test_final_image_preserves_every_runner_manifest_path() -> None:
-    repository = Path(__file__).parents[3]
-    manifest = json.loads((repository / "runtime/oaf_tf1/runner-source-manifest.json").read_text())
-    mappings = _final_stage_copy_mappings(repository)
-    for row in manifest["files"]:
-        source_path = row["path"]
-        assert (repository / source_path).is_file()
-        assert f"/opt/crux/{source_path}" in _final_stage_destinations(mappings, source_path)
-
-
 def test_tensor_coverage_accepts_exact_130_78_52_partition() -> None:
     checkpoint, required, non_inference, graph = _inventories()
 
@@ -274,35 +210,32 @@ def test_ready_carries_authenticated_smoke_prediction_identity(
 ) -> None:
     repository = Path(__file__).parents[3]
     staged_root = tmp_path / "crux"
-    mappings = _final_stage_copy_mappings(repository)
-    runner_manifest_content = (
-        repository / "runtime/oaf_tf1/runner-source-manifest.json"
-    ).read_bytes()
-    runner_manifest_payload = json.loads(runner_manifest_content)
-    runner_manifest = _stage_final_image_file(
-        repository=repository,
-        staged_root=staged_root,
-        mappings=mappings,
-        source_path="runtime/oaf_tf1/runner-source-manifest.json",
-        destination="/opt/crux/runtime/runner-source-manifest.json",
+    runner_source_path = "runtime/oaf_tf1/oaf_backend.py"
+    runner_source = repository / runner_source_path
+    runner_manifest_content = canonical_json_bytes(
+        {
+            "covered_roots": ["runtime/oaf_tf1"],
+            "files": [
+                {
+                    "path": runner_source_path,
+                    "sha256": hashlib.sha256(runner_source.read_bytes()).hexdigest(),
+                }
+            ],
+            "schema": "crux.oaf-runner-source-manifest/v1",
+        },
+        trailing_newline=True,
     )
-    for row in runner_manifest_payload["files"]:
-        staged = _stage_final_image_file(
-            repository=repository,
-            staged_root=staged_root,
-            mappings=mappings,
-            source_path=row["path"],
-        )
-        assert staged == staged_root / row["path"]
+    runner_manifest = staged_root / "runtime/runner-source-manifest.json"
+    runner_manifest.parent.mkdir(parents=True, exist_ok=True)
+    runner_manifest.write_bytes(runner_manifest_content)
+    staged_runner_source = staged_root / runner_source_path
+    staged_runner_source.parent.mkdir(parents=True, exist_ok=True)
+    staged_runner_source.write_bytes(runner_source.read_bytes())
     upstream_manifest_content = (repository / "runtime/oaf_tf1/source-manifest.json").read_bytes()
     upstream_manifest_payload = json.loads(upstream_manifest_content)
-    upstream_manifest = _stage_final_image_file(
-        repository=repository,
-        staged_root=staged_root,
-        mappings=mappings,
-        source_path="runtime/oaf_tf1/source-manifest.json",
-        destination="/opt/crux/vendor/source-manifest.json",
-    )
+    upstream_manifest = staged_root / "vendor/source-manifest.json"
+    upstream_manifest.parent.mkdir(parents=True, exist_ok=True)
+    upstream_manifest.write_bytes(upstream_manifest_content)
     for row in upstream_manifest_payload["files"]:
         source = repository / "runtime/oaf_tf1/vendor" / row["path"]
         destination = staged_root / "upstream" / row["path"]

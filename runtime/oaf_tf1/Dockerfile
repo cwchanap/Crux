@@ -60,12 +60,8 @@ COPY runtime/oaf_tf1/source-manifest.json /opt/crux/vendor/source-manifest.json
 COPY runtime/oaf_tf1/*.py /opt/crux/runtime/oaf_tf1/
 COPY runtime/oaf_tf1/patches/ /opt/crux/runtime/oaf_tf1/patches/
 COPY runtime/oaf_tf1/tests/ /opt/crux/runtime/tests/
-COPY runtime/oaf_tf1/runner-source-manifest.json /opt/crux/runtime/runner-source-manifest.json
 # Preserve the manifest-addressed repository layout in the test image too.
 COPY runtime/oaf_tf1/ /opt/crux/runtime/oaf_tf1/
-COPY .github/workflows/hpa320-native-bootstrap.yml /opt/crux/.github/workflows/hpa320-native-bootstrap.yml
-COPY .github/workflows/hpa320-native-candidate.yml /opt/crux/.github/workflows/hpa320-native-candidate.yml
-COPY tools/hpa320/ /opt/crux/tools/hpa320/
 WORKDIR /opt/crux
 USER "${RUNTIME_UID}:${RUNTIME_GID}"
 
@@ -79,12 +75,8 @@ COPY --from=instrumented-source /opt/crux/runtime/instrumented-source-manifest.j
 COPY runtime/oaf_tf1/source-manifest.json /opt/crux/vendor/source-manifest.json
 COPY runtime/oaf_tf1/*.py /opt/crux/runtime/
 COPY runtime/oaf_tf1/patches/ /opt/crux/runtime/patches/
-COPY runtime/oaf_tf1/runner-source-manifest.json /opt/crux/runtime/runner-source-manifest.json
 # Preserve the manifest-addressed repository layout solely for fail-closed source attestation.
 COPY runtime/oaf_tf1/ /opt/crux/runtime/oaf_tf1/
-COPY .github/workflows/hpa320-native-bootstrap.yml /opt/crux/.github/workflows/hpa320-native-bootstrap.yml
-COPY .github/workflows/hpa320-native-candidate.yml /opt/crux/.github/workflows/hpa320-native-candidate.yml
-COPY tools/hpa320/ /opt/crux/tools/hpa320/
 WORKDIR /opt/crux
 USER "${RUNTIME_UID}:${RUNTIME_GID}"
 ENTRYPOINT ["/usr/bin/env", "-i", "CUDA_VISIBLE_DEVICES=-1", "MKL_NUM_THREADS=1", "OMP_NUM_THREADS=1", "OPENBLAS_NUM_THREADS=1", "PYTHONHASHSEED=0", "PYTHONCOERCECLOCALE=0", "TF_NUM_INTEROP_THREADS=1", "TF_NUM_INTRAOP_THREADS=1", "/opt/crux/venv/bin/python", "-s", "/opt/crux/runtime/entrypoint.py"]

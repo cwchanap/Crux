@@ -370,6 +370,68 @@ def _validate_mounted_source_manifest(payload, source_root):
         )
 
 
+def _validate_oaf_native_schema(schema, content):
+    """Validate retained OaF smoke and tensor fixtures without seal tooling."""
+    expected_by_schema = {
+        "crux.oaf-smoke-oracle/v1": SMOKE_ORACLE_KEYS,
+        "crux.oaf-tensor-coverage/v1": {
+            "active_predict_dropout",
+            "checkpoint_inventory",
+            "non_inference_inventory",
+            "note_sequence_byte_parity",
+            "required_inference_inventory",
+            "schema",
+            "uninitialized_required",
+        },
+    }
+    try:
+        if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+            raise ValueError("schema golden newline is invalid")
+        value = json.loads(content[:-1].decode("utf-8"))
+        expected = expected_by_schema[schema]
+        if not isinstance(value, dict) or set(value) != expected or value.get("schema") != schema:
+            raise ValueError("schema golden keys are invalid")
+        if canonical_json_bytes(value, trailing_newline=True) != content:
+            raise ValueError("schema golden is not canonical")
+        if schema == "crux.oaf-smoke-oracle/v1":
+            if value["input_view_id"] != "fixture":
+                raise ValueError("schema golden input view differs")
+            if value["input_audio_sha256"] != hashlib.sha256(b"schema-golden-audio\n").hexdigest():
+                raise ValueError("schema golden smoke audio hash is invalid")
+            if (
+                not isinstance(value["input_audio_frame_count"], int)
+                or isinstance(value["input_audio_frame_count"], bool)
+                or value["input_audio_frame_count"] <= 0
+                or not isinstance(value["source_audio_sha256"], str)
+                or len(value["source_audio_sha256"]) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in value["source_audio_sha256"]
+                )
+                or not isinstance(value["native_events"], list)
+                or not value["native_events"]
+            ):
+                raise ValueError("schema golden smoke oracle is invalid")
+            return
+        if value["active_predict_dropout"] is not False:
+            raise ValueError("schema golden tensor coverage is invalid")
+        if (
+            value["uninitialized_required"] != []
+            or value["note_sequence_byte_parity"] is not True
+            or any(
+                not isinstance(value[field], list)
+                for field in (
+                    "checkpoint_inventory",
+                    "required_inference_inventory",
+                    "non_inference_inventory",
+                )
+            )
+        ):
+            raise ValueError("schema golden tensor coverage inventories are invalid")
+    except (UnicodeDecodeError, KeyError, TypeError, ValueError):
+        raise ValueError("runner schema golden is invalid") from None
+
+
 def validate_schema_golden(schema, content):
     """Validate runner fixtures with the shared production lock authority."""
     if schema in {
@@ -386,89 +448,13 @@ def validate_schema_golden(schema, content):
         except (ImportError, ValueError) as error:
             raise ValueError("runner schema golden is invalid") from error
 
-    # Check runner-native exact schemas for isolated drift fixtures.
+    # Check retained runner-native exact schemas without the deleted seal tooling.
     if schema in {"crux.oaf-smoke-oracle/v1", "crux.oaf-tensor-coverage/v1"}:
-        try:
-            from tools.hpa320 import seal_oaf_backend as seal
-
-            value = json.loads(content[:-1].decode("utf-8"))
-            if schema == "crux.oaf-tensor-coverage/v1":
-                if set(value) != {
-                    "active_predict_dropout",
-                    "checkpoint_inventory",
-                    "non_inference_inventory",
-                    "note_sequence_byte_parity",
-                    "required_inference_inventory",
-                    "schema",
-                    "uninitialized_required",
-                }:
-                    raise ValueError("schema golden tensor keys are invalid")
-                if value["schema"] != "crux.oaf-tensor-coverage/v1":
-                    raise ValueError("schema golden tensor schema is invalid")
-                evidence = seal.LoadedSealEvidence(
-                    Path("golden-seal.json"),
-                    {
-                        field: value[field]
-                        for field in (
-                            "checkpoint_inventory",
-                            "required_inference_inventory",
-                            "non_inference_inventory",
-                        )
-                    },
-                    "0" * 64,
-                )
-                seal._validate_tensor_coverage(value, evidence)
-                return
-            if set(value) != SMOKE_ORACLE_KEYS:
-                raise ValueError("schema golden smoke keys are invalid")
-            if value["input_view_id"] != "fixture":
-                raise ValueError("schema golden input view differs")
-            audio = b"schema-golden-audio\n"
-            prediction = b"schema-golden-prediction\n"
-            if value["input_audio_sha256"] != hashlib.sha256(audio).hexdigest():
-                raise ValueError("schema golden smoke audio hash is invalid")
-            if (
-                not isinstance(value["source_audio_sha256"], str)
-                or len(value["source_audio_sha256"]) != 64
-                or any(
-                    character not in "0123456789abcdef"
-                    for character in value["source_audio_sha256"]
-                )
-            ):
-                raise ValueError("schema golden source audio hash is invalid")
-            with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
-                root = Path(directory)
-                audio_path = root / seal.CANDIDATE_ARTIFACT_PATHS["smoke_audio"]
-                prediction_path = root / seal.CANDIDATE_ARTIFACT_PATHS["smoke_prediction"]
-                audio_path.parent.mkdir(parents=True)
-                prediction_path.parent.mkdir(parents=True)
-                audio_path.write_bytes(audio)
-                prediction_path.write_bytes(prediction)
-                evidence = seal.LoadedSealEvidence(
-                    root / "seal.json",
-                    {
-                        "smoke_audio_sha256": value["input_audio_sha256"],
-                        "smoke_prediction_sha256": hashlib.sha256(prediction).hexdigest(),
-                    },
-                    "0" * 64,
-                )
-                seal._validate_smoke(value, root, evidence)
-            return
-        except (ImportError, OSError, ValueError) as error:
-            raise ValueError("runner schema golden is invalid") from error
+        _validate_oaf_native_schema(schema, content)
+        return
     expected_by_schema = {
         "crux.oaf-upstream-source-manifest/v1": UPSTREAM_MANIFEST_KEYS,
         "crux.oaf-runner-source-manifest/v1": RUNNER_MANIFEST_KEYS,
-        "crux.oaf-smoke-oracle/v1": SMOKE_ORACLE_KEYS,
-        "crux.oaf-tensor-coverage/v1": {
-            "active_predict_dropout",
-            "checkpoint_inventory",
-            "non_inference_inventory",
-            "note_sequence_byte_parity",
-            "required_inference_inventory",
-            "schema",
-            "uninitialized_required",
-        },
     }
     try:
         expected = expected_by_schema[schema]
@@ -523,43 +509,6 @@ def validate_schema_golden(schema, content):
                     raise ValueError("schema golden source hash differs")
         if "upstream_commit" in expected and value["upstream_commit"] != "a" * 40:
             raise ValueError("schema golden upstream authority differs")
-        if "input_audio_frame_count" in expected and (
-            not isinstance(value["input_audio_frame_count"], int)
-            or isinstance(value["input_audio_frame_count"], bool)
-            or value["input_audio_frame_count"] <= 0
-        ):
-            raise ValueError("schema golden frame count is invalid")
-        if "input_audio_frame_count" in expected and (
-            not isinstance(value["input_audio_sha256"], str)
-            or not isinstance(value["source_audio_sha256"], str)
-            or any(
-                len(value[field]) != 64
-                or any(character not in "0123456789abcdef" for character in value[field])
-                for field in ("input_audio_sha256", "source_audio_sha256")
-            )
-            or not all(
-                isinstance(value[field], str) and value[field]
-                for field in ("input_view_id", "source_audio_id")
-            )
-            or not isinstance(value["native_events"], list)
-            or not value["native_events"]
-        ):
-            raise ValueError("schema golden smoke oracle is invalid")
-        if "active_predict_dropout" in expected and value["active_predict_dropout"] is not False:
-            raise ValueError("schema golden tensor coverage is invalid")
-        if "active_predict_dropout" in expected and (
-            value["uninitialized_required"] != []
-            or value["note_sequence_byte_parity"] is not True
-            or any(
-                not isinstance(value[field], list)
-                for field in (
-                    "checkpoint_inventory",
-                    "required_inference_inventory",
-                    "non_inference_inventory",
-                )
-            )
-        ):
-            raise ValueError("schema golden tensor coverage inventories are invalid")
     except (UnicodeDecodeError, ValueError, TypeError):
         raise ValueError("runner schema golden is invalid") from None
 
