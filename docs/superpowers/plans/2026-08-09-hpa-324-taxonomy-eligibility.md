@@ -2,31 +2,43 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Freeze the benchmark drum taxonomy and OaF prediction-map data, convert HPA-323 persisted native DTX events into immutable benchmark-reference events, expose one deterministic common scorer projection, and publish model-independent eligible/quarantined reference results for HPA-325/HPA-326/HPA-327.
+**Goal:** Freeze the benchmark drum taxonomy and mapping data, expose deterministic in-memory reference projection, audit the real HPA-323 corpus before freezing unknown-lane policy, publish a model-independent eligibility manifest, and ensure OaF predictions persist the common class HPA-325 will score.
 
-**Architecture:** Keep policy data small and code-defined in `taxonomy.py`. Reuse HPA-323 canonical event/manifest validation instead of reparsing DTX, timing, or audio. Build one pure native-reference mapper plus one exported common projection, use those exact production functions in the real-corpus lane audit, then publish a derived reference manifest with binary `eligible|quarantined` status and orthogonal warnings. HPA-423 remains owner of prediction conversion mechanics; HPA-324 supplies OaF mapping data keyed by `upstream_8hit_group_id` without rewriting native MIDI identity.
+**Architecture:** Keep taxonomy/mapping policy in one small `taxonomy.py`. Reuse HPA-323 persisted native reference events and validation. Map references in memory through one pure detailed mapper and one public common projection; do not publish a redundant mapped-event artifact. Publish only a derived eligibility manifest with version IDs and diagnostic counts. HPA-423 remains owner of prediction conversion, but its active prediction schema must persist `common_class` before HPA-326 is allowed to run.
 
-**Tech Stack:** Python 3.13, frozen dataclasses, `typing.Literal`, `MappingProxyType`, `Decimal`, pathlib, existing strict canonical JSON/JSONL helpers, Click, pytest, Ruff, Pylint.
+**Tech Stack:** Python, frozen dataclasses, `typing.Literal`, `MappingProxyType`, `Decimal`, pathlib, existing strict canonical JSON/JSONL helpers, Click, pytest, Ruff, Pylint.
 
 ## Global Constraints
 
-- HPA-322 and HPA-323 are complete; consume merged `main` contracts only.
-- HPA-423 is active in parallel. HPA-324 owns mapping vocabulary/data; HPA-423 owns prediction conversion, map stamping, and `scorer_input.py` unblocking.
-- Before Task 7, rebase onto merged HPA-423 if it has landed. Do not independently reimplement its mapper or redefine its final API.
-- Score **onset time plus instrument class only**. Preserve prediction velocity/confidence and DTX note/sample identity for diagnostics; never score DTX `#VOLUME` as hit velocity.
-- Keep two class levels: detailed canonical (`kick`, `snare`, `closed_hihat`, `open_hihat`, `crash`, `ride`, `high_tom`, `low_or_floor_tom`) and common comparison (`kick`, `snare`, `hihat`, `crash`, `ride`, `tom`).
-- Define one total `DETAILED_TO_COMMON` projection. Any mapping with a non-null detailed class must agree with it.
-- OaF map lookup uses `NativeEvent.native_metadata["upstream_8hit_group_id"]`; do not rewrite `NativeEvent.native_class_id="midi_<note>"`.
-- Keep all persisted HPA-323 events lossless. Deduplicate only the common scorer projection.
-- Common collapse identity uses canonical durable time (`Decimal(str(audio_time_sec))`) plus `common_class`; do not use raw float object identity, fuzzy buckets, or score tolerances.
-- Do not rerun chart selection, DTX parsing, timing construction, BGM resolution, R2 access, or audio decoding in HPA-324.
-- Do not silently discard unknown lanes. A lane is mapped, explicitly ignored after review, or quarantines the reference.
-- Start `IGNORED_NON_DRUM_LANES` empty. Grow it only after the committed real-corpus audit verifies an observed lane is non-drum.
-- Reference eligibility status is exactly `eligible|quarantined`. Warnings are an array on eligible rows, not a third status.
-- Mapped benchmark-reference event rows mirror HPA-323 style and do not contain a per-row `schema` field.
-- Keep exact MuScriptor and IDM map tables out of HPA-324. HPA-395/HPA-396 freeze their observed locked vocabularies before their scored runs.
-- No generic plugin discovery, key-selector framework, config DSL, mapping database, service, queue, or concurrency layer.
-- Breaking internal API cleanup is allowed; do not retain aliases solely for backward compatibility.
+- HPA-322 and HPA-323 are complete; consume merged `main` contracts.
+- HPA-423 is active in parallel. HPA-324 owns taxonomy/map policy; HPA-423 owns prediction mapping/serialization mechanics.
+- Score onset time plus **common instrument class**. Detailed class is retained where justified for diagnosis; velocity/confidence are diagnostic only.
+- `DETAILED_TO_COMMON` is total. Every map entry with a non-null detailed class must agree with `project_to_common`.
+- OaF lookup uses `NativeEvent.native_metadata["upstream_8hit_group_id"]`; never rewrite `native_class_id="midi_<note>"`.
+- Before HPA-326, the active prediction artifact must persist `common_class` for mapped events (`crux.drum-prediction-events/v2`).
+- Preserve HPA-323 native reference artifacts as the only persisted event source. HPA-324 does **not** publish mapped-reference JSONL.
+- Deduplicate only the common scorer projection, keyed by `(Decimal(str(audio_time_sec)), common_class)`.
+- Do not use fuzzy time buckets. HPA-325 owns matching tolerances.
+- Do not rerun chart selection, DTX parsing, timing, BGM resolution, R2 access, or audio decoding.
+- Start `IGNORED_NON_DRUM_LANES` empty, but do not freeze eligibility policy until the real-corpus lane audit is committed and reviewed.
+- Unknown lanes are never silently dropped. A lane is mapped, explicitly reviewed as non-drum, or quarantines the reference.
+- Keep MuScriptor/IDM exact maps out of HPA-324. HPA-395/HPA-396 freeze them from their actual locked vocabularies.
+- No generic plugin discovery, native-key selector framework, mapping DB, config DSL, service, queue, or concurrency layer.
+- Breaking internal schemas is allowed. Do not add compatibility readers for prediction v1 merely to preserve old internal artifacts.
+
+## Risks / Hard Gates
+
+### Gate A — Prediction common class
+
+Current `crux.drum-prediction-events/v1` has no `common_class`. HPA-326 must not begin until a real OaF-shaped hihat/tom prediction round-trips through the active prediction artifact with its common class intact.
+
+### Gate B — Real-corpus lane policy
+
+HPA-323 retains pattern channels outside 01/02/03/08. An unreviewed empty ignore set can therefore quarantine a large corpus while accounting still balances. The lane audit in Task 4 is a hard prerequisite for Task 5. If the real HPA-323 artifacts are unavailable, implementation stops at Task 4.
+
+### Gate C — HPA-423 merge timing
+
+Tasks 1-6 can be implemented independently. If HPA-423 is not merged when they finish, HPA-324 remains **In Progress**. Do not mark HPA-324 Done and do not start HPA-326 until Task 7 verifies the prediction schema/map seam.
 
 ---
 
@@ -43,8 +55,8 @@
 - `tests/benchmark/test_reference_set_manifest.py`
 - `tests/benchmark/test_reference_set_acceptance.py`
 - `tests/tools/hpa324/test_analyze_reference_lanes.py`
-- `tests/benchmark/schema_goldens/crux.benchmark-reference-event-v1.jsonl`
 - `tests/benchmark/schema_goldens/crux.benchmark-reference-manifest-v1.jsonl`
+- `docs/superpowers/evidence/2026-08-09-hpa-324-reference-lane-audit.json`
 
 ### Modify
 
@@ -54,7 +66,6 @@
 - `src/benchmark/reference_timing_manifest.py`
 - `src/benchmark/render_audio.py`
 - `src/cli/benchmark.py`
-- `scripts/calibrate_egmd_mapping.py` only if taxonomy grep finds an active old-name assumption rather than a passive import
 - `tests/benchmark/test_mapping.py`
 - `tests/benchmark/test_midi_io.py`
 - `tests/benchmark/test_reference_timing.py`
@@ -62,11 +73,22 @@
 - `tests/benchmark/test_render_audio.py`
 - `tests/test_cli_benchmark.py`
 - `tests/benchmark/schema_goldens/manifest.json`
-- HPA-423 mapping tests after rebasing onto its actual merged API.
+- `scripts/calibrate_egmd_mapping.py` only if the Task 1 grep finds an active old-class assumption
+
+### HPA-423 integration files (Task 7, after rebase)
+
+Current `main` seam:
+
+- `src/benchmark/prediction_artifact.py`
+- `src/benchmark/scorer_input.py`
+- `tests/benchmark/test_prediction_artifact.py`
+- `tests/benchmark/test_scorer_input.py`
+
+If HPA-423 moves or replaces these files, use its merged equivalents; do not resurrect removed code.
 
 ---
 
-## Task 1: Freeze taxonomy and migrate existing mapping consumers
+## Task 1: Freeze taxonomy and migrate existing consumers
 
 **Files:**
 - Create: `src/benchmark/taxonomy.py`
@@ -104,7 +126,6 @@ CommonDrumClass = Literal[
 TAXONOMY_VERSION = "crux.drum-taxonomy/v1"
 DTX_LANE_MAP_VERSION = "crux.dtx-lane-map/v1"
 OAF_PREDICTION_MAP_ID = "crux.prediction-map/oaf-egmd-8hit-v1"
-OAF_PREDICTION_MAP_METADATA_KEY = "upstream_8hit_group_id"
 
 DETAILED_TO_COMMON: Mapping[DetailedDrumClass, CommonDrumClass]
 
@@ -131,9 +152,7 @@ IGNORED_NON_DRUM_LANES: frozenset[str]
 OAF_PREDICTION_MAP: PredictionMap
 ```
 
-`OAF_PREDICTION_MAP.classes` is keyed by the eight values carried in `NativeEvent.native_metadata["upstream_8hit_group_id"]`. `native_class_id`, output bin, and native MIDI note remain independent native identity.
-
-- [ ] **Step 1: Write exact taxonomy and projection tests**
+- [ ] **Step 1: Write the total projection test**
 
 ```python
 def test_detailed_to_common_projection_is_total() -> None:
@@ -150,9 +169,9 @@ def test_detailed_to_common_projection_is_total() -> None:
     assert set(DETAILED_TO_COMMON) == set(get_args(DetailedDrumClass))
 ```
 
-Add exact assertions for the two class Literals and all three version IDs.
+- [ ] **Step 2: Write exact DTX mapping tests**
 
-- [ ] **Step 2: Write the DTX lane-map tests**
+Require:
 
 ```python
 expected = {
@@ -171,85 +190,64 @@ expected = {
 }
 ```
 
-Require `DRUM_LANE_IDS == frozenset(expected)` and `IGNORED_NON_DRUM_LANES == frozenset()` initially.
-
-For every DTX mapping entry:
+For every non-null detailed entry:
 
 ```python
 assert mapping.common_class == project_to_common(mapping.canonical_class)
 ```
 
-- [ ] **Step 3: Write OaF group-key tests**
+- [ ] **Step 3: Bind the OaF map to the existing locked vocabulary**
 
-Require the exact keys:
-
-```python
-assert set(OAF_PREDICTION_MAP.classes) == {
-    "kick",
-    "snare",
-    "toms",
-    "hihat",
-    "ride",
-    "ride_bell",
-    "crash",
-    "sticks",
-}
-```
-
-Assert:
+In `tests/benchmark/test_taxonomy.py`, import the existing constants and require:
 
 ```python
+from src.benchmark.backend_identity import OAF_BACKEND_ID
+from src.benchmark.prediction_artifact import OAF_GROUP_IDS
+
+assert set(OAF_PREDICTION_MAP.classes) == OAF_GROUP_IDS
+assert OAF_PREDICTION_MAP.model_id == OAF_BACKEND_ID
 assert OAF_PREDICTION_MAP.classes["hihat"] == ClassMapping(None, "hihat")
 assert OAF_PREDICTION_MAP.classes["toms"] == ClassMapping(None, "tom")
 assert OAF_PREDICTION_MAP.classes["sticks"] == ClassMapping(None, None)
 ```
 
-For entries with a non-null detailed class, require the same `project_to_common` invariant.
+Keep this cross-module vocabulary assertion in tests so production `taxonomy.py` does not need to import `prediction_artifact.py`.
 
-- [ ] **Step 4: Write reverse-MIDI rename regressions**
+- [ ] **Step 4: Write reverse MIDI rename regressions**
 
-Require `write_reference_midi` to handle the new detailed tom class instead of warning/skipping it:
+In `tests/benchmark/test_midi_io.py`:
 
 ```python
 assert REFERENCE_CLASS_TO_MIDI["low_or_floor_tom"] == 45
 assert "low_tom" not in REFERENCE_CLASS_TO_MIDI
 ```
 
-Before removing `mid_tom`, search active producers:
+Add a `write_reference_midi` test proving `low_or_floor_tom` emits a tom note rather than the existing "Skipping unmapped canonical class" warning.
 
-```bash
-git grep -n '"mid_tom"\|"low_tom"' -- src tests scripts
-```
-
-If no active producer emits `mid_tom`, remove it from `REFERENCE_CLASS_TO_MIDI`; do not keep it for compatibility alone.
-
-- [ ] **Step 5: Run tests and verify RED**
+- [ ] **Step 5: Verify RED**
 
 ```bash
 uv run pytest tests/benchmark/test_taxonomy.py tests/benchmark/test_mapping.py \
   tests/benchmark/test_midi_io.py -q
 ```
 
-Expected RED is missing taxonomy/new-name behavior.
+Expected: missing taxonomy/new-class behavior.
 
-- [ ] **Step 6: Implement `taxonomy.py` with immutable maps**
+- [ ] **Step 6: Implement immutable taxonomy/maps**
 
-Use `MappingProxyType` for `DETAILED_TO_COMMON`, `DTX_LANE_MAP`, and `OAF_PREDICTION_MAP.classes`.
-
-`project_to_common` is a direct lookup:
+Use `MappingProxyType` for `DETAILED_TO_COMMON`, `DTX_LANE_MAP`, and `OAF_PREDICTION_MAP.classes`. Start:
 
 ```python
-def project_to_common(detailed: DetailedDrumClass) -> CommonDrumClass:
-    return DETAILED_TO_COMMON[detailed]
+IGNORED_NON_DRUM_LANES = frozenset()
 ```
 
-Do not add a loader or generic validation framework.
+Do not add a loader/config layer.
 
-- [ ] **Step 7: Migrate `mapping.py` to the single DTX policy owner**
+- [ ] **Step 7: Make `mapping.py` consume the single DTX map**
 
-Delete `DtxClassMapping` and `DEFAULT_DTX_LANE_MAP` as policy owners. Import `DTX_LANE_MAP` from `taxonomy.py`.
+Delete `DtxClassMapping` / `DEFAULT_DTX_LANE_MAP` as policy owners. `map_dtx_events` keeps its legacy API but imports `DTX_LANE_MAP`.
 
-Keep the legacy `map_dtx_events` API because `runner.py` still uses it. Set `canonical_class` from `ClassMapping.canonical_class` and preserve the common class in metadata:
+Store the common projection in metadata:
 
 ```python
 metadata = {
@@ -259,53 +257,56 @@ metadata = {
 }
 ```
 
-Update the old test that expected `metadata["native_class"]`; native lane/note identity already exists on the source event and should not be duplicated under a misleading class field.
+Update the old `metadata["native_class"]` assertion accordingly.
 
-Keep `DEFAULT_MIDI_NOTE_MAP` only for the legacy folder/MIDI scorer. Rename its emitted tom classes to `low_or_floor_tom`/`high_tom` so it cannot emit values outside `DetailedDrumClass`.
+Keep `DEFAULT_MIDI_NOTE_MAP` only for the legacy folder/MIDI scorer and make all emitted classes valid `DetailedDrumClass` values.
 
-- [ ] **Step 8: Update render and reverse-MIDI consumers**
+- [ ] **Step 8: Update render and reverse MIDI consumers**
 
-`render_audio.py` should import only `DRUM_LANE_IDS` for membership:
+`render_audio.py` imports `DRUM_LANE_IDS` for membership only.
 
-```python
-if event.lane_id not in DRUM_LANE_IDS:
-    continue
-```
-
-Update `REFERENCE_CLASS_TO_MIDI` in `midi_io.py` in the same task and extend `test_write_reference_midi_handles_simultaneous_hits` or add a focused `low_or_floor_tom` test in `tests/benchmark/test_midi_io.py`.
-
-- [ ] **Step 9: Check the calibration script blast radius**
+Update `REFERENCE_CLASS_TO_MIDI` to the renamed detailed class. Before removing `mid_tom`, run:
 
 ```bash
-git grep -n 'DEFAULT_MIDI_NOTE_MAP\|map_dtx_events\|low_tom\|mid_tom' -- scripts/calibrate_egmd_mapping.py
+git grep -n '"mid_tom"\|"low_tom"' -- src tests scripts
 ```
 
-If the script only consumes the maps dynamically, no code change is needed. If it asserts or serializes an old class spelling as policy, update that assumption and add the smallest regression available.
+Remove `mid_tom` only if no active producer remains.
+
+- [ ] **Step 9: Check calibration-script blast radius**
+
+```bash
+git grep -n 'DEFAULT_MIDI_NOTE_MAP\|map_dtx_events\|low_tom\|mid_tom' \
+  -- scripts/calibrate_egmd_mapping.py
+```
+
+If the script only consumes `map_dtx_events`/`DEFAULT_MIDI_NOTE_MAP`, no direct edit is required. If it asserts an old class string, update that exact assumption in the same task.
 
 - [ ] **Step 10: Run focused validation**
 
 ```bash
 uv run pytest tests/benchmark/test_taxonomy.py tests/benchmark/test_mapping.py \
   tests/benchmark/test_midi_io.py tests/benchmark/test_render_audio.py -q
-uv run ruff check src/benchmark/taxonomy.py src/benchmark/mapping.py src/benchmark/midi_io.py \
-  src/benchmark/render_audio.py tests/benchmark
+uv run ruff check src/benchmark/taxonomy.py src/benchmark/mapping.py \
+  src/benchmark/midi_io.py src/benchmark/render_audio.py \
+  tests/benchmark/test_taxonomy.py tests/benchmark/test_mapping.py \
+  tests/benchmark/test_midi_io.py tests/benchmark/test_render_audio.py
 ```
 
-- [ ] **Step 11: Commit Task 1**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add src/benchmark/taxonomy.py src/benchmark/mapping.py src/benchmark/midi_io.py \
   src/benchmark/render_audio.py tests/benchmark/test_taxonomy.py \
   tests/benchmark/test_mapping.py tests/benchmark/test_midi_io.py \
   tests/benchmark/test_render_audio.py
+git add scripts/calibrate_egmd_mapping.py 2>/dev/null || true
 git commit -m "feat: freeze benchmark drum taxonomy"
 ```
 
-If Step 9 required an actual calibration-script edit, stage `scripts/calibrate_egmd_mapping.py` in this same commit.
-
 ---
 
-## Task 2: Expose read-only HPA-323 consumption APIs
+## Task 2: Expose HPA-323 readers and reuse its manifest validation core
 
 **Files:**
 - Modify: `src/benchmark/reference_timing.py`
@@ -331,63 +332,91 @@ class ReferenceTimingRowView:
     source_audio_content_hash: str | None
 
 
-def reference_timing_row_view_from_row(
-    row: Mapping[str, object],
-) -> ReferenceTimingRowView: ...
+@dataclass(frozen=True)
+class LoadedReferenceTimingRow:
+    source_row: Mapping[str, object]
+    view: ReferenceTimingRowView
+
+
+@dataclass(frozen=True)
+class LoadedReferenceTimingManifest:
+    manifest_sha256: str
+    corpus_version: str
+    rows: tuple[LoadedReferenceTimingRow, ...]
+
+
+def load_reference_timing_manifest(path: Path) -> LoadedReferenceTimingManifest: ...
 ```
 
-These are read-only adapters over HPA-323 validators. They do not rerun timing or resolve source files.
-
-- [ ] **Step 1: Write event reader round-trip tests**
+- [ ] **Step 1: Write event-reader round-trip tests**
 
 ```python
-def test_read_reference_events_round_trips_canonical_render() -> None:
-    content = render_reference_events((sample_native_reference_event(),))
-    events = read_reference_events(content)
-    assert render_reference_events(events) == content
+content = render_reference_events((sample_native_reference_event(),))
+assert render_reference_events(read_reference_events(content)) == content
 ```
 
-Also reject non-canonical JSON, wrong key sets, non-finite time, and invalid native event ordering/duplicates through the existing validators.
+Also reject non-canonical JSON, wrong keys, invalid time, and invalid sequence order/duplicates through the existing validators.
 
-- [ ] **Step 2: Write timing-row adapter tests**
+- [ ] **Step 2: Write timing-row view tests**
 
-Use existing valid ready/quarantined row fixtures. Require the adapter to call the same status-shape policy HPA-323 already uses.
+Use existing ready/quarantined row fixtures and prove the new view rejects anything `_validate_timing_status_shape` rejects.
 
-```python
-assert ready_view.timing_status == "ready"
-assert ready_view.reference_events_cache_path.startswith("events/")
-assert quarantined_view.reference_events_cache_path is None
-```
+- [ ] **Step 3: Write timing-manifest loader tests**
 
-- [ ] **Step 3: Run focused tests and verify RED**
+Cover:
+
+- valid ready + quarantined rows;
+- exact input SHA-256;
+- one shared corpus version;
+- duplicate simfile ID rejection;
+- non-canonical/empty input rejection;
+- byte-identical rerender requirement.
+
+Also rerun existing `load_reference_chart_manifest` tests to prove the refactor does not relax HPA-322 validation.
+
+- [ ] **Step 4: Verify RED**
 
 ```bash
-uv run pytest tests/benchmark/test_reference_timing.py tests/benchmark/test_reference_timing_manifest.py \
-  -k "read_reference_events or timing_row_view" -q
+uv run pytest tests/benchmark/test_reference_timing.py \
+  tests/benchmark/test_reference_timing_manifest.py \
+  -k "read_reference_events or timing_row_view or load_reference_timing" -q
 ```
 
-- [ ] **Step 4: Implement `read_reference_events` by reusing HPA-323 validation**
+- [ ] **Step 5: Implement `read_reference_events` by reusing existing validators**
 
-1. parse each row through `strict_json_loads(..., require_canonical=True)`;
-2. call existing `_validate_reference_event_row` and `_validate_reference_event_sequence`;
-3. construct `NativeReferenceEvent` values;
-4. re-render with `render_reference_events` and require byte identity.
+Parse canonical rows, call `_validate_reference_event_row` and `_validate_reference_event_sequence`, construct `NativeReferenceEvent`, rerender, and require byte identity.
 
-Do not maintain a second schema key list.
+Do not add another key list.
 
-- [ ] **Step 5: Implement `ReferenceTimingRowView` as a thin adapter**
+- [ ] **Step 6: Extract only the canonical manifest-reading core**
 
-Call the existing timing row validator/status-shape logic first, then narrow only the fields HPA-324 needs. Do not expose mutable raw mappings through the view.
+Inside `reference_timing_manifest.py`, extract a private helper from the existing `load_reference_chart_manifest` for:
 
-- [ ] **Step 6: Run focused validation**
+- file read;
+- final-newline / nonblank canonical JSONL checks;
+- per-row schema-version check supplied as an argument;
+- strict canonical parse;
+- exact-content SHA-256;
+- byte-identical `render_manifest` verification.
+
+Keep HPA-322-specific `ReferenceChartRowView` identity checks in `load_reference_chart_manifest`.
+
+Do **not** add a generic outcome/invariant framework.
+
+- [ ] **Step 7: Implement `ReferenceTimingRowView` and `load_reference_timing_manifest` in the source-owner module**
+
+The loader uses the extracted canonical core, validates each row through `ReferenceTimingRowView`, rejects duplicate simfile IDs/mixed corpus versions, and retains immutable source rows for HPA-324 pass-through.
+
+- [ ] **Step 8: Run focused + regression tests**
 
 ```bash
-uv run pytest tests/benchmark/test_reference_timing.py tests/benchmark/test_reference_timing_manifest.py -q
+uv run pytest tests/benchmark/test_reference_timing.py \
+  tests/benchmark/test_reference_timing_manifest.py -q
 uv run ruff check src/benchmark/reference_timing.py src/benchmark/reference_timing_manifest.py \
   tests/benchmark/test_reference_timing.py tests/benchmark/test_reference_timing_manifest.py
 ```
 
-- [ ] **Step 7: Commit Task 2**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add src/benchmark/reference_timing.py src/benchmark/reference_timing_manifest.py \
@@ -397,20 +426,15 @@ git commit -m "feat: expose persisted reference timing readers"
 
 ---
 
-## Task 3: Map native references and own the common scorer projection
+## Task 3: Implement pure reference mapping and scorer projection
 
 **Files:**
 - Create: `src/benchmark/reference_set.py`
 - Create: `tests/benchmark/test_reference_set.py`
-- Create: `tests/benchmark/schema_goldens/crux.benchmark-reference-event-v1.jsonl`
-- Modify: `tests/benchmark/schema_goldens/manifest.json`
 
 **Interfaces:**
 
 ```python
-BENCHMARK_REFERENCE_EVENT_SCHEMA = "crux.benchmark-reference-event/v1"
-
-
 @dataclass(frozen=True)
 class MappedReferenceEvent:
     native: NativeReferenceEvent
@@ -420,7 +444,7 @@ class MappedReferenceEvent:
 
 @dataclass(frozen=True)
 class CommonReferenceEvent:
-    audio_time_sec: float
+    canonical_audio_time: Decimal
     common_class: CommonDrumClass
     source_events: tuple[MappedReferenceEvent, ...]
 
@@ -439,9 +463,6 @@ class ReferenceMappingResult:
     diagnostics: ReferenceMappingDiagnostics
 
 
-def canonical_reference_time(time_sec: float) -> Decimal: ...
-
-
 def project_common_reference_events(
     mapped_events: tuple[MappedReferenceEvent, ...],
 ) -> tuple[CommonReferenceEvent, ...]: ...
@@ -449,272 +470,188 @@ def project_common_reference_events(
 
 def map_reference_events(
     events: tuple[NativeReferenceEvent, ...],
+    *,
+    lane_map: Mapping[str, ClassMapping] = DTX_LANE_MAP,
+    ignored_lanes: frozenset[str] = IGNORED_NON_DRUM_LANES,
 ) -> ReferenceMappingResult: ...
-
-
-def render_mapped_reference_events(
-    events: tuple[MappedReferenceEvent, ...],
-) -> bytes: ...
-
-
-def read_mapped_reference_events(content: bytes) -> tuple[MappedReferenceEvent, ...]: ...
 ```
 
-- [ ] **Step 1: Write native-identity preservation tests**
+- [ ] **Step 1: Write identity-preservation tests**
 
-Map representative kick, snare, open hi-hat, crash, ride, high-tom, and low/floor-tom lanes. For lane `18`:
+For lanes 13, 18, 14/15, 16, and 19, require the mapped event retains the exact `NativeReferenceEvent` and produces the expected detailed/common class.
 
-```python
-assert mapped.native == source_event
-assert mapped.canonical_class == "open_hihat"
-assert mapped.common_class == "hihat"
-```
+- [ ] **Step 2: Write unknown/ignored tests**
 
-- [ ] **Step 2: Write unknown/ignored lane tests**
+Use explicit test inputs:
 
-Use a test-only lane-map/ignore-set parameter or monkeypatch so tests do not depend on the real audit outcome.
-
-- unknown -> `diagnostics.unmapped`, no mapped event;
-- explicitly ignored -> `diagnostics.ignored`, no mapped event;
+- unknown lane -> `diagnostics.unmapped`, no mapped event;
+- explicit `ignored_lanes=frozenset({"2A"})` -> `diagnostics.ignored`, no mapped event;
 - source tuple remains unchanged.
 
-- [ ] **Step 3: Write canonical time-key tests**
+- [ ] **Step 3: Write durable exact-collapse tests**
 
 ```python
-def test_canonical_reference_time_matches_durable_decimal_text() -> None:
-    assert canonical_reference_time(0.1) == Decimal("0.1")
-    assert canonical_reference_time(1.001) == Decimal("1.001")
+mapped = (
+    mapped_event("14", 1.0),
+    mapped_event("15", 1.0),
+    mapped_event("15", 1.001),
+)
+
+common = project_common_reference_events(mapped)
+
+assert [(e.canonical_audio_time, e.common_class) for e in common] == [
+    (Decimal("1.0"), "tom"),
+    (Decimal("1.001"), "tom"),
+]
+assert len(common[0].source_events) == 2
 ```
 
-Round-trip one HPA-323 event through `render_reference_events`/`read_reference_events` and require the canonical key is unchanged.
+Also prove open/closed hi-hat collapses only at the exact same durable time.
 
-- [ ] **Step 4: Write exact common-collapse tests through the public API**
-
-```python
-def test_common_projection_collapses_only_exact_canonical_time_and_class() -> None:
-    mapped = map_reference_events(
-        (
-            native_event(lane_id="14", audio_time_sec=1.0),
-            native_event(lane_id="15", audio_time_sec=1.0),
-            native_event(lane_id="15", audio_time_sec=1.001),
-        )
-    ).mapped_events
-
-    common = project_common_reference_events(mapped)
-
-    assert [(event.audio_time_sec, event.common_class) for event in common] == [
-        (1.0, "tom"),
-        (1.001, "tom"),
-    ]
-    assert len(common[0].source_events) == 2
-```
-
-Also cover simultaneous open/closed hi-hat and prove all detailed mapped rows remain present.
-
-- [ ] **Step 5: Write mapped-event schema-golden tests**
-
-The stable row has exactly these keys and **no `schema` key**:
-
-```text
-simfile_id
-selected_chart_key
-selected_chart_content_hash
-source_audio_key
-source_audio_content_hash
-source_order
-measure
-position
-lane_id
-note_id
-chart_time_sec
-audio_time_sec
-canonical_class
-common_class
-taxonomy_version
-lane_map_version
-```
-
-Require `taxonomy_version == crux.drum-taxonomy/v1` and `lane_map_version == crux.dtx-lane-map/v1`. Register the golden under schema ID `crux.benchmark-reference-event/v1` with validator module `src.benchmark.reference_set`.
-
-- [ ] **Step 6: Run tests and verify RED**
+- [ ] **Step 4: Verify RED**
 
 ```bash
-uv run pytest tests/benchmark/test_reference_set.py tests/benchmark/test_schema_goldens.py -q
+uv run pytest tests/benchmark/test_reference_set.py -q
 ```
 
-- [ ] **Step 7: Implement pure mapping**
+- [ ] **Step 5: Implement the public common projection first**
 
-Map only through `DTX_LANE_MAP` and `IGNORED_NON_DRUM_LANES`. For every mapped DTX event, assert/derive:
+Key groups by:
 
 ```python
-common_class = project_to_common(canonical_class)
+(Decimal(str(event.native.audio_time_sec)), event.common_class)
 ```
 
-Do not permit free-form mismatched detailed/common pairs.
+Sort by `(canonical_audio_time, common_class)`.
 
-- [ ] **Step 8: Implement the one common projection**
+- [ ] **Step 6: Implement `map_reference_events` by composing the projection**
+
+Map lanes through `lane_map`, report ignored/unmapped counts, then call `project_common_reference_events(mapped_events)`. Do not duplicate collapse logic inside `map_reference_events`.
+
+`duplicate_common_event_count` is:
 
 ```python
-groups: dict[tuple[Decimal, CommonDrumClass], list[MappedReferenceEvent]] = {}
-for event in mapped_events:
-    key = (canonical_reference_time(event.native.audio_time_sec), event.common_class)
-    groups.setdefault(key, []).append(event)
+sum(len(event.source_events) - 1 for event in common_events)
 ```
-
-Sort by `(canonical_time, common_class)`. `duplicate_common_event_count` equals:
-
-```python
-sum(len(group) - 1 for group in groups.values())
-```
-
-`map_reference_events` must call `project_common_reference_events`; do not duplicate collapse logic privately.
-
-- [ ] **Step 9: Implement canonical mapped-event read/render**
-
-Mirror HPA-323's renderer/reader pattern. Preserve all native identity fields and exact version IDs. Event rows contain no per-row schema marker. Re-render on read and require byte identity.
-
-- [ ] **Step 10: Run focused validation**
-
-```bash
-uv run pytest tests/benchmark/test_reference_set.py tests/benchmark/test_schema_goldens.py -q
-uv run ruff check src/benchmark/reference_set.py tests/benchmark/test_reference_set.py
-```
-
-- [ ] **Step 11: Commit Task 3**
-
-```bash
-git add src/benchmark/reference_set.py tests/benchmark/test_reference_set.py \
-  tests/benchmark/schema_goldens/crux.benchmark-reference-event-v1.jsonl \
-  tests/benchmark/schema_goldens/manifest.json
-git commit -m "feat: map native benchmark references"
-```
-
----
-
-## Task 4: Build the committed real-corpus lane diagnostic
-
-**Files:**
-- Create: `src/benchmark/reference_set_manifest.py` (loader/view portion only)
-- Create: `tools/hpa324/analyze_reference_lanes.py`
-- Create: `tests/tools/hpa324/test_analyze_reference_lanes.py`
-- Create: `tests/benchmark/test_reference_set_manifest.py` (loader tests begin here)
-
-**Interfaces:**
-
-```python
-@dataclass(frozen=True)
-class LoadedReferenceTimingManifest:
-    manifest_sha256: str
-    corpus_version: str
-    rows: tuple[LoadedReferenceTimingRow, ...]
-
-
-@dataclass(frozen=True)
-class LoadedReferenceTimingRow:
-    source_row: Mapping[str, object]
-    view: ReferenceTimingRowView
-
-
-def load_reference_timing_manifest(path: Path) -> LoadedReferenceTimingManifest: ...
-
-
-@dataclass(frozen=True)
-class LaneAudit:
-    input_manifest_sha256: str
-    row_count: int
-    ready_row_count: int
-    lane_event_counts: Mapping[str, int]
-    unmapped_lane_event_counts: Mapping[str, int]
-    unmapped_lane_simfile_counts: Mapping[str, int]
-    common_collision_count: int
-    common_collision_simfile_count: int
-```
-
-The audit is reproducible tooling, not a new stable benchmark artifact schema.
-
-- [ ] **Step 1: Write canonical timing-manifest loader tests**
-
-Cover valid ready/quarantined rows, exact input SHA-256, one shared corpus version, duplicate simfile rejection, malformed/non-canonical JSONL rejection, and empty manifest rejection.
-
-- [ ] **Step 2: Write diagnostic fixture tests using production mapping**
-
-Create a temporary HPA-323 layout with mapped lane `13`, mapped lane `18`, synthetic unknown lane `2A`, and simultaneous lanes `14` + `15` at one timestamp.
-
-The audit must call `map_reference_events`/`project_common_reference_events`, not reproduce lane/collapse logic.
-
-Require one unknown lane and one common collision while both native tom events remain in the source artifact.
-
-- [ ] **Step 3: Run tests and verify RED**
-
-```bash
-uv run pytest tests/benchmark/test_reference_set_manifest.py \
-  tests/tools/hpa324/test_analyze_reference_lanes.py -q
-```
-
-- [ ] **Step 4: Implement read-only timing-manifest loading**
-
-- read exact bytes once;
-- require canonical JSONL;
-- validate rows through `reference_timing_row_view_from_row`;
-- reject duplicate simfile IDs and mixed corpus versions;
-- retain validated source rows with `MappingProxyType` for later pass-through;
-- compute exact input SHA-256.
-
-Do not add a second timing status-shape policy.
-
-- [ ] **Step 5: Implement the audit through production readers**
-
-For each timing-ready row:
-
-1. resolve `reference_events_cache_path` beneath the timing artifact root;
-2. verify `events/<64 lowercase hex>.jsonl` shape and filename hash;
-3. read bytes and call `read_reference_events`;
-4. call `map_reference_events`;
-5. aggregate mapped/unmapped/ignored lane diagnostics;
-6. use the returned/public common projection to count collisions.
-
-Timing-quarantined rows count toward total rows but are not opened.
-
-- [ ] **Step 6: Add the audit CLI**
-
-```bash
-uv run python -m tools.hpa324.analyze_reference_lanes --manifest "$REFERENCE_TIMING_MANIFEST"
-```
-
-Write one sorted ordinary JSON object to stdout; diagnostic errors go to stderr; invalid input exits nonzero.
 
 - [ ] **Step 7: Run focused validation**
 
 ```bash
-uv run pytest tests/benchmark/test_reference_set_manifest.py \
-  tests/tools/hpa324/test_analyze_reference_lanes.py -q
-uv run ruff check src/benchmark/reference_set_manifest.py tools/hpa324 \
-  tests/benchmark/test_reference_set_manifest.py tests/tools/hpa324
+uv run pytest tests/benchmark/test_reference_set.py -q
+uv run ruff check src/benchmark/reference_set.py tests/benchmark/test_reference_set.py
 ```
 
-- [ ] **Step 8: Run the real-corpus audit before growing the ignore set**
-
-Locate the current local HPA-323 manifest explicitly (for example from `reference-timing/latest.json`) and run the audit against that immutable manifest.
-
-Review every `unmapped_lane_event_counts` entry. For an observed lane whose semantics are verified non-drum, add that exact lane to `IGNORED_NON_DRUM_LANES` and add a test explaining the policy. If semantics are uncertain, leave it unmapped; affected references quarantine in Task 5.
-
-If no real HPA-323 artifact is locally available, keep `IGNORED_NON_DRUM_LANES` empty. Do not invent an ignore list from assumptions.
-
-- [ ] **Step 9: Commit Task 4**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add src/benchmark/reference_set_manifest.py tools/hpa324 tests/tools/hpa324 \
-  tests/benchmark/test_reference_set_manifest.py src/benchmark/taxonomy.py tests/benchmark/test_taxonomy.py
+git add src/benchmark/reference_set.py tests/benchmark/test_reference_set.py
+git commit -m "feat: map benchmark references in memory"
+```
+
+---
+
+## Task 4: Run and commit the real-corpus lane audit — HARD GATE
+
+**Files:**
+- Create: `tools/hpa324/analyze_reference_lanes.py`
+- Create: `tests/tools/hpa324/test_analyze_reference_lanes.py`
+- Create: `docs/superpowers/evidence/2026-08-09-hpa-324-reference-lane-audit.json`
+- Modify: `src/benchmark/taxonomy.py` only after evidence review
+- Modify: `tests/benchmark/test_taxonomy.py` only after evidence review
+
+**Audit output:**
+
+```text
+source_reference_timing_manifest_sha256
+source_reference_timing_version
+row_count
+ready_row_count
+lane_event_counts
+unmapped_lane_event_counts
+unmapped_lane_simfile_counts
+common_collision_count
+common_collision_simfile_count
+ignored_non_drum_lanes
+prospective_eligible_row_count
+prospective_quarantined_row_count
+```
+
+- [ ] **Step 1: Write audit fixture tests**
+
+Use a temporary HPA-323 manifest with mapped lanes, one synthetic unknown lane, and simultaneous tom lanes. Assert lane counts, unknown visibility, collision counts, and prospective eligibility/quarantine counts.
+
+- [ ] **Step 2: Verify RED**
+
+```bash
+uv run pytest tests/tools/hpa324/test_analyze_reference_lanes.py -q
+```
+
+- [ ] **Step 3: Implement the audit using production readers/functions only**
+
+For timing-ready rows:
+
+1. resolve inherited `reference_events_cache_path` beneath the timing artifact root;
+2. verify the content-addressed filename hash;
+3. call `read_reference_events`;
+4. call `map_reference_events`;
+5. aggregate lane/unmapped/ignored/collision and prospective row-status counts.
+
+Do not parse DTX or implement a second mapper.
+
+- [ ] **Step 4: Run focused validation**
+
+```bash
+uv run pytest tests/tools/hpa324/test_analyze_reference_lanes.py -q
+uv run ruff check tools/hpa324 tests/tools/hpa324
+```
+
+- [ ] **Step 5: Locate and run against the real HPA-323 manifest**
+
+Use the actual immutable reference-timing manifest selected by the local `reference-timing/latest.json` pointer or the known operator artifact path. Run:
+
+```bash
+uv run python -m tools.hpa324.analyze_reference_lanes \
+  --manifest "$REFERENCE_TIMING_MANIFEST" \
+  > docs/superpowers/evidence/2026-08-09-hpa-324-reference-lane-audit.json
+```
+
+If the real manifest/artifacts are unavailable, **stop here**. Do not proceed to Task 5.
+
+- [ ] **Step 6: Review every observed unmapped lane**
+
+For each observed unmapped lane, verify whether it is non-drum from authoritative DTX semantics/source evidence. Add only verified non-drum lane IDs to `IGNORED_NON_DRUM_LANES`, with a test asserting the reviewed policy.
+
+Do not infer "non-drum" from rarity or from being outside the current map.
+
+- [ ] **Step 7: Rerun the audit after policy changes**
+
+Overwrite the evidence file with the final reviewed policy reflected in `ignored_non_drum_lanes`.
+
+Require:
+
+```text
+ready_row_count = prospective_eligible_row_count + prospective_quarantined_row_count
+prospective_eligible_row_count > 0
+```
+
+If prospective eligible count is zero, stop and revisit lane policy before Task 5.
+
+- [ ] **Step 8: Commit the reviewed evidence and policy**
+
+```bash
+git add tools/hpa324 tests/tools/hpa324 \
+  docs/superpowers/evidence/2026-08-09-hpa-324-reference-lane-audit.json \
+  src/benchmark/taxonomy.py tests/benchmark/test_taxonomy.py
 git commit -m "feat: audit benchmark reference lanes"
 ```
 
 ---
 
-## Task 5: Publish model-independent reference eligibility
+## Task 5: Publish the model-independent eligibility manifest
 
 **Files:**
-- Modify: `src/benchmark/reference_set_manifest.py`
-- Modify: `tests/benchmark/test_reference_set_manifest.py`
+- Create: `src/benchmark/reference_set_manifest.py`
+- Create: `tests/benchmark/test_reference_set_manifest.py`
 - Create: `tests/benchmark/schema_goldens/crux.benchmark-reference-manifest-v1.jsonl`
 - Modify: `tests/benchmark/schema_goldens/manifest.json`
 
@@ -746,10 +683,9 @@ class ReferenceSetOutcome:
     manifest: PublishedManifest | None
     eligible_count: int
     quarantined_count: int
-    mapped_event_artifact_count: int
 ```
 
-Each derived row adds:
+Added row fields:
 
 ```text
 schema_version = crux.benchmark-reference-manifest/v1
@@ -760,7 +696,6 @@ lane_map_version
 reference_eligibility_status
 reference_eligibility_reason_codes
 reference_eligibility_warnings
-benchmark_reference_events_path
 mapped_event_count
 common_scored_event_count
 ignored_event_count
@@ -768,112 +703,114 @@ unmapped_event_count
 duplicate_common_event_count
 ```
 
-All HPA-323 fields except its top-level derived `corpus_version` pass through verbatim.
+There is no mapped-event artifact path/count. The inherited HPA-323 `reference_events_cache_path` remains the source HPA-325 reads.
 
-- [ ] **Step 1: Write upstream-quarantine tests**
+- [ ] **Step 1: Write upstream quarantine tests**
 
-A timing-quarantined input becomes HPA-324 quarantined with `upstream_reference_unavailable`, null mapped-event path, zero mapped/common counts, and unchanged upstream timing reasons.
+A timing-quarantined row becomes HPA-324 quarantined with `upstream_reference_unavailable`, zero mapping counts, and unchanged upstream timing reasons.
 
 - [ ] **Step 2: Write artifact-integrity tests**
 
-For timing-ready rows, quarantine with `reference_event_artifact_invalid` when the artifact path is unsafe, file is missing, filename hash differs, or `read_reference_events` rejects content. These are row-local failures.
+For timing-ready rows, quarantine with `reference_event_artifact_invalid` when the inherited event path is unsafe/missing/hash-mismatched or `read_reference_events` rejects its bytes.
 
-- [ ] **Step 3: Write binary-status eligibility tests**
+These are row-local failures.
+
+- [ ] **Step 3: Write mapping/status tests**
 
 Cover:
 
-1. mapped events, no warnings -> `eligible`, warnings `[]`;
-2. mapped events with ignored lanes -> `eligible`, warning array populated;
-3. mapped events with exact common collapse -> `eligible`, warning array populated;
-4. any unclassified lane -> `quarantined` with `unclassified_reference_lane` and no mapped artifact;
-5. no mapped drum event after explicit ignores -> `quarantined` with `no_scored_drum_events`.
+1. mapped events, no warnings -> `eligible`;
+2. mapped events plus reviewed ignored lanes -> `eligible` + deterministic warning;
+3. exact common collapse -> `eligible` + duplicate warning;
+4. unclassified lane -> `quarantined` with `unclassified_reference_lane`;
+5. no mapped events after reviewed ignores -> `quarantined` with `no_scored_drum_events`.
 
-Use exact warning formats:
+Warnings:
 
 ```text
 ignored_reference_lane:<LANE>:count=<N>
 duplicate_common_projection:count=<N>
 ```
 
-Sort warnings lexicographically.
+- [ ] **Step 4: Tie realistic non-drum acceptance to committed evidence**
 
-- [ ] **Step 4: Write accounting tests**
+Read `docs/superpowers/evidence/2026-08-09-hpa-324-reference-lane-audit.json` in the test. For every lane listed in `ignored_non_drum_lanes`, build a reference event on that lane and assert the row stays eligible (assuming at least one mapped drum event is also present) and reports the ignored-lane warning.
+
+This prevents the implementation from committing evidence/policy that the eligibility path does not honor.
+
+- [ ] **Step 5: Write accounting tests**
 
 ```python
 assert eligible_count + quarantined_count == total_input_rows
-assert mapped_event_artifact_count == eligible_count
 ```
 
-No quarantines -> exit `0`; any quarantine with a published manifest -> exit `1`; fatal input/publication failure -> exit `2` and no manifest.
-
-- [ ] **Step 5: Write publication tests**
-
-For each eligible row:
-
-1. render detailed mapped events;
-2. hash the bytes;
-3. publish `output_dir / "events" / f"{sha256}.jsonl"` through the existing immutable publisher;
-4. set `benchmark_reference_events_path` to that relative path;
-5. publish the derived manifest through `render_manifest`, `publish_manifest`, and `publish_latest_manifest`.
-
-A repeated run with identical inputs must produce identical event/manifest bytes.
+No quarantines -> exit `0`; any quarantine -> exit `1`; fatal manifest/publication failure -> exit `2` with no manifest.
 
 - [ ] **Step 6: Add the manifest schema golden**
 
 Create one eligible-with-warnings row and one quarantined row. The eligible row still has `reference_eligibility_status="eligible"`.
 
-The validator enforces the binary status set, closed reason codes, sorted warning strings, version fields, nullable path/count shapes, and row invariants.
+Register only `crux.benchmark-reference-manifest/v1`; there is no mapped-event golden.
 
-- [ ] **Step 7: Run tests and verify RED**
+- [ ] **Step 7: Verify RED**
 
 ```bash
-uv run pytest tests/benchmark/test_reference_set_manifest.py tests/benchmark/test_schema_goldens.py -q
+uv run pytest tests/benchmark/test_reference_set_manifest.py \
+  tests/benchmark/test_schema_goldens.py -q
 ```
 
 - [ ] **Step 8: Implement row evaluation**
+
+For each loaded HPA-323 row:
 
 ```text
 if timing_status != ready:
     quarantine upstream_reference_unavailable
 else:
-    verify/read persisted native event artifact
+    verify/read inherited native reference artifact
     result = map_reference_events(native_events)
     if result.diagnostics.unmapped:
         quarantine unclassified_reference_lane
     elif not result.mapped_events:
         quarantine no_scored_drum_events
     else:
-        publish mapped event artifact
-        status = eligible
-        warnings = deterministic ignored/collapse diagnostics
+        eligible
+        record deterministic ignored/collapse warnings + counts
 ```
 
-Do not inspect model predictions or scores.
+Do not publish event bytes.
 
-- [ ] **Step 9: Implement lossless upstream pass-through and immediate lineage**
+- [ ] **Step 9: Implement explicit row derivation**
 
-Use the HPA-323 source row as the base, remove only top-level `corpus_version`, replace `schema_version`, add HPA-324 fields, and let `render_manifest` derive the new version.
+Copy the validated HPA-323 source row, remove only top-level `corpus_version`, replace `schema_version`, add the HPA-324 fields above, then let `render_manifest` derive the new corpus version.
 
-Record:
+Record immediate lineage:
 
 ```text
 source_reference_timing_manifest_sha256 = exact input bytes SHA-256
 source_reference_timing_version = HPA-323 input corpus_version
 ```
 
-Preserve older HPA-321/HPA-322 lineage unchanged.
+Do not generalize `build_timing_row()` into a callback framework; its timing fields/invariants are domain-specific.
 
-- [ ] **Step 10: Run focused validation**
+- [ ] **Step 10: Implement explicit outcome accounting**
+
+Keep the 0/1/2 convention identical to HPA-323, but keep HPA-324's two-count invariant explicit rather than adding a generic invariant-list helper.
+
+- [ ] **Step 11: Run focused validation**
 
 ```bash
-uv run pytest tests/benchmark/test_reference_set_manifest.py tests/benchmark/test_schema_goldens.py -q
-uv run ruff check src/benchmark/reference_set_manifest.py tests/benchmark/test_reference_set_manifest.py
+uv run pytest tests/benchmark/test_reference_set_manifest.py \
+  tests/benchmark/test_schema_goldens.py -q
+uv run ruff check src/benchmark/reference_set_manifest.py \
+  tests/benchmark/test_reference_set_manifest.py
 ```
 
-- [ ] **Step 11: Commit Task 5**
+- [ ] **Step 12: Commit**
 
 ```bash
-git add src/benchmark/reference_set_manifest.py tests/benchmark/test_reference_set_manifest.py \
+git add src/benchmark/reference_set_manifest.py \
+  tests/benchmark/test_reference_set_manifest.py \
   tests/benchmark/schema_goldens/crux.benchmark-reference-manifest-v1.jsonl \
   tests/benchmark/schema_goldens/manifest.json
 git commit -m "feat: classify benchmark reference eligibility"
@@ -881,14 +818,14 @@ git commit -m "feat: classify benchmark reference eligibility"
 
 ---
 
-## Task 6: Add offline `build-reference-set` CLI and acceptance
+## Task 6: Add offline CLI and prove HPA-325 reconstruction
 
 **Files:**
 - Modify: `src/cli/benchmark.py`
 - Modify: `tests/test_cli_benchmark.py`
 - Create: `tests/benchmark/test_reference_set_acceptance.py`
 
-**Interface:**
+**CLI:**
 
 ```bash
 uv run crux benchmark build-reference-set \
@@ -896,7 +833,7 @@ uv run crux benchmark build-reference-set \
   --output-dir artifacts/benchmark/reference-set
 ```
 
-Machine-readable stdout fields:
+Machine-readable stdout:
 
 ```text
 corpus_version
@@ -904,21 +841,20 @@ eligible_count
 exit_code
 manifest_path
 manifest_sha256
-mapped_event_artifact_count
 quarantined_count
 status
 ```
 
 - [ ] **Step 1: Write CLI tests**
 
-Cover required `--manifest`, default output dir, exits 0/1/2, one canonical JSON stdout object, and absence of R2/cache/model/tolerance/concurrency options.
+Cover required `--manifest`, default output dir, exits 0/1/2, one canonical JSON stdout object, and absence of cache/R2/model/tolerance/concurrency options.
 
 - [ ] **Step 2: Write offline acceptance fixture**
 
-Build one temporary HPA-323 manifest with:
+Build a temporary HPA-323 manifest with:
 
 - one ready kick/snare reference;
-- one ready simultaneous high/low tom reference that remains `eligible` with a duplicate warning;
+- one ready simultaneous high/low tom reference producing a duplicate warning;
 - one upstream-quarantined reference.
 
 Require:
@@ -926,34 +862,35 @@ Require:
 ```python
 assert outcome.eligible_count == 2
 assert outcome.quarantined_count == 1
-assert outcome.mapped_event_artifact_count == 2
 assert outcome.exit_code == 1
 ```
 
-Read both mapped artifacts and prove they retain native lane/note identity.
+- [ ] **Step 3: Prove no mapped artifact exists or is needed**
 
-- [ ] **Step 3: Prove HPA-325 can reuse the public projection**
+For an eligible published HPA-324 row:
 
-Reload a mapped artifact through `read_mapped_reference_events`, call `project_common_reference_events`, and require the common events equal those produced before persistence.
+1. read its inherited `reference_events_cache_path`;
+2. call `read_reference_events`;
+3. call `map_reference_events`;
+4. call `project_common_reference_events`;
+5. require event counts equal the manifest's `mapped_event_count` / `common_scored_event_count`.
 
-This is the anti-reimplementation gate for HPA-325.
+This is the HPA-325 reconstruction contract.
 
-- [ ] **Step 4: Add remap-without-inference acceptance**
+- [ ] **Step 4: Prove remapping needs no inference**
 
-Persist one HPA-323 native event artifact once. Map it under v1, then use a test-only alternate lane mapping/version to remap the same native bytes.
+Persist one native HPA-323 event artifact once. Map it under DTX map v1, then call `map_reference_events` with a test-only alternate lane map. Require unchanged native bytes/hash and changed mapped result without audio/model/transcription calls.
 
-Require unchanged native input hash, changed mapped/version output, and no audio/model/transcription call.
-
-- [ ] **Step 5: Run tests and verify RED**
+- [ ] **Step 5: Verify RED**
 
 ```bash
 uv run pytest tests/test_cli_benchmark.py -k build_reference_set -q
 uv run pytest tests/benchmark/test_reference_set_acceptance.py -q
 ```
 
-- [ ] **Step 6: Implement the command and summary**
+- [ ] **Step 6: Implement CLI command/summary**
 
-Follow `_emit_reference_timing_summary` style with lazy imports. Do not add `--cache-dir`, R2, model, tolerance, or concurrency options.
+Follow `_emit_reference_timing_summary` style with lazy imports. No additional infrastructure.
 
 - [ ] **Step 7: Run focused acceptance**
 
@@ -964,49 +901,67 @@ uv run pytest tests/benchmark/test_reference_set.py \
 uv run pytest tests/test_cli_benchmark.py -q
 ```
 
-- [ ] **Step 8: Commit Task 6**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/cli/benchmark.py tests/test_cli_benchmark.py \
   tests/benchmark/test_reference_set_acceptance.py
-git commit -m "feat: publish benchmark reference set"
+git commit -m "feat: publish benchmark reference eligibility"
 ```
 
 ---
 
-## Task 7: Verify the HPA-423 prediction seam without redefining native identity
+## Task 7: Integrate the HPA-423 prediction schema/map seam — BLOCKING DONE GATE
 
-**Files:**
-- Modify: `tests/benchmark/test_taxonomy.py`
-- Modify: HPA-423 prediction mapping/scorer-input tests after their final paths are known from merged `main`.
-- Modify production HPA-423 mapping code only if the merged implementation cannot consume the frozen OaF group map; keep any change a narrow seam adaptation.
+This task runs only after rebasing onto the merged HPA-423 implementation. Tasks 1-6 may be merged first, but HPA-324 stays In Progress until this task passes.
 
-There is deliberately no speculative production function signature here. Inspect merged HPA-423 first.
+**Current seam files:**
+- `src/benchmark/prediction_artifact.py`
+- `src/benchmark/scorer_input.py`
+- `tests/benchmark/test_prediction_artifact.py`
+- `tests/benchmark/test_scorer_input.py`
+- `tests/benchmark/test_taxonomy.py`
 
-**Required semantics:**
-
-- OaF lookup key comes from `native_metadata["upstream_8hit_group_id"]`;
-- `native_class_id="midi_<note>"` remains unchanged;
-- output bin and native MIDI note remain unchanged;
-- mapping stamps `prediction_map_version == OAF_PREDICTION_MAP.map_id`;
-- unknown/missing groups remain visible in diagnostics;
-- `hihat` maps only to common `hihat`;
-- `toms` maps only to common `tom`;
-- `sticks` remains unmapped;
-- `model_id` and `input_view_id` persist to scorer input.
-
-- [ ] **Step 1: Rebase after HPA-423 lands**
+- [ ] **Step 1: Rebase onto merged HPA-423**
 
 ```bash
 git fetch origin
 git rebase origin/main
 ```
 
-Inspect the final HPA-423 mapper/tests before editing. Do not resurrect deleted seal/protocol files.
+Inspect HPA-423's final persistence/mapping API. Do not restore files it intentionally deleted.
 
-- [ ] **Step 2: Write real OaF-shaped seam fixtures**
+- [ ] **Step 2: Require prediction artifact v2**
 
-Use events such as:
+The active schema must expose both `canonical_class` and `common_class`:
+
+```text
+PREDICTION_SCHEMA = crux.drum-prediction-events/v2
+```
+
+Mapped event invariant:
+
+```text
+prediction_map_version != null
+common_class != null
+canonical_class may be null
+mapping_status = mapped
+```
+
+Unmapped event invariant:
+
+```text
+prediction_map_version != null
+common_class = null
+canonical_class = null
+mapping_status = unmapped
+```
+
+No v1 compatibility reader is required.
+
+- [ ] **Step 3: Write real OaF-shaped round-trip tests**
+
+Use events retaining native identity, for example:
 
 ```python
 NativeEvent(
@@ -1020,122 +975,137 @@ NativeEvent(
 )
 ```
 
-Add corresponding hihat/toms/ride_bell/sticks events with real MIDI-style `native_class_id` values. Do **not** construct `NativeEvent(native_class_id="kick")` merely to make the table convenient.
+Add hihat, toms, ride_bell, and sticks examples with their real MIDI-style native IDs.
 
-- [ ] **Step 3: Verify map consumption and native preservation**
+Require:
 
-Call the actual merged HPA-423 mapper with `OAF_PREDICTION_MAP` (or make the minimum seam adaptation required by its final API).
+- group metadata drives `OAF_PREDICTION_MAP` lookup;
+- native ID/bin/MIDI/confidence/velocity survive serialization;
+- hihat round-trips with `canonical_class=None`, `common_class="hihat"`;
+- toms round-trips with `canonical_class=None`, `common_class="tom"`;
+- sticks round-trips as unmapped with both classes null;
+- every attempted mapping carries `crux.prediction-map/oaf-egmd-8hit-v1`.
 
-Require group-based class lookup, preserved MIDI/native identity, and stamped map ID.
+- [ ] **Step 4: Verify scorer input consumes persisted common class**
 
-- [ ] **Step 4: Verify scorer-input common events**
+`read_scorer_events` (or HPA-423's merged replacement) must read the persisted common class without a model-specific OaF branch.
 
-Using HPA-423's final scorer-input API, prove a mapped OaF prediction can produce common scorer events without an HPA-325 model-specific branch.
+Do not make HPA-325 infer common class from `canonical_class`; hihat/toms intentionally have no detailed class.
 
-Do not add HPA-325 metrics or tolerance matching here.
-
-- [ ] **Step 5: Run HPA-423 + HPA-324 focused tests**
-
-```bash
-uv run pytest tests/benchmark/test_taxonomy.py tests/benchmark/test_reference_set.py \
-  tests/benchmark/test_reference_set_manifest.py -q
-```
-
-Also run the exact HPA-423 mapper/scorer-input test files discovered after rebase.
-
-- [ ] **Step 6: Commit the seam verification**
-
-Stage only HPA-324 taxonomy/tests plus any minimal HPA-423 seam adaptation and commit:
+- [ ] **Step 5: Run HPA-423/HPA-324 seam tests**
 
 ```bash
-git commit -m "test: bind OaF group map to benchmark taxonomy"
+uv run pytest tests/benchmark/test_prediction_artifact.py \
+  tests/benchmark/test_scorer_input.py tests/benchmark/test_taxonomy.py -q
 ```
 
-If HPA-423 has not landed, do not invent its API. Leave Task 7 blocked until it does; HPA-324 map data remains independently testable.
+Also run any HPA-423 mapper test file introduced by the merge.
+
+- [ ] **Step 6: Commit only if HPA-423 did not already satisfy the contract**
+
+If HPA-423 already implements v2/common-class persistence, this step is test-only. Otherwise make the smallest breaking schema update required; do not add compatibility code.
+
+```bash
+git add src/benchmark/prediction_artifact.py src/benchmark/scorer_input.py \
+  tests/benchmark/test_prediction_artifact.py tests/benchmark/test_scorer_input.py \
+  tests/benchmark/test_taxonomy.py
+git commit -m "feat: persist common prediction classes"
+```
 
 ---
 
-## Task 8: Final acceptance and stale-policy cleanup
+## Task 8: Final verification and completion gate
 
-**Files:**
-- All HPA-324 files above.
-
-- [ ] **Step 1: Run benchmark/reference tests**
+- [ ] **Step 1: Run HPA-324 focused tests**
 
 ```bash
-uv run pytest tests/benchmark -q
-uv run pytest tests/test_cli_benchmark.py -q
-uv run pytest tests/tools/hpa324 -q
+uv run pytest tests/benchmark/test_taxonomy.py tests/benchmark/test_mapping.py \
+  tests/benchmark/test_midi_io.py tests/benchmark/test_reference_timing.py \
+  tests/benchmark/test_reference_timing_manifest.py tests/benchmark/test_reference_set.py \
+  tests/benchmark/test_reference_set_manifest.py \
+  tests/benchmark/test_reference_set_acceptance.py \
+  tests/tools/hpa324/test_analyze_reference_lanes.py \
+  tests/test_cli_benchmark.py -q
 ```
 
-- [ ] **Step 2: Run repository validation**
+- [ ] **Step 2: Run repository-defined gates**
 
 ```bash
-uv run pytest -q
-uv run ruff check .
-uv run ruff format --check src tests tools
-uv run pylint --errors-only --disable=E1120,E0401 src
+uv run pytest
+uv run ruff check src tests
+uv run ruff format --check src tests
+uv run pylint src/app src/cli
 ```
 
-Any known repository baseline exception must be demonstrated unchanged from `main`; do not silently bless a new failure.
+These are the repository gates from `CLAUDE.md`.
 
-- [ ] **Step 3: Verify schema goldens and deterministic rerendering**
+For HPA-324's new tool files additionally run:
+
+```bash
+uv run ruff check tools/hpa324 tests/tools/hpa324
+uv run ruff format --check tools/hpa324 tests/tools/hpa324
+```
+
+A broader `uv run pylint src` may be diagnostic, but it is not the completion gate.
+
+- [ ] **Step 3: Verify schema goldens**
 
 ```bash
 uv run pytest tests/benchmark/test_schema_goldens.py -q
 ```
 
-Run one reference-set acceptance fixture twice and require identical event/manifest hashes.
+Only the benchmark-reference **manifest** golden is new. No mapped-reference-event golden should exist.
 
-- [ ] **Step 4: Search the full active blast radius for stale taxonomy policy**
-
-```bash
-git grep -n 'DEFAULT_DTX_LANE_MAP\|DtxClassMapping\|low_tom\|mid_tom\|REFERENCE_CLASS_TO_MIDI' -- src tests scripts
-```
-
-Resolve active old taxonomy owners/spellings. `REFERENCE_CLASS_TO_MIDI` itself is expected to remain, but its active keys must use the new taxonomy. Historical docs are outside this cleanup.
-
-- [ ] **Step 5: Verify OaF identity was not rewritten**
+- [ ] **Step 4: Verify stale policy is gone**
 
 ```bash
-git grep -n 'upstream_8hit_group_id\|native_class_id' -- src/benchmark runtime/oaf_tf1 tests/benchmark
+git grep -n "DEFAULT_DTX_LANE_MAP\|DtxClassMapping\|\"low_tom\"\|\"mid_tom\"" -- src tests scripts
 ```
 
-Confirm HPA-324 did not turn group IDs into `native_class_id`. OaF group mapping must remain metadata-driven.
+Resolve active policy duplicates. Historical docs may retain old terminology.
 
-- [ ] **Step 6: Check scope**
+- [ ] **Step 5: Verify audit evidence and eligibility are consistent**
+
+Require the committed lane-audit file exists and its prospective counts reconcile. Re-run the audit against the same source manifest if the source artifact is still available and compare the normalized JSON output to the committed evidence.
+
+- [ ] **Step 6: Verify HPA-326 blocker**
+
+Before moving HPA-324 to Done, confirm Task 7 passed: prediction artifact v2 persists `common_class`, OaF group mapping preserves native identity, and scorer input reads common classes.
+
+If HPA-423 is still unmerged, **stop here and leave HPA-324 In Progress**.
+
+- [ ] **Step 7: Scope check**
 
 ```bash
 git diff --stat origin/main...HEAD
 git diff --check origin/main...HEAD
 ```
 
-Confirm the implementation did not add guessed MuScriptor/IDM tables, velocity scoring, DTX/audio/R2 reprocessing, scoring tolerances, generic mapping frameworks, or result-driven mapping changes.
+Confirm the implementation did not add:
 
-- [ ] **Step 7: Commit mechanical cleanup only when Steps 4-6 found concrete files to change**
-
-Stage those concrete paths individually rather than using `git add -A`, then commit:
-
-```bash
-git commit -m "chore: finalize benchmark taxonomy contracts"
-```
-
-If Steps 4-6 find no cleanup, do not create an empty commit.
+- mapped-reference event persistence;
+- MuScriptor/IDM guessed tables;
+- velocity scoring;
+- DTX/audio/R2 reprocessing;
+- scoring metrics/tolerances;
+- plugin/config/key-selector frameworks;
+- result-driven map changes.
 
 ---
 
 ## HPA-324 Completion Gate
 
-Before moving HPA-324 to Done, verify from committed code/tests/artifacts:
+HPA-324 is Done only when all are true:
 
-1. detailed/common taxonomy, total `DETAILED_TO_COMMON`, and DTX lane-map v1 are frozen in one module;
-2. OaF has one immutable prediction-map ID keyed by `upstream_8hit_group_id`, while `native_class_id="midi_<note>"` remains native identity;
-3. active legacy mapping/MIDI consumers use the new tom terminology without silent drops;
-4. HPA-323 native artifacts are consumed directly and can be remapped without inference;
-5. mapped benchmark-reference rows contain the exact HPA-323-derived identity + class/version fields and no per-row schema key;
-6. unknown lanes are visible and only reviewed non-drum lanes are ignored;
-7. `project_common_reference_events` is the single scorer-facing common projection and uses canonical decimal time identity;
-8. every HPA-323 row is exactly `eligible` or `quarantined`; warnings are orthogonal to eligibility status;
-9. reference eligibility is independent of model score and model-specific inference success;
-10. after HPA-423 lands, its OaF mapping consumes group metadata, stamps the HPA-324 map ID, and preserves MIDI/native identity;
-11. HPA-395/HPA-396 remain responsible for their exact MuScriptor/IDM maps; no guessed future vocabulary is added here.
+1. detailed/common taxonomy and total projection are frozen in one module;
+2. DTX lane map v1 and OaF group map v1 are versioned and immutable;
+3. OaF map keys are test-bound to `OAF_GROUP_IDS` and model ID to `OAF_BACKEND_ID`;
+4. HPA-323 native events are consumed through thin validated readers;
+5. reference mapping/common projection is pure and persisted mapped copies are not added;
+6. real-corpus lane audit evidence is committed and reviewed before eligibility policy;
+7. unknown/ignored/collision diagnostics are visible and every row is exactly eligible or quarantined;
+8. HPA-325 can reconstruct common reference events from inherited native artifacts + version IDs;
+9. active prediction artifacts persist `common_class` and OaF hihat/toms round-trip scoreably;
+10. HPA-423 consumes the OaF group map without rewriting native MIDI identity;
+11. HPA-395/HPA-396 retain ownership of their exact future maps;
+12. HPA-326 has not started before items 9-10 pass.
