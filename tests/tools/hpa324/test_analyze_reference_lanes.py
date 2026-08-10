@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from src.benchmark.backend_identity import strict_json_loads
 from src.benchmark.corpus_manifest import render_manifest
-from src.benchmark.reference_timing import NativeReferenceEvent, render_reference_events
+from src.benchmark.reference_timing import (
+    NativeReferenceEvent,
+    read_reference_events,
+    render_reference_events,
+)
 
 
 def _event(
@@ -99,6 +104,48 @@ def _write_fixture(tmp_path: Path) -> Path:
     return manifest_path
 
 
+def _rehashed_identity_manifest(manifest_path: Path, field: str) -> Path:
+    rows = [
+        dict(strict_json_loads(line, require_canonical=True))
+        for line in manifest_path.read_bytes().splitlines()
+    ]
+    source_row = rows[0]
+    event_path = source_row["reference_events_cache_path"]
+    assert isinstance(event_path, str)
+    artifact = manifest_path.parent.parent / event_path
+    events = read_reference_events(artifact.read_bytes())
+
+    def mutate(event: NativeReferenceEvent) -> NativeReferenceEvent:
+        if field == "simfile_id":
+            return replace(
+                event,
+                simfile_id=43,
+                selected_chart_key="43/real.dtx",
+                source_audio_key="43/bgm.wav",
+            )
+        if field == "selected_chart_key":
+            return replace(event, selected_chart_key="42/other.dtx")
+        if field == "selected_chart_content_hash":
+            return replace(event, selected_chart_content_hash="d" * 64)
+        if field == "source_audio_key":
+            return replace(event, source_audio_key="42/other-bgm.wav")
+        if field == "source_audio_content_hash":
+            return replace(event, source_audio_content_hash="d" * 64)
+        raise AssertionError(f"unsupported identity field: {field}")
+
+    content = render_reference_events(tuple(mutate(event) for event in events))
+    digest = hashlib.sha256(content).hexdigest()
+    relative_path = f"events/{digest}.jsonl"
+    artifact.parent.joinpath(f"{digest}.jsonl").write_bytes(content)
+    source_row["reference_events_cache_path"] = relative_path
+    rendered = render_manifest(
+        tuple({key: value for key, value in row.items() if key != "corpus_version"} for row in rows)
+    )
+    tampered_manifest = manifest_path.parent / f"{rendered.manifest_sha256}.jsonl"
+    tampered_manifest.write_bytes(rendered.content)
+    return tampered_manifest
+
+
 def test_audit_reports_unknown_lanes_collisions_and_prospective_status(tmp_path: Path) -> None:
     manifest_path = _write_fixture(tmp_path)
 
@@ -139,3 +186,23 @@ def test_audit_rejects_content_addressed_event_hash_drift(tmp_path: Path) -> Non
 
     with pytest.raises(ValueError, match="content hash"):
         run_reference_lane_audit(manifest_path)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "simfile_id",
+        "selected_chart_key",
+        "selected_chart_content_hash",
+        "source_audio_key",
+        "source_audio_content_hash",
+    ],
+)
+def test_audit_rejects_rehashed_event_identity_mismatch(tmp_path: Path, field: str) -> None:
+    manifest_path = _write_fixture(tmp_path)
+    tampered_manifest = _rehashed_identity_manifest(manifest_path, field)
+
+    from tools.hpa324.analyze_reference_lanes import run_reference_lane_audit
+
+    with pytest.raises(ValueError, match="identity"):
+        run_reference_lane_audit(tampered_manifest)

@@ -71,9 +71,26 @@ def run_reference_lane_audit(manifest_path: Path) -> dict[str, Any]:
         if view.reference_events_cache_path is None:
             raise ValueError(f"ready row {view.simfile_id} has no reference event artifact")
         events = _read_event_artifact(manifest_path, view.reference_events_cache_path)
-        if any(event.simfile_id != view.simfile_id for event in events):
+        expected_identity = (
+            view.simfile_id,
+            loaded_row.source_row["selected_chart_key"],
+            loaded_row.source_row["selected_chart_content_hash"],
+            view.source_audio_key,
+            view.source_audio_content_hash,
+        )
+        if any(
+            (
+                event.simfile_id,
+                event.selected_chart_key,
+                event.selected_chart_content_hash,
+                event.source_audio_key,
+                event.source_audio_content_hash,
+            )
+            != expected_identity
+            for event in events
+        ):
             raise ValueError(
-                f"reference event artifact identity does not match simfile {view.simfile_id}"
+                f"reference event artifact identity does not match timing row {view.simfile_id}"
             )
 
         for event in events:
