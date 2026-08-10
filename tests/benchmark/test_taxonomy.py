@@ -5,6 +5,7 @@ from src.benchmark.prediction_artifact import OAF_GROUP_IDS
 from src.benchmark.taxonomy import (
     DETAILED_TO_COMMON,
     DTX_LANE_MAP,
+    IGNORED_NON_DRUM_LANES,
     OAF_PREDICTION_MAP,
     ClassMapping,
     DetailedDrumClass,
@@ -49,6 +50,10 @@ def test_dtx_lane_map_uses_frozen_detailed_and_common_classes() -> None:
     for mapping in DTX_LANE_MAP.values():
         if mapping.canonical_class is not None:
             assert mapping.common_class == project_to_common(mapping.canonical_class)
+
+
+def test_ignored_non_drum_lanes_match_reviewed_dtx_channels() -> None:
+    assert IGNORED_NON_DRUM_LANES == frozenset({"54", "C2"})
 
 
 def test_oaf_prediction_map_binds_to_locked_vocabulary() -> None:

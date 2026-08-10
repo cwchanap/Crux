@@ -81,7 +81,11 @@ DTX_LANE_MAP: Mapping[str, ClassMapping] = MappingProxyType(
 )
 
 DRUM_LANE_IDS: frozenset[str] = frozenset(DTX_LANE_MAP)
-IGNORED_NON_DRUM_LANES: frozenset[str] = frozenset()
+# DTXMania's channel enum identifies hexadecimal channel 0x54 as ``Movie`` and
+# 0xC2 as ``BeatLineDisplay``; neither is a playable drum lane.  The HPA-323
+# corpus audit observed both channels, so retain them as explicit non-drum
+# exclusions rather than treating them as unresolved taxonomy gaps.
+IGNORED_NON_DRUM_LANES: frozenset[str] = frozenset({"54", "C2"})
 
 OAF_PREDICTION_MAP = PredictionMap(
     map_id=OAF_PREDICTION_MAP_ID,
