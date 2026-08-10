@@ -888,6 +888,40 @@ def test_read_reference_events_round_trips_rendered_content() -> None:
     assert render_reference_events(events) == content
 
 
+def test_read_reference_events_round_trips_base36_note_id() -> None:
+    event = NativeReferenceEvent(
+        source_order=0,
+        measure=1,
+        position=0.5,
+        lane_id="14",
+        note_id="0L",
+        chart_time_sec=2.5,
+        audio_time_sec=1.5,
+        **_IDENTITY_KWARGS,  # type: ignore[arg-type]
+    )
+    content = render_reference_events((event,))
+
+    assert read_reference_events(content) == (event,)
+    assert b'"note_id":"0L"' in content
+
+
+@pytest.mark.parametrize("note_id", ["0l", "0/", "000"])
+def test_read_reference_events_rejects_noncanonical_dtx_note_id(note_id: str) -> None:
+    event = NativeReferenceEvent(
+        source_order=0,
+        measure=1,
+        position=0.5,
+        lane_id="14",
+        note_id=note_id,
+        chart_time_sec=2.5,
+        audio_time_sec=1.5,
+        **_IDENTITY_KWARGS,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ValueError):
+        read_reference_events(render_reference_events((event,)))
+
+
 @pytest.mark.parametrize(
     "content_builder",
     [
@@ -1130,9 +1164,9 @@ def test_validate_reference_event_golden_rejects_non_canonical_bytes() -> None:
         ("position", Decimal("-0.1")),
         ("position", Decimal("1.0")),
         ("lane_id", "1"),
-        ("lane_id", "GG"),
+        ("lane_id", "G_"),
         ("note_id", "000"),
-        ("note_id", "GG"),
+        ("note_id", "0/"),
         ("selected_chart_key", "../escape.dtx"),
         ("selected_chart_key", "/42/real.dtx"),
         ("selected_chart_key", "42\\real.dtx"),
@@ -1149,6 +1183,16 @@ def test_validate_reference_event_golden_rejects_invalid_identity_fields(
     content = canonical_json_bytes(row, trailing_newline=True)
 
     with pytest.raises(ValueError):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)
+
+
+@pytest.mark.parametrize("field", ["lane_id", "note_id"])
+def test_validate_reference_event_golden_rejects_lowercase_dtx_ids(field: str) -> None:
+    row = _golden_event_row()
+    row[field] = "0l"
+    content = canonical_json_bytes(row, trailing_newline=True)
+
+    with pytest.raises(ValueError, match="uppercase base-36"):
         validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)
 
 
