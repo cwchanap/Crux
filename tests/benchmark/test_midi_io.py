@@ -2,7 +2,11 @@ from pathlib import Path
 
 import pretty_midi
 
-from src.benchmark.midi_io import parse_prediction_midi, write_reference_midi
+from src.benchmark.midi_io import (
+    REFERENCE_CLASS_TO_MIDI,
+    parse_prediction_midi,
+    write_reference_midi,
+)
 from src.benchmark.models import BenchmarkEvent
 
 
@@ -33,6 +37,25 @@ def test_write_reference_midi_handles_simultaneous_hits(tmp_path: Path):
     parsed = pretty_midi.PrettyMIDI(str(path))
     notes = sorted(note.pitch for note in parsed.instruments[0].notes)
     assert notes == [36, 38]
+
+
+def test_reference_midi_uses_frozen_floor_tom_name() -> None:
+    assert REFERENCE_CLASS_TO_MIDI["low_or_floor_tom"] == 45
+    assert "low_tom" not in REFERENCE_CLASS_TO_MIDI
+
+
+def test_write_reference_midi_writes_low_or_floor_tom_without_warning(tmp_path: Path, caplog):
+    import logging
+
+    path = tmp_path / "reference.mid"
+    events = [BenchmarkEvent("song", 0.0, "low_or_floor_tom", "ground_truth")]
+
+    with caplog.at_level(logging.WARNING, logger="src.benchmark.midi_io"):
+        write_reference_midi(events, path)
+
+    assert "Skipping unmapped canonical class" not in caplog.text
+    parsed = pretty_midi.PrettyMIDI(str(path))
+    assert [note.pitch for note in parsed.instruments[0].notes] == [45]
 
 
 def test_write_reference_midi_skips_unmapped_classes_with_warning(tmp_path: Path, caplog):

@@ -1,14 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
 from src.benchmark.models import BenchmarkEvent
+from src.benchmark.taxonomy import DRUM_LANE_IDS as _DRUM_LANE_IDS
+from src.benchmark.taxonomy import DTX_LANE_MAP, ClassMapping, DetailedDrumClass
 
-
-@dataclass(frozen=True)
-class DtxClassMapping:
-    collapsed_class: str
-    native_class: str
+DRUM_LANE_IDS = _DRUM_LANE_IDS
 
 
 @dataclass(frozen=True)
@@ -16,30 +15,14 @@ class MappingDiagnostics:
     unmapped: dict[str, int]
 
 
-DEFAULT_DTX_LANE_MAP: dict[str, DtxClassMapping] = {
-    "11": DtxClassMapping("closed_hihat", "closed_hihat"),
-    "12": DtxClassMapping("snare", "snare"),
-    "13": DtxClassMapping("kick", "kick"),
-    "14": DtxClassMapping("high_tom", "high_tom"),
-    "15": DtxClassMapping("low_tom", "low_tom"),
-    "16": DtxClassMapping("crash", "crash"),
-    "17": DtxClassMapping("low_tom", "floor_tom"),
-    "18": DtxClassMapping("open_hihat", "open_hihat"),
-    "19": DtxClassMapping("ride", "ride"),
-    "1A": DtxClassMapping("crash", "left_cymbal"),
-    "1B": DtxClassMapping("closed_hihat", "pedal_hihat"),
-    "1C": DtxClassMapping("kick", "left_kick"),
-}
-DRUM_LANE_IDS = frozenset(DEFAULT_DTX_LANE_MAP)
-
-DEFAULT_MIDI_NOTE_MAP: dict[int, str] = {
+DEFAULT_MIDI_NOTE_MAP: dict[int, DetailedDrumClass] = {
     36: "kick",
     38: "snare",
-    41: "low_tom",
+    41: "low_or_floor_tom",
     42: "closed_hihat",
-    45: "low_tom",
+    45: "low_or_floor_tom",
     46: "open_hihat",
-    47: "low_tom",
+    47: "low_or_floor_tom",
     49: "crash",
     50: "high_tom",
     51: "ride",
@@ -48,9 +31,9 @@ DEFAULT_MIDI_NOTE_MAP: dict[int, str] = {
 
 def map_dtx_events(
     events: list[BenchmarkEvent],
-    lane_map: dict[str, DtxClassMapping] | None = None,
+    lane_map: Mapping[str, ClassMapping] | None = None,
 ) -> tuple[list[BenchmarkEvent], MappingDiagnostics]:
-    lane_map = DEFAULT_DTX_LANE_MAP if lane_map is None else lane_map
+    lane_map = DTX_LANE_MAP if lane_map is None else lane_map
     mapped: list[BenchmarkEvent] = []
     unmapped: dict[str, int] = {}
     for event in events:
@@ -62,12 +45,12 @@ def map_dtx_events(
         metadata = {
             **event.metadata,
             "lane_id": lane_id,
-            "native_class": class_mapping.native_class,
+            "common_class": class_mapping.common_class,
         }
         mapped.append(
             replace(
                 event,
-                canonical_class=class_mapping.collapsed_class,
+                canonical_class=class_mapping.canonical_class,
                 metadata=metadata,
             )
         )
@@ -76,7 +59,7 @@ def map_dtx_events(
 
 def map_midi_events(
     events: list[BenchmarkEvent],
-    note_map: dict[int, str] | None = None,
+    note_map: Mapping[int, DetailedDrumClass] | None = None,
 ) -> tuple[list[BenchmarkEvent], MappingDiagnostics]:
     note_map = DEFAULT_MIDI_NOTE_MAP if note_map is None else note_map
     mapped: list[BenchmarkEvent] = []
