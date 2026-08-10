@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from src.benchmark.reference_set import (
     CommonReferenceEvent,
     MappedReferenceEvent,
@@ -82,6 +84,18 @@ def test_map_reference_events_reports_unknown_and_ignored_without_mutating_sourc
     assert result.diagnostics.unmapped == {"ZZ": 1}
     assert result.diagnostics.ignored == {"2A": 1}
     assert result.diagnostics.duplicate_common_event_count == 0
+
+
+def test_map_reference_events_diagnostics_are_immutable() -> None:
+    result = map_reference_events(
+        (native_event("ZZ", 1.0), native_event("2A", 2.0)),
+        ignored_lanes=frozenset({"2A"}),
+    )
+
+    with pytest.raises(TypeError):
+        result.diagnostics.unmapped["ZZ"] = 2
+    with pytest.raises(TypeError):
+        result.diagnostics.ignored["2A"] = 2
 
 
 def test_project_common_reference_events_collapses_only_exact_time_and_class() -> None:

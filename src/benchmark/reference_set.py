@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
+from types import MappingProxyType
 
 from src.benchmark.reference_timing import NativeReferenceEvent
 from src.benchmark.taxonomy import (
@@ -98,8 +99,8 @@ def map_reference_events(
     mapped = tuple(mapped_events)
     common = project_common_reference_events(mapped)
     diagnostics = ReferenceMappingDiagnostics(
-        unmapped=dict(sorted(unmapped.items())),
-        ignored=dict(sorted(ignored.items())),
+        unmapped=MappingProxyType(dict(sorted(unmapped.items()))),
+        ignored=MappingProxyType(dict(sorted(ignored.items()))),
         duplicate_common_event_count=sum(len(event.source_events) - 1 for event in common),
     )
     return ReferenceMappingResult(
