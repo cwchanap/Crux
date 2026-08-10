@@ -36,13 +36,22 @@ _COMPONENT_CONTENT = {
     "model.ckpt-569400.index": b"index-component",
     "model.ckpt-569400.meta": b"meta-component",
 }
+_CHECKPOINT_POINTER = (
+    b'model_checkpoint_path: "model.ckpt-569400"\nall_model_checkpoint_paths: "model.ckpt-569400"\n'
+)
 
 
-def _synthetic_archive(tmp_path: Path) -> tuple[Path, OafModelConfig]:
+def _synthetic_archive(
+    tmp_path: Path,
+    *,
+    pointer: bytes | None = _CHECKPOINT_POINTER,
+) -> tuple[Path, OafModelConfig]:
     archive = tmp_path / "checkpoint.zip"
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as output:
         for name, content in _COMPONENT_CONTENT.items():
             output.writestr(name, content)
+        if pointer is not None:
+            output.writestr("checkpoint", pointer)
     archive_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
     config = OafModelConfig(
         backend_id="test-backend",
@@ -179,6 +188,38 @@ def test_prepare_oaf_checkpoint_publishes_verified_local_archive(tmp_path: Path)
 
     assert result == tmp_path / "cache" / "sha256" / config.checkpoint.archive_sha256
     assert {path.name: path.read_bytes() for path in result.iterdir()} == _COMPONENT_CONTENT
+
+
+def test_prepare_oaf_checkpoint_accepts_and_validates_checkpoint_pointer(
+    tmp_path: Path,
+) -> None:
+    archive, config = _synthetic_archive(tmp_path, pointer=_CHECKPOINT_POINTER)
+
+    result = prepare_oaf_checkpoint(
+        config,
+        tmp_path / "cache",
+        download=False,
+        archive_path=archive,
+    )
+
+    assert {path.name: path.read_bytes() for path in result.iterdir()} == _COMPONENT_CONTENT
+
+
+def test_prepare_oaf_checkpoint_rejects_noncanonical_checkpoint_pointer(
+    tmp_path: Path,
+) -> None:
+    archive, config = _synthetic_archive(
+        tmp_path,
+        pointer=b'model_checkpoint_path: "model.ckpt-123"\n',
+    )
+
+    with pytest.raises(CheckpointAcquisitionError, match="checkpoint pointer"):
+        prepare_oaf_checkpoint(
+            config,
+            tmp_path / "cache",
+            download=False,
+            archive_path=archive,
+        )
 
 
 def test_prepare_oaf_checkpoint_verify_only_reuses_existing_cache(tmp_path: Path) -> None:

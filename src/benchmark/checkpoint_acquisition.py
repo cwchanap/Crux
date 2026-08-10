@@ -87,6 +87,10 @@ _EVIDENCE_KEYS = frozenset(
         "cache_path",
     }
 )
+_CHECKPOINT_POINTER_NAME = "checkpoint"
+_EXPECTED_CHECKPOINT_POINTER = (
+    b'model_checkpoint_path: "model.ckpt-569400"\nall_model_checkpoint_paths: "model.ckpt-569400"\n'
+)
 
 
 class CheckpointAcquisitionError(ValueError):
@@ -476,13 +480,18 @@ def _read_checkpoint_components(
         with zipfile.ZipFile(io.BytesIO(archive)) as source:
             infos = source.infolist()
             names = [info.filename for info in infos]
-            if len(names) != len(set(names)) or set(names) != set(expected):
+            expected_names = set(expected) | {_CHECKPOINT_POINTER_NAME}
+            if len(names) != len(set(names)) or set(names) != expected_names:
                 raise CheckpointAcquisitionError("checkpoint archive members differ")
             components: dict[str, bytes] = {}
             for info in infos:
                 if not _safe_zip_name(info.filename) or info.is_dir():
                     raise CheckpointAcquisitionError("checkpoint archive member is unsafe")
                 content = source.read(info)
+                if info.filename == _CHECKPOINT_POINTER_NAME:
+                    if content != _EXPECTED_CHECKPOINT_POINTER:
+                        raise CheckpointAcquisitionError("checkpoint pointer differs")
+                    continue
                 if hashlib.sha256(content).hexdigest() != expected[info.filename]:
                     raise CheckpointAcquisitionError("checkpoint component hash differs")
                 components[info.filename] = content
