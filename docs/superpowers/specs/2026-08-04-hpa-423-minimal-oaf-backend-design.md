@@ -21,6 +21,8 @@ The implementation is primarily **subtraction and extraction**:
 - keep the existing prediction artifact as the persistence seam, but advance it to v2;
 - remove sealing, attestation, verification reports, lock state, heuristic fallback, calibration publication, and protocol hardening that are not needed for a hobby benchmark.
 
+The replacement is staged so each committed task remains import-clean and repository-testable. Independently dead outer seal estate is removed first, but shared types/modules that still have live consumers are cut over only once their replacements exist. This staging is not backward compatibility: no old interface or artifact reader remains in the final state.
+
 ## Current Repository State
 
 The planning baseline already contains most of the raw mechanisms, but they are trapped behind the old seal lifecycle.
@@ -81,6 +83,7 @@ HPA-423 will extract only the still-needed generic file/publication helpers into
 5. **Persist scoreable predictions once.** HPA-326 must not need to rerun expensive inference because class mapping was omitted from the artifact.
 6. **Scale only from measurements.** One sequential worker is the default until HPA-326 runtime evidence shows otherwise.
 7. **Prefer direct failures over policy frameworks.** Expected development failures should be understandable without custom attestation/error taxonomies.
+8. **Keep intermediate commits healthy.** A task may use focused RED/GREEN tests while being developed, but its commit must not intentionally leave live imports or the repository suite broken for a later task to repair.
 
 ## Target Architecture
 
@@ -113,9 +116,16 @@ The host/backend boundary ends at native prediction. Taxonomy policy stays outsi
 
 ## 1. Remove the Seal Lifecycle from the Active Architecture
 
-Deletion starts before new benchmark behavior is built because the old path cannot instantiate the official backend anyway.
+Cleanup is **outer-estate first, shared-contract cutover once**.
 
-### Delete outright
+The HPA-320 workflows/tools/calibration/publication pieces that have no retained live import are removed as soon as import/call-site search proves them unreachable. By contrast, shared seal-shaped types/modules such as `NativePrediction` lock fields, `prediction_artifact.py`, the old OaF adapter, `transcription.py`, and `backend_process.py` remain temporarily only while they are still live imports. They are removed together in one breaking cutover after the replacement model/worker/adapter/mapping components exist.
+
+This avoids two bad outcomes at once:
+
+- preserving the old architecture as compatibility baggage; and
+- committing a branch where ordinary imports/full tests stay red for several later tasks.
+
+### Delete outright when unreachable
 
 After import/call-site search proves each item is no longer referenced by retained code, remove:
 
@@ -129,7 +139,8 @@ After import/call-site search proves each item is no longer referenced by retain
 - the report/verification-heavy `src/benchmark/transcription.py` path and its old CLI commands;
 - runtime calibration/candidate/attestation manifests and entrypoints that are not required by inference;
 - seal/schema goldens and tests that exist only for the removed lifecycle;
-- the old `src/benchmark/backends/oaf_tf1.py` after the new adapter owns active OaF creation.
+- the old `src/benchmark/backends/oaf_tf1.py` after the new adapter owns active OaF creation;
+- the old seal-oriented `src/benchmark/backend_process.py` after the new small worker-process helper owns active process control.
 
 Git history is the archive. No compatibility readers remain.
 
@@ -141,19 +152,21 @@ Two old modules contain useful non-seal mechanics.
 
 Create a neutral `src/benchmark/artifact_io.py` containing only the retained generic responsibilities currently used outside sealing:
 
-- `DirectoryAnchor` if the active caller still needs it after simplification;
+- `DirectoryAnchor` only if an active caller still needs it after simplification;
 - `read_regular_file_no_follow()`;
 - a small immutable-file publisher used by prediction artifacts.
 
-Move `PublishedArtifact` out of the backend contract if a publisher result type is still useful.
+Move `PublishedArtifact` out of the backend contract if a publisher result type is still useful. If it becomes the simple `(path, sha256)` result, update `publish_prediction_artifact()` in the same extraction so no retained call keeps the old `role=` or seal-specific anchor arguments.
 
 Do not carry over directory transaction, attestation, rollback, or seal-publication machinery unless an active retained caller demonstrably requires it.
 
-#### `backend_prepare.py`
+The old `backend_publication.py` may remain temporarily for old HPA-320 callers until the atomic backend cutover; the final active callers must use `artifact_io.py` only.
 
-The existing checkpoint download/extract/hash logic is useful; its lock/evidence/publication framework is not.
+#### `checkpoint_acquisition.py` and `backend_prepare.py`
 
-Move the minimum released-checkpoint acquisition behavior into `checkpoint_acquisition.py`, then delete `backend_prepare.py`.
+`src/benchmark/checkpoint_acquisition.py` already exists and already owns the released archive/component identities plus request/evidence loading. Do **not** create a second acquisition path beside it.
+
+Simplify the existing `checkpoint_acquisition.py` in place around `runtime/oaf_tf1/model.json`, reusing only the useful download/extract/hash mechanics from `backend_prepare.py`. Remove request/evidence/backend-lock/publication concepts from the retained path. Delete `backend_prepare.py` only after its old OaF caller is removed at cutover.
 
 The new path verifies:
 
@@ -165,7 +178,9 @@ It does not publish acquisition evidence, use a backend lock, or implement atomi
 
 ## 2. Minimal Shared Backend Contract
 
-Keep `src/benchmark/backends/base.py`, but reduce it to transcription-domain types.
+Keep `src/benchmark/backends/base.py`, but reduce it to transcription-domain types **at the atomic backend cutover**, not earlier while live consumers still construct/read the seal-shaped `NativePrediction`.
+
+The cutover commit updates or removes every active constructor/reader/import of the removed fields and verification types in the same change. No committed task intentionally leaves `prediction_artifact.py`, `transcription.py`, the old OaF adapter, or process/report modules importing removed names.
 
 ### `CanonicalAudio`
 
@@ -379,9 +394,9 @@ Keep basic request IDs and malformed-response detection because they make failur
 
 ## 7. Small Host Process Wrapper and OaF Adapter
 
-Shrink `src/benchmark/backend_process.py` to a private line-JSON process helper rather than preserving its host-evidence/protocol-security framework.
+Add a new small private line-JSON process helper alongside the old seal-oriented `backend_process.py` while the old adapter still imports it. The target helper may be named `worker_process.py`; it becomes the only process helper after cutover and the old `backend_process.py` is deleted.
 
-It only needs to:
+The new helper only needs to:
 
 - start the worker/container with stdin/stdout/stderr pipes;
 - read the ready line;
@@ -391,7 +406,7 @@ It only needs to:
 
 No worker pools or concurrent in-flight requests are added.
 
-Create `src/benchmark/backends/oaf.py` as the active adapter. It owns:
+Create `src/benchmark/backends/oaf.py` at the atomic backend cutover. It owns:
 
 - checking that `CanonicalAudio.path` is under the configured input root;
 - starting the fixed local OaF image/container;
@@ -408,7 +423,7 @@ The adapter does not own taxonomy policy, corpus traversal, retries, resume logi
 
 ## 8. Static Backend Selection, No Heuristic
 
-Keep `backend_registry.py`, but reduce it to a small static factory map.
+At the atomic backend cutover, reduce `backend_registry.py` to a small static factory map.
 
 Conceptually:
 
@@ -429,17 +444,30 @@ HPA-324 owns:
 - `src/benchmark/taxonomy.py`;
 - detailed/common taxonomy;
 - `ClassMapping` / `PredictionMap` data structures;
+- `PredictionMap.backend_id` as the backend/native-output identity selector;
 - `OAF_PREDICTION_MAP_ID = "crux.prediction-map/oaf-egmd-8hit-v1"`;
 - the frozen OaF group-to-class table.
 
 HPA-423 owns:
 
 - applying the OaF map to native predictions;
+- validating the map applies to the descriptor;
 - carrying map identity into every persisted event;
 - prediction artifact v2 serialization/deserialization;
 - scorer input conversion.
 
 Do not duplicate HPA-324 taxonomy constants in HPA-423.
+
+### Map identity rule
+
+Before lookup, HPA-423 validates exactly:
+
+```python
+prediction.descriptor.payload["backend_id"] == prediction_map.backend_id
+prediction.descriptor.payload["native_output_space_id"] == prediction_map.native_output_space_id
+```
+
+The checkpoint descriptor field `model_id=magenta-egmd-ckpt-569400-v1` is separate and is **not** compared to `PredictionMap.backend_id`.
 
 ### OaF lookup key
 
@@ -513,13 +541,17 @@ Replace the unconditional exception in `scorer_input.py`.
 
 `read_scorer_events()` reads prediction artifact v2 and returns only mapped events as `BenchmarkEvent` instances using the persisted **common class** as the scorer class.
 
+The existing `BenchmarkEvent.canonical_class` field is therefore a compatibility-shaped scorer field name: on this prediction bridge it contains the **common comparison class**, not HPA-324's detailed canonical class. The detailed value, when present, is retained only as `metadata["detailed_canonical_class"]`.
+
+HPA-325 must treat prediction `BenchmarkEvent.canonical_class` and reference `CommonReferenceEvent.common_class` as the same headline class level. HPA-325 must not reinterpret `BenchmarkEvent.canonical_class` as the detailed taxonomy or derive common class from it.
+
 The scorer path has no OaF-specific branch. Native/detailed identities are retained in metadata for diagnosis.
 
 Unmapped events are not fabricated into a score class; their presence remains visible in the prediction artifact and mapping diagnostics.
 
 ## 12. Checkpoint Preparation Command
 
-Keep the existing `prepare-backend` command name but simplify its contract.
+Keep the existing `prepare-backend` command name but simplify its contract around the rewritten-in-place `src/benchmark/checkpoint_acquisition.py`.
 
 Target usage:
 
@@ -641,11 +673,11 @@ Keep ordinary tests fast; the real checkpoint runs only in the manual smoke work
 
 ### Contract/registry tests
 
-- backend protocol has only descriptor/transcribe/close;
+- backend protocol has only descriptor/transcribe/close after the cutover;
 - four `CanonicalAudio` identity fields remain;
 - registry selects `oaf`;
 - unknown backend fails;
-- no seal/heuristic constants remain.
+- no seal/heuristic constants remain after the cutover.
 
 ### Model/config tests
 
@@ -670,13 +702,15 @@ Keep ordinary tests fast; the real checkpoint runs only in the manual smoke work
 
 ### Mapping/artifact tests
 
+- map backend/native-output identity is validated before lookup;
 - kick/snare mapped event;
 - OaF hi-hat maps to `canonical_class=None`, `common_class="hihat"`;
 - OaF tom maps to `canonical_class=None`, `common_class="tom"`;
 - `sticks` persists as unmapped;
 - every event records `prediction_map_version`;
 - native fields survive write/read exactly;
-- scorer input uses persisted common class without an OaF branch.
+- scorer input uses persisted common class without an OaF branch;
+- scorer bridge stores detailed canonical identity only in metadata.
 
 ### CLI/workflow tests
 
@@ -684,29 +718,34 @@ Keep ordinary tests fast; the real checkpoint runs only in the manual smoke work
 - `smoke-backend` works with a fake backend and writes one prediction artifact/summary;
 - workflow has one job, no custom dispatch inputs, no attestation permissions, one build, one smoke invocation, and one uploaded prediction artifact.
 
+### Commit health
+
+Every task commit runs its focused tests and a repository import/full-test gate appropriate to the touched surface. A task may not intentionally defer broken imports/constructors to a later task. The atomic cutover is one task precisely because the contract, adapter, registry, prediction persistence, scorer bridge, and old live consumers change together.
+
 ## Implementation Order
 
-The implementation order is intentionally different from the original August 4 draft.
+The implementation order is intentionally different from the original August 4 draft and from the earlier over-aggressive contract-first revision.
 
-1. **Shrink active shared contracts and remove immediately unreachable seal/report/heuristic surfaces.**
-2. **Extract generic artifact I/O and simple checkpoint acquisition, then delete their seal-oriented containers.**
-3. **Advance prediction mapping/persistence to the HPA-324 v2 common-class contract.** This task may land only when HPA-324's `taxonomy.py` contract is available; do not create a second taxonomy as a workaround.
-4. **Extract the OaF model engine and simplify the container.**
-5. **Replace the sealed worker/process protocol with the small persistent sequential worker.**
-6. **Add the new OaF host adapter and make it the only registry OaF path.**
+1. **Prune independently dead outer HPA-320 estate and heuristic-only surfaces without changing shared backend/prediction types that still have live consumers.**
+2. **Extract generic artifact I/O and simplify the existing `checkpoint_acquisition.py` in place around `model.json`.** Keep old `backend_publication.py`/`backend_prepare.py` only while old live callers still need them.
+3. **Extract the OaF model engine and simplify the container build context.** Keep the old runtime backend only as extraction source until cutover.
+4. **Add the new small persistent worker and a new small host worker-process helper alongside the old seal-oriented process controller.**
+5. **Add the pure HPA-324 OaF prediction mapper against the still-existing `NativePrediction` fields it actually consumes.** Do not rewrite persistence yet.
+6. **Perform one atomic backend cutover:** shrink shared backend types/descriptor, create and activate `backends/oaf.py`, reduce registry to `oaf`, advance prediction artifact to v2, un-stub scorer input, update the prediction publisher to neutral artifact I/O, remove old `transcription.py`/OaF adapter/process/lock/report/attestation/preparation/publication live paths, and update all affected tests in the same commit.
 7. **Add simplified checkpoint/smoke CLI commands and the one manual workflow.**
-8. **Run the real checkpoint smoke.** If it fails, repair the new path. Do not restore the abandoned seal path.
-9. **Perform final import/call-site search and remove remaining unreachable HPA-320 seal files/tests.**
+8. **Perform final import/call-site cleanup, repository verification, and final image build.**
+9. **Run the real released-checkpoint smoke.** If it fails, repair the new path. Do not restore the abandoned seal path.
 
-This sequencing keeps deletion first while retaining the few old files that must temporarily serve as extraction sources.
+This preserves subtraction-first intent without using knowingly broken intermediate commits as an implementation technique.
 
 ## HPA-324 Coordination
 
 HPA-423 and HPA-324 may be implemented in parallel, but their merge boundary is explicit:
 
 - HPA-324 can implement taxonomy/reference eligibility independently.
-- HPA-423 can implement cleanup, config/checkpoint, model, worker, and adapter independently.
-- HPA-423's prediction-mapping/artifact-v2 acceptance requires the HPA-324 `PredictionMap`/OaF map contract.
+- HPA-423 can implement outer cleanup, config/checkpoint, model, and worker independently.
+- HPA-423's mapper requires the HPA-324 `PredictionMap.backend_id`/native-output contract and OaF map data.
+- HPA-423's artifact-v2/scorer cutover consumes that mapper in the same breaking cutover commit.
 - HPA-326 must not start until the real OaF-shaped hi-hat/tom v2 round-trip passes and HPA-423's real smoke passes.
 
 Do not duplicate temporary taxonomy/map constants in HPA-423 to avoid this coordination point.
@@ -729,7 +768,7 @@ It must reuse the HPA-423 OaF adapter, persistent worker, prediction mapper, and
 - per-class/per-song/aggregate reports;
 - score cohort semantics.
 
-It consumes HPA-423 scorer input and HPA-324 reference common projection.
+It consumes HPA-423 scorer input and HPA-324 reference common projection. For prediction-side `BenchmarkEvent`, `canonical_class` means the **common scoring class**; any detailed canonical prediction identity is diagnostic metadata only. HPA-325 must not mix the detailed and common levels.
 
 ### HPA-328 owns
 
@@ -760,19 +799,24 @@ HPA-423 does not implement:
 ## Acceptance Criteria
 
 - [ ] Active shared backend types contain only backend identity, the four audio identity fields, native prediction events, transcription, and cleanup.
+- [ ] The shared-contract removal lands atomically with every active constructor/reader/import updated or removed; no committed task intentionally leaves the live repository broken for a later task.
 - [ ] `verify()`, `BackendVerification`, `TensorCoverageCheck`, `SmokeCheck`, shared lock hashes, seal state, and heuristic registry support are removed.
 - [ ] `OAF_BACKEND_ID` remains `magenta-egmd-tf1-94529798-8hit-v1`; the short registry key `oaf` cannot fall back to another backend.
 - [ ] Generic artifact I/O still required by active benchmark modules is extracted from `backend_publication.py`; the seal-oriented remainder is removed.
+- [ ] `publish_prediction_artifact()` uses the neutral artifact publisher and no retained call requires the removed `PublishedArtifact.role`/`role=` contract.
 - [ ] One `runtime/oaf_tf1/model.json` is the single source for OaF model/checkpoint identities.
+- [ ] Existing `src/benchmark/checkpoint_acquisition.py` is simplified in place; no second checkpoint-acquisition implementation remains.
 - [ ] Checkpoint archive SHA-256 and all required component hashes are verified without backend/seal locks or acquisition-evidence publication.
 - [ ] OaF graph/checkpoint/inference code is isolated in `runtime/oaf_tf1/model.py` from GitHub, sealing, attestation, and corpus orchestration.
 - [ ] All 78 required inference tensors restore before the worker announces ready.
 - [ ] One persistent worker loads the model once and serves at least two sequential mocked requests in tests.
 - [ ] One small host adapter returns native predictions and is the only active OaF registry implementation.
+- [ ] OaF prediction mapping validates `PredictionMap.backend_id` against descriptor `backend_id` and validates `native_output_space_id`; descriptor checkpoint `model_id` is not misused as the map selector.
 - [ ] Prediction artifact v2 persists `canonical_class`, `common_class`, `mapping_status`, and non-null `prediction_map_version` while preserving native event identity.
 - [ ] Real OaF-shaped hi-hat and tom events round-trip with `common_class="hihat"` and `common_class="tom"` respectively.
 - [ ] Unmapped OaF events remain persisted and counted rather than silently dropped.
 - [ ] `scorer_input.py` returns mapped `BenchmarkEvent` values using persisted common class and contains no OaF-specific scoring branch.
+- [ ] HPA-325 treats prediction `BenchmarkEvent.canonical_class` as the common scoring class and detailed prediction class only as diagnostic metadata.
 - [ ] `crux benchmark prepare-backend --backend oaf --download` verifies/prepares the released checkpoint with the simplified contract.
 - [ ] `crux benchmark smoke-backend --backend oaf` uses the normal adapter/worker, writes one v2 prediction artifact, and reports elapsed time plus real-time factor.
 - [ ] `.github/workflows/oaf-smoke.yml` has no custom inputs, one Ubuntu 24.04 job, one image build, one real inference, one uploaded prediction artifact, and no attestation/signing path.
