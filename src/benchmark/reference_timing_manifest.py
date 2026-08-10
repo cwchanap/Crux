@@ -417,12 +417,18 @@ def _reference_timing_row_view_from_row(
 
 
 def load_reference_timing_manifest(path: Path) -> LoadedReferenceTimingManifest:
-    """Load immutable HPA-323 timing rows for read-only downstream consumers."""
+    """Load immutable HPA-323 timing rows for read-only downstream consumers.
+
+    Every row passes the persisted HPA-323 validator before the narrow HPA-324
+    view is built.  The golden validator is intentionally not used here because
+    its fixed two-row ready/quarantined rule only applies to the schema golden.
+    """
     rows: list[LoadedReferenceTimingRow] = []
     simfile_ids: set[int] = set()
 
     def validate_rows(source_rows: tuple[Mapping[str, object], ...]) -> None:
         for source_row in source_rows:
+            _validate_timing_manifest_row(source_row)
             view = _reference_timing_row_view_from_row(source_row)
             if view.simfile_id in simfile_ids:
                 raise ValueError("reference timing manifest contains duplicate simfile IDs")

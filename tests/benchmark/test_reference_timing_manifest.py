@@ -392,6 +392,38 @@ def test_timing_manifest_loader_retains_immutable_source_rows(tmp_path: Path) ->
         loaded.rows[0].source_row["simfile_id"] = 99  # type: ignore[index]
 
 
+def test_timing_manifest_loader_rejects_invalid_timing_semantics_version(
+    tmp_path: Path,
+) -> None:
+    fixture = _timing_manifest_fixture(tmp_path)
+    rows = [dict(row) for row in fixture.rows]
+    rows[0]["timing_semantics_version"] = "crux.wrong/v1"
+    normalized = tuple(
+        {key: value for key, value in row.items() if key != "corpus_version"} for row in rows
+    )
+    path = tmp_path / "invalid-timing-semantics.jsonl"
+    path.write_bytes(render_manifest(normalized).content)
+
+    with pytest.raises(ValueError, match="semantics version"):
+        load_reference_timing_manifest(path)
+
+
+def test_timing_manifest_loader_rejects_invalid_hpa322_passthrough_field(
+    tmp_path: Path,
+) -> None:
+    fixture = _timing_manifest_fixture(tmp_path)
+    rows = [dict(row) for row in fixture.rows]
+    rows[0]["selected_chart_key"] = "../escape.dtx"
+    normalized = tuple(
+        {key: value for key, value in row.items() if key != "corpus_version"} for row in rows
+    )
+    path = tmp_path / "invalid-hpa322-passthrough.jsonl"
+    path.write_bytes(render_manifest(normalized).content)
+
+    with pytest.raises(ValueError, match="reference chart payload"):
+        load_reference_timing_manifest(path)
+
+
 @pytest.mark.parametrize(
     ("row_index", "mutation"),
     [
@@ -431,8 +463,7 @@ def test_timing_manifest_loader_reuses_timing_status_shape(
 
 def test_timing_manifest_loader_rejects_duplicate_simfile_ids(tmp_path: Path) -> None:
     fixture = _timing_manifest_fixture(tmp_path)
-    rows = [dict(row) for row in fixture.rows]
-    rows[1]["simfile_id"] = rows[0]["simfile_id"]
+    rows = [dict(fixture.rows[0]), dict(fixture.rows[0])]
     path = tmp_path / "duplicate-reference-timing.jsonl"
     normalized = tuple(
         {key: value for key, value in row.items() if key != "corpus_version"} for row in rows
