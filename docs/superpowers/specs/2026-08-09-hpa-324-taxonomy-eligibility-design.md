@@ -1,55 +1,57 @@
 # HPA-324: Versioned Drum Taxonomy, Mapping, and Eligibility Design
 
+**Issue:** HPA-324  
+**Status:** Revised after review  
+**Date:** 2026-08-09
+
 ## Context
 
-HPA-324 is the next unstarted Crux benchmark task that is ready.
+HPA-324 is the next unstarted Crux benchmark task that is ready:
 
-- HPA-322 is complete and publishes authoritative chart selection.
-- HPA-323 is complete and publishes audio-relative native reference events plus `crux.reference-timing-manifest/v1`.
-- HPA-324 is blocked only by HPA-322 and HPA-323, so both explicit blockers are satisfied.
-- HPA-324 blocks HPA-325 scoring, HPA-326 OaF corpus inference, and HPA-327 reviewed-subset work.
-- HPA-423 is already in progress and explicitly owns the `NativeEvent -> BenchmarkEvent` prediction-mapping mechanism; HPA-324 owns the taxonomy and mapping data that mechanism consumes.
+- HPA-322 is complete and selects authoritative DTX charts.
+- HPA-323 is complete and publishes audio-relative native DTX reference events plus `crux.reference-timing-manifest/v1`.
+- HPA-324 is blocked only by HPA-322 and HPA-323, so its explicit blockers are satisfied.
+- HPA-324 blocks HPA-325 scoring, HPA-326 OaF corpus inference, and HPA-327 reviewed-reference work.
+- HPA-423 is already in progress and owns prediction conversion mechanics. HPA-324 owns the taxonomy and mapping policy/data that HPA-423 must consume.
 
-The merged HPA-323 boundary is already sufficient:
+The repository already has the important persistence seams:
 
-- `reference_timing.py` publishes lossless `crux.dtx-reference-event/v1` JSONL with native DTX lane/note identity and audio-relative times;
-- `reference_timing_manifest.py` classifies rows as timing `ready` or `quarantined` and preserves HPA-322/HPA-321 lineage;
-- `mapping.py` still contains an unversioned legacy DTX/MIDI map;
-- `prediction_artifact.py` reserves canonical mapping fields but persists OaF native identity separately from its 8-hit group identity;
-- `scorer_input.py` remains intentionally blocked until HPA-423 supplies canonical prediction mapping.
+- `reference_timing.py` persists native DTX events with lane/note identity and audio-relative time.
+- `reference_timing_manifest.py` carries source/chart/audio lineage and `ready|quarantined` timing status.
+- `prediction_artifact.py` persists OaF native identity, including `native_class_id="midi_<note>"` and `native_metadata["upstream_8hit_group_id"]`.
+- `prediction_artifact.py` currently has `canonical_class`, `mapping_status`, and `prediction_map_version` fields, but **no common-class field**.
+- `scorer_input.py` is intentionally blocked until prediction mapping is available.
 
-HPA-324 builds on these seams. It does not add another corpus pipeline or model framework.
+HPA-324 should define the smallest stable taxonomy and reference-eligibility layer on top of those seams. It should not add another corpus pipeline or persist data that can be deterministically recomputed from already-persisted native events.
 
-## Requirement Clarification: Benchmark Target
+## Benchmark Target
 
-The Linear addendum is normative: the initial benchmark scores **onset time plus drum class**.
+The initial benchmark scores **onset time plus instrument class**.
 
-DTX `#WAVxx`, `#VOLUMExx`, sample choice, and chip identity are not trustworthy per-hit velocity ground truth. Therefore:
+DTX `#WAVxx`, `#VOLUMExx`, chip identity, and sample choice are not trustworthy per-hit performance-velocity ground truth. Therefore:
 
-- predicted velocity/confidence remains diagnostic metadata only;
-- DTX sample/note identity remains diagnostic metadata only;
+- predicted confidence and velocity remain diagnostic metadata only;
+- DTX `note_id` and sample metadata remain diagnostic identity only;
 - velocity is not part of reference eligibility or headline scoring;
-- a future velocity metric requires a separately reviewed reference and metric version.
+- a future velocity metric requires its own reviewed reference and versioned metric.
 
 ## Design Choice
 
-Use a **small code-defined versioned taxonomy and mapping-data layer**, plus one derived reference/eligibility stage.
+Use a **small code-defined taxonomy/mapping data layer** plus one derived eligibility manifest.
 
-Do not add YAML/JSON configuration frameworks, plugin discovery, databases, a mapping DSL, or model-registration infrastructure. These mappings are small reviewed benchmark policy. Python dataclasses/constants plus stable version IDs are the smallest maintainable representation.
+Do not add YAML/JSON mapping configuration, plugin discovery, a mapping database, a generic native-key selector, or a new service. These maps are small benchmark policy. Python constants, frozen dataclasses, and stable version IDs are enough.
 
-Three approaches were considered:
+The revised design is intentionally smaller than the first draft:
 
-1. **Selected: typed mapping data in Python.** Smallest surface, direct tests, stable version IDs, no runtime parser.
-2. External mapping JSON files. More editable, but adds schema/loading/publication machinery without a current need.
-3. Keep ad-hoc dictionaries/functions in `mapping.py`. Small today, but cannot cleanly express stable per-model identity or detailed-vs-common projection.
+1. keep taxonomy and maps in memory;
+2. read HPA-323 native reference artifacts directly;
+3. map and project them through pure functions;
+4. publish only the eligibility manifest and diagnostic counts;
+5. let HPA-325 call the same pure functions instead of publishing a redundant mapped-event artifact.
 
-## Key Modeling Decision: Detailed vs Common Class
+## 1. Two Class Levels
 
-One flat class label cannot honestly satisfy the benchmark requirements.
-
-The authored DTX can distinguish open/closed hi-hat and high/low tom lanes. Frozen OaF does not: its current 8-hit grouping contains one `hihat` group and one `toms` group. Mapping those outputs directly to `closed_hihat` or `high_tom` would fabricate distinctions the model never produced.
-
-HPA-324 therefore defines two explicit class levels.
+A single class label is insufficient because authored DTX contains distinctions OaF does not emit.
 
 ### Detailed canonical class
 
@@ -75,41 +77,11 @@ ride
 tom
 ```
 
-Detailed classes project through one frozen table:
+The common class is the **headline scoring space**.
 
-```text
-kick              -> kick
-snare             -> snare
-closed_hihat      -> hihat
-open_hihat        -> hihat
-crash             -> crash
-ride              -> ride
-high_tom          -> tom
-low_or_floor_tom  -> tom
-```
-
-The projection is code, not prose-only policy:
+Freeze one total projection:
 
 ```python
-DETAILED_TO_COMMON: Mapping[DetailedDrumClass, CommonDrumClass]
-
-
-def project_to_common(detailed: DetailedDrumClass) -> CommonDrumClass: ...
-```
-
-Every detailed class must appear exactly once in `DETAILED_TO_COMMON`. Any `ClassMapping` with a non-null detailed class must use the corresponding common class. This invariant is tested for every frozen DTX/OaF entry and is reused by later MuScriptor/IDM maps.
-
-A model prediction may have `canonical_class=None` while still having a valid `common_class` when its native output cannot justify the detailed distinction. OaF `hihat` and `toms` are the primary examples.
-
-## Versioned Mapping Contracts
-
-Create `src/benchmark/taxonomy.py` as the single policy/data owner.
-
-```python
-from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Literal
-
 DetailedDrumClass = Literal[
     "kick",
     "snare",
@@ -130,14 +102,40 @@ CommonDrumClass = Literal[
     "tom",
 ]
 
+DETAILED_TO_COMMON: Mapping[DetailedDrumClass, CommonDrumClass] = MappingProxyType(
+    {
+        "kick": "kick",
+        "snare": "snare",
+        "closed_hihat": "hihat",
+        "open_hihat": "hihat",
+        "crash": "crash",
+        "ride": "ride",
+        "high_tom": "tom",
+        "low_or_floor_tom": "tom",
+    }
+)
+
+
+def project_to_common(detailed: DetailedDrumClass) -> CommonDrumClass:
+    return DETAILED_TO_COMMON[detailed]
+```
+
+Every map entry with a non-null detailed class must satisfy:
+
+```python
+mapping.common_class == project_to_common(mapping.canonical_class)
+```
+
+This makes the detailed-to-common relationship code, not prose.
+
+## 2. Versioned Mapping Data
+
+Create `src/benchmark/taxonomy.py` as the single policy/data owner.
+
+```python
 TAXONOMY_VERSION = "crux.drum-taxonomy/v1"
 DTX_LANE_MAP_VERSION = "crux.dtx-lane-map/v1"
 OAF_PREDICTION_MAP_ID = "crux.prediction-map/oaf-egmd-8hit-v1"
-
-DETAILED_TO_COMMON: Mapping[DetailedDrumClass, CommonDrumClass]
-
-
-def project_to_common(detailed: DetailedDrumClass) -> CommonDrumClass: ...
 
 
 @dataclass(frozen=True)
@@ -154,11 +152,9 @@ class PredictionMap:
     classes: Mapping[str, ClassMapping]
 ```
 
-Use immutable mappings (`MappingProxyType`) for the frozen tables. Changing mapping semantics requires a new ID. Git history is sufficient archival storage for this hobby project; no signed registry or mapping database is needed.
+Use `MappingProxyType` for frozen tables. Git history is sufficient archival storage for old mapping code in this hobby project. A map-semantics change requires a new version ID.
 
 ### DTX lane map v1
-
-Freeze the current intended drum lanes, replacing the legacy `low_tom` spelling with the ticket terminology:
 
 ```text
 11 -> closed_hihat / hihat
@@ -175,21 +171,30 @@ Freeze the current intended drum lanes, replacing the legacy `low_tom` spelling 
 1C -> kick / kick
 ```
 
-`lane_id` and `note_id` remain preserved on every mapped reference event.
+Native `lane_id` and `note_id` are never replaced.
 
-The taxonomy rename must update legacy reverse MIDI export in `midi_io.py` at the same time. `REFERENCE_CLASS_TO_MIDI` must accept `low_or_floor_tom`; no active code may silently skip the renamed tom class. The legacy `mid_tom` key should be removed unless an active producer still emits it after the taxonomy migration.
+The `low_or_floor_tom` rename must update the legacy reverse MIDI map in `midi_io.py` in the same change so `write_reference_midi` cannot silently drop the renamed class. `mid_tom` is removed if no active producer remains after the migration.
 
-### OaF prediction map v1: preserve native identity
+### OaF prediction map v1
 
-Do **not** redefine OaF `NativeEvent.native_class_id`.
+Do **not** redefine OaF native identity.
 
-The existing OaF contract intentionally uses identities such as `native_class_id="midi_36"`, while the frozen 8-hit semantic group is carried separately in:
+Current OaF events intentionally use values such as:
 
-```python
-event.native_metadata["upstream_8hit_group_id"]
+```text
+native_class_id = midi_36
+native_midi_note = 36
+model_output_bin = 15
+native_metadata.upstream_8hit_group_id = kick
 ```
 
-HPA-324 freezes `OAF_PREDICTION_MAP.classes` by the eight **group IDs**, not by `native_class_id`:
+The 8-hit semantic lookup key is:
+
+```python
+key = event.native_metadata["upstream_8hit_group_id"]
+```
+
+Freeze:
 
 ```text
 kick      -> kick / kick
@@ -202,34 +207,92 @@ crash     -> crash / crash
 sticks    -> None / None
 ```
 
-HPA-423 must look up OaF mapping data using the group metadata:
+`sticks` remains visible as unmapped coverage.
+
+Tests must bind this table to the existing locked vocabulary rather than duplicate the vocabulary as an independent literal:
 
 ```python
-key = event.native_metadata["upstream_8hit_group_id"]
-mapping = OAF_PREDICTION_MAP.classes.get(key)
+assert set(OAF_PREDICTION_MAP.classes) == OAF_GROUP_IDS
+assert OAF_PREDICTION_MAP.model_id == OAF_BACKEND_ID
 ```
 
-`native_class_id`, `model_output_bin`, `native_midi_note`, confidence, velocity, and all native metadata remain diagnostic identity. HPA-324 must not force HPA-423 to normalize `kick`, `hihat`, or `toms` into `native_class_id`.
+These assertions can live in tests to avoid creating an undesirable production import cycle from `taxonomy.py` into `prediction_artifact.py`.
 
-`sticks` stays visible as unmapped native coverage; it is not silently converted to snare.
+### MuScriptor and IDM
 
-This is deliberately OaF-specific and small. HPA-324 does not invent a generic key-selector framework for future models.
+Do not guess their exact tables in HPA-324.
 
-### MuScriptor and IDM ownership
+- HPA-395 freezes the exact observed MuScriptor drum vocabulary before its scored run.
+- HPA-396 freezes the exact loaded IDM `train_classes` ordering before its pilot.
 
-Do **not** guess exact MuScriptor or IDM native class tables inside HPA-324.
+Both must use this taxonomy/projection contract and their own immutable prediction-map IDs.
 
-HPA-395 must observe the exact locked MuScriptor drum pitch vocabulary and freeze its map before scored corpus results. HPA-396 must read the exact loaded IDM `train_classes` ordering and freeze its map before its pilot.
+## 3. Prediction Persistence Must Carry the Common Class
 
-HPA-324 defines the `PredictionMap`, class projection, and versioning contract they must obey. HPA-395/HPA-396 decide how their own adapters extract the lookup key from their concrete native event shapes. This avoids a premature generic selector layer.
+This is a benchmark correctness gate, not an optional HPA-423 implementation detail.
 
-## Reference Mapping Pipeline
+The current `crux.drum-prediction-events/v1` event row has `canonical_class` but no `common_class`. That is insufficient because valid OaF predictions such as `hihat` and `toms` intentionally have no detailed canonical class.
 
-HPA-323 already performed chart selection, DTX parsing, timing, source-audio resolution/decoding, hash validation, BGM anchoring, and bounds checks.
+Before HPA-326 can persist corpus predictions, the active prediction artifact contract must become:
 
-HPA-324 must **not repeat those checks**. A timing `ready` row is the upstream technical-integrity gate.
+```text
+crux.drum-prediction-events/v2
+```
 
-Expose only the missing read APIs over HPA-323's existing validators:
+with both:
+
+```text
+canonical_class
+common_class
+```
+
+Required event semantics:
+
+```text
+mapping_status = mapped:
+  prediction_map_version is non-null
+  common_class is non-null
+  canonical_class may be null
+
+mapping_status = unmapped:
+  prediction_map_version is non-null
+  canonical_class is null
+  common_class is null
+```
+
+Native fields remain unchanged:
+
+```text
+native_class_id
+model_output_bin
+native_midi_note
+native_metadata
+confidence
+velocity_midi
+```
+
+A mapped OaF hi-hat event therefore persists approximately:
+
+```json
+{
+  "native_class_id": "midi_46",
+  "native_metadata": {"upstream_8hit_group_id": "hihat"},
+  "canonical_class": null,
+  "common_class": "hihat",
+  "mapping_status": "mapped",
+  "prediction_map_version": "crux.prediction-map/oaf-egmd-8hit-v1"
+}
+```
+
+The exact serializer implementation remains HPA-423-owned. HPA-324 defines this data requirement because HPA-324 defines the scoring taxonomy.
+
+**HPA-326 must not start until a real OaF-shaped hi-hat/tom event round-trips through the active prediction artifact with `common_class` intact.** Otherwise the expensive corpus run would produce unscoreable predictions and require rerunning inference.
+
+## 4. Read HPA-323 Artifacts; Do Not Persist a Derived Mapping Artifact
+
+HPA-323 already persists every native reference identity needed for deterministic remapping.
+
+Add only the missing read adapters:
 
 ```python
 def read_reference_events(content: bytes) -> tuple[NativeReferenceEvent, ...]: ...
@@ -237,10 +300,42 @@ def read_reference_events(content: bytes) -> tuple[NativeReferenceEvent, ...]: .
 
 @dataclass(frozen=True)
 class ReferenceTimingRowView:
-    ...
+    simfile_id: int
+    corpus_version: str
+    timing_status: Literal["ready", "quarantined"]
+    timing_reason_codes: tuple[TimingReasonCode, ...]
+    timing_warnings: tuple[str, ...]
+    reference_events_cache_path: str | None
+    source_audio_key: str | None
+    source_audio_content_hash: str | None
 ```
 
-Then map each native reference event to:
+`read_reference_events` reuses HPA-323's existing row/sequence validators and requires byte-identical rerendering.
+
+`ReferenceTimingRowView` reuses `_validate_timing_status_shape` and exposes only the HPA-324 fields.
+
+### No `crux.benchmark-reference-event/v1`
+
+Do **not** publish a second mapped-event JSONL.
+
+`canonical_class` and `common_class` are pure functions of `lane_id` plus the frozen taxonomy/map version. The source HPA-323 event bytes are already content-addressed and the HPA-324 manifest records the taxonomy/lane-map version.
+
+Persisting a mapped copy would add:
+
+- another renderer;
+- another reader;
+- another key-set validator;
+- another schema golden;
+- another immutable publication path;
+- another artifact-path/count field;
+
+without adding independent information.
+
+If a future workflow genuinely needs frozen mapped bytes, it can add that one publication step later. HPA-324 does not prepay that complexity.
+
+## 5. Pure Reference Mapping and Common Projection
+
+Create `src/benchmark/reference_set.py` with pure in-memory functions only.
 
 ```python
 @dataclass(frozen=True)
@@ -248,118 +343,129 @@ class MappedReferenceEvent:
     native: NativeReferenceEvent
     canonical_class: DetailedDrumClass
     common_class: CommonDrumClass
-```
 
-Publish the detailed mapped events as content-addressed canonical JSONL under the stable schema identity:
 
-```text
-crux.benchmark-reference-event/v1
-```
+@dataclass(frozen=True)
+class CommonReferenceEvent:
+    canonical_audio_time: Decimal
+    common_class: CommonDrumClass
+    source_events: tuple[MappedReferenceEvent, ...]
 
-Like HPA-323's `crux.dtx-reference-event/v1`, **event rows do not carry a per-row `schema` field**. The schema identity is the validator/golden registration plus the manifest contract.
 
-Each mapped row contains:
+@dataclass(frozen=True)
+class ReferenceMappingDiagnostics:
+    unmapped: Mapping[str, int]
+    ignored: Mapping[str, int]
+    duplicate_common_event_count: int
 
-```text
-simfile_id
-selected_chart_key
-selected_chart_content_hash
-source_audio_key
-source_audio_content_hash
-source_order
-measure
-position
-lane_id
-note_id
-chart_time_sec
-audio_time_sec
-canonical_class
-common_class
-lane_map_version
-taxonomy_version
-```
 
-The native HPA-323 event artifact remains authoritative and immutable; HPA-324's event artifact is a derived scoring view.
+@dataclass(frozen=True)
+class ReferenceMappingResult:
+    mapped_events: tuple[MappedReferenceEvent, ...]
+    common_events: tuple[CommonReferenceEvent, ...]
+    diagnostics: ReferenceMappingDiagnostics
 
-## Unknown/Non-Drum Lane Policy
 
-Do not silently treat every unmapped pattern channel as irrelevant.
+def map_reference_events(
+    events: tuple[NativeReferenceEvent, ...],
+) -> ReferenceMappingResult: ...
 
-The implementation first adds a committed real-corpus diagnostic that enumerates:
 
-- every observed `lane_id` and event count;
-- mapped vs unmapped lane counts;
-- simfiles containing each unmapped lane;
-- simultaneous events that collide after common-class projection.
-
-Use production HPA-323 readers and HPA-324 mapping functions only. Do not build a parallel throwaway parser.
-
-Start:
-
-```python
-IGNORED_NON_DRUM_LANES = frozenset()
-```
-
-After reviewing the real corpus, add only observed lanes whose non-drum meaning is verified. Any other unmapped lane quarantines the row rather than disappearing silently. Corpus yield is not a classification criterion.
-
-## Common Scoring Projection
-
-Preserve all native/mapped event rows. Deduplicate only the **common scorer projection**.
-
-This projection is one public pure function, owned by `reference_set.py` and reused by eligibility now and HPA-325 later:
-
-```python
 def project_common_reference_events(
     mapped_events: tuple[MappedReferenceEvent, ...],
 ) -> tuple[CommonReferenceEvent, ...]: ...
 ```
 
-`map_reference_events()` may call this helper; it must not embed a second private collapse implementation.
+`project_common_reference_events` is the single scorer-facing projection HPA-325 must reuse.
 
-### Exact identity uses canonical durable time
+### Exact duplicate identity
 
-The common-scoring identity is:
-
-```text
-(canonical_audio_time, common_class)
-```
-
-where `canonical_audio_time` is the same decimal representation used for durable event rendering, e.g.:
+Use durable canonical time:
 
 ```python
 Decimal(str(event.native.audio_time_sec))
 ```
 
-Do not key a durable exact identity directly on raw binary-float object identity. Do not round or bucket timestamps. HPA-325 owns tolerance matching.
+Common scoring identity is:
 
-If multiple mapped events collapse to the same identity, the scorer projection contains one common event and retains every source event for diagnostics.
+```text
+(canonical_audio_time, common_class)
+```
 
-Examples:
+No rounding, fuzzy bucket, or tolerance belongs here. HPA-325 owns matching tolerances.
 
-- simultaneous high/low toms -> one common `tom` event;
-- simultaneous open/closed hi-hat -> one common `hihat` event;
-- events even slightly apart in canonical time remain separate.
+Multiple detailed/native events at the same exact durable time/common class become one common scorer event while all source events remain available for diagnostics.
 
-## Reference Eligibility
+## 6. Unknown-Lane Policy Requires Real-Corpus Evidence
 
-Publish one derived manifest:
+HPA-323 currently preserves pattern channels outside the explicitly handled control channels. Therefore an empty ignored-lane set plus "any unknown lane quarantines" could quarantine a large fraction of the real corpus while all accounting checks still pass.
+
+The exact impact is not known from the repository alone. Do not guess.
+
+Start with:
+
+```python
+IGNORED_NON_DRUM_LANES = frozenset()
+```
+
+Then run a committed real-corpus audit **before eligibility policy is allowed to freeze**.
+
+### Hard audit gate
+
+Add `tools/hpa324/analyze_reference_lanes.py`, using only production readers/mapping functions.
+
+Commit its reviewed output to:
+
+```text
+docs/superpowers/evidence/2026-08-09-hpa-324-reference-lane-audit.json
+```
+
+The report records at minimum:
+
+```text
+source_reference_timing_manifest_sha256
+source_reference_timing_version
+row_count
+ready_row_count
+lane_event_counts
+unmapped_lane_event_counts
+unmapped_lane_simfile_counts
+common_collision_count
+common_collision_simfile_count
+prospective_eligible_row_count
+prospective_quarantined_row_count
+```
+
+Review every observed unmapped lane. Add a lane to `IGNORED_NON_DRUM_LANES` only when its non-drum meaning is verified from the DTX semantics/source data. Uncertain lanes remain unclassified and quarantine affected rows.
+
+Do **not** replace this with a broad rule such as "ignore every channel outside the current drum map" or "ignore every non-1x channel". That would silently discard a future/extended playable drum lane.
+
+### No escape hatch
+
+If the real HPA-323 manifest/artifacts are unavailable, HPA-324 implementation stops at the audit gate. It does not ship eligibility policy with an unmeasured empty ignore set.
+
+If the audit reports zero prospective eligible rows, stop and review lane disposition before implementing the eligibility manifest.
+
+Acceptance coverage must include at least one observed, reviewed non-drum lane from the committed audit whenever the audit produces such a lane.
+
+## 7. Reference Eligibility Manifest
+
+Publish only:
 
 ```text
 crux.benchmark-reference-manifest/v1
 ```
 
-It consumes `crux.reference-timing-manifest/v1` and its referenced native event artifacts. All upstream fields pass through verbatim except the top-level derived `corpus_version`.
+It consumes the HPA-323 timing manifest and native event artifacts and carries all upstream fields through verbatim except top-level `corpus_version`.
 
 ### Status
-
-Use the same binary availability shape established by HPA-323:
 
 ```text
 eligible
 quarantined
 ```
 
-Warnings are orthogonal data, not a third status. A row with warnings remains `eligible` and carries deterministic `reference_eligibility_warnings`.
+Warnings are orthogonal data on eligible rows.
 
 ### Closed reason codes
 
@@ -372,14 +478,27 @@ EligibilityReasonCode = Literal[
 ]
 ```
 
-Meaning:
+### Added fields
 
-- `upstream_reference_unavailable`: HPA-323 timing status was not `ready`;
-- `reference_event_artifact_invalid`: referenced native JSONL is missing, hash-mismatched, non-canonical, or schema-invalid;
-- `unclassified_reference_lane`: an event lane is neither mapped nor explicitly ignored;
-- `no_scored_drum_events`: after explicit non-drum exclusions, no mapped drum event remains.
+```text
+schema_version = crux.benchmark-reference-manifest/v1
+source_reference_timing_manifest_sha256
+source_reference_timing_version
+taxonomy_version
+lane_map_version
+reference_eligibility_status
+reference_eligibility_reason_codes
+reference_eligibility_warnings
+mapped_event_count
+common_scored_event_count
+ignored_event_count
+unmapped_event_count
+duplicate_common_event_count
+```
 
-Do not duplicate HPA-323 timing reason codes into this list; the carried-through row already contains them.
+Do **not** add `benchmark_reference_events_path` or a mapped-event artifact counter.
+
+The inherited HPA-323 `reference_events_cache_path` remains the durable source event reference HPA-325 uses.
 
 Deterministic warning formats:
 
@@ -388,120 +507,139 @@ ignored_reference_lane:<LANE>:count=<N>
 duplicate_common_projection:count=<N>
 ```
 
-### Accounting
-
-The outcome enforces:
+Accounting:
 
 ```text
 inventoried = eligible + quarantined
 ```
 
-Every `eligible` row publishes one mapped-event artifact whether or not warnings are present.
+Low model scores, model-specific failures, and chart simplification judgments never change reference eligibility.
 
-Low future model scores, simplified charts, and model-specific inference failures never change reference eligibility.
+## 8. Reuse the Existing Manifest Validation Core, Not a Generic Framework
 
-## Prediction Mapping Seam with HPA-423
+The current `load_reference_chart_manifest()` is not directly reusable: it hardcodes the HPA-322 schema and `ReferenceChartRowView` source-identity fields.
 
-HPA-423 owns prediction conversion mechanics. HPA-324 owns the policy data.
+However, HPA-324 should not create a third independent canonical-JSONL parser either.
 
-After HPA-423 lands, the seam verification must use **real OaF-shaped native events**, for example:
+The targeted refactor is:
 
-```python
-NativeEvent(
-    time_sec=...,
-    native_class_id="midi_36",
-    model_output_bin=15,
-    native_midi_note=36,
-    native_metadata={"upstream_8hit_group_id": "kick"},
-    confidence=...,
-    velocity_midi=...,
-)
-```
+1. extract the byte/canonical-JSONL/re-render core from `load_reference_chart_manifest()` into a small private helper inside `reference_timing_manifest.py`;
+2. keep HPA-322-specific identity checks in `load_reference_chart_manifest()`;
+3. add `load_reference_timing_manifest()` in the same source-owner module, reusing the private core plus `ReferenceTimingRowView` validation;
+4. let `reference_set_manifest.py` consume that typed loader.
 
-The test proves HPA-423 consumes `OAF_PREDICTION_MAP` by group metadata, stamps `prediction_map_version == OAF_PREDICTION_MAP.map_id`, preserves the MIDI/native identities, and exposes unmapped `sticks`.
+Do not generalize row remapping or outcome accounting into callback-heavy frameworks. `build_timing_row()` is timing-specific, and the HPA-324 row/outcome invariants are short enough to remain explicit.
 
-Do not define a speculative HPA-423 production function signature in HPA-324. Rebase first, inspect the actual merged API, and add only the minimum seam adaptation needed. If HPA-423 has not landed, correct OaF map data plus taxonomy tests are sufficient for the HPA-324 planning boundary; seam verification waits.
+## 9. CLI
 
-## CLI
-
-Add one derived-stage command:
+Add:
 
 ```bash
 uv run crux benchmark build-reference-set \
-  --manifest artifacts/benchmark/reference-timing/manifests/<manifest-sha>.jsonl \
+  --manifest artifacts/benchmark/reference-timing/manifests/<sha256>.jsonl \
   --output-dir artifacts/benchmark/reference-set
 ```
 
 `--manifest` is required. `--output-dir` defaults to `artifacts/benchmark/reference-set`.
 
-No R2 credentials are needed. Every source/chart/audio decision was already frozen by HPA-321/322/323.
+No cache/R2/model/tolerance/concurrency options belong here.
 
 Exit codes follow the existing derived-manifest convention:
 
-- `0`: manifest published with no quarantined rows;
+- `0`: manifest published and every row is eligible;
 - `1`: manifest published with one or more quarantined rows;
-- `2`: fatal input/publication error before a valid derived manifest can be published.
+- `2`: fatal input/publication failure before a valid derived manifest can be published.
 
-## Output Layout
+Output layout:
 
 ```text
 artifacts/benchmark/reference-set/
-  events/<sha256>.jsonl
   manifests/<sha256>.jsonl
   latest.json
 ```
 
-Mapped reference events remain detailed and immutable. The common scorer projection is reproducibly re-derived through `project_common_reference_events`; no second common-event artifact is needed.
+## Risks and Gates
 
-## Testing
+### Risk 1: common prediction class discovered after inference
 
-Focused tests:
+**Risk:** HPA-326 persists OaF hihat/tom events without a scorable common class and must rerun expensive inference.
 
-- detailed/common taxonomy and `DETAILED_TO_COMMON` are exact and total;
-- every mapping with a detailed class agrees with `project_to_common`;
-- DTX lane map produces detailed + common classes for every v1 lane;
-- legacy reverse MIDI export supports `low_or_floor_tom` after the rename;
-- OaF lookup uses `upstream_8hit_group_id` while preserving `native_class_id="midi_<note>"`;
+**Gate:** `crux.drum-prediction-events/v2` with `common_class` must be implemented and a hihat/tom round-trip test must pass before HPA-326 starts.
+
+### Risk 2: corpus-wide quarantine from unknown lanes
+
+**Risk:** HPA-323 preserves many pattern channels, so an unreviewed empty ignore set can make technically valid references all quarantine.
+
+**Gate:** committed real-corpus lane audit is mandatory before eligibility policy/Task 5.
+
+### Risk 3: HPA-423 integration timing
+
+HPA-324 Tasks covering taxonomy/reference mapping/eligibility may land before HPA-423 finishes, but **HPA-324 must remain In Progress** until the prediction persistence/mapping seam is verified against the merged HPA-423 implementation.
+
+If HPA-423 is not ready, stop after the independent HPA-324 work. Do not mark HPA-324 Done and do not start HPA-326.
+
+## Testing Strategy
+
+Focused tests only:
+
+- detailed/common taxonomies and total projection are exact;
+- DTX map uses the projection invariant;
+- OaF map keys equal existing `OAF_GROUP_IDS` and model ID equals `OAF_BACKEND_ID`;
 - OaF hihat/toms do not fabricate detailed distinctions;
-- OaF sticks remains explicitly unmapped;
-- HPA-323 native event reader rejects non-canonical/hash-invalid content;
-- reference mapping preserves every native identity field;
-- mapped event rows mirror HPA-323 style and contain no per-row `schema` field;
-- unknown lane handling is visible and deterministic;
-- `project_common_reference_events` collapses only identical canonical decimal time + common class;
-- eligibility is exactly `eligible|quarantined`, with warnings orthogonal to status;
-- upstream HPA-323 quarantine is carried through without re-running timing/audio checks;
-- mapped event and manifest schema goldens are byte-stable;
-- CLI returns 0/1/2 consistently;
-- persisted native events can be remapped under a new mapping version without inference.
+- reverse MIDI export handles `low_or_floor_tom`;
+- HPA-323 event reader rejects non-canonical/invalid content and round-trips valid bytes;
+- timing-row view/loader reuses existing validation;
+- mapping preserves native identity;
+- common collapse uses `Decimal(str(audio_time_sec))` and deduplicates only exact identity;
+- hard lane-audit evidence is produced before eligibility policy freezes;
+- observed reviewed non-drum lanes remain eligible with warnings rather than being silently dropped/quarantined;
+- unknown lanes remain visible and quarantine;
+- eligibility accounting is exact;
+- HPA-325 can reload native events and reuse `project_common_reference_events` without a mapped-event artifact;
+- prediction artifact v2 round-trips mapped OaF hihat/toms with `common_class` intact;
+- CLI returns 0/1/2 consistently.
 
-No real model inference belongs in HPA-324 tests.
+No real model inference belongs in HPA-324 unit tests.
 
-## Non-goals
+## Validation Commands
+
+Repository-defined validation remains the gate:
+
+```bash
+uv run pytest
+uv run ruff check src tests
+uv run ruff format --check src tests
+uv run pylint src/app src/cli
+```
+
+HPA-324-specific tests may additionally lint/check `tools/hpa324`, but a broader `pylint src` run is diagnostic only, not the repository gate.
+
+## Non-Goals
 
 - rerunning chart selection, DTX timing, BGM/audio resolution, or audio decoding;
-- scoring precision/recall/F1 or choosing matching tolerances (HPA-325);
-- corpus OaF inference/resume/runtime orchestration (HPA-326);
-- implementing MuScriptor or IDM adapters (HPA-395/HPA-396);
-- guessing MuScriptor pitches or IDM `train_classes` before exact locked vocabularies are observed;
+- publishing a redundant mapped-reference event artifact;
+- scoring precision/recall/F1 or choosing tolerances;
+- corpus OaF inference/resume/runtime orchestration;
+- implementing MuScriptor or IDM adapters;
+- guessing future model vocabularies;
 - velocity scoring;
-- manually judging musical fidelity or chart simplification;
+- manually judging musical fidelity/chart simplification;
 - result-driven remapping after scores are inspected;
-- a generic plugin/key-selector system, external mapping service, database, or configuration framework.
+- generic loader/outcome frameworks, plugin systems, mapping services, databases, or configuration DSLs.
 
-## Acceptance Interpretation
+## Acceptance Criteria
 
-HPA-324 itself is complete when:
+HPA-324 can be moved to Done only when:
 
-1. stable detailed/common taxonomy, total detailed-to-common projection, and DTX lane map v1 exist;
-2. the OaF prediction map is frozen by `upstream_8hit_group_id` without rewriting native MIDI identity;
-3. HPA-323 native events are deterministically remapped into immutable benchmark-reference events with no per-row schema field;
-4. unknown/ignored lanes and duplicate common collapses are visible;
-5. common scorer projection is one exported pure function keyed by canonical durable time;
-6. every HPA-323 input row is exactly `eligible` or `quarantined`, with warnings orthogonal to status;
-7. reference eligibility is model-independent and reconciles exactly;
-8. a mapping version change can remap persisted native artifacts without rerunning inference;
-9. after HPA-423 lands, it consumes HPA-324's OaF map data through group metadata and stamps map identity without redefining `native_class_id`;
-10. HPA-395/HPA-396 remain responsible for freezing their exact MuScriptor/IDM maps before their scored runs.
-
-The cross-model invariant that OaF, MuScriptor, and IDM each use distinct locked prediction maps is completed when HPA-395/HPA-396 make those model vocabularies concrete. HPA-324 must not invent future tables merely to make the present ticket look complete.
+1. one code-owned detailed/common taxonomy and total projection are frozen;
+2. DTX lane map v1 is frozen and legacy mapping/MIDI consumers use the new class names;
+3. OaF prediction map v1 is keyed by `upstream_8hit_group_id` and bound by tests to the existing OaF vocabulary/model identity;
+4. HPA-323 reference events are consumed through thin readers and can be remapped without rerunning inference;
+5. `map_reference_events` and public `project_common_reference_events` are the single reference mapping/projection implementations;
+6. the reviewed real-corpus lane audit is committed and the ignore/quarantine policy is frozen from that evidence;
+7. every HPA-323 row is exactly `eligible` or `quarantined`, with deterministic warnings/counts;
+8. HPA-325 can reconstruct scorer-ready common reference events from the inherited native artifact plus HPA-324 version IDs;
+9. the active prediction artifact persists `common_class` and a real OaF-shaped hihat/tom event round-trips with its common class intact;
+10. HPA-423 consumes the OaF group map without rewriting native MIDI identity and stamps the prediction-map ID;
+11. HPA-395/HPA-396 remain responsible for their exact later model maps;
+12. HPA-326 has not started before items 9-10 are verified.
