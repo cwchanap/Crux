@@ -14,6 +14,7 @@
 - HPA-423 is active in parallel. HPA-324 owns taxonomy/map policy; HPA-423 owns prediction mapping/serialization mechanics.
 - Score onset time plus **common instrument class**. Detailed class is retained where justified for diagnosis; velocity/confidence are diagnostic only.
 - `DETAILED_TO_COMMON` is total. Every map entry with a non-null detailed class must agree with `project_to_common`.
+- `PredictionMap.backend_id` identifies the backend/native-output contract; it must never be populated from a checkpoint `model_id`.
 - OaF lookup uses `NativeEvent.native_metadata["upstream_8hit_group_id"]`; never rewrite `native_class_id="midi_<note>"`.
 - Before HPA-326, the active prediction artifact must persist `common_class` for mapped events (`crux.drum-prediction-events/v2`).
 - Preserve HPA-323 native reference artifacts as the only persisted event source. HPA-324 does **not** publish mapped-reference JSONL.
@@ -142,7 +143,7 @@ class ClassMapping:
 @dataclass(frozen=True)
 class PredictionMap:
     map_id: str
-    model_id: str
+    backend_id: str
     native_output_space_id: str
     classes: Mapping[str, ClassMapping]
 
@@ -196,7 +197,7 @@ For every non-null detailed entry:
 assert mapping.common_class == project_to_common(mapping.canonical_class)
 ```
 
-- [ ] **Step 3: Bind the OaF map to the existing locked vocabulary**
+- [ ] **Step 3: Bind the OaF map to the existing locked vocabulary and backend identity**
 
 In `tests/benchmark/test_taxonomy.py`, import the existing constants and require:
 
@@ -205,11 +206,13 @@ from src.benchmark.backend_identity import OAF_BACKEND_ID
 from src.benchmark.prediction_artifact import OAF_GROUP_IDS
 
 assert set(OAF_PREDICTION_MAP.classes) == OAF_GROUP_IDS
-assert OAF_PREDICTION_MAP.model_id == OAF_BACKEND_ID
+assert OAF_PREDICTION_MAP.backend_id == OAF_BACKEND_ID
 assert OAF_PREDICTION_MAP.classes["hihat"] == ClassMapping(None, "hihat")
 assert OAF_PREDICTION_MAP.classes["toms"] == ClassMapping(None, "tom")
 assert OAF_PREDICTION_MAP.classes["sticks"] == ClassMapping(None, None)
 ```
+
+The concrete OaF `PredictionMap` is constructed with `backend_id=OAF_BACKEND_ID`. Do not populate this field from descriptor `model_id`; HPA-423 validates the descriptor's `backend_id` and `native_output_space_id` against the map before applying it.
 
 Keep this cross-module vocabulary assertion in tests so production `taxonomy.py` does not need to import `prediction_artifact.py`.
 
@@ -979,6 +982,7 @@ Add hihat, toms, ride_bell, and sticks examples with their real MIDI-style nativ
 
 Require:
 
+- HPA-423 validates `OAF_PREDICTION_MAP.backend_id` against descriptor `backend_id` before mapping;
 - group metadata drives `OAF_PREDICTION_MAP` lookup;
 - native ID/bin/MIDI/confidence/velocity survive serialization;
 - hihat round-trips with `canonical_class=None`, `common_class="hihat"`;
@@ -1099,13 +1103,13 @@ HPA-324 is Done only when all are true:
 
 1. detailed/common taxonomy and total projection are frozen in one module;
 2. DTX lane map v1 and OaF group map v1 are versioned and immutable;
-3. OaF map keys are test-bound to `OAF_GROUP_IDS` and model ID to `OAF_BACKEND_ID`;
+3. OaF map keys are test-bound to `OAF_GROUP_IDS` and `backend_id` to `OAF_BACKEND_ID`;
 4. HPA-323 native events are consumed through thin validated readers;
 5. reference mapping/common projection is pure and persisted mapped copies are not added;
 6. real-corpus lane audit evidence is committed and reviewed before eligibility policy;
 7. unknown/ignored/collision diagnostics are visible and every row is exactly eligible or quarantined;
 8. HPA-325 can reconstruct common reference events from inherited native artifacts + version IDs;
 9. active prediction artifacts persist `common_class` and OaF hihat/toms round-trip scoreably;
-10. HPA-423 consumes the OaF group map without rewriting native MIDI identity;
+10. HPA-423 validates map backend/native-output identity and consumes the OaF group map without rewriting native MIDI identity;
 11. HPA-395/HPA-396 retain ownership of their exact future maps;
 12. HPA-326 has not started before items 9-10 pass.
