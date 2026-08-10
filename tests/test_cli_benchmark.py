@@ -98,6 +98,27 @@ class _FakeRegistry:
         return self.backend
 
 
+class _ControllableClock:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.now = 10.0
+        self.inference_stopped = False
+        self.post_timer_operations: list[str] = []
+
+    def perf_counter(self) -> float:
+        self.calls += 1
+        if self.calls == 1:
+            return self.now
+        if self.calls == 2:
+            self.now = 12.0
+            self.inference_stopped = True
+            return self.now
+        raise AssertionError("smoke benchmark timer should stop exactly once")
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
 def test_smoke_backend_times_only_backend_inference_and_publishes_v2(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -107,7 +128,25 @@ def test_smoke_backend_times_only_backend_inference_and_publishes_v2(
     import src.cli.benchmark as benchmark_module
 
     fake_registry = _FakeRegistry(_FakeBackend(prediction))
+    clock = _ControllableClock()
+    original_map = benchmark_module.map_oaf_prediction
+    original_publish = benchmark_module.publish_prediction_artifact
+
+    def map_after_timer_stop(native_prediction: NativePrediction):
+        assert clock.inference_stopped
+        clock.post_timer_operations.append("mapping")
+        clock.advance(100.0)
+        return original_map(native_prediction)
+
+    def publish_after_timer_stop(path: Path, mapped_prediction):
+        assert clock.inference_stopped
+        clock.post_timer_operations.append("publication")
+        clock.advance(100.0)
+        return original_publish(path, mapped_prediction)
+
     monkeypatch.setattr(benchmark_module, "default_backend_registry", lambda: fake_registry)
+    monkeypatch.setattr(benchmark_module, "map_oaf_prediction", map_after_timer_stop)
+    monkeypatch.setattr(benchmark_module, "publish_prediction_artifact", publish_after_timer_stop)
     monkeypatch.setattr(
         benchmark_module,
         "load_model_config",
@@ -123,7 +162,7 @@ def test_smoke_backend_times_only_backend_inference_and_publishes_v2(
     monkeypatch.setattr(
         benchmark_module, "load_direct_audio", lambda *args, **kwargs: prediction.audio
     )
-    monkeypatch.setattr(benchmark_module.time, "perf_counter", iter((10.0, 12.0)).__next__)
+    monkeypatch.setattr(benchmark_module.time, "perf_counter", clock.perf_counter)
 
     result = CliRunner().invoke(
         main,
@@ -140,6 +179,8 @@ def test_smoke_backend_times_only_backend_inference_and_publishes_v2(
     assert summary["real_time_factor"] == 2.0 / (
         prediction.audio.audio_frame_count / prediction.audio.sample_rate
     )
+    assert clock.calls == 2
+    assert clock.post_timer_operations == ["mapping", "publication"]
     assert summary["oracle_status"] == "not_checked"
     prediction_path = Path(summary["prediction_path"])
     assert prediction_path.exists()
