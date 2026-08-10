@@ -124,6 +124,53 @@ class _FakeWorker:
         self.close_count += 1
 
 
+def test_task_d_oaf_adapter_translates_correlated_worker_error_and_reuses_process(
+    tmp_path: Path,
+) -> None:
+    import sys
+
+    input_root = tmp_path / "input"
+    checkpoint = tmp_path / "checkpoint"
+    input_root.mkdir()
+    checkpoint.mkdir()
+    audio = _audio(input_root / "song.wav")
+    script = tmp_path / "worker.py"
+    script.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'type':'ready','backend_id':%r,'restored_tensor_count':78}), flush=True)\n"
+        "first = True\n"
+        "for line in sys.stdin:\n"
+        "    request = json.loads(line)\n"
+        "    if first:\n"
+        "        first = False\n"
+        "        print(json.dumps({'id':request['id'],'error':{'code':'audio_unavailable','message':'audio unavailable'}}), flush=True)\n"
+        "    else:\n"
+        "        print(json.dumps({'id':request['id'],'events':[]}), flush=True)\n"
+        % OAF_BACKEND_ID,
+        encoding="utf-8",
+    )
+    starts: list[list[str]] = []
+
+    def process_factory(command: object, **kwargs: object) -> object:
+        del command
+        starts.append([sys.executable, str(script)])
+        from src.benchmark.worker_process import WorkerProcess
+
+        return WorkerProcess.start(
+            starts[-1], timeout_seconds=float(kwargs.get("timeout_seconds", 1.0))
+        )
+
+    backend = OafBackend(checkpoint, input_root, process_factory=process_factory)
+    try:
+        with pytest.raises(OafBackendError) as raised:
+            backend.transcribe(audio)
+        assert raised.value.code == "audio_unavailable"
+        assert backend.transcribe(audio).events == ()
+        assert len(starts) == 1
+    finally:
+        backend.close()
+
+
 def test_task_d_oaf_adapter_validates_ready_reuses_worker_and_closes(tmp_path: Path) -> None:
     input_root = tmp_path / "input"
     checkpoint = tmp_path / "checkpoint"
@@ -213,10 +260,23 @@ def test_task_d_oaf_adapter_rejects_outside_input(tmp_path: Path) -> None:
 def test_task_d_oaf_launch_command_is_read_only_and_networkless(tmp_path: Path) -> None:
     command = build_docker_command(tmp_path / "checkpoint", tmp_path / "input")
     assert command[:6] == ["docker", "run", "--rm", "-i", "--network=none", "--read-only"]
+    assert "--tmpfs=/tmp:rw" in command
     assert f"--mount=type=bind,src={tmp_path / 'checkpoint'},dst=/model,readonly" in command
     assert f"--mount=type=bind,src={tmp_path / 'input'},dst=/input,readonly" in command
     assert "--workdir=/input" in command
     assert command[-1] == "crux-oaf-tf1:local"
+
+
+def test_task_d_docker_uses_non_root_defaults_without_workflow_build_args() -> None:
+    repository = Path(__file__).parents[2]
+    dockerfile = (repository / "runtime/oaf_tf1/Dockerfile").read_text(encoding="utf-8")
+    workflow = (repository / ".github/workflows/oaf-smoke.yml").read_text(encoding="utf-8")
+
+    assert "ARG RUNTIME_UID=65532" in dockerfile
+    assert "ARG RUNTIME_GID=65532" in dockerfile
+    assert "docker build -f runtime/oaf_tf1/Dockerfile -t crux-oaf-tf1:local ." in workflow
+    assert "--build-arg RUNTIME_UID" not in workflow
+    assert "--build-arg RUNTIME_GID" not in workflow
 
 
 def test_task_d_docker_drops_retained_runner_manifest_consumer() -> None:
@@ -227,6 +287,13 @@ def test_task_d_docker_drops_retained_runner_manifest_consumer() -> None:
     assert (
         "COPY --from=instrumented-source /opt/crux/vendor/ /opt/crux/runtime/vendor/" in dockerfile
     )
+
+
+def test_task_d_docker_keeps_unmodified_upstream_parity_source() -> None:
+    repository = Path(__file__).parents[2]
+    dockerfile = (repository / "runtime/oaf_tf1/Dockerfile").read_text(encoding="utf-8")
+    assert "COPY runtime/oaf_tf1/vendor/magenta/ /opt/crux/upstream/magenta/" in dockerfile
+    assert "COPY --from=instrumented-source /opt/crux/upstream/ /opt/crux/upstream/" in dockerfile
 
 
 def test_task_d_docker_copies_model_config_to_worker_runtime_path() -> None:

@@ -135,3 +135,33 @@ def test_worker_process_poisoned_after_malformed_output(tmp_path: Path) -> None:
             process.request("two.wav")
     finally:
         process.close()
+
+
+def test_worker_process_preserves_correlated_error_without_poisoning_child(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "error_then_success_worker.py"
+    script.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'type':'ready'}), flush=True)\n"
+        "first = True\n"
+        "for line in sys.stdin:\n"
+        "    request = json.loads(line)\n"
+        "    if first:\n"
+        "        first = False\n"
+        "        print(json.dumps({'id':request['id'],'error':{'code':'audio_unavailable','message':'audio unavailable'}}), flush=True)\n"
+        "    else:\n"
+        "        print(json.dumps({'id':request['id'],'events':[]}), flush=True)\n",
+        encoding="utf-8",
+    )
+    process = WorkerProcess.start([sys.executable, str(script)], timeout_seconds=1)
+    try:
+        response = process.request("one.wav")
+        assert response["error"] == {
+            "code": "audio_unavailable",
+            "message": "audio unavailable",
+        }
+        assert not process.closed
+        assert process.request("two.wav")["events"] == []
+    finally:
+        process.close()

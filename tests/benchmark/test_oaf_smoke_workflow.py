@@ -38,3 +38,11 @@ def test_oaf_smoke_workflow_has_no_attestation_or_measurement_steps() -> None:
         "second image",
     ):
         assert forbidden not in content
+
+
+def test_oaf_smoke_docker_build_uses_dockerfile_non_root_defaults() -> None:
+    dockerfile = (
+        WORKFLOW.parents[2].joinpath("runtime/oaf_tf1/Dockerfile").read_text(encoding="utf-8")
+    )
+    assert "ARG RUNTIME_UID=65532" in dockerfile
+    assert "ARG RUNTIME_GID=65532" in dockerfile

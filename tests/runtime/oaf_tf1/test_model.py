@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -109,3 +110,18 @@ def test_native_event_conversion_preserves_capture_values(
     assert event.time_sec == 64 * 512 / 44100
     assert event.confidence == 0.625
     assert event.velocity_midi == int(0.8 * 127)
+
+
+def test_uninstrumented_parity_loader_uses_unmodified_upstream_layout() -> None:
+    from runtime.oaf_tf1 import model
+
+    assert model.DEFAULT_UNINSTRUMENTED_SEQUENCE_LIB == Path(
+        "/opt/crux/upstream/magenta/music/sequences_lib.py"
+    )
+
+
+def test_model_does_not_pin_tensorflow_inter_or_intra_threads() -> None:
+    source = Path(__file__).parents[3] / "runtime/oaf_tf1/model.py"
+    content = source.read_text(encoding="utf-8")
+    assert "inter_op_parallelism_threads" not in content
+    assert "intra_op_parallelism_threads" not in content

@@ -121,10 +121,12 @@ class WorkerProcess:
                     self._poison()
                     raise WorkerProcessError("worker response id mismatch")
                 error_payload = response["error"]
-                if isinstance(error_payload, Mapping) and isinstance(
-                    error_payload.get("message"), str
+                if (
+                    isinstance(error_payload, Mapping)
+                    and isinstance(error_payload.get("code"), str)
+                    and isinstance(error_payload.get("message"), str)
                 ):
-                    raise WorkerProcessError(error_payload["message"])
+                    return response
                 self._poison()
                 raise WorkerProcessError("worker response is invalid")
             if response.get("id") != identifier:

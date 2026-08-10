@@ -3,8 +3,8 @@
 # The backend is intentionally frozen to the linux/amd64 base-image manifest.
 FROM python@sha256:ea8897698c0955ba96144bd2b7310ef7884ccce4db7a1f97ffc21fb8b89d1673 AS runtime-base
 
-ARG RUNTIME_UID
-ARG RUNTIME_GID
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
 
 RUN set -eu; \
     case "${RUNTIME_UID}" in ""|0|65534|*[!0-9]*) exit 64;; esac; \

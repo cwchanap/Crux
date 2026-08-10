@@ -170,6 +170,7 @@ def build_docker_command(
         "-i",
         "--network=none",
         "--read-only",
+        "--tmpfs=/tmp:rw",
         f"--mount=type=bind,src={checkpoint_dir},dst=/model,readonly",
         f"--mount=type=bind,src={input_root},dst=/input,readonly",
         "--workdir=/input",

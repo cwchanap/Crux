@@ -177,6 +177,7 @@ REQUIRED_INFERENCE_COUNT = 78
 NON_INFERENCE_COUNT = 52
 MIN_MIDI_PITCH = 21
 MODEL_SCRATCH_DIRECTORY = "/tmp/crux-oaf-model"
+DEFAULT_UNINSTRUMENTED_SEQUENCE_LIB = Path("/opt/crux/upstream/magenta/music/sequences_lib.py")
 _STOCHASTIC_OPERATION_TYPES = frozenset(
     {
         "Multinomial",
@@ -559,18 +560,8 @@ def _plain_inventory(values: Sequence[Mapping[str, Any]]) -> tuple[Mapping[str, 
     )
 
 
-def _configure_prediction_estimator_session(estimator: Any, tf: Any) -> Any:
-    session_config = tf.ConfigProto(inter_op_parallelism_threads=1, intra_op_parallelism_threads=1)
-    configured = estimator.config.replace(session_config=session_config)
-    setattr(estimator, "_config", configured)
-    setattr(estimator, "_session_config", configured.session_config)
-    return estimator
-
-
 def _load_uninstrumented_sequences_module(source_path: Path | None = None) -> Any:
-    source = (
-        source_path or Path(__file__).with_name("vendor") / "magenta" / "music" / "sequences_lib.py"
-    )
+    source = source_path or DEFAULT_UNINSTRUMENTED_SEQUENCE_LIB
     try:
         status = source.lstat()
         if not stat.S_ISREG(status.st_mode):
@@ -670,10 +661,7 @@ class OafModel:
             required_uninitialized = tf.report_uninitialized_variables(
                 var_list=list(required_variables.values())
             )
-        with tf.Session(
-            graph=graph,
-            config=tf.ConfigProto(inter_op_parallelism_threads=1, intra_op_parallelism_threads=1),
-        ) as session:
+        with tf.Session(graph=graph) as session:
             try:
                 required_saver.restore(session, checkpoint_prefix)
                 uninitialized_raw = session.run(required_uninitialized)
@@ -695,8 +683,8 @@ class OafModel:
             graph_inventory=graph_inventory,
             uninitialized_required=uninitialized,
         )
-        estimator = _configure_prediction_estimator_session(
-            train_util.create_estimator(model_config.model_fn, MODEL_SCRATCH_DIRECTORY, hparams), tf
+        estimator = train_util.create_estimator(
+            model_config.model_fn, MODEL_SCRATCH_DIRECTORY, hparams
         )
         state = _LoadedModelState(
             estimator=estimator,
