@@ -1164,7 +1164,7 @@ def test_validate_reference_event_golden_rejects_non_canonical_bytes() -> None:
         ("position", Decimal("-0.1")),
         ("position", Decimal("1.0")),
         ("lane_id", "1"),
-        ("lane_id", "G_"),
+        ("lane_id", "GG"),
         ("note_id", "000"),
         ("note_id", "0/"),
         ("selected_chart_key", "../escape.dtx"),
@@ -1186,13 +1186,31 @@ def test_validate_reference_event_golden_rejects_invalid_identity_fields(
         validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)
 
 
-@pytest.mark.parametrize("field", ["lane_id", "note_id"])
-def test_validate_reference_event_golden_rejects_lowercase_dtx_ids(field: str) -> None:
+def test_validate_reference_event_golden_rejects_non_hex_lane_with_base36_note() -> None:
     row = _golden_event_row()
-    row[field] = "0l"
+    row["lane_id"] = "GG"
+    row["note_id"] = "0L"
     content = canonical_json_bytes(row, trailing_newline=True)
 
-    with pytest.raises(ValueError, match="uppercase base-36"):
+    with pytest.raises(ValueError, match="lane_id must be a two-digit uppercase hexadecimal ID"):
+        validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("lane_id", "1a", "uppercase hexadecimal"),
+        ("note_id", "0l", "uppercase base-36"),
+    ],
+)
+def test_validate_reference_event_golden_rejects_lowercase_dtx_ids(
+    field: str, value: str, message: str
+) -> None:
+    row = _golden_event_row()
+    row[field] = value
+    content = canonical_json_bytes(row, trailing_newline=True)
+
+    with pytest.raises(ValueError, match=message):
         validate_schema_golden(REFERENCE_EVENT_SCHEMA, content)
 
 

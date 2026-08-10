@@ -58,7 +58,8 @@ _AUDIO_PROBE_ERRORS: tuple[type[BaseException], ...] = (
 )
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
-_DTX_ID_RE = re.compile(r"[0-9A-Z]{2}")
+_DTX_LANE_ID_RE = re.compile(r"[0-9A-F]{2}")
+_DTX_NOTE_ID_RE = re.compile(r"[0-9A-Z]{2}")
 
 TimingReasonCode = Literal[
     "upstream_chart_selection_unavailable",
@@ -707,10 +708,12 @@ def _validate_reference_event_row(row: object) -> None:
     for key in _REFERENCE_EVENT_STRING_KEYS:
         if not isinstance(row[key], str) or not row[key]:
             raise ValueError(f"{key} must be a non-empty string")
-    for key in ("lane_id", "note_id"):
-        value = row[key]
-        if _DTX_ID_RE.fullmatch(value) is None:
-            raise ValueError(f"{key} must be a two-digit uppercase base-36 ID")
+    lane_id = row["lane_id"]
+    if _DTX_LANE_ID_RE.fullmatch(lane_id) is None:
+        raise ValueError("lane_id must be a two-digit uppercase hexadecimal ID")
+    note_id = row["note_id"]
+    if _DTX_NOTE_ID_RE.fullmatch(note_id) is None:
+        raise ValueError("note_id must be a two-digit uppercase base-36 ID")
     for key in ("selected_chart_key", "source_audio_key"):
         if not _is_safe_event_object_key(row[key], simfile_id):
             raise ValueError(f"{key} must be a safe simfile object key")
