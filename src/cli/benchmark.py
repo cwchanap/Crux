@@ -403,6 +403,31 @@ def _emit_reference_timing_summary(
     standard_output.flush()
 
 
+def _emit_reference_set_summary(
+    *,
+    status: str,
+    exit_code: int,
+    manifest_path: Path | None,
+    manifest_sha256: str | None,
+    corpus_version: str | None,
+    eligible_count: int,
+    quarantined_count: int,
+) -> None:
+    """Write the sole machine-readable result after reference-set publication."""
+    payload = {
+        "corpus_version": corpus_version,
+        "eligible_count": eligible_count,
+        "exit_code": exit_code,
+        "manifest_path": None if manifest_path is None else str(manifest_path),
+        "manifest_sha256": manifest_sha256,
+        "quarantined_count": quarantined_count,
+        "status": status,
+    }
+    standard_output = click.get_binary_stream("stdout")
+    standard_output.write(canonical_json_bytes(payload, trailing_newline=True))
+    standard_output.flush()
+
+
 @benchmark.command("select-reference-charts")
 @click.option(
     "--manifest",
@@ -522,6 +547,50 @@ def build_reference_timing_command(
         quarantined_count=outcome.quarantined_count,
         upstream_quarantined_count=outcome.upstream_quarantined_count,
         events_published=outcome.events_published,
+    )
+    if outcome.exit_code:
+        ctx.exit(outcome.exit_code)
+
+
+@benchmark.command("build-reference-set")
+@click.option(
+    "--manifest",
+    "manifest_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required path to an immutable HPA-323 reference-timing manifest (JSONL).",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=Path("artifacts/benchmark/reference-set"),
+    show_default=True,
+    help="Publication directory.",
+)
+@click.pass_context
+def build_reference_set_command(
+    ctx: click.Context,
+    manifest_path: Path,
+    output_dir: Path,
+) -> None:
+    """Build and publish model-independent reference eligibility."""
+    from src.benchmark.reference_set_manifest import ReferenceSetRequest, run_reference_set
+
+    outcome = run_reference_set(
+        ReferenceSetRequest(
+            manifest_path=manifest_path,
+            output_dir=output_dir,
+        )
+    )
+    published = outcome.manifest
+    _emit_reference_set_summary(
+        status=outcome.status,
+        exit_code=outcome.exit_code,
+        manifest_path=None if published is None else published.path,
+        manifest_sha256=None if published is None else published.manifest_sha256,
+        corpus_version=None if published is None else published.corpus_version,
+        eligible_count=outcome.eligible_count,
+        quarantined_count=outcome.quarantined_count,
     )
     if outcome.exit_code:
         ctx.exit(outcome.exit_code)

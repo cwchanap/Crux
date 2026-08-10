@@ -1,6 +1,6 @@
 from src.benchmark.mapping import (
-    DEFAULT_DTX_LANE_MAP,
     DEFAULT_MIDI_NOTE_MAP,
+    DTX_LANE_MAP,
     map_dtx_events,
     map_midi_events,
 )
@@ -8,9 +8,9 @@ from src.benchmark.models import BenchmarkEvent
 
 
 def test_default_dtx_mapping_supports_drumery_editor_lanes():
-    assert DEFAULT_DTX_LANE_MAP["13"].collapsed_class == "kick"
-    assert DEFAULT_DTX_LANE_MAP["12"].collapsed_class == "snare"
-    assert DEFAULT_DTX_LANE_MAP["11"].collapsed_class == "closed_hihat"
+    assert DTX_LANE_MAP["13"].canonical_class == "kick"
+    assert DTX_LANE_MAP["12"].canonical_class == "snare"
+    assert DTX_LANE_MAP["11"].canonical_class == "closed_hihat"
 
 
 def test_default_midi_mapping_supports_current_transcriber_notes():
@@ -19,20 +19,20 @@ def test_default_midi_mapping_supports_current_transcriber_notes():
 
 
 def test_default_midi_note_47_maps_to_existing_dtx_tom_class():
-    """MIDI note 47 must map to a collapsed class that DEFAULT_DTX_LANE_MAP
+    """MIDI note 47 must map to a detailed class that DTX_LANE_MAP
     can produce, otherwise mid-tom predictions are guaranteed false-positives."""
-    collapsed = DEFAULT_MIDI_NOTE_MAP[47]
-    dtx_classes = {m.collapsed_class for m in DEFAULT_DTX_LANE_MAP.values()}
-    assert collapsed in dtx_classes, f"{collapsed!r} not in DTX collapsed classes {dtx_classes}"
+    detailed = DEFAULT_MIDI_NOTE_MAP[47]
+    dtx_classes = {m.canonical_class for m in DTX_LANE_MAP.values()}
+    assert detailed in dtx_classes, f"{detailed!r} not in DTX detailed classes {dtx_classes}"
 
 
-def test_map_dtx_event_replaces_lane_class_and_preserves_native_metadata():
+def test_map_dtx_event_replaces_lane_class_and_stores_common_metadata():
     event = BenchmarkEvent("song", 0.0, "13", "ground_truth", {"lane_id": "13"})
 
     mapped, diagnostics = map_dtx_events([event])
 
     assert mapped[0].canonical_class == "kick"
-    assert mapped[0].metadata["native_class"] == "kick"
+    assert mapped[0].metadata["common_class"] == "kick"
     assert diagnostics.unmapped == {}
 
 
