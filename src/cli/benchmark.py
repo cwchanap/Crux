@@ -49,7 +49,7 @@ def _emit_backend_summary(
 
 
 @benchmark.command("prepare-backend")
-@click.option("--backend", type=str, required=True)
+@click.option("--backend", type=str, default="oaf", show_default=True)
 @click.option("--download", is_flag=True)
 @click.option(
     "--archive",
@@ -59,22 +59,8 @@ def _emit_backend_summary(
 @click.option(
     "--cache-root",
     type=click.Path(path_type=Path, file_okay=False),
-    required=True,
-)
-@click.option(
-    "--acquisition-request",
-    type=click.Path(path_type=Path, dir_okay=False),
-    default=None,
-)
-@click.option(
-    "--evidence-output",
-    type=click.Path(path_type=Path, dir_okay=False),
-    default=None,
-)
-@click.option(
-    "--backend-lock",
-    type=click.Path(path_type=Path, dir_okay=False),
-    default=None,
+    default=Path("artifacts/benchmark/model-cache"),
+    show_default=True,
 )
 @click.pass_context
 def prepare_backend_command(
@@ -83,73 +69,67 @@ def prepare_backend_command(
     download: bool,
     archive: Path | None,
     cache_root: Path,
-    acquisition_request: Path | None,
-    evidence_output: Path | None,
-    backend_lock: Path | None,
 ) -> None:
-    """Acquire or verify the immutable frozen OaF checkpoint cache."""
+    """Acquire or verify the immutable OaF checkpoint cache."""
     if download and archive is not None:
         raise click.UsageError("--download and --archive are mutually exclusive.")
 
-    from src.benchmark import backend_prepare
-    from src.benchmark.backend_lock import load_backend_lock
-    from src.benchmark.backend_registry import OFFICIAL_BACKEND_ID
-
-    if backend != OFFICIAL_BACKEND_ID:
+    if backend != "oaf":
         click.echo("backend_selection_invalid", err=True)
-        outcome = backend_prepare.PrepareBackendOutcome(
-            status="integrity_failed",
-            exit_code=2,
-            model_cache_path=None,
+        _emit_prepare_backend_summary(
+            backend=backend, checkpoint_path=None, status="integrity_failed"
         )
-    else:
-        loaded_lock = None
-        if backend_lock is not None:
-            try:
-                loaded_lock = load_backend_lock(backend_lock)
-            except (OSError, ValueError):
-                click.echo("backend_lock_invalid", err=True)
-                outcome = backend_prepare.PrepareBackendOutcome(
-                    status="integrity_failed",
-                    exit_code=2,
-                    model_cache_path=None,
-                )
-            else:
-                outcome = backend_prepare.prepare_oaf_backend(
-                    backend_prepare.PrepareBackendRequest(
-                        backend_id=backend,
-                        cache_root=cache_root,
-                        archive_path=archive,
-                        download=download,
-                        acquisition_request_path=acquisition_request,
-                        evidence_output_path=evidence_output,
-                        backend_lock_path=backend_lock,
-                    ),
-                    backend_lock=loaded_lock,
-                )
-        else:
-            outcome = backend_prepare.prepare_oaf_backend(
-                backend_prepare.PrepareBackendRequest(
-                    backend_id=backend,
-                    cache_root=cache_root,
-                    archive_path=archive,
-                    download=download,
-                    acquisition_request_path=acquisition_request,
-                    evidence_output_path=evidence_output,
-                    backend_lock_path=None,
-                ),
-            )
+        ctx.exit(2)
 
-    _emit_backend_summary(
-        status=outcome.status,
-        exit_code=outcome.exit_code,
-        report_path=(None if outcome.evidence_artifact is None else outcome.evidence_artifact.path),
-        report_sha256=(
-            None if outcome.evidence_artifact is None else outcome.evidence_artifact.sha256
-        ),
+    from runtime.oaf_tf1.model import OafModelConfigError, load_model_config
+    from src.benchmark.checkpoint_acquisition import (
+        CheckpointAcquisitionError,
+        prepare_oaf_checkpoint,
     )
-    if outcome.exit_code:
-        ctx.exit(outcome.exit_code)
+
+    try:
+        checkpoint_path = prepare_oaf_checkpoint(
+            load_model_config(),
+            cache_root,
+            download=download,
+            archive_path=archive,
+        )
+    except OafModelConfigError:
+        _emit_prepare_backend_summary(
+            backend=backend,
+            checkpoint_path=None,
+            status="integrity_failed",
+        )
+        ctx.exit(2)
+    except CheckpointAcquisitionError:
+        _emit_prepare_backend_summary(
+            backend=backend,
+            checkpoint_path=None,
+            status="acquisition_failed",
+        )
+        ctx.exit(1)
+
+    _emit_prepare_backend_summary(
+        backend=backend,
+        checkpoint_path=checkpoint_path,
+        status="ready",
+    )
+
+
+def _emit_prepare_backend_summary(
+    *,
+    backend: str,
+    checkpoint_path: Path | None,
+    status: str,
+) -> None:
+    payload = {
+        "backend": backend,
+        "checkpoint_path": None if checkpoint_path is None else str(checkpoint_path),
+        "status": status,
+    }
+    standard_output = click.get_binary_stream("stdout")
+    standard_output.write(canonical_json_bytes(payload, trailing_newline=True))
+    standard_output.flush()
 
 
 def _validate_verification_backend_id(

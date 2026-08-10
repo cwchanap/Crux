@@ -1,0 +1,21 @@
+{
+  "schema": "crux.oaf-model/v1",
+  "backend_id": "magenta-egmd-tf1-94529798-8hit-v1",
+  "model_id": "magenta-egmd-ckpt-569400-v1",
+  "architecture_id": "magenta-oaf-model-tpu-drums-v1",
+  "upstream_source_commit": "94529798dfbbb14c27ddfd76f23027dc8e2ce185",
+  "training_data_map_id": "magenta-egmd-data-8hit-94529798-v1",
+  "native_output_space_id": "magenta-oaf-midi88-a0-v1",
+  "native_metadata_schema_id": "magenta-oaf-native-metadata-v1",
+  "max_input_audio_frames": null,
+  "checkpoint": {
+    "url": "https://storage.googleapis.com/magentadata/models/onsets_frames_transcription/e-gmd_checkpoint.zip",
+    "archive_name": "e-gmd_checkpoint.zip",
+    "archive_sha256": "09765ae0ff19c7d769a3c20e158eba3b9cd279429b02e498b1e911d16f82e2c0",
+    "components": {
+      "model.ckpt-569400.data-00000-of-00001": "6312cd6f8e29ee6f21f4a763822d554f46393e0e336812ba4a8cb324d2e8b0b5",
+      "model.ckpt-569400.index": "475ca21993e102d52e2e6c7066b598b9b9e9a097bfb2fa6b770d40eedaa6139a",
+      "model.ckpt-569400.meta": "e36105b27c17f2367292682df825b8ad16eb887ccad465bbb5ddf955ef75d422"
+    }
+  }
+}
