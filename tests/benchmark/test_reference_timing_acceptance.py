@@ -13,11 +13,17 @@ import importlib.util
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from hashlib import sha256
+from io import BytesIO
 from pathlib import Path
 
+import numpy as np
 import pytest
+import soundfile as sf
 
+from src.benchmark.corpus_cache import CacheIndexEntry, CacheIndexStore
+from src.benchmark.r2_corpus_models import format_manifest_timestamp
 from src.benchmark.reference_timing_manifest import (
     run_reference_timing,
 )
@@ -78,6 +84,32 @@ def _fatal_factory() -> Iterator[tuple[list[object], Callable[[object], object]]
 def _read_events(output_dir: Path, relative_path: object) -> bytes:
     assert isinstance(relative_path, str)
     return (output_dir / relative_path).read_bytes()
+
+
+def _same_size_different_wav_bytes(reference: bytes) -> bytes:
+    """Re-encode ``reference`` WAV with non-zero samples at the same byte size.
+
+    The data section is replaced sample-for-sample so the file size is identical
+    (the existing size check in ``resolve_verified_cache_body`` cannot
+    distinguish it) while the content hash differs.  A small non-zero amplitude
+    keeps the float32 samples finite so ``inspect_source_audio`` still succeeds.
+    """
+    info = sf.info(BytesIO(reference))
+    frames = int(info.frames)
+    sample_rate = int(info.samplerate)
+    buffer = BytesIO()
+    sf.write(
+        buffer,
+        np.full(frames, 0.5, dtype=np.float32),
+        sample_rate,
+        format="WAV",
+        subtype=info.subtype,
+    )
+    rendered = buffer.getvalue()
+    assert len(rendered) == len(reference), (
+        f"re-encoded WAV size {len(rendered)} != reference {len(reference)}"
+    )
+    return rendered
 
 
 # ---------------------------------------------------------------------------
@@ -383,3 +415,72 @@ def test_acceptance_failed_download_is_mapped_and_does_not_abort_siblings(tmp_pa
     rows = {row["simfile_id"]: row for row in _ready_rows(outcome)}
     assert rows[42]["timing_status"] == "ready"
     assert rows[43]["timing_reason_codes"] == ["source_audio_download_failed"]
+
+
+# ---------------------------------------------------------------------------
+# Scenario 7: a cache index entry whose remote identity no longer matches the
+# immutable HPA-322 manifest (the source object at the same key changed and a
+# later sync updated index-v1.json) must NOT be silently rehydrated.  The row
+# falls through to the R2 fill path, whose conditional retrieval detects the
+# changed source instead of substituting newer content under the old identity.
+# ---------------------------------------------------------------------------
+
+
+def test_acceptance_stale_cache_index_entry_with_changed_identity_does_not_rehydrate(
+    tmp_path,
+):
+    original_audio = _wav_bytes()
+    spec = _SelectedSimfile(42, _READY_CHART_BODY, original_audio, audio_verified=False)
+    fixture = _publish_timing_manifest(
+        tmp_path,
+        selected=(spec,),
+        endpoint_sha256=_FILL_ENDPOINT_HASH,
+    )
+
+    # A later corpus/cache sync updated the index entry for the same key after
+    # R2's 42/bgm.wav changed: same byte size (so the existing size check in
+    # resolve_verified_cache_body cannot catch it), different content/etag, and
+    # a different last_modified.  The body validates against this stale entry,
+    # so without the remote-identity check the run would silently rehydrate the
+    # newer content under the old immutable HPA-322 identity.
+    stale_audio = _same_size_different_wav_bytes(original_audio)
+    assert stale_audio != original_audio
+    assert len(stale_audio) == len(original_audio)
+    stale_digest = sha256(stale_audio).hexdigest()
+    stale_time = datetime(2026, 8, 6, tzinfo=timezone.utc)
+    stale_entry = CacheIndexEntry(
+        source_endpoint_sha256=_FILL_ENDPOINT_HASH,
+        bucket="simfile-dtx",
+        key="42/bgm.wav",
+        etag="etag-stale-42/bgm.wav",
+        etag_is_weak=False,
+        size=len(stale_audio),
+        last_modified=format_manifest_timestamp(stale_time),
+        sha256=stale_digest,
+        cache_path=f"sha256/{stale_digest[:2]}/{stale_digest}",
+    )
+    stale_body_path = fixture.cache_dir / "sha256" / stale_digest[:2] / stale_digest
+    stale_body_path.parent.mkdir(parents=True, exist_ok=True)
+    stale_body_path.write_bytes(stale_audio)
+    CacheIndexStore.load(fixture.cache_dir).checkpoint(stale_entry)
+
+    # The fake store serves the ORIGINAL audio (the one the immutable HPA-322
+    # manifest describes).  If the stale entry were rehydrated, the store would
+    # never be called and the content hash would be the stale digest.
+    store = _AudioFakeStore({"42/bgm.wav": original_audio})
+
+    outcome = run_reference_timing(
+        _timing_request(fixture),
+        environ={"CRUX_R2_ENDPOINT_URL": _FILL_ENDPOINT, "CRUX_R2_BUCKET": "simfile-dtx"},
+        dependency_check=lambda: None,
+        store_factory=lambda config: store,
+    )
+
+    assert outcome.exit_code == 0
+    assert outcome.ready_count == 1
+    # The R2 fill path ran — the stale cache entry was not accepted.
+    assert [call[0] for call in store.open_calls] == ["42/bgm.wav"]
+    (row,) = _ready_rows(outcome)
+    original_digest = sha256(original_audio).hexdigest()
+    assert row["source_audio_content_hash"] == original_digest
+    assert row["source_audio_content_hash"] != stale_digest

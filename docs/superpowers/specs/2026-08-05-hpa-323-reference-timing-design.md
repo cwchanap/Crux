@@ -418,14 +418,20 @@ derived corpus version. Timing reason codes are validated against
 Output schema: `crux.reference-timing-manifest/v1`.
 
 The v1 timing row carries a minimal timing-specific payload on top of the
-preserved HPA-322 row.  The richer per-event audit data (source-audio header
-metadata, BGM anchor identity, pre/post exclusion counts, event SHA-256) is
-already computed by `SourceAudioInfo`, `BgmResolution`, and
-`AudioRelativeReference` and is published immutably in the
-`events/<sha256>.jsonl` artifact; the manifest row points at that artifact via
-`reference_events_cache_path` rather than duplicating every field inline.  This
-keeps the manifest row compact and avoids freezing a wide schema before
-downstream consumers have concrete requirements for the extra columns.
+preserved HPA-322 row.  The per-event artifact (`events/<sha256>.jsonl`) records
+only native event identity, source-audio identity, chart time, and audio time;
+the manifest row points at that artifact via `reference_events_cache_path`
+rather than duplicating every field inline.  This keeps the manifest row compact
+and avoids freezing a wide schema before downstream consumers have concrete
+requirements for the extra columns.
+
+The richer per-event audit data (source-audio header metadata such as
+sample rate / frames / channels, BGM anchor identity, pre/post exclusion counts)
+is computed transiently by `SourceAudioInfo`, `BgmResolution`, and
+`AudioRelativeReference` to build and bound the events, but is intentionally not
+retained in the v1 event artifact.  These fields can be added to a future schema
+revision if a consumer needs them surfaced durably rather than re-derived from
+the source audio.
 
 Add to the preserved HPA-322 row:
 

@@ -529,11 +529,22 @@ def _sync_selected_objects(
     return CacheSyncResult(rebuilt_simfiles, ordered_actions)
 
 
-def _remote_identity_matches(
+def cache_entry_matches_remote(
     entry: CacheIndexEntry | None,
     remote: RemoteObject,
-    config: R2Config,
+    *,
+    endpoint: str,
+    bucket: str,
 ) -> bool:
+    """Return whether ``entry`` still describes the same immutable ``remote``.
+
+    Compares the full remote identity ``(endpoint, bucket, key, etag,
+    etag_is_weak, size, last_modified)`` — not just the key — so a cache index
+    updated after the source object changed cannot silently substitute newer
+    content for an older immutable remote.  ``last_modified`` is normalized
+    through :func:`format_manifest_timestamp` because the index stores the
+    canonical string form while ``remote`` carries a :class:`~datetime.datetime`.
+    """
     return entry is not None and (
         entry.source_endpoint_sha256,
         entry.bucket,
@@ -543,13 +554,23 @@ def _remote_identity_matches(
         entry.size,
         entry.last_modified,
     ) == (
-        config.source_endpoint_sha256,
-        config.bucket,
+        endpoint,
+        bucket,
         remote.key,
         remote.etag,
         remote.etag_is_weak,
         remote.size,
         format_manifest_timestamp(remote.last_modified),
+    )
+
+
+def _remote_identity_matches(
+    entry: CacheIndexEntry | None,
+    remote: RemoteObject,
+    config: R2Config,
+) -> bool:
+    return cache_entry_matches_remote(
+        entry, remote, endpoint=config.source_endpoint_sha256, bucket=config.bucket
     )
 
 

@@ -62,6 +62,7 @@ import soundfile as sf
 from src.benchmark.backend_identity import StrictJsonError, require_sha256, strict_json_loads
 from src.benchmark.corpus_cache import (
     CacheIndexStore,
+    cache_entry_matches_remote,
     cache_writer_lock,
     read_verified_cache_body,
     resolve_verified_cache_body,
@@ -692,9 +693,19 @@ def _resolve_or_queue_audio(
     resolves without touching the optional R2 store.  Only genuinely
     absent/invalid local bodies fall through to ``pending_audio_key`` for a
     targeted R2 fill.
+
+    The cache entry's full remote identity (etag, etag_is_weak, size,
+    last_modified) must still match the HPA-322 ``audio_remote``: a later corpus
+    or cache sync can update ``index-v1.json`` after the source object at the
+    same key changed, and re-running an older immutable HPA-322 manifest must not
+    silently rehydrate that newer content.  On identity mismatch the row falls
+    through to the R2 fill path, whose conditional retrieval then detects the
+    changed source rather than substituting it.
     """
     entry = cache_index.get(endpoint, bucket, audio_remote.key)
-    if entry is None:
+    if entry is None or not cache_entry_matches_remote(
+        entry, audio_remote, endpoint=endpoint, bucket=bucket
+    ):
         state.pending_audio_key = audio_remote.key
         return
     validation = validate_cached_body(cache_dir, entry)
