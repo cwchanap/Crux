@@ -36,6 +36,7 @@ from src.benchmark.reference_timing import (
     build_audio_relative_events,
     inspect_source_audio,
     publish_immutable_content,
+    read_reference_events,
     render_reference_events,
     resolve_bgm_reference_groups,
     select_bgm_reference,
@@ -865,6 +866,72 @@ def test_render_reference_events_emits_canonical_jsonl_each_line() -> None:
     for line in content.splitlines(keepends=True):
         assert line.endswith(b"\n")
         strict_json_loads(line[:-1], require_canonical=True)
+
+
+def test_read_reference_events_round_trips_rendered_content() -> None:
+    content = render_reference_events(_sample_events())
+
+    events = read_reference_events(content)
+
+    assert events == tuple(
+        sorted(
+            _sample_events(),
+            key=lambda event: (
+                event.measure,
+                event.position,
+                event.source_order,
+                event.lane_id,
+                event.note_id,
+            ),
+        )
+    )
+    assert render_reference_events(events) == content
+
+
+@pytest.mark.parametrize(
+    "content_builder",
+    [
+        pytest.param(
+            lambda content: content.replace(b'":', b'" :', 1),
+            id="non-canonical-json",
+        ),
+        pytest.param(
+            lambda content: canonical_json_bytes(
+                {
+                    **strict_json_loads(content.splitlines()[0], require_canonical=True),
+                    "unexpected": "value",
+                },
+                trailing_newline=True,
+            ),
+            id="wrong-keys",
+        ),
+        pytest.param(
+            lambda content: canonical_json_bytes(
+                {
+                    **strict_json_loads(content.splitlines()[0], require_canonical=True),
+                    "audio_time_sec": "not-a-time",
+                },
+                trailing_newline=True,
+            ),
+            id="invalid-time",
+        ),
+        pytest.param(
+            lambda content: content.splitlines(keepends=True)[1]
+            + content.splitlines(keepends=True)[0],
+            id="out-of-order",
+        ),
+        pytest.param(
+            lambda content: content.splitlines(keepends=True)[0]
+            + content.splitlines(keepends=True)[0],
+            id="duplicate-native-identity",
+        ),
+    ],
+)
+def test_read_reference_events_rejects_invalid_content(content_builder) -> None:
+    content = content_builder(render_reference_events(_sample_events()))
+
+    with pytest.raises(ValueError):
+        read_reference_events(content)
 
 
 # ---------------------------------------------------------------------------

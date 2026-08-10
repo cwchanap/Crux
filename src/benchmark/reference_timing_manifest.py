@@ -79,6 +79,7 @@ from src.benchmark.corpus_manifest import (
 from src.benchmark.dtx_parser import ParsedDtxChart, parse_dtx_bytes
 from src.benchmark.durability import ensure_durable_directory
 from src.benchmark.r2_corpus_models import (
+    MAX_SIMFILE_ID,
     CacheSyncResult,
     PublishedManifest,
     R2Config,
@@ -231,6 +232,66 @@ class LoadedReferenceChartManifest:
     rows: tuple[_ValidatedReferenceChartRow, ...]
 
 
+@dataclass(frozen=True)
+class _CanonicalManifestRead:
+    manifest_sha256: str
+    corpus_version: str
+    rows: tuple[Mapping[str, object], ...]
+
+
+def _read_canonical_manifest_core(
+    path: Path,
+    *,
+    schema_version: str,
+    validate_rows: Callable[[tuple[Mapping[str, object], ...]], None] | None = None,
+) -> _CanonicalManifestRead:
+    """Read one immutable canonical JSONL manifest through shared invariants.
+
+    The HPA-322 and HPA-323 loaders differ only in their row views.  This core
+    owns the bytes-on-disk contract: canonical JSONL framing, the caller's
+    schema version, exact input hashing, and byte-identical ``render_manifest``
+    verification.  Row identity and domain validation stay with each loader.
+    """
+    try:
+        content = path.read_bytes()
+    except OSError:
+        raise ValueError("reference manifest is unavailable") from None
+
+    if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+        raise ValueError("reference manifest must contain canonical JSONL records")
+
+    rows: list[Mapping[str, object]] = []
+    for line in content.splitlines(keepends=True):
+        if not line.endswith(b"\n") or line == b"\n":
+            raise ValueError("reference manifest must contain canonical JSONL records")
+        try:
+            source_row = strict_json_loads(line[:-1], require_canonical=True)
+        except StrictJsonError:
+            raise ValueError("reference manifest must contain canonical JSONL records") from None
+        if not isinstance(source_row, dict) or source_row.get("schema_version") != schema_version:
+            raise ValueError("reference manifest contains an unsupported row")
+        rows.append(MappingProxyType(source_row))
+
+    if not rows:
+        raise ValueError("reference manifest contains no records")
+
+    if validate_rows is not None:
+        validate_rows(tuple(rows))
+
+    normalized_rows = tuple(
+        {key: value for key, value in source_row.items() if key != "corpus_version"}
+        for source_row in rows
+    )
+    rendered = render_manifest(normalized_rows)
+    if rendered.content != content:
+        raise ValueError("reference manifest has an invalid derived corpus version")
+    return _CanonicalManifestRead(
+        manifest_sha256=sha256(content).hexdigest(),
+        corpus_version=rendered.corpus_version,
+        rows=tuple(rows),
+    )
+
+
 def load_reference_chart_manifest(
     path: Path,
     *,
@@ -244,70 +305,141 @@ def load_reference_chart_manifest(
     :func:`manifest_row_view_from_row`.  Records the exact input-byte SHA-256
     and the shared HPA-322 ``corpus_version`` for downstream lineage.
     """
-    try:
-        content = path.read_bytes()
-    except OSError:
-        raise ValueError("reference chart manifest is unavailable") from None
-
-    if not content.endswith(b"\n") or content.endswith(b"\n\n"):
-        raise ValueError("reference chart manifest must contain canonical JSONL records")
-
     rows: list[_ValidatedReferenceChartRow] = []
     build_row_view = (
         reference_chart_row_view_from_row if row_view_builder is None else row_view_builder
     )
     simfile_ids: set[int] = set()
     source_identity: tuple[str, str, str, str, str] | None = None
-    for line in content.splitlines(keepends=True):
-        if not line.endswith(b"\n") or line == b"\n":
-            raise ValueError("reference chart manifest must contain canonical JSONL records")
-        try:
-            source_row = strict_json_loads(line[:-1], require_canonical=True)
-        except StrictJsonError:
-            raise ValueError(
-                "reference chart manifest must contain canonical JSONL records"
-            ) from None
-        if (
-            not isinstance(source_row, dict)
-            or source_row.get("schema_version") != REFERENCE_CHART_MANIFEST_SCHEMA
-        ):
-            raise ValueError("reference chart manifest contains an unsupported row")
-        try:
-            view = build_row_view(source_row)
-        except ValueError:
-            raise ValueError(
-                "reference chart manifest contains an invalid reference chart row"
-            ) from None
 
-        identity = (
-            view.corpus_version,
-            view.source.source_endpoint_sha256,
-            view.source.source_bucket,
-            view.source.cache_profile,
-            view.source.source_discovery_method,
-        )
-        if source_identity is None:
-            source_identity = identity
-        elif identity != source_identity:
-            raise ValueError("reference chart manifest contains mixed source identity")
-        if view.simfile_id in simfile_ids:
-            raise ValueError("reference chart manifest contains duplicate simfile IDs")
-        simfile_ids.add(view.simfile_id)
-        rows.append(_ValidatedReferenceChartRow(MappingProxyType(source_row), view))
+    def validate_rows(source_rows: tuple[Mapping[str, object], ...]) -> None:
+        nonlocal source_identity
+        for source_row in source_rows:
+            try:
+                view = build_row_view(source_row)
+            except ValueError:
+                raise ValueError(
+                    "reference chart manifest contains an invalid reference chart row"
+                ) from None
+
+            identity = (
+                view.corpus_version,
+                view.source.source_endpoint_sha256,
+                view.source.source_bucket,
+                view.source.cache_profile,
+                view.source.source_discovery_method,
+            )
+            if source_identity is None:
+                source_identity = identity
+            elif identity != source_identity:
+                raise ValueError("reference chart manifest contains mixed source identity")
+            if view.simfile_id in simfile_ids:
+                raise ValueError("reference chart manifest contains duplicate simfile IDs")
+            simfile_ids.add(view.simfile_id)
+            rows.append(_ValidatedReferenceChartRow(source_row, view))
+
+    canonical = _read_canonical_manifest_core(
+        path,
+        schema_version=REFERENCE_CHART_MANIFEST_SCHEMA,
+        validate_rows=validate_rows,
+    )
 
     if not rows:
         raise ValueError("reference chart manifest contains no records")
-    normalized_rows = tuple(
-        {key: value for key, value in validated.source_row.items() if key != "corpus_version"}
-        for validated in rows
-    )
-    rendered = render_manifest(normalized_rows)
-    assert source_identity is not None
-    if rendered.content != content or rendered.corpus_version != source_identity[0]:
+    if canonical.corpus_version != rows[0].view.corpus_version:
         raise ValueError("reference chart manifest has an invalid derived corpus version")
     return LoadedReferenceChartManifest(
-        source_reference_chart_manifest_sha256=sha256(content).hexdigest(),
-        source_reference_chart_version=source_identity[0],
+        source_reference_chart_manifest_sha256=canonical.manifest_sha256,
+        source_reference_chart_version=canonical.corpus_version,
+        rows=tuple(rows),
+    )
+
+
+@dataclass(frozen=True)
+class ReferenceTimingRowView:
+    simfile_id: int
+    corpus_version: str
+    timing_status: Literal["ready", "quarantined"]
+    timing_reason_codes: tuple[TimingReasonCode, ...]
+    timing_warnings: tuple[str, ...]
+    reference_events_cache_path: str | None
+    source_audio_key: str | None
+    source_audio_content_hash: str | None
+
+
+@dataclass(frozen=True)
+class LoadedReferenceTimingRow:
+    source_row: Mapping[str, object]
+    view: ReferenceTimingRowView
+
+
+@dataclass(frozen=True)
+class LoadedReferenceTimingManifest:
+    manifest_sha256: str
+    corpus_version: str
+    rows: tuple[LoadedReferenceTimingRow, ...]
+
+
+def _reference_timing_row_view_from_row(
+    source_row: Mapping[str, object],
+) -> ReferenceTimingRowView:
+    """Build the narrow HPA-324 timing view after HPA-323 shape validation."""
+    try:
+        _validate_timing_status_shape(source_row)
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("reference timing manifest contains an invalid timing row") from None
+
+    corpus_version = source_row.get("corpus_version")
+    if not _is_corpus_version(corpus_version):
+        raise ValueError("reference timing manifest contains an invalid corpus version")
+    simfile_id = source_row.get("simfile_id")
+    if isinstance(simfile_id, bool) or not isinstance(simfile_id, int):
+        raise ValueError("reference timing manifest contains an invalid simfile ID")
+    if not 0 <= simfile_id <= MAX_SIMFILE_ID:
+        raise ValueError("reference timing manifest contains an invalid simfile ID")
+    status = source_row["timing_status"]
+    reason_codes = source_row["timing_reason_codes"]
+    warnings = source_row["timing_warnings"]
+    if not isinstance(status, str) or not isinstance(reason_codes, list):
+        raise ValueError("reference timing manifest contains an invalid timing row")
+    if not isinstance(warnings, list) or any(not isinstance(warning, str) for warning in warnings):
+        raise ValueError("reference timing manifest contains invalid timing warnings")
+    return ReferenceTimingRowView(
+        simfile_id=simfile_id,
+        corpus_version=corpus_version,
+        timing_status=status,  # type: ignore[arg-type]
+        timing_reason_codes=tuple(reason_codes),  # type: ignore[arg-type]
+        timing_warnings=tuple(warnings),
+        reference_events_cache_path=source_row["reference_events_cache_path"],  # type: ignore[arg-type]
+        source_audio_key=source_row["source_audio_key"],  # type: ignore[arg-type]
+        source_audio_content_hash=source_row["source_audio_content_hash"],  # type: ignore[arg-type]
+    )
+
+
+def load_reference_timing_manifest(path: Path) -> LoadedReferenceTimingManifest:
+    """Load immutable HPA-323 timing rows for read-only downstream consumers."""
+    rows: list[LoadedReferenceTimingRow] = []
+    simfile_ids: set[int] = set()
+
+    def validate_rows(source_rows: tuple[Mapping[str, object], ...]) -> None:
+        for source_row in source_rows:
+            view = _reference_timing_row_view_from_row(source_row)
+            if view.simfile_id in simfile_ids:
+                raise ValueError("reference timing manifest contains duplicate simfile IDs")
+            simfile_ids.add(view.simfile_id)
+            rows.append(LoadedReferenceTimingRow(source_row=source_row, view=view))
+
+    canonical = _read_canonical_manifest_core(
+        path,
+        schema_version=REFERENCE_TIMING_MANIFEST_SCHEMA,
+        validate_rows=validate_rows,
+    )
+    for loaded_row in rows:
+        if loaded_row.view.corpus_version != canonical.corpus_version:
+            raise ValueError("reference timing manifest contains mixed corpus versions")
+    return LoadedReferenceTimingManifest(
+        manifest_sha256=canonical.manifest_sha256,
+        corpus_version=canonical.corpus_version,
         rows=tuple(rows),
     )
 
