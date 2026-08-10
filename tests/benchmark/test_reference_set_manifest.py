@@ -16,6 +16,7 @@ from src.benchmark.reference_set_manifest import (
     validate_schema_golden,
 )
 from src.benchmark.reference_timing import NativeReferenceEvent, render_reference_events
+from src.benchmark.reference_timing_manifest import load_reference_timing_manifest
 
 _GOLDEN = Path(__file__).parent / "schema_goldens/crux.reference-timing-manifest-v1.jsonl"
 _AUDIT = (
@@ -64,9 +65,6 @@ def _write_timing_manifest(
 
     rendered = render_manifest(
         ({key: value for key, value in row.items() if key != "corpus_version"},)
-    )
-    manifest_path = (
-        tmp_path / "timing" / rendered.relative_path if hasattr(rendered, "relative_path") else None
     )
     # RenderedManifest intentionally has no relative path; publish the fixture
     # in the same layout as HPA-323 so the event reader resolves its sibling.
@@ -150,6 +148,32 @@ def test_ready_row_invalid_event_artifact_is_row_local_quarantine(
             "duplicate_common_event_count",
         )
     )
+
+
+def test_safe_looking_symlink_event_artifact_is_row_local_quarantine(tmp_path: Path) -> None:
+    event = _native_event("13", audio_time_sec=1.0)
+    manifest_path = _write_timing_manifest(tmp_path, (event,))
+    row = json.loads(manifest_path.read_text())
+    event_path = manifest_path.parent.parent / str(row["reference_events_cache_path"])
+    external_path = tmp_path / "external-events.jsonl"
+    external_path.write_bytes(render_reference_events((event,)))
+    event_path.unlink()
+    event_path.symlink_to(external_path)
+    assert load_reference_timing_manifest(manifest_path).rows[0].view.timing_status == "ready"
+    assert event_path.is_symlink()
+
+    outcome = run_reference_set(ReferenceSetRequest(manifest_path, tmp_path / "reference-set"))
+
+    assert outcome.status == "partial"
+    assert outcome.exit_code == 1
+    assert outcome.manifest is not None
+    assert outcome.eligible_count == 0
+    assert outcome.quarantined_count == 1
+    published_row = _published_rows(outcome)[0]
+    assert published_row["reference_eligibility_status"] == "quarantined"
+    assert published_row["reference_eligibility_reason_codes"] == [
+        "reference_event_artifact_invalid"
+    ]
 
 
 def test_mapped_events_without_diagnostics_are_eligible(tmp_path: Path) -> None:
