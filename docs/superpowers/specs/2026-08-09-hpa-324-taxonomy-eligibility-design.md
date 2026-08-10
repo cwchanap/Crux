@@ -147,10 +147,12 @@ class ClassMapping:
 @dataclass(frozen=True)
 class PredictionMap:
     map_id: str
-    model_id: str
+    backend_id: str
     native_output_space_id: str
     classes: Mapping[str, ClassMapping]
 ```
+
+`PredictionMap.backend_id` identifies the backend/native-output contract that the map applies to. It is deliberately **not** the checkpoint/model identity field: for OaF the backend ID is `magenta-egmd-tf1-94529798-8hit-v1`, while the backend descriptor separately records checkpoint `model_id=magenta-egmd-ckpt-569400-v1`. HPA-423 validates both `backend_id` and `native_output_space_id` before applying a map.
 
 Use `MappingProxyType` for frozen tables. Git history is sufficient archival storage for old mapping code in this hobby project. A map-semantics change requires a new version ID.
 
@@ -213,7 +215,7 @@ Tests must bind this table to the existing locked vocabulary rather than duplica
 
 ```python
 assert set(OAF_PREDICTION_MAP.classes) == OAF_GROUP_IDS
-assert OAF_PREDICTION_MAP.model_id == OAF_BACKEND_ID
+assert OAF_PREDICTION_MAP.backend_id == OAF_BACKEND_ID
 ```
 
 These assertions can live in tests to avoid creating an undesirable production import cycle from `taxonomy.py` into `prediction_artifact.py`.
@@ -584,7 +586,7 @@ Focused tests only:
 
 - detailed/common taxonomies and total projection are exact;
 - DTX map uses the projection invariant;
-- OaF map keys equal existing `OAF_GROUP_IDS` and model ID equals `OAF_BACKEND_ID`;
+- OaF map keys equal existing `OAF_GROUP_IDS` and backend ID equals `OAF_BACKEND_ID`;
 - OaF hihat/toms do not fabricate detailed distinctions;
 - reverse MIDI export handles `low_or_floor_tom`;
 - HPA-323 event reader rejects non-canonical/invalid content and round-trips valid bytes;
@@ -633,13 +635,13 @@ HPA-324 can be moved to Done only when:
 
 1. one code-owned detailed/common taxonomy and total projection are frozen;
 2. DTX lane map v1 is frozen and legacy mapping/MIDI consumers use the new class names;
-3. OaF prediction map v1 is keyed by `upstream_8hit_group_id` and bound by tests to the existing OaF vocabulary/model identity;
+3. OaF prediction map v1 is keyed by `upstream_8hit_group_id` and bound by tests to the existing OaF vocabulary/backend identity;
 4. HPA-323 reference events are consumed through thin readers and can be remapped without rerunning inference;
 5. `map_reference_events` and public `project_common_reference_events` are the single reference mapping/projection implementations;
 6. the reviewed real-corpus lane audit is committed and the ignore/quarantine policy is frozen from that evidence;
 7. every HPA-323 row is exactly `eligible` or `quarantined`, with deterministic warnings/counts;
 8. HPA-325 can reconstruct scorer-ready common reference events from the inherited native artifact plus HPA-324 version IDs;
 9. the active prediction artifact persists `common_class` and a real OaF-shaped hihat/tom event round-trips with its common class intact;
-10. HPA-423 consumes the OaF group map without rewriting native MIDI identity and stamps the prediction-map ID;
+10. HPA-423 validates the map `backend_id`/native-output identity, consumes the OaF group map without rewriting native MIDI identity, and stamps the prediction-map ID;
 11. HPA-395/HPA-396 remain responsible for their exact later model maps;
 12. HPA-326 has not started before items 9-10 are verified.
