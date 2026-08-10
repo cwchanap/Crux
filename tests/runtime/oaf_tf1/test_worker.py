@@ -88,3 +88,4 @@ def test_worker_rejects_unsafe_audio_paths(tmp_path: Path, audio_path: str) -> N
     )
     record = json.loads(output.getvalue().splitlines()[1])
     assert record["error"]["code"] == "invalid_request"
+    assert record["id"] == "request-1"

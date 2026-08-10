@@ -55,6 +55,16 @@ def _valid_request(payload: object) -> tuple[str, str]:
     return request_id, audio_path
 
 
+def _request_id(payload: object) -> str | None:
+    """Return a usable request ID before validating the rest of a request."""
+    if not isinstance(payload, dict):
+        return None
+    request_id = payload.get("id")
+    if isinstance(request_id, str) and request_id:
+        return request_id
+    return None
+
+
 def serve_requests(
     stdin: TextIO = sys.stdin,
     stdout: TextIO = sys.stdout,
@@ -76,13 +86,18 @@ def serve_requests(
         },
     )
     for raw_line in stdin:
+        request_id = None
         try:
             payload = json.loads(raw_line)
+            request_id = _request_id(payload)
             request_id, audio_path = _valid_request(payload)
         except (TypeError, ValueError, json.JSONDecodeError):
+            error = {"error": {"code": "invalid_request", "message": "invalid request"}}
+            if request_id is not None:
+                error["id"] = request_id
             _write(
                 stdout,
-                {"error": {"code": "invalid_request", "message": "invalid request"}},
+                error,
             )
             continue
         try:

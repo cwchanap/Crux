@@ -64,11 +64,7 @@ class WorkerProcess:
         worker = cls(process, timeout_seconds=timeout_seconds, ready={})
         try:
             ready = worker._read_record(timeout_seconds)
-            if (
-                ready.get("type") != "ready"
-                or not isinstance(ready.get("backend_id"), str)
-                or ready.get("restored_tensor_count") != 78
-            ):
+            if ready.get("type") != "ready":
                 raise WorkerProcessError("worker ready response is invalid")
             worker._ready = ready
             return worker
@@ -100,6 +96,7 @@ class WorkerProcess:
             raise WorkerProcessError("worker process is closed")
         with self._request_lock:
             if self._process.poll() is not None:
+                self._poison()
                 raise WorkerProcessError("worker exited before ready")
             identifier = request_id or uuid.uuid4().hex
             if not isinstance(identifier, str) or not identifier:
@@ -112,21 +109,36 @@ class WorkerProcess:
                 stream.write((json.dumps(payload, separators=(",", ":")) + "\n").encode())
                 stream.flush()
             except (BrokenPipeError, OSError) as error:
+                self._poison()
                 raise WorkerProcessError("worker request failed") from error
-            response = self._read_record(self._timeout_seconds)
-            if response.get("id") != identifier:
-                raise WorkerProcessError("worker response id mismatch")
+            try:
+                response = self._read_record(self._timeout_seconds)
+            except WorkerProcessError:
+                self._poison()
+                raise
             if "error" in response:
+                if response.get("id") != identifier:
+                    self._poison()
+                    raise WorkerProcessError("worker response id mismatch")
                 error_payload = response["error"]
                 if isinstance(error_payload, Mapping) and isinstance(
                     error_payload.get("message"), str
                 ):
                     raise WorkerProcessError(error_payload["message"])
-                raise WorkerProcessError("worker inference failed")
+                self._poison()
+                raise WorkerProcessError("worker response is invalid")
+            if response.get("id") != identifier:
+                self._poison()
+                raise WorkerProcessError("worker response id mismatch")
             events = response.get("events")
             if not isinstance(events, list):
+                self._poison()
                 raise WorkerProcessError("worker response is invalid")
             return response
+
+    def _poison(self) -> None:
+        """Close a process after a protocol failure so it cannot be reused."""
+        self.close()
 
     def _read_record(self, timeout_seconds: float) -> dict[str, Any]:
         stream = self._process.stdout

@@ -44,7 +44,7 @@ def test_worker_process_reuses_child_for_two_requests_and_close(tmp_path: Path) 
 @pytest.mark.parametrize(
     ("script_output", "message"),
     [
-        ({"type": "ready"}, "worker ready response is invalid"),
+        ({}, "worker ready response is invalid"),
     ],
 )
 def test_worker_process_rejects_malformed_ready(
@@ -53,6 +53,16 @@ def test_worker_process_rejects_malformed_ready(
     script = _script(tmp_path, [script_output])
     with pytest.raises(WorkerProcessError, match=message):
         WorkerProcess.start([sys.executable, str(script)], timeout_seconds=1)
+
+
+def test_worker_process_accepts_generic_ready_record(tmp_path: Path) -> None:
+    script = _script(tmp_path, [{"type": "ready"}])
+    process = WorkerProcess.start([sys.executable, str(script)], timeout_seconds=1)
+    try:
+        assert process.ready == {"type": "ready"}
+        assert process.request("one.wav")["events"] == []
+    finally:
+        process.close()
 
 
 def test_worker_process_reports_early_exit(tmp_path: Path) -> None:
@@ -80,5 +90,48 @@ def test_worker_process_reports_wrong_response_id(tmp_path: Path) -> None:
     try:
         with pytest.raises(WorkerProcessError, match="worker response id mismatch"):
             process.request("one.wav")
+        assert process.closed
+        with pytest.raises(WorkerProcessError, match="worker process is closed"):
+            process.request("two.wav")
+    finally:
+        process.close()
+
+
+def test_worker_process_poisoned_after_timeout(tmp_path: Path) -> None:
+    script = tmp_path / "slow_worker.py"
+    script.write_text(
+        "import json, sys, time\n"
+        "print(json.dumps({'type':'ready'}), flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    request = json.loads(line)\n"
+        "    time.sleep(0.2)\n"
+        "    print(json.dumps({'id':request['id'],'events':[]}), flush=True)\n"
+    )
+    process = WorkerProcess.start([sys.executable, str(script)], timeout_seconds=0.05)
+    try:
+        with pytest.raises(WorkerProcessError, match="worker response timed out"):
+            process.request("one.wav")
+        assert process.closed
+        with pytest.raises(WorkerProcessError, match="worker process is closed"):
+            process.request("two.wav")
+    finally:
+        process.close()
+
+
+def test_worker_process_poisoned_after_malformed_output(tmp_path: Path) -> None:
+    script = tmp_path / "malformed_worker.py"
+    script.write_text(
+        "import sys\n"
+        'print(\'{"type":"ready"}\', flush=True)\n'
+        "for _line in sys.stdin:\n"
+        "    print('not-json', flush=True)\n"
+    )
+    process = WorkerProcess.start([sys.executable, str(script)], timeout_seconds=1)
+    try:
+        with pytest.raises(WorkerProcessError, match="worker response is invalid"):
+            process.request("one.wav")
+        assert process.closed
+        with pytest.raises(WorkerProcessError, match="worker process is closed"):
+            process.request("two.wav")
     finally:
         process.close()
