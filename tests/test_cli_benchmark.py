@@ -40,6 +40,7 @@ from src.benchmark.r2_corpus_models import (
 )
 from src.benchmark.r2_corpus_sync import ProgressEvent
 from src.benchmark.reference_chart_manifest import SelectionOutcome, SelectionRequest
+from src.benchmark.reference_set_manifest import ReferenceSetOutcome, ReferenceSetRequest
 from src.benchmark.reference_timing_manifest import (
     ReferenceTimingOutcome,
     ReferenceTimingRequest,
@@ -2168,3 +2169,151 @@ def test_installed_build_reference_timing_help_is_silent_and_avoids_optional_imp
     assert "--manifest" in result.stdout
     assert "--cache-dir" in result.stdout
     assert "--output-dir" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# build-reference-set (HPA-324 Task 6)
+# ---------------------------------------------------------------------------
+
+
+def _make_reference_set_published(tmp_path: Path) -> PublishedManifest:
+    published_path = tmp_path / "reference-set" / "manifests" / ("b" * 64 + ".jsonl")
+    published_path.parent.mkdir(parents=True, exist_ok=True)
+    return PublishedManifest(
+        corpus_version="sha256:" + "a" * 64,
+        manifest_sha256="b" * 64,
+        relative_path="manifests/" + "b" * 64 + ".jsonl",
+        path=published_path,
+        latest_path=tmp_path / "reference-set" / "latest.json",
+    )
+
+
+def _make_reference_set_outcome(
+    *,
+    status: str,
+    exit_code: int,
+    tmp_path: Path,
+    published: PublishedManifest | None = None,
+    eligible_count: int = 0,
+    quarantined_count: int = 0,
+) -> ReferenceSetOutcome:
+    return ReferenceSetOutcome(
+        status=status,  # type: ignore[arg-type]
+        exit_code=exit_code,  # type: ignore[arg-type]
+        manifest=published,
+        eligible_count=eligible_count,
+        quarantined_count=quarantined_count,
+    )
+
+
+def test_build_reference_set_help_exposes_only_manifest_and_output_dir() -> None:
+    result = runner.invoke(main, ["benchmark", "build-reference-set", "--help"])
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    output = result.stdout
+    option_lines = [line.strip() for line in output.splitlines() if line.startswith("  --")]
+    assert [line.split()[0] for line in option_lines] == ["--manifest", "--output-dir"]
+    assert "--manifest" in output
+    assert "[required]" in output
+    assert "[default: artifacts/benchmark/reference-set]" in " ".join(output.split())
+    for forbidden in ("--cache-dir", "--endpoint", "--model", "--tolerance", "--concurrency"):
+        assert forbidden not in output
+
+
+@pytest.mark.parametrize(
+    ("status", "exit_code", "eligible_count", "quarantined_count"),
+    [("complete", 0, 2, 0), ("partial", 1, 2, 1), ("failed", 2, 0, 0)],
+)
+def test_build_reference_set_emits_one_canonical_summary_and_maps_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    status: str,
+    exit_code: int,
+    eligible_count: int,
+    quarantined_count: int,
+) -> None:
+    manifest_path = tmp_path / "reference-timing" / "manifests" / ("c" * 64 + ".jsonl")
+    published = _make_reference_set_published(tmp_path) if exit_code != 2 else None
+    outcome = _make_reference_set_outcome(
+        status=status,
+        exit_code=exit_code,
+        tmp_path=tmp_path,
+        published=published,
+        eligible_count=eligible_count,
+        quarantined_count=quarantined_count,
+    )
+    monkeypatch.setattr(
+        "src.benchmark.reference_set_manifest.run_reference_set",
+        lambda request: outcome,
+    )
+
+    result = runner.invoke(
+        main,
+        ["benchmark", "build-reference-set", "--manifest", str(manifest_path)],
+    )
+
+    assert result.exit_code == exit_code
+    assert result.stderr_bytes == b""
+    expected_manifest_path = None if published is None else published.path
+    expected_manifest_sha = None if published is None else published.manifest_sha256
+    expected_corpus = None if published is None else published.corpus_version
+    expected = (
+        f'{{"corpus_version":{json.dumps(expected_corpus, separators=(",", ":"))},'
+        f'"eligible_count":{eligible_count},"exit_code":{exit_code},'
+        f'"manifest_path":{json.dumps(None if expected_manifest_path is None else str(expected_manifest_path), separators=(",", ":"))},'
+        f'"manifest_sha256":{json.dumps(expected_manifest_sha, separators=(",", ":"))},'
+        f'"quarantined_count":{quarantined_count},"status":"{status}"}}\n'
+    ).encode("utf-8")
+    assert result.stdout_bytes == expected
+    assert result.stdout_bytes.count(b"\n") == 1
+    assert set(json.loads(result.stdout)) == {
+        "corpus_version",
+        "eligible_count",
+        "exit_code",
+        "manifest_path",
+        "manifest_sha256",
+        "quarantined_count",
+        "status",
+    }
+
+
+def test_build_reference_set_requires_manifest_and_uses_default_output_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "src.benchmark.reference_set_manifest.run_reference_set",
+        lambda request: pytest.fail("missing required option reached orchestration"),
+    )
+    missing = runner.invoke(main, ["benchmark", "build-reference-set"])
+    assert missing.exit_code == 2
+    assert missing.stdout == ""
+    assert "Missing option" in missing.stderr
+
+    captured: list[ReferenceSetRequest] = []
+    manifest_path = tmp_path / "timing.jsonl"
+
+    def fake_run(request: ReferenceSetRequest) -> ReferenceSetOutcome:
+        captured.append(request)
+        return _make_reference_set_outcome(
+            status="complete",
+            exit_code=0,
+            tmp_path=tmp_path,
+            published=_make_reference_set_published(tmp_path),
+            eligible_count=1,
+        )
+
+    monkeypatch.setattr("src.benchmark.reference_set_manifest.run_reference_set", fake_run)
+    result = runner.invoke(
+        main,
+        ["benchmark", "build-reference-set", "--manifest", str(manifest_path)],
+    )
+
+    assert result.exit_code == 0
+    assert captured == [
+        ReferenceSetRequest(
+            manifest_path=manifest_path,
+            output_dir=Path("artifacts/benchmark/reference-set"),
+        )
+    ]
