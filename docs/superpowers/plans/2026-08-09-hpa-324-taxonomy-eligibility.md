@@ -1099,7 +1099,7 @@ HPA-324 is Done only when all are true:
 
 1. detailed/common taxonomy and total projection are frozen in one module;
 2. DTX lane map v1 and OaF group map v1 are versioned and immutable;
-3. OaF map keys are test-bound to `OAF_GROUP_IDS` and model ID to `OAF_BACKEND_ID`;
+3. OaF map keys are test-bound to `OAF_GROUP_IDS` and backend ID to `OAF_BACKEND_ID`;
 4. HPA-323 native events are consumed through thin validated readers;
 5. reference mapping/common projection is pure and persisted mapped copies are not added;
 6. real-corpus lane audit evidence is committed and reviewed before eligibility policy;

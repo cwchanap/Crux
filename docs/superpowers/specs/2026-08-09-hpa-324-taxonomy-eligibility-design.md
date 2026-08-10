@@ -584,7 +584,7 @@ Focused tests only:
 
 - detailed/common taxonomies and total projection are exact;
 - DTX map uses the projection invariant;
-- OaF map keys equal existing `OAF_GROUP_IDS` and model ID equals `OAF_BACKEND_ID`;
+- OaF map keys equal existing `OAF_GROUP_IDS` and backend ID equals `OAF_BACKEND_ID`;
 - OaF hihat/toms do not fabricate detailed distinctions;
 - reverse MIDI export handles `low_or_floor_tom`;
 - HPA-323 event reader rejects non-canonical/invalid content and round-trips valid bytes;
@@ -633,7 +633,7 @@ HPA-324 can be moved to Done only when:
 
 1. one code-owned detailed/common taxonomy and total projection are frozen;
 2. DTX lane map v1 is frozen and legacy mapping/MIDI consumers use the new class names;
-3. OaF prediction map v1 is keyed by `upstream_8hit_group_id` and bound by tests to the existing OaF vocabulary/model identity;
+3. OaF prediction map v1 is keyed by `upstream_8hit_group_id` and bound by tests to the existing OaF vocabulary/backend identity;
 4. HPA-323 reference events are consumed through thin readers and can be remapped without rerunning inference;
 5. `map_reference_events` and public `project_common_reference_events` are the single reference mapping/projection implementations;
 6. the reviewed real-corpus lane audit is committed and the ignore/quarantine policy is frozen from that evidence;
