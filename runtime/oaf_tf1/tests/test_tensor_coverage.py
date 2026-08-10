@@ -19,7 +19,6 @@ from runtime.oaf_tf1.protocol import (
     AuthenticatedObject,
     ProtocolFailure,
     VerifiedWav,
-    canonical_json_bytes,
 )
 
 
@@ -204,33 +203,42 @@ def test_tensor_coverage_rejects_uninitialized_required_variable() -> None:
         )
 
 
+def test_shipped_runner_manifest_is_present_and_retained_only() -> None:
+    repository = Path(__file__).parents[3]
+    manifest_path = repository / "runtime/oaf_tf1/runner-source-manifest.json"
+
+    assert manifest_path.is_file()
+    payload = json.loads(manifest_path.read_bytes())
+    assert payload["schema"] == "crux.oaf-runner-source-manifest/v1"
+    assert payload["covered_roots"] == ["runtime/oaf_tf1"]
+    assert payload["files"]
+    assert (
+        "COPY runtime/oaf_tf1/runner-source-manifest.json "
+        "/opt/crux/runtime/runner-source-manifest.json"
+    ) in (repository / "runtime/oaf_tf1/Dockerfile").read_text()
+    assert all(
+        not row["path"].startswith((".github/workflows/", "tools/hpa320/"))
+        for row in payload["files"]
+    )
+
+
 def test_ready_carries_authenticated_smoke_prediction_identity(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     repository = Path(__file__).parents[3]
     staged_root = tmp_path / "crux"
-    runner_source_path = "runtime/oaf_tf1/oaf_backend.py"
-    runner_source = repository / runner_source_path
-    runner_manifest_content = canonical_json_bytes(
-        {
-            "covered_roots": ["runtime/oaf_tf1"],
-            "files": [
-                {
-                    "path": runner_source_path,
-                    "sha256": hashlib.sha256(runner_source.read_bytes()).hexdigest(),
-                }
-            ],
-            "schema": "crux.oaf-runner-source-manifest/v1",
-        },
-        trailing_newline=True,
-    )
+    runner_manifest_source = repository / "runtime/oaf_tf1/runner-source-manifest.json"
+    runner_manifest_content = runner_manifest_source.read_bytes()
+    runner_manifest_payload = json.loads(runner_manifest_content)
     runner_manifest = staged_root / "runtime/runner-source-manifest.json"
     runner_manifest.parent.mkdir(parents=True, exist_ok=True)
     runner_manifest.write_bytes(runner_manifest_content)
-    staged_runner_source = staged_root / runner_source_path
-    staged_runner_source.parent.mkdir(parents=True, exist_ok=True)
-    staged_runner_source.write_bytes(runner_source.read_bytes())
+    for row in runner_manifest_payload["files"]:
+        source = repository / row["path"]
+        destination = staged_root / row["path"]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes())
     upstream_manifest_content = (repository / "runtime/oaf_tf1/source-manifest.json").read_bytes()
     upstream_manifest_payload = json.loads(upstream_manifest_content)
     upstream_manifest = staged_root / "vendor/source-manifest.json"

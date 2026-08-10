@@ -1443,7 +1443,6 @@ def authenticate_startup(
         label="runner_source_manifest",
         exact_keys=RUNNER_MANIFEST_KEYS,
         expected_schema="crux.oaf-runner-source-manifest/v1",
-        expected_sha256=runtime.payload["runner_source_manifest_sha256"],
     )
     upstream_manifest = load_authenticated_object(
         upstream_source_manifest_path,

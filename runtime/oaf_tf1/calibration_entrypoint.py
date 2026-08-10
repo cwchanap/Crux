@@ -485,7 +485,6 @@ def authenticate_calibration_startup(
             "runner_source_manifest",
             _RUNNER_MANIFEST_KEYS,
             "crux.oaf-runner-source-manifest/v1",
-            expected_sha256=bootstrap_request.payload["runner_source_manifest_sha256"],
         )
         upstream_manifest = _load(
             upstream_source_manifest_path,

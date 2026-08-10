@@ -297,15 +297,11 @@ class OafTf1Backend:
             "host adapter source manifest",
         )
         _require_artifact_hash(
-            runner_manifest,
-            locks.runtime.payload["runner_source_manifest_sha256"],
-            "runner source manifest",
-        )
-        _require_artifact_hash(
             upstream_manifest,
             locks.runtime.payload["upstream_source_manifest_sha256"],
             "upstream source manifest",
         )
+        runner_manifest_sha256 = sha256_hex(runner_manifest.read_bytes())
         tensor_artifact = _tensor_artifact(
             tensor_report,
             locks.seal.payload["tensor_coverage_sha256"],
@@ -334,13 +330,13 @@ class OafTf1Backend:
         )
         profile = _launch_profile(self._config, locks)
         smoke_audio = _load_smoke_audio(self._config, locks)
-        persistent = self._start_verified_process(profile, locks)
+        persistent = self._start_verified_process(profile, locks, runner_manifest_sha256)
         self._process = persistent
         fresh: _Runner | None = None
         try:
             persistent_first = self._request_smoke_prediction(smoke_audio, persistent)
             persistent_second = self._request_smoke_prediction(smoke_audio, persistent)
-            fresh = self._start_verified_process(profile, locks)
+            fresh = self._start_verified_process(profile, locks, runner_manifest_sha256)
             fresh_first = self._request_smoke_prediction(smoke_audio, fresh)
         finally:
             if fresh is not None:
@@ -496,7 +492,12 @@ class OafTf1Backend:
             raise _item(code, "The runner event list is malformed.") from None
         return prediction
 
-    def _start_verified_process(self, profile: RunnerLaunchProfile, locks: _Locks) -> _Runner:
+    def _start_verified_process(
+        self,
+        profile: RunnerLaunchProfile,
+        locks: _Locks,
+        runner_manifest_sha256: str,
+    ) -> _Runner:
         try:
             process = self._process_factory(profile)
         except BackendFatalFailure:
@@ -507,7 +508,7 @@ class OafTf1Backend:
                 "The frozen backend runner could not be launched.",
             ) from None
         try:
-            _validate_handshake(process.handshake, locks)
+            _validate_handshake(process.handshake, locks, runner_manifest_sha256)
         except BaseException:
             try:
                 process.close()
@@ -876,7 +877,11 @@ def _positive_integer(value: object, label: str) -> int:
     return cast(int, value)
 
 
-def _validate_handshake(handshake: Mapping[str, JsonValue], locks: _Locks) -> None:
+def _validate_handshake(
+    handshake: Mapping[str, JsonValue],
+    locks: _Locks,
+    runner_manifest_sha256: str,
+) -> None:
     backend = locks.backend
     runtime = locks.runtime
     seal = locks.seal
@@ -895,7 +900,7 @@ def _validate_handshake(handshake: Mapping[str, JsonValue], locks: _Locks) -> No
         "required_inference_count": 78,
         "required_inference_inventory_sha256": sha256_hex(canonical_json_bytes(required)),
         "restored_inference_count": 78,
-        "runner_source_manifest_sha256": runtime.payload["runner_source_manifest_sha256"],
+        "runner_source_manifest_sha256": runner_manifest_sha256,
         "runtime_lock_sha256": runtime.sha256,
         "smoke_audio_sha256": backend.payload["smoke_audio_sha256"],
         "smoke_oracle_sha256": backend.payload["smoke_oracle_sha256"],

@@ -62,6 +62,7 @@ COPY runtime/oaf_tf1/patches/ /opt/crux/runtime/oaf_tf1/patches/
 COPY runtime/oaf_tf1/tests/ /opt/crux/runtime/tests/
 # Preserve the manifest-addressed repository layout in the test image too.
 COPY runtime/oaf_tf1/ /opt/crux/runtime/oaf_tf1/
+COPY runtime/oaf_tf1/runner-source-manifest.json /opt/crux/runtime/runner-source-manifest.json
 WORKDIR /opt/crux
 USER "${RUNTIME_UID}:${RUNTIME_GID}"
 
@@ -77,6 +78,7 @@ COPY runtime/oaf_tf1/*.py /opt/crux/runtime/
 COPY runtime/oaf_tf1/patches/ /opt/crux/runtime/patches/
 # Preserve the manifest-addressed repository layout solely for fail-closed source attestation.
 COPY runtime/oaf_tf1/ /opt/crux/runtime/oaf_tf1/
+COPY runtime/oaf_tf1/runner-source-manifest.json /opt/crux/runtime/runner-source-manifest.json
 WORKDIR /opt/crux
 USER "${RUNTIME_UID}:${RUNTIME_GID}"
 ENTRYPOINT ["/usr/bin/env", "-i", "CUDA_VISIBLE_DEVICES=-1", "MKL_NUM_THREADS=1", "OMP_NUM_THREADS=1", "OPENBLAS_NUM_THREADS=1", "PYTHONHASHSEED=0", "PYTHONCOERCECLOCALE=0", "TF_NUM_INTEROP_THREADS=1", "TF_NUM_INTRAOP_THREADS=1", "/opt/crux/venv/bin/python", "-s", "/opt/crux/runtime/entrypoint.py"]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import struct
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -45,6 +46,20 @@ RUNTIME_SHA256 = "c" * 64
 SEAL_SHA256 = "d" * 64
 AUDIT_SHA256 = "e" * 64
 Inventory = list[dict[str, object]]
+
+
+def test_shipped_runner_manifest_is_available_to_host_verification() -> None:
+    repository = Path(__file__).parents[2]
+    manifest_path = repository / "runtime/oaf_tf1/runner-source-manifest.json"
+
+    assert manifest_path.is_file()
+    payload = json.loads(manifest_path.read_bytes())
+    assert payload["schema"] == "crux.oaf-runner-source-manifest/v1"
+    assert payload["covered_roots"] == ["runtime/oaf_tf1"]
+    assert all(
+        not row["path"].startswith((".github/workflows/", "tools/hpa320/"))
+        for row in payload["files"]
+    )
 
 
 def _canonical_file(path: Path, payload: object) -> Path:
