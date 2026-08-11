@@ -15,6 +15,7 @@ from src.benchmark.backend_identity import (
 from src.benchmark.backends import CanonicalAudio, NativeEvent, NativePrediction
 from src.benchmark.mapping import map_oaf_prediction
 from src.benchmark.oaf_smoke_oracle import (
+    SmokeOracleEvent,
     assert_smoke_oracle_matches,
     read_smoke_oracle,
     render_smoke_oracle,
@@ -137,3 +138,44 @@ def test_oracle_compare_rejects_backend_or_input_identity_mismatch(tmp_path: Pat
         assert_smoke_oracle_matches(prediction, replace(oracle, backend_id="other"))
     with pytest.raises(AssertionError):
         assert_smoke_oracle_matches(prediction, replace(oracle, input_audio_sha256="0" * 64))
+
+
+def test_checked_in_smoke_oracle_matches_run5_native_bit_patterns() -> None:
+    fixture_path = Path(__file__).parents[2] / "tests/fixtures/oaf_tf1_smoke/smoke-oracle.json"
+
+    oracle = read_smoke_oracle(fixture_path.read_bytes())
+
+    assert oracle.schema == "crux.oaf-smoke-oracle/v2"
+    assert oracle.backend_id == OAF_BACKEND_ID
+    assert oracle.input_audio_sha256 == (
+        "8ec2aed65945b7002e17b51818495ca754a519c39940f739cdcd1403eb661673"
+    )
+    assert oracle.native_events == (
+        SmokeOracleEvent(
+            time_sec_binary64="3fb7c6fbd273d5bb",
+            native_class_id="midi_38",
+            model_output_bin=17,
+            native_midi_note=38,
+            upstream_8hit_group_id="snare",
+            confidence_binary64="3fe3a19c9d5a187a",
+            velocity_midi=116,
+        ),
+        SmokeOracleEvent(
+            time_sec_binary64="3fd943675ddd2ae9",
+            native_class_id="midi_38",
+            model_output_bin=17,
+            native_midi_note=38,
+            upstream_8hit_group_id="snare",
+            confidence_binary64="3feb05caafbc1ace",
+            velocity_midi=118,
+        ),
+        SmokeOracleEvent(
+            time_sec_binary64="3fe64a89fc6da448",
+            native_class_id="midi_38",
+            model_output_bin=17,
+            native_midi_note=38,
+            upstream_8hit_group_id="snare",
+            confidence_binary64="3feb67ddca4b124d",
+            velocity_midi=107,
+        ),
+    )

@@ -33,7 +33,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          summary="$(uv run crux benchmark smoke-backend --backend oaf)"
+          summary="$(uv run crux benchmark smoke-backend --backend oaf --oracle tests/fixtures/oaf_tf1_smoke/smoke-oracle.json)"
           printf '%s\n' "$summary" | tee smoke-summary.json
           {
             echo "## OaF smoke"

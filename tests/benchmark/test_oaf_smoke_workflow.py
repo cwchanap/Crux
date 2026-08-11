@@ -18,6 +18,12 @@ def test_oaf_smoke_workflow_is_manual_single_job_and_minimal() -> None:
     assert content.count("prepare-backend --backend oaf --download") == 1
     assert content.count("docker build -f runtime/oaf_tf1/Dockerfile -t crux-oaf-tf1:local .") == 1
     assert content.count("smoke-backend --backend oaf") == 1
+    assert (
+        content.count(
+            "smoke-backend --backend oaf --oracle tests/fixtures/oaf_tf1_smoke/smoke-oracle.json"
+        )
+        == 1
+    )
     assert "artifacts/benchmark/oaf-smoke/prediction.jsonl" in content
     assert "actions/upload-artifact@v4" in content
     assert "GITHUB_STEP_SUMMARY" in content
