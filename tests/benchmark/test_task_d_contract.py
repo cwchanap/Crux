@@ -20,10 +20,12 @@ from src.benchmark.backends import CanonicalAudio, NativeEvent, NativePrediction
 from src.benchmark.backends.oaf import OafBackend, OafBackendError, build_docker_command
 from src.benchmark.mapping import map_oaf_prediction
 from src.benchmark.prediction_artifact import (
+    PREDICTION_SCHEMA,
     read_prediction_artifact,
     render_prediction_artifact,
 )
 from src.benchmark.scorer_input import read_scorer_events
+from src.benchmark.taxonomy import OAF_PREDICTION_MAP_ID
 from src.cli.main import main
 
 
@@ -96,6 +98,111 @@ def test_task_d_oaf_mapping_and_scorer_bridge(tmp_path: Path) -> None:
     assert len(events) == 1
     assert events[0].canonical_class == "hihat"
     assert events[0].metadata["detailed_canonical_class"] is None
+
+
+def test_task_d_oaf_prediction_round_trip_preserves_common_mapping_seam(
+    tmp_path: Path,
+) -> None:
+    native_events = (
+        NativeEvent(
+            time_sec=0.5,
+            native_class_id="midi_46",
+            model_output_bin=25,
+            native_midi_note=46,
+            native_metadata={"upstream_8hit_group_id": "hihat"},
+            confidence=0.9,
+            velocity_midi=100,
+        ),
+        NativeEvent(
+            time_sec=1.0,
+            native_class_id="midi_48",
+            model_output_bin=27,
+            native_midi_note=48,
+            native_metadata={"upstream_8hit_group_id": "toms"},
+            confidence=0.8,
+            velocity_midi=101,
+        ),
+        NativeEvent(
+            time_sec=1.5,
+            native_class_id="midi_53",
+            model_output_bin=32,
+            native_midi_note=53,
+            native_metadata={"upstream_8hit_group_id": "ride_bell"},
+            confidence=0.7,
+            velocity_midi=102,
+        ),
+        NativeEvent(
+            time_sec=2.0,
+            native_class_id="midi_75",
+            model_output_bin=54,
+            native_midi_note=75,
+            native_metadata={"upstream_8hit_group_id": "sticks"},
+            confidence=0.6,
+            velocity_midi=103,
+        ),
+    )
+    mapped, diagnostics = map_oaf_prediction(_prediction(tmp_path, native_events))
+
+    assert diagnostics.unmapped == {"sticks": 1}
+    assert [event.prediction_map_version for event in mapped.events] == [
+        OAF_PREDICTION_MAP_ID
+    ] * len(native_events)
+    assert [
+        (event.canonical_class, event.common_class, event.mapping_status) for event in mapped.events
+    ] == [
+        (None, "hihat", "mapped"),
+        (None, "tom", "mapped"),
+        ("ride", "ride", "mapped"),
+        (None, None, "unmapped"),
+    ]
+
+    artifact = read_prediction_artifact(render_prediction_artifact(mapped))
+    assert f'"schema":"{PREDICTION_SCHEMA}"'.encode() in artifact.content
+    round_tripped = artifact.prediction.events
+    assert [
+        (
+            event.native.native_class_id,
+            event.native.model_output_bin,
+            event.native.native_midi_note,
+            event.native.native_metadata["upstream_8hit_group_id"],
+            event.native.confidence,
+            event.native.velocity_midi,
+        )
+        for event in round_tripped
+    ] == [
+        (
+            event.native_class_id,
+            event.model_output_bin,
+            event.native_midi_note,
+            event.native_metadata["upstream_8hit_group_id"],
+            event.confidence,
+            event.velocity_midi,
+        )
+        for event in native_events
+    ]
+    assert [
+        (event.canonical_class, event.common_class, event.mapping_status) for event in round_tripped
+    ] == [
+        (None, "hihat", "mapped"),
+        (None, "tom", "mapped"),
+        ("ride", "ride", "mapped"),
+        (None, None, "unmapped"),
+    ]
+    assert [event.prediction_map_version for event in round_tripped] == [
+        OAF_PREDICTION_MAP_ID
+    ] * len(native_events)
+
+    scorer_events = read_scorer_events(artifact.content)
+    assert [(event.canonical_class, event.time_sec) for event in scorer_events] == [
+        ("hihat", 0.5),
+        ("tom", 1.0),
+        ("ride", 1.5),
+    ]
+    assert [event.metadata["detailed_canonical_class"] for event in scorer_events] == [
+        None,
+        None,
+        "ride",
+    ]
 
 
 def test_task_d_mapping_rejects_descriptor_identity_mismatch(tmp_path: Path) -> None:
