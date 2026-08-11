@@ -6,6 +6,10 @@ FROM python@sha256:ea8897698c0955ba96144bd2b7310ef7884ccce4db7a1f97ffc21fb8b89d1
 ARG RUNTIME_UID=65532
 ARG RUNTIME_GID=65532
 
+RUN apt-get update; \
+    apt-get install -y --no-install-recommends libsndfile1=1.0.31-2+deb11u2; \
+    rm -rf /var/lib/apt/lists/*
+
 RUN set -eu; \
     case "${RUNTIME_UID}" in ""|0|65534|*[!0-9]*) exit 64;; esac; \
     case "${RUNTIME_GID}" in ""|0|65534|*[!0-9]*) exit 64;; esac; \

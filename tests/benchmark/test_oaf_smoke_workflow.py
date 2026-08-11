@@ -63,6 +63,17 @@ def test_oaf_smoke_runtime_places_numba_cache_on_writable_tmpfs() -> None:
     assert cache_env == ["ENV NUMBA_CACHE_DIR=/tmp/numba-cache"]
 
 
+def test_oaf_smoke_runtime_installs_pinned_libsndfile_runtime_library() -> None:
+    dockerfile = (
+        WORKFLOW.parents[2].joinpath("runtime/oaf_tf1/Dockerfile").read_text(encoding="utf-8")
+    )
+    runtime_base = dockerfile.split("FROM runtime-base AS runtime-build", maxsplit=1)[0]
+
+    assert "apt-get install -y --no-install-recommends" in runtime_base
+    assert "libsndfile1=1.0.31-2+deb11u2" in runtime_base
+    assert "rm -rf /var/lib/apt/lists/*" in runtime_base
+
+
 def test_oaf_smoke_docker_build_is_self_contained_without_ignored_wheelhouse() -> None:
     repository = WORKFLOW.parents[2]
     dockerfile = repository.joinpath("runtime/oaf_tf1/Dockerfile").read_text(encoding="utf-8")
