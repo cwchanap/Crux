@@ -26,6 +26,9 @@ def test_oaf_smoke_workflow_is_manual_single_job_and_minimal() -> None:
     )
     assert "artifacts/benchmark/oaf-smoke/prediction.jsonl" in content
     assert "actions/upload-artifact@v4" in content
+    upload_step = content.split("      - name: Upload prediction artifact\n", maxsplit=1)[1]
+    assert upload_step.startswith("        if: always()\n")
+    assert "          if-no-files-found: error" in upload_step
     assert "GITHUB_STEP_SUMMARY" in content
     assert "GITHUB_SHA" in content
     assert "GITHUB_REF" in content
