@@ -55,6 +55,26 @@ def test_worker_process_rejects_malformed_ready(
         WorkerProcess.start([sys.executable, str(script)], timeout_seconds=1)
 
 
+def test_worker_process_surfaces_bounded_stderr_when_exiting_before_ready(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "failing_worker.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stderr.write('checkpoint load failed\\n' + ('x' * 10000))\n"
+        "sys.stderr.flush()\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkerProcessError) as caught:
+        WorkerProcess.start([sys.executable, str(script)], timeout_seconds=1)
+
+    message = str(caught.value)
+    assert message.startswith("worker exited before ready: checkpoint load failed")
+    assert len(message) < 5_000
+
+
 def test_worker_process_accepts_generic_ready_record(tmp_path: Path) -> None:
     script = _script(tmp_path, [{"type": "ready"}])
     process = WorkerProcess.start([sys.executable, str(script)], timeout_seconds=1)

@@ -63,3 +63,14 @@ def test_schema_golden_manifest_contains_only_task_d_rows() -> None:
 def test_prediction_v2_schema_golden_is_valid() -> None:
     path = Path(__file__).parent / "schema_goldens" / "crux.drum-prediction-events-v2.jsonl"
     validate_schema_golden("crux.drum-prediction-events/v2", path.read_bytes())
+
+
+def test_oaf_smoke_oracle_schema_golden_is_valid() -> None:
+    repository_root = Path(__file__).parents[2]
+    entry = next(
+        item
+        for item in load_schema_golden_manifest(repository_root)
+        if item.schema == "crux.oaf-smoke-oracle/v2"
+    )
+
+    validate_schema_golden_entry(entry, repository_root)

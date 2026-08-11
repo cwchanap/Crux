@@ -7,6 +7,11 @@ ARG RUNTIME_UID=65532
 ARG RUNTIME_GID=65532
 
 RUN set -eu; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends libsndfile1=1.0.31-2+deb11u2; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eu; \
     case "${RUNTIME_UID}" in ""|0|65534|*[!0-9]*) exit 64;; esac; \
     case "${RUNTIME_GID}" in ""|0|65534|*[!0-9]*) exit 64;; esac; \
     groupadd --gid "${RUNTIME_GID}" crux; \
@@ -18,11 +23,14 @@ ENV CUDA_VISIBLE_DEVICES=-1 \
 
 FROM runtime-base AS runtime-build
 
+COPY runtime/oaf_tf1/requirements-build.lock /opt/crux/requirements-build.lock
 COPY runtime/oaf_tf1/requirements.lock /opt/crux/requirements.lock
-COPY runtime/oaf_tf1/wheelhouse/runtime/ /opt/crux/wheelhouse/
 RUN python -m venv /opt/crux/venv; \
-    /opt/crux/venv/bin/pip install --no-index --require-hashes --only-binary=:all: \
-      --find-links=/opt/crux/wheelhouse \
+    /opt/crux/venv/bin/pip install --require-hashes --only-binary=:all: \
+      --index-url https://pypi.org/simple \
+      --requirement /opt/crux/requirements-build.lock; \
+    /opt/crux/venv/bin/pip install --no-build-isolation --require-hashes \
+      --index-url https://pypi.org/simple \
       --requirement /opt/crux/requirements.lock
 
 FROM runtime-build AS instrumented-source
@@ -37,6 +45,8 @@ RUN python /opt/crux/runtime/apply_instrumentation_patch.py \
       --manifest /opt/crux/runtime/instrumented-source-manifest.json
 
 FROM runtime-build AS runtime
+
+ENV NUMBA_CACHE_DIR=/tmp/numba-cache
 
 COPY --from=runtime-build /opt/crux/venv /opt/crux/venv
 COPY --from=instrumented-source /opt/crux/vendor/ /opt/crux/runtime/vendor/

@@ -20,7 +20,10 @@ from src.benchmark.oaf_smoke_oracle import (
     assert_smoke_oracle_matches,
     read_smoke_oracle,
 )
-from src.benchmark.prediction_artifact import publish_prediction_artifact
+from src.benchmark.prediction_artifact import (
+    publish_prediction_artifact,
+    read_prediction_artifact,
+)
 from src.benchmark.r2_corpus_models import MAX_SIMFILE_ID, SyncOutcome, SyncRequest
 from src.benchmark.r2_corpus_sync import ProgressEvent, sync_r2_corpus
 from src.cli.options import (
@@ -283,7 +286,13 @@ def smoke_backend(backend: str, oracle: Path | None) -> None:
         if oracle is not None:
             try:
                 oracle_content = read_regular_file_no_follow(oracle)
-                assert_smoke_oracle_matches(mapped_prediction, read_smoke_oracle(oracle_content))
+                canonical_prediction = read_prediction_artifact(
+                    read_regular_file_no_follow(prediction_path)
+                ).prediction
+                assert_smoke_oracle_matches(
+                    canonical_prediction,
+                    read_smoke_oracle(oracle_content),
+                )
             except (AssertionError, OSError, TypeError, ValueError) as error:
                 raise click.ClickException(str(error)) from error
             oracle_status = "matched"

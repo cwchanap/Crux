@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -16,6 +16,10 @@ from src.benchmark.backend_identity import (
 from src.benchmark.backends import CanonicalAudio, NativeEvent, NativePrediction
 from src.benchmark.mapping import map_oaf_prediction
 from src.benchmark.oaf_smoke_oracle import render_smoke_oracle
+from src.benchmark.prediction_artifact import (
+    publish_prediction_artifact,
+    read_prediction_artifact,
+)
 from src.cli.main import main
 
 
@@ -238,3 +242,67 @@ def test_smoke_backend_matches_optional_oracle_and_rejects_missing_or_mismatchin
         ["benchmark", "smoke-backend", "--backend", "oaf", "--oracle", str(oracle_path)],
     )
     assert mismatching.exit_code != 0
+
+
+def test_smoke_backend_compares_oracle_to_canonical_published_prediction(
+    tmp_path: Path, monkeypatch
+) -> None:
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    base_prediction = _prediction(input_root)
+    raw_prediction = replace(
+        base_prediction,
+        events=(
+            replace(
+                base_prediction.events[0],
+                time_sec=0.123456789,
+                confidence=0.987654321,
+            ),
+            *base_prediction.events[1:],
+        ),
+    )
+    mapped_prediction = map_oaf_prediction(raw_prediction)[0]
+    oracle_source_path = tmp_path / "oracle-source.jsonl"
+    publish_prediction_artifact(oracle_source_path, mapped_prediction)
+    canonical_prediction = read_prediction_artifact(oracle_source_path.read_bytes()).prediction
+    oracle_path = tmp_path / "oracle.json"
+    oracle_path.write_bytes(render_smoke_oracle(canonical_prediction))
+
+    assert mapped_prediction.events[0].native.time_sec == 0.123456789
+    assert canonical_prediction.events[0].native.time_sec == 0.123457
+    assert mapped_prediction.events[0].native.confidence == 0.987654321
+    assert canonical_prediction.events[0].native.confidence == 0.987654
+
+    import src.cli.benchmark as benchmark_module
+
+    fake_registry = _FakeRegistry(_FakeBackend(raw_prediction))
+    monkeypatch.setattr(benchmark_module, "default_backend_registry", lambda: fake_registry)
+    monkeypatch.setattr(
+        benchmark_module,
+        "load_model_config",
+        lambda: type(
+            "Config",
+            (),
+            {
+                "max_input_audio_frames": None,
+                "checkpoint": type("Checkpoint", (), {"archive_sha256": "a" * 64})(),
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        benchmark_module, "load_direct_audio", lambda *args, **kwargs: raw_prediction.audio
+    )
+    monkeypatch.setattr(benchmark_module.time, "perf_counter", iter((10.0, 12.0)).__next__)
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(
+        main,
+        ["benchmark", "smoke-backend", "--backend", "oaf", "--oracle", str(oracle_path)],
+    )
+
+    assert result.exit_code == 0
+    summary = json.loads(result.output)
+    assert summary["oracle_status"] == "matched"
+    persisted = Path(summary["prediction_path"]).read_bytes()
+    assert summary["prediction_sha256"] == sha256_hex(persisted)
+    assert read_prediction_artifact(persisted).prediction == canonical_prediction

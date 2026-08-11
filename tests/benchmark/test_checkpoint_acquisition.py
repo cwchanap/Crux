@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat
 import zipfile
 from pathlib import Path
 
@@ -121,6 +122,37 @@ def test_prepare_checkpoint_verifies_archive_pointer_members_and_components(tmp_
 
     assert result == tmp_path / "cache" / "sha256" / config.checkpoint.archive_sha256
     assert {path.name: path.read_bytes() for path in result.iterdir()} == _COMPONENT_CONTENT
+
+
+def test_prepare_checkpoint_publishes_runtime_traversable_permissions(tmp_path: Path) -> None:
+    archive, config = _synthetic_archive(tmp_path)
+
+    result = prepare_oaf_checkpoint(
+        config,
+        tmp_path / "cache",
+        download=False,
+        archive_path=archive,
+    )
+
+    assert stat.S_IMODE(result.lstat().st_mode) == 0o755
+    assert {stat.S_IMODE(path.lstat().st_mode) for path in result.iterdir()} == {0o644}
+
+
+def test_prepare_checkpoint_normalizes_verified_cache_permissions(tmp_path: Path) -> None:
+    archive, config = _synthetic_archive(tmp_path)
+    result = prepare_oaf_checkpoint(
+        config,
+        tmp_path / "cache",
+        download=False,
+        archive_path=archive,
+    )
+    result.chmod(0o700)
+    for path in result.iterdir():
+        path.chmod(0o600)
+
+    assert prepare_oaf_checkpoint(config, tmp_path / "cache", download=False) == result
+    assert stat.S_IMODE(result.lstat().st_mode) == 0o755
+    assert {stat.S_IMODE(path.lstat().st_mode) for path in result.iterdir()} == {0o644}
 
 
 def test_prepare_checkpoint_verify_only_reuses_and_verifies_cache(tmp_path: Path) -> None:

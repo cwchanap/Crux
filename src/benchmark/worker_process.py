@@ -13,6 +13,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+_MAX_STDERR_DIAGNOSTIC_BYTES = 4096
+_STDERR_READ_CHUNK_BYTES = 4096
+
 
 class WorkerProcessError(RuntimeError):
     """The worker process or its line protocol failed."""
@@ -34,6 +37,17 @@ class WorkerProcess:
         self._closed = False
         self._ready = dict(ready)
         self._stdout_buffer = bytearray()
+        self._stderr_buffer = bytearray()
+        self._stderr_truncated = False
+        self._stderr_lock = threading.Lock()
+        self._stderr_thread: threading.Thread | None = None
+        if process.stderr is not None:
+            self._stderr_thread = threading.Thread(
+                target=self._capture_stderr,
+                args=(process.stderr,),
+                daemon=True,
+            )
+            self._stderr_thread.start()
 
     @classmethod
     def start(
@@ -71,7 +85,10 @@ class WorkerProcess:
         except WorkerProcessError as error:
             worker.close()
             if str(error) in {"worker exited before ready", "worker response timed out"}:
-                raise
+                diagnostic_error = worker._with_stderr_diagnostic(error)
+                if diagnostic_error is error:
+                    raise
+                raise diagnostic_error from error
             raise WorkerProcessError("worker ready response is invalid") from error
         except Exception as error:
             worker.close()
@@ -97,7 +114,11 @@ class WorkerProcess:
         with self._request_lock:
             if self._process.poll() is not None:
                 self._poison()
-                raise WorkerProcessError("worker exited before ready")
+                error = WorkerProcessError("worker exited before ready")
+                diagnostic_error = self._with_stderr_diagnostic(error)
+                if diagnostic_error is error:
+                    raise error
+                raise diagnostic_error from error
             identifier = request_id or uuid.uuid4().hex
             if not isinstance(identifier, str) or not identifier:
                 raise WorkerProcessError("worker request id is invalid")
@@ -113,9 +134,12 @@ class WorkerProcess:
                 raise WorkerProcessError("worker request failed") from error
             try:
                 response = self._read_record(self._timeout_seconds)
-            except WorkerProcessError:
+            except WorkerProcessError as error:
                 self._poison()
-                raise
+                diagnostic_error = self._with_stderr_diagnostic(error)
+                if diagnostic_error is error:
+                    raise
+                raise diagnostic_error from error
             if "error" in response:
                 if response.get("id") != identifier:
                     self._poison()
@@ -141,6 +165,34 @@ class WorkerProcess:
     def _poison(self) -> None:
         """Close a process after a protocol failure so it cannot be reused."""
         self.close()
+
+    def _capture_stderr(self, stream: Any) -> None:
+        while True:
+            try:
+                chunk = stream.read(_STDERR_READ_CHUNK_BYTES)
+            except (OSError, ValueError):
+                return
+            if not chunk:
+                return
+            with self._stderr_lock:
+                remaining = _MAX_STDERR_DIAGNOSTIC_BYTES - len(self._stderr_buffer)
+                if remaining > 0:
+                    self._stderr_buffer.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    self._stderr_truncated = True
+
+    def _with_stderr_diagnostic(self, error: WorkerProcessError) -> WorkerProcessError:
+        if str(error) != "worker exited before ready":
+            return error
+        with self._stderr_lock:
+            content = bytes(self._stderr_buffer)
+            truncated = self._stderr_truncated
+        diagnostic = content.decode("utf-8", errors="replace").strip()
+        if not diagnostic:
+            return error
+        if truncated:
+            diagnostic += " ... [stderr truncated]"
+        return WorkerProcessError(f"{error}: {diagnostic}")
 
     def _read_record(self, timeout_seconds: float) -> dict[str, Any]:
         stream = self._process.stdout
@@ -193,6 +245,8 @@ class WorkerProcess:
             except subprocess.TimeoutExpired:
                 self._process.kill()
                 self._process.wait()
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=max(self._timeout_seconds, 0.1))
         for stream in (self._process.stdout, self._process.stderr):
             if stream is not None:
                 try:
