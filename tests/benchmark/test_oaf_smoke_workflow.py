@@ -49,6 +49,20 @@ def test_oaf_smoke_docker_build_uses_dockerfile_non_root_defaults() -> None:
     assert "ARG RUNTIME_GID=65532" in dockerfile
 
 
+def test_oaf_smoke_runtime_places_numba_cache_on_writable_tmpfs() -> None:
+    dockerfile = (
+        WORKFLOW.parents[2].joinpath("runtime/oaf_tf1/Dockerfile").read_text(encoding="utf-8")
+    )
+    runtime_stage = dockerfile.split("FROM runtime-build AS runtime", maxsplit=1)[1]
+
+    cache_env = [
+        line.strip()
+        for line in runtime_stage.splitlines()
+        if line.strip().startswith("ENV NUMBA_CACHE_DIR=")
+    ]
+    assert cache_env == ["ENV NUMBA_CACHE_DIR=/tmp/numba-cache"]
+
+
 def test_oaf_smoke_docker_build_is_self_contained_without_ignored_wheelhouse() -> None:
     repository = WORKFLOW.parents[2]
     dockerfile = repository.joinpath("runtime/oaf_tf1/Dockerfile").read_text(encoding="utf-8")

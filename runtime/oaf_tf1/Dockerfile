@@ -41,6 +41,8 @@ RUN python /opt/crux/runtime/apply_instrumentation_patch.py \
 
 FROM runtime-build AS runtime
 
+ENV NUMBA_CACHE_DIR=/tmp/numba-cache
+
 COPY --from=runtime-build /opt/crux/venv /opt/crux/venv
 COPY --from=instrumented-source /opt/crux/vendor/ /opt/crux/runtime/vendor/
 COPY --from=instrumented-source /opt/crux/upstream/ /opt/crux/upstream/
