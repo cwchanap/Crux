@@ -161,6 +161,7 @@ def test_task_d_oaf_prediction_round_trip_preserves_common_mapping_seam(
     round_tripped = artifact.prediction.events
     assert [
         (
+            event.native.time_sec,
             event.native.native_class_id,
             event.native.model_output_bin,
             event.native.native_midi_note,
@@ -171,6 +172,7 @@ def test_task_d_oaf_prediction_round_trip_preserves_common_mapping_seam(
         for event in round_tripped
     ] == [
         (
+            event.time_sec,
             event.native_class_id,
             event.model_output_bin,
             event.native_midi_note,
