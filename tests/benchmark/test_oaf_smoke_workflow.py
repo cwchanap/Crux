@@ -69,7 +69,9 @@ def test_oaf_smoke_runtime_installs_pinned_libsndfile_runtime_library() -> None:
     )
     runtime_base = dockerfile.split("FROM runtime-base AS runtime-build", maxsplit=1)[0]
 
-    assert "apt-get install -y --no-install-recommends" in runtime_base
+    assert (
+        "RUN set -eu; \\\n    apt-get update; \\\n    apt-get install -y --no-install-recommends"
+    ) in runtime_base
     assert "libsndfile1=1.0.31-2+deb11u2" in runtime_base
     assert "rm -rf /var/lib/apt/lists/*" in runtime_base
 
