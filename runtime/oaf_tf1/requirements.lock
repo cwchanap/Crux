@@ -1,7 +1,5 @@
---no-index
 --require-hashes
 --only-binary=:all:
---find-links=/opt/crux/wheelhouse
 # filename=absl_py-2.1.0-py3-none-any.whl byte_length=133706
 absl-py==2.1.0 --hash=sha256:526a04eadab8b4ee719ce68f204172ead1027549089702d99b9059f129ff1308
 # filename=astor-0.8.1-py2.py3-none-any.whl byte_length=27488

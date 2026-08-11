@@ -19,10 +19,9 @@ ENV CUDA_VISIBLE_DEVICES=-1 \
 FROM runtime-base AS runtime-build
 
 COPY runtime/oaf_tf1/requirements.lock /opt/crux/requirements.lock
-COPY runtime/oaf_tf1/wheelhouse/runtime/ /opt/crux/wheelhouse/
 RUN python -m venv /opt/crux/venv; \
-    /opt/crux/venv/bin/pip install --no-index --require-hashes --only-binary=:all: \
-      --find-links=/opt/crux/wheelhouse \
+    /opt/crux/venv/bin/pip install --require-hashes --only-binary=:all: \
+      --index-url https://pypi.org/simple \
       --requirement /opt/crux/requirements.lock
 
 FROM runtime-build AS instrumented-source

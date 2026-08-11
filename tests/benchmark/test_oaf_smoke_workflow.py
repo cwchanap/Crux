@@ -46,3 +46,20 @@ def test_oaf_smoke_docker_build_uses_dockerfile_non_root_defaults() -> None:
     )
     assert "ARG RUNTIME_UID=65532" in dockerfile
     assert "ARG RUNTIME_GID=65532" in dockerfile
+
+
+def test_oaf_smoke_docker_build_is_self_contained_without_ignored_wheelhouse() -> None:
+    repository = WORKFLOW.parents[2]
+    dockerfile = repository.joinpath("runtime/oaf_tf1/Dockerfile").read_text(encoding="utf-8")
+    requirements_lock = repository.joinpath("runtime/oaf_tf1/requirements.lock").read_text(
+        encoding="utf-8"
+    )
+    gitignore = repository.joinpath(".gitignore").read_text(encoding="utf-8")
+
+    assert "runtime/oaf_tf1/wheelhouse/" in gitignore
+    assert "wheelhouse" not in dockerfile
+    assert "--no-index" not in requirements_lock
+    assert "--find-links" not in requirements_lock
+    assert "COPY runtime/oaf_tf1/requirements.lock /opt/crux/requirements.lock" in dockerfile
+    assert "pip install --require-hashes --only-binary=:all:" in dockerfile
+    assert "--index-url https://pypi.org/simple" in dockerfile
