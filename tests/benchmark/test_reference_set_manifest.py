@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,11 @@ from src.benchmark.reference_set_manifest import (
     run_reference_set,
     validate_schema_golden,
 )
-from src.benchmark.reference_timing import NativeReferenceEvent, render_reference_events
+from src.benchmark.reference_timing import (
+    NativeReferenceEvent,
+    read_reference_events,
+    render_reference_events,
+)
 from src.benchmark.reference_timing_manifest import load_reference_timing_manifest
 
 _GOLDEN = Path(__file__).parent / "schema_goldens/crux.reference-timing-manifest-v1.jsonl"
@@ -174,6 +179,71 @@ def test_safe_looking_symlink_event_artifact_is_row_local_quarantine(tmp_path: P
     assert published_row["reference_eligibility_reason_codes"] == [
         "reference_event_artifact_invalid"
     ]
+
+
+@pytest.mark.parametrize(
+    ("identity_field", "event_updates"),
+    [
+        (
+            "simfile_id",
+            {
+                "simfile_id": 43,
+                "selected_chart_key": "43/real.dtx",
+                "source_audio_key": "43/bgm.wav",
+            },
+        ),
+        ("selected_chart_key", {"selected_chart_key": "42/alternate.dtx"}),
+        (
+            "selected_chart_content_hash",
+            {"selected_chart_content_hash": "d" * 64},
+        ),
+        ("source_audio_key", {"source_audio_key": "42/alternate.wav"}),
+        (
+            "source_audio_content_hash",
+            {"source_audio_content_hash": "e" * 64},
+        ),
+    ],
+)
+def test_canonical_rehashed_event_identity_mismatch_is_row_local_quarantine(
+    tmp_path: Path,
+    identity_field: str,
+    event_updates: dict[str, object],
+) -> None:
+    event = replace(_native_event("13", audio_time_sec=1.0), **event_updates)
+    manifest_path = _write_timing_manifest(tmp_path, (event,))
+
+    loaded = load_reference_timing_manifest(manifest_path)
+    assert loaded.rows[0].view.timing_status == "ready"
+    assert getattr(event, identity_field) != loaded.rows[0].source_row[identity_field]
+    row = json.loads(manifest_path.read_text())
+    relative = row["reference_events_cache_path"]
+    assert isinstance(relative, str)
+    event_path = manifest_path.parent.parent / relative
+    content = event_path.read_bytes()
+    assert hashlib.sha256(content).hexdigest() == event_path.stem
+    assert read_reference_events(content) == (event,)
+
+    outcome = run_reference_set(ReferenceSetRequest(manifest_path, tmp_path / "reference-set"))
+
+    assert outcome.status == "partial"
+    assert outcome.exit_code == 1
+    assert outcome.eligible_count == 0
+    assert outcome.quarantined_count == 1
+    published_row = _published_rows(outcome)[0]
+    assert published_row["reference_eligibility_status"] == "quarantined"
+    assert published_row["reference_eligibility_reason_codes"] == [
+        "reference_event_artifact_invalid"
+    ]
+    assert all(
+        published_row[field] == 0
+        for field in (
+            "mapped_event_count",
+            "common_scored_event_count",
+            "ignored_event_count",
+            "unmapped_event_count",
+            "duplicate_common_event_count",
+        )
+    )
 
 
 def test_mapped_events_without_diagnostics_are_eligible(tmp_path: Path) -> None:

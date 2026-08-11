@@ -143,8 +143,25 @@ def _read_native_reference_events(
     if sha256(content).hexdigest() != expected_sha256:
         raise ValueError("reference event artifact hash mismatch")
     events = read_reference_events(content)
-    if any(event.simfile_id != loaded.view.simfile_id for event in events):
-        raise ValueError("reference event artifact has an inconsistent simfile ID")
+    expected_identity = (
+        loaded.view.simfile_id,
+        loaded.source_row["selected_chart_key"],
+        loaded.source_row["selected_chart_content_hash"],
+        loaded.view.source_audio_key,
+        loaded.view.source_audio_content_hash,
+    )
+    if any(
+        (
+            event.simfile_id,
+            event.selected_chart_key,
+            event.selected_chart_content_hash,
+            event.source_audio_key,
+            event.source_audio_content_hash,
+        )
+        != expected_identity
+        for event in events
+    ):
+        raise ValueError("reference event artifact identity does not match timing row")
     return events
 
 
