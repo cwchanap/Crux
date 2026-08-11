@@ -8,7 +8,7 @@ import pytest
 import soundfile as sf
 
 import src.benchmark.render_audio as render_audio
-from src.benchmark.mapping import DEFAULT_DTX_LANE_MAP, map_dtx_events
+from src.benchmark.mapping import DTX_LANE_MAP, map_dtx_events
 from src.benchmark.models import BenchmarkEvent
 from src.benchmark.render_audio import (
     plan_render_corpus,
@@ -689,12 +689,12 @@ def test_bgm_channel_01_is_not_a_renderable_lane():
     This is the regression proof that moving channel 01 out of
     ``chart.events`` changes control-data visibility, not playable drum
     output: ``render_audio`` already excluded lane 01 because it is absent
-    from ``DEFAULT_DTX_LANE_MAP``, and the mapping classifies it only as
+    from ``DTX_LANE_MAP``, and the mapping classifies it only as
     unmapped diagnostics.
     """
     # Lane 01 is not part of the playable drum lane map, so render_audio's
-    # ``if lane_id not in DEFAULT_DTX_LANE_MAP: continue`` skips it.
-    assert "01" not in DEFAULT_DTX_LANE_MAP
+    # ``if lane_id not in DRUM_LANE_IDS: continue`` skips it.
+    assert "01" not in DTX_LANE_MAP
 
     bgm_event = BenchmarkEvent(
         chart_id="song",

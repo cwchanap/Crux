@@ -27,12 +27,15 @@ from src.benchmark.reference_chart_manifest import (
 from src.benchmark.reference_timing_manifest import (
     REFERENCE_TIMING_MANIFEST_SCHEMA,
     TIMING_SEMANTICS_VERSION,
+    LoadedReferenceTimingManifest,
     ReferenceTimingRequest,
+    ReferenceTimingRowView,
     TimingRowResolution,
     build_reference_timing_outcome,
     build_timing_row,
     failed_reference_timing_outcome,
     load_reference_chart_manifest,
+    load_reference_timing_manifest,
     run_reference_timing,
     upstream_chart_unavailable_resolution,
     validate_schema_golden,
@@ -146,6 +149,35 @@ def _published_hpa322(
 
 def _render_hpa322_bytes(rows: tuple[dict[str, object], ...]) -> bytes:
     return _source_manifest_bytes(rows)
+
+
+@dataclass(frozen=True)
+class _TimingManifestFixture:
+    path: Path
+    content: bytes
+    rows: tuple[dict[str, object], ...]
+
+
+def _timing_manifest_fixture(tmp_path: Path) -> _TimingManifestFixture:
+    fixture = _published_hpa322(tmp_path)
+    loaded = load_reference_chart_manifest(fixture.manifest_path)
+    rows = tuple(
+        build_timing_row(
+            validated,
+            source_reference_chart_manifest_sha256=loaded.source_reference_chart_manifest_sha256,
+            source_reference_chart_version=loaded.source_reference_chart_version,
+            timing=(
+                _ready_resolution()
+                if validated.view.selection_status == "selected"
+                else upstream_chart_unavailable_resolution()
+            ),
+        )
+        for validated in loaded.rows
+    )
+    rendered = render_manifest(rows)
+    path = tmp_path / "reference-timing.jsonl"
+    path.write_bytes(rendered.content)
+    return _TimingManifestFixture(path, rendered.content, rendered.rows)
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +350,170 @@ def test_loader_rejects_unreadable_manifest_path(tmp_path: Path) -> None:
     directory.mkdir()
     with pytest.raises(ValueError, match="unavailable"):
         load_reference_chart_manifest(directory)
+
+
+# ---------------------------------------------------------------------------
+# HPA-324 read-only timing-manifest views
+# ---------------------------------------------------------------------------
+
+
+def test_timing_manifest_loader_reads_ready_and_quarantined_rows_with_exact_identity(
+    tmp_path: Path,
+) -> None:
+    fixture = _timing_manifest_fixture(tmp_path)
+
+    loaded = load_reference_timing_manifest(fixture.path)
+
+    assert isinstance(loaded, LoadedReferenceTimingManifest)
+    assert loaded.manifest_sha256 == sha256(fixture.content).hexdigest()
+    assert len(loaded.rows) == 2
+    assert isinstance(loaded.rows[0].view, ReferenceTimingRowView)
+    assert {row.view.timing_status for row in loaded.rows} == {"ready", "quarantined"}
+    assert {row.view.corpus_version for row in loaded.rows} == {fixture.rows[0]["corpus_version"]}
+    ready = next(row.view for row in loaded.rows if row.view.timing_status == "ready")
+    quarantined = next(row.view for row in loaded.rows if row.view.timing_status == "quarantined")
+    assert ready.reference_events_cache_path == _EVENTS_CACHE_PATH
+    assert ready.source_audio_key == _AUDIO_KEY
+    assert ready.source_audio_content_hash == _AUDIO_HASH
+    assert ready.timing_reason_codes == ()
+    assert quarantined.reference_events_cache_path is None
+    assert quarantined.source_audio_key is None
+    assert quarantined.source_audio_content_hash is None
+    assert quarantined.timing_reason_codes == ("upstream_chart_selection_unavailable",)
+
+
+def test_timing_manifest_loader_retains_immutable_source_rows(tmp_path: Path) -> None:
+    fixture = _timing_manifest_fixture(tmp_path)
+
+    loaded = load_reference_timing_manifest(fixture.path)
+
+    assert loaded.rows[0].source_row == fixture.rows[0]
+    with pytest.raises(TypeError):
+        loaded.rows[0].source_row["simfile_id"] = 99  # type: ignore[index]
+
+
+def test_timing_manifest_loader_rejects_invalid_timing_semantics_version(
+    tmp_path: Path,
+) -> None:
+    fixture = _timing_manifest_fixture(tmp_path)
+    rows = [dict(row) for row in fixture.rows]
+    rows[0]["timing_semantics_version"] = "crux.wrong/v1"
+    normalized = tuple(
+        {key: value for key, value in row.items() if key != "corpus_version"} for row in rows
+    )
+    path = tmp_path / "invalid-timing-semantics.jsonl"
+    path.write_bytes(render_manifest(normalized).content)
+
+    with pytest.raises(ValueError, match="semantics version"):
+        load_reference_timing_manifest(path)
+
+
+def test_timing_manifest_loader_rejects_invalid_hpa322_passthrough_field(
+    tmp_path: Path,
+) -> None:
+    fixture = _timing_manifest_fixture(tmp_path)
+    rows = [dict(row) for row in fixture.rows]
+    rows[0]["selected_chart_key"] = "../escape.dtx"
+    normalized = tuple(
+        {key: value for key, value in row.items() if key != "corpus_version"} for row in rows
+    )
+    path = tmp_path / "invalid-hpa322-passthrough.jsonl"
+    path.write_bytes(render_manifest(normalized).content)
+
+    with pytest.raises(ValueError, match="reference chart payload"):
+        load_reference_timing_manifest(path)
+
+
+@pytest.mark.parametrize(
+    ("row_index", "mutation"),
+    [
+        (0, lambda row: row.update({"timing_status": "unknown"})),
+        (0, lambda row: row.update({"timing_reason_codes": ["timing_map_invalid"]})),
+        (0, lambda row: row.update({"source_audio_key": None})),
+        (1, lambda row: row.update({"timing_reason_codes": []})),
+        (1, lambda row: row.update({"source_audio_key": "42/bgm.wav"})),
+        (0, lambda row: row.update({"timing_reason_codes": ["not-a-reason"]})),
+    ],
+    ids=[
+        "invalid-status",
+        "ready-reason-codes",
+        "ready-missing-audio-key",
+        "quarantine-without-reason",
+        "quarantine-with-audio-key",
+        "unknown-reason-code",
+    ],
+)
+def test_timing_manifest_loader_reuses_timing_status_shape(
+    tmp_path: Path,
+    row_index: int,
+    mutation,
+) -> None:
+    fixture = _timing_manifest_fixture(tmp_path)
+    rows = [dict(row) for row in fixture.rows]
+    mutation(rows[row_index])
+    path = tmp_path / "invalid-reference-timing.jsonl"
+    normalized = tuple(
+        {key: value for key, value in row.items() if key != "corpus_version"} for row in rows
+    )
+    path.write_bytes(render_manifest(normalized).content)
+
+    with pytest.raises(ValueError):
+        load_reference_timing_manifest(path)
+
+
+def test_timing_manifest_loader_rejects_duplicate_simfile_ids(tmp_path: Path) -> None:
+    fixture = _timing_manifest_fixture(tmp_path)
+    rows = [dict(fixture.rows[0]), dict(fixture.rows[0])]
+    path = tmp_path / "duplicate-reference-timing.jsonl"
+    normalized = tuple(
+        {key: value for key, value in row.items() if key != "corpus_version"} for row in rows
+    )
+    path.write_bytes(render_manifest(normalized).content)
+
+    with pytest.raises(ValueError, match="duplicate simfile IDs"):
+        load_reference_timing_manifest(path)
+
+
+def test_timing_manifest_loader_rejects_mixed_corpus_versions(tmp_path: Path) -> None:
+    fixture = _timing_manifest_fixture(tmp_path)
+    rows = [dict(row) for row in fixture.rows]
+    rows[1]["corpus_version"] = "sha256:" + "c" * 64
+    path = tmp_path / "mixed-reference-timing.jsonl"
+    path.write_bytes(b"".join(canonical_json_bytes(row, trailing_newline=True) for row in rows))
+
+    with pytest.raises(ValueError):
+        load_reference_timing_manifest(path)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [b"", b"{}", b"{}\n\n"],
+    ids=["empty", "partial-line", "blank-line"],
+)
+def test_timing_manifest_loader_rejects_empty_or_noncanonical_input(
+    tmp_path: Path,
+    content: bytes,
+) -> None:
+    path = tmp_path / "invalid-reference-timing.jsonl"
+    path.write_bytes(content)
+
+    with pytest.raises(ValueError):
+        load_reference_timing_manifest(path)
+
+
+def test_timing_manifest_loader_rejects_non_byte_identical_rerender(tmp_path: Path) -> None:
+    fixture = _timing_manifest_fixture(tmp_path)
+    first, second = fixture.content.splitlines(keepends=True)
+    # Keep valid JSON and canonical line syntax while changing corpus identity;
+    # the canonical render must reject the resulting byte stream.
+    row = strict_json_loads(second[:-1], require_canonical=True)
+    assert isinstance(row, dict)
+    row["corpus_version"] = "sha256:" + "d" * 64
+    path = tmp_path / "drifted-reference-timing.jsonl"
+    path.write_bytes(first + canonical_json_bytes(row, trailing_newline=True))
+
+    with pytest.raises(ValueError, match="canonical render|corpus version"):
+        load_reference_timing_manifest(path)
 
 
 # ---------------------------------------------------------------------------

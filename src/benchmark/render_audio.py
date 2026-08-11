@@ -10,9 +10,9 @@ import numpy as np
 import soundfile as sf
 
 from src.benchmark.dtx_parser import parse_dtx_file
-from src.benchmark.mapping import DEFAULT_DTX_LANE_MAP
 from src.benchmark.models import BenchmarkEvent
 from src.benchmark.prepare import _select_chart
+from src.benchmark.taxonomy import DRUM_LANE_IDS
 from src.benchmark.timing import dtx_events_to_chart_time_events
 
 logger = logging.getLogger(__name__)
@@ -146,7 +146,7 @@ def _plan_render_selection(
 
     for event in timed_events:
         lane_id = str(event.metadata.get("lane_id", "")).upper()
-        if lane_id not in DEFAULT_DTX_LANE_MAP:
+        if lane_id not in DRUM_LANE_IDS:
             continue
         placement, missing_note_id, missing_sample_name, missing_metadata = _plan_sample_placement(
             song_dir, chart.wav_table, chart.volume_table, event

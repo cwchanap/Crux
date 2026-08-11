@@ -3,16 +3,27 @@ from __future__ import annotations
 # Commands keep optional and heavy implementation modules behind their Click boundary.
 # pylint: disable=import-outside-toplevel
 import json
+import time
 from dataclasses import asdict
 from pathlib import Path
 
 import click
 
-from src.benchmark.backend_identity import canonical_json_bytes
+from runtime.oaf_tf1.model import load_model_config
+from src.benchmark.artifact_io import read_regular_file_no_follow
+from src.benchmark.backend_identity import canonical_json_bytes, quantize_six
+from src.benchmark.backend_registry import default_backend_registry
+from src.benchmark.backends.oaf import RESTORED_TENSOR_COUNT
+from src.benchmark.input_view import load_direct_audio
+from src.benchmark.mapping import map_oaf_prediction
+from src.benchmark.oaf_smoke_oracle import (
+    assert_smoke_oracle_matches,
+    read_smoke_oracle,
+)
+from src.benchmark.prediction_artifact import publish_prediction_artifact
 from src.benchmark.r2_corpus_models import MAX_SIMFILE_ID, SyncOutcome, SyncRequest
 from src.benchmark.r2_corpus_sync import ProgressEvent, sync_r2_corpus
 from src.cli.options import (
-    audio_dir_option,
     charts_dir_option,
     output_dir_option,
     predictions_dir_option,
@@ -20,7 +31,6 @@ from src.cli.options import (
     resolve_benchmark_output_dir,
     run_name_option,
     song_dir_option,
-    tolerance_option,
 )
 
 
@@ -29,27 +39,8 @@ def benchmark() -> None:
     """Benchmark drum transcription against DTX ground truth."""
 
 
-def _emit_backend_summary(
-    *,
-    status: str,
-    exit_code: int,
-    report_path: Path | None,
-    report_sha256: str | None,
-) -> None:
-    """Write the sole machine-readable result after a backend command has parsed."""
-    payload = {
-        "exit_code": exit_code,
-        "report_path": None if report_path is None else str(report_path),
-        "report_sha256": report_sha256,
-        "status": status,
-    }
-    standard_output = click.get_binary_stream("stdout")
-    standard_output.write(canonical_json_bytes(payload, trailing_newline=True))
-    standard_output.flush()
-
-
 @benchmark.command("prepare-backend")
-@click.option("--backend", type=str, required=True)
+@click.option("--backend", type=str, default="oaf", show_default=True)
 @click.option("--download", is_flag=True)
 @click.option(
     "--archive",
@@ -59,22 +50,8 @@ def _emit_backend_summary(
 @click.option(
     "--cache-root",
     type=click.Path(path_type=Path, file_okay=False),
-    required=True,
-)
-@click.option(
-    "--acquisition-request",
-    type=click.Path(path_type=Path, dir_okay=False),
-    default=None,
-)
-@click.option(
-    "--evidence-output",
-    type=click.Path(path_type=Path, dir_okay=False),
-    default=None,
-)
-@click.option(
-    "--backend-lock",
-    type=click.Path(path_type=Path, dir_okay=False),
-    default=None,
+    default=Path("artifacts/benchmark/model-cache"),
+    show_default=True,
 )
 @click.pass_context
 def prepare_backend_command(
@@ -83,73 +60,67 @@ def prepare_backend_command(
     download: bool,
     archive: Path | None,
     cache_root: Path,
-    acquisition_request: Path | None,
-    evidence_output: Path | None,
-    backend_lock: Path | None,
 ) -> None:
-    """Acquire or verify the immutable frozen OaF checkpoint cache."""
+    """Acquire or verify the immutable OaF checkpoint cache."""
     if download and archive is not None:
         raise click.UsageError("--download and --archive are mutually exclusive.")
 
-    from src.benchmark import backend_prepare
-    from src.benchmark.backend_lock import load_backend_lock
-    from src.benchmark.backend_registry import OFFICIAL_BACKEND_ID
-
-    if backend != OFFICIAL_BACKEND_ID:
+    if backend != "oaf":
         click.echo("backend_selection_invalid", err=True)
-        outcome = backend_prepare.PrepareBackendOutcome(
-            status="integrity_failed",
-            exit_code=2,
-            model_cache_path=None,
+        _emit_prepare_backend_summary(
+            backend=backend, checkpoint_path=None, status="integrity_failed"
         )
-    else:
-        loaded_lock = None
-        if backend_lock is not None:
-            try:
-                loaded_lock = load_backend_lock(backend_lock)
-            except (OSError, ValueError):
-                click.echo("backend_lock_invalid", err=True)
-                outcome = backend_prepare.PrepareBackendOutcome(
-                    status="integrity_failed",
-                    exit_code=2,
-                    model_cache_path=None,
-                )
-            else:
-                outcome = backend_prepare.prepare_oaf_backend(
-                    backend_prepare.PrepareBackendRequest(
-                        backend_id=backend,
-                        cache_root=cache_root,
-                        archive_path=archive,
-                        download=download,
-                        acquisition_request_path=acquisition_request,
-                        evidence_output_path=evidence_output,
-                        backend_lock_path=backend_lock,
-                    ),
-                    backend_lock=loaded_lock,
-                )
-        else:
-            outcome = backend_prepare.prepare_oaf_backend(
-                backend_prepare.PrepareBackendRequest(
-                    backend_id=backend,
-                    cache_root=cache_root,
-                    archive_path=archive,
-                    download=download,
-                    acquisition_request_path=acquisition_request,
-                    evidence_output_path=evidence_output,
-                    backend_lock_path=None,
-                ),
-            )
+        ctx.exit(2)
 
-    _emit_backend_summary(
-        status=outcome.status,
-        exit_code=outcome.exit_code,
-        report_path=(None if outcome.evidence_artifact is None else outcome.evidence_artifact.path),
-        report_sha256=(
-            None if outcome.evidence_artifact is None else outcome.evidence_artifact.sha256
-        ),
+    from runtime.oaf_tf1.model import OafModelConfigError, load_model_config
+    from src.benchmark.checkpoint_acquisition import (
+        CheckpointAcquisitionError,
+        prepare_oaf_checkpoint,
     )
-    if outcome.exit_code:
-        ctx.exit(outcome.exit_code)
+
+    try:
+        checkpoint_path = prepare_oaf_checkpoint(
+            load_model_config(),
+            cache_root,
+            download=download,
+            archive_path=archive,
+        )
+    except OafModelConfigError:
+        _emit_prepare_backend_summary(
+            backend=backend,
+            checkpoint_path=None,
+            status="integrity_failed",
+        )
+        ctx.exit(2)
+    except CheckpointAcquisitionError:
+        _emit_prepare_backend_summary(
+            backend=backend,
+            checkpoint_path=None,
+            status="acquisition_failed",
+        )
+        ctx.exit(1)
+
+    _emit_prepare_backend_summary(
+        backend=backend,
+        checkpoint_path=checkpoint_path,
+        status="ready",
+    )
+
+
+def _emit_prepare_backend_summary(
+    *,
+    backend: str,
+    checkpoint_path: Path | None,
+    status: str,
+) -> None:
+    payload = {
+        "backend": backend,
+        "checkpoint_path": None if checkpoint_path is None else str(checkpoint_path),
+        "status": status,
+    }
+    standard_output = click.get_binary_stream("stdout")
+    standard_output.write(canonical_json_bytes(payload, trailing_newline=True))
+    standard_output.flush()
 
 
 def _validate_verification_backend_id(
@@ -158,8 +129,7 @@ def _validate_verification_backend_id(
     value: str,
 ) -> str:
     supported = {
-        "magenta-egmd-tf1-94529798-8hit-v1",
-        "heuristic-onset-v1",
+        "oaf",
     }
     if value not in supported:
         raise click.BadParameter("must select a supported verification backend")
@@ -170,7 +140,7 @@ def _validate_verification_backend_id(
 @click.option(
     "--backend",
     type=str,
-    default="magenta-egmd-tf1-94529798-8hit-v1",
+    default="oaf",
     show_default=True,
     callback=_validate_verification_backend_id,
 )
@@ -188,52 +158,8 @@ def verify_backend_command(
     reports_root: Path,
     allow_emulated_diagnostics: bool,
 ) -> None:
-    """Verify a frozen transcription backend and publish its sealed evidence."""
-    from src.benchmark.backend_registry import default_backend_registry
-    from src.benchmark.backend_reports import OperationalReportPublicationError
-    from src.benchmark.transcription import VerifyBackendRequest, run_verify_backend
-
-    try:
-        outcome = run_verify_backend(
-            VerifyBackendRequest(
-                backend_id=backend,
-                reports_root=reports_root,
-                allow_emulated_diagnostics=allow_emulated_diagnostics,
-            ),
-            registry=default_backend_registry(),
-        )
-    except OperationalReportPublicationError:
-        click.echo(
-            "report_publication_failed: Operational report could not be published.",
-            err=True,
-        )
-        ctx.exit(2)
-
-    _emit_backend_summary(
-        status=outcome.status,
-        exit_code=outcome.exit_code,
-        report_path=outcome.report_artifact.path,
-        report_sha256=outcome.report_artifact.sha256,
-    )
-    if outcome.exit_code:
-        ctx.exit(outcome.exit_code)
-
-
-def _validate_transcribe_one_provenance(
-    source_audio_id: str | None,
-    input_view_id: str | None,
-    input_view_manifest: Path | None,
-) -> None:
-    direct_mode = (
-        source_audio_id is not None and input_view_id is not None and input_view_manifest is None
-    )
-    derived_mode = (
-        source_audio_id is None and input_view_id is None and input_view_manifest is not None
-    )
-    if not (direct_mode or derived_mode):
-        raise click.UsageError(
-            "Provide exactly one provenance mode: direct IDs or an input-view manifest."
-        )
+    del ctx, backend, reports_root, allow_emulated_diagnostics
+    raise click.ClickException("verify-backend was removed; use the Task E smoke command")
 
 
 # Click owns this fixed external signature, and backend imports must remain lazy.
@@ -281,48 +207,110 @@ def transcribe_one(
     midi_output: Path | None,
     reports_root: Path,
 ) -> None:
-    """Transcribe one canonical audio input to authoritative native JSONL."""
-    _validate_transcribe_one_provenance(
+    del (
+        ctx,
+        backend,
+        audio,
         source_audio_id,
         input_view_id,
         input_view_manifest,
+        output,
+        midi_output,
+        reports_root,
     )
-
-    from src.benchmark.backend_registry import default_backend_registry
-    from src.benchmark.backend_reports import OperationalReportPublicationError
-    from src.benchmark.transcription import TranscribeOneRequest, run_transcribe_one
-
-    request = TranscribeOneRequest(
-        backend_id=backend,
-        audio_path=audio,
-        output_path=output,
-        source_audio_id=source_audio_id,
-        input_view_id=input_view_id,
-        input_view_manifest=input_view_manifest,
-        midi_output_path=midi_output,
-        reports_root=reports_root,
-    )
-    try:
-        outcome = run_transcribe_one(request, registry=default_backend_registry())
-    except OperationalReportPublicationError:
-        click.echo(
-            "report_publication_failed: Operational report could not be published.",
-            err=True,
-        )
-        ctx.exit(2)
-
-    _emit_backend_summary(
-        status=outcome.status,
-        exit_code=outcome.exit_code,
-        report_path=outcome.report_artifact.path,
-        report_sha256=outcome.report_artifact.sha256,
-    )
-    if outcome.exit_code:
-        ctx.exit(outcome.exit_code)
+    raise click.ClickException("transcribe-one was removed; use the Task E smoke command")
 
 
 # pylint: enable=too-many-arguments,too-many-positional-arguments
 # pylint: enable=too-many-locals
+
+
+@benchmark.command("smoke-backend")
+@click.option(
+    "--backend",
+    type=str,
+    default="oaf",
+    show_default=True,
+    callback=_validate_verification_backend_id,
+)
+@click.option(
+    "--oracle",
+    type=click.Path(exists=True, path_type=Path, dir_okay=False),
+    default=None,
+    help="Optional exact native-event oracle JSON path.",
+)
+def smoke_backend(backend: str, oracle: Path | None) -> None:
+    """Run one OaF inference against the checked-in canonical smoke fixture."""
+    fixture_path = Path("tests/fixtures/oaf_tf1_smoke/canonical.wav").resolve()
+    prediction_path = Path("artifacts/benchmark/oaf-smoke/prediction.jsonl")
+    config = load_model_config()
+    checkpoint_dir = (
+        Path("artifacts/benchmark/model-cache").resolve()
+        / "sha256"
+        / config.checkpoint.archive_sha256
+    )
+    try:
+        audio = load_direct_audio(
+            fixture_path,
+            source_audio_id="oaf-smoke-canonical-v1",
+            input_view_id="oaf-smoke-canonical-v1",
+            max_input_audio_frames=config.max_input_audio_frames,
+        )
+        backend_instance = default_backend_registry().create(
+            backend,
+            checkpoint_dir=checkpoint_dir,
+            input_root=fixture_path.parent,
+            image="crux-oaf-tf1:local",
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+
+    try:
+        started = time.perf_counter()
+        native_prediction = backend_instance.transcribe(audio)
+        inference_elapsed_seconds = time.perf_counter() - started
+
+        mapped_prediction, diagnostics = map_oaf_prediction(native_prediction)
+        mapped_event_count = sum(
+            event.mapping_status == "mapped" for event in mapped_prediction.events
+        )
+        unmapped_event_count = sum(diagnostics.unmapped.values())
+        if mapped_event_count == 0:
+            raise click.ClickException("smoke inference produced no mapped events")
+        published = publish_prediction_artifact(prediction_path, mapped_prediction)
+
+        oracle_status = "not_checked"
+        if oracle is not None:
+            try:
+                oracle_content = read_regular_file_no_follow(oracle)
+                assert_smoke_oracle_matches(mapped_prediction, read_smoke_oracle(oracle_content))
+            except (AssertionError, OSError, TypeError, ValueError) as error:
+                raise click.ClickException(str(error)) from error
+            oracle_status = "matched"
+
+        duration_seconds = audio.audio_frame_count / audio.sample_rate
+        summary = {
+            "backend_id": native_prediction.descriptor.payload["backend_id"],
+            "checkpoint_archive_sha256": config.checkpoint.archive_sha256,
+            "fixture_sha256": audio.input_audio_sha256,
+            "inference_elapsed_seconds": quantize_six(inference_elapsed_seconds),
+            "mapped_event_count": mapped_event_count,
+            "oracle_status": oracle_status,
+            "prediction_path": str(prediction_path),
+            "prediction_sha256": published.sha256,
+            "real_time_factor": quantize_six(inference_elapsed_seconds / duration_seconds),
+            "restored_tensor_count": RESTORED_TENSOR_COUNT,
+            "status": "ok",
+            "unmapped_event_count": unmapped_event_count,
+            "upstream_source_commit": native_prediction.descriptor.payload[
+                "upstream_source_commit"
+            ],
+        }
+        standard_output = click.get_binary_stream("stdout")
+        standard_output.write(canonical_json_bytes(summary, trailing_newline=True))
+        standard_output.flush()
+    finally:
+        backend_instance.close()
 
 
 def _emit_progress(event: ProgressEvent) -> None:
@@ -417,6 +405,31 @@ def _emit_reference_timing_summary(
         "ready_count": ready_count,
         "status": status,
         "upstream_quarantined_count": upstream_quarantined_count,
+    }
+    standard_output = click.get_binary_stream("stdout")
+    standard_output.write(canonical_json_bytes(payload, trailing_newline=True))
+    standard_output.flush()
+
+
+def _emit_reference_set_summary(
+    *,
+    status: str,
+    exit_code: int,
+    manifest_path: Path | None,
+    manifest_sha256: str | None,
+    corpus_version: str | None,
+    eligible_count: int,
+    quarantined_count: int,
+) -> None:
+    """Write the sole machine-readable result after reference-set publication."""
+    payload = {
+        "corpus_version": corpus_version,
+        "eligible_count": eligible_count,
+        "exit_code": exit_code,
+        "manifest_path": None if manifest_path is None else str(manifest_path),
+        "manifest_sha256": manifest_sha256,
+        "quarantined_count": quarantined_count,
+        "status": status,
     }
     standard_output = click.get_binary_stream("stdout")
     standard_output.write(canonical_json_bytes(payload, trailing_newline=True))
@@ -547,6 +560,50 @@ def build_reference_timing_command(
         ctx.exit(outcome.exit_code)
 
 
+@benchmark.command("build-reference-set")
+@click.option(
+    "--manifest",
+    "manifest_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required path to an immutable HPA-323 reference-timing manifest (JSONL).",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=Path("artifacts/benchmark/reference-set"),
+    show_default=True,
+    help="Publication directory.",
+)
+@click.pass_context
+def build_reference_set_command(
+    ctx: click.Context,
+    manifest_path: Path,
+    output_dir: Path,
+) -> None:
+    """Build and publish model-independent reference eligibility."""
+    from src.benchmark.reference_set_manifest import ReferenceSetRequest, run_reference_set
+
+    outcome = run_reference_set(
+        ReferenceSetRequest(
+            manifest_path=manifest_path,
+            output_dir=output_dir,
+        )
+    )
+    published = outcome.manifest
+    _emit_reference_set_summary(
+        status=outcome.status,
+        exit_code=outcome.exit_code,
+        manifest_path=None if published is None else published.path,
+        manifest_sha256=None if published is None else published.manifest_sha256,
+        corpus_version=None if published is None else published.corpus_version,
+        eligible_count=outcome.eligible_count,
+        quarantined_count=outcome.quarantined_count,
+    )
+    if outcome.exit_code:
+        ctx.exit(outcome.exit_code)
+
+
 @benchmark.command("sync-r2-corpus")
 @click.option(
     "--cache-dir",
@@ -625,50 +682,6 @@ def prepare_benchmark_corpus(raw_dir: Path, run_name: str | None, output_dir: Pa
     )
 
 
-@benchmark.command("score-midi")
-@charts_dir_option
-@predictions_dir_option
-@run_name_option
-@output_dir_option
-@tolerance_option
-@click.option(
-    "--align/--no-align",
-    default=True,
-    show_default=True,
-    help="Compute and apply a global time-offset correction. Emits both raw and aligned report rows when enabled.",
-)
-@click.option(
-    "--export-reference-midi/--no-export-reference-midi", default=False, show_default=True
-)
-def score_midi(
-    charts_dir: Path,
-    predictions_dir: Path,
-    run_name: str | None,
-    output_dir: Path | None,
-    tolerance_ms: tuple[int, ...],
-    align: bool,
-    export_reference_midi: bool,
-) -> None:
-    """Score precomputed prediction MIDI files."""
-    from src.benchmark.runner import run_score_midi
-
-    resolved_output_dir = resolve_benchmark_output_dir(output_dir, run_name, charts_dir.parent)
-    try:
-        reports = run_score_midi(
-            charts_dir=charts_dir,
-            predictions_dir=predictions_dir,
-            output_dir=resolved_output_dir,
-            tolerance_ms=list(tolerance_ms),
-            align=align,
-            export_reference_midi=export_reference_midi,
-        )
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
-    click.echo(
-        f"Wrote benchmark reports for {len({report.chart_id for report in reports})} chart(s)"
-    )
-
-
 @benchmark.command("validate-corpus")
 @charts_dir_option
 @predictions_dir_option
@@ -699,20 +712,6 @@ def inspect_dtx(dtx_path: Path) -> None:
     click.echo(f"bpm_events: {len(chart.bpm_events)}")
     click.echo(f"measure_length_changes: {len(chart.measure_lengths)}")
     click.echo(f"lanes: {','.join(lanes)}")
-
-
-@benchmark.command("export-reference-midi")
-@charts_dir_option
-@run_name_option
-@output_dir_option
-def export_reference_midi(charts_dir: Path, run_name: str | None, output_dir: Path | None) -> None:
-    """Export MIDI files derived from DTX charts for manual inspection (not used for scoring)."""
-    from src.benchmark.runner import export_reference_midis
-
-    count = export_reference_midis(
-        charts_dir, resolve_benchmark_output_dir(output_dir, run_name, charts_dir.parent)
-    )
-    click.echo(f"Wrote {count} reference MIDI file(s)")
 
 
 @benchmark.command("render-audio")
@@ -750,30 +749,3 @@ def render_audio(
     if result.invalid_items:
         click.echo(f"Skipped {len(result.invalid_items)} invalid song folder(s)", err=True)
     click.echo(f"Rendered {len(result.valid_items)} song(s) to {resolved_output_dir / 'audio'}")
-
-
-@benchmark.command("transcribe-and-score")
-@charts_dir_option
-@audio_dir_option
-@run_name_option
-@output_dir_option
-@tolerance_option
-def transcribe_and_score(
-    charts_dir: Path,
-    audio_dir: Path,
-    run_name: str | None,
-    output_dir: Path | None,
-    tolerance_ms: tuple[int, ...],
-) -> None:
-    """Run transcription and score generated MIDI."""
-    from src.benchmark.runner import run_transcribe_and_score
-
-    reports = run_transcribe_and_score(
-        charts_dir,
-        audio_dir,
-        resolve_benchmark_output_dir(output_dir, run_name, charts_dir.parent),
-        list(tolerance_ms),
-    )
-    click.echo(
-        f"Wrote benchmark reports for {len({report.chart_id for report in reports})} chart(s)"
-    )

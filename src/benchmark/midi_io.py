@@ -16,8 +16,7 @@ REFERENCE_CLASS_TO_MIDI = {
     "open_hihat": 46,
     "crash": 49,
     "ride": 51,
-    "low_tom": 45,
-    "mid_tom": 47,
+    "low_or_floor_tom": 45,
     "high_tom": 50,
 }
 

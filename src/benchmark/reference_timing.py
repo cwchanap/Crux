@@ -58,7 +58,8 @@ _AUDIO_PROBE_ERRORS: tuple[type[BaseException], ...] = (
 )
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
-_DTX_ID_RE = re.compile(r"[0-9A-F]{2}")
+_DTX_LANE_ID_RE = re.compile(r"[0-9A-F]{2}")
+_DTX_NOTE_ID_RE = re.compile(r"[0-9A-Z]{2}")
 
 TimingReasonCode = Literal[
     "upstream_chart_selection_unavailable",
@@ -564,6 +565,54 @@ def render_reference_events(
     )
 
 
+def read_reference_events(content: bytes) -> tuple[NativeReferenceEvent, ...]:
+    """Read and validate canonical native reference events from JSONL bytes.
+
+    The persisted event artifact is deliberately read-only: every row and the
+    complete sequence are checked by the validators used by
+    :func:`validate_schema_golden`, then reconstructed into native event
+    objects.  Re-rendering the reconstructed objects must reproduce the input
+    bytes exactly so callers never consume a representation that would drift
+    from the immutable artifact.
+    """
+    if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+        raise ValueError("reference event content must be canonical JSONL with one final newline")
+
+    lines = content.splitlines(keepends=True)
+    if not lines or any(not line.endswith(b"\n") or line == b"\n" for line in lines):
+        raise ValueError("reference event content must contain one record per line")
+    try:
+        rows = tuple(strict_json_loads(line[:-1], require_canonical=True) for line in lines)
+    except StrictJsonError:
+        raise ValueError("reference event content must be canonical JSONL") from None
+
+    for row in rows:
+        _validate_reference_event_row(row)
+    _validate_reference_event_sequence(rows)
+
+    typed_rows = tuple(row for row in rows if isinstance(row, dict))
+    events = tuple(
+        NativeReferenceEvent(
+            simfile_id=row["simfile_id"],
+            selected_chart_key=row["selected_chart_key"],
+            selected_chart_content_hash=row["selected_chart_content_hash"],
+            source_audio_key=row["source_audio_key"],
+            source_audio_content_hash=row["source_audio_content_hash"],
+            source_order=row["source_order"],
+            measure=row["measure"],
+            position=float(row["position"]),
+            lane_id=row["lane_id"],
+            note_id=row["note_id"],
+            chart_time_sec=float(row["chart_time_sec"]),
+            audio_time_sec=float(row["audio_time_sec"]),
+        )
+        for row in typed_rows
+    )
+    if render_reference_events(events) != content:
+        raise ValueError("reference event content is not byte-identical to its canonical render")
+    return events
+
+
 def publish_immutable_content(path: Path, content: bytes, expected_sha256: str) -> None:
     """Publish ``content`` at ``path`` immutably, delegating all durability.
 
@@ -659,10 +708,12 @@ def _validate_reference_event_row(row: object) -> None:
     for key in _REFERENCE_EVENT_STRING_KEYS:
         if not isinstance(row[key], str) or not row[key]:
             raise ValueError(f"{key} must be a non-empty string")
-    for key in ("lane_id", "note_id"):
-        value = row[key]
-        if _DTX_ID_RE.fullmatch(value) is None:
-            raise ValueError(f"{key} must be a two-digit uppercase hexadecimal ID")
+    lane_id = row["lane_id"]
+    if _DTX_LANE_ID_RE.fullmatch(lane_id) is None:
+        raise ValueError("lane_id must be a two-digit uppercase hexadecimal ID")
+    note_id = row["note_id"]
+    if _DTX_NOTE_ID_RE.fullmatch(note_id) is None:
+        raise ValueError("note_id must be a two-digit uppercase base-36 ID")
     for key in ("selected_chart_key", "source_audio_key"):
         if not _is_safe_event_object_key(row[key], simfile_id):
             raise ValueError(f"{key} must be a safe simfile object key")
