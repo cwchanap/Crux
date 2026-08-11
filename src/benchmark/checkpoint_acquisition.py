@@ -24,6 +24,10 @@ class CheckpointAcquisitionError(ValueError):
     pass
 
 
+_CHECKPOINT_DIRECTORY_MODE = 0o755
+_CHECKPOINT_COMPONENT_MODE = 0o644
+
+
 def prepare_oaf_checkpoint(
     config: "OafModelConfig",
     cache_root: Path,
@@ -77,9 +81,11 @@ def prepare_oaf_checkpoint(
         for name, content in extracted.items():
             destination = staging / name
             with destination.open("xb") as output:
+                os.fchmod(output.fileno(), _CHECKPOINT_COMPONENT_MODE)
                 output.write(content)
                 output.flush()
                 os.fsync(output.fileno())
+        _normalize_mode(staging, _CHECKPOINT_DIRECTORY_MODE, directory=True)
         _fsync_directory(staging)
         try:
             os.rename(staging, target)
@@ -156,6 +162,9 @@ def _verify_cached_components(path: Path, expected: Mapping[str, str]) -> None:
             content = read_regular_file_no_follow(path / name)
             if hashlib.sha256(content).hexdigest() != digest:
                 raise CheckpointAcquisitionError("checkpoint component hash differs")
+        _normalize_mode(path, _CHECKPOINT_DIRECTORY_MODE, directory=True)
+        for name in expected:
+            _normalize_mode(path / name, _CHECKPOINT_COMPONENT_MODE, directory=False)
     except CheckpointAcquisitionError:
         raise
     except OSError:
@@ -179,6 +188,23 @@ def _safe_zip_name(name: str) -> bool:
         and name not in {".", ".."}
         and all(character not in name for character in ("/", "\\", ":", "\x00"))
     )
+
+
+def _normalize_mode(path: Path, mode: int, *, directory: bool) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if directory:
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if directory and not stat.S_ISDIR(metadata.st_mode):
+            raise OSError("checkpoint cache path is not a directory")
+        if not directory and not stat.S_ISREG(metadata.st_mode):
+            raise OSError("checkpoint cache component is not a regular file")
+        if stat.S_IMODE(metadata.st_mode) != mode:
+            os.fchmod(descriptor, mode)
+    finally:
+        os.close(descriptor)
 
 
 def _fsync_directory(path: Path) -> None:
