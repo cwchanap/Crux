@@ -1,5 +1,6 @@
 --require-hashes
 --only-binary=:all:
+--no-binary=gast,pretty-midi
 # filename=absl_py-2.1.0-py3-none-any.whl byte_length=133706
 absl-py==2.1.0 --hash=sha256:526a04eadab8b4ee719ce68f204172ead1027549089702d99b9059f129ff1308
 # filename=astor-0.8.1-py2.py3-none-any.whl byte_length=27488
@@ -22,8 +23,8 @@ charset-normalizer==3.4.9 --hash=sha256:68e5f26a1ad57ded6d1cfb85331d1c1a19531475
 cloudpickle==2.2.1 --hash=sha256:61f594d1f4c295fa5cd9014ceb3a1fc4a70b0de1164b94fbc2d854ccba056f9f
 # filename=decorator-5.1.1-py3-none-any.whl byte_length=9073
 decorator==5.1.1 --hash=sha256:b8c3f85900b9dc423225913c5aace94729fe1fa9763b38939a95226f02d37186
-# filename=gast-0.2.2-py3-none-any.whl byte_length=7540
-gast==0.2.2 --hash=sha256:6b1a8f31a83f67c7b3e2d98ee43f648ab150c62bd00b12b670a7b245a2a8f4db
+# filename=gast-0.2.2.tar.gz byte_length=10294
+gast==0.2.2 --hash=sha256:fe939df4583692f0512161ec1c880e0a10e71e6a232da045ab8edd3756fbadf0
 # filename=google_pasta-0.2.0-py3-none-any.whl byte_length=57471
 google-pasta==0.2.0 --hash=sha256:b32482794a366b5366a32c92a9a9201b107821889935a02b3e51f6b432ea84ed
 # filename=grpcio-1.46.5-cp37-cp37m-manylinux_2_12_x86_64.manylinux2010_x86_64.whl byte_length=4152051
@@ -80,8 +81,8 @@ pillow==8.3.2 --hash=sha256:4326ea1e2722f3dc00ed77c36d3b5354b8fb7399fb59230249ea
 platformdirs==4.0.0 --hash=sha256:118c954d7e949b35437270383a3f2531e99dd93cf7ce4dc8340d3356d30f173b
 # filename=pooch-1.8.2-py3-none-any.whl byte_length=64574
 pooch==1.8.2 --hash=sha256:3529a57096f7198778a5ceefd5ac3ef0e4d06a6ddaf9fc2d609b806f25302c47
-# filename=pretty_midi-0.2.10-py3-none-any.whl byte_length=5592285
-pretty-midi==0.2.10 --hash=sha256:0cadaeb454b8a959b0da8fe1a072b3b368848d30ab5739715576ee1ec7cc8a74
+# filename=pretty_midi-0.2.10.tar.gz byte_length=5592108
+pretty-midi==0.2.10 --hash=sha256:ea6e192f94044674e833336ea1f415318ddf28e320302ac7b109edff0d4534bd
 # filename=prompt_toolkit-3.0.48-py3-none-any.whl byte_length=386595
 prompt-toolkit==3.0.48 --hash=sha256:f49a827f90062e411f1ce1f854f2aedb3c23353244f8108b89283587397ac10e
 # filename=protobuf-3.20.3-cp37-cp37m-manylinux_2_5_x86_64.manylinux1_x86_64.whl byte_length=1018223

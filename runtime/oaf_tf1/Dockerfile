@@ -18,9 +18,13 @@ ENV CUDA_VISIBLE_DEVICES=-1 \
 
 FROM runtime-base AS runtime-build
 
+COPY runtime/oaf_tf1/requirements-build.lock /opt/crux/requirements-build.lock
 COPY runtime/oaf_tf1/requirements.lock /opt/crux/requirements.lock
 RUN python -m venv /opt/crux/venv; \
     /opt/crux/venv/bin/pip install --require-hashes --only-binary=:all: \
+      --index-url https://pypi.org/simple \
+      --requirement /opt/crux/requirements-build.lock; \
+    /opt/crux/venv/bin/pip install --no-build-isolation --require-hashes \
       --index-url https://pypi.org/simple \
       --requirement /opt/crux/requirements.lock
 

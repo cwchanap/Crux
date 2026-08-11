@@ -1,7 +1,5 @@
---no-index
 --require-hashes
 --only-binary=:all:
---find-links=/opt/crux/wheelhouse
 # filename=setuptools-67.8.0-py3-none-any.whl byte_length=1093916
 setuptools==67.8.0 --hash=sha256:5df61bf30bb10c6f756eb19e7c9f3b473051f48db77fddbe06ff2ca307df9a6f
 # filename=wheel-0.41.3-py3-none-any.whl byte_length=65801
