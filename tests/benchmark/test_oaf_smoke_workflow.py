@@ -129,3 +129,28 @@ def test_oaf_smoke_runtime_lock_allows_only_manifested_source_exceptions() -> No
             in requirements_lock
         )
         assert wheel["sha256"] not in requirements_lock
+
+
+def test_oaf_runtime_lock_pins_upstream_sox_wrapper_to_published_wheel() -> None:
+    repository = WORKFLOW.parents[2]
+    requirements_in = repository.joinpath("runtime/oaf_tf1/requirements.in").read_text(
+        encoding="utf-8"
+    )
+    requirements_lock = repository.joinpath("runtime/oaf_tf1/requirements.lock").read_text(
+        encoding="utf-8"
+    )
+
+    assert "sox==1.4.1" in requirements_in
+    assert "mir_eval==0.8.2" in requirements_in
+    assert "# filename=sox-1.4.1-py2.py3-none-any.whl byte_length=39686" in requirements_lock
+    assert (
+        "sox==1.4.1 --hash=sha256:2458c8e71e229e7fb1a088874ad07906e0aedfb2874a6c4f0430efd6e7587129"
+        in requirements_lock
+    )
+    assert "sox-1.4.1.tar.gz" not in requirements_lock
+    assert "# filename=mir_eval-0.8.2-py3-none-any.whl byte_length=102794" in requirements_lock
+    assert (
+        "mir-eval==0.8.2 --hash=sha256:114cda33d8e17408c170598e0b36ed0d71ff4a2fee8eaf9e165b58ecf1c87170"
+        in requirements_lock
+    )
+    assert "mir_eval-0.8.2.tar.gz" not in requirements_lock
