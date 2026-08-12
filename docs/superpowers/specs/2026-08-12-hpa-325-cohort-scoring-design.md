@@ -10,26 +10,26 @@ Therefore HPA-325 must not rebuild model mapping, prediction persistence, refere
 
 ## Why HPA-325 Next
 
-The foundation required by HPA-325 is now present:
+The foundation required by HPA-325 is present:
 
-- HPA-323 audio-relative native reference events are persisted.
+- HPA-323 persists audio-relative native reference events.
 - HPA-324 freezes the detailed/common taxonomy and model-independent reference eligibility.
 - HPA-423 persists mapped OaF prediction artifact v2 and exposes the common-class scorer bridge.
-- `src/benchmark/scoring.py` already owns onset matching, TP/FP/FN retention, timing error, and raw versus global-offset diagnostic scoring.
+- `src/benchmark/scoring.py` already owns onset matching, TP/FP/FN retention, timing error, raw/aligned scoring, and the percentile rank convention used by existing score summaries.
 
-HPA-325 should land before HPA-326 broad-corpus execution so the OaF run has a stable scoring/report consumer rather than inventing metrics during or after the corpus run.
+HPA-325 should land before HPA-326 broad-corpus execution so the OaF run has a stable scoring/report consumer rather than inventing metrics and serialization rules during the expensive corpus run.
 
 ## Goals
 
 1. Score one model + input-view cohort at 30 ms, 50 ms, and 100 ms.
 2. Preserve raw and diagnostically aligned modes as separate results.
-3. Produce per-song and per-class metrics without changing the working matcher.
+3. Produce per-song and per-class metrics without changing matcher/alignment behavior.
 4. Produce event-micro, song-macro, class-macro, and per-song F1 distribution aggregates.
 5. Keep quarantined/failed/skipped population rows and grouped reasons visible instead of silently scoring only successes.
-6. Report native/mapped/unmapped prediction coverage and reference mapping counts for every item where those artifacts exist.
-7. Persist matched, false-positive, and false-negative diagnostics for later inspection while retaining both original and aligned prediction times.
-8. Make identical inputs produce byte-identical canonical JSON/JSONL and stable CSV/Markdown content.
-9. Keep model/reference/timing/mapping/scoring identities first-class in persisted score rows.
+6. Report native/mapped/unmapped prediction coverage and reference mapping counts where artifacts exist.
+7. Persist matched, false-positive, and false-negative diagnostics while retaining original and aligned prediction times.
+8. Make identical inputs produce byte-identical canonical JSON/JSONL and stable CSV/Markdown bytes.
+9. Reuse the repository's existing SHA-256 validation, numeric quantization, and percentile conventions rather than defining parallel ones.
 10. Expose a small in-memory handoff that HPA-326 can populate from its future run manifest without HPA-325 defining a runner/queue framework.
 
 ## Non-Goals
@@ -38,42 +38,43 @@ HPA-325 should land before HPA-326 broad-corpus execution so the OaF run has a s
 - A prediction-run manifest writer; HPA-326 owns corpus execution/run persistence.
 - Cross-model or cross-input paired comparisons; HPA-562 owns them.
 - Threshold tuning or score-driven model configuration changes.
-- Rewriting `score_events()`, `_match_class()`, or alignment search unless a new adversarial regression proves a correctness defect.
+- Rewriting `score_events()`, `_match_class()`, or alignment search.
 - Parquet, databases, dashboards, generic report plugins, or a metrics service.
-- Backward compatibility for the existing small `reports.py` API; there are no production consumers to preserve.
-- Combining broad-corpus, reviewed-subset, and pilot scopes in one result. Run one cohort per scope so each report keeps one unambiguous population.
+- Backward compatibility for `ChartReport` / `write_reports`; only tests consume them.
+- Combining broad-corpus, reviewed-subset, and pilot scopes in one result. Each is a separate cohort.
+- Immutable publication for regenerated score reports; ordinary deterministic files are sufficient.
 
 ## Approaches Considered
 
 ### A. Extend `reports.py` only
 
-Keep all orchestration, aggregation, and serialization in the existing report file.
+Keep orchestration, aggregation, and serialization in the existing report file.
 
-This minimizes file count but mixes scoring policy with rendering and would make the already simple report writer become the owner of cohort semantics. It is fast initially but harder to reuse from HPA-326 and later MuScriptor/IDM work.
+This minimizes file count but mixes scoring policy with rendering and makes the report writer own cohort semantics. It is harder to reuse from HPA-326 and later model work.
 
 ### B. Pure cohort scorer + focused report writer — selected
 
-Add one `cohort_scoring.py` module for scoring/aggregation and rewrite `reports.py` as deterministic rendering only. Reuse `scoring.py`, `reference_set.py`, and `scorer_input.py` unchanged except for a tiny reference-to-`BenchmarkEvent` adapter.
+Add one `cohort_scoring.py` module for validation/scoring/aggregation and rewrite `reports.py` as deterministic rendering only. Reuse `scoring.py`, `reference_set.py`, and `scorer_input.py`, adding only the reference-side scorer adapter and promoting the already-existing percentile helper to a public name.
 
-This keeps the architecture small while giving HPA-326 a clear seam: construct `CohortItem` values from its run/reference artifacts, call `score_cohort()`, then `write_cohort_reports()`.
+This keeps the architecture small while giving HPA-326 one clear seam: construct `CohortItem` values, call `score_cohort()`, then `write_cohort_reports()`.
 
 ### C. Generic benchmark pipeline/framework
 
 Introduce typed stages, plugin registries, report backends, generic manifest loaders, and model adapters.
 
-Rejected. There is one immediate scorer consumer and one known future model path. The existing backend/taxonomy seams are already sufficient. A general pipeline would add indirection without removing current work.
+Rejected. There is one immediate scorer consumer and existing backend/taxonomy seams are already sufficient.
 
 ## Architecture
 
 ### 1. `scorer_input.py` remains the artifact projection boundary
 
-Keep existing prediction projection:
+Keep the existing prediction projection:
 
 ```python
 prediction_to_benchmark_events(artifact: PredictionArtifact) -> tuple[BenchmarkEvent, ...]
 ```
 
-Add only the corresponding reference projection helper:
+Add the corresponding reference projection helper:
 
 ```python
 reference_to_benchmark_events(
@@ -82,11 +83,11 @@ reference_to_benchmark_events(
 ) -> tuple[BenchmarkEvent, ...]
 ```
 
-The adapter uses `CommonReferenceEvent.canonical_audio_time` as the event time and `common_class` as `BenchmarkEvent.canonical_class`. It must not rerun DTX parsing or invent a second taxonomy map.
+The adapter uses `CommonReferenceEvent.canonical_audio_time` as event time and `common_class` as `BenchmarkEvent.canonical_class`. It does not go back through `map_dtx_events()` or chart-time conversion.
 
 ### 2. `cohort_scoring.py` owns scoring policy, coverage input, and aggregation
 
-Use a small set of frozen dataclasses:
+Use frozen dataclasses with closed `Literal` status/mode contracts:
 
 ```python
 CohortExecutionStatus = Literal["success", "failed", "skipped", "quarantined"]
@@ -129,62 +130,56 @@ class CohortItem:
     failure_reason: str | None = None
 ```
 
-`CohortItem` is deliberately an in-memory boundary, not another persisted manifest schema. HPA-326 can later adapt its run rows plus the HPA-324 reference manifest/prediction artifact into this type.
+`CohortItem` is an in-memory seam, not a persisted run manifest. HPA-326 later adapts its own run rows into this type.
 
-For a successful item, prediction coverage counts are required and must reconcile with `prediction_events`: mapped count equals the number of scoreable prediction events and `native = mapped + unmapped`. For a failed/skipped/quarantined item, prediction counts may be `None` if no valid prediction artifact exists. Reference counts come from HPA-324 mapping/reference-manifest data rather than being rediscovered here.
+For success rows, prediction coverage must reconcile with scoreable prediction events: `native = mapped + unmapped` and `mapped == len(prediction_events)`. Failed/skipped/quarantined rows remain in population accounting without fabricated scores.
 
-Successful items are scored for every tolerance and both modes. Failed/skipped/quarantined rows stay in population accounting but do not fabricate zero model scores.
+### 3. Identity validation reuses `require_sha256()`
 
-### 3. Per-class metrics reuse the same matcher
+`CohortIdentity` validates `reference_manifest_sha256`, `model_lock_sha256`, and `backend_descriptor_sha256` through the existing `src.benchmark.backend_identity.require_sha256()` helper. If the cohort API should surface `ValueError`, catch `StrictJsonError` and raise `ValueError` with the same message.
 
-For each successful song/tolerance/mode, compute the whole-song `ScoreResult` once. Per-class metrics are derived from that result's matched/FP/FN event sets grouped by common class rather than rerunning a different matching algorithm.
+Do not copy lowercase-hex validation into `cohort_scoring.py`.
 
-This guarantees that whole-song totals equal the sum of per-class totals.
+Other identity strings remain explicit nonempty strings; HPA-325 does not invent another general identity framework.
 
-### 4. Aggregate definitions
+### 4. Per-class metrics reuse one matcher result
+
+For each successful song/tolerance/mode, compute the whole-song `ScoreResult` once. Derive per-class TP/FP/FN from that same result's matched/unmatched collections rather than rerunning a different matcher.
+
+This guarantees whole-song totals equal the sum of per-class totals.
+
+### 5. Aggregate definitions reuse the scorer percentile convention
 
 For one tolerance and mode:
 
 - **Event-micro P/R/F1:** sum TP/FP/FN across successful items, then calculate metrics once.
-- **Song-macro F1:** arithmetic mean of per-song F1 across successful eligible items. HPA-324 quarantines references with no scored drum events, so a successful eligible song must have reference support. An empty prediction therefore has F1 `0.0`, not an omitted song.
-- **Class-macro F1:** arithmetic mean across common classes having reference or prediction support in the successful cohort. Classes with zero total support on both sides are excluded.
+- **Song-macro F1:** arithmetic mean of successful song F1 values. An eligible song with empty predictions has F1 `0.0` and stays in the mean.
+- **Class-macro F1:** arithmetic mean across common classes with reference or prediction support.
 - **Per-class aggregate:** summed TP/FP/FN/support per common class.
-- **Per-song F1 distribution:** deterministic `min`, p10, p25, median, p75, p90, and `max` across successful song F1 values. Empty successful populations return `None` for all distribution values.
-- **Population counts:** total input rows plus success/failed/skipped/quarantined counts and grouped reason counts.
+- **Per-song F1 distribution:** min, p10, p25, median, p75, p90, max.
+- **Population counts:** total/success/failed/skipped/quarantined plus grouped reason counts.
 
-If a cohort has zero successful items, micro/macro/distribution values are empty/`None`; population accounting still renders successfully.
+Promote the existing `scoring._percentile()` helper to public `scoring.percentile()` and use it for p10/p25/p75/p90. This is a name promotion of an existing numeric convention, not a matcher/alignment behavior change. Keep `statistics.median()` for the median.
 
-### 5. Native/common coverage
+Undefined P/R/F1 remain `None`; HPA-325 does not coalesce them to `0.0`.
 
-Do not infer native coverage from scoreable `BenchmarkEvent` rows because the scorer intentionally drops unmapped native predictions. `CohortCoverage` carries the small amount of artifact-level accounting needed for reports.
+### 6. Native/common coverage
 
-For each item report:
+Do not infer native coverage from `BenchmarkEvent`, because unmapped native predictions are intentionally absent from scorer input. `CohortCoverage` carries the small artifact-level accounting needed for reports:
 
 - reference native/common/ignored/unmapped counts;
-- prediction native/mapped/unmapped counts when a prediction artifact exists;
-- prediction mapping coverage = mapped/native when native count is nonzero;
-- native class counts from the prediction artifact, sorted by native class ID;
-- common-class reference/prediction support from the existing per-class score rows.
+- prediction native/mapped/unmapped counts when a valid prediction artifact exists;
+- native class counts sorted by native class ID;
+- common-class support from song/class score rows.
 
-This satisfies native-output/common-canonical coverage reporting without adding another persisted mapping artifact.
+No separate coverage artifact is introduced.
 
-### 6. Event diagnostics
+### 7. Event diagnostics stay small
 
-Persist one deterministic JSONL artifact, `event_diagnostics.jsonl`, containing matched/FP/FN event evidence needed for later inspection.
-
-For aligned mode the current scorer returns offset-adjusted prediction copies. The diagnostic therefore records both:
+Persist one deterministic `event_diagnostics.jsonl` containing only event-level evidence plus `cohort_id`:
 
 ```text
-prediction_time_sec          # original persisted prediction time
-scored_prediction_time_sec   # after the diagnostic global offset
-```
-
-For raw mode those values are identical. Recover the original aligned prediction time as `scored_prediction_time_sec - offset_sec`; do not mutate or repersist the prediction artifact.
-
-Each diagnostic row includes:
-
-```text
-cohort/model/input/map/scoring identity
+cohort_id
 simfile_id
 mode
 tolerance_ms
@@ -196,11 +191,41 @@ scored_prediction_time_sec (nullable)
 timing_error_sec (nullable)
 ```
 
-Do not duplicate full native prediction metadata here; the immutable prediction artifact remains the source of truth.
+Full cohort identity appears once in `summary.json`. `items.csv`, `per_song.csv`, and `per_class.csv` retain the full traceability prefix because they are durable cohort/score rows; event diagnostics join back through `cohort_id` and do not repeat eleven cohort-constant fields on every matched/FP/FN line.
 
-### 7. Reports
+For aligned mode, recover the original persisted prediction time as `scored_prediction_time_sec - offset_sec`. For raw mode both prediction times are identical.
 
-Rewrite `reports.py` around one public entry point:
+Do not duplicate full native prediction metadata; the immutable prediction artifact remains the source of truth.
+
+### 8. One numeric encoding contract for every report artifact
+
+`canonical_json_bytes()` accepts repository `JsonValue`, which deliberately excludes Python `float`. Every float-derived metric, ratio, offset, timing error, and timestamp must therefore cross one report-number boundary before JSON/JSONL/CSV rendering.
+
+Reuse `quantize_six()` from `src.benchmark.backend_identity`:
+
+```python
+def _report_decimal(value: float | None) -> Decimal | None:
+    return None if value is None else quantize_six(value)
+
+
+def _csv_decimal(value: float | None) -> str:
+    decimal = _report_decimal(value)
+    return "" if decimal is None else canonical_json_bytes(decimal).decode("ascii")
+```
+
+Rules:
+
+- JSON/JSONL float-derived values become `Decimal` through `quantize_six()`; `None` remains JSON `null`.
+- CSV uses the exact canonical decimal token from the same quantized `Decimal`; `None` becomes an empty cell.
+- Counts remain integers.
+- Strings/statuses remain strings.
+- No `str(float)`, `repr(float)`, custom rounding, or `json.dumps()` numeric path is allowed.
+
+This matches prediction artifact numeric semantics and prevents HPA-326 from inheriting a second float renderer.
+
+### 9. Reports
+
+Rewrite `reports.py` around:
 
 ```python
 write_cohort_reports(result: CohortScoreResult, output_dir: Path) -> ReportArtifacts
@@ -218,20 +243,16 @@ Output layout:
   summary.md
 ```
 
-`items.csv` is the explicit full-population ledger: one row per input item with status, failure reason, warnings, reference/prediction coverage, and native class counts. `per_song.csv` contains successful score rows for every tolerance/mode. `per_class.csv` contains song-level and cohort-level common-class rows.
+`summary.json` contains the full cohort identity once, population, item coverage/failures, aggregate rows, and F1 distributions. `items.csv`, `per_song.csv`, and `per_class.csv` repeat the traceability prefix. `event_diagnostics.jsonl` carries only `cohort_id` plus event evidence. Markdown is rendered from the same result object.
 
-`summary.json` is canonical JSON using existing `canonical_json_bytes()` and includes identity, all item rows, population, aggregate rows, and F1 distributions. JSONL diagnostics use the same canonical serializer. CSV uses explicit fixed field lists and stable row sorting. Markdown is human-readable but generated from the same result object, not independently recomputed.
-
-Every CSV score row and diagnostic JSONL row repeats the load-bearing cohort/model/reference/input/mapping/scoring identity fields needed to trace that row without relying on a directory name.
-
-No generic writer registry is introduced.
+Use ordinary file writes for these regenerable reports; do not add `publish_immutable_file()`.
 
 ## Data Flow
 
 ```text
 HPA-324 native reference artifact + reference manifest row
   -> map_reference_events()
-  -> common reference events + reference counts
+  -> common reference events + mapping counts
   -> reference_to_benchmark_events()
 
 prediction artifact v2
@@ -239,14 +260,15 @@ prediction artifact v2
   -> prediction_to_benchmark_events()
   -> native/mapped/unmapped counts + native class counts
 
-HPA-326/future caller execution row
+HPA-326/future execution row
   -> CohortItem(status + events + coverage + warnings/failure)
 
 CohortItem[] + CohortIdentity
   -> score_cohort()
   -> CohortScoreResult
   -> write_cohort_reports()
-  -> canonical JSON / CSV / JSONL / Markdown
+  -> quantize_six numeric boundary
+  -> canonical JSON / fixed CSV / canonical JSONL / Markdown
 ```
 
 ## Identity and Reproducibility
@@ -255,7 +277,7 @@ Every cohort result carries:
 
 - HPA-324 reference manifest SHA-256;
 - HPA-323 reference timing version;
-- taxonomy version and DTX lane-map version;
+- taxonomy and DTX lane-map versions;
 - backend ID;
 - checkpoint/model ID;
 - model-lock SHA-256;
@@ -265,75 +287,67 @@ Every cohort result carries:
 - scoring version;
 - tolerance set and scoring modes.
 
-Define one code-owned `SCORING_VERSION = "crux.single-cohort-scoring/v1"` and fixed default tolerances `(30, 50, 100)` ms. A future semantic scoring change increments this version.
+Define `SCORING_VERSION = "crux.single-cohort-scoring/v1"` and default tolerances `(30, 50, 100)` ms. A semantic scoring change increments the version.
 
-A mapping correction changes mapping identity upstream and can therefore rescore persisted artifacts without inference.
-
-Broad corpus, reviewed subset, and later pilot scopes are separate `cohort_id` invocations using the same scorer. HPA-325 does not merge those populations into one unlabeled result.
+A mapping correction changes mapping identity upstream and can rescore persisted artifacts without inference.
 
 ## Error Handling
 
-- Invalid persisted prediction artifacts fail at the existing artifact reader boundary; HPA-325 does not add permissive compatibility readers.
-- A `success` item with no prediction event tuple is invalid input and raises `ValueError`.
-- A non-success item with prediction events is invalid input; callers must classify one execution outcome consistently.
-- An eligible success item with zero reference events is invalid because HPA-324 would quarantine that source.
+- Invalid prediction artifacts fail at the existing artifact reader boundary; no compatibility readers.
+- A `success` item requires a prediction tuple; an empty tuple is valid.
+- A non-success item must not carry prediction events and must carry a failure reason.
+- An eligible success item requires nonempty reference events.
 - Successful prediction coverage must balance and match the scoreable prediction-event count.
-- Missing confidence/velocity do not affect scoring because `BenchmarkEvent` scoring uses time + common class only.
-- Warnings and model failure reasons are retained as report data; they do not mutate cohort membership.
-- Report publication writes complete deterministic files; no best-effort partial report set is needed at this stage.
+- Invalid SHA-256 identities reuse `require_sha256()` and surface as cohort `ValueError`.
+- Nonfinite report floats fail through `quantize_six()` rather than being rendered.
+- Missing confidence/velocity do not affect onset/class scoring.
+- Report writing is all-or-error at this stage; no best-effort partial report set.
 
 ## Testing Strategy
 
-### Pin the matcher before building aggregates
+### Pin matcher behavior first
 
-Add focused regressions for:
+Add/retain regressions for simultaneous same-class hits, dense hits, empty prediction songs, classes present on one side, duplicate-after-common-collapse input, missing confidence/velocity metadata at scorer level, and large-offset raw/aligned separation.
 
-- simultaneous same-class hits;
-- dense same-class hits (existing test retained);
-- empty prediction song;
-- empty class on one side;
-- duplicate-after-common-collapse input;
-- missing confidence/velocity metadata at the scorer adapter;
-- large-offset raw/aligned separation (existing test retained).
-
-If these pass with the current matcher, do not change `scoring.py`.
+Do not change matcher/alignment behavior if these pass.
 
 ### Cohort scoring tests
 
-Use small synthetic `BenchmarkEvent` tuples to prove:
+Prove the 30/50/100 ms × raw/aligned matrix, song/class reconciliation, micro/macro definitions, percentile values, coverage balancing, full population accounting, and zero-success `None` semantics.
 
-- 30/50/100 ms × raw/aligned output matrix;
-- whole-song totals reconcile with per-class totals;
-- micro/macro definitions;
-- p10/p25/median/p75/p90 song-F1 distribution values;
-- unsupported common classes are excluded from class macro;
-- coverage accounting balances;
-- failed/skipped/quarantined rows remain in population counts;
-- zero successful cohort renders metrics/distributions as `None` without losing failures.
+### Helper reuse tests
+
+- Invalid identity hashes fail through the shared SHA-256 contract.
+- `scoring.percentile()` retains the existing upper-nearest-rank behavior after the private-to-public rename.
+
+### Report encoding goldens
+
+Pin at least one canonical JSONL line and one CSV numeric cell. A `0.5` float must render as the canonical token `0.5`, not a binary-float representation or a separate fixed-width decimal format. `None` renders JSON `null` and an empty CSV field.
 
 ### Artifact integration test
 
-Round-trip a real-shaped HPA-324 reference event projection and OaF prediction artifact v2 through the existing readers/adapters, derive coverage directly from those artifacts, then score them without invoking a backend.
+Round-trip HPA-324 reference projection and OaF prediction artifact v2, derive coverage from artifacts, score without invoking a backend, and write reports.
 
 ### Report determinism
 
-Write the same `CohortScoreResult` twice into separate directories and assert all six file byte streams are identical. Reverse input item order and require the same bytes.
+Write the same result into separate directories and assert all six file byte streams are identical. Reverse input item order and require the same bytes.
 
 ## Scope / Maintenance Notes
 
-This design intentionally avoids a CLI and disk-level prediction-run loader in HPA-325. HPA-326 owns corpus execution and its run manifest. HPA-326 should adapt its run/reference/prediction rows into the small `CohortItem` boundary rather than HPA-325 guessing a not-yet-landed run schema.
+HPA-325 intentionally avoids a CLI and disk-level prediction-run loader. HPA-326 owns corpus execution and its run manifest and should adapt those rows into `CohortItem`.
 
-That keeps HPA-325 independently testable now while preserving a clean, low-cost integration seam for HPA-326 and later model adapters.
+The selected design is intentionally smaller than the previous draft: reuse `require_sha256()` and the scorer percentile helper, centralize report numeric encoding, and keep event diagnostics joined by `cohort_id` rather than repeating cohort-constant identity fields.
 
 ## Acceptance Mapping
 
-- Persisted predictions are consumed through the already-landed HPA-423 mapper; no model is invoked.
+- Persisted predictions are consumed through the landed HPA-423 mapper; no model is invoked.
 - 30/50/100 ms and raw/aligned modes are explicit result dimensions.
-- Per-song, per-class, event-micro, song-macro, class-macro, and F1 distribution metrics are produced.
+- Per-song, per-class, event-micro, song-macro, class-macro, and F1 distributions are produced.
 - Native/mapped/unmapped coverage and full item status/failure populations are persisted explicitly.
-- Matched/FP/FN evidence is retained in `event_diagnostics.jsonl`, with original and scored prediction times separated for aligned mode.
+- Matched/FP/FN diagnostics retain original/scored prediction times and join through `cohort_id`.
 - Adversarial matcher fixtures are pinned before aggregate work.
-- Population, coverage, song, class, and aggregate counts are reconciled by construction and tests.
-- Model/reference/timing/mapping/input/scoring identities are carried through persisted score rows.
+- Population, coverage, song, class, and aggregate counts reconcile by construction and tests.
+- Full identity is in `summary.json` and score/ledger CSV rows; diagnostic JSONL avoids redundant identity stamping.
 - Mapping changes rescore persisted events because mapping/inference remain separate.
+- All report floats use the same `quantize_six()` + canonical decimal encoding already used by prediction artifacts.
 - Canonical JSON/JSONL plus fixed CSV ordering provide deterministic output.
