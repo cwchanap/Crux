@@ -2,32 +2,62 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Turn one frozen model/input-view cohort of persisted reference and prediction events into deterministic per-song, per-class, aggregate, coverage, population, and event-diagnostic reports at 30/50/100 ms without invoking inference or rebuilding the existing matcher/mapping seams.
+**Goal:** Turn one frozen model/input-view cohort of persisted reference and prediction events into deterministic per-song, per-class, aggregate, coverage, failure, and optionally bounded event-diagnostic reports at 30/50/100 ms without invoking inference or rebuilding existing mapping/matching seams.
 
-**Architecture:** Keep `src/benchmark/scoring.py` as the sole onset-matching/alignment implementation; only promote its existing private percentile helper to a public name so aggregate distributions reuse the same rank convention. Add one small `cohort_scoring.py` module for validated in-memory cohort rows, artifact coverage, score aggregation, and population accounting. Extend `scorer_input.py` only with the reference-side common-event adapter. Rewrite `reports.py` as a deterministic renderer that reuses `quantize_six()`, `require_sha256()`, and `canonical_json_bytes()` rather than inventing parallel numeric or identity encoders.
+**Architecture:** Keep `src/benchmark/scoring.py` as the sole onset-matching/alignment implementation. Add one small `cohort_scoring.py` module for the in-memory cohort contract, identity/coverage validation, canonical ordering, bounded diagnostics, per-class derivation, population accounting, and aggregates. Extend `scorer_input.py` only with the reference-side common-event adapter. Rewrite the small `reports.py` API as deterministic rendering over one canonical result object; HPA-326 later adapts its run rows into `CohortItem` rather than HPA-325 inventing a run schema.
 
-**Tech Stack:** Python 3.12, frozen dataclasses, `typing.Literal`, `statistics.fmean`/`median`, existing `BenchmarkEvent`/`ScoreSummary`/`ScoreResult`, existing `require_sha256`/`quantize_six`/canonical JSON helpers, CSV, pathlib, pytest, Ruff, Pylint.
+**Tech Stack:** Python 3.12, frozen dataclasses, `typing.Literal`, `statistics.fmean`/`median`, existing `BenchmarkEvent`/`ScoreSummary`/`ScoreResult`, existing `require_sha256()` / `quantize_six()` / canonical JSON helpers, CSV, pathlib, pytest, Ruff, Pylint.
 
 ## Global Constraints
 
 - Consume merged HPA-323 audio-relative native reference artifacts; do not rerun DTX parsing, timing, BGM resolution, chart selection, R2 access, or audio decoding.
-- Consume HPA-324 `map_reference_events()` / `CommonReferenceEvent` and the frozen common taxonomy; do not define another lane or class map.
+- Consume HPA-324 `map_reference_events()` / `CommonReferenceEvent`; do not define another lane/class map or mapped-reference artifact.
 - Consume HPA-423 prediction artifact v2 and `prediction_to_benchmark_events()`; do not rebuild `NativeEvent` mapping or prediction persistence.
-- The scored identity is one model/checkpoint + one `input_view_id` + one population scope per cohort.
+- Keep `score_events()` / `_match_class()` / alignment behavior unchanged unless a focused adversarial regression first proves a correctness defect.
+- Score one model/checkpoint + one `input_view_id` cohort at a time.
 - Default tolerances are exactly `30`, `50`, and `100` milliseconds.
-- Raw and diagnostically aligned scores are separate named modes; alignment never replaces raw scoring.
-- Headline matching uses onset time + common class only. Confidence and velocity remain diagnostic metadata and never affect matching.
-- Failed, skipped, and quarantined items remain visible in population accounting; never silently reduce the cohort to successes.
-- Do not change `score_events()`, `_match_class()`, alignment search, or their semantics. The only `scoring.py` change allowed is renaming/exporting the existing percentile helper and updating its internal call site.
-- Reuse `require_sha256()` for SHA-256 identity validation. Do not copy lowercase-hex validators.
-- Reuse the existing scoring percentile convention. Do not create a second percentile implementation.
-- Every float-derived report number crosses one `quantize_six()` rendering boundary. JSON/JSONL receive `Decimal`; CSV receives the same canonical decimal token. Never pass Python `float` to `canonical_json_bytes()`.
-- Undefined P/R/F1 remain `None`; do not coalesce them to `0.0`.
-- Full identity appears once in `summary.json` and on `items.csv` / `per_song.csv` / `per_class.csv` score/ledger rows. `event_diagnostics.jsonl` carries `cohort_id` only plus event evidence.
-- Do not add inference, worker pools, queues, retries, a prediction-run manifest, cross-model comparison, Parquet, a database, a metrics service, a report plugin registry, or a generic benchmark pipeline.
-- Breaking `ChartReport` / `write_reports` is allowed; do not add a compatibility wrapper.
-- Reports are regenerable files; do not use `publish_immutable_file()`.
-- Repository verification follows `CLAUDE.md`: `uv run pytest`, `uv run ruff check src tests`, `uv run ruff format --check src tests`, and `uv run pylint src/app src/cli`.
+- Raw and diagnostically aligned modes are separate named rows; alignment never replaces raw scoring.
+- Headline matching uses onset time + common class only. Confidence/velocity never affect matching.
+- Failed/skipped/quarantined rows remain visible in population accounting; never silently reduce a cohort to successes.
+- Event diagnostics are opt-in by simfile ID and empty by default; never materialize broad-corpus diagnostics automatically.
+- Every Python-float-derived persisted report number crosses `quantize_six()` before canonical JSON/JSONL or CSV/Markdown rendering.
+- Undefined metrics and undefined 0/0 mapping coverage remain `None` / JSON `null` / empty CSV cells.
+- `summary.json` owns cohort-level identity/population/aggregates. `items.csv` owns the item ledger. Cohort class aggregates live only in `summary.json`.
+- `items.csv` and `event_diagnostics.jsonl` carry `cohort_id` only for cohort identity. `per_song.csv` and `per_class.csv` additionally carry the Linear-required score-row dimensions: `model_id`, `model_lock_sha256`, `prediction_map_version`, `input_view_id`, and `scoring_version`.
+- Do not add inference, a CLI/run manifest, worker pool, queue, retry framework, generic pipeline, report registry, database, Parquet, or immutable report publication.
+- Breaking `ChartReport` / `write_reports` is allowed; do not add a compatibility shim.
+
+## Risks / Hard Gates
+
+### Gate A — Diagnostic volume
+
+`score_cohort(..., diagnostics_for=())` must produce zero event diagnostics. Diagnostics are materialized only for explicitly requested successful song IDs. HPA-326 broad-corpus scoring uses the empty default.
+
+### Gate B — Cohort identity
+
+Every successful prediction event must carry `metadata["input_view_id"]` and `metadata["prediction_map_version"]` matching `CohortIdentity`. Mixed input-view/map events fail before scoring.
+
+### Gate C — Coverage balance
+
+Reference accounting must include duplicate common collapse and satisfy:
+
+```text
+native = common + duplicate-collapsed + ignored + unmapped
+```
+
+Prediction accounting must satisfy:
+
+```text
+native = mapped + unmapped
+```
+
+### Gate D — Numeric encoding
+
+No Python `float` may reach `canonical_json_bytes()`. Task 5 must pin one exact JSONL line and exact CSV `0.5` cells before report implementation can pass.
+
+### Gate E — CI lint scope
+
+Final implementation verification must run the CI-equivalent `ruff check .` and errors-only Pylint over all `src`, including the new benchmark module.
 
 ---
 
@@ -35,17 +65,17 @@
 
 ### Create
 
-- `src/benchmark/cohort_scoring.py` — identity/item validation, artifact coverage, song/class scoring derivation, aggregates, F1 distributions, and population accounting.
-- `tests/benchmark/test_scorer_input.py` — focused reference-side scorer adapter tests.
-- `tests/benchmark/test_cohort_scoring.py` — identity, coverage, scoring matrix, aggregation, percentile, and reconciliation tests.
-- `tests/benchmark/test_cohort_scoring_acceptance.py` — persisted HPA-324/HPA-423 artifact-to-report proof with no backend.
+- `src/benchmark/cohort_scoring.py` — closed cohort contract, validation, coverage, canonical ordering, bounded diagnostics, scoring, and aggregates.
+- `tests/benchmark/test_scorer_input.py` — reference-side adapter tests.
+- `tests/benchmark/test_cohort_scoring.py` — cohort contract/scoring/aggregate tests.
+- `tests/benchmark/test_cohort_scoring_acceptance.py` — persisted HPA-324/HPA-423 artifact acceptance without inference.
 
 ### Modify
 
 - `src/benchmark/scorer_input.py` — add only `reference_to_benchmark_events()`.
-- `src/benchmark/scoring.py` — promote `_percentile()` to `percentile()` and use that name internally; no matcher/alignment behavior change.
-- `src/benchmark/reports.py` — replace flat chart rendering with deterministic cohort rendering and the shared report-number boundary.
-- `tests/benchmark/test_scoring.py` — pin remaining matcher behavior and public percentile convention.
+- `src/benchmark/scoring.py` — promote `_percentile` to public `percentile` without semantic change.
+- `src/benchmark/reports.py` — replace the flat chart writer with deterministic cohort rendering.
+- `tests/benchmark/test_scoring.py` — pin remaining matcher behavior and public percentile name.
 - `tests/benchmark/test_reports.py` — replace legacy report tests with schema/encoding/determinism tests.
 
 ### Explicitly unchanged
@@ -60,7 +90,7 @@
 
 ---
 
-## Task 1: Pin matcher behavior and add the reference scorer adapter
+## Task 1: Pin the matcher and add the reference scorer adapter
 
 **Files:**
 - Modify: `tests/benchmark/test_scoring.py`
@@ -68,7 +98,7 @@
 - Create: `tests/benchmark/test_scorer_input.py`
 
 **Interfaces:**
-- Consumes: `CommonReferenceEvent`, `BenchmarkEvent`, existing prediction scorer adapters.
+- Consumes: existing `BenchmarkEvent`, `CommonReferenceEvent`, and prediction scorer adapter.
 - Produces:
 
 ```python
@@ -78,7 +108,7 @@ def reference_to_benchmark_events(
 ) -> tuple[BenchmarkEvent, ...]: ...
 ```
 
-- [ ] **Step 1: Add simultaneous-hit and empty-song matcher regressions**
+- [ ] **Step 1: Add simultaneous/empty/one-sided-class matcher pins**
 
 Append to `tests/benchmark/test_scoring.py`:
 
@@ -89,19 +119,17 @@ def test_simultaneous_same_class_hits_match_one_to_one() -> None:
         [event(1.0, "kick", "pred_a"), event(1.0, "kick", "pred_b")],
         0.03,
     )
-
     assert result.summary.true_positives == 2
     assert result.summary.false_positives == 0
     assert result.summary.false_negatives == 0
 
 
-def test_empty_prediction_song_counts_every_reference_as_false_negative() -> None:
+def test_empty_prediction_song_counts_all_references_as_false_negatives() -> None:
     result = score_events(
         [event(1.0, "kick", "gt"), event(2.0, "snare", "gt")],
         [],
         0.05,
     )
-
     assert result.summary.true_positives == 0
     assert result.summary.false_positives == 0
     assert result.summary.false_negatives == 2
@@ -114,35 +142,32 @@ def test_class_present_on_only_one_side_is_retained() -> None:
         [event(1.0, "snare", "pred")],
         0.05,
     )
-
     assert [item.canonical_class for item in result.unmatched_ground_truth] == ["kick"]
     assert [item.canonical_class for item in result.unmatched_predictions] == ["snare"]
 ```
 
-Keep the existing dense-hit and large-offset tests.
+Keep existing dense-hit and large-offset tests unchanged.
 
-- [ ] **Step 2: Run matcher regressions before touching scoring code**
+- [ ] **Step 2: Run matcher pins before touching scoring code**
 
 ```bash
 uv run pytest tests/benchmark/test_scoring.py -q
 ```
 
-Expected: PASS. If a new matcher regression fails, treat that as a separate correctness finding before continuing; do not compensate in cohort aggregation.
+Expected: PASS. If a new fixture fails, stop and review the matcher as a correctness defect before aggregate work.
 
-- [ ] **Step 3: Write the failing reference adapter tests**
+- [ ] **Step 3: Write RED tests for reference projection**
 
 Create `tests/benchmark/test_scorer_input.py`:
 
 ```python
 from decimal import Decimal
 
-import pytest
-
 from src.benchmark.reference_set import CommonReferenceEvent
 from src.benchmark.scorer_input import reference_to_benchmark_events
 
 
-def test_reference_common_events_become_ground_truth_benchmark_events() -> None:
+def test_reference_common_events_become_ground_truth_events() -> None:
     common = (
         CommonReferenceEvent(Decimal("0.500000"), "kick", ()),
         CommonReferenceEvent(Decimal("1.250000"), "hihat", ()),
@@ -150,15 +175,26 @@ def test_reference_common_events_become_ground_truth_benchmark_events() -> None:
 
     result = reference_to_benchmark_events("42", common)
 
-    assert [(item.chart_id, item.time_sec, item.canonical_class, item.source) for item in result] == [
+    assert [
+        (item.chart_id, item.time_sec, item.canonical_class, item.source)
+        for item in result
+    ] == [
         ("42", 0.5, "kick", "ground_truth"),
         ("42", 1.25, "hihat", "ground_truth"),
     ]
+    assert all(type(item.time_sec) is float for item in result)
 
 
-def test_reference_adapter_rejects_empty_simfile_id() -> None:
-    with pytest.raises(ValueError, match="simfile_id must be a nonempty string"):
-        reference_to_benchmark_events("", ())
+def test_reference_adapter_preserves_common_projection_order() -> None:
+    common = (
+        CommonReferenceEvent(Decimal("1.000000"), "kick", ()),
+        CommonReferenceEvent(Decimal("1.000000"), "snare", ()),
+    )
+    result = reference_to_benchmark_events("song", common)
+    assert [(item.time_sec, item.canonical_class) for item in result] == [
+        (1.0, "kick"),
+        (1.0, "snare"),
+    ]
 ```
 
 - [ ] **Step 4: Verify RED**
@@ -167,9 +203,9 @@ def test_reference_adapter_rejects_empty_simfile_id() -> None:
 uv run pytest tests/benchmark/test_scorer_input.py -q
 ```
 
-Expected: FAIL because `reference_to_benchmark_events` does not exist.
+Expected: FAIL because the reference adapter does not exist.
 
-- [ ] **Step 5: Implement the minimal reference adapter**
+- [ ] **Step 5: Implement the minimal sibling adapter**
 
 In `src/benchmark/scorer_input.py`:
 
@@ -183,25 +219,25 @@ def reference_to_benchmark_events(
     return tuple(
         BenchmarkEvent(
             chart_id=simfile_id,
-            time_sec=float(item.canonical_audio_time),
-            canonical_class=item.common_class,
+            time_sec=float(event.canonical_audio_time),
+            canonical_class=event.common_class,
             source="ground_truth",
             metadata={},
         )
-        for item in common_events
+        for event in common_events
     )
 ```
 
-Add it to `__all__`. Do not accept native DTX/reference events here; callers must first use HPA-324 common projection.
+Export it in `__all__`. Do not accept native reference events and do not call DTX timing/mapping helpers here.
 
-- [ ] **Step 6: Run scorer-input + HPA-423 bridge tests**
+- [ ] **Step 6: Run adapter + existing HPA-423 bridge coverage**
 
 ```bash
 uv run pytest tests/benchmark/test_scorer_input.py \
   tests/benchmark/test_task_d_contract.py tests/benchmark/test_scoring.py -q
 ```
 
-Expected: PASS, including existing OaF hihat/tom common-class round-trip coverage.
+Expected: PASS.
 
 - [ ] **Step 7: Commit**
 
@@ -213,21 +249,31 @@ git commit -m "test: pin cohort scorer inputs"
 
 ---
 
-## Task 2: Define cohort identity, item, and artifact-coverage contracts
+## Task 2: Define the closed cohort identity, reason, and coverage contract
 
 **Files:**
 - Create: `src/benchmark/cohort_scoring.py`
 - Create: `tests/benchmark/test_cohort_scoring.py`
 
 **Interfaces:**
-- Consumes: `ReferenceMappingResult`, `PredictionArtifact`, `BenchmarkEvent`, `require_sha256()`.
+- Consumes: `ReferenceMappingResult`, `PredictionArtifact`, `BenchmarkEvent`, existing identity validators.
 - Produces:
 
 ```python
 SCORING_VERSION = "crux.single-cohort-scoring/v1"
 DEFAULT_TOLERANCES_MS = (30, 50, 100)
+SCORE_MODES = ("raw", "aligned")
 
 CohortExecutionStatus = Literal["success", "failed", "skipped", "quarantined"]
+CohortFailureReason = Literal[
+    "reference_quarantined",
+    "backend_unavailable",
+    "inference_failed",
+    "prediction_artifact_invalid",
+    "prediction_missing",
+    "explicitly_skipped",
+]
+COHORT_FAILURE_REASONS = frozenset(get_args(CohortFailureReason))
 ScoreMode = Literal["raw", "aligned"]
 
 @dataclass(frozen=True)
@@ -251,6 +297,7 @@ class CohortCoverage:
     reference_common_event_count: int
     reference_ignored_event_count: int
     reference_unmapped_event_count: int
+    reference_duplicate_collapsed_count: int
     prediction_native_event_count: int | None
     prediction_mapped_event_count: int | None
     prediction_unmapped_event_count: int | None
@@ -264,7 +311,7 @@ class CohortItem:
     prediction_events: tuple[BenchmarkEvent, ...] | None
     coverage: CohortCoverage
     warnings: tuple[str, ...] = ()
-    failure_reason: str | None = None
+    failure_reason: CohortFailureReason | None = None
 
 
 def coverage_from_artifacts(
@@ -273,13 +320,26 @@ def coverage_from_artifacts(
 ) -> CohortCoverage: ...
 ```
 
-- [ ] **Step 1: Write a shared identity fixture**
+- [ ] **Step 1: Write the closed reason-code invariant**
 
 ```python
-from src.benchmark.cohort_scoring import CohortIdentity
-from src.benchmark.taxonomy import DTX_LANE_MAP_VERSION, OAF_PREDICTION_MAP_ID, TAXONOMY_VERSION
+def test_cohort_failure_reason_set_is_closed() -> None:
+    assert COHORT_FAILURE_REASONS == {
+        "reference_quarantined",
+        "backend_unavailable",
+        "inference_failed",
+        "prediction_artifact_invalid",
+        "prediction_missing",
+        "explicitly_skipped",
+    }
+    assert COHORT_FAILURE_REASONS == frozenset(get_args(CohortFailureReason))
+```
 
+These are grouped scoring categories. HPA-326 may retain detailed worker text in its own run manifest; do not put detail into grouped HPA-325 reason strings.
 
+- [ ] **Step 2: Write a shared identity fixture and direct SHA validation tests**
+
+```python
 def identity() -> CohortIdentity:
     return CohortIdentity(
         cohort_id="oaf-full-mix-v1",
@@ -287,7 +347,7 @@ def identity() -> CohortIdentity:
         reference_timing_version="sha256:" + "b" * 64,
         taxonomy_version=TAXONOMY_VERSION,
         lane_map_version=DTX_LANE_MAP_VERSION,
-        backend_id="magenta-egmd-tf1-94529798-8hit-v1",
+        backend_id=OAF_BACKEND_ID,
         model_id="magenta-egmd-ckpt-569400-v1",
         model_lock_sha256="c" * 64,
         backend_descriptor_sha256="d" * 64,
@@ -296,55 +356,23 @@ def identity() -> CohortIdentity:
     )
 ```
 
-- [ ] **Step 2: Write shared SHA-validation tests**
-
-Parametrize the three raw SHA fields:
+Parametrize the SHA fields and require the existing message:
 
 ```python
 @pytest.mark.parametrize(
     "field",
     ["reference_manifest_sha256", "model_lock_sha256", "backend_descriptor_sha256"],
 )
-def test_identity_rejects_invalid_sha256_through_shared_contract(field: str) -> None:
+def test_identity_reuses_shared_sha256_validation(field: str) -> None:
     values = dataclasses.asdict(identity())
     values[field] = "ABC"
-
     with pytest.raises(ValueError, match=f"{field} must be lowercase SHA-256"):
         CohortIdentity(**values)
 ```
 
-This test intentionally locks the existing `require_sha256()` message. Do not write a local regex/hex loop.
+- [ ] **Step 3: Implement identity validation using `require_sha256()` directly**
 
-- [ ] **Step 3: Write artifact coverage tests using real domain objects**
-
-Reuse `NativeReferenceEvent` fixtures from `tests/benchmark/test_reference_set.py` and OaF mapped prediction fixtures from `test_task_d_contract.py`. Build mapped lane `13`, ignored lane `54`, one mapped prediction, and one unmapped prediction.
-
-Assert:
-
-```python
-assert coverage.reference_native_event_count == 2
-assert coverage.reference_common_event_count == 1
-assert coverage.reference_ignored_event_count == 1
-assert coverage.reference_unmapped_event_count == 0
-assert coverage.prediction_native_event_count == 2
-assert coverage.prediction_mapped_event_count == 1
-assert coverage.prediction_unmapped_event_count == 1
-assert coverage.prediction_native_class_counts == (("midi_36", 1), ("midi_75", 1))
-```
-
-For `prediction=None`, prediction counts are `None` and native-class counts are empty.
-
-- [ ] **Step 4: Verify RED**
-
-```bash
-uv run pytest tests/benchmark/test_cohort_scoring.py -q
-```
-
-Expected: FAIL because `cohort_scoring.py` does not exist.
-
-- [ ] **Step 5: Implement identity validation by reusing `require_sha256()`**
-
-In `CohortIdentity.__post_init__`, require all non-hash identity strings to be nonempty, require `scoring_version == SCORING_VERSION`, then validate hashes:
+In `CohortIdentity.__post_init__` validate nonempty identity strings and exact `SCORING_VERSION`, then:
 
 ```python
 for field in (
@@ -352,28 +380,75 @@ for field in (
     "model_lock_sha256",
     "backend_descriptor_sha256",
 ):
-    try:
-        require_sha256(getattr(self, field), field)
-    except StrictJsonError as error:
-        raise ValueError(str(error)) from None
+    require_sha256(getattr(self, field), field)
 ```
 
-No new SHA helper.
+Do **not** catch/re-wrap `StrictJsonError`; it already subclasses `ValueError`. Do not add a local SHA regex/helper.
+
+- [ ] **Step 4: Write reference/prediction coverage tests from real domain objects**
+
+Build a `ReferenceMappingResult` containing:
+
+- mapped tom lanes `14` and `15` at the same exact time (one duplicate collapse);
+- one mapped kick lane `13`;
+- one ignored lane `54`;
+- no unknown lane.
+
+Use an OaF-shaped mapped prediction artifact containing one mapped and one unmapped native event.
+
+Require:
+
+```python
+assert coverage.reference_native_event_count == 4
+assert coverage.reference_common_event_count == 2
+assert coverage.reference_duplicate_collapsed_count == 1
+assert coverage.reference_ignored_event_count == 1
+assert coverage.reference_unmapped_event_count == 0
+assert (
+    coverage.reference_native_event_count
+    == coverage.reference_common_event_count
+    + coverage.reference_duplicate_collapsed_count
+    + coverage.reference_ignored_event_count
+    + coverage.reference_unmapped_event_count
+)
+assert coverage.prediction_native_event_count == 2
+assert coverage.prediction_mapped_event_count == 1
+assert coverage.prediction_unmapped_event_count == 1
+```
+
+For `prediction=None`, all prediction counts are `None` and native-class counts are empty.
+
+- [ ] **Step 5: Verify RED for coverage**
+
+```bash
+uv run pytest tests/benchmark/test_cohort_scoring.py -q
+```
+
+Expected: FAIL because `cohort_scoring.py` is incomplete/missing.
 
 - [ ] **Step 6: Implement `coverage_from_artifacts()`**
 
 Reference native count:
 
 ```python
-len(reference.mapped_events) + sum(reference.diagnostics.ignored.values()) + sum(
-    reference.diagnostics.unmapped.values()
+reference_native_event_count = (
+    len(reference.mapped_events)
+    + sum(reference.diagnostics.ignored.values())
+    + sum(reference.diagnostics.unmapped.values())
 )
+```
+
+Carry:
+
+```python
+reference_common_event_count = len(reference.common_events)
+reference_duplicate_collapsed_count = reference.diagnostics.duplicate_common_event_count
 ```
 
 Prediction counts:
 
 ```python
-native_events = artifact.prediction.events
+native_events = prediction.prediction.events
 mapped_count = sum(item.mapping_status == "mapped" for item in native_events)
 unmapped_count = sum(item.mapping_status == "unmapped" for item in native_events)
 native_class_counts = tuple(
@@ -381,31 +456,68 @@ native_class_counts = tuple(
 )
 ```
 
-Do not create another coverage artifact.
+Do not persist another coverage artifact.
 
-- [ ] **Step 7: Write and implement item/tolerance validation**
+- [ ] **Step 7: Write item/status/coverage validation tests**
 
-Tests require:
+Require:
 
-- unique nonempty `simfile_id` values;
-- sorted unique positive tolerances;
-- `success` rows have nonempty references and `prediction_events is not None`; empty prediction tuple is valid;
-- non-success rows have `prediction_events is None` and nonempty `failure_reason`;
-- success rows have `failure_reason is None`;
-- success prediction coverage is non-`None`, balances `native == mapped + unmapped`, and `mapped == len(prediction_events)`;
-- reference common count equals `len(reference_events)`.
+- nonempty unique `simfile_id` values in a cohort;
+- success: nonempty references, `prediction_events is not None` (empty tuple valid), and `failure_reason is None`;
+- failed: no prediction tuple and reason in `backend_unavailable | inference_failed | prediction_artifact_invalid | prediction_missing`;
+- skipped: no prediction tuple and reason exactly `explicitly_skipped`;
+- quarantined: no prediction tuple and reason exactly `reference_quarantined`;
+- reference coverage counts are nonnegative and satisfy the balance equation;
+- `coverage.reference_common_event_count == len(reference_events)`;
+- when prediction counts exist, they are nonnegative and `native == mapped + unmapped`;
+- success requires prediction counts and `prediction_mapped_event_count == len(prediction_events)`.
 
-Use direct `ValueError`; no validation framework.
+A future HPA-326 resume hit that reuses a valid prediction artifact is adapted as `success`, not `skipped`.
 
-- [ ] **Step 8: Run the contract suite**
+- [ ] **Step 8: Write mixed-cohort prediction metadata tests**
 
-```bash
-uv run pytest tests/benchmark/test_cohort_scoring.py -q
+Use prediction `BenchmarkEvent`s shaped like the existing scorer adapter output:
+
+```python
+metadata={
+    "input_view_id": "full-mix-v1",
+    "prediction_map_version": OAF_PREDICTION_MAP_ID,
+}
 ```
 
-Expected: PASS for identity/coverage/validation tests.
+Require success validation to reject either mismatch:
 
-- [ ] **Step 9: Commit**
+```python
+with pytest.raises(ValueError, match="input_view_id"):
+    validate_cohort_items(identity(), (mixed_view_item,))
+
+with pytest.raises(ValueError, match="prediction_map_version"):
+    validate_cohort_items(identity(), (mixed_map_item,))
+```
+
+Missing metadata also fails. Do not infer identity from cohort labels.
+
+- [ ] **Step 9: Implement narrow validation helpers**
+
+Use direct loops and `ValueError`; do not add a validation framework. For each successful prediction event:
+
+```python
+if event.metadata.get("input_view_id") != identity.input_view_id:
+    raise ValueError("prediction event input_view_id does not match cohort")
+if event.metadata.get("prediction_map_version") != identity.prediction_map_version:
+    raise ValueError("prediction event prediction_map_version does not match cohort")
+```
+
+- [ ] **Step 10: Run contract tests**
+
+```bash
+uv run pytest tests/benchmark/test_cohort_scoring.py \
+  tests/benchmark/test_task_d_contract.py -q
+```
+
+Expected: PASS.
+
+- [ ] **Step 11: Commit**
 
 ```bash
 git add src/benchmark/cohort_scoring.py tests/benchmark/test_cohort_scoring.py
@@ -414,14 +526,14 @@ git commit -m "feat: define cohort scoring contract"
 
 ---
 
-## Task 3: Score every tolerance/mode and derive class/event diagnostics from one matcher result
+## Task 3: Add canonical song/class scoring with opt-in diagnostics
 
 **Files:**
 - Modify: `src/benchmark/cohort_scoring.py`
 - Modify: `tests/benchmark/test_cohort_scoring.py`
 
 **Interfaces:**
-- Consumes: validated `CohortItem` rows and `score_events_with_alignment()`.
+- Consumes: validated `CohortItem`s and `score_events_with_alignment()`.
 - Produces:
 
 ```python
@@ -455,46 +567,68 @@ class EventDiagnostic:
     timing_error_sec: float | None
 
 
-def score_cohort(
-    identity: CohortIdentity,
+def _score_success_items(
     items: tuple[CohortItem, ...],
-    tolerances_ms: tuple[int, ...] = DEFAULT_TOLERANCES_MS,
-) -> CohortScoreResult: ...
+    tolerances_ms: tuple[int, ...],
+    diagnostics_for: frozenset[str],
+) -> tuple[tuple[SongScore, ...], tuple[EventDiagnostic, ...]]: ...
 ```
 
-- [ ] **Step 1: Write the fixed tolerance/mode matrix test**
+- [ ] **Step 1: Write fixed tolerance/mode matrix tests**
 
-Use one success row with a 40 ms-late kick prediction. Require sorted score dimensions:
+Use one success with a kick prediction 40 ms late. Require canonical row order:
 
 ```python
 [
-    (30, "aligned"), (30, "raw"),
-    (50, "aligned"), (50, "raw"),
-    (100, "aligned"), (100, "raw"),
+    (30, "raw"),
+    (30, "aligned"),
+    (50, "raw"),
+    (50, "aligned"),
+    (100, "raw"),
+    (100, "aligned"),
 ]
 ```
 
-Require raw 30 ms F1 `0.0`, aligned 30 ms F1 `1.0`, and raw 50/100 ms F1 `1.0`.
+Raw 30 ms F1 is `0.0`; aligned 30 ms and raw 50/100 ms F1 are `1.0`.
 
-- [ ] **Step 2: Write per-class reconciliation tests**
+- [ ] **Step 2: Write per-class reconciliation test**
 
-Use kick + snare references and an unmatched hihat prediction. For every `SongScore`:
+Use kick + snare references plus an unmatched hihat prediction. For every song result:
 
 ```python
 assert sum(row.summary.true_positives for row in score.per_class) == score.summary.true_positives
 assert sum(row.summary.false_positives for row in score.per_class) == score.summary.false_positives
 assert sum(row.summary.false_negatives for row in score.per_class) == score.summary.false_negatives
+assert [row.common_class for row in score.per_class] == sorted(
+    row.common_class for row in score.per_class
+)
 ```
 
-Require hihat to remain present with zero reference support.
+Require hihat even with zero reference support.
 
 - [ ] **Step 3: Write scorer metadata-independence test**
 
-Compare predictions with `metadata={}` against otherwise identical predictions carrying confidence/velocity metadata. Counts and F1 must match. Do not create an invalid OaF artifact with null OaF fields; this is a scorer-level contract.
+Compare otherwise identical prediction `BenchmarkEvent`s with/without confidence/velocity metadata. Counts/F1 are identical. Do not create an invalid OaF persisted artifact merely to test missing optional model fields at the scorer layer.
 
-- [ ] **Step 4: Write aligned original/scored-time regression**
+- [ ] **Step 4: Write default-empty diagnostics test**
 
-For reference `1.0`, persisted prediction `1.1`, and aligned offset `-0.1`:
+```python
+song_scores, diagnostics = _score_success_items(
+    (success_a, success_b),
+    DEFAULT_TOLERANCES_MS,
+    diagnostics_for=frozenset(),
+)
+assert song_scores
+assert diagnostics == ()
+```
+
+This is the broad-corpus safety default.
+
+- [ ] **Step 5: Write selected-song diagnostic test**
+
+Request only song `"2"` and require every diagnostic row to have `simfile_id == "2"`; no row for song `"1"` is materialized.
+
+For an aligned prediction:
 
 ```python
 assert diagnostic.reference_time_sec == pytest.approx(1.0)
@@ -503,15 +637,15 @@ assert diagnostic.scored_prediction_time_sec == pytest.approx(1.0)
 assert diagnostic.timing_error_sec == pytest.approx(0.0)
 ```
 
-- [ ] **Step 5: Verify RED**
+- [ ] **Step 6: Verify RED**
 
 ```bash
 uv run pytest tests/benchmark/test_cohort_scoring.py -q
 ```
 
-Expected: FAIL on missing score rows/diagnostics.
+Expected: FAIL on missing score/diagnostic behavior.
 
-- [ ] **Step 6: Implement one matcher invocation per success/tolerance**
+- [ ] **Step 7: Implement one matcher call per success/tolerance**
 
 ```python
 aligned = score_events_with_alignment(
@@ -521,41 +655,69 @@ aligned = score_events_with_alignment(
 )
 ```
 
-Turn `aligned.raw` and `aligned.aligned` into separate `SongScore` rows. Do not invoke the matcher again for classes.
+Turn `aligned.raw` and `aligned.aligned` into two rows in fixed `SCORE_MODES = ("raw", "aligned")` order. Do not run a second matcher for classes.
 
-- [ ] **Step 7: Derive per-class rows from the same `ScoreResult`**
+- [ ] **Step 8: Derive per-class rows from the same `ScoreResult`**
 
-For every class present in matches or either unmatched set:
+For each class present in matches or either unmatched set:
 
-- TP = matched rows for class;
+- TP = matching rows for class;
 - FP = unmatched predictions for class;
 - FN = unmatched references for class;
 - reference support = TP + FN;
 - prediction support = TP + FP.
 
-Use `ScoreSummary(tp, fp, fn)` for class P/R/F1. Do not add class timing distributions.
+Construct `ScoreSummary(tp, fp, fn)` and sort `ClassScore` rows by `common_class`.
 
-- [ ] **Step 8: Derive diagnostics from the same `ScoreResult`**
+- [ ] **Step 9: Derive diagnostics only for requested IDs**
 
-For raw mode, original/scored prediction time are identical. For aligned mode:
+Do nothing when `item.simfile_id not in diagnostics_for`.
+
+Raw mode: original/scored prediction times are equal.
+
+Aligned mode:
 
 ```python
 original_prediction_time = scored_prediction_time - score_result.summary.offset_sec
 ```
 
-Apply this to matched and FP rows. FN rows have prediction fields `None`; FP rows have reference/error fields `None`.
+FN rows have prediction fields `None`; FP rows have reference/error fields `None`.
 
-Sort diagnostics by `(simfile_id, tolerance_ms, mode, outcome, common_class, reference_time_sec or -1, prediction_time_sec or -1)`.
+- [ ] **Step 10: Establish canonical song/diagnostic ordering here**
 
-- [ ] **Step 9: Run focused scoring tests**
+Sort song scores by:
+
+```python
+(simfile_id, tolerance_ms, mode_rank)
+```
+
+with `raw=0`, `aligned=1`.
+
+Sort diagnostics by:
+
+```python
+(
+    simfile_id,
+    tolerance_ms,
+    mode_rank,
+    outcome,
+    common_class,
+    -1.0 if reference_time_sec is None else reference_time_sec,
+    -1.0 if prediction_time_sec is None else prediction_time_sec,
+)
+```
+
+Writers must not define another semantic order.
+
+- [ ] **Step 11: Run focused scoring tests**
 
 ```bash
 uv run pytest tests/benchmark/test_cohort_scoring.py tests/benchmark/test_scoring.py -q
 ```
 
-Expected: PASS without matcher/alignment changes.
+Expected: PASS without modifying matcher/alignment semantics.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 12: Commit**
 
 ```bash
 git add src/benchmark/cohort_scoring.py tests/benchmark/test_cohort_scoring.py
@@ -564,7 +726,7 @@ git commit -m "feat: score single benchmark cohorts"
 
 ---
 
-## Task 4: Reuse the scorer percentile helper and add aggregates/population
+## Task 4: Reuse the percentile helper and add public cohort aggregation
 
 **Files:**
 - Modify: `src/benchmark/scoring.py`
@@ -573,7 +735,7 @@ git commit -m "feat: score single benchmark cohorts"
 - Modify: `tests/benchmark/test_cohort_scoring.py`
 
 **Interfaces:**
-- Consumes: existing `_percentile` implementation, all `CohortItem` and `SongScore` rows.
+- Consumes: existing `_percentile` semantics plus Task 3 song rows.
 - Produces:
 
 ```python
@@ -586,7 +748,7 @@ class PopulationSummary:
     failed_count: int
     skipped_count: int
     quarantined_count: int
-    reason_counts: tuple[tuple[str, int], ...]
+    reason_counts: tuple[tuple[CohortFailureReason, int], ...]
 
 @dataclass(frozen=True)
 class F1Distribution:
@@ -618,23 +780,30 @@ class CohortScoreResult:
     event_diagnostics: tuple[EventDiagnostic, ...]
     population: PopulationSummary
     aggregates: tuple[CohortAggregate, ...]
+
+
+def score_cohort(
+    identity: CohortIdentity,
+    items: tuple[CohortItem, ...],
+    tolerances_ms: tuple[int, ...] = DEFAULT_TOLERANCES_MS,
+    diagnostics_for: tuple[str, ...] = (),
+) -> CohortScoreResult: ...
 ```
 
-- [ ] **Step 1: Pin the existing percentile convention under its public name**
+- [ ] **Step 1: Pin the existing percentile convention under a public name**
 
-In `tests/benchmark/test_scoring.py` import `percentile` and add:
+In `tests/benchmark/test_scoring.py`:
 
 ```python
 def test_percentile_uses_existing_upper_nearest_rank_convention() -> None:
     values = [0.0, 0.25, 0.5, 0.75, 1.0]
-
     assert percentile(values, 0.10) == 0.25
     assert percentile(values, 0.25) == 0.25
     assert percentile(values, 0.75) == 0.75
     assert percentile(values, 0.90) == 1.0
 ```
 
-- [ ] **Step 2: Verify RED for the public name**
+- [ ] **Step 2: Verify RED, then promote `_percentile` without semantic change**
 
 ```bash
 uv run pytest tests/benchmark/test_scoring.py::test_percentile_uses_existing_upper_nearest_rank_convention -q
@@ -642,23 +811,31 @@ uv run pytest tests/benchmark/test_scoring.py::test_percentile_uses_existing_upp
 
 Expected: FAIL because only `_percentile` exists.
 
-- [ ] **Step 3: Promote `_percentile` to `percentile` without semantic change**
+Rename the existing function to `percentile` and update `score_events()`'s p95 call. Do not keep an alias; repository search shows no external consumer.
 
-Rename:
+- [ ] **Step 3: Write input-order and diagnostics-request validation tests for public `score_cohort()`**
+
+Build items in reverse ID order and require:
 
 ```python
-def percentile(values: list[float], percentile: float) -> float:
-    if not values:
-        raise ValueError("values must not be empty")
-    index = min(len(values) - 1, ceil((len(values) - 1) * percentile))
-    return values[index]
+result = score_cohort(identity(), (item_2, item_1))
+assert [item.simfile_id for item in result.items] == ["1", "2"]
+assert [
+    (row.simfile_id, row.tolerance_ms, row.mode)
+    for row in result.song_scores
+] == sorted_by_declared_contract
 ```
 
-Update `score_events()` to call `percentile(errors, 0.95)`. Do not leave a compatibility alias; repository search shows no other consumer.
+Require:
 
-- [ ] **Step 4: Write full-population accounting test**
+- tolerances are positive, unique, and sorted;
+- `diagnostics_for` contains unique, nonempty IDs;
+- every diagnostics ID names a successful input item;
+- default diagnostics are empty.
 
-Use one success, one failed, one skipped, and one quarantined item:
+- [ ] **Step 4: Write full-population/closed-reason tests**
+
+Use success + failed + skipped + quarantined rows and require:
 
 ```python
 assert result.population.total_count == 4
@@ -667,26 +844,26 @@ assert result.population.failed_count == 1
 assert result.population.skipped_count == 1
 assert result.population.quarantined_count == 1
 assert result.population.reason_counts == (
-    ("already_complete", 1),
+    ("explicitly_skipped", 1),
+    ("inference_failed", 1),
     ("reference_quarantined", 1),
-    ("worker_error", 1),
 )
 ```
 
-Warnings remain warnings, not failure reasons.
+Group only stable reason codes; warnings never become reason buckets.
 
-- [ ] **Step 5: Write event-micro/song-macro/class-macro test**
+- [ ] **Step 5: Write event-micro/song-macro/class-macro tests**
 
 Use two successful songs:
 
-- song A: kick TP, snare FN;
-- song B: kick TP plus one kick FP.
+- song A: kick TP + snare FN;
+- song B: kick TP + kick FP.
 
-Require aggregate TP/FP/FN `(2, 1, 1)`, song macro as arithmetic mean of song F1 values, and class macro as arithmetic mean of supported aggregate class F1 values.
+Require event-micro `(TP,FP,FN) == (2,1,1)`, song macro equals the arithmetic mean of song F1s, and class macro equals the arithmetic mean of supported aggregate class F1s.
 
-- [ ] **Step 6: Write exact F1 distribution tests using `percentile()`**
+- [ ] **Step 6: Write F1 distribution tests using `scoring.percentile()`**
 
-For successful song F1 values `(0.0, 0.25, 0.5, 0.75, 1.0)`:
+For song F1 values `(0.0, 0.25, 0.5, 0.75, 1.0)` require:
 
 ```python
 assert distribution.minimum == 0.0
@@ -698,23 +875,38 @@ assert distribution.p90 == 1.0
 assert distribution.maximum == 1.0
 ```
 
-Use `statistics.median()` only for median; p10/p25/p75/p90 must call `scoring.percentile()`.
+Use `statistics.median()` for the median; p10/p25/p75/p90 call the promoted `percentile()`.
 
-- [ ] **Step 7: Write zero-success test**
+- [ ] **Step 7: Write zero-success tests**
 
-A cohort containing only failed/quarantined rows still returns six aggregate dimensions. Require micro counts zero with P/R/F1 `None`, song/class macro `None`, empty class rows, and every `F1Distribution` field `None`.
+A cohort with failed/quarantined rows only still returns six aggregate dimensions. Require zero event counts with undefined P/R/F1, undefined macro/distribution fields, empty aggregate class rows, and intact population counts.
 
-- [ ] **Step 8: Verify RED for aggregate behavior**
+- [ ] **Step 8: Implement `score_cohort()` canonicalization before scoring**
 
-```bash
-uv run pytest tests/benchmark/test_cohort_scoring.py tests/benchmark/test_scoring.py -q
+Validation order:
+
+1. validate `CohortIdentity` (dataclass post-init already covers hash/string rules);
+2. validate tolerances;
+3. validate unique item IDs/status/reason/coverage/event metadata;
+4. validate `diagnostics_for`;
+5. sort `items` by `simfile_id`;
+6. call `_score_success_items()` with a `frozenset(diagnostics_for)`;
+7. aggregate canonical song rows;
+8. return canonical tuples.
+
+Do not defer item ordering to the writer.
+
+- [ ] **Step 9: Implement population/aggregate helpers**
+
+Event micro:
+
+```python
+ScoreSummary(
+    true_positives=sum(row.summary.true_positives for row in rows),
+    false_positives=sum(row.summary.false_positives for row in rows),
+    false_negatives=sum(row.summary.false_negatives for row in rows),
+)
 ```
-
-Expected: aggregate tests FAIL; percentile public-name test PASS after Step 3.
-
-- [ ] **Step 9: Implement population and aggregate helpers**
-
-Population counts are built before filtering successes. Event micro sums TP/FP/FN and constructs one `ScoreSummary`. Aggregate classes sum the same class rows across songs.
 
 Macro helper:
 
@@ -724,25 +916,9 @@ def _mean_f1(values: tuple[float | None, ...]) -> float | None:
     return fmean(scored) if scored else None
 ```
 
-Distribution helper uses sorted successful song F1 values:
+Aggregate class rows by summed TP/FP/FN and sort by `common_class`.
 
-```python
-F1Distribution(
-    minimum=values[0],
-    p10=percentile(values, 0.10),
-    p25=percentile(values, 0.25),
-    median=median(values),
-    p75=percentile(values, 0.75),
-    p90=percentile(values, 0.90),
-    maximum=values[-1],
-)
-```
-
-- [ ] **Step 10: Add reconciliation assertions in tests**
-
-For all six `(tolerance_ms, mode)` aggregates, require TP/FP/FN equal summed song counts. For each aggregate class, reconcile against song-level class rows.
-
-- [ ] **Step 11: Run the aggregate suite**
+- [ ] **Step 10: Run scoring/aggregate suites**
 
 ```bash
 uv run pytest tests/benchmark/test_scoring.py tests/benchmark/test_cohort_scoring.py -q
@@ -750,24 +926,24 @@ uv run pytest tests/benchmark/test_scoring.py tests/benchmark/test_cohort_scorin
 
 Expected: PASS.
 
-- [ ] **Step 12: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
-git add src/benchmark/scoring.py tests/benchmark/test_scoring.py \
-  src/benchmark/cohort_scoring.py tests/benchmark/test_cohort_scoring.py
+git add src/benchmark/scoring.py src/benchmark/cohort_scoring.py \
+  tests/benchmark/test_scoring.py tests/benchmark/test_cohort_scoring.py
 git commit -m "feat: aggregate cohort benchmark results"
 ```
 
 ---
 
-## Task 5: Replace the flat report writer and freeze numeric/identity encoding
+## Task 5: Replace the flat report writer with non-duplicated deterministic artifacts
 
 **Files:**
 - Modify: `src/benchmark/reports.py`
 - Modify: `tests/benchmark/test_reports.py`
 
 **Interfaces:**
-- Consumes: `CohortScoreResult`, `quantize_six()`, `canonical_json_bytes()`.
+- Consumes: canonical `CohortScoreResult`, `quantize_six()`, `canonical_json_bytes()`.
 - Produces:
 
 ```python
@@ -789,9 +965,9 @@ def write_cohort_reports(
 ) -> ReportArtifacts: ...
 ```
 
-- [ ] **Step 1: Replace the legacy report test with the six-file contract**
+- [ ] **Step 1: Replace legacy report tests with the six-file contract**
 
-Build a result through `score_cohort()` and require:
+Require paths:
 
 ```python
 assert artifacts.summary_json == tmp_path / "summary.json"
@@ -802,34 +978,11 @@ assert artifacts.event_diagnostics_jsonl == tmp_path / "event_diagnostics.jsonl"
 assert artifacts.summary_markdown == tmp_path / "summary.md"
 ```
 
-Delete legacy `ChartReport` / `write_reports` tests and imports.
+Delete legacy `ChartReport` / `write_reports` test imports.
 
-- [ ] **Step 2: Define one traceability helper for durable CSV rows**
+- [ ] **Step 2: Pin the single numeric boundary before any writer code**
 
-`summary.json` stores the full identity once. `items.csv`, `per_song.csv`, and `per_class.csv` repeat this prefix:
-
-```text
-cohort_id
-reference_manifest_sha256
-reference_timing_version
-taxonomy_version
-lane_map_version
-backend_id
-model_id
-model_lock_sha256
-backend_descriptor_sha256
-prediction_map_version
-input_view_id
-scoring_version
-```
-
-Implement one `_identity_fields(identity)` helper and reuse it for the three CSV writers.
-
-`event_diagnostics.jsonl` does **not** use `_identity_fields`; it carries `cohort_id` only and joins to `summary.json`.
-
-- [ ] **Step 3: Write the report-number helper tests before writer implementation**
-
-In `tests/benchmark/test_reports.py` pin:
+In `tests/benchmark/test_reports.py`:
 
 ```python
 assert _report_decimal(0.5) == Decimal("0.500000")
@@ -838,19 +991,17 @@ assert _csv_decimal(0.5) == "0.5"
 assert _csv_decimal(None) == ""
 ```
 
-Also require a nonfinite input to raise `StrictJsonError` through `quantize_six()`.
+Require nonfinite input to raise `StrictJsonError` through `quantize_six()`.
 
-- [ ] **Step 4: Verify RED for numeric helpers**
+- [ ] **Step 3: Verify RED, then implement numeric helpers**
 
 ```bash
 uv run pytest tests/benchmark/test_reports.py -q
 ```
 
-Expected: FAIL because the new report helpers/writer do not exist.
+Expected: FAIL.
 
-- [ ] **Step 5: Implement the single numeric boundary**
-
-In `src/benchmark/reports.py`:
+Implement:
 
 ```python
 def _report_decimal(value: float | None) -> Decimal | None:
@@ -862,62 +1013,124 @@ def _csv_decimal(value: float | None) -> str:
     return "" if decimal is None else canonical_json_bytes(decimal).decode("ascii")
 ```
 
-Rules for every writer:
+Every float-derived persisted number uses these helpers. No `str(float)` / `repr(float)`.
 
-- float-derived metrics/times/ratios/coverage percentages -> `_report_decimal()` for JSON/JSONL;
-- the same values -> `_csv_decimal()` for CSV/Markdown numeric tokens;
-- `None` -> JSON `null` / empty CSV cell;
-- counts -> integer;
-- never pass Python `float` to `canonical_json_bytes()`;
-- never use `str(float)` or `repr(float)` as report encoding.
+- [ ] **Step 4: Test `summary.json` as cohort-level facts only**
 
-- [ ] **Step 6: Test `items.csv` as the complete cohort ledger**
-
-After the identity prefix, fixed fields are:
+Require exact top-level keys:
 
 ```text
-simfile_id,status,failure_reason,warnings,
-reference_native_event_count,reference_common_event_count,
-reference_ignored_event_count,reference_unmapped_event_count,
-prediction_native_event_count,prediction_mapped_event_count,
-prediction_unmapped_event_count,prediction_mapping_coverage,prediction_native_class_counts
+schema
+identity
+tolerances_ms
+population
+aggregates
 ```
 
-Warnings are sorted and `|`-joined. Native class counts are `class=count|class=count`. Missing prediction counts are empty cells. Mapping coverage is mapped/native; when a successful artifact has zero native events, encode `1.0`; when no artifact exists, leave empty.
+There is **no** `items` key. Each aggregate owns its cohort per-class aggregate rows and F1 distribution.
 
-Require a fixture with one-half coverage to produce the exact CSV cell:
+Parse with `strict_json_loads(..., require_canonical=True)`. Assert one-half becomes `Decimal("0.5")` and undefined metrics remain `None`.
+
+- [ ] **Step 5: Test `items.csv` as the sole item ledger**
+
+Fixed fields:
+
+```text
+cohort_id
+simfile_id
+status
+failure_reason
+warnings
+reference_native_event_count
+reference_common_event_count
+reference_ignored_event_count
+reference_unmapped_event_count
+reference_duplicate_collapsed_count
+prediction_native_event_count
+prediction_mapped_event_count
+prediction_unmapped_event_count
+prediction_mapping_coverage
+prediction_native_class_counts
+```
+
+Rules:
+
+- warnings sorted and `|`-joined;
+- native-class counts `class=count|class=count`;
+- missing prediction counts => empty fields;
+- mapping coverage = mapped/native only when native > 0;
+- native == 0 => empty coverage field (undefined, not `1.0`).
+
+Require:
 
 ```python
-assert row["prediction_mapping_coverage"] == "0.5"
+assert half_coverage_row["prediction_mapping_coverage"] == "0.5"
+assert empty_prediction_row["prediction_mapping_coverage"] == ""
 ```
 
-- [ ] **Step 7: Test `per_song.csv` and `per_class.csv` fields**
+- [ ] **Step 6: Test the reduced but Linear-compliant `per_song.csv` identity columns**
 
-`per_song.csv`, after identity prefix:
+Fixed fields:
 
 ```text
-simfile_id,tolerance_ms,mode,tp,fp,fn,precision,recall,f1,
-prediction_to_reference_ratio,median_abs_error_ms,p95_abs_error_ms,offset_ms,warnings
+cohort_id
+model_id
+model_lock_sha256
+prediction_map_version
+input_view_id
+scoring_version
+simfile_id
+tolerance_ms
+mode
+tp
+fp
+fn
+precision
+recall
+f1
+prediction_to_reference_ratio
+median_abs_error_ms
+p95_abs_error_ms
+offset_ms
+warnings
 ```
 
-`per_class.csv`, after identity prefix:
+Do not repeat reference/backend descriptor hashes here; those join through `cohort_id` to `summary.json`.
 
-```text
-scope,simfile_id,tolerance_ms,mode,common_class,tp,fp,fn,
-reference_support,prediction_support,precision,recall,f1
-```
-
-`scope` is `song` or `cohort`; cohort rows have empty `simfile_id`.
-
-Use a fixture where precision is one-half and lock:
+Use a half-precision fixture:
 
 ```python
 assert raw_50_row["precision"] == "0.5"
 ```
 
-Do not emit `0.500000` or a binary-float representation.
+- [ ] **Step 7: Test `per_class.csv` as song rows only**
 
-- [ ] **Step 8: Test the slim canonical event JSONL schema with a golden line**
+Fixed fields:
+
+```text
+cohort_id
+model_id
+model_lock_sha256
+prediction_map_version
+input_view_id
+scoring_version
+simfile_id
+tolerance_ms
+mode
+common_class
+tp
+fp
+fn
+reference_support
+prediction_support
+precision
+recall
+f1
+```
+
+No `scope` column and no cohort rows. Cohort class aggregates live only in `summary.json`.
+
+- [ ] **Step 8: Test slim, bounded canonical event JSONL with an exact golden line**
 
 Each line contains exactly:
 
@@ -934,9 +1147,7 @@ scored_prediction_time_sec
 timing_error_sec
 ```
 
-Use `canonical_json_bytes(..., trailing_newline=True)` per line. Empty diagnostics produce an empty file; no header record.
-
-For a raw matched kick at 0.5 s, require this exact canonical line to occur:
+For a raw matched kick at 0.5 seconds, require this exact canonical line:
 
 ```python
 expected = (
@@ -948,28 +1159,13 @@ expected = (
 assert expected in (tmp_path / "event_diagnostics.jsonl").read_bytes().splitlines()
 ```
 
-This golden locks `quantize_six()` + canonical decimal rendering and the smaller diagnostic identity shape.
+A result built with default `diagnostics_for=()` produces an empty JSONL file.
 
-- [ ] **Step 9: Test `summary.json` exact top-level contract**
+- [ ] **Step 9: Implement report payload builders from canonical result order**
 
-Require:
+Writers iterate result tuples in their existing order. They do not semantically resort items/song/class rows.
 
-```text
-schema
-identity
-tolerances_ms
-population
-items
-aggregates
-```
-
-All float-derived values inside items/aggregates are `Decimal` before `canonical_json_bytes()`. Parse with `strict_json_loads(..., require_canonical=True)` and assert a one-half metric becomes `Decimal("0.5")`; undefined metrics become `None`.
-
-- [ ] **Step 10: Implement the three CSV writers, JSONL writer, and summary renderer**
-
-Use explicit fixed `csv.DictWriter(fieldnames=...)` lists and stable row sorting. Build JSON/JSONL dictionaries only from JSON-safe scalars: ints/strings/bools/`None`/quantized `Decimal`.
-
-For score metrics, use a helper returning quantized values:
+Score metric helper:
 
 ```python
 def _metric(summary: ScoreSummary) -> dict[str, JsonValue]:
@@ -983,9 +1179,11 @@ def _metric(summary: ScoreSummary) -> dict[str, JsonValue]:
     }
 ```
 
-Apply the same boundary to ratios, milliseconds, offsets, F1 distributions, and event diagnostic times/errors.
+Apply `_report_decimal()` / `_csv_decimal()` to ratios, coverage, milliseconds, offsets, F1 distributions, and diagnostic times/errors.
 
-- [ ] **Step 11: Render Markdown from the same result and numeric tokens**
+Use `canonical_json_bytes()` for `summary.json` and each JSONL record; explicit `csv.DictWriter(fieldnames=...)` for CSVs.
+
+- [ ] **Step 10: Render Markdown from the same result/numeric tokens**
 
 Fixed sections:
 
@@ -999,21 +1197,25 @@ Fixed sections:
 ## Song Extremes
 ```
 
-Use the same canonical numeric token helper rather than independent float formatting. For `Song Extremes`, show up to five lowest/highest raw 50 ms successful songs sorted by `(f1, simfile_id)`. If none, write `No successful songs.`.
+Use the same canonical numeric token helper instead of independent float formatting. Song extremes show up to five lowest/highest raw-50ms successful songs sorted by `(f1, simfile_id)`; if none, write `No successful songs.`.
 
-- [ ] **Step 12: Write byte-determinism tests**
+- [ ] **Step 11: Write byte-determinism tests**
 
-Write the same result into `first/` and `second/`; compare all six file byte streams. Reverse input `CohortItem` order, rescore, and require the same bytes again.
+1. Write the same `CohortScoreResult` to `first/` and `second/`; compare all six byte streams.
+2. Reverse input item order, call `score_cohort()` again, and require identical six output files.
+3. Require JSON/JSONL canonical parsing succeeds.
 
-- [ ] **Step 13: Run report/cohort tests**
+This test now diagnoses scorer-order bugs in Task 4 rather than relying on writer sorting.
+
+- [ ] **Step 12: Run report/cohort tests**
 
 ```bash
 uv run pytest tests/benchmark/test_reports.py tests/benchmark/test_cohort_scoring.py -q
 ```
 
-Expected: PASS with no Python float reaching canonical JSON.
+Expected: PASS with no Python float reaching canonical JSON and no duplicated item/cohort-class data.
 
-- [ ] **Step 14: Commit**
+- [ ] **Step 13: Commit**
 
 ```bash
 git add src/benchmark/reports.py tests/benchmark/test_reports.py
@@ -1026,15 +1228,15 @@ git commit -m "feat: write deterministic cohort reports"
 
 **Files:**
 - Create: `tests/benchmark/test_cohort_scoring_acceptance.py`
-- Modify only if the test exposes a missing narrow contract: `src/benchmark/scorer_input.py`, `src/benchmark/cohort_scoring.py`, or `src/benchmark/reports.py`
+- Modify only if the test exposes a narrow missing contract: `src/benchmark/scorer_input.py`, `src/benchmark/cohort_scoring.py`, or `src/benchmark/reports.py`
 
 **Interfaces:**
-- Consumes: `map_reference_events()`, `reference_to_benchmark_events()`, `map_oaf_prediction()`, prediction artifact v2, `prediction_to_benchmark_events()`, `coverage_from_artifacts()`, `score_cohort()`, and `write_cohort_reports()`.
-- Produces: one persisted-event acceptance proof. Importing/starting `OafBackend`, Docker, or `WorkerProcess` is forbidden.
+- Consumes: existing reference mapping, prediction artifact v2, both scorer adapters, coverage derivation, `score_cohort()`, and report writer.
+- Produces: one persisted-artifact proof without importing/starting `OafBackend`, Docker, or `WorkerProcess`.
 
-- [ ] **Step 1: Build HPA-323-shaped reference events with exact common collapse**
+- [ ] **Step 1: Build HPA-323-shaped references with exact common collapse**
 
-Create simultaneous tom lanes `14` and `15` at 1.0 s plus a kick at 2.0 s. Run `map_reference_events()` and assert:
+Create simultaneous lanes `14` and `15` at 1.0 s plus kick `13` at 2.0 s. Run `map_reference_events()`:
 
 ```python
 assert len(reference_mapping.mapped_events) == 3
@@ -1042,75 +1244,91 @@ assert len(reference_mapping.common_events) == 2
 assert reference_mapping.diagnostics.duplicate_common_event_count == 1
 ```
 
-This proves duplicate-after-collapse behavior before scoring.
-
-- [ ] **Step 2: Convert the HPA-324 common references through the new adapter**
+- [ ] **Step 2: Convert common references through the new adapter**
 
 ```python
 reference_events = reference_to_benchmark_events(
     "7",
     reference_mapping.common_events,
 )
-assert [(item.time_sec, item.canonical_class) for item in reference_events] == [
-    (1.0, "tom"),
-    (2.0, "kick"),
+assert [(item.canonical_class, item.time_sec) for item in reference_events] == [
+    ("tom", 1.0),
+    ("kick", 2.0),
 ]
 ```
 
-- [ ] **Step 3: Build and round-trip a real-shaped OaF prediction artifact v2**
+- [ ] **Step 3: Round-trip a real-shaped OaF prediction artifact v2**
 
-Reuse the descriptor/audio/native-event style from `tests/benchmark/test_task_d_contract.py`. Include one `toms` event at 1.0 s, one `kick` at 2.0 s, and one `sticks` unmapped event.
+Use `NativePrediction`/descriptor fixtures matching `test_task_d_contract.py`, map with `map_oaf_prediction()`, render/read prediction artifact v2, then:
 
 ```python
-mapped_prediction, diagnostics = map_oaf_prediction(native_prediction)
-artifact = read_prediction_artifact(render_prediction_artifact(mapped_prediction))
 prediction_events = prediction_to_benchmark_events(artifact)
-
-assert diagnostics.unmapped == {"sticks": 1}
-assert [(item.time_sec, item.canonical_class) for item in prediction_events] == [
-    (1.0, "tom"),
-    (2.0, "kick"),
-]
 ```
 
-- [ ] **Step 4: Derive coverage from the same artifacts**
+Include one common tom and kick matching the references plus one unmapped native sticks event so coverage proves native vs mapped accounting.
+
+- [ ] **Step 4: Derive balanced coverage including duplicate collapse**
 
 ```python
 coverage = coverage_from_artifacts(reference_mapping, artifact)
-assert coverage.reference_native_event_count == 3
-assert coverage.reference_common_event_count == 2
-assert coverage.prediction_native_event_count == 3
-assert coverage.prediction_mapped_event_count == 2
-assert coverage.prediction_unmapped_event_count == 1
+assert coverage.reference_duplicate_collapsed_count == 1
+assert (
+    coverage.reference_native_event_count
+    == coverage.reference_common_event_count
+    + coverage.reference_duplicate_collapsed_count
+    + coverage.reference_ignored_event_count
+    + coverage.reference_unmapped_event_count
+)
+assert coverage.prediction_native_event_count == (
+    coverage.prediction_mapped_event_count + coverage.prediction_unmapped_event_count
+)
 ```
 
-- [ ] **Step 5: Score without invoking a backend**
+- [ ] **Step 5: Build one valid cohort item and identity from artifact metadata**
 
-Construct one `CohortItem(status="success", ...)`, call `score_cohort()`, and require raw 30/50/100 ms F1 `1.0` and aggregate counts `(2, 0, 0)`.
+Use `input_view_id` and `prediction_map_version` matching the scorer event metadata so the mixed-cohort guard is exercised on the success path.
 
-- [ ] **Step 6: Prove mapping/version identity affects report bytes without inference**
+- [ ] **Step 6: Request diagnostics for this fixture only**
 
-Score/write once with the normal `prediction_map_version`, then score/write the same persisted events with a deliberately different identity string such as `crux.prediction-map/test-v2`. Do not remap or transcribe. Require score counts equal but `summary.json` bytes differ and contain the changed identity.
+```python
+result = score_cohort(
+    identity,
+    (item,),
+    diagnostics_for=("7",),
+)
+assert result.event_diagnostics
+assert {row.simfile_id for row in result.event_diagnostics} == {"7"}
+```
 
-This is the rescoring/provenance proof: prediction inference is not rerun when score identity changes.
+Then rescore with default diagnostics and require `event_diagnostics == ()` while aggregate metrics are identical.
 
-- [ ] **Step 7: Assert canonical numeric report output**
+- [ ] **Step 7: Write and validate all reports**
 
-Parse `summary.json` with `strict_json_loads(..., require_canonical=True)`. Assert report floats are parsed as `Decimal`, not rejected, and the event diagnostics contain the canonical `0.5`/`1` style tokens where applicable.
+```python
+artifacts = write_cohort_reports(result, tmp_path / "reports")
+```
 
-- [ ] **Step 8: Assert no backend/runtime imports in the acceptance module**
+Require:
 
-Keep imports limited to domain artifacts/mappers/scorer/reports. Do not import `src.benchmark.backends.oaf`, `WorkerProcess`, or Docker helpers.
+- `summary.json` has identity/population/aggregates but no items;
+- `items.csv` includes duplicate-collapse coverage;
+- `per_song.csv` includes mandated score-row identity fields;
+- `per_class.csv` contains only song-scope rows;
+- diagnostics JSONL contains only `cohort_id` plus event evidence;
+- no backend/worker module is imported during the test.
 
-- [ ] **Step 9: Run focused acceptance**
+- [ ] **Step 8: Prove a mapping identity change rescoring path does not invoke inference**
+
+Construct a second `CohortIdentity` with a different `prediction_map_version` and corresponding copied prediction-event metadata, then rescore the already-persisted events. The test must remain entirely in mapping/artifact/scorer/report code.
+
+- [ ] **Step 9: Run acceptance suite**
 
 ```bash
 uv run pytest tests/benchmark/test_cohort_scoring_acceptance.py \
-  tests/benchmark/test_reports.py tests/benchmark/test_cohort_scoring.py \
-  tests/benchmark/test_scorer_input.py tests/benchmark/test_scoring.py -q
+  tests/benchmark/test_task_d_contract.py tests/benchmark/test_reference_set.py -q
 ```
 
-Expected: PASS with no inference/container work.
+Expected: PASS without Docker/backend startup.
 
 - [ ] **Step 10: Commit**
 
@@ -1121,12 +1339,24 @@ git commit -m "test: prove persisted cohort rescoring"
 
 ---
 
-## Task 7: Full verification and scope check
+## Task 7: Run CI-equivalent verification and freeze the HPA-326 handoff
 
 **Files:**
-- No intended production changes beyond Tasks 1-6.
+- Modify only if verification exposes a defect in the files already named by Tasks 1–6.
 
-- [ ] **Step 1: Run full tests**
+- [ ] **Step 1: Run focused HPA-325 tests**
+
+```bash
+uv run pytest tests/benchmark/test_scorer_input.py \
+  tests/benchmark/test_scoring.py \
+  tests/benchmark/test_cohort_scoring.py \
+  tests/benchmark/test_reports.py \
+  tests/benchmark/test_cohort_scoring_acceptance.py -q
+```
+
+Expected: PASS.
+
+- [ ] **Step 2: Run the full test suite**
 
 ```bash
 uv run pytest
@@ -1134,17 +1364,26 @@ uv run pytest
 
 Expected: PASS.
 
-- [ ] **Step 2: Run repository lint/format gates**
+- [ ] **Step 3: Run CI-equivalent Ruff checks**
 
 ```bash
-uv run ruff check src tests
+uv run ruff check .
 uv run ruff format --check src tests
-uv run pylint src/app src/cli
 ```
 
-Expected: PASS according to the repository's `CLAUDE.md` gates.
+Expected: PASS.
 
-- [ ] **Step 3: Check diff hygiene**
+- [ ] **Step 4: Run CI-equivalent Pylint across all source modules**
+
+```bash
+uv run pylint --errors-only --disable=E1120,E0401 src
+```
+
+Expected: no Pylint errors, including `src/benchmark/cohort_scoring.py`.
+
+Do not substitute `uv run pylint src/app src/cli`; that misses every new HPA-325 source file.
+
+- [ ] **Step 5: Check diff hygiene**
 
 ```bash
 git diff --check main...HEAD
@@ -1152,81 +1391,68 @@ git diff --check main...HEAD
 
 Expected: no whitespace errors.
 
-- [ ] **Step 4: Verify no forbidden architecture appeared**
-
-Inspect `git diff --stat main...HEAD` and imports. Confirm there is no:
-
-- CLI for HPA-325;
-- inference/backend runtime change;
-- run-manifest schema;
-- queue/retry/concurrency layer;
-- generic benchmark/report plugin framework;
-- Parquet/database layer;
-- copied SHA-256 validator;
-- copied percentile implementation;
-- custom float JSON renderer;
-- immutable publication layer;
-- compatibility wrapper for `ChartReport` / `write_reports`.
-
-- [ ] **Step 5: Verify report traceability and compact diagnostics**
-
-Check one generated fixture report and confirm:
-
-- `summary.json` contains full identity once;
-- `items.csv`, `per_song.csv`, and `per_class.csv` contain the full traceability prefix;
-- `event_diagnostics.jsonl` contains only `cohort_id` plus event fields;
-- every float-derived JSON/JSONL number came through `quantize_six()`;
-- CSV numeric cells use the same canonical decimal tokens;
-- undefined metrics remain JSON null / empty CSV cells.
-
-- [ ] **Step 6: Commit any verification-only fixture correction if needed**
-
-Only if a deterministic expected fixture required correction:
+- [ ] **Step 6: Run final contract-focused regressions**
 
 ```bash
-git add tests
- git commit -m "test: align cohort report fixtures"
+uv run pytest \
+  tests/benchmark/test_task_d_contract.py \
+  tests/benchmark/test_reference_set.py \
+  tests/benchmark/test_prediction_artifact.py \
+  tests/benchmark/test_scorer_input.py \
+  tests/benchmark/test_cohort_scoring.py \
+  tests/benchmark/test_reports.py \
+  tests/benchmark/test_cohort_scoring_acceptance.py -q
 ```
 
-If no correction is needed, do not create an empty commit.
+Expected: PASS.
+
+- [ ] **Step 7: Verify the HPA-326 handoff contract**
+
+Confirm by tests/source inspection:
+
+```text
+HPA-326 provides:
+- CohortIdentity
+- one CohortItem per reference/run row
+- persisted reference/prediction artifacts used to derive coverage/events
+
+HPA-325 provides:
+- score_cohort(identity, items, diagnostics_for=selected_ids)
+- write_cohort_reports(result, output_dir)
+
+Broad HPA-326 baseline rule:
+- call score_cohort() with default diagnostics_for=()
+- classify valid resumed prediction artifacts as success for scoring
+- retain detailed runtime failure text in HPA-326's run manifest
+- map failures to closed HPA-325 CohortFailureReason categories
+```
+
+No queue, runner, retry, or manifest loader belongs in HPA-325.
+
+- [ ] **Step 8: Commit only verification-driven fixes if any**
+
+Use a focused conventional commit describing the actual fix. Do not create a no-op verification commit.
 
 ---
 
-## Self-Review
+## Completion Checklist
 
-### Spec coverage
-
-- Persisted prediction bridge: reused from HPA-423; not rebuilt.
-- Reference common projection: reused from HPA-324 with one scorer adapter.
-- Matcher/alignment: unchanged; adversarial behavior pinned first.
-- 30/50/100 ms and raw/aligned: explicit result matrix.
-- Per-song/per-class/micro/song-macro/class-macro/F1 distribution: covered.
-- Native/mapped/unmapped coverage: derived from persisted artifacts.
-- Full failed/skipped/quarantined population: retained in item ledger and summary.
-- Matched/FP/FN evidence: compact deterministic JSONL with original/scored prediction times.
-- Identity: full once in summary and repeated on durable CSV score/ledger rows; diagnostics join by `cohort_id`.
-- SHA validation: shared `require_sha256()`.
-- Percentiles: shared `scoring.percentile()` after a public-name promotion.
-- Numeric encoding: shared `quantize_six()` + `canonical_json_bytes()`; no float JSON path.
-- Determinism: golden JSONL/CSV numeric tokens plus byte-for-byte rerender tests.
-- Rescoring without inference: persisted-artifact acceptance proof.
-- HPA-326 runner/run-manifest work: deferred.
-- HPA-562 paired comparisons: deferred.
-
-### Placeholder scan
-
-No TBD/TODO or implementation placeholders remain. Each code-producing task has explicit interfaces, failing tests, implementation shape, verification commands, and commit boundaries.
-
-### Type consistency
-
-- `CohortItem.prediction_events` is `tuple[BenchmarkEvent, ...] | None`; empty tuple means a successful zero-event prediction, `None` means no valid prediction artifact for a non-success row.
-- `CohortCoverage` prediction counts follow the same distinction.
-- Domain score values remain Python floats/`None`; conversion to `Decimal` happens only at report rendering.
-- `ScoreSummary` keeps its existing `None` semantics.
-- Event diagnostics keep original and scored prediction times as separate domain floats until the report boundary.
-
-## Execution Handoff
-
-Plan complete at `docs/superpowers/plans/2026-08-12-hpa-325-cohort-scoring.md`.
-
-Recommended implementation path: use `superpowers:subagent-driven-development` task-by-task, with review after each task. Do not start HPA-326 corpus inference until the HPA-325 scorer/report contract is implemented and verified.
+- [ ] Existing matcher/alignment semantics remain unchanged.
+- [ ] Reference `Decimal` time converts intentionally to scorer `float`.
+- [ ] HPA-423 persisted prediction scorer bridge remains unchanged and covered.
+- [ ] `CohortFailureReason` is closed and grouped counts cannot split on free-form details.
+- [ ] `require_sha256()` is called directly; no copied hash validator/wrapper.
+- [ ] Reference coverage carries duplicate-collapse count and balances exactly.
+- [ ] Prediction coverage balances exactly; 0/0 mapping coverage is undefined.
+- [ ] Prediction event input-view/map identities must match the cohort.
+- [ ] Caller item order cannot alter result/report ordering.
+- [ ] Diagnostics are opt-in and broad-corpus default is empty.
+- [ ] Per-class song rows derive from the same `ScoreResult` as song totals.
+- [ ] Public `scoring.percentile()` retains the existing percentile convention.
+- [ ] `summary.json` contains cohort facts only; item ledger lives only in `items.csv`.
+- [ ] Cohort per-class aggregate rows live only in `summary.json`; `per_class.csv` is song scope only.
+- [ ] `items.csv`/diagnostics use `cohort_id` only; score CSVs carry only the explicitly required score-row identity subset.
+- [ ] All float-derived persisted values use `quantize_six()` + canonical decimal rendering.
+- [ ] Exact JSONL and CSV numeric goldens lock encoding.
+- [ ] No CLI, run manifest, queue, pipeline framework, Parquet/database, or immutable report publisher is introduced.
+- [ ] Full tests, CI-equivalent Ruff, CI-equivalent all-`src` Pylint, and diff hygiene pass before implementation is called complete.
