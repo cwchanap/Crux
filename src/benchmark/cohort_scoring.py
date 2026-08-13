@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, get_args
 
 from src.benchmark.backend_identity import require_sha256
@@ -16,6 +16,7 @@ from src.benchmark.scoring import ScoreResult, score_events_with_alignment
 SCORING_VERSION = "crux.single-cohort-scoring/v1"
 DEFAULT_TOLERANCES_MS = (30, 50, 100)
 SCORE_MODES = ("raw", "aligned")
+_ORIGINAL_PREDICTION_TIME_METADATA_KEY = "_crux_original_prediction_time_sec"
 
 CohortExecutionStatus = Literal["success", "failed", "skipped", "quarantined"]
 CohortFailureReason = Literal[
@@ -339,10 +340,11 @@ def _score_success_items(
         if item.status != "success" or item.prediction_events is None:
             continue
 
+        prediction_events = _prediction_events_with_provenance(item.prediction_events)
         for tolerance_ms in sorted(tolerances_ms):
             aligned = score_events_with_alignment(
                 list(item.reference_events),
-                list(item.prediction_events),
+                list(prediction_events),
                 tolerance_sec=tolerance_ms / 1000.0,
             )
             for mode in SCORE_MODES:
@@ -411,7 +413,7 @@ def _event_diagnostics(
     diagnostics: list[EventDiagnostic] = []
 
     for match in score_result.matches:
-        prediction_time = _original_prediction_time(match.prediction, mode, score_result)
+        prediction_time = _original_prediction_time(match.prediction, mode)
         diagnostics.append(
             EventDiagnostic(
                 simfile_id=item.simfile_id,
@@ -427,7 +429,7 @@ def _event_diagnostics(
         )
 
     for event in score_result.unmatched_predictions:
-        prediction_time = _original_prediction_time(event, mode, score_result)
+        prediction_time = _original_prediction_time(event, mode)
         diagnostics.append(
             EventDiagnostic(
                 simfile_id=item.simfile_id,
@@ -463,11 +465,28 @@ def _event_diagnostics(
 def _original_prediction_time(
     event: BenchmarkEvent,
     mode: ScoreMode,
-    score_result: ScoreResult,
 ) -> float:
     if mode == "raw":
         return event.time_sec
-    return event.time_sec - score_result.summary.offset_sec
+    provenance = event.metadata.get(_ORIGINAL_PREDICTION_TIME_METADATA_KEY)
+    if not isinstance(provenance, (int, float)) or isinstance(provenance, bool):
+        raise ValueError("aligned prediction is missing original time provenance")
+    return float(provenance)
+
+
+def _prediction_events_with_provenance(
+    events: tuple[BenchmarkEvent, ...],
+) -> tuple[BenchmarkEvent, ...]:
+    return tuple(
+        replace(
+            event,
+            metadata={
+                **event.metadata,
+                _ORIGINAL_PREDICTION_TIME_METADATA_KEY: event.time_sec,
+            },
+        )
+        for event in events
+    )
 
 
 def _song_score_sort_key(score: SongScore) -> tuple[str, int, int]:

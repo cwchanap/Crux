@@ -564,3 +564,20 @@ def test_score_success_items_materializes_only_selected_song_diagnostics() -> No
     assert aligned.prediction_time_sec == pytest.approx(1.1)
     assert aligned.scored_prediction_time_sec == pytest.approx(1.0)
     assert aligned.timing_error_sec == pytest.approx(0.0)
+
+
+def test_aligned_diagnostics_preserve_exact_binary64_prediction_time() -> None:
+    success = scoring_item(
+        "1",
+        (scoring_event("1", 0.3, "kick", "ground_truth"),),
+        (scoring_event("1", 0.1, "kick", "prediction"),),
+    )
+
+    _, diagnostics = _score_success_items((success,), (50,), frozenset({"1"}))
+
+    aligned = next(
+        diagnostic
+        for diagnostic in diagnostics
+        if diagnostic.mode == "aligned" and diagnostic.outcome == "matched"
+    )
+    assert aligned.prediction_time_sec == 0.1
