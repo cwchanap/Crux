@@ -82,6 +82,39 @@ def test_matching_maximizes_true_positives_for_dense_hits():
     assert result.summary.false_negatives == 0
 
 
+def test_simultaneous_same_class_hits_match_one_to_one() -> None:
+    result = score_events(
+        [event(1.0, "kick", "gt_a"), event(1.0, "kick", "gt_b")],
+        [event(1.0, "kick", "pred_a"), event(1.0, "kick", "pred_b")],
+        0.03,
+    )
+    assert result.summary.true_positives == 2
+    assert result.summary.false_positives == 0
+    assert result.summary.false_negatives == 0
+
+
+def test_empty_prediction_song_counts_all_references_as_false_negatives() -> None:
+    result = score_events(
+        [event(1.0, "kick", "gt"), event(2.0, "snare", "gt")],
+        [],
+        0.05,
+    )
+    assert result.summary.true_positives == 0
+    assert result.summary.false_positives == 0
+    assert result.summary.false_negatives == 2
+    assert result.summary.f1 == 0.0
+
+
+def test_class_present_on_only_one_side_is_retained() -> None:
+    result = score_events(
+        [event(1.0, "kick", "gt")],
+        [event(1.0, "snare", "pred")],
+        0.05,
+    )
+    assert [item.canonical_class for item in result.unmatched_ground_truth] == ["kick"]
+    assert [item.canonical_class for item in result.unmatched_predictions] == ["snare"]
+
+
 def test_alignment_applies_single_global_offset():
     ground_truth = [event(1.0, "kick", "ground_truth"), event(2.0, "snare", "ground_truth")]
     predictions = [event(1.1, "kick", "prediction"), event(2.1, "snare", "prediction")]

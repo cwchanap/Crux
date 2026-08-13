@@ -8,6 +8,7 @@ from src.benchmark.prediction_artifact import (
     PredictionArtifact,
     read_prediction_artifact,
 )
+from src.benchmark.reference_set import CommonReferenceEvent
 
 
 def prediction_to_benchmark_events(artifact: PredictionArtifact) -> tuple[BenchmarkEvent, ...]:
@@ -24,6 +25,24 @@ def prediction_to_benchmark_events(artifact: PredictionArtifact) -> tuple[Benchm
 
 def read_scorer_events(content: bytes) -> tuple[BenchmarkEvent, ...]:
     return prediction_to_benchmark_events(read_prediction_artifact(content))
+
+
+def reference_to_benchmark_events(
+    simfile_id: str,
+    common_events: tuple[CommonReferenceEvent, ...],
+) -> tuple[BenchmarkEvent, ...]:
+    if not isinstance(simfile_id, str) or not simfile_id:
+        raise ValueError("simfile_id must be a nonempty string")
+    return tuple(
+        BenchmarkEvent(
+            chart_id=simfile_id,
+            time_sec=float(event.canonical_audio_time),
+            canonical_class=event.common_class,
+            source="ground_truth",
+            metadata={},
+        )
+        for event in common_events
+    )
 
 
 def _benchmark_event(
@@ -50,4 +69,8 @@ def _benchmark_event(
     )
 
 
-__all__ = ["prediction_to_benchmark_events", "read_scorer_events"]
+__all__ = [
+    "prediction_to_benchmark_events",
+    "read_scorer_events",
+    "reference_to_benchmark_events",
+]
