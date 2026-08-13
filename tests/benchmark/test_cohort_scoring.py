@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import struct
+from decimal import Decimal
 from pathlib import Path
 from typing import get_args
 
@@ -39,6 +40,7 @@ from src.benchmark.reference_set import map_reference_events
 from src.benchmark.reference_timing import NativeReferenceEvent
 from src.benchmark.scorer_input import (
     prediction_to_benchmark_events,
+    reference_to_benchmark_events,
 )
 from src.benchmark.taxonomy import (
     DTX_LANE_MAP_VERSION,
@@ -662,6 +664,50 @@ def test_score_cohort_rejects_forged_artifact_identity_for_empty_prediction() ->
 
     with pytest.raises(ValueError, match="artifact"):
         score_cohort(identity(), (forged,), tolerances_ms=(50,))
+
+
+def test_score_cohort_rejects_prediction_projection_substitution(tmp_path: Path) -> None:
+    artifact = _artifact_for_song(tmp_path, "42")
+    reference = reference_mapping()
+    valid = cohort_scoring.cohort_item_from_artifacts(identity(), "42", reference, artifact)
+    tampered_prediction = dataclasses.replace(artifact.prediction, events=())
+    tampered_artifact = dataclasses.replace(artifact, prediction=tampered_prediction)
+    assert tampered_artifact.prediction.events == ()
+    assert tampered_artifact.content == artifact.content
+    assert tampered_artifact.event_count == artifact.event_count == 2
+    assert tampered_artifact.prefix_sha256 == artifact.prefix_sha256
+    assert tampered_artifact.artifact_sha256 == artifact.artifact_sha256
+    tampered = dataclasses.replace(
+        valid,
+        prediction_events=(),
+        coverage=coverage_from_artifacts(reference, tampered_artifact),
+        prediction_artifact=tampered_artifact,
+    )
+
+    with pytest.raises(ValueError, match="content|canonical|artifact"):
+        score_cohort(identity(), (tampered,), tolerances_ms=(50,))
+
+
+def test_score_cohort_rejects_reference_common_projection_substitution(tmp_path: Path) -> None:
+    artifact = _artifact_for_song(tmp_path, "42")
+    reference = reference_mapping()
+    valid = cohort_scoring.cohort_item_from_artifacts(identity(), "42", reference, artifact)
+    forged_common = dataclasses.replace(
+        reference.common_events[0],
+        canonical_audio_time=Decimal("9.000000"),
+    )
+    tampered_reference = dataclasses.replace(
+        reference,
+        common_events=(forged_common, *reference.common_events[1:]),
+    )
+    tampered = dataclasses.replace(
+        valid,
+        reference_events=reference_to_benchmark_events("42", tampered_reference.common_events),
+        reference_artifact=tampered_reference,
+    )
+
+    with pytest.raises(ValueError, match="projection|common_events|reference"):
+        score_cohort(identity(), (tampered,), tolerances_ms=(50,))
 
 
 def scoring_item(

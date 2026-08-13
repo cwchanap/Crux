@@ -11,8 +11,11 @@ from typing import Literal, get_args
 from src.benchmark import scoring
 from src.benchmark.backend_identity import OAF_BACKEND_ID, require_sha256
 from src.benchmark.models import BenchmarkEvent, ScoreSummary
-from src.benchmark.prediction_artifact import PredictionArtifact
-from src.benchmark.reference_set import ReferenceMappingResult
+from src.benchmark.prediction_artifact import PredictionArtifact, read_prediction_artifact
+from src.benchmark.reference_set import (
+    ReferenceMappingResult,
+    project_common_reference_events,
+)
 from src.benchmark.scorer_input import (
     prediction_to_benchmark_events,
     reference_to_benchmark_events,
@@ -487,10 +490,23 @@ def _validate_success_artifact_binding(identity: CohortIdentity, item: CohortIte
     if not isinstance(item.prediction_artifact, PredictionArtifact):
         raise ValueError("success item requires prediction artifact evidence")
 
+    canonical_prediction = read_prediction_artifact(item.prediction_artifact.content)
+    if canonical_prediction != item.prediction_artifact:
+        raise ValueError("prediction artifact fields do not match canonical content")
+
+    projected_common_events = project_common_reference_events(item.reference_artifact.mapped_events)
+    if item.reference_artifact.common_events != projected_common_events:
+        raise ValueError("reference common_events do not match mapped event projection")
+    expected_duplicate_count = sum(
+        len(event.source_events) - 1 for event in projected_common_events
+    )
+    if item.reference_artifact.diagnostics.duplicate_common_event_count != expected_duplicate_count:
+        raise ValueError("reference duplicate diagnostics do not match mapped event projection")
+
     expected_identity = _artifact_identity_from_artifacts(
         item.simfile_id,
         item.reference_artifact,
-        item.prediction_artifact,
+        canonical_prediction,
     )
     if item.artifact_identity != expected_identity:
         raise ValueError("artifact_identity does not match persisted artifact evidence")
@@ -504,11 +520,11 @@ def _validate_success_artifact_binding(identity: CohortIdentity, item: CohortIte
     if item.reference_events != expected_reference_events:
         raise ValueError("reference_events do not match reference artifact evidence")
 
-    expected_prediction_events = prediction_to_benchmark_events(item.prediction_artifact)
+    expected_prediction_events = prediction_to_benchmark_events(canonical_prediction)
     if item.prediction_events != expected_prediction_events:
         raise ValueError("prediction_events do not match prediction artifact evidence")
 
-    expected_coverage = coverage_from_artifacts(item.reference_artifact, item.prediction_artifact)
+    expected_coverage = coverage_from_artifacts(item.reference_artifact, canonical_prediction)
     if item.coverage != expected_coverage:
         raise ValueError("coverage does not match persisted artifact evidence")
 
