@@ -5,8 +5,10 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
+from statistics import fmean, median
 from typing import Literal, get_args
 
+from src.benchmark import scoring
 from src.benchmark.backend_identity import require_sha256
 from src.benchmark.models import BenchmarkEvent, ScoreSummary
 from src.benchmark.prediction_artifact import PredictionArtifact
@@ -48,6 +50,58 @@ class SongScore:
     prediction_to_reference_ratio: float
     per_class: tuple[ClassScore, ...]
     warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PopulationSummary:
+    total_count: int
+    success_count: int
+    failed_count: int
+    skipped_count: int
+    quarantined_count: int
+    reason_counts: tuple[tuple[CohortFailureReason, int], ...]
+
+
+@dataclass(frozen=True)
+class F1Distribution:
+    minimum: float | None
+    p10: float | None
+    p25: float | None
+    median: float | None
+    p75: float | None
+    p90: float | None
+    maximum: float | None
+
+
+# pylint: disable=too-many-instance-attributes
+@dataclass(frozen=True)
+class CohortAggregate:
+    tolerance_ms: int
+    mode: ScoreMode
+    event_micro: ScoreSummary
+    song_macro_f1: float | None
+    class_macro_f1: float | None
+    song_f1_distribution: F1Distribution
+    per_class: tuple[ClassScore, ...]
+    successful_song_count: int
+
+
+# pylint: enable=too-many-instance-attributes
+
+
+# pylint: disable=too-many-instance-attributes
+@dataclass(frozen=True)
+class CohortScoreResult:
+    identity: CohortIdentity
+    tolerances_ms: tuple[int, ...]
+    items: tuple[CohortItem, ...]
+    song_scores: tuple[SongScore, ...]
+    event_diagnostics: tuple[EventDiagnostic, ...]
+    population: PopulationSummary
+    aggregates: tuple[CohortAggregate, ...]
+
+
+# pylint: enable=too-many-instance-attributes
 
 
 # pylint: disable=too-many-instance-attributes
@@ -327,6 +381,180 @@ def _validate_coverage(
             raise ValueError("prediction native class counts must be nonnegative integers")
 
 
+def score_cohort(
+    identity: CohortIdentity,
+    items: tuple[CohortItem, ...],
+    tolerances_ms: tuple[int, ...] = DEFAULT_TOLERANCES_MS,
+    diagnostics_for: tuple[str, ...] = (),
+) -> CohortScoreResult:
+    """Validate, score, and aggregate a cohort in canonical order."""
+    if not isinstance(identity, CohortIdentity):
+        raise TypeError("identity must be CohortIdentity")
+
+    canonical_tolerances = _validate_tolerances(tolerances_ms)
+    canonical_items = tuple(items)
+    validate_cohort_items(identity, canonical_items)
+    canonical_diagnostics = _validate_diagnostics_for(diagnostics_for, canonical_items)
+    canonical_items = tuple(sorted(canonical_items, key=lambda item: item.simfile_id))
+
+    song_scores, event_diagnostics = _score_success_items(
+        canonical_items,
+        canonical_tolerances,
+        frozenset(canonical_diagnostics),
+    )
+    population = _population_summary(canonical_items)
+    aggregates = _cohort_aggregates(song_scores, canonical_tolerances)
+    return CohortScoreResult(
+        identity=identity,
+        tolerances_ms=canonical_tolerances,
+        items=canonical_items,
+        song_scores=song_scores,
+        event_diagnostics=event_diagnostics,
+        population=population,
+        aggregates=aggregates,
+    )
+
+
+def _validate_tolerances(tolerances_ms: tuple[int, ...]) -> tuple[int, ...]:
+    if not isinstance(tolerances_ms, tuple):
+        raise TypeError("tolerances_ms must be a tuple")
+    if not tolerances_ms:
+        raise ValueError("tolerances_ms must not be empty")
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in tolerances_ms):
+        raise ValueError("tolerances_ms must contain positive integers")
+    if any(value <= 0 for value in tolerances_ms):
+        raise ValueError("tolerances_ms must contain positive integers")
+    if len(set(tolerances_ms)) != len(tolerances_ms):
+        raise ValueError("tolerances_ms must contain unique values")
+    if tolerances_ms != tuple(sorted(tolerances_ms)):
+        raise ValueError("tolerances_ms must be sorted")
+    return tolerances_ms
+
+
+def _validate_diagnostics_for(
+    diagnostics_for: tuple[str, ...],
+    items: tuple[CohortItem, ...],
+) -> tuple[str, ...]:
+    if not isinstance(diagnostics_for, tuple):
+        raise TypeError("diagnostics_for must be a tuple")
+    if any(not isinstance(simfile_id, str) for simfile_id in diagnostics_for):
+        raise ValueError("diagnostics_for IDs must be strings")
+    if any(not simfile_id for simfile_id in diagnostics_for):
+        raise ValueError("diagnostics_for IDs must be nonempty")
+    if len(set(diagnostics_for)) != len(diagnostics_for):
+        raise ValueError("diagnostics_for IDs must be unique")
+
+    by_id = {item.simfile_id: item for item in items}
+    for simfile_id in diagnostics_for:
+        item = by_id.get(simfile_id)
+        if item is None:
+            raise ValueError("diagnostics_for ID names an input item")
+        if item.status != "success":
+            raise ValueError("diagnostics_for IDs must name successful items")
+    return diagnostics_for
+
+
+def _population_summary(items: tuple[CohortItem, ...]) -> PopulationSummary:
+    status_counts = Counter(item.status for item in items)
+    reason_counts = Counter(
+        item.failure_reason for item in items if item.failure_reason is not None
+    )
+    return PopulationSummary(
+        total_count=len(items),
+        success_count=status_counts["success"],
+        failed_count=status_counts["failed"],
+        skipped_count=status_counts["skipped"],
+        quarantined_count=status_counts["quarantined"],
+        reason_counts=tuple(sorted(reason_counts.items())),
+    )
+
+
+def _cohort_aggregates(
+    song_scores: tuple[SongScore, ...],
+    tolerances_ms: tuple[int, ...],
+) -> tuple[CohortAggregate, ...]:
+    aggregates: list[CohortAggregate] = []
+    for tolerance_ms in tolerances_ms:
+        for mode in SCORE_MODES:
+            rows = tuple(
+                row for row in song_scores if row.tolerance_ms == tolerance_ms and row.mode == mode
+            )
+            event_micro = ScoreSummary(
+                true_positives=sum(row.summary.true_positives for row in rows),
+                false_positives=sum(row.summary.false_positives for row in rows),
+                false_negatives=sum(row.summary.false_negatives for row in rows),
+            )
+            song_f1_values = tuple(row.summary.f1 for row in rows)
+            per_class = _aggregate_class_scores(rows)
+            aggregates.append(
+                CohortAggregate(
+                    tolerance_ms=tolerance_ms,
+                    mode=mode,
+                    event_micro=event_micro,
+                    song_macro_f1=_mean_f1(song_f1_values),
+                    class_macro_f1=_mean_f1(tuple(row.summary.f1 for row in per_class)),
+                    song_f1_distribution=_f1_distribution(song_f1_values),
+                    per_class=per_class,
+                    successful_song_count=len(rows),
+                )
+            )
+    return tuple(aggregates)
+
+
+def _mean_f1(values: tuple[float | None, ...]) -> float | None:
+    scored = tuple(value for value in values if value is not None)
+    return fmean(scored) if scored else None
+
+
+def _f1_distribution(values: tuple[float | None, ...]) -> F1Distribution:
+    scored = tuple(sorted(value for value in values if value is not None))
+    if not scored:
+        return F1Distribution(None, None, None, None, None, None, None)
+    scored_list = list(scored)
+    return F1Distribution(
+        minimum=scored[0],
+        p10=scoring.percentile(scored_list, 0.10),
+        p25=scoring.percentile(scored_list, 0.25),
+        median=median(scored),
+        p75=scoring.percentile(scored_list, 0.75),
+        p90=scoring.percentile(scored_list, 0.90),
+        maximum=scored[-1],
+    )
+
+
+def _aggregate_class_scores(rows: tuple[SongScore, ...]) -> tuple[ClassScore, ...]:
+    totals: dict[str, tuple[int, int, int, int, int]] = {}
+    for row in rows:
+        for class_row in row.per_class:
+            previous = totals.get(class_row.common_class, (0, 0, 0, 0, 0))
+            totals[class_row.common_class] = (
+                previous[0] + class_row.summary.true_positives,
+                previous[1] + class_row.summary.false_positives,
+                previous[2] + class_row.summary.false_negatives,
+                previous[3] + class_row.reference_support,
+                previous[4] + class_row.prediction_support,
+            )
+
+    aggregate_rows: list[ClassScore] = []
+    for common_class in sorted(totals):
+        true_positives, false_positives, false_negatives, reference_support, prediction_support = (
+            totals[common_class]
+        )
+        aggregate_rows.append(
+            ClassScore(
+                common_class=common_class,
+                summary=ScoreSummary(
+                    true_positives=true_positives,
+                    false_positives=false_positives,
+                    false_negatives=false_negatives,
+                ),
+                reference_support=reference_support,
+                prediction_support=prediction_support,
+            )
+        )
+    return tuple(aggregate_rows)
+
+
 def _score_success_items(
     items: tuple[CohortItem, ...],
     tolerances_ms: tuple[int, ...],
@@ -521,11 +749,16 @@ __all__ = [
     "ScoreMode",
     "ClassScore",
     "SongScore",
+    "PopulationSummary",
+    "F1Distribution",
+    "CohortAggregate",
+    "CohortScoreResult",
     "EventDiagnostic",
     "CohortIdentity",
     "CohortCoverage",
     "CohortItem",
     "coverage_from_artifacts",
     "validate_cohort_items",
+    "score_cohort",
     "_score_success_items",
 ]

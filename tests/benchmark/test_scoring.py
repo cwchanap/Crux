@@ -4,6 +4,7 @@ import pytest
 from src.benchmark.models import BenchmarkEvent
 from src.benchmark.scoring import (
     _alignment_histogram,
+    percentile,
     score_events,
     score_events_with_alignment,
 )
@@ -11,6 +12,15 @@ from src.benchmark.scoring import (
 
 def event(time_sec: float, canonical_class: str, source: str) -> BenchmarkEvent:
     return BenchmarkEvent("song", time_sec, canonical_class, source)
+
+
+def test_percentile_uses_existing_upper_nearest_rank_convention() -> None:
+    values = [0.0, 0.25, 0.5, 0.75, 1.0]
+
+    assert percentile(values, 0.10) == 0.25
+    assert percentile(values, 0.25) == 0.25
+    assert percentile(values, 0.75) == 0.75
+    assert percentile(values, 0.90) == 1.0
 
 
 def test_scores_exact_match():

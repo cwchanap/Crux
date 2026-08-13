@@ -21,12 +21,14 @@ from src.benchmark.cohort_scoring import (
     CohortCoverage,
     CohortIdentity,
     CohortItem,
+    F1Distribution,
     _score_success_items,
     coverage_from_artifacts,
+    score_cohort,
     validate_cohort_items,
 )
 from src.benchmark.mapping import map_oaf_prediction
-from src.benchmark.models import BenchmarkEvent
+from src.benchmark.models import BenchmarkEvent, ScoreSummary
 from src.benchmark.prediction_artifact import (
     PredictionArtifact,
     read_prediction_artifact,
@@ -430,6 +432,32 @@ def scoring_event(
     )
 
 
+def cohort_scoring_item(
+    simfile_id: str,
+    reference_events: tuple[BenchmarkEvent, ...],
+    prediction_events: tuple[BenchmarkEvent, ...],
+    *,
+    warnings: tuple[str, ...] = (),
+) -> CohortItem:
+    prediction_events = tuple(
+        dataclasses.replace(
+            event,
+            metadata={
+                **event.metadata,
+                "input_view_id": identity().input_view_id,
+                "prediction_map_version": identity().prediction_map_version,
+            },
+        )
+        for event in prediction_events
+    )
+    return scoring_item(
+        simfile_id,
+        reference_events,
+        prediction_events,
+        warnings=warnings,
+    )
+
+
 def test_score_success_items_uses_fixed_tolerance_mode_matrix() -> None:
     success = scoring_item(
         "1",
@@ -581,3 +609,282 @@ def test_aligned_diagnostics_preserve_exact_binary64_prediction_time() -> None:
         if diagnostic.mode == "aligned" and diagnostic.outcome == "matched"
     )
     assert aligned.prediction_time_sec == 0.1
+
+
+def test_score_cohort_canonicalizes_items_and_song_rows() -> None:
+    item_1 = cohort_scoring_item(
+        "1",
+        (scoring_event("1", 1.0, "kick", "ground_truth"),),
+        (scoring_event("1", 1.0, "kick", "prediction"),),
+    )
+    item_2 = cohort_scoring_item(
+        "2",
+        (scoring_event("2", 1.0, "snare", "ground_truth"),),
+        (scoring_event("2", 1.0, "snare", "prediction"),),
+    )
+
+    result = score_cohort(identity(), (item_2, item_1), tolerances_ms=(50, 100))
+
+    assert [item.simfile_id for item in result.items] == ["1", "2"]
+    assert [(row.simfile_id, row.tolerance_ms, row.mode) for row in result.song_scores] == [
+        ("1", 50, "raw"),
+        ("1", 50, "aligned"),
+        ("1", 100, "raw"),
+        ("1", 100, "aligned"),
+        ("2", 50, "raw"),
+        ("2", 50, "aligned"),
+        ("2", 100, "raw"),
+        ("2", 100, "aligned"),
+    ]
+    assert result.event_diagnostics == ()
+    assert result.tolerances_ms == (50, 100)
+
+
+@pytest.mark.parametrize(
+    ("tolerances_ms", "message"),
+    [
+        ((0,), "positive"),
+        ((50, 50), "unique"),
+        ((100, 50), "sorted"),
+    ],
+)
+def test_score_cohort_rejects_invalid_tolerances(
+    tolerances_ms: tuple[int, ...], message: str
+) -> None:
+    item_1 = cohort_scoring_item(
+        "1",
+        (scoring_event("1", 1.0, "kick", "ground_truth"),),
+        (scoring_event("1", 1.0, "kick", "prediction"),),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        score_cohort(identity(), (item_1,), tolerances_ms=tolerances_ms)
+
+
+def test_score_cohort_rejects_invalid_diagnostics_requests() -> None:
+    success = cohort_scoring_item(
+        "1",
+        (scoring_event("1", 1.0, "kick", "ground_truth"),),
+        (scoring_event("1", 1.0, "kick", "prediction"),),
+    )
+    failed = item(
+        simfile_id="2",
+        status="failed",
+        prediction_events=None,
+        failure_reason="inference_failed",
+    )
+
+    with pytest.raises(ValueError, match="unique"):
+        score_cohort(identity(), (success,), diagnostics_for=("1", "1"))
+    with pytest.raises(ValueError, match="nonempty"):
+        score_cohort(identity(), (success,), diagnostics_for=("",))
+    with pytest.raises(ValueError, match="successful"):
+        score_cohort(identity(), (success, failed), diagnostics_for=("2",))
+    with pytest.raises(ValueError, match="names an input item"):
+        score_cohort(identity(), (success,), diagnostics_for=("missing",))
+
+
+def test_score_cohort_materializes_diagnostics_only_for_requested_successes() -> None:
+    success_1 = cohort_scoring_item(
+        "1",
+        (scoring_event("1", 1.0, "kick", "ground_truth"),),
+        (scoring_event("1", 1.1, "kick", "prediction"),),
+    )
+    success_2 = cohort_scoring_item(
+        "2",
+        (scoring_event("2", 1.0, "snare", "ground_truth"),),
+        (scoring_event("2", 1.1, "snare", "prediction"),),
+    )
+
+    result = score_cohort(
+        identity(), (success_2, success_1), tolerances_ms=(30,), diagnostics_for=("2",)
+    )
+
+    assert result.event_diagnostics
+    assert {row.simfile_id for row in result.event_diagnostics} == {"2"}
+
+
+def test_score_cohort_retains_full_population_and_closed_reason_counts() -> None:
+    successful = cohort_scoring_item(
+        "1",
+        (scoring_event("1", 1.0, "kick", "ground_truth"),),
+        (scoring_event("1", 1.0, "kick", "prediction"),),
+        warnings=("warning-only",),
+    )
+    failed = item(
+        simfile_id="2",
+        status="failed",
+        prediction_events=None,
+        failure_reason="inference_failed",
+        coverage=no_prediction_coverage(),
+    )
+    skipped = item(
+        simfile_id="3",
+        status="skipped",
+        prediction_events=None,
+        failure_reason="explicitly_skipped",
+        coverage=no_prediction_coverage(),
+    )
+    quarantined = item(
+        simfile_id="4",
+        status="quarantined",
+        prediction_events=None,
+        failure_reason="reference_quarantined",
+        coverage=no_prediction_coverage(),
+    )
+
+    result = score_cohort(identity(), (quarantined, successful, skipped, failed))
+
+    assert result.population.total_count == 4
+    assert result.population.success_count == 1
+    assert result.population.failed_count == 1
+    assert result.population.skipped_count == 1
+    assert result.population.quarantined_count == 1
+    assert result.population.reason_counts == (
+        ("explicitly_skipped", 1),
+        ("inference_failed", 1),
+        ("reference_quarantined", 1),
+    )
+
+
+def test_score_cohort_aggregates_event_micro_song_macro_and_class_macro() -> None:
+    song_a = cohort_scoring_item(
+        "a",
+        (
+            scoring_event("a", 1.0, "kick", "ground_truth"),
+            scoring_event("a", 2.0, "snare", "ground_truth"),
+        ),
+        (scoring_event("a", 1.0, "kick", "prediction"),),
+    )
+    song_b = cohort_scoring_item(
+        "b",
+        (scoring_event("b", 1.0, "kick", "ground_truth"),),
+        (
+            scoring_event("b", 1.0, "kick", "prediction"),
+            scoring_event("b", 2.0, "kick", "prediction"),
+        ),
+    )
+
+    result = score_cohort(identity(), (song_b, song_a), tolerances_ms=(50,))
+    aggregate = next(row for row in result.aggregates if row.mode == "raw")
+
+    assert (
+        aggregate.event_micro.true_positives,
+        aggregate.event_micro.false_positives,
+        aggregate.event_micro.false_negatives,
+    ) == (2, 1, 1)
+    assert aggregate.event_micro.precision == pytest.approx(2 / 3)
+    assert aggregate.event_micro.recall == pytest.approx(2 / 3)
+    assert aggregate.event_micro.f1 == pytest.approx(2 / 3)
+    assert aggregate.song_macro_f1 == pytest.approx(2 / 3)
+    assert aggregate.class_macro_f1 == pytest.approx(0.4)
+    assert aggregate.successful_song_count == 2
+    assert [row.common_class for row in aggregate.per_class] == ["kick", "snare"]
+    kick = aggregate.per_class[0]
+    assert (
+        kick.summary.true_positives,
+        kick.summary.false_positives,
+        kick.summary.false_negatives,
+    ) == (
+        2,
+        1,
+        0,
+    )
+    assert kick.summary.f1 == pytest.approx(0.8)
+
+
+def test_score_cohort_uses_percentile_convention_for_song_f1_distribution() -> None:
+    songs = (
+        cohort_scoring_item(
+            "0.0",
+            (scoring_event("0.0", 1.0, "kick", "ground_truth"),),
+            (),
+        ),
+        cohort_scoring_item(
+            "0.25",
+            (scoring_event("0.25", 1.0, "kick", "ground_truth"),),
+            (
+                scoring_event("0.25", 1.0, "kick", "prediction"),
+                *tuple(
+                    scoring_event("0.25", float(index), "kick", "prediction")
+                    for index in range(2, 8)
+                ),
+            ),
+        ),
+        cohort_scoring_item(
+            "0.5",
+            (scoring_event("0.5", 1.0, "kick", "ground_truth"),),
+            (
+                scoring_event("0.5", 1.0, "kick", "prediction"),
+                scoring_event("0.5", 2.0, "kick", "prediction"),
+                scoring_event("0.5", 3.0, "kick", "prediction"),
+            ),
+        ),
+        cohort_scoring_item(
+            "0.75",
+            tuple(
+                scoring_event("0.75", float(index), "kick", "ground_truth") for index in range(1, 5)
+            ),
+            (
+                *(
+                    scoring_event("0.75", float(index), "kick", "prediction")
+                    for index in range(1, 4)
+                ),
+                scoring_event("0.75", 5.0, "kick", "prediction"),
+            ),
+        ),
+        cohort_scoring_item(
+            "1.0",
+            (scoring_event("1.0", 1.0, "kick", "ground_truth"),),
+            (scoring_event("1.0", 1.0, "kick", "prediction"),),
+        ),
+    )
+
+    result = score_cohort(identity(), songs, tolerances_ms=(50,))
+    distribution = next(row for row in result.aggregates if row.mode == "raw").song_f1_distribution
+
+    assert distribution.minimum == 0.0
+    assert distribution.p10 == 0.25
+    assert distribution.p25 == 0.25
+    assert distribution.median == 0.5
+    assert distribution.p75 == 0.75
+    assert distribution.p90 == 1.0
+    assert distribution.maximum == 1.0
+
+
+def test_score_cohort_zero_success_keeps_population_and_undefined_aggregates() -> None:
+    failed = item(
+        simfile_id="1",
+        status="failed",
+        prediction_events=None,
+        failure_reason="prediction_missing",
+        coverage=no_prediction_coverage(),
+    )
+    quarantined = item(
+        simfile_id="2",
+        status="quarantined",
+        prediction_events=None,
+        failure_reason="reference_quarantined",
+        coverage=no_prediction_coverage(),
+    )
+
+    result = score_cohort(identity(), (quarantined, failed))
+
+    assert len(result.aggregates) == 6
+    assert result.population.total_count == 2
+    assert result.population.success_count == 0
+    assert result.population.failed_count == 1
+    assert result.population.quarantined_count == 1
+    assert result.event_diagnostics == ()
+    for aggregate in result.aggregates:
+        assert aggregate.event_micro == ScoreSummary(0, 0, 0)
+        assert aggregate.event_micro.precision is None
+        assert aggregate.event_micro.recall is None
+        assert aggregate.event_micro.f1 is None
+        assert aggregate.song_macro_f1 is None
+        assert aggregate.class_macro_f1 is None
+        assert aggregate.song_f1_distribution == F1Distribution(
+            None, None, None, None, None, None, None
+        )
+        assert aggregate.per_class == ()
+        assert aggregate.successful_song_count == 0
