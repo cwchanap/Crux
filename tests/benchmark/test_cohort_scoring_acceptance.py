@@ -7,6 +7,7 @@ import struct
 import subprocess
 import sys
 from pathlib import Path
+from types import MappingProxyType
 
 from src.benchmark.backend_identity import (
     OAF_BACKEND_ID,
@@ -39,7 +40,10 @@ from src.benchmark.scorer_input import (
 )
 from src.benchmark.taxonomy import (
     DTX_LANE_MAP_VERSION,
+    OAF_PREDICTION_MAP,
     TAXONOMY_VERSION,
+    ClassMapping,
+    PredictionMap,
 )
 
 _FORBIDDEN_RUNTIME_MODULES = (
@@ -104,7 +108,7 @@ def _audio(tmp_path: Path) -> CanonicalAudio:
     return CanonicalAudio(
         path=path,
         source_audio_id="7",
-        source_audio_sha256=digest,
+        source_audio_sha256="b" * 64,
         input_view_id="full-mix-v1",
         input_audio_sha256=digest,
         byte_length=len(content),
@@ -209,19 +213,6 @@ def _copy_item(
         reference,
         copied_prediction,
         warnings=item.warnings,
-    )
-
-
-def _with_prediction_map_version(
-    artifact: PredictionArtifact,
-    prediction_map_version: str,
-) -> PredictionArtifact:
-    events = tuple(
-        dataclasses.replace(event, prediction_map_version=prediction_map_version)
-        for event in artifact.prediction.events
-    )
-    return read_prediction_artifact(
-        render_prediction_artifact(dataclasses.replace(artifact.prediction, events=events))
     )
 
 
@@ -406,14 +397,34 @@ def test_persisted_artifacts_rescore_without_inference(tmp_path: Path) -> None:
     assert selected.song_scores == default.song_scores
     _assert_reports(selected, tmp_path / "reports", identity, ("7", "8"))
 
-    changed_map = identity.prediction_map_version + "/rescored"
-    changed_identity = dataclasses.replace(identity, prediction_map_version=changed_map)
-    changed_artifact = _with_prediction_map_version(artifact, changed_map)
+    # Reconstruct NativePrediction from persisted native events and remap with
+    # one intentionally changed mapping to prove persisted native events can be
+    # rescored without inference.  "toms" is remapped from common_class "tom" to
+    # "kick", so the first prediction event no longer matches the reference tom.
+    native_events = tuple(event.native for event in artifact.prediction.events)
+    native_prediction = NativePrediction(
+        audio=artifact.prediction.audio,
+        descriptor=artifact.prediction.descriptor,
+        events=native_events,
+    )
+    changed_classes = dict(OAF_PREDICTION_MAP.classes)
+    changed_classes["toms"] = ClassMapping("kick", "kick")
+    changed_prediction_map = PredictionMap(
+        map_id=OAF_PREDICTION_MAP.map_id + "/rescored",
+        backend_id=OAF_PREDICTION_MAP.backend_id,
+        native_output_space_id=OAF_PREDICTION_MAP.native_output_space_id,
+        classes=MappingProxyType(changed_classes),
+    )
+    remapped, _ = map_oaf_prediction(native_prediction, prediction_map=changed_prediction_map)
+    remapped_artifact = read_prediction_artifact(render_prediction_artifact(remapped))
+
+    changed_identity = dataclasses.replace(
+        identity, prediction_map_version=changed_prediction_map.map_id
+    )
     changed_items = (
-        cohort_item_from_artifacts(changed_identity, "7", reference, changed_artifact),
-        _copy_item(item, "8", changed_identity, prediction=changed_artifact),
+        cohort_item_from_artifacts(changed_identity, "7", reference, remapped_artifact),
+        _copy_item(item, "8", changed_identity, prediction=remapped_artifact),
     )
     rescored = score_cohort(changed_identity, changed_items)
-    assert rescored.event_diagnostics == ()
-    assert rescored.aggregates == default.aggregates
-    assert rescored.song_scores == default.song_scores
+    assert rescored.aggregates != default.aggregates
+    assert rescored.song_scores != default.song_scores

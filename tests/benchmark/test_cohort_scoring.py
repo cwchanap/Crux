@@ -46,6 +46,7 @@ from src.benchmark.taxonomy import (
     DTX_LANE_MAP_VERSION,
     OAF_PREDICTION_MAP_ID,
     TAXONOMY_VERSION,
+    ClassMapping,
 )
 
 
@@ -123,7 +124,7 @@ def build_prediction_artifact(tmp_path: Path) -> PredictionArtifact:
     audio = CanonicalAudio(
         audio_path,
         "song",
-        digest,
+        "f" * 64,
         "full-mix-v1",
         digest,
         len(audio_content),
@@ -205,7 +206,7 @@ def synthetic_prediction_artifact(
     audio = CanonicalAudio(
         Path(),
         simfile_id,
-        "a" * 64,
+        "f" * 64,
         "full-mix-v1",
         "b" * 64,
         46,
@@ -585,6 +586,55 @@ def test_cohort_item_from_artifacts_rejects_wrong_song_reference_and_prediction(
             "42",
             build_reference_mapping(),
             _artifact_for_song(tmp_path, "8"),
+        )
+
+
+def test_cohort_item_rejects_mismatched_source_audio_hash(tmp_path: Path) -> None:
+    """A stale prediction for an older audio revision must not score against a newer reference."""
+    reference = build_reference_mapping()
+    artifact = _artifact_for_song(tmp_path, "42")
+    mismatched_audio = dataclasses.replace(artifact.prediction.audio, source_audio_sha256="e" * 64)
+    mismatched_prediction = dataclasses.replace(artifact.prediction, audio=mismatched_audio)
+    mismatched_artifact = read_prediction_artifact(
+        render_prediction_artifact(mismatched_prediction)
+    )
+    with pytest.raises(ValueError, match="source_audio_content_hash.*source_audio_sha256"):
+        cohort_scoring.cohort_item_from_artifacts(
+            build_identity(), "42", reference, mismatched_artifact
+        )
+
+
+def test_identity_rejects_wrong_taxonomy_version() -> None:
+    values = dataclasses.asdict(build_identity())
+    values["taxonomy_version"] = "crux.dtx-taxonomy/v1"
+    with pytest.raises(ValueError, match="taxonomy_version must be"):
+        CohortIdentity(**values)
+
+
+def test_identity_rejects_wrong_lane_map_version() -> None:
+    values = dataclasses.asdict(build_identity())
+    values["lane_map_version"] = "crux.other-lane-map/v1"
+    with pytest.raises(ValueError, match="lane_map_version must be"):
+        CohortIdentity(**values)
+
+
+def test_validate_rejects_reference_mapped_with_custom_lane_map(tmp_path: Path) -> None:
+    """A reference mapped with a custom lane_map must not be reported as crux.dtx-lane-map/v1."""
+    native_events = (
+        build_native_reference("14", 1.0, 0),
+        build_native_reference("15", 1.0, 1),
+        build_native_reference("13", 2.0, 2),
+    )
+    custom_lane_map = {
+        "14": ClassMapping("snare", "snare"),
+        "15": ClassMapping("low_or_floor_tom", "tom"),
+        "13": ClassMapping("kick", "kick"),
+    }
+    custom_reference = map_reference_events(native_events, lane_map=custom_lane_map)
+    artifact = _artifact_for_song(tmp_path, "42")
+    with pytest.raises(ValueError, match="frozen DTX lane map"):
+        cohort_scoring.cohort_item_from_artifacts(
+            build_identity(), "42", custom_reference, artifact
         )
 
 

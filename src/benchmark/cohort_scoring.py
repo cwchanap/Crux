@@ -21,7 +21,13 @@ from src.benchmark.scorer_input import (
     reference_to_benchmark_events,
 )
 from src.benchmark.scoring import ScoreResult, score_events_with_alignment
-from src.benchmark.taxonomy import OAF_PREDICTION_MAP_ID
+from src.benchmark.taxonomy import (
+    DTX_LANE_MAP,
+    DTX_LANE_MAP_VERSION,
+    OAF_PREDICTION_MAP_ID,
+    TAXONOMY_VERSION,
+    project_to_common,
+)
 
 SCORING_VERSION = "crux.single-cohort-scoring/v1"
 DEFAULT_TOLERANCES_MS = (30, 50, 100)
@@ -165,6 +171,10 @@ class CohortIdentity:
                 raise ValueError(f"{field} must be a nonempty string")
         if self.scoring_version != SCORING_VERSION:
             raise ValueError(f"scoring_version must be {SCORING_VERSION}")
+        if self.taxonomy_version != TAXONOMY_VERSION:
+            raise ValueError(f"taxonomy_version must be {TAXONOMY_VERSION}")
+        if self.lane_map_version != DTX_LANE_MAP_VERSION:
+            raise ValueError(f"lane_map_version must be {DTX_LANE_MAP_VERSION}")
         for field in (
             "reference_manifest_sha256",
             "model_lock_sha256",
@@ -454,6 +464,19 @@ def _artifact_identity_from_artifacts(
     if audio.source_audio_id != simfile_id:
         raise ValueError("prediction artifact source_audio_id does not match item")
 
+    if reference.mapped_events:
+        source_hashes = {
+            mapped_event.native.source_audio_content_hash
+            for mapped_event in reference.mapped_events
+        }
+        if len(source_hashes) > 1:
+            raise ValueError("reference events have mixed source_audio_content_hash values")
+        reference_source_hash = next(iter(source_hashes))
+        if reference_source_hash != audio.source_audio_sha256:
+            raise ValueError(
+                "reference source_audio_content_hash does not match prediction source_audio_sha256"
+            )
+
     descriptor = prediction.prediction.descriptor
     descriptor_payload = descriptor.payload
     backend_id = descriptor_payload.get("backend_id")
@@ -483,6 +506,7 @@ def _artifact_identity_from_artifacts(
     )
 
 
+# pylint: disable-next=too-many-branches
 def _validate_success_artifact_binding(identity: CohortIdentity, item: CohortItem) -> None:
     """Recompute successful item evidence from the persisted artifacts."""
     if not isinstance(item.reference_artifact, ReferenceMappingResult):
@@ -502,6 +526,23 @@ def _validate_success_artifact_binding(identity: CohortIdentity, item: CohortIte
     )
     if item.reference_artifact.diagnostics.duplicate_common_event_count != expected_duplicate_count:
         raise ValueError("reference duplicate diagnostics do not match mapped event projection")
+
+    for mapped_event in item.reference_artifact.mapped_events:
+        lane_id = mapped_event.native.lane_id
+        expected_mapping = DTX_LANE_MAP.get(lane_id)
+        if expected_mapping is None or expected_mapping.canonical_class is None:
+            raise ValueError("mapped reference event was not mapped using the frozen DTX lane map")
+        if mapped_event.canonical_class != expected_mapping.canonical_class:
+            raise ValueError(
+                "mapped reference event canonical_class does not match frozen DTX lane map"
+            )
+        expected_common = expected_mapping.common_class or project_to_common(
+            expected_mapping.canonical_class
+        )
+        if mapped_event.common_class != expected_common:
+            raise ValueError(
+                "mapped reference event common_class does not match frozen DTX lane map"
+            )
 
     expected_identity = _artifact_identity_from_artifacts(
         item.simfile_id,
