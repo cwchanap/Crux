@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from src.benchmark import cohort_scoring
 from src.benchmark.backend_identity import StrictJsonError, strict_json_loads
 from src.benchmark.cohort_scoring import (
     CohortCoverage,
@@ -70,6 +71,18 @@ def _item(
         ),
         warnings=warnings,
         failure_reason=failure_reason,  # type: ignore[arg-type]
+        artifact_identity=(
+            cohort_scoring.CohortArtifactIdentity(
+                simfile_id=simfile_id,
+                backend_id="backend-v1",
+                model_id="model-v1",
+                backend_descriptor_sha256="d" * 64,
+                input_view_id="full-mix-v1",
+                prediction_map_version="map-v1",
+            )
+            if prediction_events is not None
+            else None
+        ),
     )
 
 
@@ -96,6 +109,13 @@ def _result(*, diagnostics_for: tuple[str, ...] = (), reverse_items: bool = Fals
         prediction_unmapped_event_count=0,
         prediction_native_class_counts=(("midi_46", 1), ("midi_36", 1)),
     )
+    partial = _item(
+        "4",
+        prediction_events=(_prediction("4", 0.5),),
+        prediction_native_event_count=2,
+        prediction_mapped_event_count=1,
+        prediction_unmapped_event_count=1,
+    )
     empty = _item(
         "2",
         prediction_events=(),
@@ -109,7 +129,7 @@ def _result(*, diagnostics_for: tuple[str, ...] = (), reverse_items: bool = Fals
         status="failed",
         failure_reason="prediction_missing",
     )
-    items = (failed, empty, success)
+    items = (failed, empty, success, partial)
     if reverse_items:
         items = tuple(reversed(items))
     return score_cohort(_identity(), items, tolerances_ms=(50,), diagnostics_for=diagnostics_for)
@@ -138,7 +158,7 @@ def test_write_cohort_reports_outputs_six_contract_files(tmp_path: Path) -> None
     assert set(summary) == {"schema", "identity", "tolerances_ms", "population", "aggregates"}
     assert summary["schema"] == REPORT_SCHEMA
     assert "items" not in summary
-    assert summary["aggregates"][0]["event_micro"]["precision"] == Decimal("0.5")
+    assert summary["aggregates"][0]["event_micro"]["precision"] == Decimal("0.666667")
     assert summary["aggregates"][0]["song_macro_f1"] is not None
 
     with artifacts.items_csv.open(newline="", encoding="utf-8") as handle:
@@ -146,6 +166,8 @@ def test_write_cohort_reports_outputs_six_contract_files(tmp_path: Path) -> None
     assert rows[0]["simfile_id"] == "1"
     assert rows[0]["warnings"] == "a-warning|z-warning"
     assert rows[0]["prediction_mapping_coverage"] == "1"
+    partial_row = next(row for row in rows if row["simfile_id"] == "4")
+    assert partial_row["prediction_mapping_coverage"] == "0.5"
     empty_row = next(row for row in rows if row["simfile_id"] == "2")
     assert empty_row["prediction_mapping_coverage"] == ""
     assert all(row["prediction_mapping_coverage"] == "" for row in rows if row["simfile_id"] == "3")
@@ -163,7 +185,7 @@ def test_per_song_and_per_class_are_song_scoped(tmp_path: Path) -> None:
     assert "backend_descriptor_sha256" not in song_rows[0]
     assert class_rows
     assert "scope" not in class_rows[0]
-    assert {row["simfile_id"] for row in class_rows} == {"1", "2"}
+    assert {row["simfile_id"] for row in class_rows} == {"1", "2", "4"}
 
 
 def test_event_diagnostics_are_slim_canonical_jsonl(tmp_path: Path) -> None:

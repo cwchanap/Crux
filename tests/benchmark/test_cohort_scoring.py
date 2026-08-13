@@ -7,6 +7,7 @@ from typing import get_args
 
 import pytest
 
+from src.benchmark import cohort_scoring
 from src.benchmark.backend_identity import (
     OAF_BACKEND_ID,
     OAF_DESCRIPTOR_SCHEMA,
@@ -57,7 +58,7 @@ def identity() -> CohortIdentity:
         backend_id=OAF_BACKEND_ID,
         model_id="magenta-egmd-ckpt-569400-v1",
         model_lock_sha256="c" * 64,
-        backend_descriptor_sha256="d" * 64,
+        backend_descriptor_sha256=descriptor().sha256,
         prediction_map_version=OAF_PREDICTION_MAP_ID,
         input_view_id="full-mix-v1",
     )
@@ -158,6 +159,17 @@ def no_prediction_coverage() -> CohortCoverage:
     return CohortCoverage(2, 2, 0, 0, 0, None, None, None)
 
 
+def artifact_identity(simfile_id: str) -> cohort_scoring.CohortArtifactIdentity:
+    return cohort_scoring.CohortArtifactIdentity(
+        simfile_id=simfile_id,
+        backend_id=identity().backend_id,
+        model_id=identity().model_id,
+        backend_descriptor_sha256=identity().backend_descriptor_sha256,
+        input_view_id=identity().input_view_id,
+        prediction_map_version=identity().prediction_map_version,
+    )
+
+
 def item(
     *,
     simfile_id: str = "42",
@@ -184,6 +196,9 @@ def item(
             else CohortCoverage(2, 2, 0, 0, 0, 0, 0, 0)
         ),
         failure_reason=failure_reason,  # type: ignore[arg-type]
+        artifact_identity=(
+            artifact_identity(simfile_id) if prediction_events is not None else None
+        ),
     )
 
 
@@ -350,7 +365,7 @@ def test_success_requires_prediction_coverage_to_match_events() -> None:
 
 
 def test_validate_cohort_items_reconciles_success_prediction_metadata(tmp_path: Path) -> None:
-    artifact = prediction_artifact(tmp_path)
+    artifact = _artifact_for_song(tmp_path, "42")
     reference = reference_mapping()
     prediction_events = prediction_to_benchmark_events(artifact)
     valid = CohortItem(
@@ -359,6 +374,7 @@ def test_validate_cohort_items_reconciles_success_prediction_metadata(tmp_path: 
         reference_events=reference_to_benchmark_events("42", reference.common_events),
         prediction_events=prediction_events,
         coverage=coverage_from_artifacts(reference, artifact),
+        artifact_identity=artifact_identity("42"),
     )
     assert validate_cohort_items(identity(), (valid,)) is None
 
@@ -390,6 +406,167 @@ def test_validate_cohort_items_reconciles_success_prediction_metadata(tmp_path: 
         )
 
 
+def _artifact_for_song(tmp_path: Path, simfile_id: str) -> PredictionArtifact:
+    artifact = prediction_artifact(tmp_path)
+    audio = dataclasses.replace(artifact.prediction.audio, source_audio_id=simfile_id)
+    mapped = dataclasses.replace(artifact.prediction, audio=audio)
+    return read_prediction_artifact(render_prediction_artifact(mapped))
+
+
+def _empty_artifact_for_song(tmp_path: Path, simfile_id: str) -> PredictionArtifact:
+    artifact = _artifact_for_song(tmp_path, simfile_id)
+    mapped = dataclasses.replace(artifact.prediction, events=())
+    return read_prediction_artifact(render_prediction_artifact(mapped))
+
+
+def test_cohort_item_from_artifacts_binds_song_and_descriptor_provenance(
+    tmp_path: Path,
+) -> None:
+    reference = reference_mapping()
+    artifact = _artifact_for_song(tmp_path, "42")
+
+    item = cohort_scoring.cohort_item_from_artifacts(
+        identity(),
+        "42",
+        reference,
+        artifact,
+    )
+
+    assert item.artifact_identity is not None
+    assert item.artifact_identity.simfile_id == "42"
+    assert item.artifact_identity.backend_id == identity().backend_id
+    assert item.artifact_identity.model_id == identity().model_id
+    assert item.artifact_identity.backend_descriptor_sha256 == identity().backend_descriptor_sha256
+    assert validate_cohort_items(identity(), (item,)) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("backend_id", "other-backend", "backend_id"),
+        ("model_id", "other-model", "model_id"),
+        ("backend_descriptor_sha256", "e" * 64, "backend_descriptor_sha256"),
+        ("input_view_id", "stem-v1", "input_view_id"),
+        ("prediction_map_version", "other-map", "prediction_map_version"),
+    ],
+)
+def test_validate_cohort_items_rejects_mixed_artifact_provenance(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    item = cohort_scoring.cohort_item_from_artifacts(
+        identity(),
+        "42",
+        reference_mapping(),
+        _artifact_for_song(tmp_path, "42"),
+    )
+    evidence = dataclasses.replace(item.artifact_identity, **{field: value})
+    mixed = dataclasses.replace(item, artifact_identity=evidence)
+
+    with pytest.raises(ValueError, match=message):
+        validate_cohort_items(identity(), (mixed,))
+
+
+def test_cohort_item_from_artifacts_rejects_wrong_song_reference_and_prediction(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="reference.*simfile_id"):
+        cohort_scoring.cohort_item_from_artifacts(
+            identity(),
+            "8",
+            reference_mapping(),
+            _artifact_for_song(tmp_path, "8"),
+        )
+
+    with pytest.raises(ValueError, match="prediction.*source_audio_id"):
+        cohort_scoring.cohort_item_from_artifacts(
+            identity(),
+            "42",
+            reference_mapping(),
+            _artifact_for_song(tmp_path, "8"),
+        )
+
+
+def test_validate_cohort_items_rejects_reference_and_prediction_chart_or_source_mismatch(
+    tmp_path: Path,
+) -> None:
+    item = cohort_scoring.cohort_item_from_artifacts(
+        identity(),
+        "42",
+        reference_mapping(),
+        _artifact_for_song(tmp_path, "42"),
+    )
+
+    bad_reference_chart = dataclasses.replace(item.reference_events[0], chart_id="8")
+    with pytest.raises(ValueError, match="reference event chart_id"):
+        validate_cohort_items(
+            identity(),
+            (
+                dataclasses.replace(
+                    item, reference_events=(bad_reference_chart, *item.reference_events[1:])
+                ),
+            ),
+        )
+
+    bad_reference_source = dataclasses.replace(item.reference_events[0], source="prediction")
+    with pytest.raises(ValueError, match="reference event source"):
+        validate_cohort_items(
+            identity(),
+            (
+                dataclasses.replace(
+                    item, reference_events=(bad_reference_source, *item.reference_events[1:])
+                ),
+            ),
+        )
+
+    bad_prediction_chart = dataclasses.replace(item.prediction_events[0], chart_id="8")
+    with pytest.raises(ValueError, match="prediction event chart_id"):
+        validate_cohort_items(
+            identity(),
+            (
+                dataclasses.replace(
+                    item, prediction_events=(bad_prediction_chart, *item.prediction_events[1:])
+                ),
+            ),
+        )
+
+    bad_prediction_source = dataclasses.replace(item.prediction_events[0], source="ground_truth")
+    with pytest.raises(ValueError, match="prediction event source"):
+        validate_cohort_items(
+            identity(),
+            (
+                dataclasses.replace(
+                    item, prediction_events=(bad_prediction_source, *item.prediction_events[1:])
+                ),
+            ),
+        )
+
+
+def test_zero_event_artifact_is_identity_bound_without_event_metadata(tmp_path: Path) -> None:
+    item = cohort_scoring.cohort_item_from_artifacts(
+        identity(),
+        "42",
+        reference_mapping(),
+        _empty_artifact_for_song(tmp_path, "42"),
+    )
+
+    assert item.prediction_events == ()
+    assert item.artifact_identity is not None
+    assert item.artifact_identity.prediction_map_version == identity().prediction_map_version
+    assert validate_cohort_items(identity(), (item,)) is None
+
+    mixed_identity = dataclasses.replace(identity(), prediction_map_version="other-map")
+    with pytest.raises(ValueError, match="prediction_map_version"):
+        validate_cohort_items(mixed_identity, (item,))
+
+
+def test_success_item_without_artifact_provenance_is_rejected() -> None:
+    with pytest.raises(ValueError, match="artifact_identity"):
+        validate_cohort_items(identity(), (dataclasses.replace(item(), artifact_identity=None),))
+
+
 def scoring_item(
     simfile_id: str,
     reference_events: tuple[BenchmarkEvent, ...],
@@ -413,6 +590,7 @@ def scoring_item(
             prediction_unmapped_event_count=0,
         ),
         warnings=warnings,
+        artifact_identity=artifact_identity(simfile_id),
     )
 
 

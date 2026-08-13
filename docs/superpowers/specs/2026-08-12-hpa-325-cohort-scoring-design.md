@@ -156,9 +156,21 @@ class CohortItem:
     coverage: CohortCoverage
     warnings: tuple[str, ...] = ()
     failure_reason: CohortFailureReason | None = None
+    artifact_identity: CohortArtifactIdentity | None = None
 ```
 
 `CohortItem` stays in memory. HPA-325 does not persist another run manifest.
+
+Successful items are constructed through the narrow
+`cohort_item_from_artifacts(identity, simfile_id, reference, prediction)` seam.
+The item retains a frozen descriptor-level `CohortArtifactIdentity` containing
+the artifact song ID, backend ID, model ID, backend-descriptor SHA-256,
+input-view ID, and prediction-map version. `validate_cohort_items()` rejects a
+successful item without that evidence, or with reference/prediction events
+whose `chart_id` or `source` does not match the item. Empty prediction
+artifacts remain valid: the OaF map identity is derived from the existing
+backend mapping identity because an empty artifact has no event record from
+which to read it. Non-success rows retain their existing no-prediction shape.
 
 ### 3. Identity validation reuses existing contracts and rejects mixed prediction cohorts
 
