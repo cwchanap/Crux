@@ -65,7 +65,7 @@ def score_events(
         false_positives=len(unmatched_predictions),
         false_negatives=len(unmatched_ground_truth),
         median_abs_error_sec=median(errors) if errors else None,
-        p95_abs_error_sec=_percentile(errors, 0.95) if errors else None,
+        p95_abs_error_sec=percentile(errors, 0.95) if errors else None,
         offset_sec=offset_sec,
     )
     return ScoreResult(summary, matches, unmatched_ground_truth, unmatched_predictions)
@@ -105,7 +105,8 @@ def _match_class(
     return matches, unmatched_ground_truth, unmatched_predictions
 
 
-def _percentile(values: list[float], percentile: float) -> float:
+# pylint: disable-next=redefined-outer-name
+def percentile(values: list[float], percentile: float) -> float:
     if not values:
         raise ValueError("values must not be empty")
     index = min(len(values) - 1, ceil((len(values) - 1) * percentile))
