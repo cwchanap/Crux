@@ -37,6 +37,7 @@ from src.benchmark.reports import (
     _report_decimal,
     write_cohort_reports,
 )
+from src.benchmark.taxonomy import DTX_LANE_MAP_VERSION, TAXONOMY_VERSION
 
 
 def _descriptor():
@@ -59,8 +60,8 @@ def _identity() -> CohortIdentity:
         cohort_id="oaf-full-mix-v1",
         reference_manifest_sha256="a" * 64,
         reference_timing_version="sha256:" + "b" * 64,
-        taxonomy_version="crux.dtx-taxonomy/v1",
-        lane_map_version="crux.dtx-lane-map/v1",
+        taxonomy_version=TAXONOMY_VERSION,
+        lane_map_version=DTX_LANE_MAP_VERSION,
         backend_id=OAF_BACKEND_ID,
         model_id="magenta-egmd-ckpt-569400-v1",
         model_lock_sha256="c" * 64,
@@ -139,7 +140,7 @@ def _item(
         audio = CanonicalAudio(
             Path(),
             simfile_id,
-            "a" * 64,
+            "f" * 64,
             "full-mix-v1",
             "b" * 64,
             46,
