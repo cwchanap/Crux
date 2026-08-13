@@ -16,10 +16,12 @@ from src.benchmark.backend_identity import (
 from src.benchmark.backends import CanonicalAudio, NativeEvent, NativePrediction
 from src.benchmark.cohort_scoring import (
     COHORT_FAILURE_REASONS,
+    DEFAULT_TOLERANCES_MS,
     SCORING_VERSION,
     CohortCoverage,
     CohortIdentity,
     CohortItem,
+    _score_success_items,
     coverage_from_artifacts,
     validate_cohort_items,
 )
@@ -384,3 +386,181 @@ def test_validate_cohort_items_reconciles_success_prediction_metadata(tmp_path: 
             identity(),
             (dataclasses.replace(valid, prediction_events=(missing_metadata_event,)),),
         )
+
+
+def scoring_item(
+    simfile_id: str,
+    reference_events: tuple[BenchmarkEvent, ...],
+    prediction_events: tuple[BenchmarkEvent, ...],
+    *,
+    warnings: tuple[str, ...] = (),
+) -> CohortItem:
+    return CohortItem(
+        simfile_id=simfile_id,
+        status="success",
+        reference_events=reference_events,
+        prediction_events=prediction_events,
+        coverage=CohortCoverage(
+            reference_native_event_count=len(reference_events),
+            reference_common_event_count=len(reference_events),
+            reference_ignored_event_count=0,
+            reference_unmapped_event_count=0,
+            reference_duplicate_collapsed_count=0,
+            prediction_native_event_count=len(prediction_events),
+            prediction_mapped_event_count=len(prediction_events),
+            prediction_unmapped_event_count=0,
+        ),
+        warnings=warnings,
+    )
+
+
+def scoring_event(
+    simfile_id: str,
+    time_sec: float,
+    canonical_class: str,
+    source: str,
+    metadata: dict[str, object] | None = None,
+) -> BenchmarkEvent:
+    return BenchmarkEvent(
+        chart_id=simfile_id,
+        time_sec=time_sec,
+        canonical_class=canonical_class,
+        source=source,
+        metadata=metadata or {},
+    )
+
+
+def test_score_success_items_uses_fixed_tolerance_mode_matrix() -> None:
+    success = scoring_item(
+        "1",
+        (scoring_event("1", 1.0, "kick", "ground_truth"),),
+        (scoring_event("1", 1.04, "kick", "prediction"),),
+    )
+
+    scores, diagnostics = _score_success_items(
+        (success,), DEFAULT_TOLERANCES_MS, diagnostics_for=frozenset()
+    )
+
+    assert diagnostics == ()
+    assert [(score.tolerance_ms, score.mode) for score in scores] == [
+        (30, "raw"),
+        (30, "aligned"),
+        (50, "raw"),
+        (50, "aligned"),
+        (100, "raw"),
+        (100, "aligned"),
+    ]
+    assert scores[0].summary.f1 == 0.0
+    assert scores[1].summary.f1 == 1.0
+    assert scores[2].summary.f1 == 1.0
+    assert scores[4].summary.f1 == 1.0
+
+
+def test_score_success_items_reconciles_per_class_rows() -> None:
+    success = scoring_item(
+        "1",
+        (
+            scoring_event("1", 1.0, "kick", "ground_truth"),
+            scoring_event("1", 2.0, "snare", "ground_truth"),
+        ),
+        (
+            scoring_event("1", 1.0, "kick", "prediction"),
+            scoring_event("1", 3.0, "hihat", "prediction"),
+        ),
+    )
+
+    scores, _ = _score_success_items((success,), (50,), diagnostics_for=frozenset())
+
+    for score in scores:
+        assert sum(row.summary.true_positives for row in score.per_class) == (
+            score.summary.true_positives
+        )
+        assert sum(row.summary.false_positives for row in score.per_class) == (
+            score.summary.false_positives
+        )
+        assert sum(row.summary.false_negatives for row in score.per_class) == (
+            score.summary.false_negatives
+        )
+        assert [row.common_class for row in score.per_class] == sorted(
+            row.common_class for row in score.per_class
+        )
+        assert {row.common_class for row in score.per_class} == {"hihat", "kick", "snare"}
+        hihat = next(row for row in score.per_class if row.common_class == "hihat")
+        assert hihat.reference_support == 0
+        assert hihat.prediction_support == 1
+
+
+def test_score_success_items_is_independent_of_optional_prediction_metadata() -> None:
+    reference = (scoring_event("1", 1.0, "kick", "ground_truth"),)
+    bare = scoring_item("1", reference, (scoring_event("1", 1.0, "kick", "prediction"),))
+    detailed = scoring_item(
+        "1",
+        reference,
+        (
+            scoring_event(
+                "1",
+                1.0,
+                "kick",
+                "prediction",
+                {"confidence": 0.9, "velocity_midi": 100},
+            ),
+        ),
+    )
+
+    bare_scores, _ = _score_success_items((bare,), (50,), diagnostics_for=frozenset())
+    detailed_scores, _ = _score_success_items((detailed,), (50,), diagnostics_for=frozenset())
+
+    assert [
+        (score.summary.true_positives, score.summary.false_positives, score.summary.f1)
+        for score in bare_scores
+    ] == [
+        (score.summary.true_positives, score.summary.false_positives, score.summary.f1)
+        for score in detailed_scores
+    ]
+
+
+def test_score_success_items_default_diagnostics_are_empty() -> None:
+    success_a = scoring_item(
+        "1",
+        (scoring_event("1", 1.0, "kick", "ground_truth"),),
+        (scoring_event("1", 1.0, "kick", "prediction"),),
+    )
+    success_b = scoring_item(
+        "2",
+        (scoring_event("2", 1.0, "snare", "ground_truth"),),
+        (scoring_event("2", 1.0, "snare", "prediction"),),
+    )
+
+    song_scores, diagnostics = _score_success_items(
+        (success_a, success_b), DEFAULT_TOLERANCES_MS, diagnostics_for=frozenset()
+    )
+
+    assert song_scores
+    assert diagnostics == ()
+
+
+def test_score_success_items_materializes_only_selected_song_diagnostics() -> None:
+    success_a = scoring_item(
+        "1",
+        (scoring_event("1", 1.0, "kick", "ground_truth"),),
+        (scoring_event("1", 1.1, "kick", "prediction"),),
+    )
+    success_b = scoring_item(
+        "2",
+        (scoring_event("2", 1.0, "kick", "ground_truth"),),
+        (scoring_event("2", 1.1, "kick", "prediction"),),
+    )
+
+    _, diagnostics = _score_success_items((success_a, success_b), (30,), frozenset({"2"}))
+
+    assert diagnostics
+    assert {diagnostic.simfile_id for diagnostic in diagnostics} == {"2"}
+    aligned = next(
+        diagnostic
+        for diagnostic in diagnostics
+        if diagnostic.mode == "aligned" and diagnostic.outcome == "matched"
+    )
+    assert aligned.reference_time_sec == pytest.approx(1.0)
+    assert aligned.prediction_time_sec == pytest.approx(1.1)
+    assert aligned.scored_prediction_time_sec == pytest.approx(1.0)
+    assert aligned.timing_error_sec == pytest.approx(0.0)
