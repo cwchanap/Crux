@@ -39,7 +39,6 @@ from src.benchmark.reference_set import map_reference_events
 from src.benchmark.reference_timing import NativeReferenceEvent
 from src.benchmark.scorer_input import (
     prediction_to_benchmark_events,
-    reference_to_benchmark_events,
 )
 from src.benchmark.taxonomy import (
     DTX_LANE_MAP_VERSION,
@@ -150,6 +149,78 @@ def prediction_artifact(tmp_path: Path) -> PredictionArtifact:
             confidence=0.7,
             velocity_midi=95,
         ),
+    )
+    mapped, _ = map_oaf_prediction(NativePrediction(audio, descriptor(), native_events))
+    return read_prediction_artifact(render_prediction_artifact(mapped))
+
+
+def synthetic_reference_mapping(
+    simfile_id: str,
+    events: tuple[BenchmarkEvent, ...],
+):
+    lane_by_class = {
+        "kick": "13",
+        "snare": "12",
+        "hihat": "11",
+        "tom": "14",
+        "crash": "16",
+        "ride": "19",
+    }
+    native_events = tuple(
+        NativeReferenceEvent(
+            simfile_id=simfile_id,
+            selected_chart_key=f"{simfile_id}/chart.dtx",
+            selected_chart_content_hash="e" * 64,
+            source_audio_key=f"{simfile_id}/audio.wav",
+            source_audio_content_hash="f" * 64,
+            source_order=index,
+            measure=1,
+            position=float(index),
+            lane_id=lane_by_class[event.canonical_class],
+            note_id=f"{event.canonical_class}-{index}",
+            chart_time_sec=event.time_sec,
+            audio_time_sec=event.time_sec,
+        )
+        for index, event in enumerate(events)
+    )
+    return map_reference_events(native_events)
+
+
+def synthetic_prediction_artifact(
+    simfile_id: str,
+    events: tuple[BenchmarkEvent, ...],
+) -> PredictionArtifact:
+    group_by_class = {
+        "kick": "kick",
+        "snare": "snare",
+        "hihat": "hihat",
+        "tom": "toms",
+        "crash": "crash",
+        "ride": "ride",
+    }
+    audio = CanonicalAudio(
+        Path(),
+        simfile_id,
+        "a" * 64,
+        "full-mix-v1",
+        "b" * 64,
+        46,
+        44100,
+        1,
+        2,
+        1,
+    )
+    native_events = tuple(
+        NativeEvent(
+            time_sec=event.time_sec,
+            native_class_id=f"midi_{index + 22}",
+            model_output_bin=index + 1,
+            native_midi_note=index + 22,
+            native_metadata={"upstream_8hit_group_id": group_by_class[event.canonical_class]},
+            confidence=0.9,
+            velocity_midi=100,
+        )
+        for index, event in enumerate(events)
     )
     mapped, _ = map_oaf_prediction(NativePrediction(audio, descriptor(), native_events))
     return read_prediction_artifact(render_prediction_artifact(mapped))
@@ -271,7 +342,14 @@ def test_coverage_without_prediction_has_no_prediction_counts() -> None:
 
 
 def test_validate_cohort_items_accepts_success_and_closed_failure_shapes() -> None:
-    successful = item()
+    successful = cohort_scoring_item(
+        "42",
+        (
+            scoring_event("42", 1.0, "tom", "ground_truth"),
+            scoring_event("42", 2.0, "kick", "ground_truth"),
+        ),
+        (),
+    )
     failed = item(
         simfile_id="43",
         status="failed",
@@ -296,7 +374,12 @@ def test_validate_cohort_items_accepts_success_and_closed_failure_shapes() -> No
 
 def test_validate_cohort_items_rejects_duplicate_ids_and_invalid_status_shapes() -> None:
     with pytest.raises(ValueError, match="simfile_id values must be unique"):
-        validate_cohort_items(identity(), (item(), item(simfile_id="42")))
+        successful = cohort_scoring_item(
+            "42",
+            (scoring_event("42", 1.0, "kick", "ground_truth"),),
+            (),
+        )
+        validate_cohort_items(identity(), (successful, successful))
 
     with pytest.raises(ValueError, match="success item requires nonempty reference_events"):
         validate_cohort_items(
@@ -356,11 +439,16 @@ def test_non_success_items_reject_prediction_native_class_counts() -> None:
 
 
 def test_success_requires_prediction_coverage_to_match_events() -> None:
-    invalid = item(
-        prediction_events=(BenchmarkEvent("42", 1.0, "tom", "prediction"),),
-        coverage=CohortCoverage(2, 2, 0, 0, 0, 0, 0, 0),
+    valid = cohort_scoring_item(
+        "42",
+        (scoring_event("42", 1.0, "tom", "ground_truth"),),
+        (scoring_event("42", 1.0, "tom", "prediction"),),
     )
-    with pytest.raises(ValueError, match="prediction mapped count must match prediction_events"):
+    invalid = dataclasses.replace(
+        valid,
+        coverage=dataclasses.replace(valid.coverage, prediction_mapped_event_count=0),
+    )
+    with pytest.raises(ValueError, match="coverage"):
         validate_cohort_items(identity(), (invalid,))
 
 
@@ -368,13 +456,11 @@ def test_validate_cohort_items_reconciles_success_prediction_metadata(tmp_path: 
     artifact = _artifact_for_song(tmp_path, "42")
     reference = reference_mapping()
     prediction_events = prediction_to_benchmark_events(artifact)
-    valid = CohortItem(
-        simfile_id="42",
-        status="success",
-        reference_events=reference_to_benchmark_events("42", reference.common_events),
-        prediction_events=prediction_events,
-        coverage=coverage_from_artifacts(reference, artifact),
-        artifact_identity=artifact_identity("42"),
+    valid = cohort_scoring.cohort_item_from_artifacts(
+        identity(),
+        "42",
+        reference,
+        artifact,
     )
     assert validate_cohort_items(identity(), (valid,)) is None
 
@@ -567,6 +653,17 @@ def test_success_item_without_artifact_provenance_is_rejected() -> None:
         validate_cohort_items(identity(), (dataclasses.replace(item(), artifact_identity=None),))
 
 
+def test_score_cohort_rejects_forged_artifact_identity_for_empty_prediction() -> None:
+    """A caller-created identity must not bless an unbacked empty artifact."""
+    forged = item(
+        prediction_events=(),
+        coverage=CohortCoverage(2, 2, 0, 0, 0, 0, 0, 0),
+    )
+
+    with pytest.raises(ValueError, match="artifact"):
+        score_cohort(identity(), (forged,), tolerances_ms=(50,))
+
+
 def scoring_item(
     simfile_id: str,
     reference_events: tuple[BenchmarkEvent, ...],
@@ -617,21 +714,11 @@ def cohort_scoring_item(
     *,
     warnings: tuple[str, ...] = (),
 ) -> CohortItem:
-    prediction_events = tuple(
-        dataclasses.replace(
-            event,
-            metadata={
-                **event.metadata,
-                "input_view_id": identity().input_view_id,
-                "prediction_map_version": identity().prediction_map_version,
-            },
-        )
-        for event in prediction_events
-    )
-    return scoring_item(
+    return cohort_scoring.cohort_item_from_artifacts(
+        identity(),
         simfile_id,
-        reference_events,
-        prediction_events,
+        synthetic_reference_mapping(simfile_id, reference_events),
+        synthetic_prediction_artifact(simfile_id, prediction_events),
         warnings=warnings,
     )
 

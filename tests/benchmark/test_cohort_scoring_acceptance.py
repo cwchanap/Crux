@@ -180,21 +180,48 @@ def _item(
     return cohort_item_from_artifacts(identity, "7", reference, artifact)
 
 
-def _copy_item(item: CohortItem, simfile_id: str) -> CohortItem:
-    return dataclasses.replace(
-        item,
-        simfile_id=simfile_id,
-        reference_events=tuple(
-            dataclasses.replace(event, chart_id=simfile_id) for event in item.reference_events
-        ),
-        prediction_events=tuple(
-            dataclasses.replace(event, chart_id=simfile_id)
-            for event in item.prediction_events or ()
-        ),
-        artifact_identity=dataclasses.replace(
-            item.artifact_identity,
+def _copy_item(
+    item: CohortItem,
+    simfile_id: str,
+    identity: CohortIdentity,
+    *,
+    prediction: PredictionArtifact | None = None,
+) -> CohortItem:
+    assert item.reference_artifact is not None
+    assert item.prediction_artifact is not None
+    native_reference = tuple(
+        dataclasses.replace(
+            mapped.native,
             simfile_id=simfile_id,
-        ),
+            selected_chart_key=f"{simfile_id}/chart.dtx",
+            source_audio_key=f"{simfile_id}/audio.wav",
+        )
+        for mapped in item.reference_artifact.mapped_events
+    )
+    reference = map_reference_events(native_reference)
+    artifact = item.prediction_artifact if prediction is None else prediction
+    audio = dataclasses.replace(artifact.prediction.audio, source_audio_id=simfile_id)
+    mapped = dataclasses.replace(artifact.prediction, audio=audio)
+    copied_prediction = read_prediction_artifact(render_prediction_artifact(mapped))
+    return cohort_item_from_artifacts(
+        identity,
+        simfile_id,
+        reference,
+        copied_prediction,
+        warnings=item.warnings,
+    )
+
+
+def _with_prediction_map_version(
+    artifact: PredictionArtifact,
+    prediction_map_version: str,
+) -> PredictionArtifact:
+    events = tuple(
+        dataclasses.replace(event, prediction_map_version=prediction_map_version)
+        for event in artifact.prediction.events
+    )
+    return read_prediction_artifact(
+        render_prediction_artifact(dataclasses.replace(artifact.prediction, events=events))
     )
 
 
@@ -368,7 +395,7 @@ def test_persisted_artifacts_rescore_without_inference(tmp_path: Path) -> None:
 
     identity = _identity(artifact)
     item = _item(reference, artifact, identity)
-    unselected = _copy_item(item, "8")
+    unselected = _copy_item(item, "8", identity)
     selected = score_cohort(identity, (item, unselected), diagnostics_for=("7",))
     assert selected.event_diagnostics
     assert {row.simfile_id for row in selected.event_diagnostics} == {"7"}
@@ -381,22 +408,10 @@ def test_persisted_artifacts_rescore_without_inference(tmp_path: Path) -> None:
 
     changed_map = identity.prediction_map_version + "/rescored"
     changed_identity = dataclasses.replace(identity, prediction_map_version=changed_map)
-    changed_items = tuple(
-        dataclasses.replace(
-            cohort_item,
-            artifact_identity=dataclasses.replace(
-                cohort_item.artifact_identity,
-                prediction_map_version=changed_map,
-            ),
-            prediction_events=tuple(
-                dataclasses.replace(
-                    event,
-                    metadata={**event.metadata, "prediction_map_version": changed_map},
-                )
-                for event in cohort_item.prediction_events or ()
-            ),
-        )
-        for cohort_item in (item, unselected)
+    changed_artifact = _with_prediction_map_version(artifact, changed_map)
+    changed_items = (
+        cohort_item_from_artifacts(changed_identity, "7", reference, changed_artifact),
+        _copy_item(item, "8", changed_identity, prediction=changed_artifact),
     )
     rescored = score_cohort(changed_identity, changed_items)
     assert rescored.event_diagnostics == ()
