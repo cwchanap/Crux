@@ -192,7 +192,7 @@ def _copy_item(
     native_reference = tuple(
         dataclasses.replace(
             mapped.native,
-            simfile_id=simfile_id,
+            simfile_id=int(simfile_id),
             selected_chart_key=f"{simfile_id}/chart.dtx",
             source_audio_key=f"{simfile_id}/audio.wav",
         )

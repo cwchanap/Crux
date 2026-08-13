@@ -1,5 +1,7 @@
 from decimal import Decimal
 
+import pytest
+
 from src.benchmark.reference_set import CommonReferenceEvent
 from src.benchmark.scorer_input import reference_to_benchmark_events
 
@@ -31,3 +33,20 @@ def test_reference_adapter_preserves_common_projection_order() -> None:
         (1.0, "kick"),
         (1.0, "snare"),
     ]
+
+
+def test_reference_adapter_rejects_invalid_simfile_id() -> None:
+    common = (CommonReferenceEvent(Decimal("0.500000"), "kick", ()),)
+    for invalid in ("", 42, None):
+        with pytest.raises(ValueError, match="simfile_id must be a nonempty string"):
+            reference_to_benchmark_events(invalid, common)  # type: ignore[arg-type]
+
+
+def test_reference_adapter_returns_empty_tuple_for_no_events() -> None:
+    assert reference_to_benchmark_events("42", ()) == ()
+
+
+def test_reference_adapter_sets_empty_metadata() -> None:
+    common = (CommonReferenceEvent(Decimal("0.500000"), "kick", ()),)
+    result = reference_to_benchmark_events("42", common)
+    assert all(item.metadata == {} for item in result)
