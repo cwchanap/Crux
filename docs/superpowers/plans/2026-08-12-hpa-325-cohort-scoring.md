@@ -340,6 +340,13 @@ remains scoreable; its map identity comes from the existing OaF mapping
 identity because no event record exists. Non-success items keep their
 no-prediction shape and no artifact evidence.
 
+Before deriving successful-item evidence, validation re-reads
+`prediction_artifact.content` through `read_prediction_artifact()` and requires
+the canonical result to equal the retained artifact, including event count,
+hashes, descriptor, audio, and event projection. It also re-projects
+`reference.mapped_events` through `project_common_reference_events()` and
+requires the retained common events and duplicate-collapse diagnostic to agree.
+
 
 ```python
 def coverage_from_artifacts(

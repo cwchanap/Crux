@@ -178,6 +178,13 @@ identity because an empty artifact has no event record from which to read it.
 Non-success rows retain their existing no-prediction shape and no artifact
 evidence.
 
+Before deriving successful-item evidence, validation re-reads
+`prediction_artifact.content` through `read_prediction_artifact()` and requires
+the canonical result to equal the retained artifact, including event count,
+hashes, descriptor, audio, and event projection. It also re-projects
+`reference.mapped_events` through `project_common_reference_events()` and
+requires the retained common events and duplicate-collapse diagnostic to agree.
+
 ### 3. Identity validation reuses existing contracts and rejects mixed prediction cohorts
 
 `CohortIdentity` calls `require_sha256()` directly for its SHA-256 fields. `StrictJsonError` already subclasses `ValueError`, so no wrapper or second lowercase-hex validator is added.
