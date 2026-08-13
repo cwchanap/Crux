@@ -8,9 +8,10 @@ from dataclasses import dataclass
 from typing import Literal, get_args
 
 from src.benchmark.backend_identity import require_sha256
-from src.benchmark.models import BenchmarkEvent
+from src.benchmark.models import BenchmarkEvent, ScoreSummary
 from src.benchmark.prediction_artifact import PredictionArtifact
 from src.benchmark.reference_set import ReferenceMappingResult
+from src.benchmark.scoring import ScoreResult, score_events_with_alignment
 
 SCORING_VERSION = "crux.single-cohort-scoring/v1"
 DEFAULT_TOLERANCES_MS = (30, 50, 100)
@@ -27,6 +28,42 @@ CohortFailureReason = Literal[
 ]
 COHORT_FAILURE_REASONS = frozenset(get_args(CohortFailureReason))
 ScoreMode = Literal["raw", "aligned"]
+
+
+@dataclass(frozen=True)
+class ClassScore:
+    common_class: str
+    summary: ScoreSummary
+    reference_support: int
+    prediction_support: int
+
+
+@dataclass(frozen=True)
+class SongScore:
+    simfile_id: str
+    tolerance_ms: int
+    mode: ScoreMode
+    summary: ScoreSummary
+    prediction_to_reference_ratio: float
+    per_class: tuple[ClassScore, ...]
+    warnings: tuple[str, ...]
+
+
+# pylint: disable=too-many-instance-attributes
+@dataclass(frozen=True)
+class EventDiagnostic:
+    simfile_id: str
+    tolerance_ms: int
+    mode: ScoreMode
+    outcome: Literal["matched", "false_positive", "false_negative"]
+    common_class: str
+    reference_time_sec: float | None
+    prediction_time_sec: float | None
+    scored_prediction_time_sec: float | None
+    timing_error_sec: float | None
+
+
+# pylint: enable=too-many-instance-attributes
 
 
 # pylint: disable=too-many-instance-attributes
@@ -289,6 +326,172 @@ def _validate_coverage(
             raise ValueError("prediction native class counts must be nonnegative integers")
 
 
+def _score_success_items(
+    items: tuple[CohortItem, ...],
+    tolerances_ms: tuple[int, ...],
+    diagnostics_for: frozenset[str],
+) -> tuple[tuple[SongScore, ...], tuple[EventDiagnostic, ...]]:
+    """Score successful cohort items and optionally retain event diagnostics."""
+    song_scores: list[SongScore] = []
+    diagnostics: list[EventDiagnostic] = []
+
+    for item in sorted(items, key=lambda item: item.simfile_id):
+        if item.status != "success" or item.prediction_events is None:
+            continue
+
+        for tolerance_ms in sorted(tolerances_ms):
+            aligned = score_events_with_alignment(
+                list(item.reference_events),
+                list(item.prediction_events),
+                tolerance_sec=tolerance_ms / 1000.0,
+            )
+            for mode in SCORE_MODES:
+                score_result = aligned.raw if mode == "raw" else aligned.aligned
+                per_class = _class_scores(score_result)
+                song_scores.append(
+                    SongScore(
+                        simfile_id=item.simfile_id,
+                        tolerance_ms=tolerance_ms,
+                        mode=mode,
+                        summary=score_result.summary,
+                        prediction_to_reference_ratio=(
+                            len(item.prediction_events) / len(item.reference_events)
+                        ),
+                        per_class=per_class,
+                        warnings=tuple(item.warnings),
+                    )
+                )
+                if item.simfile_id in diagnostics_for:
+                    diagnostics.extend(_event_diagnostics(item, tolerance_ms, mode, score_result))
+
+    song_scores.sort(key=_song_score_sort_key)
+    diagnostics.sort(key=_event_diagnostic_sort_key)
+    return tuple(song_scores), tuple(diagnostics)
+
+
+def _class_scores(score_result: ScoreResult) -> tuple[ClassScore, ...]:
+    classes = {match.ground_truth.canonical_class for match in score_result.matches}
+    classes.update(match.prediction.canonical_class for match in score_result.matches)
+    classes.update(event.canonical_class for event in score_result.unmatched_ground_truth)
+    classes.update(event.canonical_class for event in score_result.unmatched_predictions)
+
+    rows: list[ClassScore] = []
+    for common_class in sorted(classes):
+        true_positives = sum(
+            match.ground_truth.canonical_class == common_class for match in score_result.matches
+        )
+        false_negatives = sum(
+            event.canonical_class == common_class for event in score_result.unmatched_ground_truth
+        )
+        false_positives = sum(
+            event.canonical_class == common_class for event in score_result.unmatched_predictions
+        )
+        summary = ScoreSummary(
+            true_positives=true_positives,
+            false_positives=false_positives,
+            false_negatives=false_negatives,
+        )
+        rows.append(
+            ClassScore(
+                common_class=common_class,
+                summary=summary,
+                reference_support=true_positives + false_negatives,
+                prediction_support=true_positives + false_positives,
+            )
+        )
+    return tuple(rows)
+
+
+def _event_diagnostics(
+    item: CohortItem,
+    tolerance_ms: int,
+    mode: ScoreMode,
+    score_result: ScoreResult,
+) -> list[EventDiagnostic]:
+    diagnostics: list[EventDiagnostic] = []
+
+    for match in score_result.matches:
+        prediction_time = _original_prediction_time(match.prediction, mode, score_result)
+        diagnostics.append(
+            EventDiagnostic(
+                simfile_id=item.simfile_id,
+                tolerance_ms=tolerance_ms,
+                mode=mode,
+                outcome="matched",
+                common_class=match.ground_truth.canonical_class,
+                reference_time_sec=match.ground_truth.time_sec,
+                prediction_time_sec=prediction_time,
+                scored_prediction_time_sec=match.prediction.time_sec,
+                timing_error_sec=match.timing_error_sec,
+            )
+        )
+
+    for event in score_result.unmatched_predictions:
+        prediction_time = _original_prediction_time(event, mode, score_result)
+        diagnostics.append(
+            EventDiagnostic(
+                simfile_id=item.simfile_id,
+                tolerance_ms=tolerance_ms,
+                mode=mode,
+                outcome="false_positive",
+                common_class=event.canonical_class,
+                reference_time_sec=None,
+                prediction_time_sec=prediction_time,
+                scored_prediction_time_sec=event.time_sec,
+                timing_error_sec=None,
+            )
+        )
+
+    for event in score_result.unmatched_ground_truth:
+        diagnostics.append(
+            EventDiagnostic(
+                simfile_id=item.simfile_id,
+                tolerance_ms=tolerance_ms,
+                mode=mode,
+                outcome="false_negative",
+                common_class=event.canonical_class,
+                reference_time_sec=event.time_sec,
+                prediction_time_sec=None,
+                scored_prediction_time_sec=None,
+                timing_error_sec=None,
+            )
+        )
+
+    return diagnostics
+
+
+def _original_prediction_time(
+    event: BenchmarkEvent,
+    mode: ScoreMode,
+    score_result: ScoreResult,
+) -> float:
+    if mode == "raw":
+        return event.time_sec
+    return event.time_sec - score_result.summary.offset_sec
+
+
+def _song_score_sort_key(score: SongScore) -> tuple[str, int, int]:
+    return score.simfile_id, score.tolerance_ms, _mode_rank(score.mode)
+
+
+def _event_diagnostic_sort_key(
+    diagnostic: EventDiagnostic,
+) -> tuple[str, int, int, str, str, float, float]:
+    return (
+        diagnostic.simfile_id,
+        diagnostic.tolerance_ms,
+        _mode_rank(diagnostic.mode),
+        diagnostic.outcome,
+        diagnostic.common_class,
+        -1.0 if diagnostic.reference_time_sec is None else diagnostic.reference_time_sec,
+        -1.0 if diagnostic.prediction_time_sec is None else diagnostic.prediction_time_sec,
+    )
+
+
+def _mode_rank(mode: ScoreMode) -> int:
+    return 0 if mode == "raw" else 1
+
+
 __all__ = [
     "SCORING_VERSION",
     "DEFAULT_TOLERANCES_MS",
@@ -297,9 +500,13 @@ __all__ = [
     "CohortFailureReason",
     "COHORT_FAILURE_REASONS",
     "ScoreMode",
+    "ClassScore",
+    "SongScore",
+    "EventDiagnostic",
     "CohortIdentity",
     "CohortCoverage",
     "CohortItem",
     "coverage_from_artifacts",
     "validate_cohort_items",
+    "_score_success_items",
 ]
