@@ -312,8 +312,32 @@ class CohortItem:
     coverage: CohortCoverage
     warnings: tuple[str, ...] = ()
     failure_reason: CohortFailureReason | None = None
+    artifact_identity: CohortArtifactIdentity | None = None
+```
+
+Add the narrow in-memory artifact handoff:
+
+```python
+def cohort_item_from_artifacts(
+    identity: CohortIdentity,
+    simfile_id: str,
+    reference: ReferenceMappingResult,
+    prediction: PredictionArtifact,
+    *,
+    warnings: tuple[str, ...] = (),
+) -> CohortItem: ...
+```
+
+Successful items retain a frozen `CohortArtifactIdentity` derived from the
+prediction descriptor/audio/map and the reference song identity. Validation
+requires that evidence and the cohort identity agree, rejects missing
+evidence, and rejects reference/prediction `BenchmarkEvent` `chart_id` or
+`source` mismatches. An empty OaF prediction artifact remains scoreable; its
+map identity comes from the existing OaF mapping identity because no event
+record exists. Non-success items keep their no-prediction shape.
 
 
+```python
 def coverage_from_artifacts(
     reference: ReferenceMappingResult,
     prediction: PredictionArtifact | None,

@@ -20,6 +20,7 @@ from src.benchmark.cohort_scoring import (
     CohortIdentity,
     CohortItem,
     CohortScoreResult,
+    cohort_item_from_artifacts,
     coverage_from_artifacts,
     score_cohort,
 )
@@ -176,20 +177,7 @@ def _item(
     artifact: PredictionArtifact,
     identity: CohortIdentity,
 ) -> CohortItem:
-    reference_events = reference_to_benchmark_events("7", reference.common_events)
-    prediction_events = prediction_to_benchmark_events(artifact)
-    assert all(
-        event.metadata["input_view_id"] == identity.input_view_id
-        and event.metadata["prediction_map_version"] == identity.prediction_map_version
-        for event in prediction_events
-    )
-    return CohortItem(
-        simfile_id="7",
-        status="success",
-        reference_events=reference_events,
-        prediction_events=prediction_events,
-        coverage=coverage_from_artifacts(reference, artifact),
-    )
+    return cohort_item_from_artifacts(identity, "7", reference, artifact)
 
 
 def _copy_item(item: CohortItem, simfile_id: str) -> CohortItem:
@@ -202,6 +190,10 @@ def _copy_item(item: CohortItem, simfile_id: str) -> CohortItem:
         prediction_events=tuple(
             dataclasses.replace(event, chart_id=simfile_id)
             for event in item.prediction_events or ()
+        ),
+        artifact_identity=dataclasses.replace(
+            item.artifact_identity,
+            simfile_id=simfile_id,
         ),
     )
 
@@ -392,6 +384,10 @@ def test_persisted_artifacts_rescore_without_inference(tmp_path: Path) -> None:
     changed_items = tuple(
         dataclasses.replace(
             cohort_item,
+            artifact_identity=dataclasses.replace(
+                cohort_item.artifact_identity,
+                prediction_map_version=changed_map,
+            ),
             prediction_events=tuple(
                 dataclasses.replace(
                     event,

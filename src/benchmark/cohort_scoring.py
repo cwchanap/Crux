@@ -9,11 +9,16 @@ from statistics import fmean, median
 from typing import Literal, get_args
 
 from src.benchmark import scoring
-from src.benchmark.backend_identity import require_sha256
+from src.benchmark.backend_identity import OAF_BACKEND_ID, require_sha256
 from src.benchmark.models import BenchmarkEvent, ScoreSummary
 from src.benchmark.prediction_artifact import PredictionArtifact
 from src.benchmark.reference_set import ReferenceMappingResult
+from src.benchmark.scorer_input import (
+    prediction_to_benchmark_events,
+    reference_to_benchmark_events,
+)
 from src.benchmark.scoring import ScoreResult, score_events_with_alignment
+from src.benchmark.taxonomy import OAF_PREDICTION_MAP_ID
 
 SCORING_VERSION = "crux.single-cohort-scoring/v1"
 DEFAULT_TOLERANCES_MS = (30, 50, 100)
@@ -178,6 +183,32 @@ class CohortCoverage:
     prediction_native_class_counts: tuple[tuple[str, int], ...] = ()
 
 
+@dataclass(frozen=True)
+class CohortArtifactIdentity:
+    """The descriptor-level provenance bound to one scoreable cohort item."""
+
+    simfile_id: str
+    backend_id: str
+    model_id: str
+    backend_descriptor_sha256: str
+    input_view_id: str
+    prediction_map_version: str
+
+    def __post_init__(self) -> None:
+        for field in (
+            "simfile_id",
+            "backend_id",
+            "model_id",
+            "backend_descriptor_sha256",
+            "input_view_id",
+            "prediction_map_version",
+        ):
+            value = getattr(self, field)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{field} must be a nonempty string")
+        require_sha256(self.backend_descriptor_sha256, "backend_descriptor_sha256")
+
+
 # pylint: enable=too-many-instance-attributes
 
 
@@ -190,6 +221,83 @@ class CohortItem:
     coverage: CohortCoverage
     warnings: tuple[str, ...] = ()
     failure_reason: CohortFailureReason | None = None
+    artifact_identity: CohortArtifactIdentity | None = None
+
+
+def cohort_item_from_artifacts(
+    identity: CohortIdentity,
+    simfile_id: str,
+    reference: ReferenceMappingResult,
+    prediction: PredictionArtifact,
+    *,
+    warnings: tuple[str, ...] = (),
+) -> CohortItem:
+    """Build one successful item while retaining artifact identity in memory.
+
+    The persisted artifacts remain the source of descriptor, model, backend,
+    input-view, map, and song identity.  Empty prediction artifacts use the
+    existing OaF backend map identity because their event records carry no map
+    field of their own.
+    """
+    if not isinstance(identity, CohortIdentity):
+        raise TypeError("identity must be CohortIdentity")
+    if not isinstance(simfile_id, str) or not simfile_id:
+        raise ValueError("simfile_id must be a nonempty string")
+    if not isinstance(reference, ReferenceMappingResult):
+        raise TypeError("reference must be ReferenceMappingResult")
+    if not isinstance(prediction, PredictionArtifact):
+        raise TypeError("prediction must be PredictionArtifact")
+    if not isinstance(warnings, tuple) or any(not isinstance(value, str) for value in warnings):
+        raise TypeError("warnings must be a tuple of strings")
+
+    for mapped_event in reference.mapped_events:
+        if str(mapped_event.native.simfile_id) != simfile_id:
+            raise ValueError("reference artifact simfile_id does not match item")
+
+    audio = prediction.prediction.audio
+    if audio.source_audio_id != simfile_id:
+        raise ValueError("prediction artifact source_audio_id does not match item")
+
+    descriptor = prediction.prediction.descriptor
+    descriptor_payload = descriptor.payload
+    backend_id = descriptor_payload.get("backend_id")
+    model_id = descriptor_payload.get("model_id")
+    if not isinstance(backend_id, str) or not backend_id:
+        raise ValueError("prediction descriptor backend_id is invalid")
+    if not isinstance(model_id, str) or not model_id:
+        raise ValueError("prediction descriptor model_id is invalid")
+
+    event_map_versions = {event.prediction_map_version for event in prediction.prediction.events}
+    if len(event_map_versions) > 1:
+        raise ValueError("prediction artifact has mixed prediction_map_version values")
+    if event_map_versions:
+        prediction_map_version = next(iter(event_map_versions))
+    elif backend_id == OAF_BACKEND_ID:
+        prediction_map_version = OAF_PREDICTION_MAP_ID
+    else:
+        raise ValueError("empty prediction artifact has no prediction_map_version")
+
+    artifact_identity = CohortArtifactIdentity(
+        simfile_id=simfile_id,
+        backend_id=backend_id,
+        model_id=model_id,
+        backend_descriptor_sha256=descriptor.sha256,
+        input_view_id=audio.input_view_id,
+        prediction_map_version=prediction_map_version,
+    )
+    _validate_artifact_identity(identity, artifact_identity, simfile_id)
+
+    item = CohortItem(
+        simfile_id=simfile_id,
+        status="success",
+        reference_events=reference_to_benchmark_events(simfile_id, reference.common_events),
+        prediction_events=prediction_to_benchmark_events(prediction),
+        coverage=coverage_from_artifacts(reference, prediction),
+        warnings=warnings,
+        artifact_identity=artifact_identity,
+    )
+    validate_cohort_items(identity, (item,))
+    return item
 
 
 def coverage_from_artifacts(
@@ -266,6 +374,7 @@ def validate_cohort_items(
 
         if item.status not in {"success", "failed", "skipped", "quarantined"}:
             raise ValueError("cohort item has an invalid status")
+        _validate_event_sources(item)
         _validate_coverage(item.coverage, item.reference_events)
 
         if item.status == "success":
@@ -275,6 +384,9 @@ def validate_cohort_items(
                 raise ValueError("success item requires prediction_events")
             if item.failure_reason is not None:
                 raise ValueError("success item requires failure_reason to be None")
+            if item.artifact_identity is None:
+                raise ValueError("success item requires artifact_identity")
+            _validate_artifact_identity(identity, item.artifact_identity, item.simfile_id)
             if item.coverage.prediction_native_event_count is None:
                 raise ValueError("success item requires prediction coverage")
             if item.coverage.prediction_mapped_event_count != len(item.prediction_events):
@@ -290,6 +402,8 @@ def validate_cohort_items(
                     )
             continue
 
+        if item.artifact_identity is not None:
+            raise ValueError(f"{item.status} item must not have artifact_identity")
         if item.prediction_events is not None:
             raise ValueError(f"{item.status} item must not have prediction_events")
         if any(
@@ -320,6 +434,48 @@ def validate_cohort_items(
         else:
             if item.failure_reason != "reference_quarantined":
                 raise ValueError("quarantined item requires reference_quarantined")
+
+
+def _validate_artifact_identity(
+    identity: CohortIdentity,
+    artifact_identity: CohortArtifactIdentity,
+    simfile_id: str,
+) -> None:
+    if not isinstance(artifact_identity, CohortArtifactIdentity):
+        raise TypeError("artifact_identity must be CohortArtifactIdentity")
+    if artifact_identity.simfile_id != simfile_id:
+        raise ValueError("artifact simfile_id does not match item")
+    expected_fields = (
+        "backend_id",
+        "model_id",
+        "backend_descriptor_sha256",
+        "input_view_id",
+        "prediction_map_version",
+    )
+    for field in expected_fields:
+        expected = getattr(identity, field)
+        actual = getattr(artifact_identity, field)
+        if actual != expected:
+            raise ValueError(f"artifact {field} does not match cohort")
+
+
+def _validate_event_sources(item: CohortItem) -> None:
+    for event in item.reference_events:
+        if not isinstance(event, BenchmarkEvent):
+            raise TypeError("reference_events must contain BenchmarkEvent values")
+        if event.chart_id != item.simfile_id:
+            raise ValueError("reference event chart_id does not match item simfile_id")
+        if event.source != "ground_truth":
+            raise ValueError("reference event source must be ground_truth")
+    if item.prediction_events is None:
+        return
+    for event in item.prediction_events:
+        if not isinstance(event, BenchmarkEvent):
+            raise TypeError("prediction_events must contain BenchmarkEvent values")
+        if event.chart_id != item.simfile_id:
+            raise ValueError("prediction event chart_id does not match item simfile_id")
+        if event.source != "prediction":
+            raise ValueError("prediction event source must be prediction")
 
 
 def _validate_coverage(
@@ -756,8 +912,10 @@ __all__ = [
     "EventDiagnostic",
     "CohortIdentity",
     "CohortCoverage",
+    "CohortArtifactIdentity",
     "CohortItem",
     "coverage_from_artifacts",
+    "cohort_item_from_artifacts",
     "validate_cohort_items",
     "score_cohort",
     "_score_success_items",
