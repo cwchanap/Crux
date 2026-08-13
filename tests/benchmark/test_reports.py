@@ -7,21 +7,50 @@ from pathlib import Path
 
 import pytest
 
-from src.benchmark import cohort_scoring
-from src.benchmark.backend_identity import StrictJsonError, strict_json_loads
+from src.benchmark.backend_identity import (
+    OAF_BACKEND_ID,
+    OAF_DESCRIPTOR_SCHEMA,
+    StrictJsonError,
+    build_descriptor,
+    strict_json_loads,
+)
+from src.benchmark.backends import CanonicalAudio, NativeEvent, NativePrediction
 from src.benchmark.cohort_scoring import (
     CohortCoverage,
     CohortIdentity,
     CohortItem,
+    cohort_item_from_artifacts,
     score_cohort,
 )
+from src.benchmark.mapping import map_oaf_prediction
 from src.benchmark.models import BenchmarkEvent
+from src.benchmark.prediction_artifact import (
+    read_prediction_artifact,
+    render_prediction_artifact,
+)
+from src.benchmark.reference_set import map_reference_events
+from src.benchmark.reference_timing import NativeReferenceEvent
 from src.benchmark.reports import (
     REPORT_SCHEMA,
     _csv_decimal,
     _report_decimal,
     write_cohort_reports,
 )
+
+
+def _descriptor():
+    payload = {
+        "architecture_id": "magenta-oaf-model-tpu-drums-v1",
+        "backend_id": OAF_BACKEND_ID,
+        "descriptor_schema": OAF_DESCRIPTOR_SCHEMA,
+        "model_id": "magenta-egmd-ckpt-569400-v1",
+        "native_metadata_schema_id": "magenta-oaf-native-metadata-v1",
+        "native_output_space_id": "magenta-oaf-midi88-a0-v1",
+        "prediction_schema": "crux.drum-prediction-events/v2",
+        "training_data_map_id": "magenta-egmd-data-8hit-94529798-v1",
+        "upstream_source_commit": "94529798dfbbb14c27ddfd76f23027dc8e2ce185",
+    }
+    return build_descriptor(payload, frozenset(payload), OAF_DESCRIPTOR_SCHEMA)
 
 
 def _identity() -> CohortIdentity:
@@ -31,11 +60,11 @@ def _identity() -> CohortIdentity:
         reference_timing_version="sha256:" + "b" * 64,
         taxonomy_version="crux.dtx-taxonomy/v1",
         lane_map_version="crux.dtx-lane-map/v1",
-        backend_id="backend-v1",
-        model_id="model-v1",
+        backend_id=OAF_BACKEND_ID,
+        model_id="magenta-egmd-ckpt-569400-v1",
         model_lock_sha256="c" * 64,
-        backend_descriptor_sha256="d" * 64,
-        prediction_map_version="map-v1",
+        backend_descriptor_sha256=_descriptor().sha256,
+        prediction_map_version="crux.prediction-map/oaf-egmd-8hit-v1",
         input_view_id="full-mix-v1",
     )
 
@@ -53,6 +82,80 @@ def _item(
     prediction_native_class_counts: tuple[tuple[str, int], ...] = (),
 ) -> CohortItem:
     reference_events = (BenchmarkEvent(simfile_id, 0.5, "kick", "ground_truth"),)
+    if status == "success":
+        assert prediction_events is not None
+        reference = map_reference_events(
+            (
+                NativeReferenceEvent(
+                    simfile_id=simfile_id,
+                    selected_chart_key=f"{simfile_id}/chart.dtx",
+                    selected_chart_content_hash="e" * 64,
+                    source_audio_key=f"{simfile_id}/audio.wav",
+                    source_audio_content_hash="f" * 64,
+                    source_order=0,
+                    measure=1,
+                    position=0.0,
+                    lane_id="13",
+                    note_id="kick-0",
+                    chart_time_sec=0.5,
+                    audio_time_sec=0.5,
+                ),
+            )
+        )
+        group_by_class = {
+            "kick": "kick",
+            "snare": "snare",
+            "hihat": "hihat",
+            "tom": "toms",
+            "crash": "crash",
+            "ride": "ride",
+        }
+        native_events = [
+            NativeEvent(
+                time_sec=event.time_sec,
+                native_class_id="midi_36",
+                model_output_bin=15,
+                native_midi_note=36,
+                native_metadata={"upstream_8hit_group_id": group_by_class[event.canonical_class]},
+                confidence=0.9,
+                velocity_midi=100,
+            )
+            for index, event in enumerate(prediction_events)
+        ]
+        extra_native_count = (prediction_native_event_count or 0) - len(native_events)
+        native_events.extend(
+            NativeEvent(
+                time_sec=9.0 + index,
+                native_class_id="midi_75",
+                model_output_bin=54,
+                native_midi_note=75,
+                native_metadata={"upstream_8hit_group_id": "sticks"},
+                confidence=0.9,
+                velocity_midi=100,
+            )
+            for index in range(max(0, extra_native_count))
+        )
+        audio = CanonicalAudio(
+            Path(),
+            simfile_id,
+            "a" * 64,
+            "full-mix-v1",
+            "b" * 64,
+            46,
+            44100,
+            1,
+            2,
+            1,
+        )
+        mapped, _ = map_oaf_prediction(NativePrediction(audio, _descriptor(), tuple(native_events)))
+        artifact = read_prediction_artifact(render_prediction_artifact(mapped))
+        return cohort_item_from_artifacts(
+            _identity(),
+            simfile_id,
+            reference,
+            artifact,
+            warnings=warnings,
+        )
     return CohortItem(
         simfile_id=simfile_id,
         status=status,  # type: ignore[arg-type]
@@ -71,18 +174,6 @@ def _item(
         ),
         warnings=warnings,
         failure_reason=failure_reason,  # type: ignore[arg-type]
-        artifact_identity=(
-            cohort_scoring.CohortArtifactIdentity(
-                simfile_id=simfile_id,
-                backend_id="backend-v1",
-                model_id="model-v1",
-                backend_descriptor_sha256="d" * 64,
-                input_view_id="full-mix-v1",
-                prediction_map_version="map-v1",
-            )
-            if prediction_events is not None
-            else None
-        ),
     )
 
 

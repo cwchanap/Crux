@@ -313,6 +313,8 @@ class CohortItem:
     warnings: tuple[str, ...] = ()
     failure_reason: CohortFailureReason | None = None
     artifact_identity: CohortArtifactIdentity | None = None
+    reference_artifact: ReferenceMappingResult | None = None
+    prediction_artifact: PredictionArtifact | None = None
 ```
 
 Add the narrow in-memory artifact handoff:
@@ -328,13 +330,15 @@ def cohort_item_from_artifacts(
 ) -> CohortItem: ...
 ```
 
-Successful items retain a frozen `CohortArtifactIdentity` derived from the
-prediction descriptor/audio/map and the reference song identity. Validation
-requires that evidence and the cohort identity agree, rejects missing
-evidence, and rejects reference/prediction `BenchmarkEvent` `chart_id` or
-`source` mismatches. An empty OaF prediction artifact remains scoreable; its
-map identity comes from the existing OaF mapping identity because no event
-record exists. Non-success items keep their no-prediction shape.
+Successful items retain the actual `ReferenceMappingResult` and
+`PredictionArtifact` objects used to derive their events and coverage, plus a
+frozen `CohortArtifactIdentity` derived from their descriptor/audio/map and
+reference song identity. Validation recomputes events, coverage, and identity
+from those retained artifacts before scoring; caller-supplied event tuples or
+identity values cannot bless forged evidence. An empty OaF prediction artifact
+remains scoreable; its map identity comes from the existing OaF mapping
+identity because no event record exists. Non-success items keep their
+no-prediction shape and no artifact evidence.
 
 
 ```python
