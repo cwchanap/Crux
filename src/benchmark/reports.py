@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import csv
+import os
+import tempfile
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -442,7 +444,7 @@ def _markdown_summary(result: CohortScoreResult) -> str:
     if not raw_50:
         lines.append("No successful songs.")
     else:
-        for row in raw_50[-5:]:
+        for row in reversed(raw_50[-5:]):
             lines.append(f"- `{row.simfile_id}`: F1={_markdown_value(row.summary.f1)}")
     return "\n".join(lines) + "\n"
 
@@ -465,32 +467,48 @@ def write_cohort_reports(
         summary_markdown=output_dir / "summary.md",
     )
 
-    artifacts.summary_json.write_bytes(canonical_json_bytes(_summary_payload(result)))
-    _write_csv(
-        artifacts.items_csv,
-        _ITEM_FIELDNAMES,
-        [_item_row(result, item) for item in result.items],
+    artifact_fields = (
+        "summary_json",
+        "items_csv",
+        "per_song_csv",
+        "per_class_csv",
+        "event_diagnostics_jsonl",
+        "summary_markdown",
     )
-    _write_csv(
-        artifacts.per_song_csv,
-        _PER_SONG_FIELDNAMES,
-        [_song_row(result, row) for row in result.song_scores],
-    )
-    _write_csv(
-        artifacts.per_class_csv,
-        _PER_CLASS_FIELDNAMES,
-        [
-            _class_row(result, song, class_row)
-            for song in result.song_scores
-            for class_row in song.per_class
-        ],
-    )
-    with artifacts.event_diagnostics_jsonl.open("wb") as handle:
-        for diagnostic in result.event_diagnostics:
-            handle.write(
-                canonical_json_bytes(_diagnostic_payload(result, diagnostic), trailing_newline=True)
-            )
-    artifacts.summary_markdown.write_text(_markdown_summary(result), encoding="utf-8")
+    with tempfile.TemporaryDirectory(prefix=".cohort-report-stage-", dir=output_dir) as stage_name:
+        staged_dir = Path(stage_name)
+        staged = {field: staged_dir / getattr(artifacts, field).name for field in artifact_fields}
+        staged["summary_json"].write_bytes(canonical_json_bytes(_summary_payload(result)))
+        _write_csv(
+            staged["items_csv"],
+            _ITEM_FIELDNAMES,
+            [_item_row(result, item) for item in result.items],
+        )
+        _write_csv(
+            staged["per_song_csv"],
+            _PER_SONG_FIELDNAMES,
+            [_song_row(result, row) for row in result.song_scores],
+        )
+        _write_csv(
+            staged["per_class_csv"],
+            _PER_CLASS_FIELDNAMES,
+            [
+                _class_row(result, song, class_row)
+                for song in result.song_scores
+                for class_row in song.per_class
+            ],
+        )
+        with staged["event_diagnostics_jsonl"].open("wb") as handle:
+            for diagnostic in result.event_diagnostics:
+                handle.write(
+                    canonical_json_bytes(
+                        _diagnostic_payload(result, diagnostic), trailing_newline=True
+                    )
+                )
+        staged["summary_markdown"].write_text(_markdown_summary(result), encoding="utf-8")
+
+        for field in artifact_fields:
+            os.replace(staged[field], getattr(artifacts, field))
     return artifacts
 
 

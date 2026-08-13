@@ -32,6 +32,7 @@ from src.benchmark.reference_set import map_reference_events
 from src.benchmark.reference_timing import NativeReferenceEvent
 from src.benchmark.reports import (
     REPORT_SCHEMA,
+    ReportArtifacts,
     _csv_decimal,
     _report_decimal,
     write_cohort_reports,
@@ -87,7 +88,7 @@ def _item(
         reference = map_reference_events(
             (
                 NativeReferenceEvent(
-                    simfile_id=simfile_id,
+                    simfile_id=int(simfile_id),
                     selected_chart_key=f"{simfile_id}/chart.dtx",
                     selected_chart_content_hash="e" * 64,
                     source_audio_key=f"{simfile_id}/audio.wav",
@@ -196,23 +197,16 @@ def _result(*, diagnostics_for: tuple[str, ...] = (), reverse_items: bool = Fals
         prediction_events=(_prediction("1", 0.5), _prediction("1", 1.0)),
         warnings=("z-warning", "a-warning"),
         prediction_native_event_count=2,
-        prediction_mapped_event_count=2,
-        prediction_unmapped_event_count=0,
-        prediction_native_class_counts=(("midi_46", 1), ("midi_36", 1)),
     )
     partial = _item(
         "4",
         prediction_events=(_prediction("4", 0.5),),
         prediction_native_event_count=2,
-        prediction_mapped_event_count=1,
-        prediction_unmapped_event_count=1,
     )
     empty = _item(
         "2",
         prediction_events=(),
         prediction_native_event_count=0,
-        prediction_mapped_event_count=0,
-        prediction_unmapped_event_count=0,
     )
     failed = _item(
         "3",
@@ -309,28 +303,29 @@ def test_default_diagnostics_are_empty(tmp_path: Path) -> None:
     assert artifacts.event_diagnostics_jsonl.read_bytes() == b""
 
 
+_REPORT_ARTIFACT_FIELDS = (
+    "summary_json",
+    "items_csv",
+    "per_song_csv",
+    "per_class_csv",
+    "event_diagnostics_jsonl",
+    "summary_markdown",
+)
+
+
+def _assert_same_bytes(first: ReportArtifacts, second: ReportArtifacts) -> None:
+    for first_path, second_path in zip(
+        (getattr(first, field) for field in _REPORT_ARTIFACT_FIELDS),
+        (getattr(second, field) for field in _REPORT_ARTIFACT_FIELDS),
+        strict=True,
+    ):
+        assert first_path.read_bytes() == second_path.read_bytes()
+
+
 def test_report_bytes_are_deterministic_for_same_result(tmp_path: Path) -> None:
     first = write_cohort_reports(_result(diagnostics_for=("1",)), tmp_path / "first")
     second = write_cohort_reports(_result(diagnostics_for=("1",)), tmp_path / "second")
-    for first_path, second_path in zip(
-        (
-            first.summary_json,
-            first.items_csv,
-            first.per_song_csv,
-            first.per_class_csv,
-            first.event_diagnostics_jsonl,
-            first.summary_markdown,
-        ),
-        (
-            second.summary_json,
-            second.items_csv,
-            second.per_song_csv,
-            second.per_class_csv,
-            second.event_diagnostics_jsonl,
-            second.summary_markdown,
-        ),
-    ):
-        assert first_path.read_bytes() == second_path.read_bytes()
+    _assert_same_bytes(first, second)
 
 
 def test_reversed_input_order_keeps_all_report_bytes_identical(tmp_path: Path) -> None:
@@ -338,22 +333,4 @@ def test_reversed_input_order_keeps_all_report_bytes_identical(tmp_path: Path) -
     second = write_cohort_reports(
         _result(diagnostics_for=("1",), reverse_items=True), tmp_path / "second"
     )
-    for first_path, second_path in zip(
-        (
-            first.summary_json,
-            first.items_csv,
-            first.per_song_csv,
-            first.per_class_csv,
-            first.event_diagnostics_jsonl,
-            first.summary_markdown,
-        ),
-        (
-            second.summary_json,
-            second.items_csv,
-            second.per_song_csv,
-            second.per_class_csv,
-            second.event_diagnostics_jsonl,
-            second.summary_markdown,
-        ),
-    ):
-        assert first_path.read_bytes() == second_path.read_bytes()
+    _assert_same_bytes(first, second)

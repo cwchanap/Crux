@@ -6,7 +6,7 @@
 
 **Architecture:** Keep `src/benchmark/scoring.py` as the sole onset-matching/alignment implementation. Add one small `cohort_scoring.py` module for the in-memory cohort contract, identity/coverage validation, canonical ordering, bounded diagnostics, per-class derivation, population accounting, and aggregates. Extend `scorer_input.py` only with the reference-side common-event adapter. Rewrite the small `reports.py` API as deterministic rendering over one canonical result object; HPA-326 later adapts its run rows into `CohortItem` rather than HPA-325 inventing a run schema.
 
-**Tech Stack:** Python 3.12, frozen dataclasses, `typing.Literal`, `statistics.fmean`/`median`, existing `BenchmarkEvent`/`ScoreSummary`/`ScoreResult`, existing `require_sha256()` / `quantize_six()` / canonical JSON helpers, CSV, pathlib, pytest, Ruff, Pylint.
+**Tech Stack:** Python 3.13, frozen dataclasses, `typing.Literal`, `statistics.fmean`/`median`, existing `BenchmarkEvent`/`ScoreSummary`/`ScoreResult`, existing `require_sha256()` / `quantize_six()` / canonical JSON helpers, CSV, pathlib, pytest, Ruff, Pylint.
 
 ## Global Constraints
 

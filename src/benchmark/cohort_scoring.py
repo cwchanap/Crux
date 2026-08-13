@@ -729,7 +729,9 @@ def _cohort_aggregates(
                     mode=mode,
                     event_micro=event_micro,
                     song_macro_f1=_mean_f1(song_f1_values),
-                    class_macro_f1=_mean_f1(tuple(row.summary.f1 for row in per_class)),
+                    class_macro_f1=_mean_f1(
+                        tuple(row.summary.f1 for row in per_class if row.reference_support > 0)
+                    ),
                     song_f1_distribution=_f1_distribution(song_f1_values),
                     per_class=per_class,
                     successful_song_count=len(rows),

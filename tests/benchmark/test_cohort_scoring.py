@@ -49,7 +49,7 @@ from src.benchmark.taxonomy import (
 )
 
 
-def identity() -> CohortIdentity:
+def build_identity() -> CohortIdentity:
     return CohortIdentity(
         cohort_id="oaf-full-mix-v1",
         reference_manifest_sha256="a" * 64,
@@ -59,13 +59,13 @@ def identity() -> CohortIdentity:
         backend_id=OAF_BACKEND_ID,
         model_id="magenta-egmd-ckpt-569400-v1",
         model_lock_sha256="c" * 64,
-        backend_descriptor_sha256=descriptor().sha256,
+        backend_descriptor_sha256=build_descriptor_payload().sha256,
         prediction_map_version=OAF_PREDICTION_MAP_ID,
         input_view_id="full-mix-v1",
     )
 
 
-def native_reference(
+def build_native_reference(
     lane_id: str, audio_time_sec: float, source_order: int
 ) -> NativeReferenceEvent:
     return NativeReferenceEvent(
@@ -84,18 +84,18 @@ def native_reference(
     )
 
 
-def reference_mapping():
+def build_reference_mapping():
     return map_reference_events(
         (
-            native_reference("14", 1.0, 0),
-            native_reference("15", 1.0, 1),
-            native_reference("13", 2.0, 2),
-            native_reference("54", 3.0, 3),
+            build_native_reference("14", 1.0, 0),
+            build_native_reference("15", 1.0, 1),
+            build_native_reference("13", 2.0, 2),
+            build_native_reference("54", 3.0, 3),
         )
     )
 
 
-def descriptor():
+def build_descriptor_payload():
     payload = {
         "architecture_id": "magenta-oaf-model-tpu-drums-v1",
         "backend_id": OAF_BACKEND_ID,
@@ -110,7 +110,7 @@ def descriptor():
     return build_descriptor(payload, frozenset(payload), OAF_DESCRIPTOR_SCHEMA)
 
 
-def prediction_artifact(tmp_path: Path) -> PredictionArtifact:
+def build_prediction_artifact(tmp_path: Path) -> PredictionArtifact:
     audio_content = (
         struct.pack("<4sI4s", b"RIFF", 40, b"WAVE")
         + struct.pack("<4sIHHIIHH", b"fmt ", 16, 1, 1, 44100, 88200, 2, 16)
@@ -152,7 +152,9 @@ def prediction_artifact(tmp_path: Path) -> PredictionArtifact:
             velocity_midi=95,
         ),
     )
-    mapped, _ = map_oaf_prediction(NativePrediction(audio, descriptor(), native_events))
+    mapped, _ = map_oaf_prediction(
+        NativePrediction(audio, build_descriptor_payload(), native_events)
+    )
     return read_prediction_artifact(render_prediction_artifact(mapped))
 
 
@@ -224,7 +226,9 @@ def synthetic_prediction_artifact(
         )
         for index, event in enumerate(events)
     )
-    mapped, _ = map_oaf_prediction(NativePrediction(audio, descriptor(), native_events))
+    mapped, _ = map_oaf_prediction(
+        NativePrediction(audio, build_descriptor_payload(), native_events)
+    )
     return read_prediction_artifact(render_prediction_artifact(mapped))
 
 
@@ -232,18 +236,18 @@ def no_prediction_coverage() -> CohortCoverage:
     return CohortCoverage(2, 2, 0, 0, 0, None, None, None)
 
 
-def artifact_identity(simfile_id: str) -> cohort_scoring.CohortArtifactIdentity:
+def build_artifact_identity(simfile_id: str) -> cohort_scoring.CohortArtifactIdentity:
     return cohort_scoring.CohortArtifactIdentity(
         simfile_id=simfile_id,
-        backend_id=identity().backend_id,
-        model_id=identity().model_id,
-        backend_descriptor_sha256=identity().backend_descriptor_sha256,
-        input_view_id=identity().input_view_id,
-        prediction_map_version=identity().prediction_map_version,
+        backend_id=build_identity().backend_id,
+        model_id=build_identity().model_id,
+        backend_descriptor_sha256=build_identity().backend_descriptor_sha256,
+        input_view_id=build_identity().input_view_id,
+        prediction_map_version=build_identity().prediction_map_version,
     )
 
 
-def item(
+def build_item(
     *,
     simfile_id: str = "42",
     status: str = "success",
@@ -270,7 +274,7 @@ def item(
         ),
         failure_reason=failure_reason,  # type: ignore[arg-type]
         artifact_identity=(
-            artifact_identity(simfile_id) if prediction_events is not None else None
+            build_artifact_identity(simfile_id) if prediction_events is not None else None
         ),
     )
 
@@ -294,27 +298,27 @@ def test_cohort_failure_reason_set_is_closed() -> None:
     ["reference_manifest_sha256", "model_lock_sha256", "backend_descriptor_sha256"],
 )
 def test_identity_reuses_shared_sha256_validation(field: str) -> None:
-    values = dataclasses.asdict(identity())
+    values = dataclasses.asdict(build_identity())
     values[field] = "ABC"
     with pytest.raises(ValueError, match=f"{field} must be lowercase SHA-256"):
         CohortIdentity(**values)
 
 
 def test_identity_requires_nonempty_fields_and_exact_scoring_version() -> None:
-    values = dataclasses.asdict(identity())
+    values = dataclasses.asdict(build_identity())
     values["model_id"] = ""
     with pytest.raises(ValueError, match="model_id must be a nonempty string"):
         CohortIdentity(**values)
 
-    values = dataclasses.asdict(identity())
+    values = dataclasses.asdict(build_identity())
     values["scoring_version"] = "other/v1"
     with pytest.raises(ValueError, match=SCORING_VERSION):
         CohortIdentity(**values)
 
 
 def test_coverage_from_reference_and_prediction_artifacts(tmp_path: Path) -> None:
-    reference = reference_mapping()
-    coverage = coverage_from_artifacts(reference, prediction_artifact(tmp_path))
+    reference = build_reference_mapping()
+    coverage = coverage_from_artifacts(reference, build_prediction_artifact(tmp_path))
 
     assert coverage.reference_native_event_count == 4
     assert coverage.reference_common_event_count == 2
@@ -335,7 +339,7 @@ def test_coverage_from_reference_and_prediction_artifacts(tmp_path: Path) -> Non
 
 
 def test_coverage_without_prediction_has_no_prediction_counts() -> None:
-    coverage = coverage_from_artifacts(reference_mapping(), None)
+    coverage = coverage_from_artifacts(build_reference_mapping(), None)
 
     assert coverage.prediction_native_event_count is None
     assert coverage.prediction_mapped_event_count is None
@@ -347,47 +351,49 @@ def test_validate_cohort_items_accepts_success_and_closed_failure_shapes() -> No
     successful = cohort_scoring_item(
         "42",
         (
-            scoring_event("42", 1.0, "tom", "ground_truth"),
-            scoring_event("42", 2.0, "kick", "ground_truth"),
+            build_scoring_event("42", 1.0, "tom", "ground_truth"),
+            build_scoring_event("42", 2.0, "kick", "ground_truth"),
         ),
         (),
     )
-    failed = item(
+    failed = build_item(
         simfile_id="43",
         status="failed",
         prediction_events=None,
         failure_reason="backend_unavailable",
     )
-    skipped = item(
+    skipped = build_item(
         simfile_id="44",
         status="skipped",
         prediction_events=None,
         failure_reason="explicitly_skipped",
     )
-    quarantined = item(
+    quarantined = build_item(
         simfile_id="45",
         status="quarantined",
         prediction_events=None,
         failure_reason="reference_quarantined",
     )
 
-    assert validate_cohort_items(identity(), (successful, failed, skipped, quarantined)) is None
+    assert (
+        validate_cohort_items(build_identity(), (successful, failed, skipped, quarantined)) is None
+    )
 
 
 def test_validate_cohort_items_rejects_duplicate_ids_and_invalid_status_shapes() -> None:
+    successful = cohort_scoring_item(
+        "42",
+        (build_scoring_event("42", 1.0, "kick", "ground_truth"),),
+        (),
+    )
     with pytest.raises(ValueError, match="simfile_id values must be unique"):
-        successful = cohort_scoring_item(
-            "42",
-            (scoring_event("42", 1.0, "kick", "ground_truth"),),
-            (),
-        )
-        validate_cohort_items(identity(), (successful, successful))
+        validate_cohort_items(build_identity(), (successful, successful))
 
     with pytest.raises(ValueError, match="success item requires nonempty reference_events"):
         validate_cohort_items(
-            identity(),
+            build_identity(),
             (
-                item(
+                build_item(
                     reference_events=(),
                     coverage=CohortCoverage(0, 0, 0, 0, 0, 0, 0, 0),
                 ),
@@ -395,14 +401,16 @@ def test_validate_cohort_items_rejects_duplicate_ids_and_invalid_status_shapes()
         )
 
     with pytest.raises(ValueError, match="success item requires failure_reason to be None"):
-        validate_cohort_items(identity(), (item(failure_reason="prediction_missing"),))
+        validate_cohort_items(build_identity(), (build_item(failure_reason="prediction_missing"),))
 
     with pytest.raises(ValueError, match="failed item requires a prediction failure reason"):
-        validate_cohort_items(identity(), (item(status="failed", prediction_events=None),))
+        validate_cohort_items(
+            build_identity(), (build_item(status="failed", prediction_events=None),)
+        )
 
 
 def test_validate_cohort_items_rejects_unbalanced_coverage() -> None:
-    invalid = item(
+    invalid = build_item(
         coverage=CohortCoverage(
             reference_native_event_count=2,
             reference_common_event_count=1,
@@ -415,11 +423,11 @@ def test_validate_cohort_items_rejects_unbalanced_coverage() -> None:
         ),
     )
     with pytest.raises(ValueError, match="reference coverage counts do not balance"):
-        validate_cohort_items(identity(), (invalid,))
+        validate_cohort_items(build_identity(), (invalid,))
 
 
 def test_non_success_items_reject_prediction_native_class_counts() -> None:
-    invalid = item(
+    invalid = build_item(
         simfile_id="46",
         status="skipped",
         prediction_events=None,
@@ -437,34 +445,34 @@ def test_non_success_items_reject_prediction_native_class_counts() -> None:
         ),
     )
     with pytest.raises(ValueError, match="must not have prediction native class counts"):
-        validate_cohort_items(identity(), (invalid,))
+        validate_cohort_items(build_identity(), (invalid,))
 
 
 def test_success_requires_prediction_coverage_to_match_events() -> None:
     valid = cohort_scoring_item(
         "42",
-        (scoring_event("42", 1.0, "tom", "ground_truth"),),
-        (scoring_event("42", 1.0, "tom", "prediction"),),
+        (build_scoring_event("42", 1.0, "tom", "ground_truth"),),
+        (build_scoring_event("42", 1.0, "tom", "prediction"),),
     )
     invalid = dataclasses.replace(
         valid,
         coverage=dataclasses.replace(valid.coverage, prediction_mapped_event_count=0),
     )
     with pytest.raises(ValueError, match="coverage"):
-        validate_cohort_items(identity(), (invalid,))
+        validate_cohort_items(build_identity(), (invalid,))
 
 
 def test_validate_cohort_items_reconciles_success_prediction_metadata(tmp_path: Path) -> None:
     artifact = _artifact_for_song(tmp_path, "42")
-    reference = reference_mapping()
+    reference = build_reference_mapping()
     prediction_events = prediction_to_benchmark_events(artifact)
     valid = cohort_scoring.cohort_item_from_artifacts(
-        identity(),
+        build_identity(),
         "42",
         reference,
         artifact,
     )
-    assert validate_cohort_items(identity(), (valid,)) is None
+    assert validate_cohort_items(build_identity(), (valid,)) is None
 
     mixed_view_event = dataclasses.replace(
         prediction_events[0],
@@ -472,7 +480,7 @@ def test_validate_cohort_items_reconciles_success_prediction_metadata(tmp_path: 
     )
     with pytest.raises(ValueError, match="input_view_id"):
         validate_cohort_items(
-            identity(),
+            build_identity(),
             (dataclasses.replace(valid, prediction_events=(mixed_view_event,)),),
         )
 
@@ -482,20 +490,20 @@ def test_validate_cohort_items_reconciles_success_prediction_metadata(tmp_path: 
     )
     with pytest.raises(ValueError, match="prediction_map_version"):
         validate_cohort_items(
-            identity(),
+            build_identity(),
             (dataclasses.replace(valid, prediction_events=(mixed_map_event,)),),
         )
 
     missing_metadata_event = dataclasses.replace(prediction_events[0], metadata={})
     with pytest.raises(ValueError, match="input_view_id"):
         validate_cohort_items(
-            identity(),
+            build_identity(),
             (dataclasses.replace(valid, prediction_events=(missing_metadata_event,)),),
         )
 
 
 def _artifact_for_song(tmp_path: Path, simfile_id: str) -> PredictionArtifact:
-    artifact = prediction_artifact(tmp_path)
+    artifact = build_prediction_artifact(tmp_path)
     audio = dataclasses.replace(artifact.prediction.audio, source_audio_id=simfile_id)
     mapped = dataclasses.replace(artifact.prediction, audio=audio)
     return read_prediction_artifact(render_prediction_artifact(mapped))
@@ -510,11 +518,11 @@ def _empty_artifact_for_song(tmp_path: Path, simfile_id: str) -> PredictionArtif
 def test_cohort_item_from_artifacts_binds_song_and_descriptor_provenance(
     tmp_path: Path,
 ) -> None:
-    reference = reference_mapping()
+    reference = build_reference_mapping()
     artifact = _artifact_for_song(tmp_path, "42")
 
     item = cohort_scoring.cohort_item_from_artifacts(
-        identity(),
+        build_identity(),
         "42",
         reference,
         artifact,
@@ -522,10 +530,13 @@ def test_cohort_item_from_artifacts_binds_song_and_descriptor_provenance(
 
     assert item.artifact_identity is not None
     assert item.artifact_identity.simfile_id == "42"
-    assert item.artifact_identity.backend_id == identity().backend_id
-    assert item.artifact_identity.model_id == identity().model_id
-    assert item.artifact_identity.backend_descriptor_sha256 == identity().backend_descriptor_sha256
-    assert validate_cohort_items(identity(), (item,)) is None
+    assert item.artifact_identity.backend_id == build_identity().backend_id
+    assert item.artifact_identity.model_id == build_identity().model_id
+    assert (
+        item.artifact_identity.backend_descriptor_sha256
+        == build_identity().backend_descriptor_sha256
+    )
+    assert validate_cohort_items(build_identity(), (item,)) is None
 
 
 @pytest.mark.parametrize(
@@ -545,16 +556,16 @@ def test_validate_cohort_items_rejects_mixed_artifact_provenance(
     message: str,
 ) -> None:
     item = cohort_scoring.cohort_item_from_artifacts(
-        identity(),
+        build_identity(),
         "42",
-        reference_mapping(),
+        build_reference_mapping(),
         _artifact_for_song(tmp_path, "42"),
     )
     evidence = dataclasses.replace(item.artifact_identity, **{field: value})
     mixed = dataclasses.replace(item, artifact_identity=evidence)
 
     with pytest.raises(ValueError, match=message):
-        validate_cohort_items(identity(), (mixed,))
+        validate_cohort_items(build_identity(), (mixed,))
 
 
 def test_cohort_item_from_artifacts_rejects_wrong_song_reference_and_prediction(
@@ -562,17 +573,17 @@ def test_cohort_item_from_artifacts_rejects_wrong_song_reference_and_prediction(
 ) -> None:
     with pytest.raises(ValueError, match="reference.*simfile_id"):
         cohort_scoring.cohort_item_from_artifacts(
-            identity(),
+            build_identity(),
             "8",
-            reference_mapping(),
+            build_reference_mapping(),
             _artifact_for_song(tmp_path, "8"),
         )
 
     with pytest.raises(ValueError, match="prediction.*source_audio_id"):
         cohort_scoring.cohort_item_from_artifacts(
-            identity(),
+            build_identity(),
             "42",
-            reference_mapping(),
+            build_reference_mapping(),
             _artifact_for_song(tmp_path, "8"),
         )
 
@@ -581,16 +592,16 @@ def test_validate_cohort_items_rejects_reference_and_prediction_chart_or_source_
     tmp_path: Path,
 ) -> None:
     item = cohort_scoring.cohort_item_from_artifacts(
-        identity(),
+        build_identity(),
         "42",
-        reference_mapping(),
+        build_reference_mapping(),
         _artifact_for_song(tmp_path, "42"),
     )
 
     bad_reference_chart = dataclasses.replace(item.reference_events[0], chart_id="8")
     with pytest.raises(ValueError, match="reference event chart_id"):
         validate_cohort_items(
-            identity(),
+            build_identity(),
             (
                 dataclasses.replace(
                     item, reference_events=(bad_reference_chart, *item.reference_events[1:])
@@ -601,7 +612,7 @@ def test_validate_cohort_items_rejects_reference_and_prediction_chart_or_source_
     bad_reference_source = dataclasses.replace(item.reference_events[0], source="prediction")
     with pytest.raises(ValueError, match="reference event source"):
         validate_cohort_items(
-            identity(),
+            build_identity(),
             (
                 dataclasses.replace(
                     item, reference_events=(bad_reference_source, *item.reference_events[1:])
@@ -612,7 +623,7 @@ def test_validate_cohort_items_rejects_reference_and_prediction_chart_or_source_
     bad_prediction_chart = dataclasses.replace(item.prediction_events[0], chart_id="8")
     with pytest.raises(ValueError, match="prediction event chart_id"):
         validate_cohort_items(
-            identity(),
+            build_identity(),
             (
                 dataclasses.replace(
                     item, prediction_events=(bad_prediction_chart, *item.prediction_events[1:])
@@ -623,7 +634,7 @@ def test_validate_cohort_items_rejects_reference_and_prediction_chart_or_source_
     bad_prediction_source = dataclasses.replace(item.prediction_events[0], source="ground_truth")
     with pytest.raises(ValueError, match="prediction event source"):
         validate_cohort_items(
-            identity(),
+            build_identity(),
             (
                 dataclasses.replace(
                     item, prediction_events=(bad_prediction_source, *item.prediction_events[1:])
@@ -634,42 +645,44 @@ def test_validate_cohort_items_rejects_reference_and_prediction_chart_or_source_
 
 def test_zero_event_artifact_is_identity_bound_without_event_metadata(tmp_path: Path) -> None:
     item = cohort_scoring.cohort_item_from_artifacts(
-        identity(),
+        build_identity(),
         "42",
-        reference_mapping(),
+        build_reference_mapping(),
         _empty_artifact_for_song(tmp_path, "42"),
     )
 
     assert item.prediction_events == ()
     assert item.artifact_identity is not None
-    assert item.artifact_identity.prediction_map_version == identity().prediction_map_version
-    assert validate_cohort_items(identity(), (item,)) is None
+    assert item.artifact_identity.prediction_map_version == build_identity().prediction_map_version
+    assert validate_cohort_items(build_identity(), (item,)) is None
 
-    mixed_identity = dataclasses.replace(identity(), prediction_map_version="other-map")
+    mixed_identity = dataclasses.replace(build_identity(), prediction_map_version="other-map")
     with pytest.raises(ValueError, match="prediction_map_version"):
         validate_cohort_items(mixed_identity, (item,))
 
 
 def test_success_item_without_artifact_provenance_is_rejected() -> None:
     with pytest.raises(ValueError, match="artifact_identity"):
-        validate_cohort_items(identity(), (dataclasses.replace(item(), artifact_identity=None),))
+        validate_cohort_items(
+            build_identity(), (dataclasses.replace(build_item(), artifact_identity=None),)
+        )
 
 
 def test_score_cohort_rejects_forged_artifact_identity_for_empty_prediction() -> None:
     """A caller-created identity must not bless an unbacked empty artifact."""
-    forged = item(
+    forged = build_item(
         prediction_events=(),
         coverage=CohortCoverage(2, 2, 0, 0, 0, 0, 0, 0),
     )
 
     with pytest.raises(ValueError, match="artifact"):
-        score_cohort(identity(), (forged,), tolerances_ms=(50,))
+        score_cohort(build_identity(), (forged,), tolerances_ms=(50,))
 
 
 def test_score_cohort_rejects_prediction_projection_substitution(tmp_path: Path) -> None:
     artifact = _artifact_for_song(tmp_path, "42")
-    reference = reference_mapping()
-    valid = cohort_scoring.cohort_item_from_artifacts(identity(), "42", reference, artifact)
+    reference = build_reference_mapping()
+    valid = cohort_scoring.cohort_item_from_artifacts(build_identity(), "42", reference, artifact)
     tampered_prediction = dataclasses.replace(artifact.prediction, events=())
     tampered_artifact = dataclasses.replace(artifact, prediction=tampered_prediction)
     assert tampered_artifact.prediction.events == ()
@@ -684,14 +697,16 @@ def test_score_cohort_rejects_prediction_projection_substitution(tmp_path: Path)
         prediction_artifact=tampered_artifact,
     )
 
-    with pytest.raises(ValueError, match="content|canonical|artifact"):
-        score_cohort(identity(), (tampered,), tolerances_ms=(50,))
+    with pytest.raises(
+        ValueError, match="prediction artifact fields do not match canonical content"
+    ):
+        score_cohort(build_identity(), (tampered,), tolerances_ms=(50,))
 
 
 def test_score_cohort_rejects_reference_common_projection_substitution(tmp_path: Path) -> None:
     artifact = _artifact_for_song(tmp_path, "42")
-    reference = reference_mapping()
-    valid = cohort_scoring.cohort_item_from_artifacts(identity(), "42", reference, artifact)
+    reference = build_reference_mapping()
+    valid = cohort_scoring.cohort_item_from_artifacts(build_identity(), "42", reference, artifact)
     forged_common = dataclasses.replace(
         reference.common_events[0],
         canonical_audio_time=Decimal("9.000000"),
@@ -706,8 +721,10 @@ def test_score_cohort_rejects_reference_common_projection_substitution(tmp_path:
         reference_artifact=tampered_reference,
     )
 
-    with pytest.raises(ValueError, match="projection|common_events|reference"):
-        score_cohort(identity(), (tampered,), tolerances_ms=(50,))
+    with pytest.raises(
+        ValueError, match="reference common_events do not match mapped event projection"
+    ):
+        score_cohort(build_identity(), (tampered,), tolerances_ms=(50,))
 
 
 def scoring_item(
@@ -733,11 +750,11 @@ def scoring_item(
             prediction_unmapped_event_count=0,
         ),
         warnings=warnings,
-        artifact_identity=artifact_identity(simfile_id),
+        artifact_identity=build_artifact_identity(simfile_id),
     )
 
 
-def scoring_event(
+def build_scoring_event(
     simfile_id: str,
     time_sec: float,
     canonical_class: str,
@@ -761,7 +778,7 @@ def cohort_scoring_item(
     warnings: tuple[str, ...] = (),
 ) -> CohortItem:
     return cohort_scoring.cohort_item_from_artifacts(
-        identity(),
+        build_identity(),
         simfile_id,
         synthetic_reference_mapping(simfile_id, reference_events),
         synthetic_prediction_artifact(simfile_id, prediction_events),
@@ -772,8 +789,8 @@ def cohort_scoring_item(
 def test_score_success_items_uses_fixed_tolerance_mode_matrix() -> None:
     success = scoring_item(
         "1",
-        (scoring_event("1", 1.0, "kick", "ground_truth"),),
-        (scoring_event("1", 1.04, "kick", "prediction"),),
+        (build_scoring_event("1", 1.0, "kick", "ground_truth"),),
+        (build_scoring_event("1", 1.04, "kick", "prediction"),),
     )
 
     scores, diagnostics = _score_success_items(
@@ -799,12 +816,12 @@ def test_score_success_items_reconciles_per_class_rows() -> None:
     success = scoring_item(
         "1",
         (
-            scoring_event("1", 1.0, "kick", "ground_truth"),
-            scoring_event("1", 2.0, "snare", "ground_truth"),
+            build_scoring_event("1", 1.0, "kick", "ground_truth"),
+            build_scoring_event("1", 2.0, "snare", "ground_truth"),
         ),
         (
-            scoring_event("1", 1.0, "kick", "prediction"),
-            scoring_event("1", 3.0, "hihat", "prediction"),
+            build_scoring_event("1", 1.0, "kick", "prediction"),
+            build_scoring_event("1", 3.0, "hihat", "prediction"),
         ),
     )
 
@@ -830,13 +847,13 @@ def test_score_success_items_reconciles_per_class_rows() -> None:
 
 
 def test_score_success_items_is_independent_of_optional_prediction_metadata() -> None:
-    reference = (scoring_event("1", 1.0, "kick", "ground_truth"),)
-    bare = scoring_item("1", reference, (scoring_event("1", 1.0, "kick", "prediction"),))
+    reference = (build_scoring_event("1", 1.0, "kick", "ground_truth"),)
+    bare = scoring_item("1", reference, (build_scoring_event("1", 1.0, "kick", "prediction"),))
     detailed = scoring_item(
         "1",
         reference,
         (
-            scoring_event(
+            build_scoring_event(
                 "1",
                 1.0,
                 "kick",
@@ -861,13 +878,13 @@ def test_score_success_items_is_independent_of_optional_prediction_metadata() ->
 def test_score_success_items_default_diagnostics_are_empty() -> None:
     success_a = scoring_item(
         "1",
-        (scoring_event("1", 1.0, "kick", "ground_truth"),),
-        (scoring_event("1", 1.0, "kick", "prediction"),),
+        (build_scoring_event("1", 1.0, "kick", "ground_truth"),),
+        (build_scoring_event("1", 1.0, "kick", "prediction"),),
     )
     success_b = scoring_item(
         "2",
-        (scoring_event("2", 1.0, "snare", "ground_truth"),),
-        (scoring_event("2", 1.0, "snare", "prediction"),),
+        (build_scoring_event("2", 1.0, "snare", "ground_truth"),),
+        (build_scoring_event("2", 1.0, "snare", "prediction"),),
     )
 
     song_scores, diagnostics = _score_success_items(
@@ -881,13 +898,13 @@ def test_score_success_items_default_diagnostics_are_empty() -> None:
 def test_score_success_items_materializes_only_selected_song_diagnostics() -> None:
     success_a = scoring_item(
         "1",
-        (scoring_event("1", 1.0, "kick", "ground_truth"),),
-        (scoring_event("1", 1.1, "kick", "prediction"),),
+        (build_scoring_event("1", 1.0, "kick", "ground_truth"),),
+        (build_scoring_event("1", 1.1, "kick", "prediction"),),
     )
     success_b = scoring_item(
         "2",
-        (scoring_event("2", 1.0, "kick", "ground_truth"),),
-        (scoring_event("2", 1.1, "kick", "prediction"),),
+        (build_scoring_event("2", 1.0, "kick", "ground_truth"),),
+        (build_scoring_event("2", 1.1, "kick", "prediction"),),
     )
 
     _, diagnostics = _score_success_items((success_a, success_b), (30,), frozenset({"2"}))
@@ -908,8 +925,8 @@ def test_score_success_items_materializes_only_selected_song_diagnostics() -> No
 def test_aligned_diagnostics_preserve_exact_binary64_prediction_time() -> None:
     success = scoring_item(
         "1",
-        (scoring_event("1", 0.3, "kick", "ground_truth"),),
-        (scoring_event("1", 0.1, "kick", "prediction"),),
+        (build_scoring_event("1", 0.3, "kick", "ground_truth"),),
+        (build_scoring_event("1", 0.1, "kick", "prediction"),),
     )
 
     _, diagnostics = _score_success_items((success,), (50,), frozenset({"1"}))
@@ -925,16 +942,16 @@ def test_aligned_diagnostics_preserve_exact_binary64_prediction_time() -> None:
 def test_score_cohort_canonicalizes_items_and_song_rows() -> None:
     item_1 = cohort_scoring_item(
         "1",
-        (scoring_event("1", 1.0, "kick", "ground_truth"),),
-        (scoring_event("1", 1.0, "kick", "prediction"),),
+        (build_scoring_event("1", 1.0, "kick", "ground_truth"),),
+        (build_scoring_event("1", 1.0, "kick", "prediction"),),
     )
     item_2 = cohort_scoring_item(
         "2",
-        (scoring_event("2", 1.0, "snare", "ground_truth"),),
-        (scoring_event("2", 1.0, "snare", "prediction"),),
+        (build_scoring_event("2", 1.0, "snare", "ground_truth"),),
+        (build_scoring_event("2", 1.0, "snare", "prediction"),),
     )
 
-    result = score_cohort(identity(), (item_2, item_1), tolerances_ms=(50, 100))
+    result = score_cohort(build_identity(), (item_2, item_1), tolerances_ms=(50, 100))
 
     assert [item.simfile_id for item in result.items] == ["1", "2"]
     assert [(row.simfile_id, row.tolerance_ms, row.mode) for row in result.song_scores] == [
@@ -964,21 +981,21 @@ def test_score_cohort_rejects_invalid_tolerances(
 ) -> None:
     item_1 = cohort_scoring_item(
         "1",
-        (scoring_event("1", 1.0, "kick", "ground_truth"),),
-        (scoring_event("1", 1.0, "kick", "prediction"),),
+        (build_scoring_event("1", 1.0, "kick", "ground_truth"),),
+        (build_scoring_event("1", 1.0, "kick", "prediction"),),
     )
 
     with pytest.raises(ValueError, match=message):
-        score_cohort(identity(), (item_1,), tolerances_ms=tolerances_ms)
+        score_cohort(build_identity(), (item_1,), tolerances_ms=tolerances_ms)
 
 
 def test_score_cohort_rejects_invalid_diagnostics_requests() -> None:
     success = cohort_scoring_item(
         "1",
-        (scoring_event("1", 1.0, "kick", "ground_truth"),),
-        (scoring_event("1", 1.0, "kick", "prediction"),),
+        (build_scoring_event("1", 1.0, "kick", "ground_truth"),),
+        (build_scoring_event("1", 1.0, "kick", "prediction"),),
     )
-    failed = item(
+    failed = build_item(
         simfile_id="2",
         status="failed",
         prediction_events=None,
@@ -986,29 +1003,29 @@ def test_score_cohort_rejects_invalid_diagnostics_requests() -> None:
     )
 
     with pytest.raises(ValueError, match="unique"):
-        score_cohort(identity(), (success,), diagnostics_for=("1", "1"))
+        score_cohort(build_identity(), (success,), diagnostics_for=("1", "1"))
     with pytest.raises(ValueError, match="nonempty"):
-        score_cohort(identity(), (success,), diagnostics_for=("",))
+        score_cohort(build_identity(), (success,), diagnostics_for=("",))
     with pytest.raises(ValueError, match="successful"):
-        score_cohort(identity(), (success, failed), diagnostics_for=("2",))
+        score_cohort(build_identity(), (success, failed), diagnostics_for=("2",))
     with pytest.raises(ValueError, match="names an input item"):
-        score_cohort(identity(), (success,), diagnostics_for=("missing",))
+        score_cohort(build_identity(), (success,), diagnostics_for=("missing",))
 
 
 def test_score_cohort_materializes_diagnostics_only_for_requested_successes() -> None:
     success_1 = cohort_scoring_item(
         "1",
-        (scoring_event("1", 1.0, "kick", "ground_truth"),),
-        (scoring_event("1", 1.1, "kick", "prediction"),),
+        (build_scoring_event("1", 1.0, "kick", "ground_truth"),),
+        (build_scoring_event("1", 1.1, "kick", "prediction"),),
     )
     success_2 = cohort_scoring_item(
         "2",
-        (scoring_event("2", 1.0, "snare", "ground_truth"),),
-        (scoring_event("2", 1.1, "snare", "prediction"),),
+        (build_scoring_event("2", 1.0, "snare", "ground_truth"),),
+        (build_scoring_event("2", 1.1, "snare", "prediction"),),
     )
 
     result = score_cohort(
-        identity(), (success_2, success_1), tolerances_ms=(30,), diagnostics_for=("2",)
+        build_identity(), (success_2, success_1), tolerances_ms=(30,), diagnostics_for=("2",)
     )
 
     assert result.event_diagnostics
@@ -1018,25 +1035,25 @@ def test_score_cohort_materializes_diagnostics_only_for_requested_successes() ->
 def test_score_cohort_retains_full_population_and_closed_reason_counts() -> None:
     successful = cohort_scoring_item(
         "1",
-        (scoring_event("1", 1.0, "kick", "ground_truth"),),
-        (scoring_event("1", 1.0, "kick", "prediction"),),
+        (build_scoring_event("1", 1.0, "kick", "ground_truth"),),
+        (build_scoring_event("1", 1.0, "kick", "prediction"),),
         warnings=("warning-only",),
     )
-    failed = item(
+    failed = build_item(
         simfile_id="2",
         status="failed",
         prediction_events=None,
         failure_reason="inference_failed",
         coverage=no_prediction_coverage(),
     )
-    skipped = item(
+    skipped = build_item(
         simfile_id="3",
         status="skipped",
         prediction_events=None,
         failure_reason="explicitly_skipped",
         coverage=no_prediction_coverage(),
     )
-    quarantined = item(
+    quarantined = build_item(
         simfile_id="4",
         status="quarantined",
         prediction_events=None,
@@ -1044,7 +1061,7 @@ def test_score_cohort_retains_full_population_and_closed_reason_counts() -> None
         coverage=no_prediction_coverage(),
     )
 
-    result = score_cohort(identity(), (quarantined, successful, skipped, failed))
+    result = score_cohort(build_identity(), (quarantined, successful, skipped, failed))
 
     assert result.population.total_count == 4
     assert result.population.success_count == 1
@@ -1062,21 +1079,21 @@ def test_score_cohort_aggregates_event_micro_song_macro_and_class_macro() -> Non
     song_a = cohort_scoring_item(
         "a",
         (
-            scoring_event("a", 1.0, "kick", "ground_truth"),
-            scoring_event("a", 2.0, "snare", "ground_truth"),
+            build_scoring_event("a", 1.0, "kick", "ground_truth"),
+            build_scoring_event("a", 2.0, "snare", "ground_truth"),
         ),
-        (scoring_event("a", 1.0, "kick", "prediction"),),
+        (build_scoring_event("a", 1.0, "kick", "prediction"),),
     )
     song_b = cohort_scoring_item(
         "b",
-        (scoring_event("b", 1.0, "kick", "ground_truth"),),
+        (build_scoring_event("b", 1.0, "kick", "ground_truth"),),
         (
-            scoring_event("b", 1.0, "kick", "prediction"),
-            scoring_event("b", 2.0, "kick", "prediction"),
+            build_scoring_event("b", 1.0, "kick", "prediction"),
+            build_scoring_event("b", 2.0, "kick", "prediction"),
         ),
     )
 
-    result = score_cohort(identity(), (song_b, song_a), tolerances_ms=(50,))
+    result = score_cohort(build_identity(), (song_b, song_a), tolerances_ms=(50,))
     aggregate = next(row for row in result.aggregates if row.mode == "raw")
 
     assert (
@@ -1108,50 +1125,51 @@ def test_score_cohort_uses_percentile_convention_for_song_f1_distribution() -> N
     songs = (
         cohort_scoring_item(
             "0.0",
-            (scoring_event("0.0", 1.0, "kick", "ground_truth"),),
+            (build_scoring_event("0.0", 1.0, "kick", "ground_truth"),),
             (),
         ),
         cohort_scoring_item(
             "0.25",
-            (scoring_event("0.25", 1.0, "kick", "ground_truth"),),
+            (build_scoring_event("0.25", 1.0, "kick", "ground_truth"),),
             (
-                scoring_event("0.25", 1.0, "kick", "prediction"),
+                build_scoring_event("0.25", 1.0, "kick", "prediction"),
                 *tuple(
-                    scoring_event("0.25", float(index), "kick", "prediction")
+                    build_scoring_event("0.25", float(index), "kick", "prediction")
                     for index in range(2, 8)
                 ),
             ),
         ),
         cohort_scoring_item(
             "0.5",
-            (scoring_event("0.5", 1.0, "kick", "ground_truth"),),
+            (build_scoring_event("0.5", 1.0, "kick", "ground_truth"),),
             (
-                scoring_event("0.5", 1.0, "kick", "prediction"),
-                scoring_event("0.5", 2.0, "kick", "prediction"),
-                scoring_event("0.5", 3.0, "kick", "prediction"),
+                build_scoring_event("0.5", 1.0, "kick", "prediction"),
+                build_scoring_event("0.5", 2.0, "kick", "prediction"),
+                build_scoring_event("0.5", 3.0, "kick", "prediction"),
             ),
         ),
         cohort_scoring_item(
             "0.75",
             tuple(
-                scoring_event("0.75", float(index), "kick", "ground_truth") for index in range(1, 5)
+                build_scoring_event("0.75", float(index), "kick", "ground_truth")
+                for index in range(1, 5)
             ),
             (
                 *(
-                    scoring_event("0.75", float(index), "kick", "prediction")
+                    build_scoring_event("0.75", float(index), "kick", "prediction")
                     for index in range(1, 4)
                 ),
-                scoring_event("0.75", 5.0, "kick", "prediction"),
+                build_scoring_event("0.75", 5.0, "kick", "prediction"),
             ),
         ),
         cohort_scoring_item(
             "1.0",
-            (scoring_event("1.0", 1.0, "kick", "ground_truth"),),
-            (scoring_event("1.0", 1.0, "kick", "prediction"),),
+            (build_scoring_event("1.0", 1.0, "kick", "ground_truth"),),
+            (build_scoring_event("1.0", 1.0, "kick", "prediction"),),
         ),
     )
 
-    result = score_cohort(identity(), songs, tolerances_ms=(50,))
+    result = score_cohort(build_identity(), songs, tolerances_ms=(50,))
     distribution = next(row for row in result.aggregates if row.mode == "raw").song_f1_distribution
 
     assert distribution.minimum == 0.0
@@ -1164,14 +1182,14 @@ def test_score_cohort_uses_percentile_convention_for_song_f1_distribution() -> N
 
 
 def test_score_cohort_zero_success_keeps_population_and_undefined_aggregates() -> None:
-    failed = item(
+    failed = build_item(
         simfile_id="1",
         status="failed",
         prediction_events=None,
         failure_reason="prediction_missing",
         coverage=no_prediction_coverage(),
     )
-    quarantined = item(
+    quarantined = build_item(
         simfile_id="2",
         status="quarantined",
         prediction_events=None,
@@ -1179,7 +1197,7 @@ def test_score_cohort_zero_success_keeps_population_and_undefined_aggregates() -
         coverage=no_prediction_coverage(),
     )
 
-    result = score_cohort(identity(), (quarantined, failed))
+    result = score_cohort(build_identity(), (quarantined, failed))
 
     assert len(result.aggregates) == 6
     assert result.population.total_count == 2
