@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import builtins
 import csv
 import dataclasses
+import os
 import struct
+import subprocess
 import sys
 from pathlib import Path
-
-import pytest
 
 from src.benchmark.backend_identity import (
     OAF_BACKEND_ID,
@@ -46,6 +45,14 @@ _FORBIDDEN_RUNTIME_MODULES = (
     "src.benchmark.backends.oaf",
     "src.benchmark.worker_process",
     "src.worker",
+)
+_PURE_PIPELINE_MODULES = (
+    "src.benchmark.mapping",
+    "src.benchmark.prediction_artifact",
+    "src.benchmark.reference_set",
+    "src.benchmark.scorer_input",
+    "src.benchmark.cohort_scoring",
+    "src.benchmark.reports",
 )
 
 
@@ -193,44 +200,54 @@ def _item(
     )
 
 
-def _forbidden_modules() -> set[str]:
-    return {
-        name
-        for name in sys.modules
-        if any(
-            name == module or name.startswith(module + ".") for module in _FORBIDDEN_RUNTIME_MODULES
-        )
-    }
+def _copy_item(item: CohortItem, simfile_id: str) -> CohortItem:
+    return dataclasses.replace(
+        item,
+        simfile_id=simfile_id,
+        reference_events=tuple(
+            dataclasses.replace(event, chart_id=simfile_id) for event in item.reference_events
+        ),
+        prediction_events=tuple(
+            dataclasses.replace(event, chart_id=simfile_id)
+            for event in item.prediction_events or ()
+        ),
+    )
 
 
-def _install_no_inference_import_guard(monkeypatch: pytest.MonkeyPatch) -> None:
-    original_import = builtins.__import__
+def _assert_pure_import_boundary() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    probe_script = f"""
+import importlib
+import sys
 
-    def guarded_import(
-        name: str,
-        globals: dict[str, object] | None = None,
-        locals: dict[str, object] | None = None,
-        fromlist: tuple[str, ...] = (),
-        level: int = 0,
-    ):
-        del globals, locals
-        if any(
-            name == module or name.startswith(module + ".") for module in _FORBIDDEN_RUNTIME_MODULES
-        ):
-            raise AssertionError(f"inference runtime import attempted: {name}")
-        if name == "src.benchmark.backends" and "oaf" in fromlist:
-            raise AssertionError("inference runtime import attempted: src.benchmark.backends.oaf")
-        if name == "src.benchmark" and "worker_process" in fromlist:
-            raise AssertionError("inference runtime import attempted: src.benchmark.worker_process")
-        return original_import(name, fromlist=fromlist, level=level)
+for module in {tuple(_PURE_PIPELINE_MODULES)!r}:
+    importlib.import_module(module)
 
-    monkeypatch.setattr(builtins, "__import__", guarded_import)
+for forbidden in {tuple(_FORBIDDEN_RUNTIME_MODULES)!r}:
+    if any(name == forbidden or name.startswith(forbidden + \".\") for name in sys.modules):
+        raise SystemExit(f\"forbidden runtime imported: {{forbidden}}\")
+"""
+    probe_env = os.environ.copy()
+    current_pythonpath = probe_env.get("PYTHONPATH")
+    probe_env["PYTHONPATH"] = str(project_root) + (
+        os.pathsep + current_pythonpath if current_pythonpath else ""
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", probe_script],
+        cwd=project_root,
+        env=probe_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
 def _assert_reports(
     result: CohortScoreResult,
     report_dir: Path,
     identity: CohortIdentity,
+    expected_simfile_ids: tuple[str, ...],
 ) -> None:
     from src.benchmark.reports import ReportArtifacts
 
@@ -241,18 +258,35 @@ def _assert_reports(
     assert set(summary) == {"schema", "identity", "tolerances_ms", "population", "aggregates"}
     assert "items" not in summary
     assert summary["identity"]["cohort_id"] == identity.cohort_id
+    expected_count = len(expected_simfile_ids)
     assert summary["population"] == {
         "failed_count": 0,
         "quarantined_count": 0,
         "reason_counts": {},
         "skipped_count": 0,
-        "success_count": 1,
-        "total_count": 1,
+        "success_count": expected_count,
+        "total_count": expected_count,
     }
+
+    summary_markdown = artifacts.summary_markdown.read_text(encoding="utf-8")
+    assert "# Single-Cohort Drum Benchmark" in summary_markdown
+    assert f"- cohort_id: `{identity.cohort_id}`" in summary_markdown
+    assert f"- model_id: `{identity.model_id}`" in summary_markdown
+    assert f"- total_count: {expected_count}" in summary_markdown
+    for section in (
+        "## Identity",
+        "## Population",
+        "## Aggregate Results",
+        "## Per-Class Aggregate Results",
+        "## Song F1 Distribution",
+        "## Song Extremes",
+    ):
+        assert section in summary_markdown
 
     with artifacts.items_csv.open(newline="", encoding="utf-8") as handle:
         item_rows = list(csv.DictReader(handle))
-    assert len(item_rows) == 1
+    assert len(item_rows) == expected_count
+    assert {row["simfile_id"] for row in item_rows} == set(expected_simfile_ids)
     item_row = item_rows[0]
     assert item_row["reference_duplicate_collapsed_count"] == "1"
     assert item_row["reference_native_event_count"] == "3"
@@ -264,8 +298,8 @@ def _assert_reports(
 
     with artifacts.per_song_csv.open(newline="", encoding="utf-8") as handle:
         song_rows = list(csv.DictReader(handle))
-    assert len(song_rows) == len(result.tolerances_ms) * 2
-    assert {row["simfile_id"] for row in song_rows} == {"7"}
+    assert len(song_rows) == expected_count * len(result.tolerances_ms) * 2
+    assert {row["simfile_id"] for row in song_rows} == set(expected_simfile_ids)
     assert {
         "cohort_id",
         "model_id",
@@ -278,8 +312,8 @@ def _assert_reports(
 
     with artifacts.per_class_csv.open(newline="", encoding="utf-8") as handle:
         class_rows = list(csv.DictReader(handle))
-    assert len(class_rows) == len(result.tolerances_ms) * 2 * 2
-    assert {row["simfile_id"] for row in class_rows} == {"7"}
+    assert len(class_rows) == expected_count * len(result.tolerances_ms) * 2 * 2
+    assert {row["simfile_id"] for row in class_rows} == set(expected_simfile_ids)
     assert all("scope" not in row for row in class_rows)
     assert all(row["tolerance_ms"] in {"30", "50", "100"} for row in class_rows)
 
@@ -305,12 +339,8 @@ def _assert_reports(
         assert diagnostic["simfile_id"] == "7"
 
 
-def test_persisted_artifacts_rescore_without_inference(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    before_runtime_modules = _forbidden_modules()
-    _install_no_inference_import_guard(monkeypatch)
+def test_persisted_artifacts_rescore_without_inference(tmp_path: Path) -> None:
+    _assert_pure_import_boundary()
 
     reference = _reference_mapping()
     assert len(reference.mapped_events) == 3
@@ -347,31 +377,33 @@ def test_persisted_artifacts_rescore_without_inference(
 
     identity = _identity(artifact)
     item = _item(reference, artifact, identity)
-    selected = score_cohort(identity, (item,), diagnostics_for=("7",))
+    unselected = _copy_item(item, "8")
+    selected = score_cohort(identity, (item, unselected), diagnostics_for=("7",))
     assert selected.event_diagnostics
     assert {row.simfile_id for row in selected.event_diagnostics} == {"7"}
 
-    default = score_cohort(identity, (item,))
+    default = score_cohort(identity, (item, unselected))
     assert default.event_diagnostics == ()
     assert selected.aggregates == default.aggregates
     assert selected.song_scores == default.song_scores
-    _assert_reports(selected, tmp_path / "reports", identity)
+    _assert_reports(selected, tmp_path / "reports", identity, ("7", "8"))
 
     changed_map = identity.prediction_map_version + "/rescored"
     changed_identity = dataclasses.replace(identity, prediction_map_version=changed_map)
-    changed_events = tuple(
+    changed_items = tuple(
         dataclasses.replace(
-            event,
-            metadata={**event.metadata, "prediction_map_version": changed_map},
+            cohort_item,
+            prediction_events=tuple(
+                dataclasses.replace(
+                    event,
+                    metadata={**event.metadata, "prediction_map_version": changed_map},
+                )
+                for event in cohort_item.prediction_events or ()
+            ),
         )
-        for event in item.prediction_events or ()
+        for cohort_item in (item, unselected)
     )
-    rescored = score_cohort(
-        changed_identity,
-        (dataclasses.replace(item, prediction_events=changed_events),),
-    )
+    rescored = score_cohort(changed_identity, changed_items)
     assert rescored.event_diagnostics == ()
     assert rescored.aggregates == default.aggregates
     assert rescored.song_scores == default.song_scores
-
-    assert _forbidden_modules() == before_runtime_modules
