@@ -46,14 +46,6 @@ _FORBIDDEN_RUNTIME_MODULES = (
     "src.benchmark.worker_process",
     "src.worker",
 )
-_PURE_PIPELINE_MODULES = (
-    "src.benchmark.mapping",
-    "src.benchmark.prediction_artifact",
-    "src.benchmark.reference_set",
-    "src.benchmark.scorer_input",
-    "src.benchmark.cohort_scoring",
-    "src.benchmark.reports",
-)
 
 
 def _descriptor():
@@ -216,12 +208,19 @@ def _copy_item(item: CohortItem, simfile_id: str) -> CohortItem:
 
 def _assert_pure_import_boundary() -> None:
     project_root = Path(__file__).resolve().parents[2]
+    acceptance_module = Path(__file__).resolve()
     probe_script = f"""
-import importlib
+import importlib.util
 import sys
 
-for module in {tuple(_PURE_PIPELINE_MODULES)!r}:
-    importlib.import_module(module)
+spec = importlib.util.spec_from_file_location(
+    \"crux_hpa325_acceptance_probe\", {str(acceptance_module)!r}
+)
+if spec is None or spec.loader is None:
+    raise SystemExit(\"unable to load acceptance module\")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
 
 for forbidden in {tuple(_FORBIDDEN_RUNTIME_MODULES)!r}:
     if any(name == forbidden or name.startswith(forbidden + \".\") for name in sys.modules):
