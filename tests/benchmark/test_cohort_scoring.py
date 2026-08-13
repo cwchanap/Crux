@@ -314,6 +314,28 @@ def test_validate_cohort_items_rejects_unbalanced_coverage() -> None:
         validate_cohort_items(identity(), (invalid,))
 
 
+def test_non_success_items_reject_prediction_native_class_counts() -> None:
+    invalid = item(
+        simfile_id="46",
+        status="skipped",
+        prediction_events=None,
+        failure_reason="explicitly_skipped",
+        coverage=CohortCoverage(
+            reference_native_event_count=2,
+            reference_common_event_count=2,
+            reference_ignored_event_count=0,
+            reference_unmapped_event_count=0,
+            reference_duplicate_collapsed_count=0,
+            prediction_native_event_count=None,
+            prediction_mapped_event_count=None,
+            prediction_unmapped_event_count=None,
+            prediction_native_class_counts=(("midi_42", 1),),
+        ),
+    )
+    with pytest.raises(ValueError, match="must not have prediction native class counts"):
+        validate_cohort_items(identity(), (invalid,))
+
+
 def test_success_requires_prediction_coverage_to_match_events() -> None:
     invalid = item(
         prediction_events=(BenchmarkEvent("42", 1.0, "tom", "prediction"),),
