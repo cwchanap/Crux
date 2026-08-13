@@ -209,6 +209,8 @@ def validate_cohort_items(
             )
         ):
             raise ValueError(f"{item.status} item must not have prediction coverage")
+        if item.coverage.prediction_native_class_counts:
+            raise ValueError(f"{item.status} item must not have prediction native class counts")
 
         expected_reason: set[str]
         if item.status == "failed":
