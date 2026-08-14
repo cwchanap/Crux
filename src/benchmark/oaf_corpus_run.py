@@ -424,6 +424,19 @@ def _validate_snapshot(snapshot: dict[str, JsonValue]) -> dict[str, JsonValue]:
     item_rows.sort(key=lambda item: int(item["simfile_id"]))
     snapshot["items"] = item_rows
 
+    overall_status = snapshot.get("overall_status")
+    if overall_status is not None and overall_status not in {"complete", "partial", "failed"}:
+        raise StrictJsonError("run snapshot overall_status is invalid")
+    if overall_status == "complete":
+        missing_counts = [field for field in _SNAPSHOT_COUNTS if field not in snapshot]
+        if missing_counts:
+            raise StrictJsonError("complete run snapshot requires all counts")
+        missing_dispositions = [
+            item["simfile_id"] for item in item_rows if "execution_disposition" not in item
+        ]
+        if missing_dispositions:
+            raise StrictJsonError("complete run snapshot requires item dispositions")
+
     if all(field in snapshot for field in _SNAPSHOT_COUNTS):
         expected = {field: snapshot[field] for field in _SNAPSHOT_COUNTS}
         if any(
@@ -442,12 +455,12 @@ def _validate_snapshot(snapshot: dict[str, JsonValue]) -> dict[str, JsonValue]:
                 actual["skipped_count"] += 1
             elif disposition == "quarantined":
                 actual["quarantined_count"] += 1
-        if all("execution_disposition" in item for item in item_rows) and expected != actual:
+        if (
+            overall_status == "complete"
+            or all("execution_disposition" in item for item in item_rows)
+        ) and expected != actual:
             raise StrictJsonError("run snapshot counts do not reconcile with items")
 
-    overall_status = snapshot.get("overall_status")
-    if overall_status is not None and overall_status not in {"complete", "partial", "failed"}:
-        raise StrictJsonError("run snapshot overall_status is invalid")
     completed_at = snapshot.get("completed_at")
     if completed_at is not None and overall_status != "complete":
         raise StrictJsonError("completed timestamp is only valid for a completed run")
@@ -475,6 +488,8 @@ def parse_oaf_corpus_run(
     if not isinstance(value, dict):
         raise StrictJsonError("run snapshot must be an object")
     validated = _validate_snapshot(value)
+    if canonical_json_bytes(validated) != content:
+        raise StrictJsonError("run snapshot is not semantically canonical")
     if expected_run_id is not None and validated.get("run_id") != expected_run_id:
         raise StrictJsonError("run snapshot run_id does not match expected identity")
     return validated
