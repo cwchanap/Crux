@@ -14,6 +14,7 @@ from src.benchmark.input_view import (
     InputViewManifest,
     load_derived_audio,
     load_direct_audio,
+    load_materialized_audio,
     parse_canonical_wav,
 )
 
@@ -151,6 +152,60 @@ def test_direct_audio_rejects_empty_stable_ids(tmp_path: Path, field: str) -> No
 
     with pytest.raises(ValueError, match=field):
         load_direct_audio(audio_path, max_input_audio_frames=1, **arguments)
+
+
+def test_materialized_audio_preserves_source_identity_and_hashes_input(tmp_path: Path) -> None:
+    audio_path = tmp_path / "materialized.wav"
+    content = canonical_wav_bytes(sample_frames=441)
+    audio_path.write_bytes(content)
+    source_digest = sha256(b"authoritative source bytes").hexdigest()
+
+    audio = load_materialized_audio(
+        audio_path,
+        source_audio_id="song-42-source-v1",
+        source_audio_sha256=source_digest,
+        input_view_id="crux-oaf-full-mix-mono44k1-pcm16/v1",
+        max_input_audio_frames=441,
+    )
+
+    assert audio.path == audio_path
+    assert audio.source_audio_id == "song-42-source-v1"
+    assert audio.source_audio_sha256 == source_digest
+    assert audio.input_audio_sha256 == sha256(content).hexdigest()
+    assert audio.input_view_id == "crux-oaf-full-mix-mono44k1-pcm16/v1"
+    assert audio.byte_length == len(content)
+    assert audio.sample_rate == 44100
+    assert audio.channel_count == 1
+    assert audio.sample_width_bytes == 2
+    assert audio.audio_frame_count == 441
+
+
+def test_materialized_audio_rejects_malformed_source_sha256(tmp_path: Path) -> None:
+    audio_path = tmp_path / "materialized.wav"
+    audio_path.write_bytes(canonical_wav_bytes())
+
+    with pytest.raises(ValueError, match="source_audio_sha256"):
+        load_materialized_audio(
+            audio_path,
+            source_audio_id="song-42-source-v1",
+            source_audio_sha256="not-a-sha256",
+            input_view_id="crux-oaf-full-mix-mono44k1-pcm16/v1",
+            max_input_audio_frames=1,
+        )
+
+
+def test_materialized_audio_enforces_frame_limit(tmp_path: Path) -> None:
+    audio_path = tmp_path / "materialized.wav"
+    audio_path.write_bytes(canonical_wav_bytes(sample_frames=2))
+
+    with pytest.raises(ValueError, match="frame count exceeds max_input_audio_frames"):
+        load_materialized_audio(
+            audio_path,
+            source_audio_id="song-42-source-v1",
+            source_audio_sha256="a" * 64,
+            input_view_id="crux-oaf-full-mix-mono44k1-pcm16/v1",
+            max_input_audio_frames=1,
+        )
 
 
 def test_derived_audio_rehashes_source_and_input(tmp_path: Path) -> None:

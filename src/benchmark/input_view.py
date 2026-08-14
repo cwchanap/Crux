@@ -170,6 +170,33 @@ def load_direct_audio_bytes(
     )
 
 
+def load_materialized_audio(
+    audio_path: Path,
+    *,
+    source_audio_id: str,
+    source_audio_sha256: str,
+    input_view_id: str,
+    max_input_audio_frames: int | None,
+) -> CanonicalAudio:
+    _require_nonempty_id(source_audio_id, "source_audio_id")
+    require_sha256(source_audio_sha256, "source_audio_sha256")
+    _require_nonempty_id(input_view_id, "input_view_id")
+    content = read_regular_file_no_follow(audio_path)
+    wav = parse_canonical_wav(content, max_input_audio_frames)
+    return CanonicalAudio(
+        path=audio_path,
+        source_audio_id=source_audio_id,
+        source_audio_sha256=source_audio_sha256,
+        input_view_id=input_view_id,
+        input_audio_sha256=sha256_hex(content),
+        byte_length=wav.byte_length,
+        sample_rate=wav.sample_rate,
+        channel_count=wav.channel_count,
+        sample_width_bytes=wav.sample_width_bytes,
+        audio_frame_count=wav.audio_frame_count,
+    )
+
+
 def load_derived_audio(
     audio_path: Path,
     manifest_path: Path,

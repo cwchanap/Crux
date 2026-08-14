@@ -17,7 +17,12 @@ from src.benchmark.backend_identity import (
 )
 from src.benchmark.backend_registry import BackendUnavailable, default_backend_registry
 from src.benchmark.backends import CanonicalAudio, NativeEvent, NativePrediction
-from src.benchmark.backends.oaf import OafBackend, OafBackendError, build_docker_command
+from src.benchmark.backends.oaf import (
+    OAF_ADAPTER_REVISION,
+    OafBackend,
+    OafBackendError,
+    build_docker_command,
+)
 from src.benchmark.mapping import map_oaf_prediction
 from src.benchmark.prediction_artifact import (
     PREDICTION_SCHEMA,
@@ -73,6 +78,7 @@ def _prediction(tmp_path: Path, events: tuple[NativeEvent, ...]) -> NativePredic
 
 
 def test_task_d_backend_contract_and_registry() -> None:
+    assert OAF_ADAPTER_REVISION == "crux.oaf-adapter/v1"
     field_names = {field.name for field in dataclass_fields(NativePrediction)}
     assert field_names == {"audio", "descriptor", "events"}
     assert not hasattr(NativePrediction, "verify")

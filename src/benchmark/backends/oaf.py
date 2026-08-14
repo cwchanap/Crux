@@ -20,6 +20,7 @@ from src.benchmark.backends.base import CanonicalAudio, NativeEvent, NativePredi
 from src.benchmark.worker_process import WorkerProcess, WorkerProcessError
 
 IMAGE = "crux-oaf-tf1:local"
+OAF_ADAPTER_REVISION = "crux.oaf-adapter/v1"
 RESTORED_TENSOR_COUNT = 78
 
 
@@ -325,6 +326,7 @@ def _int_or_none(value: object, field: str) -> int | None:
 __all__ = [
     "IMAGE",
     "OAF_BACKEND_ID",
+    "OAF_ADAPTER_REVISION",
     "OafBackend",
     "OafBackendError",
     "RESTORED_TENSOR_COUNT",
