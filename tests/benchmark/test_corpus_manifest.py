@@ -1073,7 +1073,7 @@ def test_publish_latest_sanitizes_uuid_generation_failures(
     def failed_uuid() -> object:
         raise RuntimeError(unsafe)
 
-    monkeypatch.setattr(corpus_manifest, "uuid4", failed_uuid)
+    monkeypatch.setattr(durability, "uuid4", failed_uuid)
 
     with pytest.raises(ManifestPublicationError) as raised:
         publish_latest_manifest(tmp_path, published, "complete", FIXED_TIME)

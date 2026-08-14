@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import stat
 from pathlib import Path
+from uuid import uuid4
 
 
 def fsync_directory(path: Path) -> None:
@@ -17,6 +18,33 @@ def fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def atomic_replace_bytes(path: Path, content: bytes) -> None:
+    temporary_path = path.parent / f".{path.name}.{uuid4().hex}.tmp"
+    temporary_exists = False
+    completed = False
+    cleanup_failed = False
+    try:
+        with temporary_path.open("xb") as temporary:
+            temporary_exists = True
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+        temporary_exists = False
+        fsync_directory(path.parent)
+        completed = True
+    except Exception:
+        completed = False
+    finally:
+        if temporary_exists:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except Exception:
+                cleanup_failed = True
+    if not completed or cleanup_failed:
+        raise OSError("artifact publication failed")
 
 
 def ensure_durable_directory(path: Path) -> None:

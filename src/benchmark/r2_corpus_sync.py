@@ -28,7 +28,7 @@ from src.benchmark.corpus_manifest import (
     render_manifest,
 )
 from src.benchmark.corpus_provenance import load_provenance
-from src.benchmark.durability import ensure_durable_directory, fsync_directory
+from src.benchmark.durability import atomic_replace_bytes, ensure_durable_directory, fsync_directory
 from src.benchmark.r2_corpus_models import (
     CACHE_PROFILE,
     REPORT_SCHEMA,
@@ -838,7 +838,7 @@ def _publish_report_file(
     filename = report_filename(started_at, run_id)
     report_path = reports_dir / filename
     content = canonical_json_line(report)
-    _atomic_replace_bytes(report_path, content)
+    atomic_replace_bytes(report_path, content)
     return report_path, f"reports/{filename}", sha256(content).hexdigest()
 
 
@@ -860,7 +860,7 @@ def _publish_latest_report(
         "report_sha256": report_sha256,
         "completed_at": format_manifest_timestamp(completed_at),
     }
-    _atomic_replace_bytes(output_dir / "latest-report.json", canonical_json_line(payload))
+    atomic_replace_bytes(output_dir / "latest-report.json", canonical_json_line(payload))
 
 
 @contextmanager
@@ -1009,7 +1009,7 @@ def _restore_pointers_or_report_failure(
 
 def _restore_pointer(path: Path, previous_content: bytes | None) -> None:
     if previous_content is not None:
-        _atomic_replace_bytes(path, previous_content)
+        atomic_replace_bytes(path, previous_content)
         return
     try:
         metadata = path.lstat()
@@ -1034,33 +1034,6 @@ def _remove_attempt_report(output_dir: Path, started_at: datetime, run_id: str) 
         fsync_directory(path.parent)
     except OSError:
         return
-
-
-def _atomic_replace_bytes(path: Path, content: bytes) -> None:
-    temporary_path = path.parent / f".{path.name}.{uuid4().hex}.tmp"
-    temporary_exists = False
-    completed = False
-    cleanup_failed = False
-    try:
-        with temporary_path.open("xb") as temporary:
-            temporary_exists = True
-            temporary.write(content)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temporary_path, path)
-        temporary_exists = False
-        fsync_directory(path.parent)
-        completed = True
-    except Exception:
-        completed = False
-    finally:
-        if temporary_exists:
-            try:
-                temporary_path.unlink(missing_ok=True)
-            except Exception:
-                cleanup_failed = True
-    if not completed or cleanup_failed:
-        raise OSError("artifact publication failed")
 
 
 def _adapter_error(error: R2StoreError) -> SyncError:

@@ -1,11 +1,93 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+import src.benchmark.worker_process as worker_process
 from src.benchmark.worker_process import WorkerProcess, WorkerProcessError
+
+
+class _FakeStream:
+    def close(self) -> None:
+        pass
+
+
+class _FakePopen:
+    def __init__(self) -> None:
+        self.stdin = _FakeStream()
+        self.stdout = _FakeStream()
+        self.stderr = _FakeStream()
+        self.wait_calls: list[float | None] = []
+
+    def wait(self, timeout: float | None = None) -> None:
+        self.wait_calls.append(timeout)
+        if timeout is not None:
+            raise subprocess.TimeoutExpired("fake-worker", timeout)
+
+    def terminate(self) -> None:
+        pass
+
+    def kill(self) -> None:
+        pass
+
+
+class _RecordingThread:
+    instances: list[_RecordingThread] = []
+
+    def __init__(self, **_kwargs: object) -> None:
+        self.join_calls: list[float | None] = []
+        self.instances.append(self)
+
+    def start(self) -> None:
+        pass
+
+    def join(self, timeout: float | None = None) -> None:
+        self.join_calls.append(timeout)
+
+
+def test_worker_process_close_uses_independent_close_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _RecordingThread.instances.clear()
+    monkeypatch.setattr(worker_process.threading, "Thread", _RecordingThread)
+    process = _FakePopen()
+    worker = WorkerProcess(
+        process,
+        timeout_seconds=3600.0,
+        close_timeout_seconds=30.0,
+        ready={"type": "ready"},
+    )
+
+    worker.close()
+
+    assert process.wait_calls == [30.0, 30.0, None]
+    assert _RecordingThread.instances[0].join_calls == [30.0]
+    assert 3600.0 not in process.wait_calls
+    assert 3600.0 not in _RecordingThread.instances[0].join_calls
+
+
+@pytest.mark.parametrize(
+    ("timeout_seconds", "close_timeout_seconds", "message"),
+    [
+        (0.0, 30.0, "timeout_seconds must be positive"),
+        (30.0, 0.0, "close_timeout_seconds must be positive"),
+    ],
+)
+def test_worker_process_rejects_non_positive_timeouts(
+    timeout_seconds: float,
+    close_timeout_seconds: float,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        WorkerProcess(
+            _FakePopen(),
+            timeout_seconds=timeout_seconds,
+            close_timeout_seconds=close_timeout_seconds,
+            ready={"type": "ready"},
+        )
 
 
 def _script(

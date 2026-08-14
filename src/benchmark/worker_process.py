@@ -29,10 +29,16 @@ class WorkerProcess:
         process: subprocess.Popen[bytes],
         *,
         timeout_seconds: float,
+        close_timeout_seconds: float = 30.0,
         ready: Mapping[str, Any],
     ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if close_timeout_seconds <= 0:
+            raise ValueError("close_timeout_seconds must be positive")
         self._process = process
         self._timeout_seconds = timeout_seconds
+        self._close_timeout_seconds = close_timeout_seconds
         self._request_lock = threading.Lock()
         self._closed = False
         self._ready = dict(ready)
@@ -55,9 +61,14 @@ class WorkerProcess:
         command: Sequence[str] | str | Path,
         *,
         timeout_seconds: float = 30.0,
+        close_timeout_seconds: float = 30.0,
         cwd: Path | None = None,
         env: Mapping[str, str] | None = None,
     ) -> "WorkerProcess":
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if close_timeout_seconds <= 0:
+            raise ValueError("close_timeout_seconds must be positive")
         if isinstance(command, (str, Path)):
             command = [sys.executable, os.fspath(command)]
         if not command:
@@ -75,7 +86,12 @@ class WorkerProcess:
             )
         except OSError as error:
             raise WorkerProcessError("worker could not be started") from error
-        worker = cls(process, timeout_seconds=timeout_seconds, ready={})
+        worker = cls(
+            process,
+            timeout_seconds=timeout_seconds,
+            close_timeout_seconds=close_timeout_seconds,
+            ready={},
+        )
         try:
             ready = worker._read_record(timeout_seconds)
             if ready.get("type") != "ready":
@@ -237,16 +253,16 @@ class WorkerProcess:
             except OSError:
                 pass
         try:
-            self._process.wait(timeout=max(self._timeout_seconds, 0.1))
+            self._process.wait(timeout=max(self._close_timeout_seconds, 0.1))
         except subprocess.TimeoutExpired:
             self._process.terminate()
             try:
-                self._process.wait(timeout=max(self._timeout_seconds, 0.1))
+                self._process.wait(timeout=max(self._close_timeout_seconds, 0.1))
             except subprocess.TimeoutExpired:
                 self._process.kill()
                 self._process.wait()
         if self._stderr_thread is not None:
-            self._stderr_thread.join(timeout=max(self._timeout_seconds, 0.1))
+            self._stderr_thread.join(timeout=max(self._close_timeout_seconds, 0.1))
         for stream in (self._process.stdout, self._process.stderr):
             if stream is not None:
                 try:

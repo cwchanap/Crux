@@ -3,10 +3,41 @@ from pathlib import Path
 
 import pytest
 
+import src.benchmark.durability as durability
 from src.benchmark.durability import (
+    atomic_replace_bytes,
     ensure_durable_directory,
     fsync_directory,
 )
+
+
+def test_atomic_replace_bytes_replaces_and_fsyncs_parent(tmp_path, monkeypatch):
+    path = tmp_path / "run.json"
+    path.write_bytes(b"old")
+    calls = []
+    monkeypatch.setattr(durability, "fsync_directory", lambda p: calls.append(p))
+
+    atomic_replace_bytes(path, b"new")
+
+    assert path.read_bytes() == b"new"
+    assert calls == [tmp_path]
+    assert list(tmp_path.glob(".run.json.*.tmp")) == []
+
+
+def test_atomic_replace_bytes_reports_publication_failure_and_cleans_up(tmp_path, monkeypatch):
+    path = tmp_path / "run.json"
+    path.write_bytes(b"old")
+    monkeypatch.setattr(
+        durability.os,
+        "replace",
+        lambda *_: (_ for _ in ()).throw(OSError("secret replace detail")),
+    )
+
+    with pytest.raises(OSError, match="artifact publication failed"):
+        atomic_replace_bytes(path, b"new")
+
+    assert path.read_bytes() == b"old"
+    assert list(tmp_path.glob(".run.json.*.tmp")) == []
 
 
 def test_fsync_directory_raises_when_no_follow_unavailable(monkeypatch, tmp_path):
