@@ -11,10 +11,13 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal, TypeAlias
+
+import librosa
+import soundfile
 
 from runtime.oaf_tf1.model import OafModelConfig
 from src.benchmark.artifact_io import read_regular_file_no_follow
@@ -28,9 +31,26 @@ from src.benchmark.backend_identity import (
     sha256_hex,
     strict_json_loads,
 )
+from src.benchmark.backends.base import CanonicalAudio
 from src.benchmark.backends.oaf import OAF_ADAPTER_REVISION
 from src.benchmark.cohort_scoring import COHORT_FAILURE_REASONS
+from src.benchmark.corpus_cache import (
+    CacheIndexStore,
+    cache_entry_matches_remote,
+    resolve_verified_cache_body,
+    validate_cached_body,
+)
+from src.benchmark.corpus_manifest import ManifestRowView
 from src.benchmark.durability import atomic_replace_bytes
+from src.benchmark.input_view import load_materialized_audio
+from src.benchmark.r2_corpus_models import RemoteObject, parse_manifest_timestamp
+from src.benchmark.reference_set import ReferenceMappingResult, map_reference_events
+from src.benchmark.reference_set_manifest import (
+    LoadedReferenceSetManifest,
+    read_native_reference_events,
+)
+from src.benchmark.reference_timing import inspect_source_audio
+from src.benchmark.reference_timing_manifest import LoadedReferenceTimingManifest
 from src.benchmark.taxonomy import OAF_PREDICTION_MAP_ID
 
 OAF_CORPUS_RUN_SCHEMA = "crux.oaf-corpus-run/v1"
@@ -43,6 +63,16 @@ OAF_WORKER_CLOSE_TIMEOUT_SECONDS = 30.0
 
 OafRunStatus: TypeAlias = Literal["complete", "partial", "failed"]
 OafRunExitCode: TypeAlias = Literal[0, 1, 2]
+
+
+@dataclass(frozen=True)
+class ResolvedSourceAudio:
+    """One locally verified source-audio body and its header duration."""
+
+    path: Path
+    source_audio_id: str
+    source_audio_sha256: str
+    duration_sec: float
 
 
 # pylint: disable=too-many-instance-attributes
@@ -360,6 +390,250 @@ def prediction_path(
 # pylint: enable=redefined-outer-name
 
 
+def _remote_from_source_mapping(
+    source: Mapping[str, object],
+    *,
+    source_audio_key: str,
+) -> RemoteObject:
+    raw_objects = source.get("objects")
+    if not isinstance(raw_objects, list):
+        raise ValueError("source manifest does not contain an object inventory")
+    for raw_object in raw_objects:
+        if not isinstance(raw_object, Mapping) or raw_object.get("key") != source_audio_key:
+            continue
+        try:
+            return RemoteObject(
+                key=source_audio_key,
+                size=raw_object["size"],  # type: ignore[arg-type]
+                etag=raw_object["etag"],  # type: ignore[arg-type]
+                etag_is_weak=raw_object["etag_is_weak"],  # type: ignore[arg-type]
+                last_modified=parse_manifest_timestamp(raw_object["last_modified"]),
+                content_type=raw_object["content_type"],  # type: ignore[arg-type]
+                cache_status=raw_object["cache_status"],  # type: ignore[arg-type]
+                sha256=raw_object["sha256"],  # type: ignore[arg-type]
+                cache_path=raw_object["cache_path"],  # type: ignore[arg-type]
+            )
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("source manifest contains an invalid audio object") from None
+    raise ValueError("source audio key is absent from the source inventory")
+
+
+def _source_audio_parts(
+    source: RemoteObject | ManifestRowView | Mapping[str, object],
+    *,
+    source_audio_key: str | None,
+    source_audio_content_hash: str | None,
+    source_endpoint_sha256: str | None,
+    source_bucket: str | None,
+) -> tuple[RemoteObject, str, str, str]:
+    if isinstance(source, ManifestRowView):
+        endpoint = source_endpoint_sha256 or source.source_endpoint_sha256
+        bucket = source_bucket or source.source_bucket
+        key = source_audio_key
+        if key is None:
+            raise ValueError("source_audio_key is required")
+        remote = next((item for item in source.inventory.objects if item.key == key), None)
+        if remote is None:
+            raise ValueError("source audio key is absent from the source inventory")
+        expected = source_audio_content_hash
+    elif isinstance(source, RemoteObject):
+        endpoint = source_endpoint_sha256
+        bucket = source_bucket
+        key = source_audio_key or source.key
+        remote = source
+        expected = source_audio_content_hash
+    elif isinstance(source, Mapping):
+        key = source_audio_key or source.get("source_audio_key")
+        endpoint = source_endpoint_sha256 or source.get("source_endpoint_sha256")
+        bucket = source_bucket or source.get("source_bucket")
+        expected = source_audio_content_hash or source.get("source_audio_content_hash")
+        if not isinstance(key, str):
+            raise ValueError("source_audio_key is required")
+        remote = _remote_from_source_mapping(source, source_audio_key=key)
+    else:
+        raise TypeError("source must be a RemoteObject, ManifestRowView, or mapping")
+
+    if not isinstance(endpoint, str) or not endpoint:
+        raise ValueError("source_endpoint_sha256 is required")
+    if not isinstance(bucket, str) or not bucket:
+        raise ValueError("source_bucket is required")
+    if not isinstance(key, str) or not key:
+        raise ValueError("source_audio_key is required")
+    if not isinstance(expected, str):
+        expected = remote.sha256
+    if not isinstance(expected, str):
+        raise ValueError("source_audio_content_hash is required")
+    require_sha256(expected, "source_audio_content_hash")
+    return remote, endpoint, bucket, expected
+
+
+# pylint: disable=too-many-arguments,too-many-locals
+def _resolve_source_audio(
+    source: RemoteObject | ManifestRowView | Mapping[str, object],
+    cache_dir: Path,
+    cache_index: CacheIndexStore | None = None,
+    *,
+    index: CacheIndexStore | None = None,
+    source_audio_key: str | None = None,
+    source_audio_content_hash: str | None = None,
+    source_endpoint_sha256: str | None = None,
+    source_bucket: str | None = None,
+) -> ResolvedSourceAudio:
+    """Resolve one source body from the verified local HPA-321 cache only."""
+    if not isinstance(cache_dir, Path):
+        raise TypeError("cache_dir must be a Path")
+    if cache_index is not None and index is not None and cache_index is not index:
+        raise ValueError("cache index arguments disagree")
+    cache_index = cache_index or index or CacheIndexStore.load(cache_dir)
+    remote, endpoint, bucket, expected = _source_audio_parts(
+        source,
+        source_audio_key=source_audio_key,
+        source_audio_content_hash=source_audio_content_hash,
+        source_endpoint_sha256=source_endpoint_sha256,
+        source_bucket=source_bucket,
+    )
+
+    verified_remote = remote
+    if remote.cache_status != "verified":
+        entry = cache_index.get(endpoint, bucket, remote.key)
+        if not cache_entry_matches_remote(entry, remote, endpoint=endpoint, bucket=bucket):
+            raise ValueError("verified source audio unavailable")
+        validation = validate_cached_body(cache_dir, entry)
+        if validation.state != "verified" or entry is None:
+            raise ValueError("verified source audio unavailable")
+        verified_remote = replace(
+            remote,
+            cache_status="verified",
+            sha256=entry.sha256,
+            cache_path=entry.cache_path,
+        )
+
+    if verified_remote.sha256 != expected:
+        raise ValueError("source audio digest does not match reference timing manifest")
+    path = resolve_verified_cache_body(
+        cache_dir,
+        verified_remote,
+        source_endpoint_sha256=endpoint,
+        bucket=bucket,
+        expected_sha256=expected,
+    )
+    duration_sec = inspect_source_audio(path).duration_sec
+    return ResolvedSourceAudio(
+        path=path,
+        source_audio_id=remote.key,
+        source_audio_sha256=expected,
+        duration_sec=duration_sec,
+    )
+
+
+# pylint: enable=too-many-arguments,too-many-locals
+
+
+def _materialize_oaf_full_mix(
+    source_audio: ResolvedSourceAudio,
+    output_path: Path,
+    *,
+    input_root: Path,
+    config: OafModelConfig,
+) -> CanonicalAudio:
+    """Materialize one temporary, canonical OaF full-mix input."""
+    if not isinstance(source_audio, ResolvedSourceAudio):
+        raise TypeError("source_audio must be ResolvedSourceAudio")
+    if not isinstance(output_path, Path) or not isinstance(input_root, Path):
+        raise TypeError("output_path and input_root must be Paths")
+    if not isinstance(config, OafModelConfig):
+        raise TypeError("config must be OafModelConfig")
+    root = input_root.resolve()
+    destination = output_path.resolve()
+    try:
+        destination.relative_to(root)
+    except ValueError:
+        raise ValueError("canonical input must be beneath input_root") from None
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    samples, _ = librosa.load(
+        source_audio.path,
+        sr=44100,
+        mono=True,
+        res_type="soxr_hq",
+    )
+    soundfile.write(
+        output_path,
+        samples,
+        44100,
+        format="WAV",
+        subtype="PCM_16",
+    )
+    return load_materialized_audio(
+        path=output_path,
+        source_audio_id=source_audio.source_audio_id,
+        source_audio_sha256=source_audio.source_audio_sha256,
+        input_view_id=OAF_FULL_MIX_INPUT_VIEW_ID,
+        max_input_audio_frames=config.max_input_audio_frames,
+    )
+
+
+# pylint: disable=too-many-branches
+def _preflight_reference_mappings(
+    reference_manifest: LoadedReferenceSetManifest,
+    timing_manifest: LoadedReferenceTimingManifest,
+    *,
+    timing_output_root: Path,
+) -> dict[int, ReferenceMappingResult | None]:
+    """Reconstruct eligible native references before any backend work."""
+    if not isinstance(reference_manifest, LoadedReferenceSetManifest):
+        raise TypeError("reference_manifest must be LoadedReferenceSetManifest")
+    if not isinstance(timing_manifest, LoadedReferenceTimingManifest):
+        raise TypeError("timing_manifest must be LoadedReferenceTimingManifest")
+    if not isinstance(timing_output_root, Path):
+        raise TypeError("timing_output_root must be a Path")
+    if (
+        reference_manifest.source_reference_timing_manifest_sha256
+        != timing_manifest.manifest_sha256
+        or reference_manifest.source_reference_timing_version != timing_manifest.corpus_version
+    ):
+        raise ValueError("reference and timing manifests have different lineage")
+
+    timing_rows = {row.view.simfile_id: row for row in timing_manifest.rows}
+    mappings: dict[int, ReferenceMappingResult | None] = {}
+    for loaded in reference_manifest.rows:
+        simfile_id = loaded.view.simfile_id
+        timing_row = timing_rows.get(simfile_id)
+        reasons = set(loaded.view.eligibility_reason_codes)
+        if loaded.view.eligibility_status != "eligible":
+            if reasons & {"upstream_reference_unavailable", "reference_event_artifact_invalid"}:
+                mappings[simfile_id] = None
+                continue
+            if timing_row is None or timing_row.view.timing_status != "ready":
+                mappings[simfile_id] = None
+                continue
+        if timing_row is None or timing_row.view.timing_status != "ready":
+            raise ValueError("eligible reference timing row is unavailable")
+        for field in (
+            "selected_chart_key",
+            "selected_chart_content_hash",
+            "source_audio_key",
+            "source_audio_content_hash",
+            "reference_events_cache_path",
+        ):
+            if loaded.source_row.get(field) != timing_row.source_row.get(field):
+                raise ValueError("eligible reference identity does not match timing row")
+        try:
+            events = read_native_reference_events(
+                timing_row,
+                timing_output_root=timing_output_root,
+            )
+            mappings[simfile_id] = map_reference_events(events)
+        except (OSError, RuntimeError, ValueError):
+            if loaded.view.eligibility_status == "eligible":
+                raise ValueError("eligible reference event artifact invalid") from None
+            mappings[simfile_id] = None
+    return mappings
+
+
+# pylint: enable=too-many-branches
+
+
 def classify_oaf_backend_error(code: str) -> tuple[str | None, str]:
     """Map a backend code to runner failure family and lifecycle disposition."""
     if not isinstance(code, str):
@@ -522,6 +796,7 @@ __all__ = [
     "RUNNER_FAILURE_TO_COHORT_REASON",
     "OafCorpusRunOutcome",
     "OafCorpusRunRequest",
+    "ResolvedSourceAudio",
     "build_inference_config",
     "build_run_id",
     "classify_oaf_backend_error",
