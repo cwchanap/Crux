@@ -307,15 +307,25 @@ def test_resolve_source_audio_rejects_missing_or_corrupt_cache_body(
 
 def test_preflight_published_eligible_artifact_deletion_is_fatal(tmp_path: Path) -> None:
     timing_path, reference_path, event_path = _published_reference_preflight_fixture(tmp_path)
-    event_path.unlink()
     timing_manifest = load_reference_timing_manifest(timing_path)
     reference_manifest = load_reference_set_manifest(reference_path)
+    timing_output_root = timing_path.parent.parent
+    simfile_id = reference_manifest.rows[0].view.simfile_id
+
+    before_deletion = _preflight_reference_mappings(
+        reference_manifest,
+        timing_manifest,
+        timing_output_root=timing_output_root,
+    )
+    assert isinstance(before_deletion[simfile_id], ReferenceMappingResult)
+
+    event_path.unlink()
 
     with pytest.raises(ValueError, match="eligible reference event artifact invalid"):
         _preflight_reference_mappings(
             reference_manifest,
             timing_manifest,
-            timing_output_root=tmp_path,
+            timing_output_root=timing_output_root,
         )
 
 
