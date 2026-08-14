@@ -446,7 +446,7 @@ def _source_audio_parts(
         key = source_audio_key or source.get("source_audio_key")
         endpoint = source_endpoint_sha256 or source.get("source_endpoint_sha256")
         bucket = source_bucket or source.get("source_bucket")
-        expected = source_audio_content_hash or source.get("source_audio_content_hash")
+        expected = source_audio_content_hash
         if not isinstance(key, str):
             raise ValueError("source_audio_key is required")
         remote = _remote_from_source_mapping(source, source_audio_key=key)
@@ -459,8 +459,6 @@ def _source_audio_parts(
         raise ValueError("source_bucket is required")
     if not isinstance(key, str) or not key:
         raise ValueError("source_audio_key is required")
-    if not isinstance(expected, str):
-        expected = remote.sha256
     if not isinstance(expected, str):
         raise ValueError("source_audio_content_hash is required")
     require_sha256(expected, "source_audio_content_hash")

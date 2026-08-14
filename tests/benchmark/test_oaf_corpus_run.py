@@ -190,6 +190,27 @@ def test_resolve_source_audio_uses_carried_verified_remote_and_probes_duration(
     assert resolved.duration_sec == pytest.approx(0.5)
 
 
+def test_resolve_source_audio_requires_hpa323_timing_hash(
+    tmp_path: Path,
+) -> None:
+    content = _source_wav_bytes()
+    digest, path = _cache_body(tmp_path, content)
+    remote = _source_remote(
+        content=content,
+        digest=digest,
+        cache_path=path.relative_to(tmp_path).as_posix(),
+    )
+
+    with pytest.raises(ValueError, match="source_audio_content_hash is required"):
+        _resolve_source_audio(
+            remote,
+            tmp_path,
+            CacheIndexStore(tmp_path, {}),
+            source_endpoint_sha256=SHA_B,
+            source_bucket="simfile-dtx",
+        )
+
+
 def test_resolve_source_audio_rehydrates_matching_stale_cache_index_entry(
     tmp_path: Path,
 ) -> None:
@@ -284,6 +305,20 @@ def test_resolve_source_audio_rejects_missing_or_corrupt_cache_body(
         )
 
 
+def test_preflight_published_eligible_artifact_deletion_is_fatal(tmp_path: Path) -> None:
+    timing_path, reference_path, event_path = _published_reference_preflight_fixture(tmp_path)
+    event_path.unlink()
+    timing_manifest = load_reference_timing_manifest(timing_path)
+    reference_manifest = load_reference_set_manifest(reference_path)
+
+    with pytest.raises(ValueError, match="eligible reference event artifact invalid"):
+        _preflight_reference_mappings(
+            reference_manifest,
+            timing_manifest,
+            timing_output_root=tmp_path,
+        )
+
+
 def test_resolve_source_audio_rejects_digest_mismatch_against_timing_manifest(
     tmp_path: Path,
 ) -> None:
@@ -304,6 +339,37 @@ def test_resolve_source_audio_rejects_digest_mismatch_against_timing_manifest(
             source_bucket="simfile-dtx",
             source_audio_content_hash=SHA_C,
         )
+
+
+def test_resolve_source_audio_duration_probe_failure_is_item_local(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = _source_wav_bytes()
+    digest, path = _cache_body(tmp_path, content)
+    remote = _source_remote(
+        content=content,
+        digest=digest,
+        cache_path=path.relative_to(tmp_path).as_posix(),
+    )
+    import src.benchmark.oaf_corpus_run as run_module
+
+    def fail_probe(_: Path):
+        raise OSError("unreadable source audio")
+
+    monkeypatch.setattr(run_module, "inspect_source_audio", fail_probe)
+
+    with pytest.raises(OSError, match="unreadable source audio"):
+        _resolve_source_audio(
+            remote,
+            tmp_path,
+            CacheIndexStore(tmp_path, {}),
+            source_endpoint_sha256=SHA_B,
+            source_bucket="simfile-dtx",
+            source_audio_content_hash=digest,
+        )
+
+    assert RUNNER_FAILURE_TO_COHORT_REASON["source_audio_decode_failed"] == "inference_failed"
 
 
 def test_materialize_oaf_full_mix_uses_pinned_resampling_and_canonical_wav(
