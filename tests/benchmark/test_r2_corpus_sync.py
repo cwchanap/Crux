@@ -15,6 +15,7 @@ from threading import Event, Lock, Thread
 
 import pytest
 
+import src.benchmark.durability as durability
 import src.benchmark.r2_corpus_sync as r2_corpus_sync
 from src.benchmark.corpus_cache import CacheIndexEntry, CacheIndexStore, cache_writer_lock
 from src.benchmark.corpus_manifest import ManifestPublicationError
@@ -758,7 +759,7 @@ def test_latest_report_directory_fsync_failure_restores_manifest_pointer_and_upd
     (output_dir / "latest.json").write_bytes(previous_latest)
     (output_dir / "latest-report.json").write_bytes(previous_latest_report)
     real_replace = r2_corpus_sync.os.replace
-    real_fsync_directory = r2_corpus_sync.fsync_directory
+    real_fsync_directory = durability.fsync_directory
     latest_report_replaced = False
     failed_once = False
 
@@ -776,7 +777,7 @@ def test_latest_report_directory_fsync_failure_restores_manifest_pointer_and_upd
         real_fsync_directory(path)
 
     monkeypatch.setattr(r2_corpus_sync.os, "replace", record_replace)
-    monkeypatch.setattr(r2_corpus_sync, "fsync_directory", fail_after_latest_report_replace)
+    monkeypatch.setattr(durability, "fsync_directory", fail_after_latest_report_replace)
 
     outcome, _ = invoke_sync(tmp_path, complete_store())
 
@@ -2268,14 +2269,14 @@ def test_atomic_replace_bytes_cleanup_failure_sets_cleanup_flag(tmp_path, monkey
 
     # Make os.replace fail so the temporary file needs cleanup.
     monkeypatch.setattr(
-        r2_corpus_sync.os,
+        durability.os,
         "replace",
         lambda *_: (_ for _ in ()).throw(OSError("SECRET replace detail")),
     )
     monkeypatch.setattr(r2_corpus_sync.Path, "unlink", fail_unlink)
 
     with pytest.raises(OSError, match="artifact publication failed"):
-        r2_corpus_sync._atomic_replace_bytes(path, b'{"data":"new"}\n')
+        durability.atomic_replace_bytes(path, b'{"data":"new"}\n')
 
 
 def test_adapter_error_assigns_object_scope_for_keyed_metadata() -> None:

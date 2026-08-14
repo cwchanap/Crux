@@ -13,7 +13,11 @@ from typing import Literal, get_args
 from uuid import uuid4
 
 from src.benchmark.corpus_provenance import provenance_for
-from src.benchmark.durability import ensure_durable_directory, fsync_directory
+from src.benchmark.durability import (
+    atomic_replace_bytes,
+    ensure_durable_directory,
+    fsync_directory,
+)
 from src.benchmark.r2_corpus_models import (
     CACHE_PROFILE,
     MANIFEST_SCHEMA,
@@ -563,31 +567,9 @@ def _verify_existing_manifest(path: Path, expected_content: bytes) -> None:
 
 
 def _atomic_replace_json(path: Path, payload: dict[str, object]) -> None:
-    temporary_path: Path | None = None
-    temporary_exists = False
-    completed = False
-    cleanup_failed = False
     try:
-        content = canonical_json_line(payload)
-        temporary_path = path.parent / f".{path.name}.{uuid4().hex}.tmp"
-        with temporary_path.open("xb") as temporary:
-            temporary_exists = True
-            temporary.write(content)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temporary_path, path)
-        temporary_exists = False
-        fsync_directory(path.parent)
-        completed = True
-    except Exception:
-        completed = False
-    finally:
-        if temporary_exists and temporary_path is not None:
-            try:
-                temporary_path.unlink(missing_ok=True)
-            except Exception:
-                cleanup_failed = True
-    if not completed or cleanup_failed:
+        atomic_replace_bytes(path, canonical_json_line(payload))
+    except OSError:
         raise ManifestPublicationError(_PUBLICATION_ERROR) from None
 
 
