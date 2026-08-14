@@ -12,7 +12,8 @@
 
 - One OaF-specific runner only; no generic backend/plugin pipeline.
 - One sequential persistent `OafBackend`; no pool, batching, queue, distributed execution, restart framework, or retry/backoff engine.
-- `OAF_CORPUS_REQUEST_TIMEOUT_SECONDS = 3600.0` for request/readiness ceiling in the first pilot.
+- `OAF_CORPUS_REQUEST_TIMEOUT_SECONDS = 3600.0` for the first real pilot request/readiness ceiling.
+- The 3600-second request ceiling is intentionally not reduced to 900 seconds before the pilot: the only real pre-HPA-326 timing evidence is the HPA-423 one-second smoke, whose first lazy-backend call took and reported RTF `24.818518`; it includes startup, but does not establish a safe 900-second full-song ceiling.
 - `WorkerProcess.close()` must use a separate `OAF_WORKER_CLOSE_TIMEOUT_SECONDS = 30.0` default rather than the request timeout.
 - `--cache-dir` is the HPA-321 corpus/audio cache only. Keep `create_backend()`'s existing checkpoint-cache default; no `--checkpoint-dir`.
 - No R2/network fill from HPA-326.
@@ -1138,9 +1139,10 @@ Record:
 ```text
 request_timeout_seconds = 3600
 worker_close_timeout_seconds = 30
+prior_hpa423_smoke_first_call_rtf = 24.818518
 ```
 
-The 3600-second request ceiling is intentionally retained for the first pilot because the existing HPA-423 one-second smoke's first lazy-backend call took 24.818518 seconds; no full-song steady-state evidence currently justifies a 900-second cap.
+The HPA-423 smoke is only evidence that a pre-pilot 900-second full-song ceiling is not yet justified; because the first call includes lazy startup it is **not** used as the corpus projection.
 
 - [ ] **Step 3: Run the fixed pilot**
 
