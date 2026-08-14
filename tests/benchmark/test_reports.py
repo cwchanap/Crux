@@ -335,3 +335,33 @@ def test_reversed_input_order_keeps_all_report_bytes_identical(tmp_path: Path) -
         _result(diagnostics_for=("1",), reverse_items=True), tmp_path / "second"
     )
     _assert_same_bytes(first, second)
+
+
+def _zero_success_result():
+    failed = _item(
+        "1",
+        prediction_events=None,
+        status="failed",
+        failure_reason="prediction_missing",
+    )
+    quarantined = _item(
+        "2",
+        prediction_events=None,
+        status="quarantined",
+        failure_reason="reference_quarantined",
+    )
+    return score_cohort(_identity(), (failed, quarantined), tolerances_ms=(50,))
+
+
+def test_write_cohort_reports_renders_empty_markdown_sections_for_zero_success(
+    tmp_path: Path,
+) -> None:
+    artifacts = write_cohort_reports(_zero_success_result(), tmp_path)
+    markdown = artifacts.summary_markdown.read_text(encoding="utf-8")
+    assert "No supported classes." in markdown
+    assert "No successful songs." in markdown
+
+
+def test_write_cohort_reports_rejects_non_cohort_score_result(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="result must be CohortScoreResult"):
+        write_cohort_reports("not a result", tmp_path)  # type: ignore[arg-type]

@@ -43,6 +43,7 @@ from src.benchmark.scorer_input import (
     reference_to_benchmark_events,
 )
 from src.benchmark.taxonomy import (
+    DTX_LANE_MAP,
     DTX_LANE_MAP_VERSION,
     OAF_PREDICTION_MAP_ID,
     TAXONOMY_VERSION,
@@ -1267,3 +1268,478 @@ def test_score_cohort_zero_success_keeps_population_and_undefined_aggregates() -
         )
         assert aggregate.per_class == ()
         assert aggregate.successful_song_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Coverage gap tests: validation error paths in cohort_scoring.py
+# ---------------------------------------------------------------------------
+
+
+def test_artifact_identity_rejects_empty_field() -> None:
+    with pytest.raises(ValueError, match="simfile_id must be a nonempty string"):
+        cohort_scoring.CohortArtifactIdentity(
+            simfile_id="",
+            backend_id=OAF_BACKEND_ID,
+            model_id="model",
+            backend_descriptor_sha256="e" * 64,
+            input_view_id="full-mix-v1",
+            prediction_map_version=OAF_PREDICTION_MAP_ID,
+        )
+
+
+@pytest.mark.parametrize(
+    ("args", "match"),
+    [
+        (("not identity", "42", None, None), "identity must be CohortIdentity"),
+        ((build_identity(), "", None, None), "simfile_id must be a nonempty string"),
+        ((build_identity(), "42", "not ref", None), "reference must be ReferenceMappingResult"),
+        ((build_identity(), "42", None, "not pred"), "prediction must be PredictionArtifact"),
+    ],
+)
+def test_cohort_item_from_artifacts_rejects_bad_argument_types(
+    tmp_path: Path, args: tuple, match: str
+) -> None:
+    reference = build_reference_mapping()
+    prediction = _artifact_for_song(tmp_path, "42")
+    identity, simfile_id, ref, pred = args
+    if ref is None:
+        ref = reference
+    if pred is None:
+        pred = prediction
+    with pytest.raises((TypeError, ValueError), match=match):
+        cohort_scoring.cohort_item_from_artifacts(identity, simfile_id, ref, pred)
+
+
+def test_cohort_item_from_artifacts_rejects_non_tuple_warnings(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="warnings must be a tuple of strings"):
+        cohort_scoring.cohort_item_from_artifacts(
+            build_identity(),
+            "42",
+            build_reference_mapping(),
+            _artifact_for_song(tmp_path, "42"),
+            warnings=["not a tuple"],
+        )
+
+
+def test_coverage_from_artifacts_rejects_bad_types() -> None:
+    with pytest.raises(TypeError, match="reference must be ReferenceMappingResult"):
+        coverage_from_artifacts("not a reference", None)
+
+    with pytest.raises(TypeError, match="prediction must be PredictionArtifact or None"):
+        coverage_from_artifacts(build_reference_mapping(), "not a prediction")
+
+
+def test_validate_cohort_items_rejects_bad_identity_type() -> None:
+    with pytest.raises(TypeError, match="identity must be CohortIdentity"):
+        validate_cohort_items("not identity", ())
+
+
+def test_validate_cohort_items_rejects_non_cohort_item() -> None:
+    with pytest.raises(TypeError, match="cohort items must be CohortItem"):
+        validate_cohort_items(build_identity(), ("not item",))
+
+
+def test_validate_cohort_items_rejects_empty_simfile_id() -> None:
+    invalid = dataclasses.replace(build_item(), simfile_id="")
+    with pytest.raises(ValueError, match="simfile_id must be a nonempty string"):
+        validate_cohort_items(build_identity(), (invalid,))
+
+
+def test_validate_cohort_items_rejects_invalid_status() -> None:
+    invalid = dataclasses.replace(build_item(), status="other")
+    with pytest.raises(ValueError, match="invalid status"):
+        validate_cohort_items(build_identity(), (invalid,))
+
+
+def test_validate_success_item_rejects_none_prediction_events() -> None:
+    invalid = build_item(prediction_events=None)
+    with pytest.raises(ValueError, match="success item requires prediction_events"):
+        validate_cohort_items(build_identity(), (invalid,))
+
+
+def test_non_success_item_rejects_artifact_evidence() -> None:
+    invalid = dataclasses.replace(
+        build_item(
+            simfile_id="43",
+            status="failed",
+            prediction_events=None,
+            failure_reason="backend_unavailable",
+        ),
+        artifact_identity=build_artifact_identity("43"),
+    )
+    with pytest.raises(ValueError, match="must not have artifact evidence"):
+        validate_cohort_items(build_identity(), (invalid,))
+
+
+def test_non_success_item_rejects_prediction_events() -> None:
+    invalid = CohortItem(
+        simfile_id="43",
+        status="failed",
+        reference_events=(BenchmarkEvent("43", 1.0, "kick", "ground_truth"),),
+        prediction_events=(BenchmarkEvent("43", 1.0, "kick", "prediction"),),
+        coverage=CohortCoverage(1, 1, 0, 0, 0, None, None, None),
+        failure_reason="backend_unavailable",
+    )
+    with pytest.raises(ValueError, match="must not have prediction_events"):
+        validate_cohort_items(build_identity(), (invalid,))
+
+
+def test_non_success_item_rejects_prediction_coverage() -> None:
+    invalid = CohortItem(
+        simfile_id="43",
+        status="failed",
+        reference_events=(BenchmarkEvent("43", 1.0, "kick", "ground_truth"),),
+        prediction_events=None,
+        coverage=CohortCoverage(1, 1, 0, 0, 0, 1, 1, 0),
+        failure_reason="backend_unavailable",
+    )
+    with pytest.raises(ValueError, match="must not have prediction coverage"):
+        validate_cohort_items(build_identity(), (invalid,))
+
+
+def test_skipped_item_rejects_wrong_failure_reason() -> None:
+    invalid = CohortItem(
+        simfile_id="44",
+        status="skipped",
+        reference_events=(BenchmarkEvent("44", 1.0, "kick", "ground_truth"),),
+        prediction_events=None,
+        coverage=CohortCoverage(1, 1, 0, 0, 0, None, None, None),
+        failure_reason="inference_failed",
+    )
+    with pytest.raises(ValueError, match="skipped item requires explicitly_skipped"):
+        validate_cohort_items(build_identity(), (invalid,))
+
+
+def test_quarantined_item_rejects_wrong_failure_reason() -> None:
+    invalid = CohortItem(
+        simfile_id="45",
+        status="quarantined",
+        reference_events=(BenchmarkEvent("45", 1.0, "kick", "ground_truth"),),
+        prediction_events=None,
+        coverage=CohortCoverage(1, 1, 0, 0, 0, None, None, None),
+        failure_reason="inference_failed",
+    )
+    with pytest.raises(ValueError, match="quarantined item requires reference_quarantined"):
+        validate_cohort_items(build_identity(), (invalid,))
+
+
+def test_validate_artifact_identity_rejects_bad_type() -> None:
+    with pytest.raises(TypeError, match="artifact_identity must be CohortArtifactIdentity"):
+        cohort_scoring._validate_artifact_identity(build_identity(), "not identity", "42")
+
+
+def test_validate_artifact_identity_rejects_simfile_id_mismatch() -> None:
+    artifact_identity = build_artifact_identity("42")
+    with pytest.raises(ValueError, match="artifact simfile_id does not match"):
+        cohort_scoring._validate_artifact_identity(build_identity(), artifact_identity, "99")
+
+
+def test_artifact_identity_rejects_mixed_source_audio_content_hash(
+    tmp_path: Path,
+) -> None:
+    native_events = (
+        build_native_reference("13", 1.0, 0),
+        NativeReferenceEvent(
+            simfile_id=42,
+            selected_chart_key="42/chart.dtx",
+            selected_chart_content_hash="e" * 64,
+            source_audio_key="42/audio.wav",
+            source_audio_content_hash="a" * 64,
+            source_order=1,
+            measure=1,
+            position=1.0,
+            lane_id="12",
+            note_id="snare-1",
+            chart_time_sec=2.0,
+            audio_time_sec=2.0,
+        ),
+    )
+    mixed_reference = map_reference_events(native_events)
+    with pytest.raises(ValueError, match="mixed source_audio_content_hash"):
+        cohort_scoring.cohort_item_from_artifacts(
+            build_identity(),
+            "42",
+            mixed_reference,
+            _artifact_for_song(tmp_path, "42"),
+        )
+
+
+def test_artifact_identity_rejects_invalid_backend_id(tmp_path: Path) -> None:
+    artifact = _artifact_for_song(tmp_path, "42")
+    tampered = dataclasses.replace(
+        artifact,
+        prediction=dataclasses.replace(
+            artifact.prediction,
+            descriptor=dataclasses.replace(
+                artifact.prediction.descriptor,
+                payload={**artifact.prediction.descriptor.payload, "backend_id": ""},
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="backend_id is invalid"):
+        cohort_scoring.cohort_item_from_artifacts(
+            build_identity(), "42", build_reference_mapping(), tampered
+        )
+
+
+def test_artifact_identity_rejects_invalid_model_id(tmp_path: Path) -> None:
+    artifact = _artifact_for_song(tmp_path, "42")
+    tampered = dataclasses.replace(
+        artifact,
+        prediction=dataclasses.replace(
+            artifact.prediction,
+            descriptor=dataclasses.replace(
+                artifact.prediction.descriptor,
+                payload={**artifact.prediction.descriptor.payload, "model_id": ""},
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="model_id is invalid"):
+        cohort_scoring.cohort_item_from_artifacts(
+            build_identity(), "42", build_reference_mapping(), tampered
+        )
+
+
+def test_artifact_identity_rejects_mixed_prediction_map_versions(
+    tmp_path: Path,
+) -> None:
+    artifact = _artifact_for_song(tmp_path, "42")
+    events = artifact.prediction.events
+    tampered_event = dataclasses.replace(events[0], prediction_map_version="other-map")
+    tampered = dataclasses.replace(
+        artifact,
+        prediction=dataclasses.replace(
+            artifact.prediction,
+            events=(tampered_event, *events[1:]),
+        ),
+    )
+    with pytest.raises(ValueError, match="mixed prediction_map_version"):
+        cohort_scoring.cohort_item_from_artifacts(
+            build_identity(), "42", build_reference_mapping(), tampered
+        )
+
+
+def test_artifact_identity_rejects_empty_non_oaf_prediction(tmp_path: Path) -> None:
+    artifact = _empty_artifact_for_song(tmp_path, "42")
+    tampered = dataclasses.replace(
+        artifact,
+        prediction=dataclasses.replace(
+            artifact.prediction,
+            descriptor=dataclasses.replace(
+                artifact.prediction.descriptor,
+                payload={**artifact.prediction.descriptor.payload, "backend_id": "other"},
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="no prediction_map_version"):
+        cohort_scoring.cohort_item_from_artifacts(
+            build_identity(), "42", build_reference_mapping(), tampered
+        )
+
+
+def test_success_item_rejects_missing_prediction_artifact_evidence(
+    tmp_path: Path,
+) -> None:
+    item = cohort_scoring.cohort_item_from_artifacts(
+        build_identity(), "42", build_reference_mapping(), _artifact_for_song(tmp_path, "42")
+    )
+    tampered = dataclasses.replace(item, prediction_artifact=None)
+    with pytest.raises(ValueError, match="prediction artifact evidence"):
+        validate_cohort_items(build_identity(), (tampered,))
+
+
+def test_success_item_rejects_reference_duplicate_diagnostics_mismatch(
+    tmp_path: Path,
+) -> None:
+    item = cohort_scoring.cohort_item_from_artifacts(
+        build_identity(), "42", build_reference_mapping(), _artifact_for_song(tmp_path, "42")
+    )
+    tampered_diagnostics = dataclasses.replace(
+        item.reference_artifact.diagnostics,
+        duplicate_common_event_count=item.reference_artifact.diagnostics.duplicate_common_event_count
+        + 1,
+    )
+    tampered = dataclasses.replace(
+        item,
+        reference_artifact=dataclasses.replace(
+            item.reference_artifact, diagnostics=tampered_diagnostics
+        ),
+    )
+    with pytest.raises(ValueError, match="reference duplicate diagnostics"):
+        validate_cohort_items(build_identity(), (tampered,))
+
+
+def test_success_item_rejects_reference_mapped_with_unknown_lane(
+    tmp_path: Path,
+) -> None:
+    custom_lane_map = {**dict(DTX_LANE_MAP), "99": ClassMapping("kick", "kick")}
+    native_events = (build_native_reference("99", 1.0, 0),)
+    custom_reference = map_reference_events(native_events, lane_map=custom_lane_map)
+    with pytest.raises(ValueError, match="not mapped using the frozen DTX lane map"):
+        cohort_scoring.cohort_item_from_artifacts(
+            build_identity(), "42", custom_reference, _artifact_for_song(tmp_path, "42")
+        )
+
+
+def test_success_item_rejects_reference_common_class_mismatch(
+    tmp_path: Path,
+) -> None:
+    custom_lane_map = {**dict(DTX_LANE_MAP), "13": ClassMapping("kick", "snare")}
+    native_events = (build_native_reference("13", 1.0, 0),)
+    custom_reference = map_reference_events(native_events, lane_map=custom_lane_map)
+    with pytest.raises(ValueError, match="common_class does not match frozen DTX lane map"):
+        cohort_scoring.cohort_item_from_artifacts(
+            build_identity(), "42", custom_reference, _artifact_for_song(tmp_path, "42")
+        )
+
+
+def test_success_item_rejects_artifact_identity_not_matching_evidence(
+    tmp_path: Path,
+) -> None:
+    item = cohort_scoring.cohort_item_from_artifacts(
+        build_identity(), "42", build_reference_mapping(), _artifact_for_song(tmp_path, "42")
+    )
+    modified_identity = dataclasses.replace(build_identity(), input_view_id="other-view")
+    modified_artifact_identity = dataclasses.replace(
+        item.artifact_identity, input_view_id="other-view"
+    )
+    tampered = dataclasses.replace(item, artifact_identity=modified_artifact_identity)
+    with pytest.raises(ValueError, match="artifact_identity does not match persisted"):
+        validate_cohort_items(modified_identity, (tampered,))
+
+
+def test_success_item_rejects_reference_events_not_matching_artifact(
+    tmp_path: Path,
+) -> None:
+    item = cohort_scoring.cohort_item_from_artifacts(
+        build_identity(), "42", build_reference_mapping(), _artifact_for_song(tmp_path, "42")
+    )
+    tampered_ref_event = dataclasses.replace(item.reference_events[0], time_sec=99.0)
+    tampered = dataclasses.replace(
+        item, reference_events=(tampered_ref_event, *item.reference_events[1:])
+    )
+    with pytest.raises(ValueError, match="reference_events do not match"):
+        validate_cohort_items(build_identity(), (tampered,))
+
+
+def test_success_item_rejects_prediction_events_not_matching_artifact(
+    tmp_path: Path,
+) -> None:
+    item = cohort_scoring.cohort_item_from_artifacts(
+        build_identity(), "42", build_reference_mapping(), _artifact_for_song(tmp_path, "42")
+    )
+    tampered_pred_event = dataclasses.replace(item.prediction_events[0], time_sec=99.0)
+    tampered = dataclasses.replace(
+        item, prediction_events=(tampered_pred_event, *item.prediction_events[1:])
+    )
+    with pytest.raises(ValueError, match="prediction_events do not match"):
+        validate_cohort_items(build_identity(), (tampered,))
+
+
+def test_success_item_rejects_coverage_not_matching_artifact(
+    tmp_path: Path,
+) -> None:
+    item = cohort_scoring.cohort_item_from_artifacts(
+        build_identity(), "42", build_reference_mapping(), _artifact_for_song(tmp_path, "42")
+    )
+    tampered_coverage = dataclasses.replace(
+        item.coverage,
+        prediction_native_class_counts=(("other_class", 99),),
+    )
+    tampered = dataclasses.replace(item, coverage=tampered_coverage)
+    with pytest.raises(ValueError, match="coverage does not match"):
+        validate_cohort_items(build_identity(), (tampered,))
+
+
+def test_validate_event_sources_rejects_non_benchmark_reference_event() -> None:
+    invalid = dataclasses.replace(build_item(), reference_events=("not an event",))
+    with pytest.raises(TypeError, match="reference_events must contain BenchmarkEvent"):
+        validate_cohort_items(build_identity(), (invalid,))
+
+
+def test_validate_event_sources_rejects_non_benchmark_prediction_event() -> None:
+    invalid = dataclasses.replace(build_item(), prediction_events=("not an event",))
+    with pytest.raises(TypeError, match="prediction_events must contain BenchmarkEvent"):
+        validate_cohort_items(build_identity(), (invalid,))
+
+
+def test_validate_coverage_rejects_non_cohort_coverage() -> None:
+    invalid = dataclasses.replace(build_item(prediction_events=None), coverage="not coverage")
+    with pytest.raises(TypeError, match="coverage must be CohortCoverage"):
+        validate_cohort_items(build_identity(), (invalid,))
+
+
+def test_validate_coverage_rejects_negative_reference_count() -> None:
+    bad_coverage = CohortCoverage(-1, 0, 0, 0, 0, None, None, None)
+    invalid = dataclasses.replace(build_item(prediction_events=None), coverage=bad_coverage)
+    with pytest.raises(ValueError, match="reference coverage counts must be nonnegative"):
+        validate_cohort_items(build_identity(), (invalid,))
+
+
+def test_validate_coverage_rejects_reference_common_count_mismatch() -> None:
+    bad_coverage = CohortCoverage(3, 3, 0, 0, 0, None, None, None)
+    invalid = dataclasses.replace(build_item(prediction_events=None), coverage=bad_coverage)
+    with pytest.raises(ValueError, match="reference common count must match"):
+        validate_cohort_items(build_identity(), (invalid,))
+
+
+def test_validate_coverage_rejects_partial_prediction_counts() -> None:
+    bad_coverage = CohortCoverage(2, 2, 0, 0, 0, 1, None, None)
+    invalid = dataclasses.replace(build_item(prediction_events=None), coverage=bad_coverage)
+    with pytest.raises(ValueError, match="prediction coverage counts must be all present"):
+        validate_cohort_items(build_identity(), (invalid,))
+
+
+def test_validate_coverage_rejects_negative_prediction_count() -> None:
+    bad_coverage = CohortCoverage(2, 2, 0, 0, 0, -1, 0, 0)
+    invalid = dataclasses.replace(build_item(prediction_events=None), coverage=bad_coverage)
+    with pytest.raises(ValueError, match="prediction coverage counts must be nonnegative"):
+        validate_cohort_items(build_identity(), (invalid,))
+
+
+def test_validate_coverage_rejects_empty_native_class_id() -> None:
+    bad_coverage = CohortCoverage(2, 2, 0, 0, 0, 1, 1, 0, (("", 1),))
+    invalid = dataclasses.replace(build_item(prediction_events=None), coverage=bad_coverage)
+    with pytest.raises(ValueError, match="prediction native class ids must be nonempty"):
+        validate_cohort_items(build_identity(), (invalid,))
+
+
+def test_validate_coverage_rejects_negative_native_class_count() -> None:
+    bad_coverage = CohortCoverage(2, 2, 0, 0, 0, 1, 1, 0, (("midi_36", -1),))
+    invalid = dataclasses.replace(build_item(prediction_events=None), coverage=bad_coverage)
+    with pytest.raises(ValueError, match="prediction native class counts must be nonnegative"):
+        validate_cohort_items(build_identity(), (invalid,))
+
+
+def test_score_cohort_rejects_non_cohort_identity() -> None:
+    with pytest.raises(TypeError, match="identity must be CohortIdentity"):
+        score_cohort("not identity", ())
+
+
+@pytest.mark.parametrize(
+    ("tolerances_ms", "match"),
+    [
+        ([50], "tolerances_ms must be a tuple"),
+        ((), "tolerances_ms must not be empty"),
+        ((True,), "tolerances_ms must contain positive integers"),
+    ],
+)
+def test_score_cohort_rejects_invalid_tolerance_types(tolerances_ms: object, match: str) -> None:
+    with pytest.raises((TypeError, ValueError), match=match):
+        score_cohort(build_identity(), (), tolerances_ms=tolerances_ms)  # type: ignore[arg-type]
+
+
+def test_score_cohort_rejects_non_tuple_diagnostics_for() -> None:
+    with pytest.raises(TypeError, match="diagnostics_for must be a tuple"):
+        score_cohort(build_identity(), (), diagnostics_for=["1"])  # type: ignore[arg-type]
+
+
+def test_score_cohort_rejects_non_string_diagnostics_for_id() -> None:
+    with pytest.raises(ValueError, match="diagnostics_for IDs must be strings"):
+        score_cohort(build_identity(), (), diagnostics_for=(42,))  # type: ignore[arg-type]
+
+
+def test_original_prediction_time_rejects_aligned_without_provenance() -> None:
+    event = BenchmarkEvent("1", 1.0, "kick", "prediction", metadata={})
+    with pytest.raises(ValueError, match="original time provenance"):
+        cohort_scoring._original_prediction_time(event, "aligned")
