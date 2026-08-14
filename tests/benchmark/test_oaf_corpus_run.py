@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
@@ -632,6 +633,56 @@ def test_materialize_oaf_full_mix_uses_pinned_resampling_and_canonical_wav(
     assert audio.audio_frame_count == 44100
 
 
+def test_materialize_uses_verified_source_bytes_after_cache_path_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_content = _source_wav_bytes(frames=22050)
+    digest, source_path = _cache_body(tmp_path, original_content)
+    remote = _source_remote(
+        content=original_content,
+        digest=digest,
+        cache_path=source_path.relative_to(tmp_path).as_posix(),
+    )
+    resolved = _resolve_source_audio(
+        remote,
+        tmp_path,
+        CacheIndexStore(tmp_path, {}),
+        source_endpoint_sha256=SHA_B,
+        source_bucket="simfile-dtx",
+        source_audio_content_hash=digest,
+    )
+    source_path.write_bytes(_source_wav_bytes(frames=44100))
+    assert getattr(resolved, "content", None) == original_content
+
+    import src.benchmark.oaf_corpus_run as run_module
+
+    original_load = run_module.librosa.load
+    load_inputs: list[object] = []
+
+    def wrapped_load(source: object, **kwargs: object):
+        load_inputs.append(source)
+        if hasattr(source, "read"):
+            source.seek(0)
+            assert source.read() == original_content
+            source.seek(0)
+        else:
+            assert source.read_bytes() == original_content  # type: ignore[union-attr]
+        return original_load(source, **kwargs)
+
+    monkeypatch.setattr(run_module.librosa, "load", wrapped_load)
+    output_path = tmp_path / "inputs" / "42" / "full-mix.wav"
+    audio = _materialize_oaf_full_mix(
+        resolved,
+        output_path=output_path,
+        input_root=tmp_path / "inputs",
+        config=load_model_config(),
+    )
+
+    assert isinstance(audio, CanonicalAudio)
+    assert len(load_inputs) == 1
+    assert hasattr(load_inputs[0], "read")
+
+
 def _reference_preflight_fixture(
     tmp_path: Path,
 ) -> tuple[
@@ -771,6 +822,49 @@ def test_preflight_reference_mappings_reconstructs_eligible_artifact(
     assert isinstance(mappings[42], ReferenceMappingResult)
     assert mappings[42] is not None
     assert len(mappings[42].common_events) == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "reference_value", "timing_value"),
+    [
+        ("source_endpoint_sha256", SHA_A, SHA_B),
+        ("source_bucket", "simfile-dtx", "other-bucket"),
+    ],
+)
+def test_preflight_binds_complete_remote_source_identity_lineage(
+    tmp_path: Path,
+    field: str,
+    reference_value: str,
+    timing_value: str,
+) -> None:
+    root, reference_manifest, timing_manifest, _ = _reference_preflight_fixture(tmp_path)
+    reference_source = {
+        **reference_manifest.rows[0].source_row,
+        "source_endpoint_sha256": SHA_A,
+        "source_bucket": "simfile-dtx",
+    }
+    timing_source = {
+        **timing_manifest.rows[0].source_row,
+        "source_endpoint_sha256": SHA_A,
+        "source_bucket": "simfile-dtx",
+    }
+    reference_source[field] = reference_value
+    timing_source[field] = timing_value
+    reference_manifest = replace(
+        reference_manifest,
+        rows=(replace(reference_manifest.rows[0], source_row=reference_source),),
+    )
+    timing_manifest = replace(
+        timing_manifest,
+        rows=(replace(timing_manifest.rows[0], source_row=timing_source),),
+    )
+
+    with pytest.raises(ValueError, match="eligible reference identity"):
+        _preflight_reference_mappings(
+            reference_manifest,
+            timing_manifest,
+            timing_output_root=root,
+        )
 
 
 def test_preflight_reference_mappings_fails_before_inference_for_corrupt_eligible_artifact(

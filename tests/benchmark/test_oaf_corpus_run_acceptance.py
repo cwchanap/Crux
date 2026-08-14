@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -340,6 +341,95 @@ def test_run_oaf_corpus_finalizes_through_existing_scorer_and_reports(
     assert report_calls == [("scored", tmp_path / "output" / "runs" / outcome.run_id / "reports")]
 
 
+def test_finalization_reports_directory_failure_returns_canonical_fatal_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.benchmark.oaf_corpus_run as run_module
+
+    _, descriptor, _ = _install_fake_run_seams(monkeypatch, tmp_path)
+    real_mkdir = run_module.Path.mkdir
+
+    def fail_reports_mkdir(path: Path, *args: object, **kwargs: object) -> None:
+        if path.name == "reports":
+            raise OSError("reports directory unavailable")
+        real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(run_module.Path, "mkdir", fail_reports_mkdir)
+
+    class HealthyBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            return NativePrediction(audio=audio, descriptor=descriptor, events=())
+
+        def close(self) -> None:
+            return None
+
+    outcome = run_oaf_corpus(
+        _request(tmp_path),
+        backend_factory=lambda **_: HealthyBackend(),
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+
+    assert outcome.overall_status == "failed"
+    assert outcome.exit_code == 2
+    assert outcome.run_id is None
+    assert outcome.run_path is None
+    assert outcome.reports_path is None
+    assert outcome.success_count == 0
+    assert outcome.failed_count == 0
+    assert outcome.skipped_count == 0
+    assert outcome.quarantined_count == 0
+
+
+@pytest.mark.parametrize("failing_stage", ["score", "reports"])
+def test_finalization_scoring_or_report_failure_returns_canonical_fatal_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_stage: str
+) -> None:
+    import src.benchmark.oaf_corpus_run as run_module
+
+    _, descriptor, _ = _install_fake_run_seams(monkeypatch, tmp_path)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError(f"{failing_stage} failed")
+
+    monkeypatch.setattr(
+        run_module,
+        "score_cohort" if failing_stage == "score" else "write_cohort_reports",
+        fail,
+    )
+
+    class HealthyBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            return NativePrediction(audio=audio, descriptor=descriptor, events=())
+
+        def close(self) -> None:
+            return None
+
+    outcome = run_oaf_corpus(
+        _request(tmp_path),
+        backend_factory=lambda **_: HealthyBackend(),
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+
+    assert outcome.overall_status == "failed"
+    assert outcome.exit_code == 2
+    assert outcome.run_id is None
+    assert outcome.run_path is None
+    assert outcome.reports_path is None
+    assert outcome.success_count == 0
+    assert outcome.failed_count == 0
+    assert outcome.skipped_count == 0
+    assert outcome.quarantined_count == 0
+
+
 def test_scorer_rejects_raw_artifact_mismatch_before_source_binding(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -479,6 +569,71 @@ def test_run_oaf_corpus_resume_retains_projection_timing(
     assert resumed.projected_full_wall_time_sec == pytest.approx(1.0)
 
 
+def test_resume_recovers_prediction_published_before_checkpoint_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.benchmark.oaf_corpus_run as run_module
+
+    _, descriptor, _ = _install_fake_run_seams(monkeypatch, tmp_path)
+    request = replace(_request(tmp_path), include_simfile_ids=(10,))
+
+    class HealthyBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            return NativePrediction(audio=audio, descriptor=descriptor, events=())
+
+        def close(self) -> None:
+            return None
+
+    real_checkpoint = run_module._write_snapshot_checkpoint
+    checkpoint_calls = 0
+
+    def crash_after_publication(*args: object, **kwargs: object) -> None:
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        if checkpoint_calls >= 3:
+            raise KeyboardInterrupt("crash after prediction publication")
+        real_checkpoint(*args, **kwargs)
+
+    monkeypatch.setattr(run_module, "_write_snapshot_checkpoint", crash_after_publication)
+    with pytest.raises(KeyboardInterrupt, match="crash after prediction publication"):
+        run_oaf_corpus(
+            request,
+            backend_factory=lambda **_: HealthyBackend(),
+            perf_counter=lambda: 0.0,
+            clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+        )
+
+    run_paths = list((tmp_path / "output" / "runs").glob("*/run.json"))
+    assert len(run_paths) == 1
+    prior_snapshot = run_module.parse_oaf_corpus_run(run_paths[0].read_bytes())
+    assert "execution_disposition" not in prior_snapshot["items"][0]
+
+    monkeypatch.setattr(run_module, "_write_snapshot_checkpoint", real_checkpoint)
+    transcribe_calls: list[int] = []
+
+    class ResumeBackend(HealthyBackend):
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            transcribe_calls.append(int(audio.source_audio_id.split("/")[0]))
+            raise AssertionError("published prediction must be recovered without inference")
+
+    resumed = run_oaf_corpus(
+        replace(request, resume=True),
+        backend_factory=lambda **_: ResumeBackend(),
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+
+    assert resumed.exit_code == 0
+    assert resumed.success_count == 1
+    assert transcribe_calls == []
+    assert resumed.run_path is not None
+    resumed_snapshot = run_module.parse_oaf_corpus_run(resumed.run_path.read_bytes())
+    assert resumed_snapshot["items"][0]["execution_disposition"] == "resumed"
+
+
 @pytest.mark.parametrize(
     "include_ids, exclude_ids",
     [((999,), ())],
@@ -557,7 +712,8 @@ def test_malformed_native_descriptor_is_poison_and_stops_later_requests(
     rows = {row["simfile_id"]: row for row in snapshot["items"]}
     assert rows[20]["execution_disposition"] == "failed"
     assert rows[20]["runner_failure_code"] == "worker_protocol_failed"
-    assert "execution_disposition" not in rows[30]
+    assert rows[30]["execution_disposition"] == "failed"
+    assert rows[30]["runner_failure_code"] == "worker_protocol_failed"
 
 
 ITEM_LOCAL_BACKEND_ERRORS = (
@@ -682,7 +838,8 @@ def test_named_and_unknown_poison_backend_errors_stop_later_rows(
     rows = {row["simfile_id"]: row for row in snapshot["items"]}
     assert rows[20]["execution_disposition"] == "failed"
     assert rows[20]["runner_failure_code"] == runner_code
-    assert "execution_disposition" not in rows[30]
+    assert rows[30]["execution_disposition"] == "failed"
+    assert rows[30]["runner_failure_code"] == "worker_protocol_failed"
 
 
 def test_backend_closes_and_final_snapshot_survives_base_exception(
@@ -906,7 +1063,8 @@ def test_poison_stops_the_worker_and_resume_reuses_exact_prediction(
     first_snapshot = run_module.parse_oaf_corpus_run(first.run_path.read_bytes())
     first_rows = {row["simfile_id"]: row for row in first_snapshot["items"]}
     assert first_rows[20]["execution_disposition"] == "failed"
-    assert 30 not in first_rows or "execution_disposition" not in first_rows[30]
+    assert first_rows[30]["execution_disposition"] == "failed"
+    assert first_rows[30]["runner_failure_code"] == "worker_protocol_failed"
     assert first.success_count == 1
 
     first_artifact_path = (
@@ -944,3 +1102,100 @@ def test_poison_stops_the_worker_and_resume_reuses_exact_prediction(
     assert second_calls == [20, 30]
     assert materialize_calls == [10, 20, 30]
     assert first_artifact_path.read_bytes() == first_artifact
+
+
+def test_poison_accounts_for_outstanding_rows_in_snapshot_scorer_and_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.benchmark.oaf_corpus_run as run_module
+
+    _, descriptor, _ = _install_fake_run_seams(monkeypatch, tmp_path)
+
+    class PoisonBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            simfile_id = int(audio.source_audio_id.split("/")[0])
+            if simfile_id == 20:
+                raise OafBackendError("worker failed", code="worker_error")
+            return NativePrediction(audio=audio, descriptor=descriptor, events=())
+
+        def close(self) -> None:
+            return None
+
+    outcome = run_oaf_corpus(
+        _request(tmp_path),
+        backend_factory=lambda **_: PoisonBackend(),
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+
+    assert outcome.exit_code == 1
+    assert outcome.success_count == 1
+    assert outcome.failed_count == 2
+    assert outcome.skipped_count == 0
+    assert outcome.quarantined_count == 0
+    assert outcome.run_path is not None
+    snapshot = run_module.parse_oaf_corpus_run(outcome.run_path.read_bytes())
+    rows = {row["simfile_id"]: row for row in snapshot["items"]}
+    assert snapshot["success_count"] == 1
+    assert snapshot["failed_count"] == 2
+    assert all(row["execution_disposition"] for row in rows.values())
+    assert rows[30]["runner_failure_code"] == "worker_protocol_failed"
+    assert outcome.reports_path is not None
+    report_summary = json.loads((outcome.reports_path / "summary.json").read_bytes())
+    assert report_summary["population"] == {
+        "failed_count": 2,
+        "quarantined_count": 0,
+        "reason_counts": {"backend_unavailable": 2},
+        "skipped_count": 0,
+        "success_count": 1,
+        "total_count": 3,
+    }
+
+
+def test_expected_skips_and_quarantines_do_not_make_healthy_run_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.benchmark.oaf_corpus_run as run_module
+
+    reference_manifest, descriptor, _ = _install_fake_run_seams(monkeypatch, tmp_path)
+    quarantined_view = replace(
+        reference_manifest.rows[2].view,
+        eligibility_status="quarantined",
+        eligibility_reason_codes=("unclassified_reference_lane",),
+    )
+    mixed_manifest = replace(
+        reference_manifest,
+        rows=(
+            reference_manifest.rows[0],
+            reference_manifest.rows[1],
+            replace(reference_manifest.rows[2], view=quarantined_view),
+        ),
+    )
+    monkeypatch.setattr(run_module, "load_reference_set_manifest", lambda _: mixed_manifest)
+
+    class HealthyBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            return NativePrediction(audio=audio, descriptor=descriptor, events=())
+
+        def close(self) -> None:
+            return None
+
+    outcome = run_oaf_corpus(
+        replace(_request(tmp_path), exclude_simfile_ids=(20,)),
+        backend_factory=lambda **_: HealthyBackend(),
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+
+    assert outcome.overall_status == "complete"
+    assert outcome.exit_code == 0
+    assert outcome.success_count == 1
+    assert outcome.failed_count == 0
+    assert outcome.skipped_count == 1
+    assert outcome.quarantined_count == 1

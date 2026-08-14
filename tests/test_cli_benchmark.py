@@ -439,7 +439,18 @@ def test_run_oaf_corpus_preserves_domain_preflight_exit_code(tmp_path: Path, mon
 
     assert result.exit_code == 2
     assert "Usage:" not in result.output
-    assert json.loads(result.output)["exit_code"] == 2
+    summary = json.loads(result.output)
+    assert summary["status"] == "failed"
+    assert summary["exit_code"] == 2
+    assert summary["run_id"] is None
+    assert summary["run_path"] is None
+    assert summary["reports_path"] is None
+    assert summary["success_count"] == 0
+    assert summary["failed_count"] == 0
+    assert summary["skipped_count"] == 0
+    assert summary["quarantined_count"] == 0
+    assert summary["aggregate_rtf"] is None
+    assert summary["projected_full_wall_time_sec"] is None
 
 
 def test_run_oaf_corpus_overlap_scope_is_canonical_fatal(tmp_path: Path, monkeypatch) -> None:
