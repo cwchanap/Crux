@@ -4,7 +4,7 @@ import dataclasses
 import struct
 from decimal import Decimal
 from pathlib import Path
-from typing import get_args
+from typing import Callable, get_args
 
 import pytest
 
@@ -1288,25 +1288,53 @@ def test_artifact_identity_rejects_empty_field() -> None:
 
 
 @pytest.mark.parametrize(
-    ("args", "match"),
+    ("expected", "match", "build_args"),
     [
-        (("not identity", "42", None, None), "identity must be CohortIdentity"),
-        ((build_identity(), "", None, None), "simfile_id must be a nonempty string"),
-        ((build_identity(), "42", "not ref", None), "reference must be ReferenceMappingResult"),
-        ((build_identity(), "42", None, "not pred"), "prediction must be PredictionArtifact"),
+        # Validation stops at the identity check, so reference/prediction
+        # fixtures are never reached and need not be built.
+        pytest.param(
+            TypeError,
+            "identity must be CohortIdentity",
+            lambda tmp_path: ("not identity", "42", None, None),
+            id="bad-identity",
+        ),
+        pytest.param(
+            ValueError,
+            "simfile_id must be a nonempty string",
+            lambda tmp_path: (build_identity(), "", None, None),
+            id="empty-simfile-id",
+        ),
+        # Validation stops at the reference check, so the prediction fixture
+        # is never reached and need not be built.
+        pytest.param(
+            TypeError,
+            "reference must be ReferenceMappingResult",
+            lambda tmp_path: (build_identity(), "42", "not ref", None),
+            id="bad-reference",
+        ),
+        # The prediction check runs last, so a real reference fixture is
+        # required to reach it.
+        pytest.param(
+            TypeError,
+            "prediction must be PredictionArtifact",
+            lambda tmp_path: (
+                build_identity(),
+                "42",
+                build_reference_mapping(),
+                "not pred",
+            ),
+            id="bad-prediction",
+        ),
     ],
 )
 def test_cohort_item_from_artifacts_rejects_bad_argument_types(
-    tmp_path: Path, args: tuple, match: str
+    tmp_path: Path,
+    expected: type[BaseException],
+    match: str,
+    build_args: Callable[[Path], tuple],
 ) -> None:
-    reference = build_reference_mapping()
-    prediction = _artifact_for_song(tmp_path, "42")
-    identity, simfile_id, ref, pred = args
-    if ref is None:
-        ref = reference
-    if pred is None:
-        pred = prediction
-    with pytest.raises((TypeError, ValueError), match=match):
+    identity, simfile_id, ref, pred = build_args(tmp_path)
+    with pytest.raises(expected, match=match):
         cohort_scoring.cohort_item_from_artifacts(identity, simfile_id, ref, pred)
 
 
