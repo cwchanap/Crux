@@ -20,7 +20,11 @@ from src.benchmark.backend_identity import (
 )
 from src.benchmark.backends.base import CanonicalAudio
 from src.benchmark.backends.oaf import OAF_ADAPTER_REVISION
-from src.benchmark.cohort_scoring import COHORT_FAILURE_REASONS
+from src.benchmark.cohort_scoring import (
+    COHORT_FAILURE_REASONS,
+    CohortIdentity,
+    validate_cohort_items,
+)
 from src.benchmark.corpus_cache import CacheIndexEntry, CacheIndexStore
 from src.benchmark.corpus_manifest import render_manifest
 from src.benchmark.oaf_corpus_run import (
@@ -35,8 +39,10 @@ from src.benchmark.oaf_corpus_run import (
     OafCorpusRunOutcome,
     OafCorpusRunRequest,
     ResolvedSourceAudio,
+    _cohort_item_from_run_row,
     _materialize_oaf_full_mix,
     _preflight_reference_mappings,
+    _project_runtime,
     _resolve_source_audio,
     _validate_scope,
     build_inference_config,
@@ -50,7 +56,7 @@ from src.benchmark.oaf_corpus_run import (
     write_oaf_corpus_run,
 )
 from src.benchmark.r2_corpus_models import RemoteObject
-from src.benchmark.reference_set import ReferenceMappingResult
+from src.benchmark.reference_set import ReferenceMappingResult, map_reference_events
 from src.benchmark.reference_set_manifest import (
     LoadedReferenceSetManifest,
     LoadedReferenceSetRow,
@@ -107,6 +113,161 @@ def test_constants_and_public_dataclasses_are_frozen_contracts() -> None:
         projected_full_wall_time_sec=3600.0,
     )
     assert outcome.success_count == 1
+
+
+def test_project_runtime_excludes_resume_without_retained_timing() -> None:
+    runtime = _project_runtime(
+        (
+            {
+                "simfile_id": 10,
+                "execution_disposition": "inferred",
+                "wall_time_sec": 2.0,
+                "source_duration_sec": 4.0,
+            },
+            {"simfile_id": 20, "execution_disposition": "resumed"},
+        ),
+        eligible_audio_durations=(4.0, 6.0),
+    )
+
+    assert runtime["measured_wall_time_sec"] == pytest.approx(2.0)
+    assert runtime["measured_audio_duration_sec"] == pytest.approx(4.0)
+    assert runtime["aggregate_rtf"] == pytest.approx(0.5)
+    assert runtime["projected_full_wall_time_sec"] == pytest.approx(5.0)
+    assert runtime["eligible_audio_duration_sec"] == pytest.approx(10.0)
+    assert runtime["eligible_audio_duration_coverage_count"] == 2
+
+
+def test_project_runtime_reports_missing_duration_without_projection() -> None:
+    runtime = _project_runtime(
+        (
+            {
+                "simfile_id": 10,
+                "execution_disposition": "inferred",
+                "wall_time_sec": 2.0,
+                "source_duration_sec": 4.0,
+            },
+        ),
+        eligible_audio_durations=(4.0, None),
+    )
+
+    assert runtime["aggregate_rtf"] == pytest.approx(0.5)
+    assert runtime["projected_full_wall_time_sec"] is None
+    assert runtime["eligible_audio_duration_sec"] is None
+    assert runtime["eligible_audio_duration_coverage_count"] == 1
+    assert runtime["eligible_audio_duration_total_count"] == 2
+
+
+def _cohort_test_identity() -> CohortIdentity:
+    return CohortIdentity(
+        cohort_id="oaf-run",
+        reference_manifest_sha256=SHA_A,
+        reference_timing_version="sha256:" + SHA_B,
+        taxonomy_version="crux.drum-taxonomy/v1",
+        lane_map_version="crux.dtx-lane-map/v1",
+        backend_id="crux.oaf",
+        model_id="model",
+        model_lock_sha256=SHA_C,
+        backend_descriptor_sha256=SHA_A,
+        prediction_map_version=OAF_PREDICTION_MAP_ID,
+        input_view_id=OAF_FULL_MIX_INPUT_VIEW_ID,
+    )
+
+
+def _cohort_test_mapping() -> ReferenceMappingResult:
+    return map_reference_events(
+        (
+            NativeReferenceEvent(
+                simfile_id=10,
+                selected_chart_key="10/chart.dtx",
+                selected_chart_content_hash=SHA_A,
+                source_audio_key="10/audio.wav",
+                source_audio_content_hash=SHA_A,
+                source_order=0,
+                measure=1,
+                position=0.0,
+                lane_id="13",
+                note_id="kick-0",
+                chart_time_sec=0.5,
+                audio_time_sec=0.5,
+            ),
+        )
+    )
+
+
+def test_cohort_item_from_run_row_pins_non_success_reference_and_coverage_shapes() -> None:
+    identity = _cohort_test_identity()
+    mapping = _cohort_test_mapping()
+
+    failed = _cohort_item_from_run_row(
+        identity,
+        {
+            "simfile_id": 10,
+            "execution_disposition": "failed",
+            "runner_failure_code": "inference_failed",
+        },
+        mapping,
+        output_dir=Path("output"),
+    )
+    assert failed.status == "failed"
+    assert failed.failure_reason == "inference_failed"
+    assert failed.reference_events
+    validate_cohort_items(identity, (failed,))
+
+    skipped = _cohort_item_from_run_row(
+        identity,
+        {
+            "simfile_id": 10,
+            "execution_disposition": "skipped",
+            "runner_failure_code": "explicitly_skipped",
+        },
+        mapping,
+        output_dir=Path("output"),
+    )
+    assert skipped.status == "skipped"
+    assert skipped.failure_reason == "explicitly_skipped"
+    validate_cohort_items(identity, (skipped,))
+
+    quarantined = _cohort_item_from_run_row(
+        identity,
+        {
+            "simfile_id": 10,
+            "execution_disposition": "quarantined",
+            "runner_failure_code": "reference_quarantined",
+        },
+        mapping,
+        output_dir=Path("output"),
+    )
+    assert quarantined.status == "quarantined"
+    assert quarantined.failure_reason == "reference_quarantined"
+    validate_cohort_items(identity, (quarantined,))
+
+    unavailable = _cohort_item_from_run_row(
+        identity,
+        {
+            "simfile_id": 10,
+            "execution_disposition": "quarantined",
+            "runner_failure_code": "reference_quarantined",
+        },
+        None,
+        output_dir=Path("output"),
+    )
+    assert unavailable.reference_events == ()
+    assert unavailable.coverage.reference_native_event_count == 0
+    assert unavailable.coverage.reference_common_event_count == 0
+    validate_cohort_items(identity, (unavailable,))
+
+
+def test_cohort_item_from_run_row_adapts_missing_prediction_to_failed() -> None:
+    item = _cohort_item_from_run_row(
+        _cohort_test_identity(),
+        {"simfile_id": 10, "execution_disposition": "inferred"},
+        None,
+        output_dir=Path("output"),
+    )
+
+    assert item.status == "failed"
+    assert item.failure_reason == "prediction_missing"
+    validate_cohort_items(_cohort_test_identity(), (item,))
 
 
 def test_resolved_source_audio_preserves_authoritative_identity() -> None:
@@ -787,6 +948,7 @@ def test_backend_error_policy_is_closed_and_unknown_errors_poison() -> None:
         "prediction_output_conflict": "prediction_artifact_invalid",
         "prediction_publish_failed": "prediction_artifact_invalid",
         "prediction_missing": "prediction_missing",
+        "explicitly_skipped": "explicitly_skipped",
     }
 
 
@@ -826,6 +988,27 @@ def test_render_normalizes_floats_sorts_items_and_round_trips() -> None:
     assert parsed["items"][0]["wall_time_sec"] == Decimal("1.25")
     assert [item["simfile_id"] for item in parsed["items"]] == [10, 20]
     assert render_oaf_corpus_run(parsed) == content
+
+
+def test_render_quantizes_runtime_projection_fields() -> None:
+    snapshot = _snapshot()
+    snapshot.update(
+        {
+            "measured_wall_time_sec": 1.23456789,
+            "measured_audio_duration_sec": 2.34567891,
+            "aggregate_rtf": 0.52500001,
+            "eligible_audio_duration_sec": 10.98765432,
+            "projected_full_wall_time_sec": 5.76543219,
+        }
+    )
+
+    parsed = parse_oaf_corpus_run(render_oaf_corpus_run(snapshot))
+
+    assert parsed["measured_wall_time_sec"] == Decimal("1.234568")
+    assert parsed["measured_audio_duration_sec"] == Decimal("2.345679")
+    assert parsed["aggregate_rtf"] == Decimal("0.525")
+    assert parsed["eligible_audio_duration_sec"] == Decimal("10.987654")
+    assert parsed["projected_full_wall_time_sec"] == Decimal("5.765432")
 
 
 def test_parse_rejects_canonical_but_semantically_unsorted_items() -> None:

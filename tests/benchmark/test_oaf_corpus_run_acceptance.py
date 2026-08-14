@@ -19,12 +19,16 @@ from src.benchmark.oaf_corpus_run import (
     run_oaf_corpus,
 )
 from src.benchmark.prediction_artifact import read_prediction_artifact
-from src.benchmark.reference_set import ReferenceMappingDiagnostics, ReferenceMappingResult
+from src.benchmark.reference_set import (
+    ReferenceMappingResult,
+    map_reference_events,
+)
 from src.benchmark.reference_set_manifest import (
     LoadedReferenceSetManifest,
     LoadedReferenceSetRow,
     ReferenceSetRowView,
 )
+from src.benchmark.reference_timing import NativeReferenceEvent
 from src.benchmark.reference_timing_manifest import LoadedReferenceTimingManifest
 
 SHA_A = "a" * 64
@@ -73,6 +77,27 @@ def _fake_manifests() -> tuple[LoadedReferenceSetManifest, LoadedReferenceTiming
     )
 
 
+def _reference_mapping(simfile_id: int) -> ReferenceMappingResult:
+    return map_reference_events(
+        (
+            NativeReferenceEvent(
+                simfile_id=simfile_id,
+                selected_chart_key=f"{simfile_id}/chart.dtx",
+                selected_chart_content_hash=SHA_A,
+                source_audio_key=f"{simfile_id}/audio.wav",
+                source_audio_content_hash=SHA_A,
+                source_order=0,
+                measure=1,
+                position=0.0,
+                lane_id="13",
+                note_id="kick-0",
+                chart_time_sec=0.25,
+                audio_time_sec=0.25,
+            ),
+        )
+    )
+
+
 def _install_fake_run_seams(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> tuple[LoadedReferenceSetManifest, BackendDescriptor, list[int]]:
@@ -83,11 +108,7 @@ def _install_fake_run_seams(
     monkeypatch.setattr(run_module, "load_reference_set_manifest", lambda _: reference_manifest)
     monkeypatch.setattr(run_module, "load_reference_timing_manifest", lambda _: timing_manifest)
     empty_mappings = {
-        row.view.simfile_id: ReferenceMappingResult(
-            mapped_events=(),
-            common_events=(),
-            diagnostics=ReferenceMappingDiagnostics({}, {}, 0),
-        )
+        row.view.simfile_id: _reference_mapping(row.view.simfile_id)
         for row in reference_manifest.rows
     }
     monkeypatch.setattr(
@@ -164,11 +185,7 @@ def test_run_oaf_corpus_uses_one_persistent_backend_and_request_timeout(
         run_module,
         "_preflight_reference_mappings",
         lambda *_args, **_kwargs: {
-            row.view.simfile_id: ReferenceMappingResult(
-                mapped_events=(),
-                common_events=(),
-                diagnostics=ReferenceMappingDiagnostics({}, {}, 0),
-            )
+            row.view.simfile_id: _reference_mapping(row.view.simfile_id)
             for row in reference_manifest.rows
         },
     )
@@ -276,6 +293,90 @@ def test_run_oaf_corpus_uses_one_persistent_backend_and_request_timeout(
             "code": "worker_close_failed",
             "message": "worker close failed",
         }
+
+
+def test_run_oaf_corpus_finalizes_through_existing_scorer_and_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.benchmark.oaf_corpus_run as run_module
+
+    _, descriptor, _ = _install_fake_run_seams(monkeypatch, tmp_path)
+    score_calls: list[tuple[object, tuple[object, ...], tuple[str, ...]]] = []
+    report_calls: list[tuple[object, Path]] = []
+
+    def fake_score(identity, items, *, diagnostics_for=()):
+        score_calls.append((identity, items, diagnostics_for))
+        return "scored"
+
+    def fake_reports(result, output_dir):
+        report_calls.append((result, output_dir))
+        return "reports"
+
+    monkeypatch.setattr(run_module, "score_cohort", fake_score, raising=False)
+    monkeypatch.setattr(run_module, "write_cohort_reports", fake_reports, raising=False)
+
+    class HealthyBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            return NativePrediction(audio=audio, descriptor=descriptor, events=())
+
+        def close(self) -> None:
+            return None
+
+    outcome = run_oaf_corpus(
+        _request(tmp_path),
+        backend_factory=lambda **_: HealthyBackend(),
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+
+    assert len(score_calls) == 1
+    identity, items, diagnostics_for = score_calls[0]
+    assert identity.cohort_id == outcome.run_id
+    assert tuple(item.simfile_id for item in items) == ("10", "20", "30")
+    assert diagnostics_for == ()
+    assert report_calls == [("scored", tmp_path / "output" / "runs" / outcome.run_id / "reports")]
+
+
+def test_run_oaf_corpus_resume_regenerates_reports_without_inference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, descriptor, _ = _install_fake_run_seams(monkeypatch, tmp_path)
+
+    class HealthyBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            return NativePrediction(audio=audio, descriptor=descriptor, events=())
+
+        def close(self) -> None:
+            return None
+
+    first = run_oaf_corpus(
+        _request(tmp_path),
+        backend_factory=lambda **_: HealthyBackend(),
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+    assert first.exit_code == 0
+
+    class ResumeGuardBackend(HealthyBackend):
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            raise AssertionError("resume scoring must not invoke inference")
+
+    resumed = run_oaf_corpus(
+        _request(tmp_path, resume=True),
+        backend_factory=lambda **_: ResumeGuardBackend(),
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+    assert resumed.exit_code == 0
+    assert resumed.run_id == first.run_id
+    assert resumed.reports_path is not None
+    assert resumed.reports_path.is_dir()
 
 
 @pytest.mark.parametrize(
@@ -632,11 +733,7 @@ def test_poison_stops_the_worker_and_resume_reuses_exact_prediction(
     monkeypatch.setattr(run_module, "load_reference_set_manifest", lambda _: reference_manifest)
     monkeypatch.setattr(run_module, "load_reference_timing_manifest", lambda _: timing_manifest)
     empty_mappings = {
-        row.view.simfile_id: ReferenceMappingResult(
-            mapped_events=(),
-            common_events=(),
-            diagnostics=ReferenceMappingDiagnostics({}, {}, 0),
-        )
+        row.view.simfile_id: _reference_mapping(row.view.simfile_id)
         for row in reference_manifest.rows
     }
     monkeypatch.setattr(
