@@ -454,17 +454,7 @@ def reference_chart_view_from_timing_row(
     loaded: LoadedReferenceTimingRow,
 ) -> ReferenceChartRowView:
     """Reconstruct the validated HPA-322 view carried by one timing row."""
-    source_row = loaded.source_row
-    hpa322_row = {
-        key: value
-        for key, value in source_row.items()
-        if key not in _TIMING_SPECIFIC_KEYS
-        and key not in _TIMING_LINEAGE_KEYS
-        and key != "corpus_version"
-    }
-    hpa322_row["schema_version"] = REFERENCE_CHART_MANIFEST_SCHEMA
-    hpa322_row["corpus_version"] = source_row["source_reference_chart_version"]
-    return reference_chart_row_view_from_row(hpa322_row)
+    return reference_chart_row_view_from_row(_hpa322_row_from_timing_row(loaded.source_row))
 
 
 def build_timing_row(
@@ -1124,15 +1114,7 @@ def _validate_timing_manifest_row(row: Mapping[str, object]) -> None:
     # digest, cache-path, DLEVEL, and selected/nullability contract to the
     # merged reference-chart validator.  This both validates the pass-through
     # payload and rejects any unknown / missing key.
-    hpa322_row = {
-        key: value
-        for key, value in row.items()
-        if key not in _TIMING_SPECIFIC_KEYS
-        and key not in _TIMING_LINEAGE_KEYS
-        and key != "corpus_version"
-    }
-    hpa322_row["schema_version"] = REFERENCE_CHART_MANIFEST_SCHEMA
-    hpa322_row["corpus_version"] = row["source_reference_chart_version"]
+    hpa322_row = _hpa322_row_from_timing_row(row)
     try:
         reference_chart_row_view_from_row(hpa322_row)
     except ValueError:
@@ -1160,6 +1142,20 @@ def _validate_timing_manifest_row(row: Mapping[str, object]) -> None:
     if not isinstance(warnings, list) or any(not isinstance(warning, str) for warning in warnings):
         raise ValueError("reference timing manifest row has invalid timing warnings")
     _validate_timing_status_shape(row)
+
+
+def _hpa322_row_from_timing_row(row: Mapping[str, object]) -> dict[str, object]:
+    """Reconstruct the HPA-322 payload carried by a timing-manifest row."""
+    hpa322_row = {
+        key: value
+        for key, value in row.items()
+        if key not in _TIMING_SPECIFIC_KEYS
+        and key not in _TIMING_LINEAGE_KEYS
+        and key != "corpus_version"
+    }
+    hpa322_row["schema_version"] = REFERENCE_CHART_MANIFEST_SCHEMA
+    hpa322_row["corpus_version"] = row["source_reference_chart_version"]
+    return hpa322_row
 
 
 def _validate_timing_status_shape(row: Mapping[str, object]) -> None:
