@@ -17,6 +17,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
+from io import BytesIO
 from pathlib import Path
 from typing import Callable, Literal, TypeAlias
 
@@ -63,6 +64,7 @@ from src.benchmark.cohort_scoring import (
 from src.benchmark.corpus_cache import (
     CacheIndexStore,
     cache_entry_matches_remote,
+    read_verified_cache_body,
     resolve_verified_cache_body,
     validate_cached_body,
 )
@@ -114,6 +116,7 @@ class ResolvedSourceAudio:
     source_audio_id: str
     source_audio_sha256: str
     duration_sec: float
+    content: bytes | None = None
 
 
 # pylint: disable=too-many-instance-attributes
@@ -557,12 +560,20 @@ def _resolve_source_audio(
         bucket=bucket,
         expected_sha256=expected,
     )
+    content = read_verified_cache_body(
+        cache_dir,
+        verified_remote,
+        source_endpoint_sha256=endpoint,
+        bucket=bucket,
+        expected_sha256=expected,
+    )
     duration_sec = inspect_source_audio(path).duration_sec
     return ResolvedSourceAudio(
         path=path,
         source_audio_id=remote.key,
         source_audio_sha256=expected,
         duration_sec=duration_sec,
+        content=content,
     )
 
 
@@ -591,8 +602,11 @@ def _materialize_oaf_full_mix(
         raise ValueError("canonical input must be beneath input_root") from None
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    source_input = (
+        BytesIO(source_audio.content) if source_audio.content is not None else source_audio.path
+    )
     samples, _ = librosa.load(
-        source_audio.path,
+        source_input,
         sr=44100,
         mono=True,
         res_type="soxr_hq",
@@ -654,6 +668,8 @@ def _preflight_reference_mappings(
             "selected_chart_content_hash",
             "source_audio_key",
             "source_audio_content_hash",
+            "source_endpoint_sha256",
+            "source_bucket",
             "reference_events_cache_path",
         ):
             if loaded.source_row.get(field) != timing_row.source_row.get(field):
@@ -1689,10 +1705,19 @@ def run_oaf_corpus(
                             item, "prediction_artifact_invalid", "prediction artifact is invalid"
                         )
                         continue
-                    prior_row = resume_rows.get(state.loaded.view.simfile_id)
-                    if prior_row is None or not _prediction_artifact_matches_run_row(
+                    prior_row = resume_rows.get(state.loaded.view.simfile_id) or {}
+                    has_persisted_artifact_evidence = any(
+                        field in prior_row
+                        for field in (
+                            "prediction_path",
+                            "prediction_artifact_sha256",
+                            "input_audio_sha256",
+                        )
+                    )
+                    artifact_matches_run_row = _prediction_artifact_matches_run_row(
                         artifact, prior_row
-                    ):
+                    )
+                    if has_persisted_artifact_evidence and not artifact_matches_run_row:
                         _set_failed(
                             item,
                             "prediction_artifact_invalid",
@@ -1818,11 +1843,18 @@ def run_oaf_corpus(
                 if interrupted_error is None:
                     interrupted_error = error
 
+    if stop_after_poison:
+        for state in eligible_states:
+            if state.snapshot.get("execution_disposition") is None:
+                _set_failed(
+                    state.snapshot,
+                    "worker_protocol_failed",
+                    "inference was not attempted after a poison failure",
+                )
+
     counts = _snapshot_counts(state.snapshot for state in states)
     has_pending = any("execution_disposition" not in state.snapshot for state in states)
-    has_item_problem = (
-        counts["failed_count"] > 0 or counts["skipped_count"] > 0 or counts["quarantined_count"] > 0
-    )
+    has_item_problem = counts["failed_count"] > 0
     has_close_problem = close_error is not None
     overall_status: OafRunStatus
     if fatal_backend_error or fatal_run_error:
@@ -1863,22 +1895,29 @@ def run_oaf_corpus(
         )
     except (OSError, StrictJsonError, ValueError):
         return _fatal_outcome()
-    outcome = _finalize_scoring_and_outcome(
-        final_snapshot,
-        run_id=run_id,
-        run_path=run_path,
-        reports_path=reports_path,
-        aggregate_rtf=(
-            runtime["aggregate_rtf"] if isinstance(runtime["aggregate_rtf"], (float, int)) else None
-        ),
-        projected_full_wall_time_sec=(
-            runtime["projected_full_wall_time_sec"]
-            if isinstance(runtime["projected_full_wall_time_sec"], (float, int))
-            else None
-        ),
-        mappings=mappings,
-        output_dir=request.output_dir,
-    )
+    try:
+        outcome = _finalize_scoring_and_outcome(
+            final_snapshot,
+            run_id=run_id,
+            run_path=run_path,
+            reports_path=reports_path,
+            aggregate_rtf=(
+                runtime["aggregate_rtf"]
+                if isinstance(runtime["aggregate_rtf"], (float, int))
+                else None
+            ),
+            projected_full_wall_time_sec=(
+                runtime["projected_full_wall_time_sec"]
+                if isinstance(runtime["projected_full_wall_time_sec"], (float, int))
+                else None
+            ),
+            mappings=mappings,
+            output_dir=request.output_dir,
+        )
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        if interrupted_error is not None:
+            raise interrupted_error from error
+        return _fatal_outcome()
     if interrupted_error is not None:
         raise interrupted_error
     return outcome
