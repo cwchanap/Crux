@@ -233,18 +233,18 @@ class LoadedReferenceChartManifest:
 
 
 @dataclass(frozen=True)
-class _CanonicalManifestRead:
+class CanonicalManifestRead:
     manifest_sha256: str
     corpus_version: str
     rows: tuple[Mapping[str, object], ...]
 
 
-def _read_canonical_manifest_core(
+def read_canonical_manifest_core(
     path: Path,
     *,
     schema_version: str,
     validate_rows: Callable[[tuple[Mapping[str, object], ...]], None] | None = None,
-) -> _CanonicalManifestRead:
+) -> CanonicalManifestRead:
     """Read one immutable canonical JSONL manifest through shared invariants.
 
     The HPA-322 and HPA-323 loaders differ only in their row views.  This core
@@ -285,7 +285,7 @@ def _read_canonical_manifest_core(
     rendered = render_manifest(normalized_rows)
     if rendered.content != content:
         raise ValueError("reference manifest has an invalid derived corpus version")
-    return _CanonicalManifestRead(
+    return CanonicalManifestRead(
         manifest_sha256=sha256(content).hexdigest(),
         corpus_version=rendered.corpus_version,
         rows=tuple(rows),
@@ -338,7 +338,7 @@ def load_reference_chart_manifest(
             simfile_ids.add(view.simfile_id)
             rows.append(_ValidatedReferenceChartRow(source_row, view))
 
-    canonical = _read_canonical_manifest_core(
+    canonical = read_canonical_manifest_core(
         path,
         schema_version=REFERENCE_CHART_MANIFEST_SCHEMA,
         validate_rows=validate_rows,
@@ -435,7 +435,7 @@ def load_reference_timing_manifest(path: Path) -> LoadedReferenceTimingManifest:
             simfile_ids.add(view.simfile_id)
             rows.append(LoadedReferenceTimingRow(source_row=source_row, view=view))
 
-    canonical = _read_canonical_manifest_core(
+    canonical = read_canonical_manifest_core(
         path,
         schema_version=REFERENCE_TIMING_MANIFEST_SCHEMA,
         validate_rows=validate_rows,
@@ -448,6 +448,23 @@ def load_reference_timing_manifest(path: Path) -> LoadedReferenceTimingManifest:
         corpus_version=canonical.corpus_version,
         rows=tuple(rows),
     )
+
+
+def reference_chart_view_from_timing_row(
+    loaded: LoadedReferenceTimingRow,
+) -> ReferenceChartRowView:
+    """Reconstruct the validated HPA-322 view carried by one timing row."""
+    source_row = loaded.source_row
+    hpa322_row = {
+        key: value
+        for key, value in source_row.items()
+        if key not in _TIMING_SPECIFIC_KEYS
+        and key not in _TIMING_LINEAGE_KEYS
+        and key != "corpus_version"
+    }
+    hpa322_row["schema_version"] = REFERENCE_CHART_MANIFEST_SCHEMA
+    hpa322_row["corpus_version"] = source_row["source_reference_chart_version"]
+    return reference_chart_row_view_from_row(hpa322_row)
 
 
 def build_timing_row(

@@ -11,8 +11,11 @@ import pytest
 from src.benchmark.corpus_manifest import render_manifest
 from src.benchmark.reference_set_manifest import (
     BENCHMARK_REFERENCE_MANIFEST_SCHEMA,
+    LoadedReferenceSetManifest,
     ReferenceSetRequest,
     failed_reference_set_outcome,
+    load_reference_set_manifest,
+    read_native_reference_events,
     run_reference_set,
     validate_schema_golden,
 )
@@ -87,6 +90,139 @@ def _published_rows(outcome: object) -> list[dict[str, object]]:
     manifest = getattr(outcome, "manifest")
     assert manifest is not None
     return [json.loads(line) for line in manifest.path.read_text().splitlines()]
+
+
+def _write_two_row_timing_manifest(tmp_path: Path) -> Path:
+    ready, quarantined = _timing_rows()
+    event = _native_event("13", audio_time_sec=1.0)
+    event_content = render_reference_events((event,))
+    event_hash = hashlib.sha256(event_content).hexdigest()
+    ready["reference_events_cache_path"] = f"events/{event_hash}.jsonl"
+    rendered = render_manifest(
+        tuple(
+            {key: value for key, value in row.items() if key != "corpus_version"}
+            for row in (ready, quarantined)
+        )
+    )
+    manifest_path = tmp_path / "timing-two" / "manifests" / f"{rendered.manifest_sha256}.jsonl"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_bytes(rendered.content)
+    event_path = manifest_path.parent.parent / str(ready["reference_events_cache_path"])
+    event_path.parent.mkdir(parents=True, exist_ok=True)
+    event_path.write_bytes(event_content)
+    return manifest_path
+
+
+def _write_reference_set_manifest(tmp_path: Path) -> tuple[Path, Path]:
+    timing_manifest_path = _write_timing_manifest(
+        tmp_path / "timing-input", (_native_event("13", audio_time_sec=1.0),)
+    )
+    outcome = run_reference_set(
+        ReferenceSetRequest(timing_manifest_path, tmp_path / "reference-set-output")
+    )
+    assert outcome.manifest is not None
+    return timing_manifest_path, outcome.manifest.path
+
+
+def test_reference_set_loader_returns_exact_identity_and_views(tmp_path: Path) -> None:
+    timing_manifest_path, reference_set_manifest_path = _write_reference_set_manifest(tmp_path)
+
+    loaded = load_reference_set_manifest(reference_set_manifest_path)
+
+    assert isinstance(loaded, LoadedReferenceSetManifest)
+    assert (
+        loaded.manifest_sha256
+        == hashlib.sha256(reference_set_manifest_path.read_bytes()).hexdigest()
+    )
+    assert loaded.corpus_version.startswith("sha256:")
+    assert (
+        loaded.source_reference_timing_manifest_sha256
+        == hashlib.sha256(timing_manifest_path.read_bytes()).hexdigest()
+    )
+    assert loaded.source_reference_timing_version.startswith("sha256:")
+    assert len(loaded.rows) == 1
+    row = loaded.rows[0]
+    assert row.view.simfile_id == 42
+    assert row.view.eligibility_status == "eligible"
+    assert row.view.eligibility_reason_codes == ()
+    assert row.view.mapped_event_count == 1
+    assert row.view.common_scored_event_count == 1
+
+
+def test_reference_set_loader_rejects_duplicate_simfile_ids(tmp_path: Path) -> None:
+    _, reference_set_manifest_path = _write_reference_set_manifest(tmp_path)
+    row = json.loads(reference_set_manifest_path.read_text())
+    normalized = {key: value for key, value in row.items() if key != "corpus_version"}
+    duplicated = render_manifest((normalized, normalized))
+    duplicate_path = tmp_path / "duplicate-reference-set.jsonl"
+    duplicate_path.write_bytes(duplicated.content)
+
+    with pytest.raises(ValueError, match="duplicate simfile IDs"):
+        load_reference_set_manifest(duplicate_path)
+
+
+def test_reference_set_loader_rejects_mixed_hpa323_timing_identity(tmp_path: Path) -> None:
+    timing_manifest_path = _write_two_row_timing_manifest(tmp_path)
+    outcome = run_reference_set(
+        ReferenceSetRequest(timing_manifest_path, tmp_path / "reference-set-output")
+    )
+    assert outcome.manifest is not None
+    rows = [json.loads(line) for line in outcome.manifest.path.read_text().splitlines()]
+    rows[1]["source_reference_timing_manifest_sha256"] = "b" * 64
+    mixed_path = tmp_path / "mixed-reference-set.jsonl"
+    mixed_path.write_bytes(
+        render_manifest(
+            tuple(
+                {key: value for key, value in row.items() if key != "corpus_version"}
+                for row in rows
+            )
+        ).content
+    )
+
+    with pytest.raises(ValueError, match="mixed source timing identity"):
+        load_reference_set_manifest(mixed_path)
+
+
+def test_reference_set_loader_rejects_malformed_hpa324_row(tmp_path: Path) -> None:
+    _, reference_set_manifest_path = _write_reference_set_manifest(tmp_path)
+    row = json.loads(reference_set_manifest_path.read_text())
+    row["mapped_event_count"] = "one"
+    malformed_path = tmp_path / "malformed-reference-set.jsonl"
+    malformed_path.write_bytes(
+        render_manifest(
+            ({key: value for key, value in row.items() if key != "corpus_version"},)
+        ).content
+    )
+
+    with pytest.raises(ValueError, match="event counts"):
+        load_reference_set_manifest(malformed_path)
+
+
+def test_reference_set_loader_requires_byte_identical_canonical_round_trip(
+    tmp_path: Path,
+) -> None:
+    _, reference_set_manifest_path = _write_reference_set_manifest(tmp_path)
+    row = json.loads(reference_set_manifest_path.read_text())
+    normalized = {key: value for key, value in row.items() if key != "corpus_version"}
+
+    assert render_manifest((normalized,)).content == reference_set_manifest_path.read_bytes()
+
+    loaded = load_reference_set_manifest(reference_set_manifest_path)
+    assert loaded.rows[0].source_row == row
+
+
+def test_native_reference_reader_uses_timing_output_root(tmp_path: Path) -> None:
+    timing_manifest_path, _ = _write_reference_set_manifest(tmp_path)
+    loaded = load_reference_timing_manifest(timing_manifest_path)
+    timing_output_root = timing_manifest_path.parent.parent
+
+    events = read_native_reference_events(
+        loaded.rows[0],
+        timing_output_root=timing_output_root,
+    )
+
+    assert len(events) == 1
+    assert events[0].simfile_id == loaded.rows[0].view.simfile_id
 
 
 def test_upstream_quarantine_preserves_timing_reasons_and_zeroes_mapping_counts(

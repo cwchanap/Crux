@@ -27,6 +27,7 @@ from src.benchmark.reference_chart_manifest import (
 from src.benchmark.reference_timing_manifest import (
     REFERENCE_TIMING_MANIFEST_SCHEMA,
     TIMING_SEMANTICS_VERSION,
+    CanonicalManifestRead,
     LoadedReferenceTimingManifest,
     ReferenceTimingRequest,
     ReferenceTimingRowView,
@@ -36,6 +37,8 @@ from src.benchmark.reference_timing_manifest import (
     failed_reference_timing_outcome,
     load_reference_chart_manifest,
     load_reference_timing_manifest,
+    read_canonical_manifest_core,
+    reference_chart_view_from_timing_row,
     run_reference_timing,
     upstream_chart_unavailable_resolution,
     validate_schema_golden,
@@ -183,6 +186,20 @@ def _timing_manifest_fixture(tmp_path: Path) -> _TimingManifestFixture:
 # ---------------------------------------------------------------------------
 # Step 1: canonical HPA-322 source-loading
 # ---------------------------------------------------------------------------
+
+
+def test_canonical_manifest_core_returns_exact_hash_and_rows(tmp_path: Path) -> None:
+    fixture = _timing_manifest_fixture(tmp_path)
+
+    canonical = read_canonical_manifest_core(
+        fixture.path,
+        schema_version=REFERENCE_TIMING_MANIFEST_SCHEMA,
+    )
+
+    assert isinstance(canonical, CanonicalManifestRead)
+    assert canonical.manifest_sha256 == sha256(fixture.content).hexdigest()
+    assert canonical.corpus_version == fixture.rows[0]["corpus_version"]
+    assert canonical.rows == tuple(fixture.rows)
 
 
 def test_loader_reads_reference_chart_manifest_bytes_once_and_records_exact_sha256(
@@ -390,6 +407,18 @@ def test_timing_manifest_loader_retains_immutable_source_rows(tmp_path: Path) ->
     assert loaded.rows[0].source_row == fixture.rows[0]
     with pytest.raises(TypeError):
         loaded.rows[0].source_row["simfile_id"] = 99  # type: ignore[index]
+
+
+def test_reference_chart_view_from_timing_row_reconstructs_hpa322_view(
+    tmp_path: Path,
+) -> None:
+    fixture = _timing_manifest_fixture(tmp_path)
+    loaded = load_reference_timing_manifest(fixture.path)
+
+    views = tuple(reference_chart_view_from_timing_row(row) for row in loaded.rows)
+
+    assert {view.simfile_id for view in views} == {42, 43}
+    assert {view.selection_status for view in views} == {"selected", "quarantined"}
 
 
 def test_timing_manifest_loader_rejects_invalid_timing_semantics_version(
