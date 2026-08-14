@@ -157,6 +157,25 @@ def test_project_runtime_reports_missing_duration_without_projection() -> None:
     assert runtime["eligible_audio_duration_total_count"] == 2
 
 
+def test_project_runtime_counts_zero_elapsed_inference() -> None:
+    runtime = _project_runtime(
+        (
+            {
+                "simfile_id": 10,
+                "execution_disposition": "inferred",
+                "wall_time_sec": 0.0,
+                "source_duration_sec": 4.0,
+            },
+        ),
+        eligible_audio_durations=(4.0,),
+    )
+
+    assert runtime["measured_wall_time_sec"] == pytest.approx(0.0)
+    assert runtime["measured_audio_duration_sec"] == pytest.approx(4.0)
+    assert runtime["aggregate_rtf"] == pytest.approx(0.0)
+    assert runtime["projected_full_wall_time_sec"] == pytest.approx(0.0)
+
+
 def _cohort_test_identity() -> CohortIdentity:
     return CohortIdentity(
         cohort_id="oaf-run",
