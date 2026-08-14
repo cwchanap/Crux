@@ -432,7 +432,9 @@ def _validate_snapshot(snapshot: dict[str, JsonValue]) -> dict[str, JsonValue]:
         if missing_counts:
             raise StrictJsonError("complete run snapshot requires all counts")
         missing_dispositions = [
-            item["simfile_id"] for item in item_rows if "execution_disposition" not in item
+            item["simfile_id"]
+            for item in item_rows
+            if item.get("execution_disposition") not in _SNAPSHOT_DISPOSITIONS
         ]
         if missing_dispositions:
             raise StrictJsonError("complete run snapshot requires item dispositions")

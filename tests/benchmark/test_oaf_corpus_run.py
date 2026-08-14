@@ -315,6 +315,19 @@ def test_complete_snapshot_requires_complete_item_accounting(missing_field: str)
         render_oaf_corpus_run(incomplete)
 
 
+def test_complete_snapshot_rejects_null_item_disposition() -> None:
+    incomplete = _snapshot()
+    incomplete["exclude_simfile_ids"] = []
+    incomplete["items"] = [{"simfile_id": 10, "execution_disposition": None}]
+    incomplete["success_count"] = 0
+    incomplete["failed_count"] = 0
+    incomplete["skipped_count"] = 0
+    incomplete["quarantined_count"] = 0
+
+    with pytest.raises(ValueError, match="disposition"):
+        render_oaf_corpus_run(incomplete)
+
+
 def test_snapshot_writer_delegates_to_atomic_replace(tmp_path: Path, monkeypatch) -> None:
     import src.benchmark.oaf_corpus_run as run_module
 
