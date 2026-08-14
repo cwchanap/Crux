@@ -18,7 +18,7 @@ from src.benchmark.oaf_corpus_run import (
     _expected_oaf_descriptor,
     run_oaf_corpus,
 )
-from src.benchmark.prediction_artifact import read_prediction_artifact
+from src.benchmark.prediction_artifact import read_prediction_artifact, render_prediction_artifact
 from src.benchmark.reference_set import (
     ReferenceMappingResult,
     map_reference_events,
@@ -340,6 +340,65 @@ def test_run_oaf_corpus_finalizes_through_existing_scorer_and_reports(
     assert report_calls == [("scored", tmp_path / "output" / "runs" / outcome.run_id / "reports")]
 
 
+def test_scorer_rejects_raw_artifact_mismatch_before_source_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.benchmark.oaf_corpus_run as run_module
+
+    _, descriptor, _ = _install_fake_run_seams(monkeypatch, tmp_path)
+
+    class HealthyBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            return NativePrediction(audio=audio, descriptor=descriptor, events=())
+
+        def close(self) -> None:
+            return None
+
+    first = run_oaf_corpus(
+        _request(tmp_path),
+        backend_factory=lambda **_: HealthyBackend(),
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+    assert first.run_path is not None
+    snapshot = run_module.parse_oaf_corpus_run(first.run_path.read_bytes())
+    row = next(row for row in snapshot["items"] if row["simfile_id"] == 10)
+    artifact_path = tmp_path / "output" / row["prediction_path"]
+    artifact = read_prediction_artifact(artifact_path.read_bytes())
+
+    wrong_sha_row = dict(row)
+    wrong_sha_row["prediction_artifact_sha256"] = SHA_B
+    identity = run_module._cohort_identity_from_snapshot(snapshot)
+    sha_mismatch_item = run_module._cohort_item_from_run_row(
+        identity,
+        wrong_sha_row,
+        _reference_mapping(10),
+        output_dir=tmp_path / "output",
+    )
+    assert sha_mismatch_item.status == "failed"
+    assert sha_mismatch_item.failure_reason == "prediction_artifact_invalid"
+
+    tampered_audio = replace(
+        artifact.prediction.audio,
+        source_audio_id="10/tampered.wav",
+    )
+    tampered_prediction = replace(artifact.prediction, audio=tampered_audio)
+    artifact_path.write_bytes(render_prediction_artifact(tampered_prediction))
+
+    item = run_module._cohort_item_from_run_row(
+        identity,
+        row,
+        _reference_mapping(10),
+        output_dir=tmp_path / "output",
+    )
+
+    assert item.status == "failed"
+    assert item.failure_reason == "prediction_artifact_invalid"
+
+
 def test_run_oaf_corpus_resume_regenerates_reports_without_inference(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -377,6 +436,47 @@ def test_run_oaf_corpus_resume_regenerates_reports_without_inference(
     assert resumed.run_id == first.run_id
     assert resumed.reports_path is not None
     assert resumed.reports_path.is_dir()
+
+
+def test_run_oaf_corpus_resume_retains_projection_timing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, descriptor, _ = _install_fake_run_seams(monkeypatch, tmp_path)
+
+    class HealthyBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            return NativePrediction(audio=audio, descriptor=descriptor, events=())
+
+        def close(self) -> None:
+            return None
+
+    first = run_oaf_corpus(
+        _request(tmp_path),
+        backend_factory=lambda **_: HealthyBackend(),
+        perf_counter=iter((0.0, 0.25, 1.0, 1.5, 2.0, 2.25)).__next__,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+    assert first.exit_code == 0
+    assert first.aggregate_rtf == pytest.approx(1.0 / 3.0)
+    assert first.projected_full_wall_time_sec == pytest.approx(1.0)
+
+    class ResumeGuardBackend(HealthyBackend):
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            raise AssertionError("resume projection must not invoke inference")
+
+    resumed = run_oaf_corpus(
+        _request(tmp_path, resume=True),
+        backend_factory=lambda **_: ResumeGuardBackend(),
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+
+    assert resumed.exit_code == 0
+    assert resumed.aggregate_rtf == pytest.approx(1.0 / 3.0)
+    assert resumed.projected_full_wall_time_sec == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize(

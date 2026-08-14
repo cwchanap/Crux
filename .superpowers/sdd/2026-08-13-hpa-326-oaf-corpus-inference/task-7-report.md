@@ -65,3 +65,36 @@ simfile ID binding required by `cohort_item_from_artifacts()`.
 - The full repository test suite was not rerun in this task; the required
   focused runner, scorer, and report suites plus module quality checks pass.
 - Task 8 CLI wiring and HPA-325 scorer/report internals remain untouched.
+
+## Review fix round 1
+
+Addressed the three review findings without expanding beyond Task 7:
+
+- raw prediction bytes are now checked against the persisted row's artifact
+  SHA, source-audio identity/hash, input-view identity, and input-audio hash
+  before any source-key-to-simfile-ID normalization; resume reuse applies the
+  same persisted-evidence check;
+- validated resume hits restore persisted `wall_time_sec` and `rtf` before
+  projection, so rescoring a completed run retains its measured aggregate;
+  and
+- finite zero wall time is counted as a measured inference while source
+  duration remains strictly positive.
+
+### Review-fix TDD evidence
+
+- RED: `rtk uv run pytest tests/benchmark/test_oaf_corpus_run_acceptance.py::test_scorer_rejects_raw_artifact_mismatch_before_source_binding -q` — FAIL, 1 failed (`success` was returned instead of `failed`).
+- RED: `rtk uv run pytest tests/benchmark/test_oaf_corpus_run.py::test_project_runtime_counts_zero_elapsed_inference -q` — FAIL, 1 failed (`None` was returned instead of zero measured wall time).
+- RED: `rtk uv run pytest tests/benchmark/test_oaf_corpus_run_acceptance.py::test_run_oaf_corpus_resume_retains_projection_timing -q` — FAIL, 1 failed (`aggregate_rtf` was `None` instead of approximately `1/3`).
+- GREEN: `rtk uv run pytest tests/benchmark/test_oaf_corpus_run_acceptance.py::test_scorer_rejects_raw_artifact_mismatch_before_source_binding tests/benchmark/test_oaf_corpus_run.py::test_project_runtime_counts_zero_elapsed_inference tests/benchmark/test_oaf_corpus_run_acceptance.py::test_run_oaf_corpus_resume_retains_projection_timing -q` — PASS, 3 passed.
+- GREEN: `rtk uv run pytest tests/benchmark/test_oaf_corpus_run.py tests/benchmark/test_oaf_corpus_run_acceptance.py tests/benchmark/test_cohort_scoring.py tests/benchmark/test_reports.py -q` — PASS, 164 passed.
+
+### Review-fix verification
+
+- `rtk uv run ruff check src/benchmark/oaf_corpus_run.py tests/benchmark/test_oaf_corpus_run.py tests/benchmark/test_oaf_corpus_run_acceptance.py` — PASS.
+- `rtk uv run black --check src/benchmark/oaf_corpus_run.py tests/benchmark/test_oaf_corpus_run.py tests/benchmark/test_oaf_corpus_run_acceptance.py` — PASS.
+- `rtk uv run pylint src/benchmark/oaf_corpus_run.py` — PASS, 10.00/10.
+- `rtk git diff --check` — PASS.
+
+### Review-fix commit
+
+- `fix: harden OaF corpus resume scoring`

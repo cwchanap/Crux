@@ -930,11 +930,13 @@ def _project_runtime(
     every eligible source duration was measured successfully.
     """
 
-    def finite_positive(value: object) -> float | None:
+    def finite_positive(value: object, *, allow_zero: bool = False) -> float | None:
         if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
             return None
         numeric = float(value)
-        return numeric if math.isfinite(numeric) and numeric > 0 else None
+        if not math.isfinite(numeric) or numeric < 0 or (numeric == 0 and not allow_zero):
+            return None
+        return numeric
 
     rows = tuple(items)
     durations = tuple(eligible_audio_durations)
@@ -957,7 +959,7 @@ def _project_runtime(
     for row in rows:
         if row.get("execution_disposition") not in {"inferred", "resumed"}:
             continue
-        wall_time = finite_positive(row.get("wall_time_sec"))
+        wall_time = finite_positive(row.get("wall_time_sec"), allow_zero=True)
         audio_duration = finite_positive(row.get("source_duration_sec"))
         if wall_time is None or audio_duration is None:
             continue
@@ -1088,6 +1090,39 @@ def _prediction_artifact_matches(
     return all(event.prediction_map_version == OAF_PREDICTION_MAP_ID for event in prediction.events)
 
 
+def _prediction_artifact_matches_run_row(
+    artifact: PredictionArtifact,
+    row: Mapping[str, object],
+) -> bool:
+    """Bind raw persisted prediction bytes to their persisted run-row evidence."""
+    if not isinstance(artifact, PredictionArtifact) or not isinstance(row, Mapping):
+        return False
+    artifact_sha = row.get("prediction_artifact_sha256")
+    source_audio_id = row.get("source_audio_id")
+    source_audio_sha256 = row.get("source_audio_sha256")
+    input_view_id = row.get("input_view_id")
+    input_audio_sha256 = row.get("input_audio_sha256")
+    if not all(
+        isinstance(value, str) and value
+        for value in (
+            artifact_sha,
+            source_audio_id,
+            source_audio_sha256,
+            input_view_id,
+            input_audio_sha256,
+        )
+    ):
+        return False
+    prediction = artifact.prediction
+    return (
+        artifact.artifact_sha256 == artifact_sha
+        and prediction.audio.source_audio_id == source_audio_id
+        and prediction.audio.source_audio_sha256 == source_audio_sha256
+        and prediction.audio.input_view_id == input_view_id
+        and prediction.audio.input_audio_sha256 == input_audio_sha256
+    )
+
+
 def _empty_reference_coverage() -> CohortCoverage:
     return CohortCoverage(
         reference_native_event_count=0,
@@ -1207,6 +1242,15 @@ def _cohort_item_from_run_row(
             )
         try:
             prediction = read_prediction_artifact(content)
+            if not _prediction_artifact_matches_run_row(prediction, row):
+                return _cohort_item_without_prediction(
+                    identity,
+                    simfile_id,
+                    mapping,
+                    status="failed",
+                    failure_reason="prediction_artifact_invalid",
+                    warnings=warnings,
+                )
             if prediction.prediction.audio.source_audio_id != simfile_id:
                 scorer_audio = replace(prediction.prediction.audio, source_audio_id=simfile_id)
                 scorer_prediction = replace(prediction.prediction, audio=scorer_audio)
@@ -1501,9 +1545,19 @@ def run_oaf_corpus(
         started_at=started_at,
     )
 
+    resume_rows: dict[int, Mapping[str, object]] = {}
     if request.resume and run_path.exists():
         try:
-            parse_oaf_corpus_run(read_regular_file_no_follow(run_path), expected_run_id=run_id)
+            prior_snapshot = parse_oaf_corpus_run(
+                read_regular_file_no_follow(run_path), expected_run_id=run_id
+            )
+            prior_items = prior_snapshot.get("items", [])
+            if isinstance(prior_items, list):
+                resume_rows = {
+                    int(row["simfile_id"]): row
+                    for row in prior_items
+                    if isinstance(row, Mapping) and isinstance(row.get("simfile_id"), int)
+                }
         except (OSError, StrictJsonError, ValueError):
             return _fatal_outcome()
 
@@ -1635,6 +1689,16 @@ def run_oaf_corpus(
                             item, "prediction_artifact_invalid", "prediction artifact is invalid"
                         )
                         continue
+                    prior_row = resume_rows.get(state.loaded.view.simfile_id)
+                    if prior_row is None or not _prediction_artifact_matches_run_row(
+                        artifact, prior_row
+                    ):
+                        _set_failed(
+                            item,
+                            "prediction_artifact_invalid",
+                            "prediction artifact does not match persisted run evidence",
+                        )
+                        continue
                     if not _prediction_artifact_matches(
                         artifact,
                         source=state.source,
@@ -1647,6 +1711,15 @@ def run_oaf_corpus(
                             "prediction artifact identity mismatch",
                         )
                         continue
+                    for timing_field in ("wall_time_sec", "rtf"):
+                        timing_value = prior_row.get(timing_field)
+                        if (
+                            isinstance(timing_value, (int, float, Decimal))
+                            and not isinstance(timing_value, bool)
+                            and math.isfinite(float(timing_value))
+                            and timing_value >= 0
+                        ):
+                            item[timing_field] = timing_value
                     item["execution_disposition"] = "resumed"
                     item["prediction_path"] = _prediction_relative_path(
                         prediction_target, request.output_dir
