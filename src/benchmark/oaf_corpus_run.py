@@ -50,7 +50,16 @@ from src.benchmark.backends.oaf import (
     OafBackendError,
     create_backend,
 )
-from src.benchmark.cohort_scoring import COHORT_FAILURE_REASONS
+from src.benchmark.cohort_scoring import (
+    COHORT_FAILURE_REASONS,
+    CohortCoverage,
+    CohortIdentity,
+    CohortItem,
+    cohort_item_from_artifacts,
+    coverage_from_artifacts,
+    score_cohort,
+    validate_cohort_items,
+)
 from src.benchmark.corpus_cache import (
     CacheIndexStore,
     cache_entry_matches_remote,
@@ -66,6 +75,7 @@ from src.benchmark.prediction_artifact import (
     PredictionArtifactError,
     publish_prediction_artifact,
     read_prediction_artifact,
+    render_prediction_artifact,
 )
 from src.benchmark.r2_corpus_models import RemoteObject, parse_manifest_timestamp
 from src.benchmark.reference_set import ReferenceMappingResult, map_reference_events
@@ -80,7 +90,9 @@ from src.benchmark.reference_timing_manifest import (
     LoadedReferenceTimingManifest,
     load_reference_timing_manifest,
 )
-from src.benchmark.taxonomy import OAF_PREDICTION_MAP_ID
+from src.benchmark.reports import write_cohort_reports
+from src.benchmark.scorer_input import reference_to_benchmark_events
+from src.benchmark.taxonomy import DTX_LANE_MAP_VERSION, OAF_PREDICTION_MAP_ID, TAXONOMY_VERSION
 
 OAF_CORPUS_RUN_SCHEMA = "crux.oaf-corpus-run/v1"
 OAF_INFERENCE_CONFIG_SCHEMA = "crux.oaf-inference-config/v1"
@@ -208,6 +220,7 @@ RUNNER_FAILURE_TO_COHORT_REASON: dict[str, str] = {
     "prediction_output_conflict": "prediction_artifact_invalid",
     "prediction_publish_failed": "prediction_artifact_invalid",
     "prediction_missing": "prediction_missing",
+    "explicitly_skipped": "explicitly_skipped",
 }
 
 if not set(RUNNER_FAILURE_TO_COHORT_REASON.values()) <= COHORT_FAILURE_REASONS:
@@ -903,6 +916,72 @@ def _snapshot_counts(items: Iterable[Mapping[str, object]]) -> dict[str, int]:
     return counts
 
 
+def _project_runtime(
+    items: Iterable[Mapping[str, object]],
+    *,
+    eligible_audio_durations: Iterable[float | None],
+) -> dict[str, object]:
+    """Project full-corpus wall time from measured inference rows.
+
+    Resumed rows are eligible for the measured aggregate only when their
+    persisted snapshot still carries both timing values.  A resume hit with
+    no retained timing therefore contributes neither a zero elapsed time nor a
+    zero duration.  The full eligible-duration total is available only when
+    every eligible source duration was measured successfully.
+    """
+
+    def finite_positive(value: object) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+            return None
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) and numeric > 0 else None
+
+    rows = tuple(items)
+    durations = tuple(eligible_audio_durations)
+    available_durations = tuple(
+        duration
+        for duration in (finite_positive(value) for value in durations)
+        if duration is not None
+    )
+    duration_count = len(durations)
+    duration_coverage_count = len(available_durations)
+    full_duration = (
+        sum(available_durations)
+        if duration_count > 0 and duration_coverage_count == duration_count
+        else None
+    )
+
+    measured_wall = 0.0
+    measured_duration = 0.0
+    measured_rows = 0
+    for row in rows:
+        if row.get("execution_disposition") not in {"inferred", "resumed"}:
+            continue
+        wall_time = finite_positive(row.get("wall_time_sec"))
+        audio_duration = finite_positive(row.get("source_duration_sec"))
+        if wall_time is None or audio_duration is None:
+            continue
+        measured_wall += wall_time
+        measured_duration += audio_duration
+        measured_rows += 1
+
+    aggregate_rtf = (
+        measured_wall / measured_duration if measured_rows and measured_duration else None
+    )
+    projected = (
+        aggregate_rtf * full_duration if aggregate_rtf is not None and full_duration else None
+    )
+    return {
+        "measured_wall_time_sec": measured_wall if measured_rows else None,
+        "measured_audio_duration_sec": measured_duration if measured_rows else None,
+        "aggregate_rtf": aggregate_rtf,
+        "eligible_audio_duration_sec": full_duration,
+        "eligible_audio_duration_coverage_count": duration_coverage_count,
+        "eligible_audio_duration_total_count": duration_count,
+        "projected_full_wall_time_sec": projected,
+    }
+
+
 def _write_snapshot_checkpoint(
     run_path: Path,
     header: Mapping[str, object],
@@ -1009,6 +1088,184 @@ def _prediction_artifact_matches(
     return all(event.prediction_map_version == OAF_PREDICTION_MAP_ID for event in prediction.events)
 
 
+def _empty_reference_coverage() -> CohortCoverage:
+    return CohortCoverage(
+        reference_native_event_count=0,
+        reference_common_event_count=0,
+        reference_ignored_event_count=0,
+        reference_unmapped_event_count=0,
+        reference_duplicate_collapsed_count=0,
+        prediction_native_event_count=None,
+        prediction_mapped_event_count=None,
+        prediction_unmapped_event_count=None,
+        prediction_native_class_counts=(),
+    )
+
+
+def _cohort_item_without_prediction(
+    identity: CohortIdentity,
+    simfile_id: str,
+    mapping: ReferenceMappingResult | None,
+    *,
+    status: str,
+    failure_reason: str,
+    warnings: tuple[str, ...] = (),
+) -> CohortItem:
+    if mapping is None:
+        reference_events = ()
+        coverage = _empty_reference_coverage()
+    else:
+        reference_events = reference_to_benchmark_events(simfile_id, mapping.common_events)
+        coverage = coverage_from_artifacts(mapping, None)
+    item = CohortItem(
+        simfile_id=simfile_id,
+        status=status,  # type: ignore[arg-type]
+        reference_events=reference_events,
+        prediction_events=None,
+        coverage=coverage,
+        warnings=warnings,
+        failure_reason=failure_reason,  # type: ignore[arg-type]
+        artifact_identity=None,
+        reference_artifact=None,
+        prediction_artifact=None,
+    )
+    validate_cohort_items(identity, (item,))
+    return item
+
+
+def _cohort_item_from_run_row(
+    identity: CohortIdentity,
+    row: Mapping[str, object],
+    mapping: ReferenceMappingResult | None,
+    *,
+    output_dir: Path,
+) -> CohortItem:
+    """Adapt one persisted execution row to the HPA-325 item contract."""
+    if not isinstance(identity, CohortIdentity):
+        raise TypeError("identity must be CohortIdentity")
+    if not isinstance(row, Mapping):
+        raise TypeError("run row must be a mapping")
+    if not isinstance(output_dir, Path):
+        raise TypeError("output_dir must be a Path")
+    raw_simfile_id = row.get("simfile_id")
+    if isinstance(raw_simfile_id, bool) or not isinstance(raw_simfile_id, (int, str)):
+        raise ValueError("run row simfile_id is invalid")
+    simfile_id = str(raw_simfile_id)
+    if not simfile_id:
+        raise ValueError("run row simfile_id is invalid")
+    warnings_value = row.get("eligibility_warnings", ())
+    if isinstance(warnings_value, (list, tuple)) and all(
+        isinstance(value, str) for value in warnings_value
+    ):
+        warnings = tuple(warnings_value)
+    else:
+        warnings = ()
+
+    disposition = row.get("execution_disposition")
+    if disposition in {"inferred", "resumed"}:
+        prediction_path_value = row.get("prediction_path")
+        if not isinstance(prediction_path_value, str) or not prediction_path_value:
+            return _cohort_item_without_prediction(
+                identity,
+                simfile_id,
+                mapping,
+                status="failed",
+                failure_reason="prediction_missing",
+                warnings=warnings,
+            )
+        prediction_artifact_path = Path(prediction_path_value)
+        if not prediction_artifact_path.is_absolute():
+            prediction_artifact_path = output_dir / prediction_artifact_path
+        try:
+            content = read_regular_file_no_follow(prediction_artifact_path)
+        except FileNotFoundError:
+            return _cohort_item_without_prediction(
+                identity,
+                simfile_id,
+                mapping,
+                status="failed",
+                failure_reason="prediction_missing",
+                warnings=warnings,
+            )
+        except OSError:
+            return _cohort_item_without_prediction(
+                identity,
+                simfile_id,
+                mapping,
+                status="failed",
+                failure_reason="prediction_artifact_invalid",
+                warnings=warnings,
+            )
+        if mapping is None:
+            return _cohort_item_without_prediction(
+                identity,
+                simfile_id,
+                mapping,
+                status="failed",
+                failure_reason="prediction_artifact_invalid",
+                warnings=warnings,
+            )
+        try:
+            prediction = read_prediction_artifact(content)
+            if prediction.prediction.audio.source_audio_id != simfile_id:
+                scorer_audio = replace(prediction.prediction.audio, source_audio_id=simfile_id)
+                scorer_prediction = replace(prediction.prediction, audio=scorer_audio)
+                prediction = read_prediction_artifact(render_prediction_artifact(scorer_prediction))
+            return cohort_item_from_artifacts(
+                identity,
+                simfile_id,
+                mapping,
+                prediction,
+                warnings=warnings,
+            )
+        except (PredictionArtifactError, StrictJsonError, TypeError, ValueError):
+            return _cohort_item_without_prediction(
+                identity,
+                simfile_id,
+                mapping,
+                status="failed",
+                failure_reason="prediction_artifact_invalid",
+                warnings=warnings,
+            )
+
+    if disposition == "quarantined":
+        return _cohort_item_without_prediction(
+            identity,
+            simfile_id,
+            mapping,
+            status="quarantined",
+            failure_reason="reference_quarantined",
+            warnings=warnings,
+        )
+    if disposition == "skipped":
+        runner_code = row.get("runner_failure_code", "explicitly_skipped")
+        failure_reason = RUNNER_FAILURE_TO_COHORT_REASON.get(
+            runner_code if isinstance(runner_code, str) else "explicitly_skipped",
+            "explicitly_skipped",
+        )
+        return _cohort_item_without_prediction(
+            identity,
+            simfile_id,
+            mapping,
+            status="skipped",
+            failure_reason=failure_reason,
+            warnings=warnings,
+        )
+
+    runner_code = row.get("runner_failure_code")
+    if not isinstance(runner_code, str) or not runner_code:
+        runner_code = "backend_unavailable"
+    failure_reason = RUNNER_FAILURE_TO_COHORT_REASON.get(runner_code, "backend_unavailable")
+    return _cohort_item_without_prediction(
+        identity,
+        simfile_id,
+        mapping,
+        status="failed",
+        failure_reason=failure_reason,
+        warnings=warnings,
+    )
+
+
 def _prediction_relative_path(path: Path, output_dir: Path) -> str:
     try:
         return path.resolve().relative_to(output_dir.resolve()).as_posix()
@@ -1071,6 +1328,51 @@ def _fatal_outcome() -> OafCorpusRunOutcome:
     )
 
 
+def _cohort_identity_from_snapshot(snapshot: Mapping[str, object]) -> CohortIdentity:
+    descriptor = snapshot.get("backend_descriptor")
+    if not isinstance(descriptor, Mapping):
+        raise ValueError("run snapshot backend descriptor is missing")
+    backend_id = descriptor.get("backend_id")
+    descriptor_model_id = descriptor.get("model_id")
+    model_id = snapshot.get("model_id", descriptor_model_id)
+    inference_config = snapshot.get("inference_config")
+    prediction_map_version = OAF_PREDICTION_MAP_ID
+    if isinstance(inference_config, Mapping):
+        configured_map = inference_config.get("prediction_map_version")
+        if isinstance(configured_map, str) and configured_map:
+            prediction_map_version = configured_map
+    values = {
+        "cohort_id": snapshot.get("run_id"),
+        "reference_manifest_sha256": snapshot.get("reference_manifest_sha256"),
+        "reference_timing_version": snapshot.get("reference_timing_version"),
+        "taxonomy_version": TAXONOMY_VERSION,
+        "lane_map_version": DTX_LANE_MAP_VERSION,
+        "backend_id": backend_id,
+        "model_id": model_id,
+        "model_lock_sha256": snapshot.get("model_lock_sha256"),
+        "backend_descriptor_sha256": snapshot.get("backend_descriptor_sha256"),
+        "prediction_map_version": prediction_map_version,
+        "input_view_id": snapshot.get("input_view_id"),
+    }
+    if any(not isinstance(value, str) or not value for value in values.values()):
+        raise ValueError("run snapshot does not contain a complete cohort identity")
+    return CohortIdentity(**values)  # type: ignore[arg-type]
+
+
+def _item_counts(items: Iterable[CohortItem]) -> dict[str, int]:
+    counts = {field: 0 for field in _SNAPSHOT_COUNTS}
+    for item in items:
+        if item.status == "success":
+            counts["success_count"] += 1
+        elif item.status == "failed":
+            counts["failed_count"] += 1
+        elif item.status == "skipped":
+            counts["skipped_count"] += 1
+        elif item.status == "quarantined":
+            counts["quarantined_count"] += 1
+    return counts
+
+
 def _finalize_scoring_and_outcome(
     snapshot: Mapping[str, object],
     *,
@@ -1079,15 +1381,43 @@ def _finalize_scoring_and_outcome(
     reports_path: Path,
     aggregate_rtf: float | None,
     projected_full_wall_time_sec: float | None,
+    mappings: Mapping[int, ReferenceMappingResult | None] | None = None,
+    output_dir: Path | None = None,
 ) -> OafCorpusRunOutcome:
-    """Return the Task 6 execution outcome and reserve the Task 7 scorer seam."""
+    """Assemble HPA-325 items, score them, and publish the canonical reports."""
     reports_path.mkdir(parents=True, exist_ok=True)
     items = snapshot.get("items", [])
     if not isinstance(items, list):
         return _fatal_outcome()
-    counts = _snapshot_counts(item for item in items if isinstance(item, Mapping))
+    identity = _cohort_identity_from_snapshot(snapshot)
+    resolved_output_dir = output_dir or run_path.parents[2]
+    mapping_by_id = mappings or {}
+    cohort_items = tuple(
+        _cohort_item_from_run_row(
+            identity,
+            row,
+            mapping_by_id.get(int(row["simfile_id"])),
+            output_dir=resolved_output_dir,
+        )
+        for row in items
+        if isinstance(row, Mapping)
+    )
+    score_result = score_cohort(identity, cohort_items, diagnostics_for=())
+    write_cohort_reports(score_result, reports_path)
+    counts = (
+        {
+            "success_count": score_result.population.success_count,
+            "failed_count": score_result.population.failed_count,
+            "skipped_count": score_result.population.skipped_count,
+            "quarantined_count": score_result.population.quarantined_count,
+        }
+        if hasattr(score_result, "population")
+        else _item_counts(cohort_items)
+    )
     status = snapshot.get("overall_status")
     if status not in {"complete", "partial", "failed"}:
+        status = "partial"
+    if status == "complete" and counts["failed_count"]:
         status = "partial"
     return OafCorpusRunOutcome(
         overall_status=status,  # type: ignore[arg-type]
@@ -1434,6 +1764,13 @@ def run_oaf_corpus(
             completed_at = _timestamp(clock())
         except (OSError, TypeError, ValueError, RuntimeError):
             overall_status = "failed"
+    runtime = _project_runtime(
+        (state.snapshot for state in states),
+        eligible_audio_durations=tuple(
+            state.source.duration_sec if state.source is not None else None
+            for state in eligible_states
+        ),
+    )
     try:
         _write_snapshot_checkpoint(
             run_path,
@@ -1442,6 +1779,7 @@ def run_oaf_corpus(
             overall_status=overall_status,
             completed_at=completed_at,
             close_error=close_error,
+            runtime=runtime,
         )
     except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError):
         return _fatal_outcome()
@@ -1457,8 +1795,16 @@ def run_oaf_corpus(
         run_id=run_id,
         run_path=run_path,
         reports_path=reports_path,
-        aggregate_rtf=None,
-        projected_full_wall_time_sec=None,
+        aggregate_rtf=(
+            runtime["aggregate_rtf"] if isinstance(runtime["aggregate_rtf"], (float, int)) else None
+        ),
+        projected_full_wall_time_sec=(
+            runtime["projected_full_wall_time_sec"]
+            if isinstance(runtime["projected_full_wall_time_sec"], (float, int))
+            else None
+        ),
+        mappings=mappings,
+        output_dir=request.output_dir,
     )
     if interrupted_error is not None:
         raise interrupted_error
