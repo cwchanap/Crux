@@ -6,234 +6,287 @@
 
 ## Decision summary
 
-Implement HPA-326 as one OaF-specific corpus orchestrator around the seams that are already merged:
+Implement HPA-326 as one OaF-specific corpus orchestrator over the seams already landed:
 
-- HPA-323 owns authoritative source-audio selection and audio-relative reference timing.
-- HPA-324 owns corpus eligibility and the frozen DTX/common taxonomy.
-- HPA-423 owns the reusable OaF backend, exact model/checkpoint identity, and one persistent sequential worker.
+- HPA-321 owns the authoritative R2 inventory and local content-addressed cache.
+- HPA-323 owns source-audio selection and audio-relative reference timing.
+- HPA-324 owns benchmark eligibility and the frozen DTX/common taxonomy.
+- HPA-423 owns the reusable OaF backend, exact released checkpoint/source identity, and persistent sequential worker.
 - HPA-423 prediction artifact v2 owns native + mapped prediction persistence.
-- HPA-325 owns cohort scoring and deterministic reports.
+- HPA-325 owns single-cohort scoring and deterministic reports.
 
-HPA-326 should add only the missing execution layer: resolve the authoritative cached full mix, materialize the canonical OaF input view, run one persistent worker sequentially, persist/reuse immutable prediction artifacts, keep an atomic run ledger, measure runtime, then adapt the resulting rows into HPA-325 scoring.
+HPA-326 adds only the missing execution layer: resolve the exact cached full mix, materialize the fixed OaF input view, run one persistent sequential worker with a corpus-scale request deadline, persist/reuse immutable prediction artifacts, keep an atomic mutable run snapshot, measure runtime, then adapt rows into HPA-325 scoring.
 
-Do **not** introduce a generic multi-backend runner, job queue, worker pool, retry engine, model registry, database, seal/attestation layer, compatibility reader, or new prediction-event schema.
+Do **not** introduce a generic multi-backend runner, job queue, worker pool, retry/backoff engine, model registry, database, second prediction schema, durable derived-audio cache, seal/attestation layer, or compatibility reader.
 
 ## Why HPA-326 is next
 
-HPA-326 is High priority and its four blockers are complete: HPA-321, HPA-323, HPA-324, and HPA-423. HPA-325 is also now merged, so the full baseline can be scored immediately after inference. Completing HPA-326 unblocks HPA-395 (MuScriptor comparison), HPA-328 (OaF separated-input ablation), and HPA-329 (final benchmark findings).
+HPA-326 is High priority and its blockers HPA-321, HPA-323, HPA-324, and HPA-423 are complete. HPA-325 is also merged, so the OaF baseline can be scored immediately after inference.
 
-The repository is therefore missing orchestration rather than another model or scoring primitive.
+Completing HPA-326 unlocks:
 
-## Current landed seams
+- HPA-395 — frozen MuScriptor comparison;
+- HPA-328 — OaF drum-stem separation ablation;
+- HPA-329 — final comparative benchmark findings.
+
+The repository is missing orchestration, not another model/scoring abstraction.
+
+## Keep the selected shape
+
+The following decisions remain unchanged:
+
+- one OaF-specific runner rather than a CLI loop or generic backend pipeline;
+- prediction artifact v2 remains reference-independent;
+- resume re-materializes and rehashes instead of adding a canonical-input cache;
+- no R2 repair/fill from the inference runner;
+- one sequential persistent `OafBackend`;
+- concurrency only after measured pilot runtime justifies it;
+- HPA-325 failure enum remains unchanged;
+- no model/mapping/threshold tuning from corpus results.
+
+## Existing contracts to reuse
 
 ### HPA-423 backend
 
 `src/benchmark/backends/oaf.py` already provides:
 
-- `OafBackend` with one lazily started `WorkerProcess` retained across requests;
-- validated backend/model/upstream/native-output descriptor identity;
-- a fixed checkpoint cache and read-only input-root mount;
+- `OafBackend`;
+- a lazily started `WorkerProcess` retained across requests;
+- exact descriptor/model/upstream/native-output identity;
+- default checkpoint lookup through `CRUX_OAF_CHECKPOINT_CACHE` or `artifacts/benchmark/model-cache`;
+- one read-only `input_root` mount;
 - `transcribe(CanonicalAudio) -> NativePrediction`;
 - no heuristic fallback.
 
-The corpus runner must create this backend once, send selected songs sequentially, and close it once. It must not wrap it in another pool/manager abstraction.
+HPA-326 creates the backend through the existing `create_backend()` seam and must not add `--checkpoint-dir`. The CLI `--cache-dir` is **only** the HPA-321 corpus/audio cache.
+
+### Worker timeout and poison semantics
+
+The HPA-423 default `timeout_seconds=30.0` is suitable for smoke execution, not full songs. `WorkerProcess.request()` uses that value as the response deadline. A timeout/protocol error poisons and closes the worker process; `OafBackend` retains that closed process object, so later requests through the same backend cannot succeed.
+
+HPA-326 therefore defines one non-CLI corpus deadline:
+
+```python
+OAF_CORPUS_REQUEST_TIMEOUT_SECONDS = 3600.0
+```
+
+and constructs the backend as:
+
+```python
+create_backend(
+    input_root=work_root,
+    timeout_seconds=OAF_CORPUS_REQUEST_TIMEOUT_SECONDS,
+)
+```
+
+Use the existing checkpoint default. Do not expose the timeout as a user-facing tuning knob in this ticket.
+
+The lifecycle semantics are intentionally simple:
+
+- a model-level inference error returned as a valid worker response is item-local; record it and continue while the worker remains usable;
+- a source/canonicalization/prediction-artifact error that never poisons the worker is item-local; record it and continue;
+- a worker startup/readiness/timeout/protocol failure makes the backend unusable for later inference in that invocation; checkpoint `run.json`, stop issuing new inference requests, close the backend, and exit partial;
+- `--resume` is the recovery path for missing/failed rows on the next invocation.
+
+Do **not** build worker restart/retry machinery. If the pilot later proves that restarting one backend after poison is materially useful, that is a measured follow-up rather than part of the initial design.
 
 ### Prediction artifact v2
 
-`src/benchmark/prediction_artifact.py` already persists a canonical immutable JSONL artifact containing:
+`src/benchmark/prediction_artifact.py` already persists canonical immutable JSONL containing:
 
 - source/input audio identities;
-- backend descriptor + model identity;
-- native OaF event identity, class/bin, confidence, and velocity;
-- canonical/common mapping and map version.
+- backend descriptor/model identity;
+- native OaF class/bin/confidence/velocity;
+- canonical/common mapping and prediction-map version.
 
-HPA-326 must reuse `map_oaf_prediction()`, `publish_prediction_artifact()`, and `read_prediction_artifact()` rather than define a runner-specific event format.
+HPA-326 reuses:
 
-### HPA-323 / HPA-324 reference lineage
+- `map_oaf_prediction()`;
+- `publish_prediction_artifact()`;
+- `read_prediction_artifact()`.
 
-HPA-323 rows contain the selected authoritative `source_audio_key`, its content hash, and the immutable reference-event artifact path. HPA-324 carries those fields forward while adding eligibility and mapping accounting.
+Reference/chart/run provenance stays in `run.json` and HPA-325 inputs. A later reference correction can therefore rescore an unchanged prediction without rerunning OaF.
 
-One subtlety matters for HPA-326: the immutable upstream manifest can still show the selected audio object as not cached even though HPA-323 later filled it. HPA-323 already solves this by consulting `CacheIndexStore`, matching the original remote identity, and rebuilding a verified local cache reference. HPA-326 must use the same public cache primitives. It must not infer a filesystem path from the R2 object key and must not silently fetch a replacement body from R2.
+### HPA-323/HPA-324 lineage
+
+HPA-323 rows already carry:
+
+- selected authoritative `source_audio_key`;
+- `source_audio_content_hash`;
+- immutable reference-event artifact path.
+
+HPA-324 carries those fields forward with eligibility/mapping accounting.
+
+The HPA-324 loader must reuse the existing canonical manifest core from `reference_timing_manifest.py`. Promote `_read_canonical_manifest_core()` to a public `read_canonical_manifest_core()` (or equivalent public name) and use it for HPA-322, HPA-323, and the new HPA-324 loader. Do not fork canonical JSONL framing/hash/round-trip logic.
+
+Domain-specific HPA-324 work remains local to `reference_set_manifest.py`:
+
+- `_validate_reference_set_row()`;
+- unique simfile IDs;
+- one HPA-323 source timing hash/version;
+- narrow `ReferenceSetRowView` fields.
+
+Promote `_read_native_reference_events()` to `read_native_reference_events()` without changing its safe-path/hash/identity validation.
+
+When HPA-326 reads native references, derive:
+
+```python
+timing_output_root = timing_manifest_path.parent.parent
+```
+
+because HPA-323 event paths are relative to the timing output directory, not the manifest file directory.
+
+### HPA-321 cache primitives
+
+Compose the existing public cache operations:
+
+- `CacheIndexStore.get()`;
+- `cache_entry_matches_remote()`;
+- `validate_cached_body()`;
+- `resolve_verified_cache_body()`.
+
+Do not copy `_resolve_or_queue_audio()` from HPA-323: its R2-fill behavior is explicitly outside HPA-326.
 
 ### HPA-325 scoring
 
 `src/benchmark/cohort_scoring.py` already provides:
 
 - `CohortIdentity`;
-- success/failure/skipped/quarantined item accounting;
-- `cohort_item_from_artifacts()` for successful persisted reference/prediction pairs;
+- success/failed/skipped/quarantined accounting;
+- `cohort_item_from_artifacts()`;
+- the closed `CohortFailureReason` set;
 - 30/50/100 ms raw + aligned scoring;
-- deterministic aggregate calculations.
+- deterministic aggregates.
 
-`src/benchmark/reports.py` already writes the six report artifacts. HPA-326 should build the cohort items and call these APIs. No scoring logic belongs in the runner.
+`src/benchmark/reports.py` writes the six report artifacts. HPA-326 builds items and calls those APIs. No scoring logic belongs in the runner.
 
 ## Goals
 
 1. Run the validated OaF model over each eligible authoritative full-mix song with one persistent sequential worker.
-2. Make interruption/restart safe by reusing only prediction artifacts whose complete input/model/config identity matches.
-3. Persist per-song inference outcome, runtime, RTF, input/source provenance, and prediction path in one simple run ledger.
-4. Produce a fixed-batch runtime projection before broad inference.
-5. Score the completed OaF cohort through HPA-325 without rerunning inference.
-6. Leave prediction artifacts reusable by later paired comparisons and input-view ablations.
+2. Make restart safe by reusing only prediction artifacts whose complete input/model/config identity matches.
+3. Persist per-song execution outcome, runtime, RTF, input/source/chart provenance, and prediction path in one atomic run snapshot.
+4. Produce a fixed-batch full-corpus wall-time projection before broad inference.
+5. Score the OaF cohort through HPA-325 without rerunning inference.
+6. Keep prediction artifacts reusable by later paired comparisons/input-view ablations.
 
 ## Non-goals
 
 - generic multi-model orchestration;
 - parallel workers, batching, queues, distributed execution, or autoscaling;
-- retry schedules/backoff policies;
-- R2 download/fill in the inference runner;
+- worker restart/retry/backoff policy;
+- R2 download/fill in the runner;
 - stem separation;
-- threshold tuning, calibration, fine-tuning, or manual prediction correction;
-- MIDI as a scoring input;
+- threshold tuning, calibration, fine-tuning, or manual correction;
+- MIDI as scoring input;
 - changing prediction artifact v2;
-- seal evidence, runtime locks, host attestation, HPA-320 compatibility, or release hardening;
-- database/Parquet storage;
-- a mutable “latest successful baseline” pointer.
+- seal evidence/runtime locks/host attestation/HPA-320 compatibility;
+- database or Parquet storage;
+- durable canonical-input cache;
+- mutable global “latest baseline” pointer.
 
 ## Approaches considered
 
 ### A. Loop over the existing single-song smoke command
 
-This is superficially smallest, but it is the wrong execution boundary. A process-level CLI loop would repeatedly construct the backend/model environment, would not own a coherent run identity, and would make exact resume/reconciliation awkward. It also fails HPA-326's explicit persistent-worker requirement.
+Rejected. It repeatedly constructs execution state, does not own coherent run identity/resume, and cannot satisfy the persistent-worker requirement.
 
-**Rejected.**
+### B. Generic corpus pipeline with pluggable backends
 
-### B. Build a generic corpus pipeline with pluggable backends
+Rejected under YAGNI. HPA-395 has not yet demonstrated that MuScriptor needs the same execution contract. Extract common orchestration only after a second concrete runner proves duplication.
 
-A generic runner could eventually serve OaF, MuScriptor, separated inputs, and future models. However HPA-395 and HPA-562 do not yet prove that those models need the same execution contract, and HPA-423 intentionally removed unused backend abstractions. Building plugins, queues, job types, and generalized run schemas now would make HPA-326 larger without increasing baseline correctness.
+### C. One OaF-specific corpus runner — selected
 
-**Rejected under YAGNI.** Extract a shared runner only after a second implementation demonstrates real duplication.
-
-### C. Add one OaF-specific corpus runner that composes existing contracts
-
-A narrow `oaf_corpus_run.py` can own exactly the missing lifecycle: manifests -> cache -> canonical input -> persistent OaF worker -> prediction v2 -> run ledger -> HPA-325 reports.
-
-It preserves the existing stable boundaries and is easy to delete/refactor if a second backend later demands a different shape.
-
-**Selected.**
-
-## Proposed architecture
+A narrow `oaf_corpus_run.py` owns exactly:
 
 ```text
-HPA-324 benchmark-reference manifest
-        |
-        | lineage check
-        v
-HPA-323 reference-timing manifest -----> native reference artifacts
-        |
-        +---- source_audio_key/hash ----> HPA-321 cache index/body
-                                           |
-                                           v
-                                  canonical full-mix WAV
-                                           |
-                                           v
-                                  one OafBackend instance
-                                           |
-                                           v
-                                   NativePrediction
-                                           |
-                                 map_oaf_prediction()
-                                           |
-                                           v
-                              prediction artifact v2 (immutable)
-                                           |
-                         +-----------------+-----------------+
-                         |                                   |
-                         v                                   v
-                  atomic run.json                    HPA-325 CohortItem
-                                                             |
-                                                             v
-                                                    score_cohort()
-                                                             |
-                                                             v
-                                                  write_cohort_reports()
+manifests -> local cache -> canonical full mix -> OaF worker
+          -> prediction v2 -> run.json -> HPA-325 reports
 ```
 
-The prediction artifact stays reference-independent. Reference/chart provenance belongs to the run row and the scorer inputs, not inside prediction artifact v2. This is important: a future reference correction should allow rescoring an unchanged prediction instead of forcing inference to rerun.
+## Input contracts and preflight
 
-## Input contracts
-
-The command consumes three explicit local inputs:
+CLI inputs:
 
 ```text
 --manifest          exact HPA-324 benchmark-reference manifest
 --timing-manifest   exact HPA-323 reference-timing manifest referenced by HPA-324
---cache-dir         HPA-321 local content-addressed cache root
+--cache-dir         HPA-321 local content-addressed corpus cache
+--output-dir        HPA-326 predictions/runs/reports root
 ```
 
-The runner validates before model execution that:
+No `--backend`, `--checkpoint-dir`, or timeout flag.
 
-- the HPA-324 manifest is canonical and schema-valid;
-- every HPA-324 row shares one `source_reference_timing_manifest_sha256` and version;
-- that hash/version matches the supplied HPA-323 timing manifest exactly;
-- simfile IDs are unique and correspond across the two manifests;
-- taxonomy/lane-map versions remain the frozen current versions;
-- the OaF backend descriptor and model config are valid.
+Before any model inference the runner must validate:
 
-Add a small public `load_reference_set_manifest()` in `reference_set_manifest.py`; do not teach the runner to parse canonical JSONL itself.
+- HPA-324 manifest through `load_reference_set_manifest()` built on `read_canonical_manifest_core()`;
+- exact HPA-324 -> supplied HPA-323 hash/version lineage;
+- unique/corresponding simfile IDs;
+- frozen taxonomy/lane-map versions;
+- valid OaF model config/descriptor;
+- include/exclude sets contain only IDs present in HPA-324;
+- include/exclude sets do not overlap.
 
-Promote the already-tested HPA-324 native-reference reader from private to public so HPA-326 can reconstruct `ReferenceMappingResult` from HPA-323 artifacts without duplicating event-path and hash validation.
+Unknown include **or exclude** IDs and overlap are fatal preflight errors (exit 2). A typo must not silently create a smaller cohort/run identity.
+
+The CLI should reuse `click.IntRange(0, MAX_SIMFILE_ID)` for repeated include/exclude options.
 
 ## Authoritative source-audio resolution
 
 For a timing-ready row:
 
-1. Find the `RemoteObject` whose key equals `source_audio_key` in the carried HPA-321 inventory.
-2. Load `CacheIndexStore` once for the run.
-3. If the carried remote is not already verified, look up the exact `(source_endpoint_sha256, bucket, key)` cache entry.
-4. Require `cache_entry_matches_remote()` so an older immutable manifest never binds to newer bytes at the same key.
-5. Require the indexed SHA-256 to equal HPA-323 `source_audio_content_hash`.
-6. Resolve/validate the content-addressed cache body.
-7. Run `inspect_source_audio()` to obtain decoded duration metadata before inference.
+1. reconstruct the validated HPA-322/source inventory view from the HPA-323 row;
+2. locate the `RemoteObject` whose key equals `source_audio_key`;
+3. load `CacheIndexStore` once for the run;
+4. if the carried remote is not already verified, look up exact `(endpoint, bucket, key)`;
+5. require `cache_entry_matches_remote()`;
+6. require the cache-entry SHA-256 to equal HPA-323 `source_audio_content_hash`;
+7. require `validate_cached_body(...).state == "verified"`;
+8. resolve through `resolve_verified_cache_body()`;
+9. use existing `inspect_source_audio()` for header-only duration/sample metadata.
 
-If the body is absent/corrupt/mismatched, record a per-song source-audio failure. HPA-326 does **not** reach R2 to repair it. Re-running HPA-323/cache sync is the correct upstream repair.
-
-This keeps the actual inference run offline with respect to corpus data and prevents an old cohort from silently consuming changed source audio.
+Missing/corrupt/mismatched content is an item failure. HPA-326 does not reach R2 to repair it.
 
 ## Canonical full-mix input view
 
-The authoritative source is commonly `bgm.ogg`, while HPA-423's host boundary expects a canonical WAV (`44.1 kHz`, mono, `16-bit PCM`). The runner therefore materializes one temporary canonical view per selected song.
-
-Define one semantic input-view constant, for example:
+The authoritative source is commonly compressed audio while OaF expects canonical WAV. Define:
 
 ```text
-crux.oaf-full-mix-mono44k1-pcm16/v1
+OAF_FULL_MIX_INPUT_VIEW_ID = "crux.oaf-full-mix-mono44k1-pcm16/v1"
+OAF_CANONICALIZATION_REVISION = "librosa-mono44k1-soundfile-pcm16/v1"
 ```
 
-The materialization policy is fixed for v1:
+Materialization v1:
 
-- decode the authoritative source with existing `librosa`;
+- decode with existing `librosa`;
 - resample to 44,100 Hz;
 - mix to mono;
-- write WAV PCM16 with existing `soundfile`;
-- immediately validate the result through `parse_canonical_wav()` / a small `load_materialized_audio()` sibling in `input_view.py`;
-- retain the original source hash as `source_audio_sha256` and the canonical WAV hash as `input_audio_sha256`.
+- write WAV PCM16 through existing `soundfile`;
+- validate through a new `load_materialized_audio()` sibling of `load_direct_audio_bytes()`;
+- `load_materialized_audio()` still calls `parse_canonical_wav()`;
+- preserve the authoritative source hash as `source_audio_sha256`;
+- compute staged WAV hash as `input_audio_sha256`.
 
-The staged WAV lives below the one `input_root` mounted into the OaF worker. It may be deleted after the song finishes because the source bytes remain in the content-addressed corpus cache and prediction v2 retains both source/input hashes.
+The staged WAV lives under the worker `input_root` and is deleted in `finally`. Do not persist a second input-view manifest or duplicate the full audio corpus.
 
-Do not persist another input-view manifest or copy the original OGG into the run directory merely to use `load_derived_audio()`; that would duplicate large corpus data for no scoring benefit.
-
-## Frozen model and inference identity
-
-HPA-326 needs identities that are narrow enough to allow legitimate reuse but strong enough to prevent stale output reuse.
+## Frozen model/inference identity
 
 ### Adapter revision
 
-Add one explicit semantic constant to `backends/oaf.py`:
+Add:
 
-```text
+```python
 OAF_ADAPTER_REVISION = "crux.oaf-adapter/v1"
 ```
 
-Bump it only when host-side inference semantics change. The Crux Git commit is still recorded separately for provenance; using the entire repository commit as prediction identity would invalidate every artifact for unrelated documentation or scoring changes.
+Bump only when host-side inference semantics change.
 
-### Model lock hash
+### Model lock
 
-Use the exact SHA-256 of checked-in `runtime/oaf_tf1/model.json` as `model_lock_sha256`. The run row also records `checkpoint_archive_sha256` explicitly. This binds the model config, checkpoint identity, architecture/native-output metadata, and upstream source revision without reviving the abandoned HPA-320 seal machinery.
+`model_lock_sha256` is the exact SHA-256 of checked-in `runtime/oaf_tf1/model.json`. Record `checkpoint_archive_sha256` separately.
 
-### Inference-config hash
+### Inference config
 
-Canonical-hash a small closed payload containing only inference-semantic fields:
+Canonical-hash a closed payload:
 
 ```text
 schema
@@ -246,11 +299,11 @@ input_view_id
 canonicalization_revision
 ```
 
-There are no tunable thresholds in this payload because HPA-326 must not tune them against the corpus.
+No corpus-derived thresholds belong here.
 
 ## Run identity
 
-The run is a cohort execution, so its identity additionally includes reference/scope state:
+Hash a canonical payload containing:
 
 ```text
 reference_manifest_sha256
@@ -265,13 +318,11 @@ sorted include IDs
 sorted exclude IDs
 ```
 
-Derive `run_id` deterministically from the canonical JSON of that payload (for example `oaf-<16 hex>`). A changed reference manifest or filter creates a new run directory, while the underlying prediction artifact can still be reused when its input/model/config identity is unchanged.
+Derive deterministic `run_id` such as `oaf-<16 hex>`. Reference/scope changes create a new run directory while prediction paths remain reusable when inference identity is unchanged.
 
-No random UUID and no “latest” pointer are required.
+## Prediction path and resume
 
-## Prediction paths and immutable reuse
-
-After canonical materialization supplies the exact `input_audio_sha256`, use a deterministic path such as:
+After canonical materialization:
 
 ```text
 <output>/predictions/
@@ -281,95 +332,120 @@ After canonical materialization supplies the exact `input_audio_sha256`, use a d
         <inference_config_sha256>.jsonl
 ```
 
-The combined config hash contains the input-view ID, checkpoint/model identity, adapter revision, map version, and canonicalization revision, so the path is keyed by all HPA-326-required inference dimensions without creating an unreadable directory hierarchy.
-
-`publish_prediction_artifact()` remains immutable. The runner never overwrites an existing file.
+`publish_prediction_artifact()` remains immutable.
 
 ### `--resume`
 
-Resume is intentionally simple:
+1. materialize and hash current canonical input;
+2. compute expected prediction path;
+3. if path exists, read/validate v2;
+4. verify source ID/hash, input-view ID/hash, descriptor/model, and map identity;
+5. matching artifact -> execution disposition `resumed`, scorer status `success`, no `transcribe()`;
+6. missing artifact -> run inference;
+7. invalid/mismatched artifact -> explicit failure, never overwrite.
 
-1. materialize and hash the current canonical input;
-2. compute the expected prediction path;
-3. if `--resume` and the file exists, read it through `read_prediction_artifact()`;
-4. verify exact source ID/hash, input-view ID/hash, descriptor/model identity, and prediction-map version against current expectations;
-5. if all match, mark the row `success` with execution disposition `resumed` and do not call `transcribe()`;
-6. if missing, run inference;
-7. if present but invalid/mismatched, record an explicit artifact failure and do not overwrite it.
+Without `--resume`, an **existing** target is `prediction_output_conflict`. A **missing** target is normal and proceeds to inference.
 
-Without `--resume`, an existing target artifact is an explicit output conflict rather than an implicit skip.
-
-Failed or missing rows naturally rerun under `--resume` because they do not have a valid matching artifact. There is no retry counter/backoff framework.
-
-Materializing/rehashing the canonical input during resume is deliberate: it keeps reuse correctness trivial and is much cheaper than OaF inference.
+Failed/missing outputs rerun naturally under `--resume`; there is no retry counter.
 
 ## Persistent sequential worker lifecycle
 
-The runner creates one OaF backend instance for the run with the run work directory as `input_root`.
+Preflight/cache/source-duration work may happen before backend creation. Once inference is needed:
 
 ```text
-create backend once
-for each selected eligible row in simfile-id order:
-    resolve source
-    materialize canonical input
-    resume or transcribe
-    map + publish
-    checkpoint run ledger
+create backend once with input_root + corpus timeout
+for selected eligible rows in simfile-id order:
+    resolve/materialize
+    resume OR transcribe
+    map/publish
+    atomically checkpoint run.json
+    if worker was poisoned: stop issuing inference requests
 close backend once
+score/report persisted state
 ```
 
-`OafBackend` remains lazy, so a run containing only resume hits does not need to start the worker process. A single bad song is recorded and the next song is attempted. A fatal preflight identity failure aborts before inference.
+A run containing only resume hits need not start the worker because `OafBackend` remains lazy.
 
-Do not proactively restart the worker, maintain a worker pool, or add retry policy. If real corpus evidence later shows the worker cannot recover after a request-level failure, address that measured failure separately.
+## Closed runner failure mapping
 
-## Run ledger
+Keep detailed operational codes in `run.json`, but map them through one closed table to the existing HPA-325 enum.
 
-Persist one canonical `run.json` snapshot under:
+Define a small runner literal/table in `oaf_corpus_run.py`:
+
+| Runner failure code | HPA-325 `CohortFailureReason` |
+| --- | --- |
+| `source_audio_unavailable` | `inference_failed` |
+| `source_audio_decode_failed` | `inference_failed` |
+| `canonical_input_failed` | `inference_failed` |
+| `backend_unavailable` | `backend_unavailable` |
+| `worker_protocol_failed` | `backend_unavailable` |
+| `inference_failed` | `inference_failed` |
+| `prediction_artifact_invalid` | `prediction_artifact_invalid` |
+| `prediction_output_conflict` | `prediction_artifact_invalid` |
+| `prediction_publish_failed` | `prediction_artifact_invalid` |
+| `prediction_missing` | `prediction_missing` |
+
+`prediction_missing` is reserved for scoring/adaptation evidence that a run state expects a prediction artifact but the artifact is actually absent. A failed publication is **not** ambiguously grouped; it is `prediction_artifact_invalid`.
+
+Upstream HPA-324 quarantine and filter skips use their existing non-failure mappings:
+
+- `quarantined` / `reference_quarantined`;
+- `skipped` / `explicitly_skipped`.
+
+Do not extend HPA-325's enum.
+
+## Run snapshot
+
+Persist one mutable canonical document:
 
 ```text
 <output>/runs/<run_id>/run.json
 ```
 
-Rewrite it atomically after every completed row. A full event log/database is unnecessary for a few hundred songs.
+Rewrite atomically after every completed row using the same repository pattern already used for mutable snapshots:
 
-The document contains:
+1. write a same-directory temporary file;
+2. flush + `os.fsync()`;
+3. `os.replace()` to `run.json`;
+4. fsync the containing directory where the existing helper/pattern does so.
+
+Do not use `publish_immutable_file()` for `run.json`; it is intentionally a mutable checkpoint.
 
 ### Run header
 
-- schema and `run_id`;
-- exact HPA-324 and HPA-323 manifest hashes/versions;
-- backend/model/checkpoint identity;
-- adapter revision;
-- inference-config hash;
-- input-view ID;
+- schema/run ID;
+- exact HPA-324/HPA-323 identities;
+- model/backend/checkpoint identities;
+- adapter revision/inference config;
+- `OAF_CORPUS_REQUEST_TIMEOUT_SECONDS`;
+- input-view identity;
 - Crux commit;
 - normalized include/exclude scope;
 - started/completed timestamps;
-- run status and counts.
+- status/counts;
+- runtime projection.
 
 ### Per-song row
 
-- `simfile_id`;
-- HPA-324 eligibility status/reason/warnings;
-- selected chart key/hash when available;
-- source audio key/hash and decoded duration;
-- input-view ID and canonical input hash when materialized;
-- execution disposition: `inferred`, `resumed`, `skipped`, `quarantined`, or `failed`;
-- stable failure code + bounded detail string for failures;
-- prediction artifact path + SHA-256 for successes;
-- measured wall time and RTF for rows actually inferred.
+- simfile ID;
+- HPA-324 eligibility/reasons/warnings;
+- chart key/hash;
+- source audio key/hash/duration;
+- input view/hash when materialized;
+- disposition (`inferred`, `resumed`, `skipped`, `quarantined`, `failed`);
+- detailed runner failure code + bounded detail;
+- prediction path/SHA for success;
+- measured wall time/RTF for actual inference.
 
-Resume hits remain scorer-level **successes**, not skipped items. `skipped` is reserved for explicit include/exclude scope filtering.
+Resume hits remain scorer-level success.
 
-The run ledger supplies the reference/chart and execution provenance that intentionally does not belong in prediction artifact v2.
+## Runtime measurement and pilot projection
 
-## Runtime measurement and fixed-batch projection
+Choose a 4–6 song pilot before inspecting model scores, using corpus metadata only (duration, density, source pack/audio representation).
 
-The exact include set used for the pilot is frozen in the run identity and ledger. The technically diverse IDs must be selected **before inspecting model scores**, using corpus metadata only (for example duration, reference-event density, audio format/source pack), then passed through repeated `--include-simfile-id` flags.
+Header-probe all eligible locally cached source audio with existing `inspect_source_audio()` before broad inference.
 
-Before any broad inference, the runner should header-probe all eligible locally cached source audio with `inspect_source_audio()`. This provides total eligible audio duration without waveform decode or model execution.
-
-For inferred pilot rows record:
+For actual pilot inference record:
 
 ```text
 measured_item_count
@@ -379,57 +455,46 @@ aggregate_rtf = measured_wall_time_sec / measured_audio_duration_sec
 full_eligible_audio_duration_sec
 projected_full_wall_time_sec = aggregate_rtf * full_eligible_audio_duration_sec
 projection_coverage_count
+request_timeout_seconds = OAF_CORPUS_REQUEST_TIMEOUT_SECONDS
 ```
 
-Only rows with an actual measured inference are included in the numerator/denominator; resume hits with no retained historical timing do not masquerade as zero-cost inference. If all eligible durations cannot be probed, the projection is `null` and coverage explains why.
+Resume hits without retained measured timing do not count as zero-cost inference. If full eligible duration coverage is incomplete, projection is `null`.
 
-This is deliberately a simple first-order estimate. Do not add confidence intervals, memory telemetry, parallel speedup modeling, or queue simulation until the measured sequential runtime justifies it.
-
-The broad run is a human/operator gate: inspect the pilot artifact and projection first, then invoke the same command without include/exclude filters. No workflow engine is needed to enforce that ordering.
+Do not add confidence intervals, memory telemetry, parallel speedup models, or queues.
 
 ## Status and exit semantics
 
-Run rows map into the HPA-325 status contract:
+- `0`: every selected eligible item has a valid prediction; upstream quarantines/filter skips are reconciled;
+- `1`: selected eligible work is incomplete/failed but a trustworthy run snapshot/report was produced, including worker-poison stop;
+- `2`: fatal preflight/run-level setup/publication failure prevented trustworthy execution.
 
-- upstream HPA-324 quarantine -> `quarantined` / `reference_quarantined`;
-- explicit filter exclusion -> `skipped` / `explicitly_skipped`;
-- valid persisted/reused prediction -> `success`;
-- source/input/backend/inference/publish problems -> `failed` mapped to the closest existing HPA-325 failure family.
+A worker protocol/start/readiness/timeout poison is exit 1 once the current run snapshot is checkpointed; subsequent not-yet-inferred rows remain missing for `--resume` rather than being falsely reported as successful.
 
-Keep detailed runner error codes in `run.json`; do not expand HPA-325's grouped failure enum merely to mirror every operational error.
+## Scoring and fixed control
 
-CLI exit convention:
+For each row:
 
-- `0`: every selected eligible item has a valid prediction; upstream quarantines and explicit filter skips are reconciled but do not fail inference;
-- `1`: one or more selected eligible items failed while a run ledger/report was still produced;
-- `2`: fatal run-level validation/setup/publication failure prevented a trustworthy run.
-
-## Scoring and fixed-control publication
-
-After row execution, reconstruct the HPA-325 cohort from persisted artifacts:
-
-- timing-ready references are read through the promoted HPA-323 reader and `map_reference_events()`;
+- derive `timing_output_root = timing_manifest_path.parent.parent`;
+- load native references through `read_native_reference_events()`;
+- map with `map_reference_events()`;
 - successes use `cohort_item_from_artifacts()`;
-- failed/skipped/quarantined rows use existing `CohortItem` / `coverage_from_artifacts()` semantics;
-- `CohortIdentity.cohort_id` uses `run_id`;
-- `reference_manifest_sha256` is the exact HPA-324 manifest hash;
-- `reference_timing_version` is the HPA-323 timing manifest version;
-- model/backend/map/input-view fields come from the frozen run identity.
+- non-success rows use the closed runner -> HPA-325 failure table;
+- `CohortIdentity.cohort_id = run_id`;
+- HPA-324 hash and HPA-323 timing version are exact;
+- backend/model/map/input-view fields come from frozen run identity.
 
-Then call:
+Then call only:
 
-```text
-score_cohort(..., diagnostics_for=())
-write_cohort_reports(..., <run-dir>/reports)
+```python
+result = score_cohort(identity, tuple(items), diagnostics_for=())
+artifacts = write_cohort_reports(result, run_dir / "reports")
 ```
 
-No broad event diagnostics are generated by default.
+No broad event diagnostics by default.
 
-A full-scope run with no eligible failures is the fixed OaF full-mix control. Later HPA-395/HPA-562 work receives the explicit `run.json`/report path; HPA-326 does not add a mutable global baseline registry.
+A full unfiltered run with no eligible failures becomes the fixed OaF full-mix control. Later tickets receive explicit run/report paths; no global registry is needed.
 
 ## CLI
-
-Add one OaF-specific command:
 
 ```bash
 crux benchmark run-oaf-corpus \
@@ -442,102 +507,112 @@ crux benchmark run-oaf-corpus \
   [--resume]
 ```
 
-Do not add `--backend`; this ticket is explicitly the frozen OaF control. A generic backend option would imply unsupported semantics for later models.
+Repeated ID options use `click.IntRange(0, MAX_SIMFILE_ID)`.
 
-Emit one small canonical JSON summary on stdout containing run ID/path, counts, measured RTF/projection, report path, status, and exit code. Progress can go to stderr.
+Do not add `--backend`, `--checkpoint-dir`, or timeout flags.
+
+Stdout emits one small canonical JSON summary; progress may go to stderr.
 
 ## File-level design
 
 ### Create
 
-- `src/benchmark/oaf_corpus_run.py` — identity, source resolution, canonical materialization, sequential orchestration, run snapshot, resume, projection, and HPA-325 adaptation.
-- `tests/benchmark/test_oaf_corpus_run.py` — pure identity/path/status/resume/orchestration tests with injected fake backend.
-- `tests/benchmark/test_oaf_corpus_run_acceptance.py` — multi-song persisted-artifact + resume + score/report acceptance using local fixtures/fakes, no real model.
+- `src/benchmark/oaf_corpus_run.py` — identity, preflight, cache/source resolution, canonical materialization, sequential orchestration, closed failure mapping, run snapshot, resume, projection, HPA-325 adaptation.
+- `tests/benchmark/test_oaf_corpus_run.py` — identity/preflight/cache/timeout/failure/resume/orchestration tests with injected fake backend.
+- `tests/benchmark/test_oaf_corpus_run_acceptance.py` — multi-song persisted-artifact + poison/resume + score/report acceptance with fakes/local fixtures.
 
 ### Modify
 
-- `src/benchmark/reference_set_manifest.py` — public HPA-324 loader; promote existing native-reference artifact reader without semantic change.
-- `tests/benchmark/test_reference_set_manifest.py` — loader/lineage tests.
-- `src/benchmark/input_view.py` — add a small `load_materialized_audio()` helper that preserves distinct source/input hashes while reusing canonical WAV validation.
-- `tests/benchmark/test_input_view.py` — helper tests.
-- `src/benchmark/backends/oaf.py` — add semantic `OAF_ADAPTER_REVISION` constant only.
-- `tests/benchmark/test_task_d_contract.py` — pin the adapter revision if this is the existing OaF adapter contract suite.
-- `src/cli/benchmark.py` — add `run-oaf-corpus` command as a thin lazy-import wrapper.
-- `tests/test_cli_benchmark.py` — CLI argument/summary/exit tests.
+- `src/benchmark/reference_timing_manifest.py` — promote `read_canonical_manifest_core()` and add narrow timing-row chart/source helper.
+- `src/benchmark/reference_set_manifest.py` — HPA-324 loader via the shared core; promote native-reference reader.
+- corresponding manifest tests;
+- `src/benchmark/input_view.py` — `load_materialized_audio()` sibling using `parse_canonical_wav()`;
+- `src/benchmark/backends/oaf.py` — semantic adapter revision constant only;
+- `src/cli/benchmark.py` — thin command;
+- CLI/OaF/input-view tests.
 
 ### Explicitly unchanged
 
-- `runtime/oaf_tf1/model.py` and worker inference semantics;
-- `src/benchmark/mapping.py` taxonomy/map behavior;
-- `src/benchmark/prediction_artifact.py` schema v2;
-- `src/benchmark/cohort_scoring.py` matcher/aggregate semantics;
-- `src/benchmark/reports.py` report schema;
-- HPA-321/HPA-323 R2 fill logic;
-- old HPA-320 seal/lock artifacts.
+- runtime OaF model/worker inference semantics;
+- prediction artifact v2;
+- taxonomy/mapping semantics;
+- HPA-325 failure enum/scoring/report schemas;
+- HPA-321/HPA-323 R2-fill path;
+- old HPA-320 security/seal artifacts.
 
 ## Hard gates
 
-### Gate A — reference lineage
+### Gate A — shared canonical manifest reader
 
-No inference starts unless the supplied HPA-324 rows point to the exact supplied HPA-323 manifest hash/version.
+The HPA-324 loader calls the promoted existing canonical JSONL core; no forked reader.
 
-### Gate B — authoritative source body
+### Gate B — reference lineage and scope
 
-Every inferred item uses a locally verified cache body whose original remote identity and SHA-256 match HPA-323. Missing/mismatched content is an explicit item failure; no R2 substitution occurs.
+No inference before exact HPA-324 -> HPA-323 lineage passes. Unknown include/exclude IDs or overlap fail preflight with exit 2.
 
-### Gate C — persistent worker
+### Gate C — authoritative source body
 
-A multi-song non-resume test proves one backend object / worker process serves repeated `transcribe()` calls and is closed once.
+Only a locally verified cache body matching original remote identity + HPA-323 SHA is used. No R2 substitution.
 
-### Gate D — resume identity
+### Gate D — corpus request deadline and poison behavior
 
-A resume hit must match source hash, canonical input hash, input-view ID, backend descriptor/model identity, prediction map, adapter/config-derived path, and canonical prediction artifact validation. Mismatch never overwrites.
+Tests prove backend factory receives `OAF_CORPUS_REQUEST_TIMEOUT_SECONDS`. Protocol/timeout poison stops further inference in that invocation; resume is recovery.
 
-### Gate E — prediction schema reuse
+### Gate E — persistent sequential worker
 
-The runner publishes exactly prediction artifact v2 after `map_oaf_prediction()`. Reference/chart/run metadata stays in `run.json`.
+Normal multi-song inference uses one backend object/worker and closes it once.
 
-### Gate F — population balance
+### Gate F — resume identity
 
-Run rows reconcile to the exact HPA-324 manifest population, and HPA-325 reports retain explicit successful/failed/skipped/quarantined accounting.
+Reuse only exact source/input/backend/model/map/config match; mismatches never overwrite.
 
-### Gate G — no tuning
+### Gate G — closed failure mapping
 
-No threshold, mapping, weight, architecture, or scoring tolerance is derived from the corpus results.
+Every detailed runner failure code maps deterministically to one existing HPA-325 reason; no ad-hoc mapping in exception handlers.
 
-### Gate H — pilot evidence before broad run
+### Gate H — prediction schema reuse
 
-Operational acceptance records the fixed include set, batch RTF, full eligible duration coverage, and projected sequential wall time before launching the unfiltered corpus run.
+Exactly prediction artifact v2 after `map_oaf_prediction()`; reference/run metadata remains outside it.
 
-## Risks and intentionally deferred work
+### Gate I — population balance
+
+Run rows and HPA-325 reports reconcile exact HPA-324 population, including quarantine/skips/failures/missing-after-poison.
+
+### Gate J — pilot evidence before broad run
+
+Record pilot IDs, request timeout, RTF, full eligible duration coverage, and projected sequential wall time before unfiltered execution.
+
+## Risks and deliberately deferred work
 
 ### Canonicalization cost on resume
 
-Resume re-materializes the canonical WAV to verify its input hash. That is extra CPU/I/O, but substantially cheaper than OaF inference and avoids a second derived-input cache/schema. If profiling later shows decode dominates resume, add a content-addressed canonical-input cache then — not now.
+Accepted. Decode/rehash is cheaper than OaF and avoids a second cache. Add one only if profiling later proves it matters.
 
-### Worker failure recovery
+### Worker poison
 
-The selected design continues after row-local failures using the existing backend behavior. If a real worker error leaves the persistent process unusable for subsequent songs, the corpus evidence will make that visible. Do not add speculative restarts until observed.
+Known and specified, not speculative. The corpus deadline prevents the 30-second smoke default from killing normal tracks. Protocol poison stops further inference in that invocation; `--resume` recovers. No restart framework now.
 
 ### Storage volume
 
-Only prediction JSONL and run/report metadata are durable HPA-326 outputs. Canonical WAVs are temporary, so the full mix is not duplicated on disk.
+Only prediction JSONL and run/report metadata are durable. Canonical WAVs are temporary.
 
 ### Future backends
 
-MuScriptor or separated-input work may reuse parts of this orchestration. Refactor only after the second concrete runner exists and the common subset is obvious.
+Refactor common execution only after a second concrete model runner demonstrates a stable common subset.
 
 ## Acceptance mapping
 
-- Fixed diverse batch: include-filtered run with frozen IDs in `run.json`.
-- Intended checkpoint identity: model lock + checkpoint archive + descriptor validation.
-- Persistent worker: one backend instance across sequential items.
-- Resume: exact artifact validation, skip inference only on match.
-- Every eligible item accounted: run ledger + HPA-325 item ledger.
-- Audio-relative predictions: canonical input starts at source-audio zero; HPA-325 reference is already audio-relative.
-- Native + canonical outputs: prediction v2 unchanged.
-- No tuning: identities/config are frozen before inference.
-- Count reconciliation: run schema + scorer population invariants.
-- Full-corpus projection: aggregate pilot RTF × full eligible header-probed duration.
-- Pairing without rerun: immutable prediction v2 paths retained in `run.json`.
-- No speculative frameworks: OaF-only sequential module, one JSON ledger, no compatibility/security/distribution layers.
+- Fixed diverse batch -> include-filtered run with frozen IDs.
+- Intended checkpoint -> model lock + checkpoint archive + descriptor validation.
+- Persistent worker -> one backend across normal sequential requests.
+- Corpus-scale deadline -> explicit 3600-second backend request timeout recorded in run evidence.
+- Poison recovery -> stop current invocation, resume missing/failed rows next invocation.
+- Resume -> exact immutable artifact validation.
+- Every eligible item accounted -> run snapshot + HPA-325 item ledger.
+- Audio-relative predictions -> source starts at audio zero; HPA-323 references already audio-relative.
+- Native + canonical outputs -> prediction v2 unchanged.
+- No tuning -> frozen identity/config before inference.
+- Count reconciliation -> run + scorer invariants.
+- Full-corpus projection -> aggregate pilot RTF × full eligible header-probed duration.
+- Pairing without rerun -> immutable prediction paths retained in `run.json`.
+- No speculative frameworks -> OaF-only sequential module, one mutable JSON snapshot, no compatibility/security/distribution layers.
