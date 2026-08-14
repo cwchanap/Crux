@@ -15,11 +15,13 @@ from src.benchmark.backend_identity import (
 )
 from src.benchmark.backends import CanonicalAudio, NativeEvent, NativePrediction
 from src.benchmark.mapping import map_oaf_prediction
+from src.benchmark.oaf_corpus_run import OafCorpusRunOutcome
 from src.benchmark.oaf_smoke_oracle import render_smoke_oracle
 from src.benchmark.prediction_artifact import (
     publish_prediction_artifact,
     read_prediction_artifact,
 )
+from src.benchmark.r2_corpus_models import MAX_SIMFILE_ID
 from src.cli.main import main
 
 
@@ -306,3 +308,164 @@ def test_smoke_backend_compares_oracle_to_canonical_published_prediction(
     persisted = Path(summary["prediction_path"]).read_bytes()
     assert summary["prediction_sha256"] == sha256_hex(persisted)
     assert read_prediction_artifact(persisted).prediction == canonical_prediction
+
+
+def test_run_oaf_corpus_builds_request_and_emits_quantized_canonical_summary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.oaf_corpus_run as runner_module
+
+    manifest_path = tmp_path / "hpa324.jsonl"
+    timing_manifest_path = tmp_path / "hpa323.jsonl"
+    cache_dir = tmp_path / "cache"
+    output_dir = tmp_path / "output"
+    run_path = output_dir / "runs" / "run-123" / "run.json"
+    reports_path = output_dir / "runs" / "run-123" / "reports"
+    captured: list[object] = []
+
+    def fake_run(request: object) -> OafCorpusRunOutcome:
+        captured.append(request)
+        return OafCorpusRunOutcome(
+            overall_status="complete",
+            exit_code=0,
+            run_id="run-123",
+            run_path=run_path,
+            reports_path=reports_path,
+            success_count=2,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+            aggregate_rtf=1.23456789,
+            projected_full_wall_time_sec=12.34567891,
+        )
+
+    monkeypatch.setattr(runner_module, "run_oaf_corpus", fake_run)
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "run-oaf-corpus",
+            "--manifest",
+            str(manifest_path),
+            "--timing-manifest",
+            str(timing_manifest_path),
+            "--cache-dir",
+            str(cache_dir),
+            "--output-dir",
+            str(output_dir),
+            "--include-simfile-id",
+            "10",
+            "--include-simfile-id",
+            "20",
+            "--exclude-simfile-id",
+            "30",
+            "--resume",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.reference_manifest_path == manifest_path
+    assert request.timing_manifest_path == timing_manifest_path
+    assert request.cache_dir == cache_dir
+    assert request.output_dir == output_dir
+    assert request.include_simfile_ids == (10, 20)
+    assert request.exclude_simfile_ids == (30,)
+    assert request.resume is True
+
+    summary = json.loads(result.output)
+    assert set(summary) == {
+        "aggregate_rtf",
+        "exit_code",
+        "failed_count",
+        "projected_full_wall_time_sec",
+        "quarantined_count",
+        "reports_path",
+        "run_id",
+        "run_path",
+        "skipped_count",
+        "status",
+        "success_count",
+    }
+    assert summary["status"] == "complete"
+    assert summary["exit_code"] == 0
+    assert summary["aggregate_rtf"] == 1.234568
+    assert summary["projected_full_wall_time_sec"] == 12.345679
+    assert summary["run_path"] == str(run_path)
+    assert summary["reports_path"] == str(reports_path)
+
+
+def test_run_oaf_corpus_preserves_domain_preflight_exit_code(tmp_path: Path, monkeypatch) -> None:
+    import src.benchmark.oaf_corpus_run as runner_module
+
+    def fake_run(_request: object) -> OafCorpusRunOutcome:
+        return OafCorpusRunOutcome(
+            overall_status="failed",
+            exit_code=2,
+            run_id=None,
+            run_path=None,
+            reports_path=None,
+            success_count=0,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+            aggregate_rtf=None,
+            projected_full_wall_time_sec=None,
+        )
+
+    monkeypatch.setattr(runner_module, "run_oaf_corpus", fake_run)
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "run-oaf-corpus",
+            "--manifest",
+            str(tmp_path / "hpa324.jsonl"),
+            "--timing-manifest",
+            str(tmp_path / "hpa323.jsonl"),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--include-simfile-id",
+            "10",
+            "--include-simfile-id",
+            "10",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert "Usage:" not in result.output
+    assert json.loads(result.output)["exit_code"] == 2
+
+
+def test_run_oaf_corpus_rejects_out_of_range_id_as_click_error(tmp_path: Path, monkeypatch) -> None:
+    import src.benchmark.oaf_corpus_run as runner_module
+
+    def unexpected_run(_request: object) -> OafCorpusRunOutcome:
+        raise AssertionError("domain runner must not run for a syntax-range violation")
+
+    monkeypatch.setattr(runner_module, "run_oaf_corpus", unexpected_run)
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "run-oaf-corpus",
+            "--manifest",
+            str(tmp_path / "hpa324.jsonl"),
+            "--timing-manifest",
+            str(tmp_path / "hpa323.jsonl"),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--include-simfile-id",
+            str(MAX_SIMFILE_ID + 1),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Invalid value for '--include-simfile-id'" in result.output
