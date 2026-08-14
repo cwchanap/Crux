@@ -161,7 +161,7 @@ def test_materialized_audio_preserves_source_identity_and_hashes_input(tmp_path:
     source_digest = sha256(b"authoritative source bytes").hexdigest()
 
     audio = load_materialized_audio(
-        audio_path,
+        path=audio_path,
         source_audio_id="song-42-source-v1",
         source_audio_sha256=source_digest,
         input_view_id="crux-oaf-full-mix-mono44k1-pcm16/v1",
