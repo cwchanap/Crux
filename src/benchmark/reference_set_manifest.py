@@ -32,6 +32,7 @@ from src.benchmark.reference_timing_manifest import (
     LoadedReferenceTimingRow,
     _validate_timing_manifest_row,
     load_reference_timing_manifest,
+    read_canonical_manifest_core,
 )
 from src.benchmark.taxonomy import DTX_LANE_MAP_VERSION, TAXONOMY_VERSION
 
@@ -89,6 +90,34 @@ class ReferenceSetOutcome:
 
 
 @dataclass(frozen=True)
+class ReferenceSetRowView:
+    simfile_id: int
+    eligibility_status: ReferenceEligibilityStatus
+    eligibility_reason_codes: tuple[EligibilityReasonCode, ...]
+    eligibility_warnings: tuple[str, ...]
+    mapped_event_count: int
+    common_scored_event_count: int
+    ignored_event_count: int
+    unmapped_event_count: int
+    duplicate_common_event_count: int
+
+
+@dataclass(frozen=True)
+class LoadedReferenceSetRow:
+    source_row: Mapping[str, object]
+    view: ReferenceSetRowView
+
+
+@dataclass(frozen=True)
+class LoadedReferenceSetManifest:
+    manifest_sha256: str
+    corpus_version: str
+    source_reference_timing_manifest_sha256: str
+    source_reference_timing_version: str
+    rows: tuple[LoadedReferenceSetRow, ...]
+
+
+@dataclass(frozen=True)
 class _ReferenceSetResolution:
     status: ReferenceEligibilityStatus
     reason_codes: tuple[EligibilityReasonCode, ...]
@@ -115,7 +144,7 @@ def _zero_resolution(
     )
 
 
-def _read_native_reference_events(
+def read_native_reference_events(
     loaded: LoadedReferenceTimingRow,
     *,
     timing_output_root: Path,
@@ -174,7 +203,7 @@ def _evaluate_row(
         return _zero_resolution("upstream_reference_unavailable")
 
     try:
-        events = _read_native_reference_events(loaded, timing_output_root=timing_output_root)
+        events = read_native_reference_events(loaded, timing_output_root=timing_output_root)
     except (OSError, RuntimeError, ValueError):
         return _zero_resolution("reference_event_artifact_invalid")
 
@@ -503,6 +532,91 @@ def _validate_reference_set_row(row: Mapping[str, object]) -> None:
             raise ValueError("empty reference set row is inconsistent")
     if status == "quarantined" and warnings:
         raise ValueError("quarantined reference set row must not carry warnings")
+
+
+def _reference_set_row_view_from_row(row: Mapping[str, object]) -> ReferenceSetRowView:
+    """Build the narrow HPA-326 view after HPA-324 row validation."""
+    simfile_id = row["simfile_id"]
+    status = row["reference_eligibility_status"]
+    reasons = row["reference_eligibility_reason_codes"]
+    warnings = row["reference_eligibility_warnings"]
+    if (
+        isinstance(simfile_id, bool)
+        or not isinstance(simfile_id, int)
+        or not isinstance(status, str)
+        or not isinstance(reasons, list)
+        or not isinstance(warnings, list)
+        or any(not isinstance(reason, str) for reason in reasons)
+        or any(not isinstance(warning, str) for warning in warnings)
+    ):
+        raise ValueError("reference set manifest contains an invalid eligibility row")
+    counts = tuple(
+        row[field]
+        for field in (
+            "mapped_event_count",
+            "common_scored_event_count",
+            "ignored_event_count",
+            "unmapped_event_count",
+            "duplicate_common_event_count",
+        )
+    )
+    if any(isinstance(count, bool) or not isinstance(count, int) for count in counts):
+        raise ValueError("reference set manifest contains invalid event counts")
+    return ReferenceSetRowView(
+        simfile_id=simfile_id,
+        eligibility_status=status,  # type: ignore[arg-type]
+        eligibility_reason_codes=tuple(reasons),  # type: ignore[arg-type]
+        eligibility_warnings=tuple(warnings),
+        mapped_event_count=counts[0],
+        common_scored_event_count=counts[1],
+        ignored_event_count=counts[2],
+        unmapped_event_count=counts[3],
+        duplicate_common_event_count=counts[4],
+    )
+
+
+def load_reference_set_manifest(path: Path) -> LoadedReferenceSetManifest:
+    """Load an immutable HPA-324 manifest through the shared JSONL core."""
+    rows: list[LoadedReferenceSetRow] = []
+    simfile_ids: set[int] = set()
+    source_manifest_sha256: str | None = None
+    source_version: str | None = None
+
+    def validate_rows(source_rows: tuple[Mapping[str, object], ...]) -> None:
+        nonlocal source_manifest_sha256, source_version
+        for source_row in source_rows:
+            _validate_reference_set_row(source_row)
+            view = _reference_set_row_view_from_row(source_row)
+            row_manifest_sha256 = source_row["source_reference_timing_manifest_sha256"]
+            row_version = source_row["source_reference_timing_version"]
+            if not isinstance(row_manifest_sha256, str) or not isinstance(row_version, str):
+                raise ValueError(
+                    "reference set manifest contains an invalid source timing identity"
+                )
+            if source_manifest_sha256 is None and source_version is None:
+                source_manifest_sha256 = row_manifest_sha256
+                source_version = row_version
+            elif row_manifest_sha256 != source_manifest_sha256 or row_version != source_version:
+                raise ValueError("reference set manifest contains mixed source timing identity")
+            if view.simfile_id in simfile_ids:
+                raise ValueError("reference set manifest contains duplicate simfile IDs")
+            simfile_ids.add(view.simfile_id)
+            rows.append(LoadedReferenceSetRow(source_row=source_row, view=view))
+
+    canonical = read_canonical_manifest_core(
+        path,
+        schema_version=BENCHMARK_REFERENCE_MANIFEST_SCHEMA,
+        validate_rows=validate_rows,
+    )
+    if source_manifest_sha256 is None or source_version is None:
+        raise ValueError("reference set manifest contains no records")
+    return LoadedReferenceSetManifest(
+        manifest_sha256=canonical.manifest_sha256,
+        corpus_version=canonical.corpus_version,
+        source_reference_timing_manifest_sha256=source_manifest_sha256,
+        source_reference_timing_version=source_version,
+        rows=tuple(rows),
+    )
 
 
 def _validate_warnings(value: object) -> None:
