@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from runtime.oaf_tf1.model import load_model_config
-from src.benchmark.backend_identity import BackendDescriptor, StrictJsonError, canonical_json_bytes
+from src.benchmark.backend_identity import (
+    BackendDescriptor,
+    StrictJsonError,
+    canonical_json_bytes,
+    strict_json_loads,
+)
 from src.benchmark.backends.oaf import OAF_ADAPTER_REVISION
 from src.benchmark.cohort_scoring import COHORT_FAILURE_REASONS
 from src.benchmark.oaf_corpus_run import (
@@ -257,6 +262,19 @@ def test_render_normalizes_floats_sorts_items_and_round_trips() -> None:
     assert render_oaf_corpus_run(parsed) == content
 
 
+def test_parse_rejects_canonical_but_semantically_unsorted_items() -> None:
+    rendered = render_oaf_corpus_run(_snapshot())
+    canonical_snapshot = strict_json_loads(rendered)
+    assert isinstance(canonical_snapshot, dict)
+    items = canonical_snapshot["items"]
+    assert isinstance(items, list)
+    canonical_snapshot["items"] = list(reversed(items))
+    semantically_unsorted = canonical_json_bytes(canonical_snapshot)
+
+    with pytest.raises(StrictJsonError, match="semantically canonical"):
+        parse_oaf_corpus_run(semantically_unsorted)
+
+
 def test_canonical_json_rejects_direct_float_injection() -> None:
     with pytest.raises(StrictJsonError, match="unsupported JSON value"):
         canonical_json_bytes({"wall_time_sec": 1.25})
@@ -282,6 +300,18 @@ def test_snapshot_validates_schema_counts_skips_and_completion() -> None:
     incomplete["overall_status"] = "partial"
     incomplete["completed_at"] = "2026-08-14T00:00:00+00:00"
     with pytest.raises(ValueError, match="completed"):
+        render_oaf_corpus_run(incomplete)
+
+
+@pytest.mark.parametrize("missing_field", ["execution_disposition", "failed_count"])
+def test_complete_snapshot_requires_complete_item_accounting(missing_field: str) -> None:
+    incomplete = _snapshot()
+    if missing_field == "execution_disposition":
+        del incomplete["items"][0][missing_field]
+    else:
+        del incomplete[missing_field]
+
+    with pytest.raises(ValueError, match="complete|count|disposition"):
         render_oaf_corpus_run(incomplete)
 
 
