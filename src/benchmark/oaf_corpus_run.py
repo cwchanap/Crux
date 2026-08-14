@@ -1248,151 +1248,172 @@ def run_oaf_corpus(
     stop_after_poison = False
     fatal_backend_error = False
     fatal_run_error = False
-
-    for state in eligible_states:
-        item = state.snapshot
-        if item.get("execution_disposition") == "failed" or state.source is None:
-            continue
-        assert state.source is not None
-        canonical_path = input_root / str(state.loaded.view.simfile_id) / "full-mix.wav"
-        prediction_target = prediction_path(
-            request.output_dir,
-            simfile_id=state.loaded.view.simfile_id,
-            source_audio_sha256=state.source.source_audio_sha256,
-            backend_descriptor_sha256=backend_descriptor.sha256,
-            inference_config_sha256=config_sha,
-        )
-        try:
-            audio = _materialize_oaf_full_mix(
-                state.source,
-                canonical_path,
-                input_root=input_root,
-                config=config,
+    interrupted_error: BaseException | None = None
+    close_error: dict[str, str] | None = None
+    try:
+        for state in eligible_states:
+            item = state.snapshot
+            if item.get("execution_disposition") == "failed" or state.source is None:
+                continue
+            assert state.source is not None
+            canonical_path = input_root / str(state.loaded.view.simfile_id) / "full-mix.wav"
+            prediction_target = prediction_path(
+                request.output_dir,
+                simfile_id=state.loaded.view.simfile_id,
+                source_audio_sha256=state.source.source_audio_sha256,
+                backend_descriptor_sha256=backend_descriptor.sha256,
+                inference_config_sha256=config_sha,
             )
-        except (OSError, RuntimeError, TypeError, ValueError) as error:
-            _set_failed(item, "canonical_input_failed", error)
-            _remove_temporary_input(canonical_path, input_root)
+            try:
+                audio = _materialize_oaf_full_mix(
+                    state.source,
+                    canonical_path,
+                    input_root=input_root,
+                    config=config,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                _set_failed(item, "canonical_input_failed", error)
+                _remove_temporary_input(canonical_path, input_root)
+                try:
+                    _write_snapshot_checkpoint(
+                        run_path, header, (state.snapshot for state in states)
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError):
+                    fatal_run_error = True
+                    stop_after_poison = True
+                    break
+                continue
+            try:
+                exists, content = _read_existing_prediction(prediction_target)
+                item["input_view_id"] = audio.input_view_id
+                item["input_audio_sha256"] = audio.input_audio_sha256
+                if exists and not request.resume:
+                    _set_failed(
+                        item, "prediction_output_conflict", "prediction artifact already exists"
+                    )
+                    continue
+                if exists and request.resume:
+                    if content is None:
+                        _set_failed(
+                            item, "prediction_artifact_invalid", "prediction artifact is unreadable"
+                        )
+                        continue
+                    try:
+                        artifact = read_prediction_artifact(content)
+                    except (PredictionArtifactError, StrictJsonError, TypeError, ValueError):
+                        _set_failed(
+                            item, "prediction_artifact_invalid", "prediction artifact is invalid"
+                        )
+                        continue
+                    if not _prediction_artifact_matches(
+                        artifact,
+                        source=state.source,
+                        audio=audio,
+                        descriptor=backend_descriptor,
+                    ):
+                        _set_failed(
+                            item,
+                            "prediction_artifact_invalid",
+                            "prediction artifact identity mismatch",
+                        )
+                        continue
+                    item["execution_disposition"] = "resumed"
+                    item["prediction_path"] = _prediction_relative_path(
+                        prediction_target, request.output_dir
+                    )
+                    item["prediction_artifact_sha256"] = artifact.artifact_sha256
+                    continue
+
+                if backend is None:
+                    try:
+                        backend = backend_factory(
+                            input_root=input_root,
+                            timeout_seconds=OAF_CORPUS_REQUEST_TIMEOUT_SECONDS,
+                        )
+                        backend_descriptor = backend.descriptor()
+                        if not isinstance(backend_descriptor, BackendDescriptor):
+                            raise OafBackendError(
+                                "backend descriptor is invalid", code="descriptor_invalid"
+                            )
+                        if backend_descriptor.sha256 != descriptor.sha256 or dict(
+                            backend_descriptor.payload
+                        ) != dict(descriptor.payload):
+                            raise OafBackendError(
+                                "backend descriptor identity changed", code="descriptor_invalid"
+                            )
+                    except OafBackendError:
+                        raise
+                    except (OSError, RuntimeError, TypeError, ValueError) as error:
+                        raise OafBackendError(
+                            _bounded_error(error), code="worker_start_failed"
+                        ) from error
+
+                started = perf_counter()
+                try:
+                    native = backend.transcribe(audio)
+                finally:
+                    elapsed = max(0.0, perf_counter() - started)
+                if not isinstance(native, NativePrediction):
+                    raise OafBackendError(
+                        "native prediction is invalid", code="native_event_invalid"
+                    )
+                item["wall_time_sec"] = elapsed
+                item["rtf"] = (
+                    elapsed / state.source.duration_sec if state.source.duration_sec > 0 else None
+                )
+                try:
+                    mapped, _ = map_oaf_prediction(native)
+                except Exception as error:  # pylint: disable=broad-exception-caught
+                    raise OafBackendError(
+                        "worker response mapping failed", code="worker_response_invalid"
+                    ) from error
+                published: PublishedArtifact = publish_prediction_artifact(
+                    prediction_target, mapped
+                )
+                item["execution_disposition"] = "inferred"
+                item["prediction_path"] = _prediction_relative_path(
+                    prediction_target, request.output_dir
+                )
+                item["prediction_artifact_sha256"] = published.sha256
+            except OafBackendError as error:
+                runner_code, disposition = classify_oaf_backend_error(error.code)
+                if disposition == "fatal_preflight":
+                    fatal_backend_error = True
+                    stop_after_poison = True
+                    _set_failed(item, "backend_unavailable", error)
+                else:
+                    _set_failed(item, runner_code or "worker_protocol_failed", error)
+                    stop_after_poison = disposition == "poison"
+            except (ArtifactPublicationError, PredictionArtifactError) as error:
+                _set_failed(item, "prediction_publish_failed", error)
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                _set_failed(item, "prediction_artifact_invalid", error)
+            except Exception:  # pylint: disable=broad-exception-caught
+                fatal_run_error = True
+                stop_after_poison = True
+            finally:
+                _remove_temporary_input(canonical_path, input_root)
+
             try:
                 _write_snapshot_checkpoint(run_path, header, (state.snapshot for state in states))
             except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError):
                 fatal_run_error = True
                 stop_after_poison = True
+            if stop_after_poison:
                 break
-            continue
-        try:
-            exists, content = _read_existing_prediction(prediction_target)
-            item["input_view_id"] = audio.input_view_id
-            item["input_audio_sha256"] = audio.input_audio_sha256
-            if exists and not request.resume:
-                _set_failed(
-                    item, "prediction_output_conflict", "prediction artifact already exists"
-                )
-                continue
-            if exists and request.resume:
-                if content is None:
-                    _set_failed(
-                        item, "prediction_artifact_invalid", "prediction artifact is unreadable"
-                    )
-                    continue
-                try:
-                    artifact = read_prediction_artifact(content)
-                except (PredictionArtifactError, StrictJsonError, TypeError, ValueError):
-                    _set_failed(
-                        item, "prediction_artifact_invalid", "prediction artifact is invalid"
-                    )
-                    continue
-                if not _prediction_artifact_matches(
-                    artifact,
-                    source=state.source,
-                    audio=audio,
-                    descriptor=backend_descriptor,
-                ):
-                    _set_failed(
-                        item, "prediction_artifact_invalid", "prediction artifact identity mismatch"
-                    )
-                    continue
-                item["execution_disposition"] = "resumed"
-                item["prediction_path"] = _prediction_relative_path(
-                    prediction_target, request.output_dir
-                )
-                item["prediction_artifact_sha256"] = artifact.artifact_sha256
-                continue
-
-            if backend is None:
-                try:
-                    backend = backend_factory(
-                        input_root=input_root,
-                        timeout_seconds=OAF_CORPUS_REQUEST_TIMEOUT_SECONDS,
-                    )
-                    backend_descriptor = backend.descriptor()
-                    if not isinstance(backend_descriptor, BackendDescriptor):
-                        raise OafBackendError(
-                            "backend descriptor is invalid", code="descriptor_invalid"
-                        )
-                    if backend_descriptor.sha256 != descriptor.sha256 or dict(
-                        backend_descriptor.payload
-                    ) != dict(descriptor.payload):
-                        raise OafBackendError(
-                            "backend descriptor identity changed", code="descriptor_invalid"
-                        )
-                except OafBackendError:
-                    raise
-                except (OSError, RuntimeError, TypeError, ValueError) as error:
-                    raise OafBackendError(
-                        _bounded_error(error), code="worker_start_failed"
-                    ) from error
-
-            started = perf_counter()
+    except BaseException as error:  # pylint: disable=broad-exception-caught
+        interrupted_error = error
+        fatal_run_error = True
+    finally:
+        if backend is not None:
             try:
-                native = backend.transcribe(audio)
-            finally:
-                elapsed = max(0.0, perf_counter() - started)
-            if not isinstance(native, NativePrediction):
-                raise OafBackendError("native prediction is invalid", code="native_event_invalid")
-            item["wall_time_sec"] = elapsed
-            item["rtf"] = (
-                elapsed / state.source.duration_sec if state.source.duration_sec > 0 else None
-            )
-            mapped, _ = map_oaf_prediction(native)
-            published: PublishedArtifact = publish_prediction_artifact(prediction_target, mapped)
-            item["execution_disposition"] = "inferred"
-            item["prediction_path"] = _prediction_relative_path(
-                prediction_target, request.output_dir
-            )
-            item["prediction_artifact_sha256"] = published.sha256
-        except OafBackendError as error:
-            runner_code, disposition = classify_oaf_backend_error(error.code)
-            if disposition == "fatal_preflight":
-                fatal_backend_error = True
-                stop_after_poison = True
-                _set_failed(item, "backend_unavailable", error)
-            else:
-                _set_failed(item, runner_code or "worker_protocol_failed", error)
-                stop_after_poison = disposition == "poison"
-        except (ArtifactPublicationError, PredictionArtifactError) as error:
-            _set_failed(item, "prediction_publish_failed", error)
-        except (OSError, RuntimeError, TypeError, ValueError) as error:
-            _set_failed(item, "prediction_artifact_invalid", error)
-        except Exception:  # pylint: disable=broad-exception-caught
-            fatal_run_error = True
-            stop_after_poison = True
-        finally:
-            _remove_temporary_input(canonical_path, input_root)
-
-        try:
-            _write_snapshot_checkpoint(run_path, header, (state.snapshot for state in states))
-        except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError):
-            fatal_run_error = True
-            stop_after_poison = True
-        if stop_after_poison:
-            break
-
-    close_error: dict[str, str] | None = None
-    if backend is not None:
-        try:
-            backend.close()
-        except (OafBackendError, OSError, RuntimeError, TypeError, ValueError) as error:
-            close_error = _bounded_close_error(error)
+                backend.close()
+            except (OafBackendError, OSError, RuntimeError, TypeError, ValueError) as error:
+                close_error = _bounded_close_error(error)
+            except BaseException as error:  # pylint: disable=broad-exception-caught
+                close_error = _bounded_close_error(error)
+                if interrupted_error is None:
+                    interrupted_error = error
 
     counts = _snapshot_counts(state.snapshot for state in states)
     has_pending = any("execution_disposition" not in state.snapshot for state in states)
@@ -1431,7 +1452,7 @@ def run_oaf_corpus(
         )
     except (OSError, StrictJsonError, ValueError):
         return _fatal_outcome()
-    return _finalize_scoring_and_outcome(
+    outcome = _finalize_scoring_and_outcome(
         final_snapshot,
         run_id=run_id,
         run_path=run_path,
@@ -1439,6 +1460,9 @@ def run_oaf_corpus(
         aggregate_rtf=None,
         projected_full_wall_time_sec=None,
     )
+    if interrupted_error is not None:
+        raise interrupted_error
+    return outcome
 
 
 # pylint: enable=too-many-arguments,too-many-return-statements,too-many-locals
