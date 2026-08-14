@@ -2,91 +2,114 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add the smallest resumable execution layer that runs the validated OaF backend sequentially over HPA-324-eligible authoritative full mixes, persists/reuses prediction artifact v2, records runtime/provenance, and produces the HPA-325 fixed-control reports.
+**Goal:** Run the validated OaF backend over the exact HPA-324-eligible authoritative full mixes with resumable immutable predictions, deterministic execution evidence, measured runtime projection, and HPA-325 reports.
 
-**Architecture:** One OaF-specific `src/benchmark/oaf_corpus_run.py` composes landed HPA-321/HPA-323/HPA-324/HPA-423/HPA-325 seams. It uses the existing shared canonical-manifest reader, local corpus cache, temporary canonical audio, one persistent backend with an explicit corpus request deadline, immutable prediction v2 artifacts, one atomic mutable `run.json`, and the existing HPA-325 scorer/reporter. Worker protocol poison stops further inference in that invocation; `--resume` is the recovery path.
+**Architecture:** Add one OaF-specific `src/benchmark/oaf_corpus_run.py` that composes the existing manifest/cache/backend/prediction/scoring contracts. Reuse a promoted canonical-manifest reader and shared atomic-replace helper; keep canonical audio temporary; use one persistent backend with a 3600-second request ceiling and a separate 30-second worker-close deadline. Prediction paths are source-hash keyed, but resume still re-materializes and validates exact canonical input bytes before reuse. Backend errors are classified through a closed policy; poison stops further inference and `--resume` is recovery.
 
 **Tech Stack:** Python 3.12, Click, existing `librosa`/`soundfile`, existing benchmark canonical JSON/cache/backend/scoring helpers, pytest, Ruff, Pylint.
 
-## Global constraints
+## Global Constraints
 
-- Keep one OaF-specific runner. Do not introduce a generic model/plugin pipeline.
-- Keep one sequential `OafBackend`; no pool, queue, batching, distributed execution, retry/backoff, or restart framework.
-- Use `OAF_CORPUS_REQUEST_TIMEOUT_SECONDS = 3600.0`; do not expose a timeout CLI flag.
-- `--cache-dir` is the HPA-321 corpus/audio cache only. Use `create_backend()`'s existing checkpoint-cache default; do not add `--checkpoint-dir`.
-- Do not fetch/fill R2 from the inference runner.
+- One OaF-specific runner only; no generic backend/plugin pipeline.
+- One sequential persistent `OafBackend`; no pool, batching, queue, distributed execution, restart framework, or retry/backoff engine.
+- `OAF_CORPUS_REQUEST_TIMEOUT_SECONDS = 3600.0` for request/readiness ceiling in the first pilot.
+- `WorkerProcess.close()` must use a separate `OAF_WORKER_CLOSE_TIMEOUT_SECONDS = 30.0` default rather than the request timeout.
+- `--cache-dir` is the HPA-321 corpus/audio cache only. Keep `create_backend()`'s existing checkpoint-cache default; no `--checkpoint-dir`.
+- No R2/network fill from HPA-326.
 - Prediction artifact v2 stays unchanged and reference-independent.
-- Canonical WAVs are temporary; do not add a durable derived-audio cache.
+- Prediction paths are keyed by authoritative `source_audio_sha256`, backend descriptor, and inference-config identity.
+- Resume re-materializes current canonical input and requires exact `input_audio_sha256` equality before artifact reuse.
+- Canonicalization explicitly uses `res_type="soxr_hq"` and revision `librosa-soxr-hq-mono44k1-soundfile-pcm16/v1`.
+- Canonical WAVs remain temporary; no durable derived-audio cache.
 - HPA-325 `CohortFailureReason` stays unchanged. Detailed runner errors map through one closed table.
-- Unknown include/exclude IDs and include/exclude overlap are fatal preflight errors before inference.
-- HPA-324 loading must reuse the existing canonical JSONL core from `reference_timing_manifest.py`; no forked manifest reader.
-- Native reference artifacts are resolved relative to `timing_manifest_path.parent.parent`.
-- `run.json` is a mutable atomic snapshot; do not publish it with immutable-artifact helpers.
-- No threshold/model/mapping/scoring tuning from corpus results.
-- Concurrency waits for measured pilot RTF/wall-time evidence.
+- Unknown include/exclude IDs and include/exclude overlap are fatal preflight errors before backend creation.
+- HPA-324 loading reuses the existing canonical JSONL core from `reference_timing_manifest.py`.
+- Native reference artifacts resolve relative to `timing_manifest_path.parent.parent`.
+- Every HPA-324 eligible reference artifact is reconstructed before inference, so scoring cannot discover a broken eligible reference only after the corpus run.
+- `run.json` is one mutable atomic snapshot written through a shared durability primitive.
+- No Python `float` reaches `canonical_json_bytes()`; float-derived run/CLI fields cross `quantize_six()`.
+- `config.max_input_audio_frames` from the loaded OaF model config is the source of the canonical-input frame limit.
+- Worker close failure is run-level evidence: reports still finalize, overall status becomes partial/exit 1.
+- Concurrency waits for measured pilot RTF and projected wall time.
 
-## Risks / hard gates
+## Hard Gates
 
-### Gate A — real worker deadline
+### Gate A — lineage and scope
 
-The existing 30-second backend default must never be used by HPA-326. Unit tests must prove the backend factory receives exactly `OAF_CORPUS_REQUEST_TIMEOUT_SECONDS`.
+Exact HPA-324 -> supplied HPA-323 hash/version match, valid eligible reference artifacts, known filters, and disjoint include/exclude sets are proven before backend creation.
 
-### Gate B — worker poison
+### Gate B — timeout separation
 
-A worker startup/readiness/timeout/protocol failure poisons the persistent process. HPA-326 must checkpoint the current run, stop issuing further inference requests in that invocation, close the backend, and return partial status. `--resume` retries missing/failed work later. Model-level inference errors returned through a valid worker response remain item-local and may continue to the next row.
+Unit tests prove HPA-326 passes exactly `3600.0` as the OaF request timeout and `WorkerProcess.close()` uses an independent 30-second deadline.
 
-### Gate C — shared manifest reader
+### Gate C — backend error disposition
 
-`load_reference_set_manifest()` must call the promoted existing `read_canonical_manifest_core()` for framing, exact bytes, schema, SHA-256, and `render_manifest()` round-trip.
+Every known `OafBackendError.code` is explicitly classified. Unknown codes fail closed as poison. Only item-local codes may continue to the next song.
 
-### Gate D — closed scope
+### Gate D — authoritative source
 
-Every include/exclude ID must exist in HPA-324, and the two sets must be disjoint. Failure is exit 2 before backend creation.
+Only locally verified source bytes matching the original remote identity and HPA-323 source digest may be inferred.
 
-### Gate E — closed failure mapping
+### Gate E — resume identity
 
-Each runner failure code maps to exactly one existing HPA-325 reason. No exception handler chooses an ad-hoc “closest” reason.
+Source-hash path lookup never silently turns canonicalizer drift into an ordinary miss. Resume re-materializes and compares current `input_audio_sha256`; mismatch is an explicit artifact failure with no overwrite.
 
-### Gate F — immutable prediction reuse
+### Gate F — canonical numerics
 
-Resume validates source/input/backend/model/map identity through real prediction v2 parsing. Mismatches/conflicts never overwrite existing output.
+Run snapshot and CLI canonical JSON contain no Python floats. Exact tests pin Decimal parsing/round-trip.
 
-### Gate G — offline source identity
+### Gate G — scorer non-success shape
 
-Only a locally verified cache body matching the original remote identity and HPA-323 source hash may be inferred. No R2 substitution.
+Failed/skipped/quarantined rows satisfy HPA-325 artifact-nullability and reference-coverage balance before the real pilot.
 
-### Gate H — pilot before broad run
+### Gate H — shared durability
 
-Operational evidence records exact pilot IDs, request timeout, per-song/aggregate RTF, eligible duration coverage, and projected sequential wall time before unfiltered execution.
+HPA-326 does not add a third private atomic writer.
+
+### Gate I — pilot before broad run
+
+Pilot evidence records exact IDs, request/close deadlines, per-song/aggregate RTF, eligible duration coverage, projected sequential wall time, persistent-worker behavior, and resume behavior before unfiltered execution.
 
 ---
 
-## File map
+## File Map
 
 ### Create
 
-- `src/benchmark/oaf_corpus_run.py` — HPA-326 identity/preflight/cache/materialization/orchestration/resume/run-snapshot/projection/scorer adaptation.
-- `tests/benchmark/test_oaf_corpus_run.py` — pure/unit orchestration tests with fake backend.
-- `tests/benchmark/test_oaf_corpus_run_acceptance.py` — multi-song local artifact + poison/resume + score/report acceptance without real Docker/model.
+- `src/benchmark/oaf_corpus_run.py` — HPA-326 request/outcome, identities, preflight, source resolution, canonical materialization, backend policy, sequential execution, resume, run snapshot, projection, scorer adaptation.
+- `tests/benchmark/test_oaf_corpus_run.py` — unit/policy/path/preflight/timeout/error/resume tests.
+- `tests/benchmark/test_oaf_corpus_run_acceptance.py` — multi-song local prediction + poison/resume + score/report acceptance with fake backend.
 
 ### Modify
 
-- `src/benchmark/reference_timing_manifest.py` — promote shared canonical manifest reader and expose narrow HPA-323 -> HPA-322 source/chart view.
-- `src/benchmark/reference_set_manifest.py` — public HPA-324 loader using shared reader; promote native-reference reader.
-- corresponding manifest tests.
-- `src/benchmark/input_view.py` / tests — materialized canonical-audio loader preserving source hash.
-- `src/benchmark/backends/oaf.py` / existing contract tests — adapter revision only.
-- `src/cli/benchmark.py` / CLI tests — thin `run-oaf-corpus` command.
+- `src/benchmark/reference_timing_manifest.py` — promote shared canonical manifest reader; expose HPA-323 -> HPA-322 source/chart view.
+- `src/benchmark/reference_set_manifest.py` — public HPA-324 loader via shared reader; promote native-reference reader.
+- `tests/benchmark/test_reference_timing_manifest.py`
+- `tests/benchmark/test_reference_set_manifest.py`
+- `src/benchmark/durability.py` — shared `atomic_replace_bytes()`.
+- `tests/benchmark/test_durability.py`
+- `src/benchmark/corpus_manifest.py` — delegate JSON replacement to shared bytes helper while retaining domain error translation.
+- `tests/benchmark/test_corpus_manifest.py`
+- `src/benchmark/r2_corpus_sync.py` — use shared bytes helper and remove private duplicate.
+- `tests/benchmark/test_r2_corpus_sync.py`
+- `src/benchmark/worker_process.py` — separate close timeout from request timeout.
+- `tests/benchmark/test_worker_process.py`
+- `src/benchmark/input_view.py` — `load_materialized_audio()` preserving source/input hash distinction.
+- `tests/benchmark/test_input_view.py`
+- `src/benchmark/backends/oaf.py` — add `OAF_ADAPTER_REVISION` only.
+- `tests/benchmark/test_task_d_contract.py`
+- `src/cli/benchmark.py` — thin `run-oaf-corpus` command.
+- `tests/test_cli_benchmark.py`
 
 ### Explicitly unchanged
 
-- `runtime/oaf_tf1/model.py` and worker inference semantics.
+- `runtime/oaf_tf1/model.py` inference semantics.
 - `src/benchmark/prediction_artifact.py` schema v2.
-- `src/benchmark/mapping.py` taxonomy/map behavior.
-- `src/benchmark/cohort_scoring.py` failure enum/scoring behavior.
+- `src/benchmark/mapping.py` taxonomy/map semantics.
+- `src/benchmark/cohort_scoring.py` failure enum/scoring semantics.
 - `src/benchmark/reports.py` report schema.
-- HPA-321/HPA-323 R2 fill logic.
-- HPA-320 seal/attestation code.
+- HPA-321/HPA-323 R2 fill behavior.
+- HPA-320 seal/attestation estate.
 
 ---
 
@@ -99,26 +122,6 @@ Operational evidence records exact pilot IDs, request timeout, per-song/aggregat
 - Modify: `tests/benchmark/test_reference_set_manifest.py`
 
 **Interfaces:**
-- Produces `read_canonical_manifest_core(...)` by promoting the existing private implementation without semantic change.
-- Produces `load_reference_set_manifest(path) -> LoadedReferenceSetManifest`.
-- Produces `reference_chart_view_from_timing_row(loaded) -> ReferenceChartRowView`.
-- Produces `read_native_reference_events(loaded, *, timing_output_root)`.
-
-- [ ] **Step 1: Pin the existing canonical core before renaming it**
-
-Add/retain tests proving the shared core rejects non-canonical framing, wrong schema, invalid derived corpus version, and returns the exact file SHA-256.
-
-Run:
-
-```bash
-uv run pytest tests/benchmark/test_reference_timing_manifest.py -q
-```
-
-Expected: PASS before rename; these tests pin semantics.
-
-- [ ] **Step 2: Promote `_read_canonical_manifest_core()` without changing behavior**
-
-Rename it to:
 
 ```python
 def read_canonical_manifest_core(
@@ -126,17 +129,53 @@ def read_canonical_manifest_core(
     *,
     schema_version: str,
     validate_rows: Callable[[tuple[Mapping[str, object], ...]], None] | None = None,
-) -> CanonicalManifestRead:
-    ...
+) -> CanonicalManifestRead: ...
+
+
+def load_reference_set_manifest(path: Path) -> LoadedReferenceSetManifest: ...
+
+
+def reference_chart_view_from_timing_row(
+    loaded: LoadedReferenceTimingRow,
+) -> ReferenceChartRowView: ...
+
+
+def read_native_reference_events(
+    loaded: LoadedReferenceTimingRow,
+    *,
+    timing_output_root: Path,
+) -> tuple[NativeReferenceEvent, ...]: ...
 ```
 
-A public dataclass/name for the existing return value is acceptable; do not add callbacks/registries beyond the current validator hook.
+- [ ] **Step 1: Pin the current private canonical reader before renaming**
 
-Update existing HPA-322/HPA-323 call sites to use the public name.
+Keep/add tests proving the existing core rejects malformed framing, wrong schema, and invalid derived corpus version while returning the exact file SHA-256.
+
+Run:
+
+```bash
+uv run pytest tests/benchmark/test_reference_timing_manifest.py -q
+```
+
+Expected: PASS before the rename.
+
+- [ ] **Step 2: Promote `_read_canonical_manifest_core()` without semantic change**
+
+Rename the current return dataclass/helper to public names and update HPA-322/HPA-323 call sites. Do not add a second abstraction layer.
+
+```python
+@dataclass(frozen=True)
+class CanonicalManifestRead:
+    manifest_sha256: str
+    corpus_version: str
+    rows: tuple[Mapping[str, object], ...]
+```
+
+Run the same focused file again; expected PASS.
 
 - [ ] **Step 3: Write RED tests for the HPA-324 loader**
 
-Add a narrow view:
+Use this narrow public shape:
 
 ```python
 @dataclass(frozen=True)
@@ -153,6 +192,12 @@ class ReferenceSetRowView:
 
 
 @dataclass(frozen=True)
+class LoadedReferenceSetRow:
+    source_row: Mapping[str, object]
+    view: ReferenceSetRowView
+
+
+@dataclass(frozen=True)
 class LoadedReferenceSetManifest:
     manifest_sha256: str
     corpus_version: str
@@ -161,14 +206,7 @@ class LoadedReferenceSetManifest:
     rows: tuple[LoadedReferenceSetRow, ...]
 ```
 
-Tests must prove:
-
-- exact HPA-324 bytes/hash are returned;
-- loader uses the same canonical round-trip rules as HPA-323;
-- duplicate simfile IDs fail;
-- mixed HPA-323 hash/version fails;
-- malformed HPA-324 rows fail through `_validate_reference_set_row()`;
-- row order stays canonical input order.
+Tests must fail until `load_reference_set_manifest()` exists and must cover exact hash, duplicate IDs, mixed HPA-323 identity, malformed HPA-324 row, and byte-identical canonical round-trip.
 
 Run:
 
@@ -176,9 +214,9 @@ Run:
 uv run pytest tests/benchmark/test_reference_set_manifest.py -q
 ```
 
-Expected: FAIL because loader/types do not exist.
+Expected: FAIL because the new loader is absent.
 
-- [ ] **Step 4: Implement `load_reference_set_manifest()` through the promoted core**
+- [ ] **Step 4: Implement the loader through `read_canonical_manifest_core()`**
 
 The implementation must call:
 
@@ -190,42 +228,23 @@ canonical = read_canonical_manifest_core(
 )
 ```
 
-`validate_rows` performs only HPA-324 domain checks: `_validate_reference_set_row()`, unique simfile IDs, one source timing identity, narrow view construction.
+Inside `validate_rows`, call `_validate_reference_set_row()` and enforce one source timing identity plus unique simfile IDs. Do not parse file bytes separately.
 
-Do **not** parse JSONL independently in `reference_set_manifest.py`.
+- [ ] **Step 5: Expose the timing-row chart/source view and native event reader**
 
-- [ ] **Step 5: Expose HPA-323 source/chart reconstruction**
+Promote `_read_native_reference_events()` unchanged. Add `reference_chart_view_from_timing_row()` by reconstructing the HPA-322 row exactly as `_validate_timing_manifest_row()` already does and delegating to `reference_chart_row_view_from_row()`.
 
-Add:
-
-```python
-def reference_chart_view_from_timing_row(
-    loaded: LoadedReferenceTimingRow,
-) -> ReferenceChartRowView:
-    ...
-```
-
-Reconstruct the HPA-322 row exactly as `_validate_timing_manifest_row()` does and delegate to `reference_chart_row_view_from_row()`.
-
-Tests: ready row returns original source inventory/selected chart; malformed timing row still fails existing validation.
-
-- [ ] **Step 6: Promote native-reference reader and pin timing root**
-
-Rename `_read_native_reference_events()` to `read_native_reference_events()` with no semantic change.
-
-Direct caller regression:
+Pin the HPA-326 root calculation in a direct regression:
 
 ```python
 timing_output_root = timing_manifest_path.parent.parent
 events = read_native_reference_events(
-    loaded_timing_row,
+    loaded_row,
     timing_output_root=timing_output_root,
 )
 ```
 
-The test fixture must fail if it incorrectly uses `timing_manifest_path.parent`.
-
-- [ ] **Step 7: Run focused tests**
+- [ ] **Step 6: Run focused tests**
 
 ```bash
 uv run pytest \
@@ -235,7 +254,7 @@ uv run pytest \
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/benchmark/reference_timing_manifest.py \
@@ -247,7 +266,154 @@ git commit -m "feat: expose benchmark reference inputs"
 
 ---
 
-## Task 2: Add canonical materialized-input identity and OaF adapter revision
+## Task 2: Share atomic replacement and separate worker close timeout
+
+**Files:**
+- Modify: `src/benchmark/durability.py`
+- Modify: `tests/benchmark/test_durability.py`
+- Modify: `src/benchmark/corpus_manifest.py`
+- Modify: `tests/benchmark/test_corpus_manifest.py`
+- Modify: `src/benchmark/r2_corpus_sync.py`
+- Modify: `tests/benchmark/test_r2_corpus_sync.py`
+- Modify: `src/benchmark/worker_process.py`
+- Modify: `tests/benchmark/test_worker_process.py`
+
+**Interfaces:**
+
+```python
+def atomic_replace_bytes(path: Path, content: bytes) -> None: ...
+
+
+class WorkerProcess:
+    @classmethod
+    def start(
+        cls,
+        command: Sequence[str] | str | Path,
+        *,
+        timeout_seconds: float = 30.0,
+        close_timeout_seconds: float = 30.0,
+        cwd: Path | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> "WorkerProcess": ...
+```
+
+- [ ] **Step 1: Write RED durability tests**
+
+Add tests that `atomic_replace_bytes()`:
+
+```python
+def test_atomic_replace_bytes_replaces_and_fsyncs_parent(tmp_path, monkeypatch):
+    path = tmp_path / "run.json"
+    path.write_bytes(b"old")
+    calls = []
+    monkeypatch.setattr(durability, "fsync_directory", lambda p: calls.append(p))
+
+    atomic_replace_bytes(path, b"new")
+
+    assert path.read_bytes() == b"new"
+    assert calls == [tmp_path]
+    assert list(tmp_path.glob(".run.json.*.tmp")) == []
+```
+
+Also inject `os.replace` failure and require `OSError("artifact publication failed")` plus temporary cleanup.
+
+Run:
+
+```bash
+uv run pytest tests/benchmark/test_durability.py -q
+```
+
+Expected: FAIL before helper exists.
+
+- [ ] **Step 2: Promote the existing R2 byte-replacement implementation**
+
+Move the generic implementation into `durability.py` with its existing OSError contract. Replace the private `r2_corpus_sync._atomic_replace_bytes` call sites with the import.
+
+Refactor `corpus_manifest._atomic_replace_json()` to:
+
+```python
+def _atomic_replace_json(path: Path, payload: dict[str, object]) -> None:
+    try:
+        atomic_replace_bytes(path, canonical_json_line(payload))
+    except OSError:
+        raise ManifestPublicationError(_PUBLICATION_ERROR) from None
+```
+
+Keep existing corpus/R2 tests green; this is behavior-preserving reuse.
+
+- [ ] **Step 3: Run durability/caller tests**
+
+```bash
+uv run pytest \
+  tests/benchmark/test_durability.py \
+  tests/benchmark/test_corpus_manifest.py \
+  tests/benchmark/test_r2_corpus_sync.py -q
+```
+
+Expected: PASS.
+
+- [ ] **Step 4: Write RED worker close-timeout tests**
+
+Construct a fake `Popen` whose `wait()` records timeout arguments. Instantiate:
+
+```python
+worker = WorkerProcess(
+    process,
+    timeout_seconds=3600.0,
+    close_timeout_seconds=30.0,
+    ready={"type": "ready"},
+)
+worker.close()
+```
+
+Assert every timed `wait()`/stderr `join()` uses `30.0`, never `3600.0`. Keep existing request-timeout tests proving `_read_record()` still uses `_timeout_seconds`.
+
+Run:
+
+```bash
+uv run pytest tests/benchmark/test_worker_process.py -q
+```
+
+Expected: FAIL until the separate close timeout exists.
+
+- [ ] **Step 5: Implement the separate close deadline**
+
+Store:
+
+```python
+self._timeout_seconds = timeout_seconds
+self._close_timeout_seconds = close_timeout_seconds
+```
+
+Validate both are positive. Use `_close_timeout_seconds` in `close()` for the pre-terminate wait, post-terminate wait, and stderr-thread join. Keep the final post-`kill()` `wait()` behavior unchanged.
+
+`WorkerProcess.start()` passes both values into the constructor; default close timeout remains 30 seconds for existing callers.
+
+- [ ] **Step 6: Run worker tests**
+
+```bash
+uv run pytest tests/benchmark/test_worker_process.py -q
+```
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/benchmark/durability.py \
+        src/benchmark/corpus_manifest.py \
+        src/benchmark/r2_corpus_sync.py \
+        src/benchmark/worker_process.py \
+        tests/benchmark/test_durability.py \
+        tests/benchmark/test_corpus_manifest.py \
+        tests/benchmark/test_r2_corpus_sync.py \
+        tests/benchmark/test_worker_process.py
+git commit -m "refactor: share durable replacement and close timeout"
+```
+
+---
+
+## Task 3: Add canonical materialized-input identity and OaF adapter revision
 
 **Files:**
 - Modify: `src/benchmark/input_view.py`
@@ -265,23 +431,26 @@ def load_materialized_audio(
     source_audio_sha256: str,
     input_view_id: str,
     max_input_audio_frames: int | None,
-) -> CanonicalAudio:
-    ...
-```
+) -> CanonicalAudio: ...
 
-```python
+
 OAF_ADAPTER_REVISION = "crux.oaf-adapter/v1"
 ```
 
-- [ ] **Step 1: Write RED materialized-audio tests**
+- [ ] **Step 1: Write RED `load_materialized_audio()` tests**
 
-Prove:
+Use a tiny valid canonical WAV and an independent source digest. Assert:
 
-- supplied source SHA is retained;
-- input SHA is computed from staged WAV bytes;
-- mono/44.1k/PCM16 validation is still `parse_canonical_wav()`;
-- frame limit remains enforced;
-- invalid source SHA/IDs fail.
+```python
+assert audio.source_audio_sha256 == source_digest
+assert audio.input_audio_sha256 == sha256_hex(wav_bytes)
+assert audio.input_view_id == "crux.oaf-full-mix-mono44k1-pcm16/v1"
+assert audio.sample_rate == 44100
+assert audio.channel_count == 1
+assert audio.sample_width_bytes == 2
+```
+
+Also reject malformed source SHA and enforce the existing frame-limit path.
 
 Run:
 
@@ -293,16 +462,24 @@ Expected: FAIL because helper is absent.
 
 - [ ] **Step 2: Implement as a sibling of `load_direct_audio_bytes()`**
 
-Read canonical WAV bytes, call `parse_canonical_wav()`, hash bytes, construct `CanonicalAudio`. Do not duplicate WAV parsing.
+Read staged bytes, call `parse_canonical_wav()`, compute input digest, preserve supplied source digest, and build `CanonicalAudio`. Do not duplicate RIFF parsing.
 
-- [ ] **Step 3: Add adapter revision constant and pin it**
+- [ ] **Step 3: Pin the adapter revision**
 
-No seal/lock document. Export the constant from the existing OaF adapter module.
+Add/export:
 
-- [ ] **Step 4: Run tests**
+```python
+OAF_ADAPTER_REVISION = "crux.oaf-adapter/v1"
+```
+
+and assert the exact value in the existing OaF contract suite.
+
+- [ ] **Step 4: Run focused tests**
 
 ```bash
-uv run pytest tests/benchmark/test_input_view.py tests/benchmark/test_task_d_contract.py -q
+uv run pytest \
+  tests/benchmark/test_input_view.py \
+  tests/benchmark/test_task_d_contract.py -q
 ```
 
 Expected: PASS.
@@ -310,14 +487,16 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/benchmark/input_view.py src/benchmark/backends/oaf.py \
-        tests/benchmark/test_input_view.py tests/benchmark/test_task_d_contract.py
+git add src/benchmark/input_view.py \
+        src/benchmark/backends/oaf.py \
+        tests/benchmark/test_input_view.py \
+        tests/benchmark/test_task_d_contract.py
 git commit -m "feat: define OaF corpus input identity"
 ```
 
 ---
 
-## Task 3: Define run identity, scope preflight, failure mapping, and atomic snapshot
+## Task 4: Define the pure HPA-326 run contract, scope, error policies, and canonical snapshot
 
 **Files:**
 - Create: `src/benchmark/oaf_corpus_run.py`
@@ -329,8 +508,9 @@ git commit -m "feat: define OaF corpus input identity"
 OAF_CORPUS_RUN_SCHEMA = "crux.oaf-corpus-run/v1"
 OAF_INFERENCE_CONFIG_SCHEMA = "crux.oaf-inference-config/v1"
 OAF_FULL_MIX_INPUT_VIEW_ID = "crux.oaf-full-mix-mono44k1-pcm16/v1"
-OAF_CANONICALIZATION_REVISION = "librosa-mono44k1-soundfile-pcm16/v1"
+OAF_CANONICALIZATION_REVISION = "librosa-soxr-hq-mono44k1-soundfile-pcm16/v1"
 OAF_CORPUS_REQUEST_TIMEOUT_SECONDS = 3600.0
+OAF_WORKER_CLOSE_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -343,97 +523,139 @@ class OafCorpusRunRequest:
     exclude_simfile_ids: tuple[int, ...] = ()
     resume: bool = False
     crux_commit: str | None = None
+
+
+@dataclass(frozen=True)
+class OafCorpusRunOutcome:
+    overall_status: Literal["complete", "partial", "failed"]
+    exit_code: Literal[0, 1, 2]
+    run_id: str | None
+    run_path: Path | None
+    reports_path: Path | None
+    success_count: int
+    failed_count: int
+    skipped_count: int
+    quarantined_count: int
+    aggregate_rtf: float | None
+    projected_full_wall_time_sec: float | None
 ```
 
-Detailed failures are a closed literal:
+- [ ] **Step 1: Write RED identity/path tests**
 
-```python
-RunnerFailureCode = Literal[
-    "source_audio_unavailable",
-    "source_audio_decode_failed",
-    "canonical_input_failed",
-    "backend_unavailable",
-    "worker_protocol_failed",
-    "inference_failed",
-    "prediction_artifact_invalid",
-    "prediction_output_conflict",
-    "prediction_publish_failed",
-    "prediction_missing",
-]
+Test exact model-lock hashing, deterministic inference-config hash, deterministic `run_id`, normalized sorted filters, and source-keyed prediction path:
+
+```text
+predictions/<simfile_id>/<source_audio_sha256>/<backend_descriptor_sha256>/<inference_config_sha256>.jsonl
 ```
 
-and one constant mapping:
+Assert prediction path stays independent from reference manifest hash and does **not** contain `input_audio_sha256`.
 
-```python
-RUNNER_FAILURE_TO_COHORT_REASON = {
-    "source_audio_unavailable": "inference_failed",
-    "source_audio_decode_failed": "inference_failed",
-    "canonical_input_failed": "inference_failed",
-    "backend_unavailable": "backend_unavailable",
-    "worker_protocol_failed": "backend_unavailable",
-    "inference_failed": "inference_failed",
-    "prediction_artifact_invalid": "prediction_artifact_invalid",
-    "prediction_output_conflict": "prediction_artifact_invalid",
-    "prediction_publish_failed": "prediction_artifact_invalid",
-    "prediction_missing": "prediction_missing",
-}
-```
-
-- [ ] **Step 1: RED identity tests**
-
-Pin model-lock SHA, inference-config hash, deterministic run ID, deterministic prediction path, and reference-independent prediction path.
-
-- [ ] **Step 2: RED closed failure-map test**
-
-Assert:
-
-```python
-assert set(RUNNER_FAILURE_TO_COHORT_REASON) == set(get_args(RunnerFailureCode))
-assert set(RUNNER_FAILURE_TO_COHORT_REASON.values()) <= COHORT_FAILURE_REASONS
-```
-
-Also pin the exact values above. No “closest family” helper.
-
-- [ ] **Step 3: RED scope preflight tests**
-
-After loading an HPA-324 manifest with IDs `{10, 20, 30}`:
-
-- include `(10, 99)` -> fatal preflight;
-- exclude `(99,)` -> fatal preflight;
-- include `(10,)`, exclude `(10,)` -> fatal preflight;
-- duplicate CLI/request values normalize or fail consistently before run identity;
-- valid include/exclude produce deterministic sorted scope.
-
-The check must happen before backend factory invocation.
-
-- [ ] **Step 4: Implement pure identity/scope helpers**
-
-Use existing `canonical_json_bytes()` / `require_sha256()`. Do not add another JSON encoder.
-
-- [ ] **Step 5: RED `run.json` tests**
-
-Pin:
-
-- canonical JSON round-trip;
-- exact run identity;
-- item order by simfile ID;
-- disposition/status/count reconciliation;
-- timeout recorded as `3600.0`;
-- `resumed` is success, not skipped;
-- completion timestamp only after iteration finishes/halts cleanly;
-- worker-poison partial run remains resumable.
-
-- [ ] **Step 6: Implement atomic mutable snapshot writer**
-
-Use the repository's existing mutable-snapshot pattern (same-directory temp, flush, fsync, `os.replace`, directory fsync where existing helper does it). Do not use `publish_immutable_file()`.
-
-- [ ] **Step 7: Run tests**
+Run:
 
 ```bash
 uv run pytest tests/benchmark/test_oaf_corpus_run.py -q
 ```
 
-Expected: PASS.
+Expected: FAIL because module is absent.
+
+- [ ] **Step 2: Implement pure identity helpers**
+
+Use only `canonical_json_bytes()`, `require_sha256()`, `sha256_hex()`, model config, `OAF_ADAPTER_REVISION`, and `OAF_PREDICTION_MAP_ID`.
+
+Inference config keys are exactly:
+
+```python
+{
+    "schema": OAF_INFERENCE_CONFIG_SCHEMA,
+    "backend_descriptor_sha256": descriptor.sha256,
+    "model_lock_sha256": model_lock_sha256,
+    "checkpoint_archive_sha256": config.checkpoint.archive_sha256,
+    "adapter_revision": OAF_ADAPTER_REVISION,
+    "prediction_map_version": OAF_PREDICTION_MAP_ID,
+    "input_view_id": OAF_FULL_MIX_INPUT_VIEW_ID,
+    "canonicalization_revision": OAF_CANONICALIZATION_REVISION,
+}
+```
+
+- [ ] **Step 3: Write RED scope-membership preflight tests**
+
+Given loaded manifest IDs `{10, 20, 30}`, require:
+
+```python
+_validate_scope((10,), (), {10, 20, 30})       # PASS
+_validate_scope((99,), (), {10, 20, 30})       # ValueError unknown include
+_validate_scope((), (99,), {10, 20, 30})       # ValueError unknown exclude
+_validate_scope((10,), (10,), {10, 20, 30})    # ValueError overlap
+```
+
+The validation must run before any backend factory call; add a fake factory that raises if touched.
+
+- [ ] **Step 4: Write RED backend-error policy tests**
+
+Pin:
+
+```python
+OAF_BACKEND_ERROR_POLICY = {
+    "inference_failed": ("inference_failed", "item_local"),
+    "invalid_request": ("inference_failed", "item_local"),
+    "input_path_invalid": ("canonical_input_failed", "item_local"),
+    "native_event_invalid": ("inference_failed", "item_local"),
+    "worker_error": ("worker_protocol_failed", "poison"),
+    "worker_start_failed": ("backend_unavailable", "poison"),
+    "worker_ready_invalid": ("backend_unavailable", "poison"),
+    "worker_identity_invalid": ("backend_unavailable", "poison"),
+    "worker_response_invalid": ("worker_protocol_failed", "poison"),
+    "backend_closed": ("worker_protocol_failed", "poison"),
+    "descriptor_invalid": (None, "fatal_preflight"),
+    "worker_close_failed": (None, "finalization"),
+}
+```
+
+Test unknown code:
+
+```python
+assert classify_oaf_backend_error("future_code") == (
+    "worker_protocol_failed",
+    "poison",
+)
+```
+
+Also pin the existing runner-code -> HPA-325 reason table and assert every target is in `COHORT_FAILURE_REASONS`.
+
+- [ ] **Step 5: Write RED canonical run-snapshot tests**
+
+Build a snapshot containing binary floats such as `1.25`, `0.5`, and `3600.0`. The renderer must convert them through `quantize_six()` before `canonical_json_bytes()`.
+
+Assert:
+
+```python
+content = render_oaf_corpus_run(snapshot)
+parsed = strict_json_loads(content)
+assert parsed["request_timeout_seconds"] == Decimal("3600")
+assert parsed["items"][0]["wall_time_sec"] == Decimal("1.25")
+assert render_oaf_corpus_run(parse_oaf_corpus_run(content)) == content
+```
+
+Also assert direct Python float injection into the canonical payload is rejected in the test fixture, proving the renderer owns normalization.
+
+- [ ] **Step 6: Implement the snapshot through `atomic_replace_bytes()`**
+
+The private writer should only do:
+
+```python
+content = render_oaf_corpus_run(snapshot)
+atomic_replace_bytes(run_path, content)
+```
+
+Do not write a local temp/replace implementation.
+
+- [ ] **Step 7: Run pure tests**
+
+```bash
+uv run pytest tests/benchmark/test_oaf_corpus_run.py -q
+```
+
+Expected: PASS for identity, scope, policy, and snapshot tests.
 
 - [ ] **Step 8: Commit**
 
@@ -444,69 +666,101 @@ git commit -m "feat: define OaF corpus run contract"
 
 ---
 
-## Task 4: Resolve authoritative cached audio and materialize full-mix input
+## Task 5: Resolve exact source audio, preflight references, and materialize canonical full mix
 
 **Files:**
 - Modify: `src/benchmark/oaf_corpus_run.py`
 - Modify: `tests/benchmark/test_oaf_corpus_run.py`
 
-- [ ] **Step 1: RED cache-resolution cases**
+**Interfaces:**
+
+```python
+@dataclass(frozen=True)
+class ResolvedSourceAudio:
+    path: Path
+    source_audio_id: str
+    source_audio_sha256: str
+    duration_sec: float
+
+
+def _resolve_source_audio(...) -> ResolvedSourceAudio: ...
+
+def _materialize_oaf_full_mix(...) -> CanonicalAudio: ...
+```
+
+- [ ] **Step 1: Write eligible-reference preflight tests**
+
+Create HPA-324/HPA-323 fixtures where an HPA-324 eligible row's referenced event artifact is removed/corrupted after manifest creation. `run_oaf_corpus()` must return fatal exit 2 before backend creation.
+
+For valid eligible rows, preflight stores `ReferenceMappingResult` for later success/failure/skip scorer assembly.
+
+Quarantined `upstream_reference_unavailable` / `reference_event_artifact_invalid` rows are expected to lack a usable mapping and do not make the run fatal.
+
+- [ ] **Step 2: Write source-cache resolution tests**
 
 Cover:
 
-1. carried remote already verified;
-2. immutable manifest says not verified but matching cache-index entry/body exists;
-3. cache index remote identity differs;
-4. cache body missing/corrupt;
-5. cache SHA differs from HPA-323 `source_audio_content_hash`.
+1. carried verified remote/body;
+2. stale manifest cache status + matching verified cache-index entry;
+3. index entry with changed remote identity;
+4. missing/corrupt body;
+5. digest mismatch against HPA-323 `source_audio_content_hash`.
 
-Only 1/2 resolve.
+Only cases 1/2 return a path. Import no R2 store/config into `oaf_corpus_run.py`.
 
-- [ ] **Step 2: Implement by composing public HPA-321 helpers**
+- [ ] **Step 3: Write duration-probe tests**
 
-Use only:
+Use existing `inspect_source_audio()` and prove a source decode/header failure becomes item-local `source_audio_decode_failed` for an eligible row rather than a run-level crash.
+
+- [ ] **Step 4: Write canonical materialization RED tests**
+
+Use a stereo 22.05 kHz fixture. Monkeypatch `librosa.load` to assert the exact call includes:
 
 ```python
-CacheIndexStore.get(...)
-cache_entry_matches_remote(...)
-validate_cached_body(...)
-resolve_verified_cache_body(...)
+sr=44100
+mono=True
+res_type="soxr_hq"
 ```
 
-Do not copy HPA-323 `_resolve_or_queue_audio()` and do not import R2 store/config code.
+Assert `soundfile.write(..., 44100, format="WAV", subtype="PCM_16")` and then real `load_materialized_audio()` validation.
 
-- [ ] **Step 3: RED source-duration probe tests**
+Use:
 
-Call existing header-only `inspect_source_audio()`. Probe failure records `source_audio_decode_failed`; it must not be mistaken for backend failure.
+```python
+max_input_audio_frames=config.max_input_audio_frames
+```
 
-- [ ] **Step 4: RED canonical materialization tests**
+from the already loaded model config. Do not hardcode or invent another limit.
 
-A stereo 22.05k fixture becomes temporary mono 44.1k PCM16 under `work_root` using existing `librosa` + `soundfile` and `load_materialized_audio()`.
+- [ ] **Step 5: Pin temporary cleanup**
 
-Assert source SHA != input SHA when appropriate and source identity remains HPA-323 identity.
+Staged WAV must be below the one run `input_root` and removed in `finally` after success, item-local failure, or poison.
 
-- [ ] **Step 5: Pin cleanup**
-
-Temporary canonical WAV is removed in `finally` after success or item-local failure.
-
-- [ ] **Step 6: Run tests and commit**
+- [ ] **Step 6: Run focused tests**
 
 ```bash
 uv run pytest tests/benchmark/test_oaf_corpus_run.py -q
+```
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit**
+
+```bash
 git add src/benchmark/oaf_corpus_run.py tests/benchmark/test_oaf_corpus_run.py
-git commit -m "feat: materialize authoritative OaF inputs"
+git commit -m "feat: resolve authoritative OaF corpus inputs"
 ```
 
 ---
 
-## Task 5: Implement one-worker sequential inference, timeout, poison semantics, publication, and resume
+## Task 6: Implement one-worker sequential inference, exact resume, poison stop, and close evidence
 
 **Files:**
 - Modify: `src/benchmark/oaf_corpus_run.py`
 - Modify: `tests/benchmark/test_oaf_corpus_run.py`
 - Create: `tests/benchmark/test_oaf_corpus_run_acceptance.py`
 
-**Public seam:**
+**Public entry point:**
 
 ```python
 def run_oaf_corpus(
@@ -515,103 +769,148 @@ def run_oaf_corpus(
     backend_factory: Callable[..., OafBackend] = create_backend,
     perf_counter: Callable[[], float] = time.perf_counter,
     clock: Callable[[], datetime] = _utc_now,
-) -> OafCorpusRunOutcome:
-    ...
+) -> OafCorpusRunOutcome: ...
 ```
 
-- [ ] **Step 1: RED backend-construction test including timeout**
+- [ ] **Step 1: Write backend-construction timeout test**
 
-The injected factory records kwargs. For any run requiring inference assert exactly:
+Fake factory records kwargs. For any invocation needing inference:
 
 ```python
-assert factory_calls == [
+assert calls == [
     {
-        "input_root": work_root,
+        "input_root": expected_work_root,
         "timeout_seconds": OAF_CORPUS_REQUEST_TIMEOUT_SECONDS,
     }
 ]
+assert OAF_CORPUS_REQUEST_TIMEOUT_SECONDS == 3600.0
 ```
 
-Do not pass `checkpoint_dir`; existing `create_backend()` resolves its model cache.
+Do not pass checkpoint dir or close timeout; existing defaults own those.
 
-- [ ] **Step 2: RED normal persistent-worker test**
+- [ ] **Step 2: Write healthy persistent-worker test**
 
-Three eligible songs with a healthy fake backend:
+Three eligible rows with successful fake predictions must produce:
 
 ```text
-backend objects = 1
-transcribe calls = 3
-close calls = 1
+backend factory calls = 1
+transcribe calls       = 3
+close calls            = 1
 ```
 
-Flow predictions through real `map_oaf_prediction()` + `publish_prediction_artifact()`.
+Feed fake native predictions through real `map_oaf_prediction()` and real `publish_prediction_artifact()`.
 
-- [ ] **Step 3: Implement normal lifecycle**
+- [ ] **Step 3: Implement the healthy lifecycle using the smoke sequence**
 
-Order:
+For each inferred item, preserve the existing single-song order:
 
-1. load HPA-324/HPA-323;
-2. lineage + scope preflight;
-3. derive model/config/run identities;
-4. build run/work dirs;
-5. load cache index once;
-6. reconstruct references;
-7. preflight eligible durations;
-8. create one backend with `input_root` and 3600-second timeout if inference is needed;
-9. iterate selected eligible rows by simfile ID;
-10. close backend once;
-11. finalize run snapshot/reports.
+```text
+materialize CanonicalAudio
+start timer
+backend.transcribe(audio)
+stop timer
+map_oaf_prediction(native)
+publish_prediction_artifact(path, mapped)
+checkpoint run.json
+```
 
-- [ ] **Step 4: RED valid model-level inference failure continuation**
+RTF uses the authoritative decoded duration stored during source preflight. Mapping/publication time stays outside inference elapsed time, matching `smoke_backend`.
 
-Fake `transcribe()` raises/returns the equivalent of an OaF model-level `inference_failed` for song 2 without poisoning the fake process; song 3 still runs. Mapping is `inference_failed -> CohortFailureReason("inference_failed")`.
+- [ ] **Step 4: Write exact resume RED tests**
 
-- [ ] **Step 5: RED worker-poison stop test**
+Prediction path is source-hash keyed. Cases:
 
-Simulate a `WorkerProcessError`/OaF `worker_error`/protocol timeout on song 2. Assert:
+1. matching artifact/current canonical input -> no transcribe, `resumed`;
+2. source path exists but current canonical `input_audio_sha256` differs -> `prediction_artifact_invalid`, no transcribe, no overwrite;
+3. artifact missing under `--resume` -> infer/publish;
+4. prior failed run row + artifact missing -> infer/publish;
+5. wrong descriptor/model/map/view/source -> artifact invalid, no overwrite;
+6. existing target without `--resume` -> `prediction_output_conflict`;
+7. artifact exists but prior snapshot missed it due interruption -> resume validates/reuses it.
 
-- song 1 prediction remains persisted;
-- song 2 records `worker_protocol_failed` -> `backend_unavailable`;
-- song 3 does **not** receive `transcribe()` in this invocation;
-- `run.json` is checkpointed as partial/incomplete;
+The test must assert the materializer is called for case 1, pinning exact-input validation rather than decode-free resume.
+
+- [ ] **Step 5: Implement resume validation**
+
+After source resolution and canonical materialization, call `read_prediction_artifact()` and compare:
+
+```text
+source_audio_id
+source_audio_sha256
+input_view_id
+input_audio_sha256
+backend_descriptor_sha256/model identity
+prediction_map_version
+```
+
+The path already binds source hash/backend/config; content validation remains mandatory.
+
+- [ ] **Step 6: Write item-local versus poison tests**
+
+Parameterize the known OaF codes. For `inference_failed`, `invalid_request`, `input_path_invalid`, and `native_event_invalid`, fail the middle song and assert a later song is attempted.
+
+For each poison code, fail the middle song and assert:
+
+- the current failed row is checkpointed;
+- no later `transcribe()` calls occur in that invocation;
+- later rows remain missing/failed according to the snapshot contract;
 - backend closes once;
-- outcome exit code is 1;
-- no restart/backend replacement occurs.
+- a second invocation with `--resume` processes outstanding rows.
 
-This replaces the old false assumption that every backend error can continue to the next song.
+Add one unknown code and assert it follows poison behavior.
 
-- [ ] **Step 6: RED success publication**
+- [ ] **Step 7: Write close-failure test**
 
-Assert each inferred success records source/chart/input/prediction identity, prediction SHA/path, duration, wall time, RTF, and that prediction v2 itself contains no chart/reference fields.
+Fake backend succeeds for all rows but raises:
 
-- [ ] **Step 7: RED resume matrix**
+```python
+OafBackendError("worker close failed", code="worker_close_failed")
+```
 
-1. matching artifact -> `resumed`, no transcribe;
-2. missing artifact -> infer/publish;
-3. prior failed row + missing artifact -> infer/publish;
-4. source/input/descriptor/model/map mismatch -> `prediction_artifact_invalid`, no overwrite;
-5. existing target with `resume=False` -> `prediction_output_conflict`, no overwrite;
-6. artifact exists but previous snapshot missed it -> resume validates/reuses;
-7. after a prior worker-poison run, next `--resume` invocation reuses prior success and attempts only missing/failed eligible work.
+from `close()`.
 
-A missing target with `resume=False` is normal inference, **not** an output conflict.
+Assert:
 
-- [ ] **Step 8: Pin publish-failure grouping**
+- prediction artifacts remain valid;
+- run snapshot records bounded close failure evidence;
+- reports still get produced;
+- outcome is `partial`, exit 1;
+- no successful item is reclassified as a prediction failure.
 
-A failed immutable publish is runner code `prediction_publish_failed` and maps exactly to `prediction_artifact_invalid`. Do not map it ambiguously to `prediction_missing`.
+- [ ] **Step 8: Implement close handling and finalization order**
 
-`prediction_missing` is reserved for scorer/adaptation evidence where run state expects a prediction but the file is absent.
+Use a structure equivalent to:
 
-- [ ] **Step 9: Acceptance interruption/resume test**
+```python
+close_error = None
+try:
+    _execute_rows(...)
+finally:
+    if backend is not None:
+        try:
+            backend.close()
+        except OafBackendError as error:
+            close_error = _bounded_close_error(error)
 
-Two invocations over 3–4 local fixture rows:
+snapshot = replace(snapshot, close_error=close_error)
+_write_run_snapshot(snapshot)
+return _finalize_scoring_and_outcome(snapshot, ...)
+```
 
-- first persists at least one success then stops on simulated worker poison;
-- second `--resume` reuses unchanged success bytes and runs only outstanding rows;
-- final prediction files parse as v2;
-- no successful output SHA changes.
+Never let close failure erase already persisted predictions/reports.
 
-- [ ] **Step 10: Run focused tests and commit**
+- [ ] **Step 9: Add interrupted/resumed acceptance test**
+
+Run 3–4 local rows twice:
+
+- invocation 1 publishes earlier successes and hits one poison failure;
+- invocation 2 with `--resume` reuses exact matches and executes only outstanding rows;
+- previously successful prediction bytes/SHA are unchanged;
+- final prediction artifacts parse as v2.
+
+No real Docker/model in CI.
+
+- [ ] **Step 10: Run focused tests**
 
 ```bash
 uv run pytest \
@@ -620,6 +919,8 @@ uv run pytest \
 ```
 
 Expected: PASS.
+
+- [ ] **Step 11: Commit**
 
 ```bash
 git add src/benchmark/oaf_corpus_run.py \
@@ -630,72 +931,97 @@ git commit -m "feat: run resumable OaF corpus inference"
 
 ---
 
-## Task 6: Add runtime projection and HPA-325 fixed-control adaptation
+## Task 7: Pin non-success scorer assembly, runtime projection, and HPA-325 reports
 
 **Files:**
 - Modify: `src/benchmark/oaf_corpus_run.py`
 - Modify: `tests/benchmark/test_oaf_corpus_run.py`
 - Modify: `tests/benchmark/test_oaf_corpus_run_acceptance.py`
 
-- [ ] **Step 1: RED projection tests**
+- [ ] **Step 1: Write non-success `CohortItem` shape tests**
 
-Pin:
+For an HPA-324 eligible reference mapping, failed and skipped rows must use:
+
+```python
+CohortItem(
+    simfile_id=simfile_id,
+    status="failed",  # or skipped
+    reference_events=reference_to_benchmark_events(simfile_id, mapping.common_events),
+    prediction_events=None,
+    coverage=coverage_from_artifacts(mapping, None),
+    failure_reason=RUNNER_FAILURE_TO_COHORT_REASON[runner_code],
+    artifact_identity=None,
+    reference_artifact=None,
+    prediction_artifact=None,
+)
+```
+
+For `unclassified_reference_lane` / `no_scored_drum_events` quarantine with readable native reference artifact, use the same mapping-derived reference events/coverage but `status="quarantined"`, `failure_reason="reference_quarantined"`, and all evidence fields `None`.
+
+For `upstream_reference_unavailable` / `reference_event_artifact_invalid`:
+
+```python
+CohortCoverage(
+    reference_native_event_count=0,
+    reference_common_event_count=0,
+    reference_ignored_event_count=0,
+    reference_unmapped_event_count=0,
+    reference_duplicate_collapsed_count=0,
+    prediction_native_event_count=None,
+    prediction_mapped_event_count=None,
+    prediction_unmapped_event_count=None,
+    prediction_native_class_counts=(),
+)
+```
+
+with `reference_events=()`.
+
+Pass every constructed item through real `validate_cohort_items()` in the tests.
+
+- [ ] **Step 2: Pin `prediction_missing` adaptation**
+
+Simulate a run row marked success whose prediction file is deleted before scoring. Adapt it to `status="failed"`, reason `prediction_missing`, with mapping-derived reference events/coverage and all artifact evidence fields `None`.
+
+- [ ] **Step 3: Write projection tests**
+
+Given inferred rows with known durations/times:
 
 ```python
 aggregate_rtf = measured_wall_time_sec / measured_audio_duration_sec
 projected_full_wall_time_sec = aggregate_rtf * full_eligible_audio_duration_sec
 ```
 
-Only actual inferred rows contribute measured timing. Resume hits without retained timing do not contribute zero time. Missing any eligible duration makes projection `None` and reports coverage count.
+Assert resume hits without retained inference timing contribute neither zero time nor zero duration. If any eligible duration is unavailable, projection is `None` and coverage count remains explicit.
 
-Also assert `request_timeout_seconds == 3600.0` is persisted with the pilot evidence.
+- [ ] **Step 4: Implement projection and canonical persistence**
 
-- [ ] **Step 2: Implement projection summary**
+Keep in-memory outcome fields as float if convenient, but when updating `run.json`, every binary float crosses `quantize_six()` via one private render helper. Do not store raw floats in snapshot payloads.
 
-No confidence intervals, memory telemetry, or parallel speedup estimate.
+- [ ] **Step 5: Write HPA-325 end-to-end scorer tests**
 
-- [ ] **Step 3: RED scorer adaptation using exact timing root**
+Assemble success/resume/failure/skip/quarantine rows and assert:
 
-Construct rows for:
+- success uses `cohort_item_from_artifacts()`;
+- all other rows satisfy the pinned table above;
+- `CohortIdentity.reference_manifest_sha256` is the exact HPA-324 manifest hash;
+- `reference_timing_version` is the exact HPA-323 version;
+- model lock/descriptor/map/input-view/run ID are frozen identities;
+- scorer population equals run population.
 
-- inferred success;
-- resumed success;
-- filter skip;
-- HPA-324 quarantine;
-- source/canonical/inference failure;
-- run-row success whose expected prediction artifact is removed before scoring.
-
-Reference load must use:
+- [ ] **Step 6: Implement only existing scoring/report calls**
 
 ```python
-timing_output_root = request.timing_manifest_path.parent.parent
-native = read_native_reference_events(
-    timing_row,
-    timing_output_root=timing_output_root,
-)
-reference = map_reference_events(native)
+score_result = score_cohort(identity, tuple(items), diagnostics_for=())
+report_artifacts = write_cohort_reports(score_result, run_dir / "reports")
 ```
 
-The removed expected prediction maps to runner `prediction_missing` -> HPA-325 `prediction_missing`.
+Do not copy matching, alignment, class aggregation, or report rendering into HPA-326.
 
-- [ ] **Step 4: Assert the complete deterministic failure table**
+- [ ] **Step 7: Prove persisted rescoring needs no inference**
 
-For every `RunnerFailureCode`, build/derive a failed scorer row and assert the exact mapped HPA-325 reason. The test should fail if a new runner code is added without updating the table.
+After one successful run, invoke the same scope with `resume=True` and a backend fake that raises if `transcribe()` is called. Exact artifacts should validate, reports regenerate, and inference call count remain zero.
 
-- [ ] **Step 5: Implement HPA-325 reuse only**
-
-```python
-result = score_cohort(identity, tuple(items), diagnostics_for=())
-reports = write_cohort_reports(result, run_dir / "reports")
-```
-
-No matching/aggregate/report logic in HPA-326.
-
-- [ ] **Step 6: Prove reports regenerate without inference**
-
-After a completed run, invoke `--resume` with a backend fake that raises if `transcribe()` is called. Matching successes reuse artifacts and reports regenerate.
-
-- [ ] **Step 7: Run tests and commit**
+- [ ] **Step 8: Run focused tests**
 
 ```bash
 uv run pytest \
@@ -707,6 +1033,8 @@ uv run pytest \
 
 Expected: PASS.
 
+- [ ] **Step 9: Commit**
+
 ```bash
 git add src/benchmark/oaf_corpus_run.py \
         tests/benchmark/test_oaf_corpus_run.py \
@@ -716,38 +1044,41 @@ git commit -m "feat: score OaF corpus control runs"
 
 ---
 
-## Task 7: Add the thin `run-oaf-corpus` CLI and closed scope behavior
+## Task 8: Add the thin `run-oaf-corpus` CLI
 
 **Files:**
 - Modify: `src/cli/benchmark.py`
 - Modify: `tests/test_cli_benchmark.py`
 
-- [ ] **Step 1: RED CLI parsing tests**
+- [ ] **Step 1: Write RED Click argument tests**
 
-Use the existing integer range:
+Invoke:
 
-```python
-click.IntRange(0, MAX_SIMFILE_ID)
+```bash
+crux benchmark run-oaf-corpus \
+  --manifest <hpa324> \
+  --timing-manifest <hpa323> \
+  --cache-dir <cache> \
+  --output-dir <output> \
+  --include-simfile-id 10 \
+  --include-simfile-id 20 \
+  --exclude-simfile-id 30 \
+  --resume
 ```
 
-for repeated `--include-simfile-id` and `--exclude-simfile-id`.
+Both repeated ID options use:
 
-No `--backend`, `--checkpoint-dir`, or `--timeout`.
+```python
+type=click.IntRange(0, MAX_SIMFILE_ID)
+```
 
-- [ ] **Step 2: RED preflight exit-2 CLI tests**
+Monkeypatch the domain runner so CLI tests never start Docker.
 
-With a fake HPA-324 manifest:
+- [ ] **Step 2: Implement the thin lazy-import command**
 
-- unknown include -> exit 2;
-- unknown exclude -> exit 2;
-- overlap -> exit 2;
-- backend factory/domain execution is not reached.
+The handler only constructs `OafCorpusRunRequest`, calls `run_oaf_corpus()`, builds a small stdout payload, quantizes any float fields, writes canonical JSON, and exits with `outcome.exit_code`.
 
-- [ ] **Step 3: Implement thin handler**
-
-Construct `OafCorpusRunRequest`, call `run_oaf_corpus()`, print canonical summary, exit with domain code. Keep heavy imports lazy like existing benchmark commands.
-
-Stdout summary includes at minimum:
+Required stdout keys:
 
 ```text
 status
@@ -760,23 +1091,28 @@ skipped_count
 quarantined_count
 aggregate_rtf
 projected_full_wall_time_sec
-request_timeout_seconds
 reports_path
 ```
 
+- [ ] **Step 3: Pin domain preflight propagation**
+
+CLI tests assert domain exit 2 is preserved for unknown/overlapping scope rather than being rewritten as a generic Click usage failure. Syntax-range violations remain Click errors.
+
 - [ ] **Step 4: Pin exit semantics**
 
-- 0: selected eligible predictions complete;
-- 1: item failures or worker-poison partial run with trustworthy snapshot;
-- 2: lineage/scope/setup/run-level fatal failure.
+- exit 0: all selected eligible items successful, clean close, reports produced;
+- exit 1: item/poison/close failure but trustworthy run/report produced;
+- exit 2: fatal preflight/snapshot/setup failure.
 
-- [ ] **Step 5: Run and commit**
+- [ ] **Step 5: Run CLI tests**
 
 ```bash
 uv run pytest tests/test_cli_benchmark.py -q
 ```
 
 Expected: PASS.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/cli/benchmark.py tests/test_cli_benchmark.py
@@ -785,33 +1121,34 @@ git commit -m "feat: add OaF corpus benchmark command"
 
 ---
 
-## Task 8: Operational acceptance — real fixed-checkpoint pilot before broad run
+## Task 9: Operational acceptance — real fixed-checkpoint pilot before broad run
 
 **Files:**
-- No production changes unless the real run proves a concrete bug.
-- Record evidence in HPA-326 / implementation PR discussion.
+- No production code unless the real pilot exposes a concrete defect.
+- Record operational evidence in HPA-326 / PR discussion rather than adding a permanent pilot-data artifact solely for this gate.
 
-- [ ] **Step 1: Freeze 4–6 technically diverse IDs before model scores**
+- [ ] **Step 1: Freeze 4–6 technically diverse IDs before reading model scores**
 
-Use HPA-323/HPA-324 metadata only: short/long duration, lower/higher reference density, multiple source packs/audio representations where available.
+Select from HPA-323/HPA-324 metadata only. Include shorter/longer audio, lower/higher reference density, and multiple packs/audio representations when available.
 
-- [ ] **Step 2: Record the corpus request deadline before execution**
+- [ ] **Step 2: Record the timeout evidence before execution**
 
-Evidence must state:
+Record:
 
 ```text
-OAF_CORPUS_REQUEST_TIMEOUT_SECONDS = 3600.0
+request_timeout_seconds = 3600
+worker_close_timeout_seconds = 30
 ```
 
-and confirm the real backend was constructed with that deadline rather than the HPA-423 30-second default.
+The 3600-second request ceiling is intentionally retained for the first pilot because the existing HPA-423 one-second smoke's first lazy-backend call took 24.818518 seconds; no full-song steady-state evidence currently justifies a 900-second cap.
 
-- [ ] **Step 3: Run fixed pilot**
+- [ ] **Step 3: Run the fixed pilot**
 
 ```bash
 uv run crux benchmark run-oaf-corpus \
   --manifest <exact-hpa324-manifest> \
   --timing-manifest <exact-hpa323-manifest> \
-  --cache-dir <exact-r2-corpus-cache> \
+  --cache-dir <exact-r2-cache> \
   --output-dir artifacts/benchmark/oaf-corpus \
   --include-simfile-id <id-1> \
   --include-simfile-id <id-2> \
@@ -819,74 +1156,65 @@ uv run crux benchmark run-oaf-corpus \
   --include-simfile-id <id-4>
 ```
 
-Do not pass a checkpoint path; `create_backend()` uses the existing OaF model-cache default/environment.
+Capture run ID, manifest hashes, model/descriptor/checkpoint identity, adapter/canonicalizer/config identity, each inferred song's duration/wall time/RTF, aggregate RTF, eligible-duration coverage, projected wall time, and report paths.
 
-Capture:
+- [ ] **Step 4: Prove one healthy persistent worker**
 
-- run ID + exact HPA-324/HPA-323 hashes;
-- backend descriptor/model/checkpoint identity;
-- adapter revision/config hash;
-- request timeout;
-- each inferred song duration/wall time/RTF;
-- aggregate RTF;
-- full eligible duration coverage;
-- projected full sequential wall time;
-- prediction/report paths and validation.
-
-- [ ] **Step 4: Prove persistent worker in normal real execution**
-
-Confirm model/worker ready occurs once and multiple song requests complete through the same worker. Do not add telemetry solely for this evidence.
+Confirm worker/model ready occurs once and multiple pilot requests complete through that worker. Do not add new telemetry infrastructure solely for this proof.
 
 - [ ] **Step 5: Prove real resume**
 
-Rerun same pilot with `--resume`:
+Immediately rerun the identical pilot with `--resume`. Require:
 
-- matching predictions reused;
-- no new inference request for matching successes;
-- prediction SHAs unchanged;
+- matching artifacts reused;
+- no inference request for resumed successes;
+- canonical input is re-materialized and hash-validated;
+- prediction bytes/SHA unchanged;
 - reports regenerate.
 
-- [ ] **Step 6: If a protocol/timeout failure occurs, verify specified poison behavior**
+- [ ] **Step 6: Review measured request ceiling and concurrency need**
 
-Confirm no later inference requests are issued in that invocation, `run.json` is partial/checkpointed, and a subsequent `--resume` attempts outstanding rows. Fix only a concrete deviation from the specified behavior; do not add an automatic restart framework.
+Use measured steady-state per-song RTF to decide whether the 3600-second request ceiling should be tightened. If any legitimate song approaches the ceiling, increase/tune only from evidence. If projected sequential runtime is acceptable, keep one worker. If prohibitive, change scope explicitly before adding concurrency.
 
-- [ ] **Step 7: Review projection before broad run**
-
-If sequential runtime is acceptable, keep one worker. If not, record measured evidence and explicitly revise scope before concurrency work.
-
-- [ ] **Step 8: Run full eligible corpus**
+- [ ] **Step 7: Run the broad corpus**
 
 ```bash
 uv run crux benchmark run-oaf-corpus \
   --manifest <exact-hpa324-manifest> \
   --timing-manifest <exact-hpa323-manifest> \
-  --cache-dir <exact-r2-corpus-cache> \
+  --cache-dir <exact-r2-cache> \
   --output-dir artifacts/benchmark/oaf-corpus \
   --resume
 ```
 
-- [ ] **Step 9: Reconcile fixed control**
+No include/exclude flags.
 
-For unfiltered broad run:
+- [ ] **Step 8: Reconcile the fixed control**
+
+Require:
 
 ```text
-eligible = success + failed_or_missing
 manifest total = success + failed + skipped + quarantined
-explicit filter skips = 0
+unfiltered broad-run explicit skips = 0
+eligible = success + failed
 ```
 
-Every eligible row has a valid prediction or explicit failed/missing state. Record the final run/report paths for HPA-395/HPA-328/HPA-562.
+A valid prediction or explicit failure exists for every eligible row. Record final run/report path for HPA-395/HPA-328/HPA-562.
 
 ---
 
-## Task 9: Full verification and scope audit
+## Task 10: Full verification and scope audit
 
-- [ ] **Step 1: Targeted benchmark tests**
+- [ ] **Step 1: Run targeted suite**
 
 ```bash
 uv run pytest \
-  tests/benchmark/test_reference_set_manifest.py \
   tests/benchmark/test_reference_timing_manifest.py \
+  tests/benchmark/test_reference_set_manifest.py \
+  tests/benchmark/test_durability.py \
+  tests/benchmark/test_corpus_manifest.py \
+  tests/benchmark/test_r2_corpus_sync.py \
+  tests/benchmark/test_worker_process.py \
   tests/benchmark/test_input_view.py \
   tests/benchmark/test_task_d_contract.py \
   tests/benchmark/test_oaf_corpus_run.py \
@@ -899,7 +1227,7 @@ uv run pytest \
 
 Expected: PASS.
 
-- [ ] **Step 2: Full test suite**
+- [ ] **Step 2: Run full tests**
 
 ```bash
 uv run pytest -q
@@ -907,7 +1235,7 @@ uv run pytest -q
 
 Expected: PASS.
 
-- [ ] **Step 3: CI-equivalent static checks**
+- [ ] **Step 3: Run CI-equivalent static checks**
 
 ```bash
 uv run ruff check .
@@ -916,35 +1244,31 @@ uv run pylint --errors-only --disable=E1120,E0401 --jobs=1 src
 git diff --check
 ```
 
-Expected: all PASS; `git diff --check` emits no errors.
+Expected: all pass; `git diff --check` emits no output.
 
-- [ ] **Step 4: Scope audit**
+- [ ] **Step 4: Audit scope**
 
-Verify:
+Verify the implementation still has:
 
-- one OaF corpus runner, not a framework;
-- normal inference uses one backend/worker;
-- backend created with explicit 3600-second request timeout;
-- protocol poison stops later requests and relies on resume;
-- no worker restart/pool/retry engine;
-- no R2/network dependency in runner;
-- `--cache-dir` and model checkpoint cache remain distinct;
-- HPA-324 loader uses shared `read_canonical_manifest_core()`;
-- unknown include/exclude and overlap fail before backend creation;
-- native reference root is `timing_manifest_path.parent.parent`;
-- failure mapping is one closed constant table; HPA-325 enum unchanged;
-- prediction artifact v2 unchanged;
+- one OaF runner module, not a framework;
+- one backend lifecycle;
+- no runner R2/network dependency;
+- no prediction schema change;
+- no generic retry/queue/pool/restart abstraction;
+- no HPA-320 compatibility machinery;
+- no corpus-derived tuning;
 - no durable canonical WAV corpus;
-- `run.json` uses mutable atomic replacement, not immutable publisher;
-- HPA-325 scoring/report logic is reused rather than copied;
-- no corpus-derived model/scoring tuning.
+- shared manifest and durability helpers rather than third copies;
+- closed backend error policy with unknown->poison;
+- exact non-success HPA-325 item contract;
+- no raw Python float in canonical run/CLI JSON.
 
-Collapse any new one-caller abstraction that is not required for testability or identity correctness.
+If a new abstraction has one caller and is not necessary for a proven contract/test seam, collapse it before final review.
 
-- [ ] **Step 5: Commit verification fixes only if needed**
+- [ ] **Step 5: Commit only verification fixes if needed**
 
 ```bash
-git add <only-files-changed-by-verification-fixes>
+git add <only-the-files-changed-by-real-verification-fixes>
 git commit -m "fix: finalize HPA-326 corpus runner"
 ```
 
@@ -952,20 +1276,21 @@ Do not create an empty cleanup commit.
 
 ---
 
-## Expected result
+## Expected Implementation Result
 
-After execution Crux has one command that can:
+After execution of this plan, Crux has one command that:
 
-1. consume exact HPA-324/HPA-323 reference lineage through the shared canonical manifest reader;
-2. reject typoed/overlapping frozen scopes before inference;
-3. resolve the exact authoritative full mix from the existing local cache;
-4. canonicalize it into the fixed OaF input view;
-5. run one validated sequential worker with a real corpus-scale request deadline;
-6. stop safely on worker protocol poison and recover outstanding work with `--resume`;
-7. persist/reuse immutable prediction v2 without reference coupling;
-8. map detailed operational failures deterministically into the unchanged HPA-325 taxonomy;
-9. record per-song runtime/RTF and publish the pilot-derived full-corpus projection;
-10. reconcile success/failure/skipped/quarantined/missing state and produce HPA-325 reports without rerunning inference;
-11. provide stable prediction/run/report paths to HPA-395, HPA-328, and HPA-562.
+1. validates exact HPA-324/HPA-323 lineage and closed filter scope;
+2. proves eligible reference artifacts before expensive inference;
+3. resolves authoritative source audio from the existing local cache only;
+4. materializes the explicit OaF full-mix canonical view temporarily;
+5. uses one persistent OaF worker with a measured request ceiling and bounded close deadline;
+6. distinguishes item-local backend failures from poison through a closed fail-closed policy;
+7. persists prediction v2 immutably under source/model/config identity;
+8. resumes only after exact current canonical input validation;
+9. checkpoints one canonical mutable run snapshot through the shared durability primitive;
+10. serializes all float-derived evidence through `quantize_six()`;
+11. assembles success/failure/skip/quarantine rows that already satisfy HPA-325 validation;
+12. publishes pilot runtime projection and HPA-325 fixed-control reports without rerunning matching logic.
 
-Concurrency, generic runners, extra models, separated inputs, derived-audio caching, and benchmark comparison remain later work.
+Concurrency, generic runners, additional models, separated inputs, and paired comparisons remain later-ticket work.
