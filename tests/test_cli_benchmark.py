@@ -442,6 +442,68 @@ def test_run_oaf_corpus_preserves_domain_preflight_exit_code(tmp_path: Path, mon
     assert json.loads(result.output)["exit_code"] == 2
 
 
+def test_run_oaf_corpus_overlap_scope_is_canonical_fatal(tmp_path: Path, monkeypatch) -> None:
+    import src.benchmark.oaf_corpus_run as runner_module
+
+    def unexpected_run(_request: object) -> OafCorpusRunOutcome:
+        raise AssertionError("domain runner must not run for invalid request scope")
+
+    monkeypatch.setattr(runner_module, "run_oaf_corpus", unexpected_run)
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "run-oaf-corpus",
+            "--manifest",
+            str(tmp_path / "hpa324.jsonl"),
+            "--timing-manifest",
+            str(tmp_path / "hpa323.jsonl"),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--include-simfile-id",
+            "10",
+            "--exclude-simfile-id",
+            "10",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.output)["exit_code"] == 2
+    assert json.loads(result.output)["status"] == "failed"
+
+
+def test_run_oaf_corpus_non_positive_scope_is_canonical_fatal(tmp_path: Path, monkeypatch) -> None:
+    import src.benchmark.oaf_corpus_run as runner_module
+
+    def unexpected_run(_request: object) -> OafCorpusRunOutcome:
+        raise AssertionError("domain runner must not run for invalid request scope")
+
+    monkeypatch.setattr(runner_module, "run_oaf_corpus", unexpected_run)
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "run-oaf-corpus",
+            "--manifest",
+            str(tmp_path / "hpa324.jsonl"),
+            "--timing-manifest",
+            str(tmp_path / "hpa323.jsonl"),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--include-simfile-id",
+            "0",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.output)["exit_code"] == 2
+    assert json.loads(result.output)["status"] == "failed"
+
+
 def test_run_oaf_corpus_rejects_out_of_range_id_as_click_error(tmp_path: Path, monkeypatch) -> None:
     import src.benchmark.oaf_corpus_run as runner_module
 
