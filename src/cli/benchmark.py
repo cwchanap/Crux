@@ -665,10 +665,14 @@ def run_oaf_corpus_command(
     resume: bool,
 ) -> None:
     """Run the validated OaF backend over an HPA-324 corpus scope."""
-    from src.benchmark.oaf_corpus_run import OafCorpusRunRequest, run_oaf_corpus
+    from src.benchmark.oaf_corpus_run import (
+        OafCorpusRunOutcome,
+        OafCorpusRunRequest,
+        run_oaf_corpus,
+    )
 
-    outcome = run_oaf_corpus(
-        OafCorpusRunRequest(
+    try:
+        request = OafCorpusRunRequest(
             reference_manifest_path=reference_manifest_path,
             timing_manifest_path=timing_manifest_path,
             cache_dir=cache_dir,
@@ -677,7 +681,22 @@ def run_oaf_corpus_command(
             exclude_simfile_ids=exclude_simfile_ids,
             resume=resume,
         )
-    )
+    except (TypeError, ValueError):
+        outcome = OafCorpusRunOutcome(
+            overall_status="failed",
+            exit_code=2,
+            run_id=None,
+            run_path=None,
+            reports_path=None,
+            success_count=0,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+            aggregate_rtf=None,
+            projected_full_wall_time_sec=None,
+        )
+    else:
+        outcome = run_oaf_corpus(request)
     payload = {
         "aggregate_rtf": (
             None if outcome.aggregate_rtf is None else quantize_six(outcome.aggregate_rtf)
