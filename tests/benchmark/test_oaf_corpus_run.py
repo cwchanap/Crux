@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
 from decimal import Decimal
+from hashlib import sha256
+from io import BytesIO
 from pathlib import Path
 
+import numpy as np
 import pytest
+import soundfile as sf
 
 from runtime.oaf_tf1.model import load_model_config
 from src.benchmark.backend_identity import (
@@ -12,8 +18,11 @@ from src.benchmark.backend_identity import (
     canonical_json_bytes,
     strict_json_loads,
 )
+from src.benchmark.backends.base import CanonicalAudio
 from src.benchmark.backends.oaf import OAF_ADAPTER_REVISION
 from src.benchmark.cohort_scoring import COHORT_FAILURE_REASONS
+from src.benchmark.corpus_cache import CacheIndexEntry, CacheIndexStore
+from src.benchmark.corpus_manifest import render_manifest
 from src.benchmark.oaf_corpus_run import (
     OAF_BACKEND_ERROR_POLICY,
     OAF_CANONICALIZATION_REVISION,
@@ -25,6 +34,10 @@ from src.benchmark.oaf_corpus_run import (
     RUNNER_FAILURE_TO_COHORT_REASON,
     OafCorpusRunOutcome,
     OafCorpusRunRequest,
+    ResolvedSourceAudio,
+    _materialize_oaf_full_mix,
+    _preflight_reference_mappings,
+    _resolve_source_audio,
     _validate_scope,
     build_inference_config,
     build_run_id,
@@ -35,6 +48,23 @@ from src.benchmark.oaf_corpus_run import (
     prediction_path,
     render_oaf_corpus_run,
     write_oaf_corpus_run,
+)
+from src.benchmark.r2_corpus_models import RemoteObject
+from src.benchmark.reference_set import ReferenceMappingResult
+from src.benchmark.reference_set_manifest import (
+    LoadedReferenceSetManifest,
+    LoadedReferenceSetRow,
+    ReferenceSetRequest,
+    ReferenceSetRowView,
+    load_reference_set_manifest,
+    run_reference_set,
+)
+from src.benchmark.reference_timing import NativeReferenceEvent, render_reference_events
+from src.benchmark.reference_timing_manifest import (
+    LoadedReferenceTimingManifest,
+    LoadedReferenceTimingRow,
+    ReferenceTimingRowView,
+    load_reference_timing_manifest,
 )
 from src.benchmark.taxonomy import OAF_PREDICTION_MAP_ID
 
@@ -77,6 +107,466 @@ def test_constants_and_public_dataclasses_are_frozen_contracts() -> None:
         projected_full_wall_time_sec=3600.0,
     )
     assert outcome.success_count == 1
+
+
+def test_resolved_source_audio_preserves_authoritative_identity() -> None:
+    resolved = ResolvedSourceAudio(
+        path=Path("cache/sha256/aa/" + SHA_A),
+        source_audio_id="42/audio.wav",
+        source_audio_sha256=SHA_A,
+        duration_sec=12.5,
+    )
+
+    assert resolved.path == Path("cache/sha256/aa/" + SHA_A)
+    assert resolved.source_audio_id == "42/audio.wav"
+    assert resolved.source_audio_sha256 == SHA_A
+    assert resolved.duration_sec == 12.5
+
+
+def _source_wav_bytes(*, sample_rate: int = 44100, frames: int = 44100) -> bytes:
+    output = BytesIO()
+    sf.write(
+        output,
+        np.zeros((frames, 1), dtype=np.float32),
+        sample_rate,
+        format="WAV",
+        subtype="PCM_16",
+    )
+    return output.getvalue()
+
+
+def _cache_body(cache_dir: Path, content: bytes) -> tuple[str, Path]:
+    digest = sha256(content).hexdigest()
+    path = cache_dir / "sha256" / digest[:2] / digest
+    path.parent.mkdir(parents=True)
+    path.write_bytes(content)
+    return digest, path
+
+
+def _source_remote(
+    *,
+    key: str = "42/bgm.wav",
+    content: bytes,
+    cache_status: str = "verified",
+    digest: str | None = None,
+    cache_path: str | None = None,
+) -> RemoteObject:
+    return RemoteObject(
+        key=key,
+        size=len(content),
+        etag='"etag-42"',
+        etag_is_weak=False,
+        last_modified=datetime(2026, 8, 14, tzinfo=timezone.utc),
+        content_type="audio/wav",
+        cache_status=cache_status,  # type: ignore[arg-type]
+        sha256=digest,
+        cache_path=cache_path,
+    )
+
+
+def test_resolve_source_audio_uses_carried_verified_remote_and_probes_duration(
+    tmp_path: Path,
+) -> None:
+    content = _source_wav_bytes(frames=22050)
+    digest, path = _cache_body(tmp_path, content)
+    remote = _source_remote(
+        content=content,
+        digest=digest,
+        cache_path=path.relative_to(tmp_path).as_posix(),
+    )
+
+    resolved = _resolve_source_audio(
+        remote,
+        tmp_path,
+        CacheIndexStore(tmp_path, {}),
+        source_endpoint_sha256=SHA_B,
+        source_bucket="simfile-dtx",
+        source_audio_content_hash=digest,
+    )
+
+    assert resolved.path == path
+    assert resolved.source_audio_id == "42/bgm.wav"
+    assert resolved.source_audio_sha256 == digest
+    assert resolved.duration_sec == pytest.approx(0.5)
+
+
+def test_resolve_source_audio_rehydrates_matching_stale_cache_index_entry(
+    tmp_path: Path,
+) -> None:
+    content = _source_wav_bytes(frames=44100)
+    digest, path = _cache_body(tmp_path, content)
+    remote = _source_remote(content=content, cache_status="not_selected")
+    entry = CacheIndexEntry(
+        source_endpoint_sha256=SHA_B,
+        bucket="simfile-dtx",
+        key=remote.key,
+        etag=remote.etag,
+        etag_is_weak=remote.etag_is_weak,
+        size=remote.size,
+        last_modified="2026-08-14T00:00:00Z",
+        sha256=digest,
+        cache_path=path.relative_to(tmp_path).as_posix(),
+    )
+
+    resolved = _resolve_source_audio(
+        remote,
+        tmp_path,
+        CacheIndexStore(tmp_path, {(SHA_B, "simfile-dtx", remote.key): entry}),
+        source_endpoint_sha256=SHA_B,
+        source_bucket="simfile-dtx",
+        source_audio_content_hash=digest,
+    )
+
+    assert resolved.path == path
+    assert resolved.source_audio_sha256 == digest
+    assert resolved.duration_sec == pytest.approx(1.0)
+
+
+def test_resolve_source_audio_rejects_changed_remote_identity(tmp_path: Path) -> None:
+    content = _source_wav_bytes()
+    digest, path = _cache_body(tmp_path, content)
+    remote = _source_remote(content=content, cache_status="not_selected")
+    entry = CacheIndexEntry(
+        source_endpoint_sha256=SHA_B,
+        bucket="simfile-dtx",
+        key=remote.key,
+        etag='"different-etag"',
+        etag_is_weak=False,
+        size=remote.size,
+        last_modified="2026-08-14T00:00:00Z",
+        sha256=digest,
+        cache_path=path.relative_to(tmp_path).as_posix(),
+    )
+
+    with pytest.raises(ValueError, match="verified source audio unavailable"):
+        _resolve_source_audio(
+            remote,
+            tmp_path,
+            CacheIndexStore(tmp_path, {(SHA_B, "simfile-dtx", remote.key): entry}),
+            source_endpoint_sha256=SHA_B,
+            source_bucket="simfile-dtx",
+            source_audio_content_hash=digest,
+        )
+
+
+@pytest.mark.parametrize("body_state", ["missing", "corrupt"])
+def test_resolve_source_audio_rejects_missing_or_corrupt_cache_body(
+    tmp_path: Path,
+    body_state: str,
+) -> None:
+    content = _source_wav_bytes()
+    digest = sha256(content).hexdigest()
+    path = tmp_path / "sha256" / digest[:2] / digest
+    path.parent.mkdir(parents=True)
+    if body_state == "corrupt":
+        path.write_bytes(b"not the source body")
+    remote = _source_remote(content=content, cache_status="not_selected")
+    entry = CacheIndexEntry(
+        source_endpoint_sha256=SHA_B,
+        bucket="simfile-dtx",
+        key=remote.key,
+        etag=remote.etag,
+        etag_is_weak=remote.etag_is_weak,
+        size=len(content),
+        last_modified="2026-08-14T00:00:00Z",
+        sha256=digest,
+        cache_path=path.relative_to(tmp_path).as_posix(),
+    )
+
+    with pytest.raises(ValueError, match="verified source audio unavailable"):
+        _resolve_source_audio(
+            remote,
+            tmp_path,
+            CacheIndexStore(tmp_path, {(SHA_B, "simfile-dtx", remote.key): entry}),
+            source_endpoint_sha256=SHA_B,
+            source_bucket="simfile-dtx",
+            source_audio_content_hash=digest,
+        )
+
+
+def test_resolve_source_audio_rejects_digest_mismatch_against_timing_manifest(
+    tmp_path: Path,
+) -> None:
+    content = _source_wav_bytes()
+    digest, path = _cache_body(tmp_path, content)
+    remote = _source_remote(
+        content=content,
+        digest=digest,
+        cache_path=path.relative_to(tmp_path).as_posix(),
+    )
+
+    with pytest.raises(ValueError, match="digest does not match"):
+        _resolve_source_audio(
+            remote,
+            tmp_path,
+            CacheIndexStore(tmp_path, {}),
+            source_endpoint_sha256=SHA_B,
+            source_bucket="simfile-dtx",
+            source_audio_content_hash=SHA_C,
+        )
+
+
+def test_materialize_oaf_full_mix_uses_pinned_resampling_and_canonical_wav(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "source.wav"
+    sf.write(
+        source_path,
+        np.zeros((22050, 2), dtype=np.float32),
+        22050,
+        format="WAV",
+        subtype="PCM_16",
+    )
+    source_digest = sha256(source_path.read_bytes()).hexdigest()
+    source = ResolvedSourceAudio(
+        path=source_path,
+        source_audio_id="42/bgm.wav",
+        source_audio_sha256=source_digest,
+        duration_sec=1.0,
+    )
+    input_root = tmp_path / "inputs"
+    output_path = input_root / "42" / "full-mix.wav"
+    config = load_model_config()
+    import src.benchmark.oaf_corpus_run as run_module
+
+    original_load = run_module.librosa.load
+    original_write = run_module.soundfile.write
+    load_calls: list[tuple[Path, dict[str, object]]] = []
+    write_calls: list[tuple[Path, int, dict[str, object]]] = []
+
+    def wrapped_load(path: Path, **kwargs: object):
+        load_calls.append((path, kwargs))
+        return original_load(path, **kwargs)
+
+    def wrapped_write(path: Path, data: object, samplerate: int, **kwargs: object) -> None:
+        write_calls.append((path, samplerate, kwargs))
+        original_write(path, data, samplerate, **kwargs)
+
+    monkeypatch.setattr(run_module.librosa, "load", wrapped_load)
+    monkeypatch.setattr(run_module.soundfile, "write", wrapped_write)
+
+    audio = _materialize_oaf_full_mix(
+        source,
+        output_path=output_path,
+        input_root=input_root,
+        config=config,
+    )
+
+    assert isinstance(audio, CanonicalAudio)
+    assert load_calls == [
+        (
+            source_path,
+            {"sr": 44100, "mono": True, "res_type": "soxr_hq"},
+        )
+    ]
+    assert write_calls == [
+        (
+            output_path,
+            44100,
+            {"format": "WAV", "subtype": "PCM_16"},
+        )
+    ]
+    assert audio.path == output_path
+    assert audio.source_audio_id == source.source_audio_id
+    assert audio.source_audio_sha256 == source_digest
+    assert audio.input_audio_sha256 == sha256(output_path.read_bytes()).hexdigest()
+    assert audio.sample_rate == 44100
+    assert audio.channel_count == 1
+    assert audio.audio_frame_count == 44100
+
+
+def _reference_preflight_fixture(
+    tmp_path: Path,
+) -> tuple[
+    Path,
+    LoadedReferenceSetManifest,
+    LoadedReferenceTimingManifest,
+    Path,
+]:
+    source_audio_key = "42/bgm.wav"
+    event = NativeReferenceEvent(
+        simfile_id=42,
+        selected_chart_key="42/real.dtx",
+        selected_chart_content_hash=SHA_A,
+        source_audio_key=source_audio_key,
+        source_audio_content_hash=SHA_B,
+        source_order=0,
+        measure=1,
+        position=0.0,
+        lane_id="11",
+        note_id="01",
+        chart_time_sec=1.0,
+        audio_time_sec=0.5,
+    )
+    artifact = (
+        tmp_path / "events" / (sha256(render_reference_events((event,))).hexdigest() + ".jsonl")
+    )
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(render_reference_events((event,)))
+    relative_artifact = artifact.relative_to(tmp_path).as_posix()
+    source_row = {
+        "selected_chart_key": event.selected_chart_key,
+        "selected_chart_content_hash": event.selected_chart_content_hash,
+        "source_audio_key": event.source_audio_key,
+        "source_audio_content_hash": event.source_audio_content_hash,
+        "reference_events_cache_path": relative_artifact,
+    }
+    timing_view = ReferenceTimingRowView(
+        simfile_id=42,
+        corpus_version="sha256:" + SHA_C,
+        timing_status="ready",
+        timing_reason_codes=(),
+        timing_warnings=(),
+        reference_events_cache_path=relative_artifact,
+        source_audio_key=source_audio_key,
+        source_audio_content_hash=SHA_B,
+    )
+    timing_row = LoadedReferenceTimingRow(source_row=source_row, view=timing_view)
+    timing_manifest = LoadedReferenceTimingManifest(
+        manifest_sha256=SHA_A,
+        corpus_version="sha256:" + SHA_C,
+        rows=(timing_row,),
+    )
+    set_view = ReferenceSetRowView(
+        simfile_id=42,
+        eligibility_status="eligible",
+        eligibility_reason_codes=(),
+        eligibility_warnings=(),
+        mapped_event_count=1,
+        common_scored_event_count=1,
+        ignored_event_count=0,
+        unmapped_event_count=0,
+        duplicate_common_event_count=0,
+    )
+    set_row = LoadedReferenceSetRow(source_row=source_row, view=set_view)
+    set_manifest = LoadedReferenceSetManifest(
+        manifest_sha256=SHA_B,
+        corpus_version="sha256:" + SHA_C,
+        source_reference_timing_manifest_sha256=SHA_A,
+        source_reference_timing_version="sha256:" + SHA_C,
+        rows=(set_row,),
+    )
+    return tmp_path, set_manifest, timing_manifest, artifact
+
+
+def _published_reference_preflight_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
+    golden_path = Path(__file__).parent / "schema_goldens/crux.reference-timing-manifest-v1.jsonl"
+    ready_row = json.loads(golden_path.read_text(encoding="utf-8").splitlines()[0])
+    event = NativeReferenceEvent(
+        simfile_id=ready_row["simfile_id"],
+        selected_chart_key=ready_row["selected_chart_key"],
+        selected_chart_content_hash=ready_row["selected_chart_content_hash"],
+        source_audio_key=ready_row["source_audio_key"],
+        source_audio_content_hash=ready_row["source_audio_content_hash"],
+        source_order=0,
+        measure=1,
+        position=0.0,
+        lane_id="13",
+        note_id="01",
+        chart_time_sec=1.0,
+        audio_time_sec=0.5,
+    )
+    event_content = render_reference_events((event,))
+    event_hash = sha256(event_content).hexdigest()
+    ready_row["reference_events_cache_path"] = f"events/{event_hash}.jsonl"
+    rendered_timing = render_manifest(
+        ({key: value for key, value in ready_row.items() if key != "corpus_version"},)
+    )
+    timing_path = tmp_path / "timing" / "manifests" / f"{rendered_timing.manifest_sha256}.jsonl"
+    timing_path.parent.mkdir(parents=True)
+    timing_path.write_bytes(rendered_timing.content)
+    event_path = timing_path.parent.parent / ready_row["reference_events_cache_path"]
+    event_path.parent.mkdir(parents=True)
+    event_path.write_bytes(event_content)
+
+    reference_outcome = run_reference_set(
+        ReferenceSetRequest(timing_path, tmp_path / "reference-set")
+    )
+    assert reference_outcome.manifest is not None
+    return timing_path, reference_outcome.manifest.path, event_path
+
+
+def test_preflight_published_eligible_artifact_corruption_is_fatal(tmp_path: Path) -> None:
+    timing_path, reference_path, event_path = _published_reference_preflight_fixture(tmp_path)
+    loaded_timing = load_reference_timing_manifest(timing_path)
+    loaded_reference = load_reference_set_manifest(reference_path)
+    event_path.write_bytes(b"corrupt event artifact")
+
+    with pytest.raises(ValueError, match="eligible reference event artifact invalid"):
+        _preflight_reference_mappings(
+            loaded_reference,
+            loaded_timing,
+            timing_output_root=timing_path.parent.parent,
+        )
+
+
+def test_preflight_reference_mappings_reconstructs_eligible_artifact(
+    tmp_path: Path,
+) -> None:
+    root, reference_manifest, timing_manifest, _ = _reference_preflight_fixture(tmp_path)
+
+    mappings = _preflight_reference_mappings(
+        reference_manifest,
+        timing_manifest,
+        timing_output_root=root,
+    )
+
+    assert isinstance(mappings[42], ReferenceMappingResult)
+    assert mappings[42] is not None
+    assert len(mappings[42].common_events) == 1
+
+
+def test_preflight_reference_mappings_fails_before_inference_for_corrupt_eligible_artifact(
+    tmp_path: Path,
+) -> None:
+    root, reference_manifest, timing_manifest, artifact = _reference_preflight_fixture(tmp_path)
+    artifact.write_bytes(b"corrupt event artifact")
+
+    with pytest.raises(ValueError, match="eligible reference event artifact invalid"):
+        _preflight_reference_mappings(
+            reference_manifest,
+            timing_manifest,
+            timing_output_root=root,
+        )
+
+
+@pytest.mark.parametrize(
+    "reason", ["upstream_reference_unavailable", "reference_event_artifact_invalid"]
+)
+def test_preflight_reference_mappings_quarantined_missing_artifact_is_not_fatal(
+    tmp_path: Path,
+    reason: str,
+) -> None:
+    root, reference_manifest, timing_manifest, artifact = _reference_preflight_fixture(tmp_path)
+    artifact.unlink()
+    source_row = reference_manifest.rows[0].source_row
+    quarantine_view = ReferenceSetRowView(
+        simfile_id=42,
+        eligibility_status="quarantined",
+        eligibility_reason_codes=(reason,),  # type: ignore[arg-type]
+        eligibility_warnings=(),
+        mapped_event_count=0,
+        common_scored_event_count=0,
+        ignored_event_count=0,
+        unmapped_event_count=0,
+        duplicate_common_event_count=0,
+    )
+    quarantine_manifest = LoadedReferenceSetManifest(
+        manifest_sha256=SHA_B,
+        corpus_version=reference_manifest.corpus_version,
+        source_reference_timing_manifest_sha256=reference_manifest.source_reference_timing_manifest_sha256,
+        source_reference_timing_version=reference_manifest.source_reference_timing_version,
+        rows=(LoadedReferenceSetRow(source_row=source_row, view=quarantine_view),),
+    )
+
+    mappings = _preflight_reference_mappings(
+        quarantine_manifest,
+        timing_manifest,
+        timing_output_root=root,
+    )
+
+    assert mappings == {42: None}
 
 
 def test_model_lock_hash_is_exact_file_sha256(tmp_path: Path) -> None:
