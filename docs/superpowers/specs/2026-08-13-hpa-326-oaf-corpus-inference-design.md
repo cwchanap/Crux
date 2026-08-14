@@ -262,7 +262,7 @@ OAF_CORPUS_REQUEST_TIMEOUT_SECONDS = 3600.0
 OAF_WORKER_CLOSE_TIMEOUT_SECONDS = 30.0
 ```
 
-The request ceiling remains 3600 seconds for the first pilot. The only real timing evidence available before HPA-326 is the HPA-423 one-second smoke, whose first lazy-backend call took 24.818518 seconds. That evidence does not justify lowering the unmeasured full-song ceiling to 900 seconds yet. The pilot exists to measure steady-state full-song RTF; adjust the request ceiling only from that evidence if needed.
+The request ceiling remains 3600 seconds for the first pilot. The only real timing evidence available before HPA-326 is the HPA-423 one-second smoke, whose first lazy-backend call took 24.818518 seconds and reported `real_time_factor=24.818518`. That first call includes lazy worker/model startup, so it is not a steady-state full-song estimate, but it still does not support asserting that a 900-second ceiling is already safely above all plausible full-mix inference. The pilot exists to measure steady-state full-song RTF; adjust the request ceiling only from that evidence if needed.
 
 `WorkerProcess` gains a separate close deadline:
 
