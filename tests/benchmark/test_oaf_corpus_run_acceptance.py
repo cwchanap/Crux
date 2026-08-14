@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from src.benchmark.oaf_corpus_run import (
     _expected_oaf_descriptor,
     run_oaf_corpus,
 )
+from src.benchmark.prediction_artifact import read_prediction_artifact
 from src.benchmark.reference_set import ReferenceMappingDiagnostics, ReferenceMappingResult
 from src.benchmark.reference_set_manifest import (
     LoadedReferenceSetManifest,
@@ -68,6 +70,72 @@ def _fake_manifests() -> tuple[LoadedReferenceSetManifest, LoadedReferenceTiming
             corpus_version="sha256:" + SHA_A,
             rows=(),
         ),
+    )
+
+
+def _install_fake_run_seams(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[LoadedReferenceSetManifest, BackendDescriptor, list[int]]:
+    """Install deterministic manifest/source/materializer seams for lifecycle tests."""
+    import src.benchmark.oaf_corpus_run as run_module
+
+    reference_manifest, timing_manifest = _fake_manifests()
+    monkeypatch.setattr(run_module, "load_reference_set_manifest", lambda _: reference_manifest)
+    monkeypatch.setattr(run_module, "load_reference_timing_manifest", lambda _: timing_manifest)
+    empty_mappings = {
+        row.view.simfile_id: ReferenceMappingResult(
+            mapped_events=(),
+            common_events=(),
+            diagnostics=ReferenceMappingDiagnostics({}, {}, 0),
+        )
+        for row in reference_manifest.rows
+    }
+    monkeypatch.setattr(
+        run_module, "_preflight_reference_mappings", lambda *_args, **_kwargs: empty_mappings
+    )
+    monkeypatch.setattr(
+        run_module,
+        "_resolve_source_audio",
+        lambda source, *_args, **_kwargs: ResolvedSourceAudio(
+            path=tmp_path / "source.wav",
+            source_audio_id=source["source_audio_key"],
+            source_audio_sha256=SHA_A,
+            duration_sec=1.0,
+        ),
+    )
+    config = load_model_config()
+    descriptor = _expected_oaf_descriptor(config)
+    materialize_calls: list[int] = []
+
+    def materialize(source, output_path, *, input_root, config):
+        del input_root, config
+        materialize_calls.append(int(source.source_audio_id.split("/")[0]))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"temporary canonical wav")
+        return CanonicalAudio(
+            path=output_path,
+            source_audio_id=source.source_audio_id,
+            source_audio_sha256=source.source_audio_sha256,
+            input_view_id=OAF_FULL_MIX_INPUT_VIEW_ID,
+            input_audio_sha256=SHA_B,
+            byte_length=88244,
+            sample_rate=44100,
+            channel_count=1,
+            sample_width_bytes=2,
+            audio_frame_count=44100,
+        )
+
+    monkeypatch.setattr(run_module, "_materialize_oaf_full_mix", materialize)
+    return reference_manifest, descriptor, materialize_calls
+
+
+def _request(tmp_path: Path, *, resume: bool = False) -> OafCorpusRunRequest:
+    return OafCorpusRunRequest(
+        reference_manifest_path=tmp_path / "reference.jsonl",
+        timing_manifest_path=tmp_path / "timing.jsonl",
+        cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "output",
+        resume=resume,
     )
 
 
@@ -198,6 +266,11 @@ def test_run_oaf_corpus_uses_one_persistent_backend_and_request_timeout(
     snapshot = run_module.parse_oaf_corpus_run(outcome.run_path.read_bytes())
     assert snapshot["success_count"] == 3
     assert snapshot["failed_count"] == 0
+    for row in snapshot["items"]:
+        artifact_path = tmp_path / "output" / row["prediction_path"]
+        artifact = read_prediction_artifact(artifact_path.read_bytes())
+        assert artifact.prediction.audio.source_audio_id == row["source_audio_id"]
+        assert artifact.prediction.audio.input_audio_sha256 == row["input_audio_sha256"]
     if close_failure:
         assert snapshot["close_error"] == {
             "code": "worker_close_failed",
@@ -242,6 +315,314 @@ def test_scope_rejection_precedes_backend_factory(
     assert calls == []
 
 
+def test_malformed_native_descriptor_is_poison_and_stops_later_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.benchmark.oaf_corpus_run as run_module
+
+    _, descriptor, _ = _install_fake_run_seams(monkeypatch, tmp_path)
+    malformed_descriptor = replace(
+        descriptor,
+        payload={**descriptor.payload, "backend_id": "malformed-native-backend"},
+    )
+    transcribe_calls: list[int] = []
+    close_calls: list[bool] = []
+
+    class MalformedBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            simfile_id = int(audio.source_audio_id.split("/")[0])
+            transcribe_calls.append(simfile_id)
+            prediction_descriptor = malformed_descriptor if simfile_id == 20 else descriptor
+            return NativePrediction(audio=audio, descriptor=prediction_descriptor, events=())
+
+        def close(self) -> None:
+            close_calls.append(True)
+
+    outcome = run_oaf_corpus(
+        _request(tmp_path),
+        backend_factory=lambda **_: MalformedBackend(),
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+
+    assert outcome.exit_code == 1
+    assert transcribe_calls == [10, 20]
+    assert close_calls == [True]
+    assert outcome.run_path is not None
+    snapshot = run_module.parse_oaf_corpus_run(outcome.run_path.read_bytes())
+    rows = {row["simfile_id"]: row for row in snapshot["items"]}
+    assert rows[20]["execution_disposition"] == "failed"
+    assert rows[20]["runner_failure_code"] == "worker_protocol_failed"
+    assert "execution_disposition" not in rows[30]
+
+
+ITEM_LOCAL_BACKEND_ERRORS = (
+    ("inference_failed", "inference_failed"),
+    ("invalid_request", "inference_failed"),
+    ("input_path_invalid", "canonical_input_failed"),
+    ("native_event_invalid", "inference_failed"),
+)
+POISON_BACKEND_ERRORS = (
+    "worker_error",
+    "worker_start_failed",
+    "worker_ready_invalid",
+    "worker_identity_invalid",
+    "worker_response_invalid",
+    "backend_closed",
+)
+
+
+@pytest.mark.parametrize("error_code,runner_code", ITEM_LOCAL_BACKEND_ERRORS)
+def test_named_item_local_backend_errors_attempt_later_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    runner_code: str,
+) -> None:
+    _, descriptor, _ = _install_fake_run_seams(monkeypatch, tmp_path)
+    transcribe_calls: list[int] = []
+    close_calls: list[bool] = []
+
+    class ItemLocalBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            simfile_id = int(audio.source_audio_id.split("/")[0])
+            transcribe_calls.append(simfile_id)
+            if simfile_id == 20:
+                raise OafBackendError("item-local failure", code=error_code)
+            return NativePrediction(audio=audio, descriptor=descriptor, events=())
+
+        def close(self) -> None:
+            close_calls.append(True)
+
+    outcome = run_oaf_corpus(
+        _request(tmp_path),
+        backend_factory=lambda **_: ItemLocalBackend(),
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+
+    assert outcome.exit_code == 1
+    assert transcribe_calls == [10, 20, 30]
+    assert close_calls == [True]
+    assert outcome.run_path is not None
+    import src.benchmark.oaf_corpus_run as run_module
+
+    snapshot = run_module.parse_oaf_corpus_run(outcome.run_path.read_bytes())
+    rows = {row["simfile_id"]: row for row in snapshot["items"]}
+    assert rows[20]["execution_disposition"] == "failed"
+    assert rows[20]["runner_failure_code"] == runner_code
+    assert rows[30]["execution_disposition"] == "inferred"
+
+
+@pytest.mark.parametrize(
+    "error_code,runner_code",
+    tuple(
+        (
+            code,
+            (
+                "backend_unavailable"
+                if code
+                in {
+                    "worker_start_failed",
+                    "worker_ready_invalid",
+                    "worker_identity_invalid",
+                }
+                else "worker_protocol_failed"
+            ),
+        )
+        for code in POISON_BACKEND_ERRORS
+    )
+    + (("future_worker_code", "worker_protocol_failed"),),
+)
+def test_named_and_unknown_poison_backend_errors_stop_later_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    runner_code: str,
+) -> None:
+    import src.benchmark.oaf_corpus_run as run_module
+
+    _, descriptor, _ = _install_fake_run_seams(monkeypatch, tmp_path)
+    transcribe_calls: list[int] = []
+    close_calls: list[bool] = []
+
+    class PoisonBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            simfile_id = int(audio.source_audio_id.split("/")[0])
+            transcribe_calls.append(simfile_id)
+            if simfile_id == 20:
+                raise OafBackendError("poison failure", code=error_code)
+            return NativePrediction(audio=audio, descriptor=descriptor, events=())
+
+        def close(self) -> None:
+            close_calls.append(True)
+
+    outcome = run_oaf_corpus(
+        _request(tmp_path),
+        backend_factory=lambda **_: PoisonBackend(),
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+
+    assert outcome.exit_code == 1
+    assert transcribe_calls == [10, 20]
+    assert close_calls == [True]
+    assert outcome.run_path is not None
+    snapshot = run_module.parse_oaf_corpus_run(outcome.run_path.read_bytes())
+    rows = {row["simfile_id"]: row for row in snapshot["items"]}
+    assert rows[20]["execution_disposition"] == "failed"
+    assert rows[20]["runner_failure_code"] == runner_code
+    assert "execution_disposition" not in rows[30]
+
+
+def test_backend_closes_and_final_snapshot_survives_base_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.benchmark.oaf_corpus_run as run_module
+
+    _, descriptor, _ = _install_fake_run_seams(monkeypatch, tmp_path)
+    factory_input_root: list[Path] = []
+    close_calls: list[bool] = []
+
+    class InterruptBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            del audio
+            raise KeyboardInterrupt("operator interrupted")
+
+        def close(self) -> None:
+            close_calls.append(True)
+
+    def factory(**kwargs: object) -> InterruptBackend:
+        factory_input_root.append(kwargs["input_root"])  # type: ignore[arg-type]
+        return InterruptBackend()
+
+    with pytest.raises(KeyboardInterrupt, match="operator interrupted"):
+        run_oaf_corpus(
+            _request(tmp_path),
+            backend_factory=factory,
+            perf_counter=lambda: 0.0,
+            clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+        )
+
+    assert close_calls == [True]
+    assert factory_input_root
+    run_path = factory_input_root[0].parent / "run.json"
+    assert run_path.exists()
+    snapshot = run_module.parse_oaf_corpus_run(run_path.read_bytes())
+    assert snapshot["overall_status"] == "failed"
+    assert "execution_disposition" not in snapshot["items"][0]
+    assert not (factory_input_root[0] / "10" / "full-mix.wav").exists()
+
+
+def test_resume_rejects_current_input_mismatch_and_nonresume_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.benchmark.oaf_corpus_run as run_module
+
+    _, descriptor, materialize_calls = _install_fake_run_seams(monkeypatch, tmp_path)
+    input_hash = {"value": SHA_B}
+
+    def materialize(source, output_path, *, input_root, config):
+        del input_root, config
+        materialize_calls.append(int(source.source_audio_id.split("/")[0]))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"temporary canonical wav")
+        return CanonicalAudio(
+            path=output_path,
+            source_audio_id=source.source_audio_id,
+            source_audio_sha256=source.source_audio_sha256,
+            input_view_id=OAF_FULL_MIX_INPUT_VIEW_ID,
+            input_audio_sha256=input_hash["value"],
+            byte_length=88244,
+            sample_rate=44100,
+            channel_count=1,
+            sample_width_bytes=2,
+            audio_frame_count=44100,
+        )
+
+    monkeypatch.setattr(run_module, "_materialize_oaf_full_mix", materialize)
+
+    class HealthyBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            return NativePrediction(audio=audio, descriptor=descriptor, events=())
+
+        def close(self) -> None:
+            return None
+
+    first = run_oaf_corpus(
+        _request(tmp_path),
+        backend_factory=lambda **_: HealthyBackend(),
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+    assert first.exit_code == 0
+    assert first.run_path is not None
+    first_snapshot = run_module.parse_oaf_corpus_run(first.run_path.read_bytes())
+    original_paths = {
+        row["simfile_id"]: tmp_path / "output" / row["prediction_path"]
+        for row in first_snapshot["items"]
+    }
+    original_bytes = {simfile_id: path.read_bytes() for simfile_id, path in original_paths.items()}
+
+    input_hash["value"] = "c" * 64
+    materialize_calls.clear()
+    factory_calls: list[bool] = []
+
+    def should_not_construct(**_: object) -> HealthyBackend:
+        factory_calls.append(True)
+        raise AssertionError("mismatched resume artifacts must not transcribe")
+
+    resumed = run_oaf_corpus(
+        _request(tmp_path, resume=True),
+        backend_factory=should_not_construct,
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+    assert resumed.exit_code == 1
+    assert materialize_calls == [10, 20, 30]
+    assert factory_calls == []
+    assert resumed.run_path is not None
+    resumed_snapshot = run_module.parse_oaf_corpus_run(resumed.run_path.read_bytes())
+    resumed_rows = {row["simfile_id"]: row for row in resumed_snapshot["items"]}
+    assert all(
+        row["runner_failure_code"] == "prediction_artifact_invalid" for row in resumed_rows.values()
+    )
+    for simfile_id, content in original_bytes.items():
+        assert original_paths[simfile_id].read_bytes() == content
+
+    conflict = run_oaf_corpus(
+        _request(tmp_path),
+        backend_factory=should_not_construct,
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+    assert conflict.exit_code == 1
+    assert factory_calls == []
+    assert conflict.run_path is not None
+    conflict_snapshot = run_module.parse_oaf_corpus_run(conflict.run_path.read_bytes())
+    conflict_rows = {row["simfile_id"]: row for row in conflict_snapshot["items"]}
+    assert all(
+        row["runner_failure_code"] == "prediction_output_conflict" for row in conflict_rows.values()
+    )
+    for simfile_id, content in original_bytes.items():
+        assert original_paths[simfile_id].read_bytes() == content
+
+
 def test_poison_stops_the_worker_and_resume_reuses_exact_prediction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -273,8 +654,10 @@ def test_poison_stops_the_worker_and_resume_reuses_exact_prediction(
     )
     config = load_model_config()
     descriptor = _expected_oaf_descriptor(config)
+    materialize_calls: list[int] = []
 
     def materialize(source, output_path, *, input_root, config):
+        materialize_calls.append(int(source.source_audio_id.split("/")[0]))
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(b"temporary canonical wav")
         return CanonicalAudio(
@@ -321,6 +704,7 @@ def test_poison_stops_the_worker_and_resume_reuses_exact_prediction(
 
     assert first.exit_code == 1
     assert first_calls == [10, 20]
+    assert materialize_calls == [10, 20]
     assert first.run_path is not None
     first_snapshot = run_module.parse_oaf_corpus_run(first.run_path.read_bytes())
     first_rows = {row["simfile_id"]: row for row in first_snapshot["items"]}
@@ -345,6 +729,7 @@ def test_poison_stops_the_worker_and_resume_reuses_exact_prediction(
             second_calls.append(int(audio.source_audio_id.split("/")[0]))
             return NativePrediction(audio=audio, descriptor=descriptor, events=())
 
+    materialize_calls.clear()
     second = run_oaf_corpus(
         OafCorpusRunRequest(
             reference_manifest_path=tmp_path / "reference.jsonl",
@@ -360,4 +745,5 @@ def test_poison_stops_the_worker_and_resume_reuses_exact_prediction(
 
     assert second.exit_code == 0
     assert second_calls == [20, 30]
+    assert materialize_calls == [10, 20, 30]
     assert first_artifact_path.read_bytes() == first_artifact
