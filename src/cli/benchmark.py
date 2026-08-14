@@ -613,6 +613,97 @@ def build_reference_set_command(
         ctx.exit(outcome.exit_code)
 
 
+@benchmark.command("run-oaf-corpus")
+@click.option(
+    "--manifest",
+    "reference_manifest_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required path to an immutable local HPA-324 reference-set manifest (JSONL).",
+)
+@click.option(
+    "--timing-manifest",
+    "timing_manifest_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required path to the source HPA-323 reference-timing manifest (JSONL).",
+)
+@click.option(
+    "--cache-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+    help="Required local HPA-321 corpus/audio cache root.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+    help="Directory where the OaF corpus run and reports are written.",
+)
+@click.option(
+    "--include-simfile-id",
+    "include_simfile_ids",
+    type=click.IntRange(0, MAX_SIMFILE_ID),
+    multiple=True,
+)
+@click.option(
+    "--exclude-simfile-id",
+    "exclude_simfile_ids",
+    type=click.IntRange(0, MAX_SIMFILE_ID),
+    multiple=True,
+)
+@click.option("--resume", is_flag=True)
+@click.pass_context
+def run_oaf_corpus_command(
+    ctx: click.Context,
+    reference_manifest_path: Path,
+    timing_manifest_path: Path,
+    cache_dir: Path,
+    output_dir: Path,
+    include_simfile_ids: tuple[int, ...],
+    exclude_simfile_ids: tuple[int, ...],
+    resume: bool,
+) -> None:
+    """Run the validated OaF backend over an HPA-324 corpus scope."""
+    from src.benchmark.oaf_corpus_run import OafCorpusRunRequest, run_oaf_corpus
+
+    outcome = run_oaf_corpus(
+        OafCorpusRunRequest(
+            reference_manifest_path=reference_manifest_path,
+            timing_manifest_path=timing_manifest_path,
+            cache_dir=cache_dir,
+            output_dir=output_dir,
+            include_simfile_ids=include_simfile_ids,
+            exclude_simfile_ids=exclude_simfile_ids,
+            resume=resume,
+        )
+    )
+    payload = {
+        "aggregate_rtf": (
+            None if outcome.aggregate_rtf is None else quantize_six(outcome.aggregate_rtf)
+        ),
+        "exit_code": outcome.exit_code,
+        "failed_count": outcome.failed_count,
+        "projected_full_wall_time_sec": (
+            None
+            if outcome.projected_full_wall_time_sec is None
+            else quantize_six(outcome.projected_full_wall_time_sec)
+        ),
+        "quarantined_count": outcome.quarantined_count,
+        "reports_path": None if outcome.reports_path is None else str(outcome.reports_path),
+        "run_id": outcome.run_id,
+        "run_path": None if outcome.run_path is None else str(outcome.run_path),
+        "skipped_count": outcome.skipped_count,
+        "status": outcome.overall_status,
+        "success_count": outcome.success_count,
+    }
+    standard_output = click.get_binary_stream("stdout")
+    standard_output.write(canonical_json_bytes(payload, trailing_newline=True))
+    standard_output.flush()
+    if outcome.exit_code:
+        ctx.exit(outcome.exit_code)
+
+
 @benchmark.command("sync-r2-corpus")
 @click.option(
     "--cache-dir",
