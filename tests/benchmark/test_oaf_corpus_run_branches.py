@@ -160,6 +160,17 @@ def _canonical_audio(source_audio_id: str = "10/audio.wav") -> CanonicalAudio:
     )
 
 
+def _resolved_source(
+    *, source_audio_id: str = "10/audio.wav", source_audio_sha256: str = SHA_A
+) -> ResolvedSourceAudio:
+    return ResolvedSourceAudio(
+        path=Path("/tmp/s.wav"),
+        source_audio_id=source_audio_id,
+        source_audio_sha256=source_audio_sha256,
+        duration_sec=1.0,
+    )
+
+
 def _native_prediction(audio: CanonicalAudio, descriptor: BackendDescriptor) -> NativePrediction:
     return NativePrediction(audio=audio, descriptor=descriptor, events=())
 
@@ -1181,12 +1192,7 @@ def test_read_existing_prediction_returns_true_none_on_os_error(
 def test_prediction_artifact_matches_rejects_descriptor_sha_mismatch() -> None:
     descriptor = _descriptor()
     artifact = _prediction_artifact(descriptor=descriptor)
-    source = ResolvedSourceAudio(
-        path=Path("/tmp/s.wav"),
-        source_audio_id="10/audio.wav",
-        source_audio_sha256=SHA_A,
-        duration_sec=1.0,
-    )
+    source = _resolved_source()
     wrong_descriptor = replace(descriptor, sha256=SHA_C)
     assert not _prediction_artifact_matches(
         artifact, source=source, audio=_canonical_audio(), descriptor=wrong_descriptor
@@ -1196,12 +1202,7 @@ def test_prediction_artifact_matches_rejects_descriptor_sha_mismatch() -> None:
 def test_prediction_artifact_matches_rejects_descriptor_payload_mismatch() -> None:
     descriptor = _descriptor()
     artifact = _prediction_artifact(descriptor=descriptor)
-    source = ResolvedSourceAudio(
-        path=Path("/tmp/s.wav"),
-        source_audio_id="10/audio.wav",
-        source_audio_sha256=SHA_A,
-        duration_sec=1.0,
-    )
+    source = _resolved_source()
     wrong_descriptor = replace(descriptor, payload={**descriptor.payload, "model_id": "other"})
     assert not _prediction_artifact_matches(
         artifact, source=source, audio=_canonical_audio(), descriptor=wrong_descriptor
@@ -1212,12 +1213,7 @@ def test_prediction_artifact_matches_rejects_source_audio_id_mismatch() -> None:
     descriptor = _descriptor()
     audio = _canonical_audio(source_audio_id="10/audio.wav")
     artifact = _prediction_artifact(audio=audio, descriptor=descriptor)
-    source = ResolvedSourceAudio(
-        path=Path("/tmp/s.wav"),
-        source_audio_id="99/audio.wav",
-        source_audio_sha256=SHA_A,
-        duration_sec=1.0,
-    )
+    source = _resolved_source(source_audio_id="99/audio.wav")
     assert not _prediction_artifact_matches(
         artifact, source=source, audio=audio, descriptor=descriptor
     )
@@ -1227,12 +1223,7 @@ def test_prediction_artifact_matches_rejects_source_sha_mismatch() -> None:
     descriptor = _descriptor()
     audio = _canonical_audio()
     artifact = _prediction_artifact(audio=audio, descriptor=descriptor)
-    source = ResolvedSourceAudio(
-        path=Path("/tmp/s.wav"),
-        source_audio_id="10/audio.wav",
-        source_audio_sha256=SHA_C,
-        duration_sec=1.0,
-    )
+    source = _resolved_source(source_audio_sha256=SHA_C)
     assert not _prediction_artifact_matches(
         artifact, source=source, audio=audio, descriptor=descriptor
     )
@@ -1242,12 +1233,7 @@ def test_prediction_artifact_matches_rejects_input_view_mismatch() -> None:
     descriptor = _descriptor()
     audio = _canonical_audio()
     artifact = _prediction_artifact(audio=audio, descriptor=descriptor)
-    source = ResolvedSourceAudio(
-        path=Path("/tmp/s.wav"),
-        source_audio_id="10/audio.wav",
-        source_audio_sha256=SHA_A,
-        duration_sec=1.0,
-    )
+    source = _resolved_source()
     wrong_audio = replace(audio, input_view_id="other/v1")
     assert not _prediction_artifact_matches(
         artifact, source=source, audio=wrong_audio, descriptor=descriptor
@@ -1258,12 +1244,7 @@ def test_prediction_artifact_matches_rejects_input_sha_mismatch() -> None:
     descriptor = _descriptor()
     audio = _canonical_audio()
     artifact = _prediction_artifact(audio=audio, descriptor=descriptor)
-    source = ResolvedSourceAudio(
-        path=Path("/tmp/s.wav"),
-        source_audio_id="10/audio.wav",
-        source_audio_sha256=SHA_A,
-        duration_sec=1.0,
-    )
+    source = _resolved_source()
     wrong_audio = replace(audio, input_audio_sha256=SHA_C)
     assert not _prediction_artifact_matches(
         artifact, source=source, audio=wrong_audio, descriptor=descriptor
@@ -1275,12 +1256,7 @@ def test_prediction_artifact_matches_rejects_audio_source_id_mismatch() -> None:
     descriptor = _descriptor()
     audio = _canonical_audio(source_audio_id="10/audio.wav")
     artifact = _prediction_artifact(audio=audio, descriptor=descriptor)
-    source = ResolvedSourceAudio(
-        path=Path("/tmp/s.wav"),
-        source_audio_id="10/audio.wav",
-        source_audio_sha256=SHA_A,
-        duration_sec=1.0,
-    )
+    source = _resolved_source()
     mismatched_audio = replace(audio, source_audio_id="99/audio.wav")
     assert not _prediction_artifact_matches(
         artifact, source=source, audio=mismatched_audio, descriptor=descriptor
@@ -1292,12 +1268,7 @@ def test_prediction_artifact_matches_rejects_audio_source_sha_mismatch() -> None
     descriptor = _descriptor()
     audio = _canonical_audio()
     artifact = _prediction_artifact(audio=audio, descriptor=descriptor)
-    source = ResolvedSourceAudio(
-        path=Path("/tmp/s.wav"),
-        source_audio_id="10/audio.wav",
-        source_audio_sha256=SHA_A,
-        duration_sec=1.0,
-    )
+    source = _resolved_source()
     mismatched_audio = replace(audio, source_audio_sha256=SHA_C)
     assert not _prediction_artifact_matches(
         artifact, source=source, audio=mismatched_audio, descriptor=descriptor
@@ -1613,12 +1584,7 @@ def test_prediction_artifact_matches_rejects_non_oaf_input_view() -> None:
     mapped = _mapped_prediction(audio=audio, descriptor=descriptor)
     wrong = replace(mapped, audio=replace(audio, input_view_id="other/v1"))
     artifact = read_prediction_artifact(render_prediction_artifact(wrong))
-    source = ResolvedSourceAudio(
-        path=Path("/tmp/s.wav"),
-        source_audio_id="10/audio.wav",
-        source_audio_sha256=SHA_A,
-        duration_sec=1.0,
-    )
+    source = _resolved_source()
     assert not _prediction_artifact_matches(
         artifact, source=source, audio=audio, descriptor=descriptor
     )
@@ -2223,9 +2189,10 @@ def test_run_oaf_corpus_prediction_publish_failure_marks_item_failed(
     assert outcome.failed_count == 1
 
 
-def test_run_oaf_corpus_unexpected_exception_is_fatal(
+def test_run_oaf_corpus_base_exception_propagates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A BaseException (e.g. KeyboardInterrupt) during materialization propagates."""
     import src.benchmark.oaf_corpus_run as run_module
     from src.benchmark.oaf_corpus_run import run_oaf_corpus
 
@@ -2278,15 +2245,11 @@ def test_run_oaf_corpus_final_snapshot_parse_failure_returns_fatal(
     descriptor = _descriptor()
 
     real_checkpoint = run_module._write_snapshot_checkpoint
-    call_count = 0
 
-    def corrupt_final_checkpoint(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        real_checkpoint(*args, **kwargs)
+    def corrupt_final_checkpoint(run_path, header, items, **kwargs):
+        real_checkpoint(run_path, header, items, **kwargs)
         # Corrupt the run.json after the final checkpoint write
-        if call_count >= 4:
-            run_path = args[0]
+        if kwargs.get("overall_status") is not None:
             run_path.write_bytes(b"corrupt\n")
 
     monkeypatch.setattr(run_module, "_write_snapshot_checkpoint", corrupt_final_checkpoint)
@@ -2304,7 +2267,7 @@ def test_run_oaf_corpus_final_snapshot_parse_failure_returns_fatal(
 def test_run_oaf_corpus_non_resume_existing_prediction_is_conflict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A pre-existing prediction artifact without resume marks the item failed (line 1693)."""
+    """A pre-existing prediction artifact without resume marks the item failed as a conflict."""
     from src.benchmark.oaf_corpus_run import run_oaf_corpus
 
     _install_run_seams(monkeypatch, tmp_path)
@@ -2330,7 +2293,7 @@ def test_run_oaf_corpus_non_resume_existing_prediction_is_conflict(
 def test_run_oaf_corpus_resume_existing_unreadable_prediction_is_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Resume with an unreadable prediction artifact marks the item failed (line 1700)."""
+    """Resume with an unreadable prediction artifact marks the item failed."""
     import src.benchmark.oaf_corpus_run as run_module
     from src.benchmark.oaf_corpus_run import run_oaf_corpus
 
@@ -2371,7 +2334,7 @@ def test_run_oaf_corpus_resume_existing_unreadable_prediction_is_failed(
 def test_run_oaf_corpus_resume_existing_corrupt_prediction_is_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Resume with a corrupt prediction artifact marks the item failed (line 1706)."""
+    """Resume with a corrupt prediction artifact marks the item failed."""
     from src.benchmark.oaf_corpus_run import run_oaf_corpus
 
     _install_run_seams(monkeypatch, tmp_path)
@@ -2402,7 +2365,7 @@ def test_run_oaf_corpus_resume_existing_corrupt_prediction_is_failed(
 def test_run_oaf_corpus_resume_artifact_mismatch_run_evidence_is_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Resume with an artifact that doesn't match persisted run evidence is failed (line 1724)."""
+    """Resume with an artifact that doesn't match persisted run evidence is failed."""
     from src.benchmark.oaf_corpus_run import run_oaf_corpus
 
     _install_run_seams(monkeypatch, tmp_path)
@@ -2435,24 +2398,25 @@ def test_run_oaf_corpus_resume_artifact_mismatch_run_evidence_is_failed(
 def test_run_oaf_corpus_checkpoint_failure_during_canonical_is_fatal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A checkpoint write failure during canonical input materialization is fatal (line 1681)."""
+    """A checkpoint write failure after source resolution is fatal."""
     import src.benchmark.oaf_corpus_run as run_module
     from src.benchmark.oaf_corpus_run import run_oaf_corpus
 
     _install_run_seams(monkeypatch, tmp_path)
     descriptor = _descriptor()
 
-    call_count = 0
     real_checkpoint = run_module._write_snapshot_checkpoint
 
-    def fail_on_second(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 2:
+    def fail_after_source_resolution(run_path, header, items, **kwargs):
+        items_list = list(items)
+        has_source_sha = any("source_audio_sha256" in item for item in items_list)
+        has_disposition = any("execution_disposition" in item for item in items_list)
+        is_final = kwargs.get("overall_status") is not None
+        if has_source_sha and not has_disposition and not is_final:
             raise OSError("checkpoint write failed")
-        return real_checkpoint(*args, **kwargs)
+        return real_checkpoint(run_path, header, items_list, **kwargs)
 
-    monkeypatch.setattr(run_module, "_write_snapshot_checkpoint", fail_on_second)
+    monkeypatch.setattr(run_module, "_write_snapshot_checkpoint", fail_after_source_resolution)
 
     outcome = run_oaf_corpus(
         _request(tmp_path),
@@ -2467,7 +2431,7 @@ def test_run_oaf_corpus_checkpoint_failure_during_canonical_is_fatal(
 def test_run_oaf_corpus_initial_checkpoint_failure_is_fatal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A checkpoint write failure during initial snapshot is fatal (line 1598)."""
+    """A checkpoint write failure during the initial snapshot is fatal."""
     import src.benchmark.oaf_corpus_run as run_module
     from src.benchmark.oaf_corpus_run import run_oaf_corpus
 
@@ -2492,24 +2456,24 @@ def test_run_oaf_corpus_initial_checkpoint_failure_is_fatal(
 def test_run_oaf_corpus_source_checkpoint_failure_is_fatal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A checkpoint write failure after source resolution is fatal (line 1643)."""
+    """A checkpoint write failure after prediction handling is fatal."""
     import src.benchmark.oaf_corpus_run as run_module
     from src.benchmark.oaf_corpus_run import run_oaf_corpus
 
     _install_run_seams(monkeypatch, tmp_path)
     descriptor = _descriptor()
 
-    call_count = 0
     real_checkpoint = run_module._write_snapshot_checkpoint
 
-    def fail_on_third(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 3:
+    def fail_after_prediction_handling(run_path, header, items, **kwargs):
+        items_list = list(items)
+        has_disposition = any("execution_disposition" in item for item in items_list)
+        is_final = kwargs.get("overall_status") is not None
+        if has_disposition and not is_final:
             raise OSError("checkpoint write failed")
-        return real_checkpoint(*args, **kwargs)
+        return real_checkpoint(run_path, header, items_list, **kwargs)
 
-    monkeypatch.setattr(run_module, "_write_snapshot_checkpoint", fail_on_third)
+    monkeypatch.setattr(run_module, "_write_snapshot_checkpoint", fail_after_prediction_handling)
 
     outcome = run_oaf_corpus(
         _request(tmp_path),
@@ -2524,24 +2488,21 @@ def test_run_oaf_corpus_source_checkpoint_failure_is_fatal(
 def test_run_oaf_corpus_final_checkpoint_failure_is_fatal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A checkpoint write failure during the final checkpoint is fatal (line 1833)."""
+    """A checkpoint write failure during the final checkpoint is fatal."""
     import src.benchmark.oaf_corpus_run as run_module
     from src.benchmark.oaf_corpus_run import run_oaf_corpus
 
     _install_run_seams(monkeypatch, tmp_path)
     descriptor = _descriptor()
 
-    call_count = 0
     real_checkpoint = run_module._write_snapshot_checkpoint
 
-    def fail_on_last(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count >= 4:
+    def fail_final_checkpoint(run_path, header, items, **kwargs):
+        if kwargs.get("overall_status") is not None:
             raise OSError("checkpoint write failed")
-        return real_checkpoint(*args, **kwargs)
+        return real_checkpoint(run_path, header, items, **kwargs)
 
-    monkeypatch.setattr(run_module, "_write_snapshot_checkpoint", fail_on_last)
+    monkeypatch.setattr(run_module, "_write_snapshot_checkpoint", fail_final_checkpoint)
 
     outcome = run_oaf_corpus(
         _request(tmp_path),
@@ -2556,7 +2517,7 @@ def test_run_oaf_corpus_final_checkpoint_failure_is_fatal(
 def test_run_oaf_corpus_checkpoint_failure_during_canonical_failure_is_fatal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A checkpoint failure during canonical input failure handling is fatal (line 1681)."""
+    """A checkpoint failure during canonical input failure handling is fatal."""
     import src.benchmark.oaf_corpus_run as run_module
     from src.benchmark.oaf_corpus_run import run_oaf_corpus
 
@@ -2568,17 +2529,17 @@ def test_run_oaf_corpus_checkpoint_failure_during_canonical_failure_is_fatal(
 
     monkeypatch.setattr(run_module, "_materialize_oaf_full_mix", fail_materialize)
 
-    call_count = 0
     real_checkpoint = run_module._write_snapshot_checkpoint
 
-    def fail_on_third(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 3:
+    def fail_after_canonical_failure(run_path, header, items, **kwargs):
+        items_list = list(items)
+        has_disposition = any("execution_disposition" in item for item in items_list)
+        is_final = kwargs.get("overall_status") is not None
+        if has_disposition and not is_final:
             raise OSError("checkpoint write failed")
-        return real_checkpoint(*args, **kwargs)
+        return real_checkpoint(run_path, header, items_list, **kwargs)
 
-    monkeypatch.setattr(run_module, "_write_snapshot_checkpoint", fail_on_third)
+    monkeypatch.setattr(run_module, "_write_snapshot_checkpoint", fail_after_canonical_failure)
 
     outcome = run_oaf_corpus(
         _request(tmp_path),
@@ -2593,7 +2554,7 @@ def test_run_oaf_corpus_checkpoint_failure_during_canonical_failure_is_fatal(
 def test_run_oaf_corpus_clock_failure_during_completion_is_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A clock failure during completion timestamp downgrades to failed (line 1876)."""
+    """A clock failure during completion timestamp downgrades to failed."""
     from src.benchmark.oaf_corpus_run import run_oaf_corpus
 
     _install_run_seams(monkeypatch, tmp_path)
@@ -2621,7 +2582,7 @@ def test_run_oaf_corpus_clock_failure_during_completion_is_failed(
 def test_run_oaf_corpus_scoring_failure_is_fatal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A scoring failure returns a fatal outcome (line 1896)."""
+    """A scoring failure returns a fatal outcome."""
     import src.benchmark.oaf_corpus_run as run_module
     from src.benchmark.oaf_corpus_run import run_oaf_corpus
 
@@ -2646,7 +2607,7 @@ def test_run_oaf_corpus_scoring_failure_is_fatal(
 def test_run_oaf_corpus_worker_start_failure_is_poison(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A worker start failure (non-OafBackendError) is wrapped and poisons the run (line 1778)."""
+    """A worker start failure (non-OafBackendError) is wrapped and poisons the run."""
     from src.benchmark.oaf_corpus_run import run_oaf_corpus
 
     _install_run_seams(monkeypatch, tmp_path)
@@ -2666,7 +2627,7 @@ def test_run_oaf_corpus_worker_start_failure_is_poison(
 def test_run_oaf_corpus_generic_exception_during_prediction_is_fatal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A generic Exception during prediction handling is fatal (line 1824)."""
+    """A generic Exception during prediction handling is fatal."""
     from src.benchmark.oaf_corpus_run import run_oaf_corpus
 
     _install_run_seams(monkeypatch, tmp_path)
@@ -2692,7 +2653,7 @@ def test_run_oaf_corpus_generic_exception_during_prediction_is_fatal(
 def test_run_oaf_corpus_prediction_artifact_invalid_exception_is_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A TypeError during prediction publishing marks the item failed (line 1822)."""
+    """A TypeError during prediction publishing marks the item failed."""
     import src.benchmark.oaf_corpus_run as run_module
     from src.benchmark.oaf_corpus_run import run_oaf_corpus
 
@@ -2716,7 +2677,7 @@ def test_run_oaf_corpus_prediction_artifact_invalid_exception_is_failed(
 def test_run_oaf_corpus_unexpected_exception_during_scoring_is_fatal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An unexpected exception during scoring with interrupted_error re-raises (line 1925)."""
+    """An unexpected exception during scoring with interrupted_error re-raises."""
     import src.benchmark.oaf_corpus_run as run_module
     from src.benchmark.oaf_corpus_run import run_oaf_corpus
 
