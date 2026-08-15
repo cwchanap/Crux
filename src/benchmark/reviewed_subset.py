@@ -14,30 +14,49 @@ HPA-327 Task 4 adds the deterministic pre-score candidate selection
 (:func:`build_candidate_stream`), the review-CSV preparation entrypoint
 (:func:`prepare_reviewed_subset`), and the optional prior-ledger continuation
 that preserves valid completed include reviews while replacing the rest from
-the same deterministic stream.
+the same deterministic stream.  HPA-327 Task 5 adds the finalization
+entrypoint (:func:`finalize_reviewed_subset`) that re-runs the same slate
+reproduction, validates the completed manual reviews, and publishes the
+canonical complete review ledger plus the accepted subset manifest.
+
+Selection metrics publish as canonical quantize-six string tokens (the same
+CSV display token) because the shared manifest rail cannot round-trip
+fractional JSON numbers.
 """
 
 from __future__ import annotations
 
 import csv
 import io
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal
+from datetime import datetime, timezone
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from hashlib import sha256
 from pathlib import Path
 from typing import Literal, get_args
 
 from src.benchmark.backend_identity import (
+    SIX_PLACES,
     StrictJsonError,
     canonical_json_bytes,
     quantize_six,
     require_sha256,
     strict_json_loads,
 )
-from src.benchmark.corpus_manifest import render_manifest
-from src.benchmark.r2_corpus_models import MAX_SIMFILE_ID, parse_manifest_timestamp
+from src.benchmark.corpus_manifest import (
+    ManifestPublicationError,
+    publish_latest_manifest,
+    publish_manifest,
+    render_manifest,
+)
+from src.benchmark.durability import atomic_replace_bytes, ensure_durable_directory
+from src.benchmark.r2_corpus_models import (
+    MAX_SIMFILE_ID,
+    PublishedManifest,
+    format_manifest_timestamp,
+    parse_manifest_timestamp,
+)
 from src.benchmark.reference_set_manifest import (
     LoadedReferenceSetManifest,
     ReferenceMappingResult,
@@ -177,8 +196,8 @@ class ReviewedSubsetRowView:
     simfile_id: int
     candidate_rank: int
     common_event_count: int
-    reference_event_span_sec: float
-    common_event_density_per_sec: float
+    reference_event_span_sec: Decimal
+    common_event_density_per_sec: Decimal
     common_class_count: int
     density_band: Band
     class_richness_band: Band
@@ -276,16 +295,26 @@ def _is_corpus_version(value: object) -> bool:
     return True
 
 
-def _is_metric_number(value: object) -> bool:
-    # The canonical renderer collapses whole-number Decimals to integer tokens
-    # and strict_json_loads parses integer tokens back as ``int``; both are
-    # legitimate for a metric field.
-    return (
-        not isinstance(value, bool)
-        and isinstance(value, (int, Decimal))
-        and math.isfinite(float(value))
-        and float(value) >= 0
-    )
+def _is_metric_token(value: object) -> bool:
+    """Whether ``value`` is a canonical quantize-six metric string token.
+
+    The shared manifest rail cannot round-trip fractional JSON numbers
+    (``strict_json_loads`` parses them as ``Decimal`` and the canonical line
+    writer is float-based), so span/density metrics publish as the exact CSV
+    display token: parse as Decimal, quantize to six places, re-render, and
+    require the byte-identical canonical form.
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation:
+        return False
+    if not parsed.is_finite() or parsed < 0:
+        return False
+    return value == canonical_json_bytes(
+        parsed.quantize(SIX_PLACES, rounding=ROUND_HALF_EVEN)
+    ).decode("ascii")
 
 
 def _validate_reviewed_subset_row(row: Mapping[str, object]) -> None:
@@ -342,7 +371,7 @@ def _validate_reviewed_subset_row(row: Mapping[str, object]) -> None:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError("reviewed subset manifest row has invalid event counts")
     for field in ("reference_event_span_sec", "common_event_density_per_sec"):
-        if not _is_metric_number(row[field]):
+        if not _is_metric_token(row[field]):
             raise ValueError("reviewed subset manifest row has invalid selection metrics")
 
     for field in ("density_band", "class_richness_band"):
@@ -387,8 +416,8 @@ def _reviewed_subset_row_view_from_row(row: Mapping[str, object]) -> ReviewedSub
         simfile_id=row["simfile_id"],  # type: ignore[arg-type]
         candidate_rank=row["candidate_rank"],  # type: ignore[arg-type]
         common_event_count=row["common_event_count"],  # type: ignore[arg-type]
-        reference_event_span_sec=float(row["reference_event_span_sec"]),  # type: ignore[arg-type]
-        common_event_density_per_sec=float(row["common_event_density_per_sec"]),  # type: ignore[arg-type]
+        reference_event_span_sec=Decimal(row["reference_event_span_sec"]),  # type: ignore[arg-type]
+        common_event_density_per_sec=Decimal(row["common_event_density_per_sec"]),  # type: ignore[arg-type]
         common_class_count=row["common_class_count"],  # type: ignore[arg-type]
         density_band=row["density_band"],  # type: ignore[arg-type]
         class_richness_band=row["class_richness_band"],  # type: ignore[arg-type]
@@ -460,20 +489,11 @@ def load_reviewed_subset_manifest(path: Path) -> LoadedReviewedSubsetManifest:
             candidate_ranks.add(view.candidate_rank)
             rows.append(LoadedReviewedSubsetRow(source_row=source_row, view=view))
 
-    try:
-        canonical = read_canonical_manifest_core(
-            path,
-            schema_version=REVIEWED_REFERENCE_SUBSET_SCHEMA,
-            validate_rows=validate_rows,
-        )
-    except TypeError:
-        # The shared core re-renders parsed rows through ``render_manifest``,
-        # whose canonical line writer cannot serialize the Decimal values that
-        # ``strict_json_loads`` produces for fractional JSON numbers.  Surface
-        # that round-trip ceiling as a load error instead of a crash.
-        # ponytail: whole-number metrics only until render_manifest grows a
-        # Decimal-aware line writer (canonical_json_bytes already has one).
-        raise ValueError("reviewed subset manifest contains unsupported numeric values") from None
+    canonical = read_canonical_manifest_core(
+        path,
+        schema_version=REVIEWED_REFERENCE_SUBSET_SCHEMA,
+        validate_rows=validate_rows,
+    )
 
     row_count = len(rows)
     if not REVIEW_MIN_COUNT <= row_count <= REVIEW_MAX_COUNT:
@@ -785,62 +805,99 @@ def _parse_prior_ledger(content: bytes) -> dict[int, _PriorReview]:
     return reviews
 
 
+@dataclass(frozen=True)
+class FinalizeReviewedSubsetRequest:
+    reference_manifest_path: Path
+    timing_manifest_path: Path
+    review_file: Path
+    output_dir: Path
+    prior_ledger_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class FinalizeReviewedSubsetOutcome:
+    exit_code: Literal[0, 2]
+    manifest: PublishedManifest | None
+    review_ledger_path: Path | None
+    included_count: int
+    excluded_count: int
+
+
+def _current_candidate_slate(
+    reference_manifest_path: Path,
+    timing_manifest_path: Path,
+    prior_ledger_path: Path | None,
+) -> tuple[tuple[ReviewCandidate, ...], dict[int, dict[str, str]], str]:
+    """Reproduce the current candidate slate exactly as preparation would.
+
+    Loads HPA-323/HPA-324 through their canonical loaders, reconstructs the
+    reference mappings once, builds the deterministic seeded stream, and
+    applies the optional prior-ledger continuation (carry forward unchanged
+    valid includes, consume unchanged excludes, replace from the stream).
+    Returns the slate in rank order, the carried manual fields by simfile ID
+    (empty when no prior ledger), and the prior-ledger SHA-256 (``""`` when
+    none).  Both prepare and finalize call this so continuation membership
+    and ranks come from a single implementation.
+    """
+    reference = load_reference_set_manifest(reference_manifest_path)
+    timing = load_reference_timing_manifest(timing_manifest_path)
+    mappings = preflight_reference_mappings(
+        reference,
+        timing,
+        timing_output_root=timing_manifest_path.parent.parent,
+    )
+    stream = build_candidate_stream(reference, timing, mappings=mappings)
+    if len(stream) < REVIEW_MIN_COUNT:
+        raise ValueError("eligible population is below the review minimum")
+
+    if prior_ledger_path is None:
+        return stream[:REVIEW_TARGET_COUNT], {}, ""
+
+    prior_bytes = prior_ledger_path.read_bytes()
+    prior_ledger_sha256 = sha256(prior_bytes).hexdigest()
+    prior_reviews = _parse_prior_ledger(prior_bytes)
+    current = {candidate.simfile_id: candidate for candidate in stream}
+    consumed: set[int] = set()
+    carried: list[tuple[ReviewCandidate, dict[str, str]]] = []
+    for prior_id, prior in prior_reviews.items():
+        candidate = current.get(prior_id)
+        if candidate is None or candidate.source_row_sha256 != prior.source_row_sha256:
+            continue
+        if prior.decision is None:
+            continue
+        consumed.add(prior_id)
+        if prior.decision == "include":
+            carried.append((candidate, prior.manual))
+    selected = [candidate for candidate, _ in carried]
+    for candidate in stream:
+        if candidate.simfile_id in consumed:
+            continue
+        if len(selected) >= REVIEW_TARGET_COUNT:
+            break
+        selected.append(candidate)
+    if len(selected) < REVIEW_MIN_COUNT:
+        raise ValueError("continuation population is below the review minimum")
+    carried_manual = {candidate.simfile_id: manual for candidate, manual in carried}
+    return tuple(selected), carried_manual, prior_ledger_sha256
+
+
 def prepare_reviewed_subset(
     request: PrepareReviewedSubsetRequest,
 ) -> PrepareReviewedSubsetOutcome:
     """Prepare the deterministic HPA-327 review CSV for the request.
 
-    Loads HPA-323/HPA-324 through their canonical loaders, reconstructs the
-    reference mappings once through :func:`preflight_reference_mappings`, and
-    selects the first ``REVIEW_TARGET_COUNT`` candidates of the deterministic
-    stream.  With ``prior_ledger_path`` the prior CSV is parsed by simfile ID
-    and its unchanged valid include reviews are carried forward (in previous
-    relative order) while unchanged excludes are consumed; the remaining slots
-    come from the next unused stream candidates, and fresh ranks ``1..N`` are
-    assigned.  Any lineage/population/continuation/write failure exits 2.
+    Delegates slate reproduction to :func:`_current_candidate_slate` (shared
+    with finalization) and renders the current slate: fresh ranks ``1..N`` in
+    slate order, prior-ledger SHA in every row, carried include reviews
+    pre-filled, remaining manual cells empty.  Any
+    lineage/population/continuation/write failure exits 2.
     """
-    carried: list[tuple[ReviewCandidate, dict[str, str]]] = []
-    prior_ledger_sha256 = ""
     try:
-        reference = load_reference_set_manifest(request.reference_manifest_path)
-        timing = load_reference_timing_manifest(request.timing_manifest_path)
-        mappings = preflight_reference_mappings(
-            reference,
-            timing,
-            timing_output_root=request.timing_manifest_path.parent.parent,
+        selected, carried_manual, prior_ledger_sha256 = _current_candidate_slate(
+            request.reference_manifest_path,
+            request.timing_manifest_path,
+            request.prior_ledger_path,
         )
-        stream = build_candidate_stream(reference, timing, mappings=mappings)
-        if len(stream) < REVIEW_MIN_COUNT:
-            raise ValueError("eligible population is below the review minimum")
-
-        if request.prior_ledger_path is not None:
-            prior_bytes = request.prior_ledger_path.read_bytes()
-            prior_ledger_sha256 = sha256(prior_bytes).hexdigest()
-            prior_reviews = _parse_prior_ledger(prior_bytes)
-            current = {candidate.simfile_id: candidate for candidate in stream}
-            consumed: set[int] = set()
-            for prior_id, prior in prior_reviews.items():
-                candidate = current.get(prior_id)
-                if candidate is None or candidate.source_row_sha256 != prior.source_row_sha256:
-                    continue
-                if prior.decision is None:
-                    continue
-                consumed.add(prior_id)
-                if prior.decision == "include":
-                    carried.append((candidate, prior.manual))
-            selected = [candidate for candidate, _ in carried]
-            for candidate in stream:
-                if candidate.simfile_id in consumed:
-                    continue
-                if len(selected) >= REVIEW_TARGET_COUNT:
-                    break
-                selected.append(candidate)
-            if len(selected) < REVIEW_MIN_COUNT:
-                raise ValueError("continuation population is below the review minimum")
-        else:
-            selected = list(stream[:REVIEW_TARGET_COUNT])
-
-        carried_by_id = {candidate.simfile_id: manual for candidate, manual in carried}
         with request.output_file.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(
                 handle,
@@ -854,7 +911,7 @@ def prepare_reviewed_subset(
                     rank=rank,
                     prior_ledger_sha256=prior_ledger_sha256,
                 )
-                row.update(carried_by_id.get(candidate.simfile_id, {}))
+                row.update(carried_manual.get(candidate.simfile_id, {}))
                 writer.writerow(row)
     except (OSError, ValueError):
         return PrepareReviewedSubsetOutcome(
@@ -868,6 +925,262 @@ def prepare_reviewed_subset(
         exit_code=0,
         output_file=request.output_file,
         candidate_count=len(selected),
-        carried_include_count=len(carried),
-        replacement_count=len(selected) - len(carried),
+        carried_include_count=len(carried_manual),
+        replacement_count=len(selected) - len(carried_manual),
+    )
+
+
+def _parse_reviewed_at(value: str) -> datetime:
+    """Parse an RFC3339 UTC timestamp, canonicalizing ``+00:00`` to ``Z``."""
+    if value.endswith("+00:00"):
+        value = value[:-6] + "Z"
+    try:
+        return parse_manifest_timestamp(value)
+    except ValueError:
+        raise ValueError("reviewed_at must be an RFC3339 UTC timestamp") from None
+
+
+@dataclass(frozen=True)
+class _CompletedReview:
+    simfile_id: int
+    reviewer: str
+    reviewed_at: datetime
+    confirmations: tuple[Literal["true", "false"], ...]
+    musical_fidelity: MusicalFidelity
+    drum_character: DrumCharacter
+    known_limitations: str
+    decision: Literal["include", "exclude"]
+    reason_codes: tuple[ReviewReasonCode, ...]
+    notes: str
+
+
+def _parse_completed_reasons(value: str) -> tuple[str, ...]:
+    if not value:
+        return ()
+    reasons = tuple(value.split(";"))
+    if any(reason not in _REASON_CODES for reason in reasons):
+        raise ValueError("review file contains an invalid reason code")
+    return tuple(sorted(set(reasons)))
+
+
+def _parse_completed_review_row(
+    simfile_id: int,
+    manual: Mapping[str, str],
+) -> _CompletedReview:
+    reviewer = manual["reviewer"]
+    if not reviewer:
+        raise ValueError("review file contains an incomplete reviewer")
+    try:
+        reviewed_at = _parse_reviewed_at(manual["reviewed_at"])
+    except ValueError:
+        raise ValueError("review file contains an invalid reviewed_at") from None
+    confirmations = tuple(manual[field] for field in _CONFIRMATION_FIELDS)
+    if any(value not in {"true", "false"} for value in confirmations):
+        raise ValueError("review file contains an invalid confirmation")
+    fidelity = manual["musical_fidelity"]
+    if fidelity not in _MUSICAL_FIDELITIES:
+        raise ValueError("review file contains an invalid musical fidelity")
+    character = manual["drum_character"]
+    if character not in _DRUM_CHARACTERS:
+        raise ValueError("review file contains an invalid drum character")
+    decision = manual["decision"]
+    if decision not in {"include", "exclude"}:
+        raise ValueError("review file contains an invalid decision")
+    reasons = _parse_completed_reasons(manual["reason_codes"])
+    if decision == "include":
+        if any(value != "true" for value in confirmations):
+            raise ValueError("review file contains an include with failed confirmations")
+        if fidelity not in {"close", "usable_with_limits"}:
+            raise ValueError("review file contains an include with unrepresentative fidelity")
+    elif not reasons:
+        raise ValueError("review file contains an exclude without reason codes")
+    if "other" in reasons and not manual["notes"]:
+        raise ValueError("review file requires notes for the other reason code")
+    return _CompletedReview(
+        simfile_id=simfile_id,
+        reviewer=reviewer,
+        reviewed_at=reviewed_at,
+        confirmations=confirmations,  # type: ignore[arg-type]
+        musical_fidelity=fidelity,  # type: ignore[arg-type]
+        drum_character=character,  # type: ignore[arg-type]
+        known_limitations=manual["known_limitations"],
+        decision=decision,  # type: ignore[arg-type]
+        reason_codes=reasons,  # type: ignore[arg-type]
+        notes=manual["notes"],
+    )
+
+
+def _parse_completed_review_file(content: bytes) -> dict[int, _CompletedReview]:
+    """Parse a completed review CSV into per-simfile reviews.
+
+    Requires the exact 36-column boundary and complete canonical rows; only
+    ``simfile_id`` and the 12 manual columns are read as authority, so
+    rewritten generated display cells never reject a review.
+    """
+    reader = csv.DictReader(io.StringIO(content.decode("utf-8")))
+    if reader.fieldnames is None:
+        raise ValueError("review file has no header")
+    if set(reader.fieldnames) != set(REVIEW_CSV_FIELDS):
+        raise ValueError("review file has an invalid column set")
+    reviews: dict[int, _CompletedReview] = {}
+    for source in reader:
+        if len(source) != len(reader.fieldnames) or None in source.values():
+            raise ValueError("review file contains a truncated row")
+        simfile_id = _parse_prior_simfile_id(source["simfile_id"])
+        if simfile_id in reviews:
+            raise ValueError("review file contains duplicate simfile IDs")
+        manual = {field: source[field] for field in REVIEW_MANUAL_FIELDS}
+        reviews[simfile_id] = _parse_completed_review_row(simfile_id, manual)
+    return reviews
+
+
+def _render_complete_ledger(
+    slate: tuple[ReviewCandidate, ...],
+    reviews: Mapping[int, _CompletedReview],
+    prior_ledger_sha256: str,
+) -> bytes:
+    """Re-render the canonical complete review ledger from fresh values.
+
+    Generated columns are rebuilt from the reproduced slate; manual columns
+    carry the validated review values with timestamps canonicalized to ``Z``
+    and reasons re-joined in sorted unique order.
+    """
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=REVIEW_CSV_FIELDS, lineterminator="\n")
+    writer.writeheader()
+    for rank, candidate in enumerate(slate, start=1):
+        row = _candidate_csv_row(candidate, rank=rank, prior_ledger_sha256=prior_ledger_sha256)
+        review = reviews[candidate.simfile_id]
+        row.update(
+            {
+                "reviewer": review.reviewer,
+                "reviewed_at": format_manifest_timestamp(review.reviewed_at),
+            }
+        )
+        row.update(dict(zip(_CONFIRMATION_FIELDS, review.confirmations)))
+        row.update(
+            {
+                "musical_fidelity": review.musical_fidelity,
+                "drum_character": review.drum_character,
+                "known_limitations": review.known_limitations,
+                "decision": review.decision,
+                "reason_codes": ";".join(review.reason_codes),
+                "notes": review.notes,
+            }
+        )
+        writer.writerow(row)
+    return buffer.getvalue().encode("utf-8")
+
+
+def _subset_manifest_row(
+    candidate: ReviewCandidate,
+    review: _CompletedReview,
+    *,
+    rank: int,
+    review_ledger_sha256: str,
+    prior_review_ledger_sha256: str | None,
+) -> dict[str, object]:
+    """Build one accepted-row contract with fresh generated values bound to the ledger hash."""
+    return {
+        "schema_version": REVIEWED_REFERENCE_SUBSET_SCHEMA,
+        "review_policy_version": REVIEW_POLICY_VERSION,
+        "prior_review_ledger_sha256": prior_review_ledger_sha256,
+        "review_ledger_sha256": review_ledger_sha256,
+        "candidate_rank": rank,
+        "simfile_id": candidate.simfile_id,
+        "source_reference_manifest_sha256": candidate.source_reference_manifest_sha256,
+        "source_reference_manifest_version": candidate.source_reference_manifest_version,
+        "source_timing_manifest_sha256": candidate.source_timing_manifest_sha256,
+        "source_timing_manifest_version": candidate.source_timing_manifest_version,
+        "source_row_sha256": candidate.source_row_sha256,
+        "selected_chart_key": candidate.selected_chart_key,
+        "selected_chart_content_hash": candidate.selected_chart_content_hash,
+        "source_audio_key": candidate.source_audio_key,
+        "source_audio_content_hash": candidate.source_audio_content_hash,
+        "common_event_count": candidate.common_event_count,
+        "reference_event_span_sec": _csv_metric(candidate.reference_event_span_sec),
+        "common_event_density_per_sec": _csv_metric(candidate.common_event_density_per_sec),
+        "common_class_count": candidate.common_class_count,
+        "density_band": candidate.density_band,
+        "class_richness_band": candidate.class_richness_band,
+        "has_timing_warning": candidate.has_timing_warning,
+        "selects_real_or_full_chart": candidate.selects_real_or_full_chart,
+        "reviewer": review.reviewer,
+        "reviewed_at": format_manifest_timestamp(review.reviewed_at),
+        "musical_fidelity": review.musical_fidelity,
+        "drum_character": review.drum_character,
+        "known_limitations": review.known_limitations,
+        "reason_codes": list(review.reason_codes),
+        "notes": review.notes,
+    }
+
+
+def finalize_reviewed_subset(
+    request: FinalizeReviewedSubsetRequest,
+) -> FinalizeReviewedSubsetOutcome:
+    """Validate the completed review CSV and publish the canonical subset.
+
+    Re-runs the same deterministic slate reproduction as preparation (same
+    optional prior ledger), requires exactly one completed review per slate
+    member, re-renders the canonical complete review ledger through the
+    shared atomic byte-replacement helper, and publishes the accepted rows on
+    the manifest rails.  Any lineage/population/review/publication failure
+    exits 2.
+    """
+    try:
+        slate, _, prior_ledger_sha256 = _current_candidate_slate(
+            request.reference_manifest_path,
+            request.timing_manifest_path,
+            request.prior_ledger_path,
+        )
+        reviews = _parse_completed_review_file(request.review_file.read_bytes())
+        candidates = {candidate.simfile_id: candidate for candidate in slate}
+        if set(reviews) != set(candidates):
+            raise ValueError("review file does not match the current candidate slate")
+
+        included_count = sum(
+            1 for candidate in slate if reviews[candidate.simfile_id].decision == "include"
+        )
+        if not REVIEW_MIN_COUNT <= included_count <= REVIEW_MAX_COUNT:
+            raise ValueError("review file must include 20 to 30 candidates")
+
+        review_ledger_bytes = _render_complete_ledger(slate, reviews, prior_ledger_sha256)
+        review_ledger_sha256 = sha256(review_ledger_bytes).hexdigest()
+        review_ledger_path = request.output_dir / "review-ledger.csv"
+        ensure_durable_directory(request.output_dir)
+        atomic_replace_bytes(review_ledger_path, review_ledger_bytes)
+
+        rows = tuple(
+            _subset_manifest_row(
+                candidate,
+                reviews[candidate.simfile_id],
+                rank=rank,
+                review_ledger_sha256=review_ledger_sha256,
+                prior_review_ledger_sha256=prior_ledger_sha256 or None,
+            )
+            for rank, candidate in enumerate(slate, start=1)
+            if reviews[candidate.simfile_id].decision == "include"
+        )
+        rendered = render_manifest(rows)
+        published = publish_manifest(request.output_dir, rendered)
+        publish_latest_manifest(
+            request.output_dir,
+            published,
+            "complete",
+            datetime.now(timezone.utc),
+        )
+    except (ManifestPublicationError, OSError, ValueError):
+        return FinalizeReviewedSubsetOutcome(
+            exit_code=2,
+            manifest=None,
+            review_ledger_path=None,
+            included_count=0,
+            excluded_count=0,
+        )
+    return FinalizeReviewedSubsetOutcome(
+        exit_code=0,
+        manifest=published,
+        review_ledger_path=review_ledger_path,
+        included_count=included_count,
+        excluded_count=len(slate) - included_count,
     )

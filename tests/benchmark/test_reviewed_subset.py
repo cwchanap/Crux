@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import replace
+from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 
@@ -23,11 +24,14 @@ from src.benchmark.reviewed_subset import (
     REVIEW_SELECTION_SEED,
     REVIEW_TARGET_COUNT,
     REVIEWED_REFERENCE_SUBSET_SCHEMA,
+    FinalizeReviewedSubsetOutcome,
+    FinalizeReviewedSubsetRequest,
     LoadedReviewedSubsetManifest,
     PrepareReviewedSubsetRequest,
     ReviewCandidate,
     build_candidate_stream,
     canonical_stratum_key,
+    finalize_reviewed_subset,
     load_reviewed_subset_manifest,
     prepare_reviewed_subset,
     validate_schema_golden,
@@ -195,6 +199,21 @@ def test_reviewed_subset_loader_rejects_mixed_review_ledger_hash(
         ("musical_fidelity", "perfect"),
         ("drum_character", "robotic"),
         ("reason_codes", ["not_a_reason"]),
+        ("reference_event_span_sec", "10.5000000"),
+        ("reference_event_span_sec", 10),
+        ("common_event_density_per_sec", "1.2000000"),
+        ("common_event_density_per_sec", 1.2),
+    ],
+    ids=[
+        "density-band",
+        "richness-band",
+        "fidelity",
+        "character",
+        "reason",
+        "span-trailing-fraction-digits",
+        "span-int",
+        "density-trailing-fraction-digits",
+        "density-float",
     ],
 )
 def test_reviewed_subset_loader_rejects_invalid_enums(
@@ -208,6 +227,38 @@ def test_reviewed_subset_loader_rejects_invalid_enums(
 
     with pytest.raises(ValueError, match="invalid"):
         load_reviewed_subset_manifest(path)
+
+
+def test_reviewed_subset_loader_accepts_fractional_metric_tokens(tmp_path: Path) -> None:
+    rows = list(_golden_rows(20))
+    rows[0]["reference_event_span_sec"] = "10.5"
+    rows[0]["common_event_density_per_sec"] = "1.25"
+    path = _write_subset(tmp_path, tuple(rows))
+
+    loaded = load_reviewed_subset_manifest(path)
+
+    assert loaded.rows[0].view.reference_event_span_sec == Decimal("10.5")
+    assert loaded.rows[0].view.common_event_density_per_sec == Decimal("1.25")
+
+
+def test_reviewed_subset_loader_requires_notes_for_other_reason(tmp_path: Path) -> None:
+    rows = list(_golden_rows(20))
+    rows[0]["reason_codes"] = ["other"]
+    path = _write_subset(tmp_path, tuple(rows))
+
+    with pytest.raises(ValueError, match="requires notes"):
+        load_reviewed_subset_manifest(path)
+
+
+def test_reviewed_subset_loader_accepts_other_reason_with_notes(tmp_path: Path) -> None:
+    rows = list(_golden_rows(20))
+    rows[0]["reason_codes"] = ["other"]
+    rows[0]["notes"] = "hand-verified against the source pack"
+    path = _write_subset(tmp_path, tuple(rows))
+
+    loaded = load_reviewed_subset_manifest(path)
+
+    assert loaded.rows[0].view.reason_codes == ("other",)
 
 
 def test_reviewed_subset_loader_rejects_fewer_than_min_rows(tmp_path: Path) -> None:
@@ -346,8 +397,13 @@ def _fill_manual_fields(rows: list[dict[str, str]], *, include_ids: set[int]) ->
             )
 
 
-def _write_prior_ledger(tmp_path: Path, rows: list[dict[str, str]]) -> Path:
-    path = tmp_path / "prior.csv"
+def _write_prior_ledger(
+    tmp_path: Path,
+    rows: list[dict[str, str]],
+    *,
+    name: str = "prior.csv",
+) -> Path:
+    path = tmp_path / name
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=REVIEW_CSV_FIELDS, lineterminator="\n")
         writer.writeheader()
@@ -786,3 +842,214 @@ def test_prepare_rejects_duplicate_prior_simfile_ids(tmp_path: Path) -> None:
 
     assert outcome.exit_code == 2
     assert outcome.output_file is None
+
+
+def _finalize_request(
+    fixture: object,
+    review_path: Path,
+    output_dir: Path,
+    *,
+    prior_ledger_path: Path | None = None,
+) -> FinalizeReviewedSubsetRequest:
+    return FinalizeReviewedSubsetRequest(
+        reference_manifest_path=fixture.reference_manifest_path,  # type: ignore[attr-defined]
+        timing_manifest_path=fixture.timing_manifest_path,  # type: ignore[attr-defined]
+        review_file=review_path,
+        output_dir=output_dir,
+        prior_ledger_path=prior_ledger_path,
+    )
+
+
+def _completed_review_file(
+    tmp_path: Path,
+    fixture: object,
+    *,
+    include_count: int = 20,
+    mutate: object = None,
+    prior_ledger_path: Path | None = None,
+) -> Path:
+    prepared = tmp_path / "prepared.csv"
+    outcome = prepare_reviewed_subset(
+        _prepare_request(fixture, prepared, prior_ledger_path=prior_ledger_path)
+    )
+    assert outcome.exit_code == 0
+    rows = list(csv.DictReader(prepared.open(encoding="utf-8", newline="")))
+    include_ids = {int(row["simfile_id"]) for row in rows[:include_count]}
+    _fill_manual_fields(rows, include_ids=include_ids)
+    if mutate is not None:
+        mutate(rows)
+    return _write_prior_ledger(tmp_path, rows, name="review.csv")
+
+
+def test_finalize_request_and_outcome_shapes() -> None:
+    assert set(FinalizeReviewedSubsetRequest.__dataclass_fields__) == {  # pylint: disable=no-member
+        "reference_manifest_path",
+        "timing_manifest_path",
+        "review_file",
+        "output_dir",
+        "prior_ledger_path",
+    }
+    assert set(FinalizeReviewedSubsetOutcome.__dataclass_fields__) == {  # pylint: disable=no-member
+        "exit_code",
+        "manifest",
+        "review_ledger_path",
+        "included_count",
+        "excluded_count",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda rows: rows[0].update(reviewer=""),
+        lambda rows: rows[0].update(reviewed_at="2026-08-15 00:00:00"),
+        lambda rows: rows[0].update(reviewed_at="2026-08-15T00:00:00+01:00"),
+        lambda rows: rows[0].update(chart_selection_confirmed="True"),
+        lambda rows: rows[0].update(chart_selection_confirmed="false"),
+        lambda rows: rows[0].update(musical_fidelity="not_representative"),
+        lambda rows: rows[0].update(decision="exclude", reason_codes=""),
+        lambda rows: rows[0].update(reason_codes="other", notes=""),
+        lambda rows: rows[0].update(reason_codes="not_a_reason"),
+    ],
+    ids=[
+        "blank-reviewer",
+        "non-rfc3339-timestamp",
+        "non-utc-offset",
+        "noncanonical-confirmation",
+        "include-false-confirmation",
+        "include-not-representative",
+        "exclude-no-reasons",
+        "other-no-notes",
+        "unknown-reason",
+    ],
+)
+def test_finalize_rejects_closed_review_violations(
+    tmp_path: Path,
+    mutate: object,
+) -> None:
+    fixture = build_reviewed_subset_reference_fixture(tmp_path, eligible_count=36)
+    review_path = _completed_review_file(tmp_path, fixture, mutate=mutate)
+
+    outcome = finalize_reviewed_subset(_finalize_request(fixture, review_path, tmp_path / "out"))
+
+    assert outcome.exit_code == 2
+    assert outcome.manifest is None
+    assert outcome.review_ledger_path is None
+
+
+def test_finalize_publishes_valid_20_includes(tmp_path: Path) -> None:
+    fixture = build_reviewed_subset_reference_fixture(tmp_path, eligible_count=36)
+    review_path = _completed_review_file(tmp_path, fixture)
+
+    outcome = finalize_reviewed_subset(_finalize_request(fixture, review_path, tmp_path / "out"))
+
+    assert outcome.exit_code == 0
+    assert outcome.manifest is not None
+    assert outcome.review_ledger_path is not None
+    assert outcome.included_count == 20
+    assert outcome.excluded_count == 10
+
+
+def test_finalize_accepts_utc_zero_offset_timestamps_and_canonicalizes(
+    tmp_path: Path,
+) -> None:
+    fixture = build_reviewed_subset_reference_fixture(tmp_path, eligible_count=36)
+
+    def use_utc_offset(rows: list[dict[str, str]]) -> None:
+        rows[0]["reviewed_at"] = "2026-08-15T00:00:00+00:00"
+
+    review_path = _completed_review_file(tmp_path, fixture, mutate=use_utc_offset)
+
+    outcome = finalize_reviewed_subset(_finalize_request(fixture, review_path, tmp_path / "out"))
+
+    assert outcome.exit_code == 0
+    ledger_rows = list(
+        csv.DictReader(outcome.review_ledger_path.open(encoding="utf-8", newline=""))  # type: ignore[union-attr]
+    )
+    assert ledger_rows[0]["reviewed_at"] == "2026-08-15T00:00:00Z"
+
+
+def test_finalize_rejects_fewer_than_20_includes(tmp_path: Path) -> None:
+    fixture = build_reviewed_subset_reference_fixture(tmp_path, eligible_count=36)
+    review_path = _completed_review_file(tmp_path, fixture, include_count=19)
+
+    outcome = finalize_reviewed_subset(_finalize_request(fixture, review_path, tmp_path / "out"))
+
+    assert outcome.exit_code == 2
+    assert outcome.manifest is None
+    assert outcome.review_ledger_path is None
+
+
+def test_finalize_ignores_rewritten_generated_cells(tmp_path: Path) -> None:
+    fixture = build_reviewed_subset_reference_fixture(tmp_path, eligible_count=36)
+
+    def rewrite_generated(rows: list[dict[str, str]]) -> None:
+        for row in rows:
+            row["candidate_rank"] = "999"
+            row["density_band"] = "nonsense"
+            row["class_richness_band"] = "nonsense"
+            row["source_row_sha256"] = "0" * 64
+            row["selected_chart_content_hash"] = "f" * 64
+            row["has_timing_warning"] = "maybe"
+            row["selects_real_or_full_chart"] = "yes"
+            row["reference_event_span_sec"] = "-12.5"
+            row["common_event_density_per_sec"] = "NaN"
+            row["common_event_count"] = "-3"
+            row["common_class_count"] = "0x10"
+            row["selected_chart_key"] = "42/other.dtx"
+            row["source_audio_cache_path"] = "C:\\Users\\reviewer\\Desktop\\audio.wav"
+            row["prior_review_ledger_sha256"] = "z" * 64
+
+    review_path = _completed_review_file(tmp_path, fixture, mutate=rewrite_generated)
+
+    outcome = finalize_reviewed_subset(_finalize_request(fixture, review_path, tmp_path / "out"))
+
+    assert outcome.exit_code == 0
+    assert outcome.included_count == 20
+
+
+def test_finalize_rejects_stale_simfile_membership(tmp_path: Path) -> None:
+    fixture = build_reviewed_subset_reference_fixture(tmp_path, eligible_count=36)
+    stale_id = _candidate_stream(fixture)[30].simfile_id
+
+    def swap_to_stale(rows: list[dict[str, str]]) -> None:
+        rows[0]["simfile_id"] = str(stale_id)
+
+    review_path = _completed_review_file(tmp_path, fixture, mutate=swap_to_stale)
+
+    outcome = finalize_reviewed_subset(_finalize_request(fixture, review_path, tmp_path / "out"))
+
+    assert outcome.exit_code == 2
+    assert outcome.manifest is None
+
+
+def test_finalize_continuation_requires_the_same_prior_ledger(tmp_path: Path) -> None:
+    fixture = build_reviewed_subset_reference_fixture(tmp_path, eligible_count=36)
+    initial = tmp_path / "initial.csv"
+    assert prepare_reviewed_subset(_prepare_request(fixture, initial)).exit_code == 0
+    initial_rows = list(csv.DictReader(initial.open(encoding="utf-8", newline="")))
+    _fill_manual_fields(
+        initial_rows,
+        include_ids={int(row["simfile_id"]) for row in initial_rows[:20]},
+    )
+    prior_path = _write_prior_ledger(tmp_path, initial_rows)
+
+    review_path = _completed_review_file(
+        tmp_path,
+        fixture,
+        prior_ledger_path=prior_path,
+    )
+    request = _finalize_request(
+        fixture,
+        review_path,
+        tmp_path / "out",
+        prior_ledger_path=prior_path,
+    )
+
+    without_prior = finalize_reviewed_subset(replace(request, prior_ledger_path=None))
+    assert without_prior.exit_code == 2
+
+    with_prior = finalize_reviewed_subset(request)
+    assert with_prior.exit_code == 0
+    assert with_prior.included_count == 20
+    assert with_prior.excluded_count == 6
