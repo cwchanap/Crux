@@ -2260,7 +2260,7 @@ def test_remove_attempt_report_swallows_unlink_oserror(tmp_path, monkeypatch) ->
 
 
 def test_atomic_replace_bytes_cleanup_failure_sets_cleanup_flag(tmp_path, monkeypatch) -> None:
-    """Cover lines 1058-1061: temporary file cleanup failure sets cleanup_failed."""
+    """Cover durability.atomic_replace_bytes: temporary cleanup failure sets cleanup_failed."""
     path = tmp_path / "output" / "target.json"
     path.parent.mkdir(parents=True)
 
@@ -2273,7 +2273,7 @@ def test_atomic_replace_bytes_cleanup_failure_sets_cleanup_flag(tmp_path, monkey
         "replace",
         lambda *_: (_ for _ in ()).throw(OSError("SECRET replace detail")),
     )
-    monkeypatch.setattr(r2_corpus_sync.Path, "unlink", fail_unlink)
+    monkeypatch.setattr(durability.Path, "unlink", fail_unlink)
 
     with pytest.raises(OSError, match="artifact publication failed"):
         durability.atomic_replace_bytes(path, b'{"data":"new"}\n')

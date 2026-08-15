@@ -6,7 +6,7 @@
 
 **Architecture:** Add one OaF-specific `src/benchmark/oaf_corpus_run.py` that composes the existing manifest/cache/backend/prediction/scoring contracts. Reuse a promoted canonical-manifest reader and shared atomic-replace helper; keep canonical audio temporary; use one persistent backend with a 3600-second request ceiling and a separate 30-second worker-close deadline. Prediction paths are source-hash keyed, but resume still re-materializes and validates exact canonical input bytes before reuse. Backend errors are classified through a closed policy; poison stops further inference and `--resume` is recovery.
 
-**Tech Stack:** Python 3.12, Click, existing `librosa`/`soundfile`, existing benchmark canonical JSON/cache/backend/scoring helpers, pytest, Ruff, Pylint.
+**Tech Stack:** Python 3.13, Click, existing `librosa`/`soundfile`, existing benchmark canonical JSON/cache/backend/scoring helpers, pytest, Ruff, Pylint.
 
 ## Global Constraints
 
