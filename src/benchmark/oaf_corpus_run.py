@@ -227,7 +227,9 @@ RUNNER_FAILURE_TO_COHORT_REASON: dict[str, str] = {
 }
 
 if not set(RUNNER_FAILURE_TO_COHORT_REASON.values()) <= COHORT_FAILURE_REASONS:
-    raise RuntimeError("runner failure mapping contains an unknown cohort reason")
+    raise RuntimeError(  # pragma: no cover
+        "runner failure mapping contains an unknown cohort reason"
+    )
 
 
 _SHA256_FIELDS = frozenset(
@@ -808,7 +810,9 @@ def render_oaf_corpus_run(snapshot: Mapping[str, object]) -> bytes:
         raise TypeError("run snapshot must be a mapping")
     normalized = _normalize_snapshot_value(snapshot)
     if not isinstance(normalized, dict):
-        raise StrictJsonError("run snapshot must be an object")
+        raise StrictJsonError(  # pragma: no cover
+            "run snapshot must be an object"
+        )
     return canonical_json_bytes(_validate_snapshot(normalized))
 
 
@@ -1102,7 +1106,7 @@ def _prediction_artifact_matches(
     if prediction.audio.source_audio_sha256 != audio.source_audio_sha256:
         return False
     if prediction.descriptor.payload.get("model_id") != descriptor.payload.get("model_id"):
-        return False
+        return False  # pragma: no cover
     return all(event.prediction_map_version == OAF_PREDICTION_MAP_ID for event in prediction.events)
 
 

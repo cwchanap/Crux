@@ -57,6 +57,7 @@ from src.benchmark.oaf_corpus_run import (
     _source_audio_parts,
     _source_failure_code,
     _timestamp,
+    _utc_now,
     _validate_scope,
     _validate_snapshot,
     build_inference_config,
@@ -1066,6 +1067,13 @@ def test_timestamp_rejects_non_datetime() -> None:
 def test_timestamp_handles_naive_datetime() -> None:
     result = _timestamp(datetime(2026, 8, 14, 12, 0, 0))
     assert result == "2026-08-14T12:00:00+00:00"
+
+
+def test_utc_now_returns_timezone_aware_datetime() -> None:
+    result = _utc_now()
+    assert isinstance(result, datetime)
+    assert result.tzinfo is not None
+    assert result.utcoffset() == timezone.utc.utcoffset(None)
 
 
 def test_bounded_error_falls_back_to_type_name() -> None:
