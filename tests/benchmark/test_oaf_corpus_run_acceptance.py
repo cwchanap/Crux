@@ -11,6 +11,7 @@ from runtime.oaf_tf1.model import load_model_config
 from src.benchmark.backend_identity import BackendDescriptor
 from src.benchmark.backends.base import CanonicalAudio, NativeEvent, NativePrediction
 from src.benchmark.backends.oaf import OafBackendError
+from src.benchmark.cohort_scoring import score_cohort
 from src.benchmark.oaf_corpus_run import (
     OAF_CORPUS_REQUEST_TIMEOUT_SECONDS,
     OAF_FULL_MIX_INPUT_VIEW_ID,
@@ -18,6 +19,8 @@ from src.benchmark.oaf_corpus_run import (
     OafCorpusRunRequest,
     ResolvedSourceAudio,
     _expected_oaf_descriptor,
+    _finalize_scoring_and_outcome,
+    build_oaf_cohort_from_snapshot,
     run_oaf_corpus,
 )
 from src.benchmark.prediction_artifact import read_prediction_artifact, render_prediction_artifact
@@ -32,6 +35,7 @@ from src.benchmark.reference_set_manifest import (
 )
 from src.benchmark.reference_timing import NativeReferenceEvent
 from src.benchmark.reference_timing_manifest import LoadedReferenceTimingManifest
+from src.benchmark.reports import write_cohort_reports
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
@@ -430,6 +434,77 @@ def test_finalization_scoring_or_report_failure_returns_canonical_fatal_outcome(
     assert outcome.failed_count == 0
     assert outcome.skipped_count == 0
     assert outcome.quarantined_count == 0
+
+
+def test_persisted_snapshot_reconstruction_matches_broad_finalization_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.benchmark.oaf_corpus_run as run_module
+
+    reference_manifest, descriptor, _ = _install_fake_run_seams(monkeypatch, tmp_path)
+
+    class HealthyBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            return NativePrediction(audio=audio, descriptor=descriptor, events=())
+
+        def close(self) -> None:
+            return None
+
+    outcome = run_oaf_corpus(
+        _request(tmp_path),
+        backend_factory=lambda **_: HealthyBackend(),
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+    assert outcome.exit_code == 0
+    assert outcome.run_id is not None
+    assert outcome.run_path is not None
+    snapshot = run_module.parse_oaf_corpus_run(outcome.run_path.read_bytes())
+    mappings = {
+        row.view.simfile_id: _reference_mapping(row.view.simfile_id)
+        for row in reference_manifest.rows
+    }
+    output_dir = tmp_path / "output"
+    run_id = outcome.run_id
+    run_path = outcome.run_path
+    actual_reports = tmp_path / "actual-reports"
+
+    identity, cohort_items = build_oaf_cohort_from_snapshot(
+        snapshot,
+        mappings=mappings,
+        output_dir=output_dir,
+    )
+    expected_result = score_cohort(identity, cohort_items, diagnostics_for=())
+    expected_reports = tmp_path / "expected-reports"
+    write_cohort_reports(expected_result, expected_reports)
+
+    outcome_final = _finalize_scoring_and_outcome(
+        snapshot,
+        run_id=run_id,
+        run_path=run_path,
+        reports_path=actual_reports,
+        aggregate_rtf=None,
+        projected_full_wall_time_sec=None,
+        mappings=mappings,
+        output_dir=output_dir,
+    )
+
+    for name in (
+        "summary.json",
+        "items.csv",
+        "per_song.csv",
+        "per_class.csv",
+        "event_diagnostics.jsonl",
+        "summary.md",
+    ):
+        assert (actual_reports / name).read_bytes() == (expected_reports / name).read_bytes()
+    assert outcome_final.success_count == expected_result.population.success_count
+    assert outcome_final.failed_count == expected_result.population.failed_count
+    assert outcome_final.skipped_count == expected_result.population.skipped_count
+    assert outcome_final.quarantined_count == expected_result.population.quarantined_count
 
 
 def test_scorer_rejects_raw_artifact_mismatch_before_source_binding(

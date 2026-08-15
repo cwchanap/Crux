@@ -46,6 +46,7 @@ from src.benchmark.oaf_corpus_run import (
     _resolve_source_audio,
     _validate_scope,
     build_inference_config,
+    build_oaf_cohort_from_snapshot,
     build_run_id,
     classify_oaf_backend_error,
     compute_model_lock_sha256,
@@ -288,6 +289,68 @@ def test_cohort_item_from_run_row_adapts_missing_prediction_to_failed() -> None:
     assert item.status == "failed"
     assert item.failure_reason == "prediction_missing"
     validate_cohort_items(_cohort_test_identity(), (item,))
+
+
+def _cohort_snapshot() -> dict[str, object]:
+    identity = _cohort_test_identity()
+    return {
+        "run_id": identity.cohort_id,
+        "backend_descriptor": {"backend_id": "crux.oaf", "model_id": identity.model_id},
+        "inference_config": {"prediction_map_version": identity.prediction_map_version},
+        "reference_manifest_sha256": identity.reference_manifest_sha256,
+        "reference_timing_version": identity.reference_timing_version,
+        "model_lock_sha256": identity.model_lock_sha256,
+        "backend_descriptor_sha256": identity.backend_descriptor_sha256,
+        "input_view_id": identity.input_view_id,
+        "items": [
+            {"simfile_id": 10, "execution_disposition": "inferred"},
+            {
+                "simfile_id": 20,
+                "execution_disposition": "skipped",
+                "runner_failure_code": "explicitly_skipped",
+            },
+            {"simfile_id": 30, "execution_disposition": "quarantined"},
+            {"simfile_id": 40, "execution_disposition": "failed"},
+        ],
+    }
+
+
+def test_build_oaf_cohort_from_snapshot_reconstructs_identity_and_items() -> None:
+    identity, items = build_oaf_cohort_from_snapshot(
+        _cohort_snapshot(),
+        mappings={10: _cohort_test_mapping()},
+        output_dir=Path("output"),
+    )
+
+    assert identity == _cohort_test_identity()
+    assert [(item.simfile_id, item.status, item.failure_reason) for item in items] == [
+        ("10", "failed", "prediction_missing"),
+        ("20", "skipped", "explicitly_skipped"),
+        ("30", "quarantined", "reference_quarantined"),
+        ("40", "failed", "backend_unavailable"),
+    ]
+    validate_cohort_items(identity, items)
+
+
+def test_build_oaf_cohort_from_snapshot_rejects_invalid_contracts() -> None:
+    with pytest.raises(TypeError, match="snapshot must be a mapping"):
+        build_oaf_cohort_from_snapshot(
+            [("items", [])],  # type: ignore[arg-type]
+            mappings={},
+            output_dir=Path("output"),
+        )
+    with pytest.raises(TypeError, match="output_dir must be a Path"):
+        build_oaf_cohort_from_snapshot(
+            _cohort_snapshot(),
+            mappings={},
+            output_dir="output",  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="run snapshot items must be a list"):
+        build_oaf_cohort_from_snapshot(
+            {**_cohort_snapshot(), "items": {}},  # type: ignore[arg-type]
+            mappings={},
+            output_dir=Path("output"),
+        )
 
 
 def test_resolved_source_audio_preserves_authoritative_identity() -> None:

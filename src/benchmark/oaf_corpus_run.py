@@ -1279,6 +1279,34 @@ def _cohort_item_from_run_row(
     )
 
 
+def build_oaf_cohort_from_snapshot(
+    snapshot: Mapping[str, object],
+    *,
+    mappings: Mapping[int, ReferenceMappingResult | None],
+    output_dir: Path,
+) -> tuple[CohortIdentity, tuple[CohortItem, ...]]:
+    """Reconstruct the HPA-325 cohort from one persisted execution snapshot."""
+    if not isinstance(snapshot, Mapping):
+        raise TypeError("snapshot must be a mapping")
+    if not isinstance(output_dir, Path):
+        raise TypeError("output_dir must be a Path")
+    items = snapshot.get("items", [])
+    if not isinstance(items, list):
+        raise ValueError("run snapshot items must be a list")
+    identity = _cohort_identity_from_snapshot(snapshot)
+    cohort_items = tuple(
+        _cohort_item_from_run_row(
+            identity,
+            row,
+            mappings.get(int(row["simfile_id"])),
+            output_dir=output_dir,
+        )
+        for row in items
+        if isinstance(row, Mapping)
+    )
+    return identity, cohort_items
+
+
 def _prediction_relative_path(path: Path, output_dir: Path) -> str:
     try:
         return path.resolve().relative_to(output_dir.resolve()).as_posix()
@@ -1402,18 +1430,11 @@ def _finalize_scoring_and_outcome(
     items = snapshot.get("items", [])
     if not isinstance(items, list):
         return _fatal_outcome()
-    identity = _cohort_identity_from_snapshot(snapshot)
     resolved_output_dir = output_dir or run_path.parents[2]
-    mapping_by_id = mappings or {}
-    cohort_items = tuple(
-        _cohort_item_from_run_row(
-            identity,
-            row,
-            mapping_by_id.get(int(row["simfile_id"])),
-            output_dir=resolved_output_dir,
-        )
-        for row in items
-        if isinstance(row, Mapping)
+    identity, cohort_items = build_oaf_cohort_from_snapshot(
+        snapshot,
+        mappings=mappings or {},
+        output_dir=resolved_output_dir,
     )
     score_result = score_cohort(identity, cohort_items, diagnostics_for=())
     write_cohort_reports(score_result, reports_path)
