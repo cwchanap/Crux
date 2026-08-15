@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from src.benchmark.backend_identity import strict_json_loads
+from src.benchmark.backend_identity import canonical_json_bytes, strict_json_loads
 from src.benchmark.corpus_manifest import render_manifest
 from src.benchmark.reference_set_manifest import (
     load_reference_set_manifest,
@@ -29,15 +29,20 @@ from src.benchmark.reviewed_subset import (
     LoadedReviewedSubsetManifest,
     PrepareReviewedSubsetRequest,
     ReviewCandidate,
+    ScoreReviewedSubsetOutcome,
+    ScoreReviewedSubsetRequest,
     build_candidate_stream,
     canonical_stratum_key,
     finalize_reviewed_subset,
     load_reviewed_subset_manifest,
     prepare_reviewed_subset,
+    score_oaf_reviewed_subset,
     validate_schema_golden,
 )
 from tests.benchmark.reviewed_subset_fixtures import (
+    ReviewedSubsetOafFixture,
     ReviewedSubsetRowSpec,
+    build_reviewed_subset_oaf_fixture,
     build_reviewed_subset_reference_fixture,
 )
 
@@ -1053,3 +1058,380 @@ def test_finalize_continuation_requires_the_same_prior_ledger(tmp_path: Path) ->
     assert with_prior.exit_code == 0
     assert with_prior.included_count == 20
     assert with_prior.excluded_count == 6
+
+
+def _failed_simfile_ids(fixture: ReviewedSubsetOafFixture) -> set[int]:
+    from src.benchmark.oaf_corpus_run import parse_oaf_corpus_run
+
+    snapshot = parse_oaf_corpus_run(fixture.run_path.read_bytes())
+    return {
+        int(row["simfile_id"])
+        for row in snapshot["items"]
+        if row["execution_disposition"] == "failed"
+    }
+
+
+def _prepare_slate_rows(fixture: ReviewedSubsetOafFixture) -> list[dict[str, str]]:
+    prepared = Path(fixture.oaf_output_dir).parent / "prepared.csv"
+    outcome = prepare_reviewed_subset(
+        PrepareReviewedSubsetRequest(
+            reference_manifest_path=fixture.reference_manifest_path,
+            timing_manifest_path=fixture.timing_manifest_path,
+            output_file=prepared,
+        )
+    )
+    assert outcome.exit_code == 0
+    return list(csv.DictReader(prepared.open(encoding="utf-8", newline="")))
+
+
+def _all_success_includes(fixture: ReviewedSubsetOafFixture) -> set[int]:
+    """The first 20 slate rows, skipping persisted non-success rows."""
+    failed = _failed_simfile_ids(fixture)
+    include_ids: list[int] = []
+    for row in _prepare_slate_rows(fixture):
+        simfile_id = int(row["simfile_id"])
+        if simfile_id in failed:
+            continue
+        include_ids.append(simfile_id)
+        if len(include_ids) == 20:
+            break
+    return set(include_ids)
+
+
+def _finalize_subset(
+    tmp_path: Path,
+    fixture: ReviewedSubsetOafFixture,
+    *,
+    include_ids: set[int],
+) -> Path:
+    """Prepare, review, and finalize a subset whose includes are exactly ``include_ids``."""
+    rows = _prepare_slate_rows(fixture)
+    _fill_manual_fields(rows, include_ids=include_ids)
+    review = tmp_path / "review.csv"
+    _write_prior_ledger(tmp_path, rows, name="review.csv")
+    outcome = finalize_reviewed_subset(
+        FinalizeReviewedSubsetRequest(
+            reference_manifest_path=fixture.reference_manifest_path,
+            timing_manifest_path=fixture.timing_manifest_path,
+            review_file=review,
+            output_dir=tmp_path / "subset",
+        )
+    )
+    assert outcome.exit_code == 0
+    assert outcome.manifest is not None
+    return outcome.manifest.path
+
+
+def _score_request(
+    fixture: ReviewedSubsetOafFixture,
+    subset_path: Path,
+    output_dir: Path,
+) -> ScoreReviewedSubsetRequest:
+    return ScoreReviewedSubsetRequest(
+        run_path=fixture.run_path,
+        reference_manifest_path=fixture.reference_manifest_path,
+        timing_manifest_path=fixture.timing_manifest_path,
+        subset_manifest_path=subset_path,
+        output_dir=output_dir,
+    )
+
+
+def _parent_reports(fixture: ReviewedSubsetOafFixture, reports_dir: Path) -> None:
+    """Reconstruct the parent-run reports exactly as the broad finalizer would."""
+    from src.benchmark.cohort_scoring import score_cohort
+    from src.benchmark.oaf_corpus_run import build_oaf_cohort_from_snapshot, parse_oaf_corpus_run
+    from src.benchmark.reports import write_cohort_reports
+
+    snapshot = parse_oaf_corpus_run(fixture.run_path.read_bytes())
+    reference = load_reference_set_manifest(fixture.reference_manifest_path)
+    timing = load_reference_timing_manifest(fixture.timing_manifest_path)
+    mappings = preflight_reference_mappings(
+        reference,
+        timing,
+        timing_output_root=fixture.timing_output_root,
+    )
+    identity, items = build_oaf_cohort_from_snapshot(
+        snapshot,
+        mappings=mappings,
+        output_dir=fixture.oaf_output_dir,
+    )
+    write_cohort_reports(score_cohort(identity, items, diagnostics_for=()), reports_dir)
+
+
+_REPORT_NAMES = (
+    "summary.json",
+    "items.csv",
+    "per_song.csv",
+    "per_class.csv",
+    "event_diagnostics.jsonl",
+    "summary.md",
+)
+
+
+def _hash_reports(reports_dir: Path) -> tuple[bytes, ...]:
+    return tuple((reports_dir / name).read_bytes() for name in _REPORT_NAMES)
+
+
+def test_score_request_and_outcome_shapes() -> None:
+    assert set(ScoreReviewedSubsetRequest.__dataclass_fields__) == {  # pylint: disable=no-member
+        "run_path",
+        "reference_manifest_path",
+        "timing_manifest_path",
+        "subset_manifest_path",
+        "output_dir",
+    }
+    assert set(ScoreReviewedSubsetOutcome.__dataclass_fields__) == {  # pylint: disable=no-member
+        "exit_code",
+        "cohort_id",
+        "reports_path",
+        "success_count",
+        "failed_count",
+        "skipped_count",
+        "quarantined_count",
+    }
+
+
+def test_score_reviewed_subset_never_constructs_backend_and_preserves_parent_reports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path)
+    subset_path = _finalize_subset(
+        tmp_path,
+        fixture,
+        include_ids=_all_success_includes(fixture),
+    )
+    parent_reports = fixture.run_path.parent / "reports"
+    _parent_reports(fixture, parent_reports)
+    before = _hash_reports(parent_reports)
+
+    def fail_backend(*args: object, **kwargs: object) -> object:
+        raise AssertionError("reviewed subset scoring must not construct OafBackend")
+
+    monkeypatch.setattr("src.benchmark.oaf_corpus_run.create_backend", fail_backend)
+    outcome = score_oaf_reviewed_subset(
+        _score_request(fixture, subset_path, tmp_path / "subset-reports")
+    )
+
+    assert outcome.exit_code in {0, 1}
+    assert _hash_reports(parent_reports) == before
+
+
+def test_score_reviewed_subset_exits_0_with_derived_cohort_id_and_reports(
+    tmp_path: Path,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path)
+    include_ids = _all_success_includes(fixture)
+    subset_path = _finalize_subset(tmp_path, fixture, include_ids=include_ids)
+    from src.benchmark.oaf_corpus_run import parse_oaf_corpus_run
+
+    run_id = str(parse_oaf_corpus_run(fixture.run_path.read_bytes())["run_id"])
+    expected_cohort_id = sha256(
+        canonical_json_bytes(
+            {
+                "parent_run_id": run_id,
+                "reviewed_subset_manifest_sha256": sha256(subset_path.read_bytes()).hexdigest(),
+            }
+        )
+    ).hexdigest()
+
+    outcome = score_oaf_reviewed_subset(
+        _score_request(fixture, subset_path, tmp_path / "subset-reports")
+    )
+
+    assert outcome.exit_code == 0
+    assert outcome.cohort_id == expected_cohort_id
+    assert outcome.cohort_id != run_id
+    assert outcome.reports_path == tmp_path / "subset-reports"
+    assert outcome.success_count == 20
+    assert outcome.failed_count == 0
+    assert outcome.skipped_count == 0
+    assert outcome.quarantined_count == 0
+    items = list(csv.DictReader((tmp_path / "subset-reports" / "items.csv").open(encoding="utf-8")))
+    assert {row["simfile_id"] for row in items} == {str(simfile_id) for simfile_id in include_ids}
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda snapshot: snapshot.update(reference_manifest_sha256="0" * 64),
+        lambda snapshot: snapshot.update(reference_timing_manifest_sha256="0" * 64),
+        lambda snapshot: snapshot.update(reference_timing_version="sha256:" + "0" * 64),
+    ],
+    ids=["run-reference-sha", "run-timing-sha", "run-timing-version"],
+)
+def test_score_reviewed_subset_exits_2_on_run_lineage_mismatch(
+    tmp_path: Path,
+    mutate: object,
+) -> None:
+    from src.benchmark.oaf_corpus_run import parse_oaf_corpus_run, write_oaf_corpus_run
+
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path)
+    subset_path = _finalize_subset(tmp_path, fixture, include_ids=_all_success_includes(fixture))
+    snapshot = parse_oaf_corpus_run(fixture.run_path.read_bytes())
+    mutate(snapshot)
+    write_oaf_corpus_run(fixture.run_path, snapshot)
+
+    outcome = score_oaf_reviewed_subset(
+        _score_request(fixture, subset_path, tmp_path / "subset-reports")
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.cohort_id is None
+    assert outcome.reports_path is None
+    assert outcome.success_count == 0
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "source_reference_manifest_sha256",
+        "source_reference_manifest_version",
+        "source_timing_manifest_sha256",
+        "source_timing_manifest_version",
+    ],
+)
+def test_score_reviewed_subset_exits_2_on_subset_lineage_mismatch(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path)
+    subset_path = _finalize_subset(tmp_path, fixture, include_ids=_all_success_includes(fixture))
+    rows = list(_load_manifest_rows(subset_path))
+    for row in rows:
+        row[field] = "sha256:" + "9" * 64 if "version" in field else "9" * 64
+    mutated = tmp_path / "mutated-subset.jsonl"
+    mutated.write_bytes(render_manifest(tuple(rows)).content)
+
+    outcome = score_oaf_reviewed_subset(
+        _score_request(fixture, mutated, tmp_path / "subset-reports")
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.cohort_id is None
+    assert outcome.reports_path is None
+
+
+def test_score_reviewed_subset_exits_2_when_member_absent_from_parent_population(
+    tmp_path: Path,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path)
+    subset_path = _finalize_subset(tmp_path, fixture, include_ids=_all_success_includes(fixture))
+    rows = list(_load_manifest_rows(subset_path))
+    rows[0]["simfile_id"] = 999
+    foreign = tmp_path / "foreign-subset.jsonl"
+    foreign.write_bytes(render_manifest(tuple(rows)).content)
+
+    outcome = score_oaf_reviewed_subset(
+        _score_request(fixture, foreign, tmp_path / "subset-reports")
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.cohort_id is None
+    assert outcome.reports_path is None
+
+
+@pytest.mark.parametrize("mode", ["garbage", "missing"], ids=["noncanonical", "unreadable"])
+def test_score_reviewed_subset_exits_2_on_noncanonical_or_unreadable_run_snapshot(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path)
+    subset_path = _finalize_subset(tmp_path, fixture, include_ids=_all_success_includes(fixture))
+    if mode == "garbage":
+        fixture.run_path.write_bytes(b"{not canonical run bytes}\n")
+    else:
+        fixture.run_path.unlink()
+
+    outcome = score_oaf_reviewed_subset(
+        _score_request(fixture, subset_path, tmp_path / "subset-reports")
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.cohort_id is None
+    assert outcome.reports_path is None
+
+
+def test_score_reviewed_subset_exits_2_on_report_publication_failure(tmp_path: Path) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path)
+    subset_path = _finalize_subset(tmp_path, fixture, include_ids=_all_success_includes(fixture))
+    blocked = tmp_path / "blocked-reports"
+    blocked.write_bytes(b"occupied")
+
+    outcome = score_oaf_reviewed_subset(_score_request(fixture, subset_path, blocked))
+
+    assert outcome.exit_code == 2
+    assert outcome.cohort_id is None
+    assert outcome.reports_path is None
+
+
+@pytest.mark.parametrize("corrupt", [False, True], ids=["missing", "corrupt"])
+def test_score_reviewed_subset_missing_or_corrupt_prediction_is_item_failure(
+    tmp_path: Path,
+    corrupt: bool,
+) -> None:
+    from src.benchmark.oaf_corpus_run import parse_oaf_corpus_run
+
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path)
+    snapshot = parse_oaf_corpus_run(fixture.run_path.read_bytes())
+    target = next(
+        row for row in snapshot["items"] if row["execution_disposition"] in {"inferred", "resumed"}
+    )
+    artifact_path = fixture.oaf_output_dir / str(target["prediction_path"])
+    assert artifact_path.exists()
+    if corrupt:
+        artifact_path.write_bytes(b"corrupted prediction bytes\n")
+    else:
+        artifact_path.unlink()
+    include_ids = _all_success_includes(fixture) | {int(target["simfile_id"])}
+    subset_path = _finalize_subset(tmp_path, fixture, include_ids=include_ids)
+
+    outcome = score_oaf_reviewed_subset(
+        _score_request(fixture, subset_path, tmp_path / "subset-reports")
+    )
+
+    assert outcome.exit_code == 1
+    assert outcome.failed_count >= 1
+    items = list(csv.DictReader((tmp_path / "subset-reports" / "items.csv").open(encoding="utf-8")))
+    failed_rows = [row for row in items if row["status"] == "failed"]
+    assert failed_rows
+    assert all(
+        row["failure_reason"]
+        == ("prediction_artifact_invalid" if corrupt else "prediction_missing")
+        for row in failed_rows
+    )
+
+
+def test_score_reviewed_subset_diagnostics_only_for_successful_selected_items(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path)
+    include_ids = _all_success_includes(fixture)
+    subset_path = _finalize_subset(tmp_path, fixture, include_ids=include_ids)
+    import src.benchmark.reviewed_subset as reviewed_module
+
+    real_score = reviewed_module.score_cohort
+    captured: dict[str, object] = {}
+
+    def spy(identity, items, *, diagnostics_for=()):
+        captured["diagnostics_for"] = diagnostics_for
+        captured["selected_items"] = items
+        return real_score(identity, items, diagnostics_for=diagnostics_for)
+
+    monkeypatch.setattr(reviewed_module, "score_cohort", spy)
+    outcome = score_oaf_reviewed_subset(
+        _score_request(fixture, subset_path, tmp_path / "subset-reports")
+    )
+
+    assert outcome.exit_code == 0
+    selected_items = captured["selected_items"]
+    assert isinstance(selected_items, tuple)
+    assert captured["diagnostics_for"] == tuple(
+        sorted(item.simfile_id for item in selected_items if item.status == "success")
+    )
+    assert captured["diagnostics_for"]
+    diagnostic_lines = (
+        (tmp_path / "subset-reports" / "event_diagnostics.jsonl").read_bytes().splitlines()
+    )
+    assert diagnostic_lines
