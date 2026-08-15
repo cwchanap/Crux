@@ -886,7 +886,7 @@ def test_backend_closes_and_final_snapshot_survives_base_exception(
     assert not (factory_input_root[0] / "10" / "full-mix.wav").exists()
 
 
-def test_resume_rejects_current_input_mismatch_and_nonresume_conflict(
+def test_resume_rejects_current_input_mismatch_and_nonresume_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import src.benchmark.oaf_corpus_run as run_module
@@ -965,6 +965,83 @@ def test_resume_rejects_current_input_mismatch_and_nonresume_conflict(
     for simfile_id, content in original_bytes.items():
         assert original_paths[simfile_id].read_bytes() == content
 
+    # A non-resume rerun must fail without mutating the existing run.json or
+    # prediction artifacts, because run_id is deterministic.
+    prior_run_json = resumed.run_path.read_bytes()
+    conflict = run_oaf_corpus(
+        _request(tmp_path),
+        backend_factory=should_not_construct,
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+    assert conflict.exit_code == 2
+    assert factory_calls == []
+    assert conflict.run_path is None
+    assert resumed.run_path.read_bytes() == prior_run_json
+    for simfile_id, content in original_bytes.items():
+        assert original_paths[simfile_id].read_bytes() == content
+
+
+def test_prediction_output_conflict_when_run_json_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """prediction_output_conflict is still reported when predictions exist but run.json does not."""
+    import src.benchmark.oaf_corpus_run as run_module
+
+    _, descriptor, materialize_calls = _install_fake_run_seams(monkeypatch, tmp_path)
+
+    def materialize(source, output_path, *, input_root, config):
+        del input_root, config
+        materialize_calls.append(int(source.source_audio_id.split("/")[0]))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"temporary canonical wav")
+        return CanonicalAudio(
+            path=output_path,
+            source_audio_id=source.source_audio_id,
+            source_audio_sha256=source.source_audio_sha256,
+            input_view_id=OAF_FULL_MIX_INPUT_VIEW_ID,
+            input_audio_sha256=SHA_B,
+            byte_length=88244,
+            sample_rate=44100,
+            channel_count=1,
+            sample_width_bytes=2,
+            audio_frame_count=44100,
+        )
+
+    monkeypatch.setattr(run_module, "_materialize_oaf_full_mix", materialize)
+
+    class HealthyBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            return NativePrediction(audio=audio, descriptor=descriptor, events=())
+
+        def close(self) -> None:
+            return None
+
+    first = run_oaf_corpus(
+        _request(tmp_path),
+        backend_factory=lambda **_: HealthyBackend(),
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+    assert first.exit_code == 0
+    assert first.run_path is not None
+    first_snapshot = run_module.parse_oaf_corpus_run(first.run_path.read_bytes())
+    original_paths = {
+        row["simfile_id"]: tmp_path / "output" / row["prediction_path"]
+        for row in first_snapshot["items"]
+    }
+    original_bytes = {simfile_id: path.read_bytes() for simfile_id, path in original_paths.items()}
+
+    # Simulate a crashed prior run: predictions remain but run.json is gone.
+    first.run_path.unlink()
+    materialize_calls.clear()
+
+    def should_not_construct(**_: object) -> HealthyBackend:
+        raise AssertionError("conflict detection must not invoke inference")
+
     conflict = run_oaf_corpus(
         _request(tmp_path),
         backend_factory=should_not_construct,
@@ -972,7 +1049,6 @@ def test_resume_rejects_current_input_mismatch_and_nonresume_conflict(
         clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
     )
     assert conflict.exit_code == 1
-    assert factory_calls == []
     assert conflict.run_path is not None
     conflict_snapshot = run_module.parse_oaf_corpus_run(conflict.run_path.read_bytes())
     conflict_rows = {row["simfile_id"]: row for row in conflict_snapshot["items"]}
