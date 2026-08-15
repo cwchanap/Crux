@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -119,15 +120,23 @@ class OafBackend:
             image=self._image,
         )
         try:
-            process = self._process_factory(
-                command,
-                timeout_seconds=self._timeout_seconds,
-                close_timeout_seconds=self._close_timeout_seconds,
+            factory_params = inspect.signature(self._process_factory).parameters
+            supports_timeout = any(
+                p.kind is inspect.Parameter.VAR_KEYWORD
+                or name in ("timeout_seconds", "close_timeout_seconds")
+                for name, p in factory_params.items()
             )
-        except TypeError:
-            # Tiny injected fakes commonly accept only the command.  The production
-            # WorkerProcess accepts the timeout keywords above.
-            process = self._process_factory(command)
+        except (TypeError, ValueError):
+            supports_timeout = False
+        try:
+            if supports_timeout:
+                process = self._process_factory(
+                    command,
+                    timeout_seconds=self._timeout_seconds,
+                    close_timeout_seconds=self._close_timeout_seconds,
+                )
+            else:
+                process = self._process_factory(command)
         except (OSError, RuntimeError, ValueError) as error:
             raise OafBackendError(
                 "worker could not be started", code="worker_start_failed"
