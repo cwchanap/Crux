@@ -25,10 +25,11 @@ from src.benchmark.corpus_manifest import (
     render_manifest,
 )
 from src.benchmark.r2_corpus_models import PublishedManifest
-from src.benchmark.reference_set import map_reference_events
+from src.benchmark.reference_set import ReferenceMappingResult, map_reference_events
 from src.benchmark.reference_timing import NativeReferenceEvent, read_reference_events
 from src.benchmark.reference_timing_manifest import (
     REFERENCE_TIMING_MANIFEST_SCHEMA,
+    LoadedReferenceTimingManifest,
     LoadedReferenceTimingRow,
     _validate_timing_manifest_row,
     load_reference_timing_manifest,
@@ -617,6 +618,65 @@ def load_reference_set_manifest(path: Path) -> LoadedReferenceSetManifest:
         source_reference_timing_version=source_version,
         rows=tuple(rows),
     )
+
+
+def preflight_reference_mappings(
+    reference_manifest: LoadedReferenceSetManifest,
+    timing_manifest: LoadedReferenceTimingManifest,
+    *,
+    timing_output_root: Path,
+) -> dict[int, ReferenceMappingResult | None]:
+    """Reconstruct eligible native references before any backend work."""
+    if not isinstance(reference_manifest, LoadedReferenceSetManifest):
+        raise TypeError("reference_manifest must be LoadedReferenceSetManifest")
+    if not isinstance(timing_manifest, LoadedReferenceTimingManifest):
+        raise TypeError("timing_manifest must be LoadedReferenceTimingManifest")
+    if not isinstance(timing_output_root, Path):
+        raise TypeError("timing_output_root must be a Path")
+    if (
+        reference_manifest.source_reference_timing_manifest_sha256
+        != timing_manifest.manifest_sha256
+        or reference_manifest.source_reference_timing_version != timing_manifest.corpus_version
+    ):
+        raise ValueError("reference and timing manifests have different lineage")
+
+    timing_rows = {row.view.simfile_id: row for row in timing_manifest.rows}
+    mappings: dict[int, ReferenceMappingResult | None] = {}
+    for loaded in reference_manifest.rows:
+        simfile_id = loaded.view.simfile_id
+        timing_row = timing_rows.get(simfile_id)
+        reasons = set(loaded.view.eligibility_reason_codes)
+        if loaded.view.eligibility_status != "eligible":
+            if reasons & {"upstream_reference_unavailable", "reference_event_artifact_invalid"}:
+                mappings[simfile_id] = None
+                continue
+            if timing_row is None or timing_row.view.timing_status != "ready":
+                mappings[simfile_id] = None
+                continue
+        if timing_row is None or timing_row.view.timing_status != "ready":
+            raise ValueError("eligible reference timing row is unavailable")
+        for field in (
+            "selected_chart_key",
+            "selected_chart_content_hash",
+            "source_audio_key",
+            "source_audio_content_hash",
+            "source_endpoint_sha256",
+            "source_bucket",
+            "reference_events_cache_path",
+        ):
+            if loaded.source_row.get(field) != timing_row.source_row.get(field):
+                raise ValueError("eligible reference identity does not match timing row")
+        try:
+            events = read_native_reference_events(
+                timing_row,
+                timing_output_root=timing_output_root,
+            )
+            mappings[simfile_id] = map_reference_events(events)
+        except (OSError, RuntimeError, ValueError):
+            if loaded.view.eligibility_status == "eligible":
+                raise ValueError("eligible reference event artifact invalid") from None
+            mappings[simfile_id] = None
+    return mappings
 
 
 def _validate_warnings(value: object) -> None:

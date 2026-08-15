@@ -42,7 +42,6 @@ from src.benchmark.oaf_corpus_run import (
     ResolvedSourceAudio,
     _cohort_item_from_run_row,
     _materialize_oaf_full_mix,
-    _preflight_reference_mappings,
     _project_runtime,
     _resolve_source_audio,
     _validate_scope,
@@ -64,6 +63,7 @@ from src.benchmark.reference_set_manifest import (
     ReferenceSetRequest,
     ReferenceSetRowView,
     load_reference_set_manifest,
+    preflight_reference_mappings,
     run_reference_set,
 )
 from src.benchmark.reference_timing import NativeReferenceEvent, render_reference_events
@@ -493,7 +493,7 @@ def test_preflight_published_eligible_artifact_deletion_is_fatal(tmp_path: Path)
     timing_output_root = timing_path.parent.parent
     simfile_id = reference_manifest.rows[0].view.simfile_id
 
-    before_deletion = _preflight_reference_mappings(
+    before_deletion = preflight_reference_mappings(
         reference_manifest,
         timing_manifest,
         timing_output_root=timing_output_root,
@@ -503,7 +503,7 @@ def test_preflight_published_eligible_artifact_deletion_is_fatal(tmp_path: Path)
     event_path.unlink()
 
     with pytest.raises(ValueError, match="eligible reference event artifact invalid"):
-        _preflight_reference_mappings(
+        preflight_reference_mappings(
             reference_manifest,
             timing_manifest,
             timing_output_root=timing_output_root,
@@ -801,7 +801,7 @@ def test_preflight_published_eligible_artifact_corruption_is_fatal(tmp_path: Pat
     event_path.write_bytes(b"corrupt event artifact")
 
     with pytest.raises(ValueError, match="eligible reference event artifact invalid"):
-        _preflight_reference_mappings(
+        preflight_reference_mappings(
             loaded_reference,
             loaded_timing,
             timing_output_root=timing_path.parent.parent,
@@ -813,7 +813,7 @@ def test_preflight_reference_mappings_reconstructs_eligible_artifact(
 ) -> None:
     root, reference_manifest, timing_manifest, _ = _reference_preflight_fixture(tmp_path)
 
-    mappings = _preflight_reference_mappings(
+    mappings = preflight_reference_mappings(
         reference_manifest,
         timing_manifest,
         timing_output_root=root,
@@ -860,7 +860,7 @@ def test_preflight_binds_complete_remote_source_identity_lineage(
     )
 
     with pytest.raises(ValueError, match="eligible reference identity"):
-        _preflight_reference_mappings(
+        preflight_reference_mappings(
             reference_manifest,
             timing_manifest,
             timing_output_root=root,
@@ -874,7 +874,7 @@ def test_preflight_reference_mappings_fails_before_inference_for_corrupt_eligibl
     artifact.write_bytes(b"corrupt event artifact")
 
     with pytest.raises(ValueError, match="eligible reference event artifact invalid"):
-        _preflight_reference_mappings(
+        preflight_reference_mappings(
             reference_manifest,
             timing_manifest,
             timing_output_root=root,
@@ -910,7 +910,7 @@ def test_preflight_reference_mappings_quarantined_missing_artifact_is_not_fatal(
         rows=(LoadedReferenceSetRow(source_row=source_row, view=quarantine_view),),
     )
 
-    mappings = _preflight_reference_mappings(
+    mappings = preflight_reference_mappings(
         quarantine_manifest,
         timing_manifest,
         timing_output_root=root,

@@ -114,7 +114,7 @@ def _install_fake_run_seams(
         for row in reference_manifest.rows
     }
     monkeypatch.setattr(
-        run_module, "_preflight_reference_mappings", lambda *_args, **_kwargs: reference_mappings
+        run_module, "preflight_reference_mappings", lambda *_args, **_kwargs: reference_mappings
     )
     monkeypatch.setattr(
         run_module,
@@ -185,7 +185,7 @@ def test_run_oaf_corpus_uses_one_persistent_backend_and_request_timeout(
     monkeypatch.setattr(run_module, "load_reference_timing_manifest", lambda _: timing_manifest)
     monkeypatch.setattr(
         run_module,
-        "_preflight_reference_mappings",
+        "preflight_reference_mappings",
         lambda *_args, **_kwargs: {
             row.view.simfile_id: _reference_mapping(row.view.simfile_id)
             for row in reference_manifest.rows
@@ -1072,7 +1072,7 @@ def test_poison_stops_the_worker_and_resume_reuses_exact_prediction(
         for row in reference_manifest.rows
     }
     monkeypatch.setattr(
-        run_module, "_preflight_reference_mappings", lambda *_args, **_kwargs: empty_mappings
+        run_module, "preflight_reference_mappings", lambda *_args, **_kwargs: empty_mappings
     )
     monkeypatch.setattr(
         run_module,
