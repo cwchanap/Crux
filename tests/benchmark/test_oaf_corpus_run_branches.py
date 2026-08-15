@@ -195,6 +195,21 @@ def _source_wav_bytes(*, sample_rate: int = 44100, frames: int = 44100) -> bytes
     return output.getvalue()
 
 
+def _source_wav_bytes_with_value(
+    value: float, *, sample_rate: int = 44100, frames: int = 44100
+) -> bytes:
+    """A valid WAV filled with one sample value (same byte length as zeros)."""
+    output = BytesIO()
+    sf.write(
+        output,
+        np.full((frames, 1), value, dtype=np.float32),
+        sample_rate,
+        format="WAV",
+        subtype="PCM_16",
+    )
+    return output.getvalue()
+
+
 def _cache_body(cache_dir: Path, content: bytes) -> tuple[str, Path]:
     from hashlib import sha256
 
@@ -1931,6 +1946,171 @@ def test_run_oaf_corpus_materialize_failure_marks_item_failed(
     )
     assert outcome.exit_code == 1
     assert outcome.failed_count == 1
+
+
+def test_run_oaf_corpus_rejects_source_body_mutated_after_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cache body mutated after the bulk preflight must be rejected at inference.
+
+    The bulk pass resolves each source with load_body=False (verified path only).
+    The per-item materialization step re-pins the body with load_body=True so the
+    bytes inferred by librosa are guaranteed to match the HPA-323 digest recorded
+    in the run row. If the cache body is replaced between preflight and inference,
+    the re-pin must fail the item rather than silently infer different bytes.
+    """
+    from hashlib import sha256
+
+    import src.benchmark.oaf_corpus_run as run_module
+    from src.benchmark.oaf_corpus_run import run_oaf_corpus
+    from src.benchmark.reference_set_manifest import (
+        LoadedReferenceSetManifest,
+        LoadedReferenceSetRow,
+        ReferenceSetRowView,
+    )
+    from src.benchmark.reference_timing import NativeReferenceEvent
+    from src.benchmark.reference_timing_manifest import LoadedReferenceTimingManifest
+
+    # Real verified cache body for simfile 10's source audio.
+    original_body = _source_wav_bytes(frames=44100)
+    audio_digest = sha256(original_body).hexdigest()
+    cache_dir = tmp_path / "cache"
+    cache_body_path = cache_dir / "sha256" / audio_digest[:2] / audio_digest
+    cache_body_path.parent.mkdir(parents=True)
+    cache_body_path.write_bytes(original_body)
+
+    # A different valid WAV of identical byte length: same size, different digest.
+    # Without the per-item re-pin, librosa would load this and infer wrong bytes
+    # while the run row still claims the original HPA-323 digest.
+    corrupt_body = _source_wav_bytes_with_value(1.0, frames=44100)
+    assert len(corrupt_body) == len(original_body)
+    assert sha256(corrupt_body).hexdigest() != audio_digest
+
+    source_row = {
+        "selected_chart_key": "10/chart.dtx",
+        "selected_chart_content_hash": SHA_A,
+        "source_audio_key": "10/audio.wav",
+        "source_audio_content_hash": audio_digest,
+        "source_endpoint_sha256": SHA_A,
+        "source_bucket": "simfile-dtx",
+        "objects": [
+            {
+                "key": "10/audio.wav",
+                "size": len(original_body),
+                "etag": '"etag-audio"',
+                "etag_is_weak": False,
+                "last_modified": "2026-08-14T00:00:00Z",
+                "content_type": "audio/wav",
+                "cache_status": "verified",
+                "sha256": audio_digest,
+                "cache_path": f"sha256/{audio_digest[:2]}/{audio_digest}",
+            }
+        ],
+    }
+    reference_manifest = LoadedReferenceSetManifest(
+        manifest_sha256=SHA_A,
+        corpus_version="sha256:" + SHA_B,
+        source_reference_timing_manifest_sha256=SHA_B,
+        source_reference_timing_version="sha256:" + SHA_A,
+        rows=(
+            LoadedReferenceSetRow(
+                source_row=source_row,
+                view=ReferenceSetRowView(
+                    simfile_id=10,
+                    eligibility_status="eligible",
+                    eligibility_reason_codes=(),
+                    eligibility_warnings=(),
+                    mapped_event_count=0,
+                    common_scored_event_count=0,
+                    ignored_event_count=0,
+                    unmapped_event_count=0,
+                    duplicate_common_event_count=0,
+                ),
+            ),
+        ),
+    )
+    timing_manifest = LoadedReferenceTimingManifest(
+        manifest_sha256=SHA_B,
+        corpus_version="sha256:" + SHA_A,
+        rows=(),
+    )
+    monkeypatch.setattr(run_module, "load_reference_set_manifest", lambda _: reference_manifest)
+    monkeypatch.setattr(run_module, "load_reference_timing_manifest", lambda _: timing_manifest)
+    monkeypatch.setattr(
+        run_module,
+        "_preflight_reference_mappings",
+        lambda *_a, **_kw: {
+            10: map_reference_events(
+                (
+                    NativeReferenceEvent(
+                        simfile_id=10,
+                        selected_chart_key="10/chart.dtx",
+                        selected_chart_content_hash=SHA_A,
+                        source_audio_key="10/audio.wav",
+                        source_audio_content_hash=audio_digest,
+                        source_order=0,
+                        measure=1,
+                        position=0.0,
+                        lane_id="13",
+                        note_id="kick-0",
+                        chart_time_sec=0.5,
+                        audio_time_sec=0.5,
+                    ),
+                )
+            )
+        },
+    )
+
+    # Wrap the real resolver: after the bulk preflight (load_body=False) succeeds,
+    # replace the cache body so the per-item re-pin (load_body=True) sees mutated
+    # bytes. _materialize_oaf_full_mix is left real so a missing re-pin would
+    # actually infer the wrong bytes against the original digest.
+    real_resolve = run_module._resolve_source_audio
+    corrupted = False
+
+    def resolve_wrapper(*args, **kwargs):
+        nonlocal corrupted
+        resolved = real_resolve(*args, **kwargs)
+        if not kwargs.get("load_body", True) and not corrupted:
+            cache_body_path.write_bytes(corrupt_body)
+            corrupted = True
+        return resolved
+
+    monkeypatch.setattr(run_module, "_resolve_source_audio", resolve_wrapper)
+
+    descriptor = _descriptor()
+    outcome = run_oaf_corpus(
+        _request(tmp_path),
+        backend_factory=lambda **_: _HealthyBackend(descriptor),
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+
+    # The item must be failed at the source-verification step, not inferred.
+    assert outcome.exit_code == 1
+    assert outcome.failed_count == 1
+    assert outcome.run_path is not None
+    snapshot = parse_oaf_corpus_run(outcome.run_path.read_bytes())
+    (item,) = snapshot["items"]
+    assert item["execution_disposition"] == "failed"
+    assert item["runner_failure_code"] == "source_audio_unavailable"
+
+    # No prediction artifact may exist: wrong bytes were never inferred.
+    config = load_model_config()
+    lock_sha = compute_model_lock_sha256(_model_lock_path())
+    inf_sha = inference_config_sha256(build_inference_config(config, descriptor, lock_sha))
+    prediction_target = prediction_path(
+        tmp_path / "output",
+        simfile_id=10,
+        source_audio_sha256=audio_digest,
+        backend_descriptor_sha256=descriptor.sha256,
+        inference_config_sha256=inf_sha,
+    )
+    assert not prediction_target.exists()
+
+    # The canonical input must not have been materialized from the mutated body.
+    canonical_path = outcome.run_path.parent / "inputs" / "10" / "full-mix.wav"
+    assert not canonical_path.exists()
 
 
 def test_run_oaf_corpus_backend_descriptor_type_invalid_is_fatal_preflight(

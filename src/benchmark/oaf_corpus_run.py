@@ -862,6 +862,7 @@ class _OafExecutionState:
     mapping: ReferenceMappingResult | None
     snapshot: dict[str, object]
     source: ResolvedSourceAudio | None = None
+    source_audio_kwargs: dict[str, str | None] | None = None
 
 
 def _utc_now() -> datetime:
@@ -1631,27 +1632,29 @@ def run_oaf_corpus(
         source_audio_content_hash = source_row.get("source_audio_content_hash")
         source_endpoint_sha256 = source_row.get("source_endpoint_sha256")
         source_bucket = source_row.get("source_bucket")
+        source_audio_kwargs = {
+            "source_audio_key": source_audio_key if isinstance(source_audio_key, str) else None,
+            "source_audio_content_hash": (
+                source_audio_content_hash if isinstance(source_audio_content_hash, str) else None
+            ),
+            "source_endpoint_sha256": (
+                source_endpoint_sha256 if isinstance(source_endpoint_sha256, str) else None
+            ),
+            "source_bucket": source_bucket if isinstance(source_bucket, str) else None,
+        }
         try:
             source = _resolve_source_audio(
                 source_row,
                 request.cache_dir,
                 cache_index,
-                source_audio_key=source_audio_key if isinstance(source_audio_key, str) else None,
-                source_audio_content_hash=(
-                    source_audio_content_hash
-                    if isinstance(source_audio_content_hash, str)
-                    else None
-                ),
-                source_endpoint_sha256=(
-                    source_endpoint_sha256 if isinstance(source_endpoint_sha256, str) else None
-                ),
-                source_bucket=source_bucket if isinstance(source_bucket, str) else None,
+                **source_audio_kwargs,
                 load_body=False,
             )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             _set_failed(state.snapshot, _source_failure_code(error), error)
             continue
         state.source = source
+        state.source_audio_kwargs = source_audio_kwargs
         state.snapshot["source_audio_id"] = source.source_audio_id
         state.snapshot["source_audio_sha256"] = source.source_audio_sha256
         state.snapshot["source_duration_sec"] = source.duration_sec
@@ -1674,6 +1677,7 @@ def run_oaf_corpus(
             if item.get("execution_disposition") == "failed" or state.source is None:
                 continue
             assert state.source is not None
+            assert state.source_audio_kwargs is not None
             canonical_path = input_root / str(state.loaded.view.simfile_id) / "full-mix.wav"
             prediction_target = prediction_path(
                 request.output_dir,
@@ -1682,6 +1686,32 @@ def run_oaf_corpus(
                 backend_descriptor_sha256=backend_descriptor.sha256,
                 inference_config_sha256=config_sha,
             )
+            # Re-pin the source body immediately before materialization so the
+            # bytes inferred by librosa are guaranteed to match the HPA-323 digest
+            # recorded in the run row. The bulk preflight only verified the cache
+            # body and retained its path; a cache replacement between that
+            # validation and inference must be rejected rather than silently
+            # inferred against the original digest.
+            try:
+                state.source = _resolve_source_audio(
+                    state.loaded.source_row,
+                    request.cache_dir,
+                    cache_index,
+                    **state.source_audio_kwargs,
+                    load_body=True,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                _set_failed(item, _source_failure_code(error), error)
+                _remove_temporary_input(canonical_path, input_root)
+                try:
+                    _write_snapshot_checkpoint(
+                        run_path, header, (state.snapshot for state in states)
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError):
+                    fatal_run_error = True
+                    stop_after_poison = True
+                    break
+                continue
             try:
                 audio = _materialize_oaf_full_mix(
                     state.source,
