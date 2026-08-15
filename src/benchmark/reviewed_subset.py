@@ -311,13 +311,13 @@ def _is_metric_token(value: object) -> bool:
         return False
     try:
         parsed = Decimal(value)
-    except InvalidOperation:
+        if not parsed.is_finite() or parsed < 0:
+            return False
+        return value == canonical_json_bytes(
+            parsed.quantize(SIX_PLACES, rounding=ROUND_HALF_EVEN)
+        ).decode("ascii")
+    except (InvalidOperation, ValueError):
         return False
-    if not parsed.is_finite() or parsed < 0:
-        return False
-    return value == canonical_json_bytes(
-        parsed.quantize(SIX_PLACES, rounding=ROUND_HALF_EVEN)
-    ).decode("ascii")
 
 
 def _validate_reviewed_subset_row(row: Mapping[str, object]) -> None:
@@ -887,6 +887,10 @@ def score_oaf_reviewed_subset(
     )
 
     try:
+        if request.output_dir.resolve() == (request.run_path.parent / "reports").resolve():
+            raise ValueError(
+                "subset report output directory must not alias the parent run's broad reports"
+            )
         reference = load_reference_set_manifest(request.reference_manifest_path)
         timing = load_reference_timing_manifest(request.timing_manifest_path)
         mappings = preflight_reference_mappings(
