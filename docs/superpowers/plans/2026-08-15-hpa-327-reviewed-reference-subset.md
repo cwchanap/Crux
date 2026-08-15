@@ -627,7 +627,35 @@ Produce a deterministic stream beyond row 30 for continuation replacements.
 
 - [ ] **Step 7: Implement exact CSV boundary**
 
-Generated fields are the design's 23 generated columns from `review_policy_version` through `selects_real_or_full_chart`; manual fields are exactly:
+Generated fields are exactly:
+
+```text
+review_policy_version
+selection_seed
+candidate_rank
+simfile_id
+source_reference_manifest_sha256
+source_reference_manifest_version
+source_timing_manifest_sha256
+source_timing_manifest_version
+source_row_sha256
+selected_chart_key
+selected_chart_content_hash
+selected_chart_cache_path
+source_audio_key
+source_audio_content_hash
+source_audio_cache_path
+common_event_count
+reference_event_span_sec
+common_event_density_per_sec
+common_class_count
+density_band
+class_richness_band
+has_timing_warning
+selects_real_or_full_chart
+```
+
+Manual fields are exactly:
 
 ```text
 reviewer
@@ -1042,7 +1070,7 @@ score: exit_code, cohort_id, success_count, failed_count, skipped_count, quarant
 uv run pytest tests/test_cli_benchmark.py -k "reviewed_subset" -q
 ```
 
-Expected: FAIL because commands are absent.
+Expected: FAIL because the commands are absent.
 
 - [ ] **Step 4: Implement Click callbacks only**
 
