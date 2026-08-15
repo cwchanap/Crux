@@ -267,6 +267,45 @@ def test_reviewed_subset_loader_accepts_fractional_metric_tokens(tmp_path: Path)
     assert loaded.rows[0].view.common_event_density_per_sec == Decimal("1.25")
 
 
+@pytest.mark.parametrize(
+    "token",
+    ["1E+999", "1" + "0" * 30],
+    ids=["huge-exponent", "huge-digit-count"],
+)
+def test_reviewed_subset_loader_rejects_overflow_metric_tokens_as_value_error(
+    tmp_path: Path,
+    token: str,
+) -> None:
+    """Finite-but-huge metric tokens must fail the loader's ValueError contract.
+
+    ``Decimal.quantize`` raises ``decimal.InvalidOperation`` (an
+    ``ArithmeticError``, not a ``ValueError``) for coefficients that exceed the
+    context precision; the loader must translate that into the same ValueError
+    rejection as any other invalid metric token.
+    """
+    rows = list(_golden_rows(20))
+    rows[0]["reference_event_span_sec"] = token
+    path = _write_subset(tmp_path, tuple(rows))
+
+    with pytest.raises(ValueError):
+        load_reviewed_subset_manifest(path)
+
+
+def test_reviewed_subset_schema_golden_rejects_overflow_metric_token_as_value_error(
+    tmp_path: Path,
+) -> None:
+    """The schema-golden validator shares the same ValueError contract."""
+    source = strict_json_loads(_GOLDEN.read_bytes()[:-1], require_canonical=True)
+    assert isinstance(source, dict)
+    row = dict(source)
+    row.pop("corpus_version", None)
+    row["reference_event_span_sec"] = "1E+999"
+    content = render_manifest((row,)).content
+
+    with pytest.raises(ValueError):
+        validate_schema_golden(REVIEWED_REFERENCE_SUBSET_SCHEMA, content)
+
+
 def test_reviewed_subset_loader_requires_notes_for_other_reason(tmp_path: Path) -> None:
     rows = list(_golden_rows(20))
     rows[0]["reason_codes"] = ["other"]
@@ -1384,6 +1423,29 @@ def test_score_reviewed_subset_exits_2_on_report_publication_failure(tmp_path: P
     assert outcome.exit_code == 2
     assert outcome.cohort_id is None
     assert outcome.reports_path is None
+
+
+def test_score_reviewed_subset_exits_2_when_output_dir_aliases_parent_broad_reports(
+    tmp_path: Path,
+) -> None:
+    """The subset output dir must never alias the parent run's broad reports.
+
+    Supplying ``<run>/reports`` as the subset output directory would make
+    ``write_cohort_reports`` overwrite the HPA-326 broad artifacts; the scorer
+    must reject it before scoring/writing, leaving the broad reports untouched.
+    """
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path)
+    subset_path = _finalize_subset(tmp_path, fixture, include_ids=_all_success_includes(fixture))
+    parent_reports = fixture.run_path.parent / "reports"
+    _parent_reports(fixture, parent_reports)
+    before = _hash_reports(parent_reports)
+
+    outcome = score_oaf_reviewed_subset(_score_request(fixture, subset_path, parent_reports))
+
+    assert outcome.exit_code == 2
+    assert outcome.cohort_id is None
+    assert outcome.reports_path is None
+    assert _hash_reports(parent_reports) == before
 
 
 @pytest.mark.parametrize("corrupt", [False, True], ids=["missing", "corrupt"])
