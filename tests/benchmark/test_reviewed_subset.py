@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import csv
+import subprocess
+import sys
 from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
@@ -78,6 +80,25 @@ def _write_subset(
     path = tmp_path / name
     path.write_bytes(rendered.content)
     return path
+
+
+def test_reviewed_subset_module_has_no_import_time_oaf_dependency() -> None:
+    """Pin the no-import-time OaF execution dependency constraint.
+
+    Must run in a subprocess: in-process ``sys.modules`` checks are unreliable
+    because other tests import ``src.benchmark.oaf_corpus_run`` first.
+    """
+    probe = (
+        "import sys, src.benchmark.reviewed_subset; "
+        "sys.exit(1 if 'src.benchmark.oaf_corpus_run' in sys.modules else 0)"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr.decode("utf-8")
 
 
 def test_reviewed_subset_schema_golden_is_valid() -> None:

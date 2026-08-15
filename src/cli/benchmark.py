@@ -786,6 +786,210 @@ def sync_r2_corpus_command(
         ctx.exit(outcome.exit_code)
 
 
+@benchmark.command("prepare-reviewed-subset")
+@click.option(
+    "--manifest",
+    "reference_manifest_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required path to an immutable local HPA-324 reference-set manifest (JSONL).",
+)
+@click.option(
+    "--timing-manifest",
+    "timing_manifest_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required path to the source HPA-323 reference-timing manifest (JSONL).",
+)
+@click.option(
+    "--output-file",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Path where the deterministic review CSV is written.",
+)
+@click.option(
+    "--prior-ledger",
+    "prior_ledger_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    default=None,
+    help="Optional prior review ledger CSV for continuation carries.",
+)
+def prepare_reviewed_subset_command(
+    reference_manifest_path: Path,
+    timing_manifest_path: Path,
+    output_file: Path,
+    prior_ledger_path: Path | None,
+) -> None:
+    """Prepare the deterministic HPA-327 review CSV (no model inputs)."""
+    from src.benchmark.reviewed_subset import (
+        PrepareReviewedSubsetRequest,
+        prepare_reviewed_subset,
+    )
+
+    outcome = prepare_reviewed_subset(
+        PrepareReviewedSubsetRequest(
+            reference_manifest_path=reference_manifest_path,
+            timing_manifest_path=timing_manifest_path,
+            output_file=output_file,
+            prior_ledger_path=prior_ledger_path,
+        )
+    )
+    payload = {
+        "candidate_count": outcome.candidate_count,
+        "carried_include_count": outcome.carried_include_count,
+        "exit_code": outcome.exit_code,
+        "output_file": None if outcome.output_file is None else str(outcome.output_file),
+        "replacement_count": outcome.replacement_count,
+    }
+    click.echo(canonical_json_bytes(payload).decode("utf-8"))
+    if outcome.exit_code:
+        raise click.exceptions.Exit(outcome.exit_code)
+
+
+@benchmark.command("finalize-reviewed-subset")
+@click.option(
+    "--manifest",
+    "reference_manifest_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required path to an immutable local HPA-324 reference-set manifest (JSONL).",
+)
+@click.option(
+    "--timing-manifest",
+    "timing_manifest_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required path to the source HPA-323 reference-timing manifest (JSONL).",
+)
+@click.option(
+    "--review-file",
+    "review_file",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required path to the completed review CSV.",
+)
+@click.option(
+    "--output-dir",
+    "output_dir",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Directory where the canonical ledger and accepted manifest are published.",
+)
+@click.option(
+    "--prior-ledger",
+    "prior_ledger_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    default=None,
+    help="Optional prior review ledger CSV used for the continuation pass.",
+)
+def finalize_reviewed_subset_command(
+    reference_manifest_path: Path,
+    timing_manifest_path: Path,
+    review_file: Path,
+    output_dir: Path,
+    prior_ledger_path: Path | None,
+) -> None:
+    """Validate the completed review CSV and publish the canonical subset."""
+    from src.benchmark.reviewed_subset import (
+        FinalizeReviewedSubsetRequest,
+        finalize_reviewed_subset,
+    )
+
+    outcome = finalize_reviewed_subset(
+        FinalizeReviewedSubsetRequest(
+            reference_manifest_path=reference_manifest_path,
+            timing_manifest_path=timing_manifest_path,
+            review_file=review_file,
+            output_dir=output_dir,
+            prior_ledger_path=prior_ledger_path,
+        )
+    )
+    payload = {
+        "excluded_count": outcome.excluded_count,
+        "exit_code": outcome.exit_code,
+        "included_count": outcome.included_count,
+        "manifest_path": None if outcome.manifest is None else str(outcome.manifest.path),
+        "review_ledger_path": (
+            None if outcome.review_ledger_path is None else str(outcome.review_ledger_path)
+        ),
+    }
+    click.echo(canonical_json_bytes(payload).decode("utf-8"))
+    if outcome.exit_code:
+        raise click.exceptions.Exit(outcome.exit_code)
+
+
+@benchmark.command("score-oaf-reviewed-subset")
+@click.option(
+    "--run",
+    "run_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required path to a persisted crux.oaf-corpus-run/v1 run.json snapshot.",
+)
+@click.option(
+    "--manifest",
+    "reference_manifest_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required path to an immutable local HPA-324 reference-set manifest (JSONL).",
+)
+@click.option(
+    "--timing-manifest",
+    "timing_manifest_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required path to the source HPA-323 reference-timing manifest (JSONL).",
+)
+@click.option(
+    "--subset-manifest",
+    "subset_manifest_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required path to the accepted crux.reviewed-reference-subset/v1 manifest (JSONL).",
+)
+@click.option(
+    "--output-dir",
+    "output_dir",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Directory where the subset cohort reports are written.",
+)
+def score_oaf_reviewed_subset_command(
+    run_path: Path,
+    reference_manifest_path: Path,
+    timing_manifest_path: Path,
+    subset_manifest_path: Path,
+    output_dir: Path,
+) -> None:
+    """Rescore one persisted OaF run on the exact reviewed subset membership."""
+    from src.benchmark.reviewed_subset import (
+        ScoreReviewedSubsetRequest,
+        score_oaf_reviewed_subset,
+    )
+
+    outcome = score_oaf_reviewed_subset(
+        ScoreReviewedSubsetRequest(
+            run_path=run_path,
+            reference_manifest_path=reference_manifest_path,
+            timing_manifest_path=timing_manifest_path,
+            subset_manifest_path=subset_manifest_path,
+            output_dir=output_dir,
+        )
+    )
+    payload = {
+        "cohort_id": outcome.cohort_id,
+        "exit_code": outcome.exit_code,
+        "failed_count": outcome.failed_count,
+        "quarantined_count": outcome.quarantined_count,
+        "reports_path": None if outcome.reports_path is None else str(outcome.reports_path),
+        "skipped_count": outcome.skipped_count,
+        "success_count": outcome.success_count,
+    }
+    click.echo(canonical_json_bytes(payload).decode("utf-8"))
+    if outcome.exit_code:
+        raise click.exceptions.Exit(outcome.exit_code)
+
+
 @benchmark.command("prepare-corpus")
 @raw_dir_option
 @run_name_option

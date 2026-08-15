@@ -21,7 +21,12 @@ from src.benchmark.prediction_artifact import (
     publish_prediction_artifact,
     read_prediction_artifact,
 )
-from src.benchmark.r2_corpus_models import MAX_SIMFILE_ID
+from src.benchmark.r2_corpus_models import MAX_SIMFILE_ID, PublishedManifest
+from src.benchmark.reviewed_subset import (
+    FinalizeReviewedSubsetOutcome,
+    PrepareReviewedSubsetOutcome,
+    ScoreReviewedSubsetOutcome,
+)
 from src.cli.main import main
 
 
@@ -513,6 +518,379 @@ def test_run_oaf_corpus_non_positive_scope_is_canonical_fatal(tmp_path: Path, mo
     assert result.exit_code == 2
     assert json.loads(result.output)["exit_code"] == 2
     assert json.loads(result.output)["status"] == "failed"
+
+
+def test_reviewed_subset_commands_declare_exact_options() -> None:
+    expected_options = {
+        "prepare-reviewed-subset": (
+            "--manifest",
+            "--timing-manifest",
+            "--output-file",
+            "--prior-ledger",
+        ),
+        "finalize-reviewed-subset": (
+            "--manifest",
+            "--timing-manifest",
+            "--review-file",
+            "--output-dir",
+            "--prior-ledger",
+        ),
+        "score-oaf-reviewed-subset": (
+            "--run",
+            "--manifest",
+            "--timing-manifest",
+            "--subset-manifest",
+            "--output-dir",
+        ),
+    }
+    for command, options in expected_options.items():
+        result = CliRunner().invoke(main, ["benchmark", command, "--help"])
+        assert result.exit_code == 0
+        for option in options:
+            assert option in result.output
+        for selector in ("--seed", "--count", "--threshold", "--model", "--backend"):
+            assert selector not in result.output
+
+
+def test_prepare_reviewed_subset_command_builds_request_and_emits_canonical_summary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.reviewed_subset as reviewed_module
+
+    reference_manifest_path = tmp_path / "hpa324.jsonl"
+    timing_manifest_path = tmp_path / "hpa323.jsonl"
+    prior_ledger_path = tmp_path / "prior.csv"
+    output_file = tmp_path / "prepared.csv"
+    for path in (reference_manifest_path, timing_manifest_path, prior_ledger_path):
+        path.write_bytes(b"x")
+    captured: list[object] = []
+
+    def fake_prepare(request: object) -> PrepareReviewedSubsetOutcome:
+        captured.append(request)
+        return PrepareReviewedSubsetOutcome(
+            exit_code=0,
+            output_file=output_file,
+            candidate_count=30,
+            carried_include_count=4,
+            replacement_count=26,
+        )
+
+    monkeypatch.setattr(reviewed_module, "prepare_reviewed_subset", fake_prepare)
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "prepare-reviewed-subset",
+            "--manifest",
+            str(reference_manifest_path),
+            "--timing-manifest",
+            str(timing_manifest_path),
+            "--output-file",
+            str(output_file),
+            "--prior-ledger",
+            str(prior_ledger_path),
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.reference_manifest_path == reference_manifest_path
+    assert request.timing_manifest_path == timing_manifest_path
+    assert request.output_file == output_file
+    assert request.prior_ledger_path == prior_ledger_path
+
+    summary = json.loads(result.output)
+    assert set(summary) == {
+        "candidate_count",
+        "carried_include_count",
+        "exit_code",
+        "output_file",
+        "replacement_count",
+    }
+    assert summary["exit_code"] == 0
+    assert summary["candidate_count"] == 30
+    assert summary["carried_include_count"] == 4
+    assert summary["replacement_count"] == 26
+    assert summary["output_file"] == str(output_file)
+
+    captured.clear()
+    omitted = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "prepare-reviewed-subset",
+            "--manifest",
+            str(reference_manifest_path),
+            "--timing-manifest",
+            str(timing_manifest_path),
+            "--output-file",
+            str(output_file),
+        ],
+        catch_exceptions=False,
+    )
+    assert omitted.exit_code == 0
+    assert len(captured) == 1
+    assert captured[0].prior_ledger_path is None
+
+
+def test_finalize_reviewed_subset_command_builds_request_and_emits_canonical_summary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.reviewed_subset as reviewed_module
+
+    reference_manifest_path = tmp_path / "hpa324.jsonl"
+    timing_manifest_path = tmp_path / "hpa323.jsonl"
+    review_file = tmp_path / "review.csv"
+    output_dir = tmp_path / "subset"
+    for path in (reference_manifest_path, timing_manifest_path, review_file):
+        path.write_bytes(b"x")
+    manifest = PublishedManifest(
+        corpus_version="sha256:" + "a" * 64,
+        manifest_sha256="b" * 64,
+        relative_path="manifests/" + "b" * 64 + ".jsonl",
+        path=output_dir / "manifests" / ("b" * 64 + ".jsonl"),
+        latest_path=output_dir / "latest.json",
+    )
+    review_ledger_path = output_dir / "review-ledger.csv"
+    captured: list[object] = []
+
+    def fake_finalize(request: object) -> FinalizeReviewedSubsetOutcome:
+        captured.append(request)
+        return FinalizeReviewedSubsetOutcome(
+            exit_code=0,
+            manifest=manifest,
+            review_ledger_path=review_ledger_path,
+            included_count=20,
+            excluded_count=10,
+        )
+
+    monkeypatch.setattr(reviewed_module, "finalize_reviewed_subset", fake_finalize)
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "finalize-reviewed-subset",
+            "--manifest",
+            str(reference_manifest_path),
+            "--timing-manifest",
+            str(timing_manifest_path),
+            "--review-file",
+            str(review_file),
+            "--output-dir",
+            str(output_dir),
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.reference_manifest_path == reference_manifest_path
+    assert request.timing_manifest_path == timing_manifest_path
+    assert request.review_file == review_file
+    assert request.output_dir == output_dir
+    assert request.prior_ledger_path is None
+
+    summary = json.loads(result.output)
+    assert set(summary) == {
+        "excluded_count",
+        "exit_code",
+        "included_count",
+        "manifest_path",
+        "review_ledger_path",
+    }
+    assert summary["manifest_path"] == str(manifest.path)
+    assert summary["review_ledger_path"] == str(review_ledger_path)
+    assert summary["included_count"] == 20
+    assert summary["excluded_count"] == 10
+
+
+def test_score_oaf_reviewed_subset_command_builds_request_and_emits_canonical_summary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.reviewed_subset as reviewed_module
+
+    run_path = tmp_path / "run.json"
+    reference_manifest_path = tmp_path / "hpa324.jsonl"
+    timing_manifest_path = tmp_path / "hpa323.jsonl"
+    subset_manifest_path = tmp_path / "subset.jsonl"
+    output_dir = tmp_path / "reports"
+    for path in (
+        run_path,
+        reference_manifest_path,
+        timing_manifest_path,
+        subset_manifest_path,
+    ):
+        path.write_bytes(b"x")
+    captured: list[object] = []
+
+    def fake_score(request: object) -> ScoreReviewedSubsetOutcome:
+        captured.append(request)
+        return ScoreReviewedSubsetOutcome(
+            exit_code=0,
+            cohort_id="c" * 64,
+            reports_path=output_dir,
+            success_count=20,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+        )
+
+    monkeypatch.setattr(reviewed_module, "score_oaf_reviewed_subset", fake_score)
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "score-oaf-reviewed-subset",
+            "--run",
+            str(run_path),
+            "--manifest",
+            str(reference_manifest_path),
+            "--timing-manifest",
+            str(timing_manifest_path),
+            "--subset-manifest",
+            str(subset_manifest_path),
+            "--output-dir",
+            str(output_dir),
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.run_path == run_path
+    assert request.reference_manifest_path == reference_manifest_path
+    assert request.timing_manifest_path == timing_manifest_path
+    assert request.subset_manifest_path == subset_manifest_path
+    assert request.output_dir == output_dir
+
+    summary = json.loads(result.output)
+    assert set(summary) == {
+        "cohort_id",
+        "exit_code",
+        "failed_count",
+        "quarantined_count",
+        "reports_path",
+        "skipped_count",
+        "success_count",
+    }
+    assert summary["cohort_id"] == "c" * 64
+    assert summary["success_count"] == 20
+    assert summary["failed_count"] == 0
+    assert summary["skipped_count"] == 0
+    assert summary["quarantined_count"] == 0
+    assert summary["reports_path"] == str(output_dir)
+
+
+def test_reviewed_subset_commands_propagate_domain_exit_code(tmp_path: Path, monkeypatch) -> None:
+    import src.benchmark.reviewed_subset as reviewed_module
+
+    reference_manifest_path = tmp_path / "hpa324.jsonl"
+    timing_manifest_path = tmp_path / "hpa323.jsonl"
+    review_file = tmp_path / "review.csv"
+    run_path = tmp_path / "run.json"
+    subset_manifest_path = tmp_path / "subset.jsonl"
+    for path in (
+        reference_manifest_path,
+        timing_manifest_path,
+        review_file,
+        run_path,
+        subset_manifest_path,
+    ):
+        path.write_bytes(b"x")
+
+    def fake_prepare(_request: object) -> PrepareReviewedSubsetOutcome:
+        return PrepareReviewedSubsetOutcome(
+            exit_code=2,
+            output_file=None,
+            candidate_count=0,
+            carried_include_count=0,
+            replacement_count=0,
+        )
+
+    def fake_finalize(_request: object) -> FinalizeReviewedSubsetOutcome:
+        return FinalizeReviewedSubsetOutcome(
+            exit_code=2,
+            manifest=None,
+            review_ledger_path=None,
+            included_count=0,
+            excluded_count=0,
+        )
+
+    def fake_score(_request: object) -> ScoreReviewedSubsetOutcome:
+        return ScoreReviewedSubsetOutcome(
+            exit_code=2,
+            cohort_id=None,
+            reports_path=None,
+            success_count=0,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+        )
+
+    monkeypatch.setattr(reviewed_module, "prepare_reviewed_subset", fake_prepare)
+    monkeypatch.setattr(reviewed_module, "finalize_reviewed_subset", fake_finalize)
+    monkeypatch.setattr(reviewed_module, "score_oaf_reviewed_subset", fake_score)
+
+    prepare = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "prepare-reviewed-subset",
+            "--manifest",
+            str(reference_manifest_path),
+            "--timing-manifest",
+            str(timing_manifest_path),
+            "--output-file",
+            str(tmp_path / "prepared.csv"),
+        ],
+        catch_exceptions=False,
+    )
+    assert prepare.exit_code == 2
+    assert json.loads(prepare.output)["exit_code"] == 2
+
+    finalize = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "finalize-reviewed-subset",
+            "--manifest",
+            str(reference_manifest_path),
+            "--timing-manifest",
+            str(timing_manifest_path),
+            "--review-file",
+            str(review_file),
+            "--output-dir",
+            str(tmp_path / "subset"),
+        ],
+        catch_exceptions=False,
+    )
+    assert finalize.exit_code == 2
+    assert json.loads(finalize.output)["exit_code"] == 2
+
+    score = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "score-oaf-reviewed-subset",
+            "--run",
+            str(run_path),
+            "--manifest",
+            str(reference_manifest_path),
+            "--timing-manifest",
+            str(timing_manifest_path),
+            "--subset-manifest",
+            str(subset_manifest_path),
+            "--output-dir",
+            str(tmp_path / "reports"),
+        ],
+        catch_exceptions=False,
+    )
+    assert score.exit_code == 2
+    assert json.loads(score.output)["exit_code"] == 2
 
 
 def test_run_oaf_corpus_rejects_out_of_range_id_as_click_error(tmp_path: Path, monkeypatch) -> None:
