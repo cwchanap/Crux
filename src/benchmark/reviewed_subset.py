@@ -29,13 +29,14 @@ from __future__ import annotations
 import csv
 import io
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from hashlib import sha256
 from pathlib import Path
 from typing import Literal, get_args
 
+from src.benchmark.artifact_io import read_regular_file_no_follow
 from src.benchmark.backend_identity import (
     SIX_PLACES,
     StrictJsonError,
@@ -44,6 +45,7 @@ from src.benchmark.backend_identity import (
     require_sha256,
     strict_json_loads,
 )
+from src.benchmark.cohort_scoring import score_cohort
 from src.benchmark.corpus_manifest import (
     ManifestPublicationError,
     publish_latest_manifest,
@@ -68,6 +70,7 @@ from src.benchmark.reference_timing_manifest import (
     load_reference_timing_manifest,
     read_canonical_manifest_core,
 )
+from src.benchmark.reports import write_cohort_reports
 
 #: Canonical schema id for the reviewed-reference-subset rows.
 REVIEWED_REFERENCE_SUBSET_SCHEMA = "crux.reviewed-reference-subset/v1"
@@ -821,6 +824,142 @@ class FinalizeReviewedSubsetOutcome:
     review_ledger_path: Path | None
     included_count: int
     excluded_count: int
+
+
+@dataclass(frozen=True)
+class ScoreReviewedSubsetRequest:
+    """Local inputs for rescoring one persisted OaF run on a reviewed subset.
+
+    ``run_path`` names the persisted ``crux.oaf-corpus-run/v1`` snapshot;
+    ``output_dir`` receives the HPA-325 report artifacts for the subset cohort.
+    """
+
+    run_path: Path
+    reference_manifest_path: Path
+    timing_manifest_path: Path
+    subset_manifest_path: Path
+    output_dir: Path
+
+
+@dataclass(frozen=True)
+class ScoreReviewedSubsetOutcome:
+    exit_code: Literal[0, 1, 2]
+    cohort_id: str | None
+    reports_path: Path | None
+    success_count: int
+    failed_count: int
+    skipped_count: int
+    quarantined_count: int
+
+
+def _fatal_score_outcome() -> ScoreReviewedSubsetOutcome:
+    return ScoreReviewedSubsetOutcome(
+        exit_code=2,
+        cohort_id=None,
+        reports_path=None,
+        success_count=0,
+        failed_count=0,
+        skipped_count=0,
+        quarantined_count=0,
+    )
+
+
+def score_oaf_reviewed_subset(
+    request: ScoreReviewedSubsetRequest,
+) -> ScoreReviewedSubsetOutcome:
+    """Rescore a persisted OaF run on the exact reviewed subset membership.
+
+    Reconstructs the persisted cohort from the run snapshot (never constructs
+    a backend), requires the run and reviewed-subset lineages to match the
+    supplied HPA-323/HPA-324 manifests, filters to the subset's exact simfile
+    IDs (keeping selected non-success rows), and scores through HPA-325 with
+    event diagnostics retained for successful selected rows only.  Exit 0 when
+    every selected row succeeds; exit 1 when any selected row is
+    failed/skipped/quarantined (missing or invalid persisted prediction
+    artifacts are item-level failures); exit 2 only for fatal
+    run/lineage/membership/report errors.
+    """
+    # Local imports keep candidate preparation free of an import-time OaF
+    # execution dependency (no backend, model, or TensorFlow at module load).
+    from src.benchmark.oaf_corpus_run import (  # pylint: disable=import-outside-toplevel
+        build_oaf_cohort_from_snapshot,
+        parse_oaf_corpus_run,
+    )
+
+    try:
+        reference = load_reference_set_manifest(request.reference_manifest_path)
+        timing = load_reference_timing_manifest(request.timing_manifest_path)
+        mappings = preflight_reference_mappings(
+            reference,
+            timing,
+            timing_output_root=request.timing_manifest_path.parent.parent,
+        )
+        snapshot = parse_oaf_corpus_run(read_regular_file_no_follow(request.run_path))
+        if snapshot.get("reference_manifest_sha256") != reference.manifest_sha256:
+            raise ValueError("run snapshot reference manifest does not match the supplied manifest")
+        if snapshot.get("reference_timing_manifest_sha256") != timing.manifest_sha256:
+            raise ValueError("run snapshot timing manifest does not match the supplied manifest")
+        if snapshot.get("reference_timing_version") != timing.corpus_version:
+            raise ValueError("run snapshot timing version does not match the supplied manifest")
+
+        subset = load_reviewed_subset_manifest(request.subset_manifest_path)
+        if subset.source_reference_manifest_sha256 != reference.manifest_sha256 or (
+            subset.source_reference_manifest_version != reference.corpus_version
+        ):
+            raise ValueError(
+                "reviewed subset reference identity does not match the supplied manifest"
+            )
+        if subset.source_timing_manifest_sha256 != timing.manifest_sha256 or (
+            subset.source_timing_manifest_version != timing.corpus_version
+        ):
+            raise ValueError("reviewed subset timing identity does not match the supplied manifest")
+
+        parent_identity, parent_items = build_oaf_cohort_from_snapshot(
+            snapshot,
+            mappings=mappings,
+            output_dir=request.run_path.parents[2],
+        )
+        subset_ids = {str(row.view.simfile_id) for row in subset.rows}
+        missing = sorted(subset_ids - {item.simfile_id for item in parent_items})
+        if missing:
+            raise ValueError("reviewed subset members are absent from the parent population")
+        selected_items = tuple(item for item in parent_items if item.simfile_id in subset_ids)
+        subset_cohort_id = sha256(
+            canonical_json_bytes(
+                {
+                    "parent_run_id": parent_identity.cohort_id,
+                    "reviewed_subset_manifest_sha256": subset.manifest_sha256,
+                }
+            )
+        ).hexdigest()
+        subset_identity = replace(parent_identity, cohort_id=subset_cohort_id)
+        diagnostics_for = tuple(
+            sorted(item.simfile_id for item in selected_items if item.status == "success")
+        )
+        result = score_cohort(
+            subset_identity,
+            selected_items,
+            diagnostics_for=diagnostics_for,
+        )
+        write_cohort_reports(result, request.output_dir)
+    except (OSError, StrictJsonError, ValueError):
+        return _fatal_score_outcome()
+    population = result.population
+    return ScoreReviewedSubsetOutcome(
+        exit_code=(
+            0
+            if population.failed_count == 0
+            and population.skipped_count == 0
+            and population.quarantined_count == 0
+            else 1
+        ),
+        cohort_id=subset_cohort_id,
+        reports_path=request.output_dir,
+        success_count=population.success_count,
+        failed_count=population.failed_count,
+        skipped_count=population.skipped_count,
+        quarantined_count=population.quarantined_count,
+    )
 
 
 def _current_candidate_slate(
