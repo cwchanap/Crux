@@ -6,116 +6,97 @@
 
 ## Decision summary
 
-Implement HPA-327 as one deterministic pre-score candidate selector, one human-review ledger, one finalized reviewed-subset manifest, and one narrow rescore path over persisted OaF run artifacts.
+Implement HPA-327 as four small pieces:
 
-The workflow is deliberately small:
+1. a deterministic, reference-only selector that freezes a 30-song candidate slate before model scores can influence membership;
+2. one editable CSV review ledger for the manual chart/audio/timing audit;
+3. one finalized canonical `crux.reviewed-reference-subset/v1` manifest containing the accepted 20–40 songs;
+4. one narrow OaF rescore path that filters the already persisted HPA-326 cohort and reuses HPA-325 scoring/report generation without rerunning inference.
 
-1. load the exact HPA-324 benchmark-reference manifest and its HPA-323 timing lineage;
-2. reconstruct eligible reference events without reading any model prediction or score;
-3. derive a few pre-inference stratification features already available from reference artifacts;
-4. deterministically choose a fixed 30-song candidate slate using a code-owned seed and balanced strata;
-5. emit an editable review CSV with immutable source identity columns and blank audit fields;
-6. manually review every candidate before consulting model scores;
-7. validate the completed review CSV and publish the accepted 20–40 songs as a canonical `crux.reviewed-reference-subset/v1` manifest;
-8. filter an already persisted HPA-326 OaF cohort to that exact membership and reuse HPA-325 scoring/report generation without rerunning inference.
-
-Do **not** add a database, reviewer UI, generic experiment framework, clustering pipeline, metadata service, configurable sampling DSL, model-result-aware selection, automatic chart repair, or second scoring implementation.
+Do **not** add a database, reviewer UI, metadata service, clustering pipeline, configurable sampling DSL, generic experiment framework, automatic chart repair, second scorer, or model-result-aware selection.
 
 ## Why HPA-327 is next
 
-HPA-321, HPA-322, HPA-323, HPA-324, HPA-325, HPA-326, and HPA-423 are complete. HPA-327 is therefore fully unblocked.
+HPA-321, HPA-322, HPA-323, HPA-324, HPA-325, HPA-326, and HPA-423 are complete, so HPA-327 is fully unblocked.
 
-It is also the highest-leverage remaining dependency in the benchmark epic:
+It also unlocks the most useful remaining benchmark work:
 
-- HPA-395 MuScriptor requires the reviewed subset in addition to the completed OaF/scoring pipeline;
-- HPA-328 uses or overlaps the same fixed subset for the separator pilot;
-- HPA-329 requires the reviewed subset for final comparative interpretation.
+- HPA-395 MuScriptor requires the fixed reviewed subset;
+- HPA-328 uses or overlaps it for the separator pilot;
+- HPA-329 needs it for final comparative interpretation.
 
-Starting HPA-395 or HPA-328 first would either leave subset selection unresolved or risk selecting diagnostic songs after seeing model results. HPA-327 should freeze the human-reviewed reference sample now, while selection can still be proven independent of prediction quality.
+Starting those tasks first would leave subset selection unresolved or risk choosing diagnostic songs after seeing model results. HPA-327 should freeze the sample now.
 
 ## Goals
 
 HPA-327 must provide:
 
-- a deterministic, reproducible pre-score candidate set;
-- explicit source hashes and selection rules;
+- deterministic pre-score candidate membership and ordering;
+- exact HPA-323/HPA-324 source identities and per-row hashes;
 - a practical manual checklist for chart/audio/timing fidelity;
-- a versioned record of include/exclude decisions and limitations;
-- a canonical accepted-subset manifest usable by later model/input comparisons;
-- a way to produce reviewed-subset OaF reports from the same persisted predictions and scorer as the broad corpus.
+- explicit include/exclude reasons and known limitations;
+- a reusable machine-readable subset manifest;
+- reviewed-subset OaF reports produced from the same prediction artifacts and HPA-325 scorer as the broad result.
 
-The subset is diagnostic evidence, not a replacement for the broad-corpus benchmark.
+The subset complements the broad corpus. It does not replace it.
 
 ## Non-goals
 
 HPA-327 does not:
 
-- create a fine-tuning or training dataset;
-- correct the full chart corpus;
-- modify any prediction artifact;
-- rerun OaF inference merely to score a subset;
-- select songs from OaF F1, error counts, confidence, runtime, or any other model output;
-- infer genre or acoustic/electronic character automatically;
-- build a general survey/review application;
-- introduce backward-compatibility machinery for future review schemas.
+- create a fine-tuning dataset;
+- correct the approximately 400-chart corpus;
+- change prediction artifacts;
+- rerun OaF merely to score a subset;
+- select songs from F1, confidence, runtime, FP/FN counts, or any other model output;
+- automatically infer genre or acoustic/electronic character;
+- preserve backward compatibility for later review schemas.
 
-If a reviewed source needs correction, preserve the original broad result and publish a new source/subset revision later. Do not mutate the baseline manifest in place.
+If review discovers a source problem, preserve the original broad result and publish a later source/subset revision rather than mutating the baseline.
 
 ## Existing seams to reuse
 
-### HPA-324 reference manifest
+### HPA-324 reference boundary
 
-`src/benchmark/reference_set_manifest.py` already provides the model-independent eligibility boundary:
+Use `src/benchmark/reference_set_manifest.py` directly:
 
-- `load_reference_set_manifest()` validates canonical HPA-324 rows and lineage;
-- `LoadedReferenceSetManifest` exposes exact manifest SHA-256 and corpus version;
-- eligible rows carry HPA-322 chart identity and HPA-323 timing/audio identity through unchanged;
-- `read_native_reference_events()` validates the referenced native-event artifact path, content hash, and source identity.
+- `load_reference_set_manifest()` for canonical HPA-324 loading and lineage;
+- `read_native_reference_events()` for event-path/hash/source-identity validation;
+- `ReferenceSetRowView.eligibility_status` for the eligible population.
 
-HPA-327 must use these functions rather than introducing another reference-manifest reader.
+Do not create another reference-manifest reader.
 
-### HPA-323 timing manifest
+### HPA-323 timing boundary
 
-`src/benchmark/reference_timing_manifest.py::load_reference_timing_manifest()` is the authoritative HPA-323 loader. HPA-327 supplies the exact timing manifest referenced by HPA-324 and verifies the same hash/version relationship used by HPA-326.
+Use `load_reference_timing_manifest()` and require its hash/version to match the HPA-324 lineage exactly, using the same relationship HPA-326 already enforces.
 
-The timing output root remains:
+Native reference paths remain relative to:
 
 ```python
 timing_output_root = timing_manifest_path.parent.parent
 ```
 
-No R2 access is needed for automated candidate selection.
+Automated selection requires no R2 access.
 
 ### Reference mapping
 
-`src/benchmark.reference_set.map_reference_events()` already produces:
+Use `map_reference_events()` for common projected events and mapping diagnostics. Candidate features come from those persisted reference events only. There is no second taxonomy projection.
 
-- mapped native drum events;
-- common projected events;
-- ignored/unmapped lane diagnostics;
-- duplicate-common-event accounting.
+### HPA-325 scoring
 
-Candidate feature extraction uses these persisted reference events only. Do not parse model output and do not add a second taxonomy projection.
+Use `score_cohort()` and `write_cohort_reports()` unchanged for subset reports.
 
-### HPA-325 scorer and reports
+### HPA-326 persisted cohort
 
-`src/benchmark/cohort_scoring.py` already owns the scorer-facing cohort contract and `score_cohort()`. `src/benchmark/reports.py::write_cohort_reports()` already owns deterministic per-song, per-class, aggregate, coverage, and summary outputs.
+`oaf_corpus_run.py` already reconstructs `CohortItem` values from `run.json` and immutable prediction artifacts inside finalization. Extract that reconstruction into one public helper so broad finalization and subset rescoring share it.
 
-Reviewed-subset scoring must call those same functions. There is no reviewed-subset metric implementation.
-
-### HPA-326 persisted run
-
-`src/benchmark/oaf_corpus_run.py` already reconstructs HPA-325 `CohortItem` values from a persisted `run.json` and immutable prediction artifacts before final scoring.
-
-The current reconstruction is private to HPA-326 finalization. HPA-327 should extract one narrow public helper that reconstructs a cohort from a validated run snapshot plus reference mappings. Both broad finalization and reviewed-subset rescoring use that helper.
-
-This is the only HPA-326 refactor required by HPA-327.
+This is the only HPA-326 refactor required.
 
 ## Fixed v1 selection policy
 
 ### Inputs
 
-Candidate selection consumes only:
+Candidate preparation consumes only:
 
 ```text
 --manifest          exact HPA-324 benchmark-reference manifest
@@ -123,20 +104,9 @@ Candidate selection consumes only:
 --output-file       editable review CSV to create
 ```
 
-It explicitly does **not** accept:
-
-- `run.json`;
-- prediction directories;
-- HPA-325 reports;
-- F1 thresholds;
-- model/backend IDs;
-- include/exclude score filters.
-
-The absence of model-result inputs is an intentional anti-bias contract.
+It must not accept a run path, prediction path, HPA-325 report, score threshold, model/backend ID, or score-derived include/exclude filter. The absence of model-result inputs is part of the anti-bias contract.
 
 ### Frozen constants
-
-Version 1 defines:
 
 ```python
 REVIEW_SUBSET_REVISION = "hpa327-v1"
@@ -146,19 +116,21 @@ REVIEW_MAX_COUNT = 40
 REVIEW_SELECTION_SEED = "crux-hpa327-v1"
 ```
 
-Do not expose CLI flags for seed or target count in v1. A future intentional selection-policy change produces a new revision instead of tuning v1 interactively.
+Do not expose seed or target-count flags in v1. An intentional policy change creates a new subset revision instead of tuning this one interactively.
 
 ### Eligible population
 
-Only HPA-324 rows with `reference_eligibility_status == "eligible"` enter candidate selection.
+Only HPA-324 `eligible` rows enter selection. Every eligible row must successfully reconstruct its native reference artifact and `ReferenceMappingResult`; a broken eligible artifact is fatal preflight inconsistency, matching HPA-326.
 
-For every eligible row, HPA-327 must reconstruct its native reference artifact and `ReferenceMappingResult` before selection. An eligible row whose artifact no longer validates is a fatal preflight inconsistency, matching HPA-326's fail-closed reference behavior.
+Population handling is fixed:
 
-If fewer than 20 eligible rows exist, candidate preparation fails. If there are 20–29 eligible rows, use all eligible rows. Otherwise select exactly 30.
+- fewer than 20 eligible rows: fail;
+- 20–29 eligible rows: select all;
+- 30 or more eligible rows: select exactly 30.
 
-### Manifest item hash
+### Source-row hash
 
-For each HPA-324 row, compute:
+Record an exact per-row identity:
 
 ```python
 source_row_sha256 = sha256(
@@ -168,11 +140,11 @@ source_row_sha256 = sha256(
 ).hexdigest()
 ```
 
-This is the exact candidate identity recorded in the review table. It is not a new persisted source artifact and does not replace the HPA-324 manifest SHA-256.
+This supplements, not replaces, the HPA-324 manifest SHA-256.
 
 ### Derived pre-inference features
 
-Keep feature extraction deliberately narrow. For each eligible reference mapping derive:
+For each eligible row derive only:
 
 ```text
 common_event_count
@@ -185,21 +157,28 @@ uses_nonstandard_master_filename
 
 Definitions:
 
-- `common_event_count`: length of the common projected reference events;
-- `reference_event_span_sec`: last common event time minus first common event time, or `0` for a single event;
+- `common_event_count`: number of common projected events;
+- `reference_event_span_sec`: last minus first common-event time, or `0` for one event;
 - `common_event_density_per_sec`: `common_event_count / max(reference_event_span_sec, 1.0)`;
-- `common_class_count`: number of distinct common classes present;
-- `has_timing_warning`: true when the carried HPA-323 `timing_warnings` list is nonempty;
-- `uses_nonstandard_master_filename`: true when the selected chart basename is `real.dtx` or `full.dtx`, case-insensitively.
+- `common_class_count`: distinct common classes present;
+- `has_timing_warning`: whether carried HPA-323 `timing_warnings` is nonempty;
+- `uses_nonstandard_master_filename`: selected basename equals `real.dtx` or `full.dtx`, case-insensitively.
 
-Do not add genre lookup, audio embedding, separator analysis, BPM extraction, or acoustic/electronic classification to candidate generation. Those would widen dependencies for little selection value. Musical character is recorded manually during review instead.
+Do not add genre lookup, embeddings, BPM extraction, separator analysis, or acoustic classification. Musical character is recorded manually during review.
 
-### Balanced strata
+### Exact rank bands
 
-Derive two rank-based bands over the eligible population:
+Create density and class-richness thirds independently.
 
-- density band: `low | medium | high` from deterministic thirds of `(density, simfile_id)` ordering;
-- class-richness band: `low | medium | high` from deterministic thirds of `(common_class_count, simfile_id)` ordering.
+For a population of `n`, sort rows ascending by `(feature_value, simfile_id)`. For zero-based sorted index `i`, assign:
+
+```python
+band_index = min(2, (i * 3) // n)
+```
+
+Map `0 -> low`, `1 -> medium`, `2 -> high`.
+
+This makes ties deterministic through `simfile_id` and removes percentile-boundary ambiguity.
 
 The selection stratum is:
 
@@ -207,25 +186,21 @@ The selection stratum is:
 (density_band, class_richness_band, has_timing_warning, uses_nonstandard_master_filename)
 ```
 
-Within each nonempty stratum, order candidates by:
+Within each nonempty stratum, sort by:
 
 ```python
 sha256(f"{REVIEW_SELECTION_SEED}:{source_row_sha256}".encode()).hexdigest()
 ```
 
-Then iterate strata in lexicographic order and take one candidate from each nonempty stratum per round until the target count is reached.
+Iterate nonempty strata in lexicographic order, taking one row from each per round until the target is filled. `candidate_rank` is the resulting 1-based acceptance order.
 
-This is not statistical sampling infrastructure. It is one small deterministic policy that prevents the fixed sample from collapsing around the most common easy-looking reference shape while preserving reproducibility.
-
-### Candidate rank
-
-`candidate_rank` is the 1-based order in which the round-robin selector accepts rows. It is persisted in the review CSV and remains unchanged after manual review.
+This is intentionally one fixed policy, not a sampling framework.
 
 ## Editable review ledger
 
-Candidate preparation writes one CSV with an exact header and one row per selected candidate. The first section is generated and must not be edited; the second section is completed manually.
+Candidate preparation writes one exact-header CSV. Generated columns are immutable; audit columns are filled manually.
 
-### Generated identity and feature columns
+### Generated columns
 
 ```text
 subset_revision
@@ -249,9 +224,9 @@ has_timing_warning
 uses_nonstandard_master_filename
 ```
 
-Float-derived CSV values use the repository's existing canonical six-decimal token convention.
+Float-derived cells use the repository's existing six-decimal token convention.
 
-### Manual audit columns
+### Manual columns
 
 ```text
 reviewer
@@ -268,19 +243,16 @@ reason_codes
 notes
 ```
 
-Closed values are:
+Closed values:
 
 ```text
-chart_selection_confirmed   true | false
-audio_revision_confirmed    true | false
-bgm_alignment_confirmed     true | false
-technical_mapping_confirmed true | false
-musical_fidelity            close | usable_with_limits | not_representative
-drum_character              acoustic | electronic | hybrid | unknown
-decision                    include | exclude
+confirmation fields   true | false
+musical_fidelity      close | usable_with_limits | not_representative
+drum_character        acoustic | electronic | hybrid | unknown
+decision              include | exclude
 ```
 
-`reviewed_at` is an RFC3339 UTC timestamp.
+`reviewed_at` is RFC3339 UTC.
 
 `reason_codes` is a semicolon-separated list from:
 
@@ -296,19 +268,19 @@ not_representative
 other
 ```
 
-`known_limitations` and `notes` are free text and may be empty. `other` requires a nonempty note.
+`other` requires nonempty `notes`. `known_limitations` and `notes` may otherwise be empty.
 
-### Manual review rule
+### Review rule
 
-Every candidate is reviewed before any model score is used for membership decisions.
+Review every candidate before model scores are used for membership decisions.
 
-An included row must have all four confirmation booleans true and `musical_fidelity` in `close | usable_with_limits`. A row with a failed source/timing/mapping confirmation or `not_representative` must be excluded with at least one reason code.
+An included row must have all four confirmations `true` and fidelity `close` or `usable_with_limits`. A failed confirmation or `not_representative` requires `exclude` plus at least one reason code.
 
-The review may record acoustic/electronic/hybrid character and limitations, but v1 does not automatically replace candidates to optimize those categories.
+The ledger records drum character and limitations but v1 does not automatically optimize replacements around those categories.
 
-If exclusions leave fewer than 20 included rows or reveal unacceptable coverage before model scores are opened, generate a **new subset revision** with documented replacement rationale. Do not mutate `hpa327-v1` membership after inspecting benchmark scores.
+If pre-score review leaves fewer than 20 acceptable rows or clearly inadequate diagnostic coverage, create a new subset revision with explicit replacement rationale. Do not mutate `hpa327-v1` after model scores are inspected.
 
-## Finalization and immutable reviewed subset
+## Finalization
 
 Finalization consumes:
 
@@ -316,27 +288,27 @@ Finalization consumes:
 --manifest          same HPA-324 manifest used for preparation
 --timing-manifest   same HPA-323 manifest used for preparation
 --review-file       completed candidate CSV
---output-dir        reviewed-subset publication root
+--output-dir        publication root
 ```
 
-Before publication, validate:
+Before publication, require:
 
-1. exact CSV header and unique candidate ranks/simfile IDs;
-2. `subset_revision` and selection seed equal the frozen v1 constants;
-3. candidate membership and order exactly reproduce deterministic preparation from the supplied manifests;
-4. every generated identity/feature cell equals a freshly reconstructed value;
-5. every row has a reviewer, timestamp, closed audit values, and decision;
-6. included rows satisfy the confirmation/fidelity rule;
-7. excluded rows contain at least one valid reason code;
-8. `other` reason rows contain notes;
+1. exact CSV header and unique ranks/simfile IDs;
+2. frozen revision and seed;
+3. membership/order exactly reproducible from the supplied manifests;
+4. every generated identity/feature cell exactly reproducible;
+5. reviewer, timestamp, audit enums, and decision completed for every row;
+6. included rows satisfy confirmations/fidelity;
+7. excluded rows contain valid reasons;
+8. `other` rows have notes;
 9. included count is 20–40;
-10. every included source row is still HPA-324 eligible.
+10. every included row remains HPA-324 eligible.
 
-A partially filled or edited-identity CSV is not publishable. The operator fixes the CSV and reruns finalization.
+A partially reviewed or edited-identity CSV is simply not publishable; the operator fixes it and reruns finalization. There is no repair engine.
 
-### Manifest schema
+### Canonical subset manifest
 
-Publish accepted rows only as canonical JSONL:
+Publish accepted rows only with:
 
 ```text
 schema_version = "crux.reviewed-reference-subset/v1"
@@ -362,37 +334,33 @@ reason_codes
 notes
 ```
 
-The `reason_codes` field is retained for included rows because `usable_with_limits` may legitimately carry documented chart simplifications or lane conventions even when the reference is still useful.
+Use existing `render_manifest()`, `publish_manifest()`, and `publish_latest_manifest()`. The content-derived `corpus_version` is the immutable publication identity; `subset_revision` is the semantic review-policy revision.
 
-Use the existing `render_manifest()`, `publish_manifest()`, and `publish_latest_manifest()` primitives. `corpus_version` remains the content-derived publication identity; `subset_revision` is the semantic review-policy revision.
-
-The completed CSV is also copied byte-for-byte into the publication directory as the human review ledger. Publication does not rewrite the operator's review text.
-
-No database or mutable subset registry is added.
+Preserve the completed CSV byte-for-byte beside the publication output as `review-ledger.csv`. The manifest is the downstream machine contract; the CSV is the complete human audit record, including exclusions.
 
 ## Reviewed-subset scoring from persisted OaF artifacts
 
-### Required HPA-326 extraction
+### Shared cohort reconstruction
 
-Refactor the current HPA-326 finalization path to expose one public helper with this responsibility:
+Extract:
 
 ```python
 def build_oaf_cohort_from_snapshot(
     snapshot: Mapping[str, object],
     *,
-    mappings: Mapping[int, ReferenceMappingResult],
+    mappings: Mapping[int, ReferenceMappingResult | None],
     output_dir: Path,
 ) -> tuple[CohortIdentity, tuple[CohortItem, ...]]:
     ...
 ```
 
-It performs the same identity reconstruction and per-run-row `CohortItem` adaptation currently performed inside `_finalize_scoring_and_outcome()`.
+`None` mappings are required for parent-run quarantined rows. The helper performs the same identity reconstruction and `_cohort_item_from_run_row()` adaptation currently embedded in `_finalize_scoring_and_outcome()`.
 
-HPA-326 broad finalization calls the new helper and then `score_cohort()` exactly as today. No behavior or report schema changes are intended.
+Broad HPA-326 finalization then calls this helper followed by `score_cohort()` exactly as today.
 
 ### Subset rescore command
 
-Add a thin model-specific command for the existing OaF run rather than a generic multi-backend runner:
+Add:
 
 ```text
 crux benchmark score-oaf-reviewed-subset \
@@ -403,34 +371,23 @@ crux benchmark score-oaf-reviewed-subset \
   --output-dir REPORT_DIR
 ```
 
-The command:
+The domain function, kept in the existing OaF corpus-run boundary rather than a new generic runner, must:
 
-1. parses and validates the persisted HPA-326 run snapshot;
-2. loads HPA-324 and HPA-323 and reuses HPA-326 preflight reference reconstruction;
-3. requires the run's reference/timing identity to match those manifests;
-4. loads the HPA-327 subset and requires its source identities to match the same manifests;
-5. reconstructs the full persisted `CohortItem` tuple without invoking `OafBackend`;
-6. requires every subset simfile ID to exist in the run population;
-7. filters items to exact subset membership in candidate-rank order;
-8. gives the filtered items a distinct deterministic cohort ID derived from the parent run ID plus subset manifest hash;
-9. calls existing `score_cohort()` and `write_cohort_reports()`;
-10. writes only reviewed-subset reports to the supplied output directory.
+1. parse the persisted HPA-326 snapshot;
+2. load/reconcile HPA-324 and HPA-323 exactly as HPA-326 does;
+3. reconstruct the full persisted cohort without constructing `OafBackend`;
+4. load the HPA-327 manifest and require exact source-manifest/timing identity;
+5. require every subset simfile ID to exist in the parent run;
+6. filter to exact candidate-rank order, retaining failed/skipped/quarantined items when selected;
+7. derive a distinct deterministic cohort ID;
+8. call existing `score_cohort()` and `write_cohort_reports()`;
+9. write only subset reports to the requested directory.
 
-The broad run reports remain untouched.
+Broad run reports and prediction artifacts are untouched.
 
-### Cohort identity
+### Subset cohort ID
 
-The subset score keeps the parent run's:
-
-- reference manifest SHA-256;
-- timing version;
-- taxonomy/lane-map versions;
-- backend/model/descriptor/model-lock identity;
-- prediction-map version;
-- input-view ID;
-- scoring version.
-
-Only `cohort_id` changes so broad and reviewed-subset reports cannot be mistaken for the same population.
+Retain every parent `CohortIdentity` dimension except `cohort_id`.
 
 Define:
 
@@ -447,9 +404,9 @@ subset_cohort_id = sha256(
 
 No prediction artifact is copied or rewritten.
 
-## CLI shape
+## CLI shape and outcomes
 
-Add three thin commands under the existing `benchmark` group:
+Add three thin commands under the existing benchmark group:
 
 ```text
 prepare-reviewed-subset
@@ -457,191 +414,119 @@ finalize-reviewed-subset
 score-oaf-reviewed-subset
 ```
 
-Keep domain logic out of Click callbacks. The CLI owns paths, concise JSON outcome rendering, and the repository's existing `0 | 1 | 2` exit convention only.
+Click callbacks own paths and concise JSON rendering only.
 
-Suggested outcome semantics:
+Use the existing `0 | 1 | 2` convention:
 
-- `prepare-reviewed-subset`: `0` when the candidate ledger is written; `2` for invalid lineage/population/publication failure;
-- `finalize-reviewed-subset`: `0` when a valid 20–40-song manifest is published; `2` for incomplete/invalid review or publication failure;
-- `score-oaf-reviewed-subset`: `0` when reports are written; `1` when the filtered persisted cohort contains item-level failed/skipped/quarantined rows; `2` for identity, artifact, or report-publication failure.
+- prepare: `0` success, `2` invalid lineage/population/write failure;
+- finalize: `0` published, `2` incomplete/invalid review or publication failure;
+- subset score: `0` all selected items successful, `1` selected cohort contains item-level failure/skip/quarantine, `2` identity/artifact/report failure.
 
-Do not add a special exit code for manual exclusions; exclusions are already represented by absence from the finalized subset plus the review ledger.
-
-## Data flow
-
-```text
-HPA-324 manifest + HPA-323 timing/events
-                |
-                v
-      deterministic feature extraction
-                |
-                v
-      fixed 30-song candidate selector
-                |
-                v
-        editable review CSV
-                |
-        manual source audit
-                |
-                v
-       finalization + validation
-                |
-                v
-  reviewed-subset manifest + review ledger
-                |
-                +--------------------------+
-                                           |
-HPA-326 run.json + prediction artifacts    |
-                |                          |
-                v                          v
-       reconstruct full persisted OaF cohort
-                |
-          filter exact membership
-                |
-                v
-       HPA-325 score_cohort + reports
-```
-
-Candidate preparation has no edge from the HPA-326 side of this diagram.
+Manual exclusions do not need a special exit code.
 
 ## Error handling
 
-Prefer explicit correctness failures over recovery machinery.
+Prefer explicit failure to recovery machinery.
 
-### Fatal preparation/finalization errors
+Fatal preparation/finalization errors include mixed or noncanonical lineage, broken eligible event artifacts, fewer than 20 eligible rows, edited generated ledger fields, incomplete reviews, duplicate rows, invalid enums/reasons, accepted population outside 20–40, and publication failure.
 
-Return exit 2 for:
-
-- noncanonical or mixed HPA-323/HPA-324 lineage;
-- eligible reference artifact mismatch;
-- fewer than 20 eligible rows;
-- edited generated review identity/feature cells;
-- missing/invalid review fields;
-- duplicate candidate rows;
-- included population outside 20–40;
-- publication failure.
-
-There is no retry engine or automatic candidate replacement.
-
-### Manual exclusions
-
-Manual exclusions are ordinary reviewed evidence, not runtime failures. They remain visible in the finalized CSV review ledger with reason codes.
-
-### Subset score errors
-
-A mismatched run/reference/subset identity, unreadable run snapshot, or missing subset member in the parent run is fatal exit 2.
-
-Item-level parent-run failures remain item-level cohort states. The subset scorer reports them through HPA-325 and exits 1 rather than silently dropping them.
+A mismatched run/reference/subset identity, unreadable run snapshot, or missing subset member in the parent run is fatal during rescoring. Parent-run item failures remain normal HPA-325 cohort states and are not dropped.
 
 ## Testing strategy
 
-### Candidate selection tests
+### Candidate selection
 
-Cover:
+Test:
 
-- only HPA-324 eligible rows are considered;
-- candidate preparation never accepts/reads a run or prediction input;
-- exact target count is 30 for populations of at least 30;
-- 20–29 eligible rows use the full eligible population;
-- fewer than 20 fail;
-- source-row SHA-256 is stable;
-- input manifest row order does not change candidate membership/rank;
-- rank-band assignment and stratum round-robin are deterministic;
-- timing-warning and `real.dtx`/`full.dtx` exceptions reach distinct strata;
-- generated CSV uses exact columns and canonical numeric tokens.
+- only eligible HPA-324 rows participate;
+- no model/run input exists in the preparation API;
+- 20–29 uses all, 30+ selects 30, fewer than 20 fails;
+- row hashes are stable;
+- input manifest ordering does not change membership/rank;
+- exact thirds formula is deterministic under tied features;
+- stratum round-robin is deterministic;
+- timing-warning and `real.dtx`/`full.dtx` cases are represented by their intended flags;
+- CSV headers and numeric tokens are exact.
 
-### Finalization tests
+### Finalization
 
-Cover:
+Test:
 
-- untouched generated fields plus completed valid reviews publish successfully;
-- edited source hash, selected chart/audio identity, feature, candidate rank, seed, or membership is rejected;
-- blank reviewer/timestamp/decision is rejected;
-- invalid enum/reason code is rejected;
+- a fully completed ledger publishes;
+- any generated-field edit is rejected;
+- blank/invalid reviewer, timestamp, confirmation, fidelity, decision, reason, or notes-for-`other` is rejected;
 - included rows require all confirmations and acceptable fidelity;
-- excluded rows require a reason;
-- `other` requires notes;
-- included count must remain 20–40;
-- output JSONL round-trips canonically and carries exact HPA-323/HPA-324 lineage;
-- completed review CSV is preserved byte-for-byte beside publication output.
+- excluded rows require reasons;
+- accepted count remains 20–40;
+- canonical manifest round-trip and source lineage are exact;
+- `review-ledger.csv` preserves the submitted bytes.
 
-### OaF rescore tests
+### OaF rescore
 
-Cover:
+Test:
 
-- extracted `build_oaf_cohort_from_snapshot()` preserves broad HPA-326 finalization results;
-- reviewed-subset scoring never constructs or invokes `OafBackend`;
-- subset membership is exact and ordered by candidate rank;
-- parent-run failure/quarantine rows remain present when selected;
-- parent run reports are unchanged;
-- cohort ID changes only by parent run + subset identity;
-- per-song/per-class/aggregate rows come from the existing HPA-325 scorer/report writer;
-- mismatched subset/run/reference identity fails closed.
+- extracted cohort reconstruction preserves existing HPA-326 broad finalization results;
+- subset scoring never constructs/invokes `OafBackend`;
+- membership and candidate-rank ordering are exact;
+- selected failed/skipped/quarantined rows remain present;
+- broad reports remain unchanged;
+- subset cohort ID is parent-run + subset identity only;
+- HPA-325 scorer/report writer remains the sole scoring path;
+- run/subset/reference mismatches fail closed.
 
-### CLI acceptance
+### Acceptance fixture
 
-Use synthetic canonical HPA-323/HPA-324 fixtures and a persisted OaF run fixture to exercise prepare -> finalize -> rescore without R2, Docker, TensorFlow, or network access.
+Exercise prepare -> finalize -> rescore using synthetic canonical HPA-323/HPA-324 data plus a persisted OaF-run fixture. No R2, Docker, TensorFlow, or network dependency belongs in the automated acceptance path.
 
-The real manual review itself is not faked by automated tests.
+Do not fake the real human audit in tests.
 
 ## Operational acceptance
 
-HPA-327 is not complete merely because the code can generate a review sheet.
+Code alone does not complete HPA-327.
 
 For the real corpus:
 
-1. run candidate preparation before inspecting OaF song-level scores for membership decisions;
-2. commit or otherwise preserve the generated v1 candidate review CSV before review begins;
-3. manually inspect all candidates against their selected chart and source audio;
-4. record reviewer, timestamp, confirmations, fidelity, drum character, limitations, decision, reasons, and notes;
-5. finalize and preserve the immutable reviewed-subset manifest plus completed ledger;
-6. verify 20–40 included songs remain and the sample contains materially different density, class, timing-warning, filename-exception, and manually recorded musical-character conditions;
-7. rescore the persisted OaF run on the exact subset and preserve the resulting reports;
-8. leave the broad-corpus run and reports unchanged.
+1. generate and preserve the v1 candidate ledger before score-informed membership decisions;
+2. manually inspect every candidate's selected chart, matching source audio, BGM alignment, mapping, and musical fidelity;
+3. record reviewer/timestamp/confirmations/fidelity/drum character/limitations/decision/reasons/notes;
+4. finalize the immutable 20–40-song subset and complete ledger;
+5. verify the accepted sample contains materially different density, class, timing-warning, master-filename, and manually observed musical-character conditions;
+6. rescore the existing OaF run on that exact membership;
+7. preserve the reviewed-subset reports while leaving the broad run/reports unchanged.
 
-If the real HPA-323/HPA-324 artifacts are unavailable in the implementation environment, the code can land after synthetic acceptance, but HPA-327 remains In Progress until this operational review evidence is completed.
+If real HPA-323/HPA-324 artifacts are unavailable during implementation, the code may land after synthetic acceptance, but HPA-327 remains In Progress until the real review evidence is completed.
 
 ## Risks and mitigations
 
 ### Selection bias
 
-**Risk:** a manually chosen diagnostic set drifts toward songs known to score well or badly.
+Freeze membership from reference-only inputs and a code-owned seed; candidate preparation has no model-result input.
 
-**Mitigation:** candidate membership is produced from reference-only inputs with a frozen seed and no prediction/run argument.
+### Overengineering
 
-### Overengineering stratification
-
-**Risk:** the ticket turns into a metadata/clustering project.
-
-**Mitigation:** v1 derives six small reference-only features and one fixed round-robin policy. Human musical character stays in the review ledger.
+Use six simple features and one fixed selector. Leave genre/acoustic classification and richer analytics out.
 
 ### Review drift
 
-**Risk:** reviewers silently change candidate membership while inspecting scores.
+Finalization re-derives candidate membership and every generated cell. Any replacement requires a new subset revision.
 
-**Mitigation:** generated identities/ranks are re-derived at finalization; replacements require a new subset revision. The completed ledger records all exclusions.
+### Source corrections
 
-### Source corrections discovered during review
+Document/exclude problems in the ledger and preserve the broad result; correct sources only through a later manifest/subset revision.
 
-**Risk:** an authored/source problem tempts the reviewer to rewrite the baseline.
+### Scoring divergence
 
-**Mitigation:** exclude/document the item in the review ledger, preserve the broad result, and create a new source/subset revision for any later correction.
-
-### Duplicate scoring code
-
-**Risk:** subset reporting diverges from broad scoring.
-
-**Mitigation:** extract only persisted-cohort reconstruction from HPA-326, then call the existing HPA-325 scorer and report writer unchanged.
+Extract only persisted-cohort reconstruction from HPA-326, then call HPA-325 scoring/reporting unchanged.
 
 ## Completion criteria
 
 HPA-327 is complete when:
 
 - deterministic reference-only candidate generation exists and is tested;
-- the real v1 candidate set is frozen before score-informed membership changes;
-- every real candidate has a completed manual review record;
-- the finalized accepted subset contains 20–40 songs with explicit source identities and exclusions;
-- the canonical reviewed-subset manifest and completed review ledger are preserved;
-- the same persisted OaF predictions generate reviewed-subset HPA-325 reports without rerunning inference;
+- the real v1 candidate slate is frozen before score-informed membership changes;
+- every real candidate has a completed review record;
+- the accepted subset contains 20–40 songs with explicit source identities and exclusions;
+- the canonical subset manifest and completed ledger are preserved;
+- the same persisted OaF predictions generate HPA-325 reviewed-subset reports without rerunning inference;
 - broad-corpus artifacts remain unchanged;
-- no model-result-aware selection, training, or chart repair is introduced.
+- no model-result-aware selection, training, or automatic chart repair is introduced.
