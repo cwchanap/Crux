@@ -55,6 +55,7 @@ def test_worker_process_close_uses_independent_close_timeout(
 ) -> None:
     _RecordingThread.instances.clear()
     monkeypatch.setattr(worker_process.threading, "Thread", _RecordingThread)
+    monkeypatch.setattr(worker_process.time, "monotonic", lambda: 0.0)
     process = _FakePopen()
     worker = WorkerProcess(
         process,
@@ -71,12 +72,36 @@ def test_worker_process_close_uses_independent_close_timeout(
     assert 3600.0 not in _RecordingThread.instances[0].join_calls
 
 
+def test_worker_process_close_deadline_shrinks_remaining_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The close timeout is one monotonic deadline, not a per-phase timeout."""
+    _RecordingThread.instances.clear()
+    monkeypatch.setattr(worker_process.threading, "Thread", _RecordingThread)
+    clock_values = iter([0.0, 10.0, 20.0, 30.0, 40.0])
+    monkeypatch.setattr(worker_process.time, "monotonic", lambda: next(clock_values))
+    process = _FakePopen()
+    worker = WorkerProcess(
+        process,
+        timeout_seconds=3600.0,
+        close_timeout_seconds=30.0,
+        ready={"type": "ready"},
+    )
+
+    worker.close()
+
+    # deadline = 0.0 + 30.0 = 30.0; each phase gets only the remaining budget.
+    assert process.wait_calls == [20.0, 10.0, 0.1]
+    assert _RecordingThread.instances[0].join_calls == [0.1]
+
+
 def test_worker_process_close_raises_when_killed_process_never_reaps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A killed process that cannot be reaped raises instead of hanging close()."""
     _RecordingThread.instances.clear()
     monkeypatch.setattr(worker_process.threading, "Thread", _RecordingThread)
+    monkeypatch.setattr(worker_process.time, "monotonic", lambda: 0.0)
     process = _FakePopen()
     process.reap_after_kill = False
     worker = WorkerProcess(

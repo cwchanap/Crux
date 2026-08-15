@@ -523,8 +523,15 @@ def _resolve_source_audio(
     source_audio_content_hash: str | None = None,
     source_endpoint_sha256: str | None = None,
     source_bucket: str | None = None,
+    load_body: bool = True,
 ) -> ResolvedSourceAudio:
-    """Resolve one source body from the verified local HPA-321 cache only."""
+    """Resolve one source body from the verified local HPA-321 cache only.
+
+    When *load_body* is ``False`` the verified path, digest, and duration are
+    resolved but the full audio body is not read into memory.  The caller may
+    read the body later from ``path`` (e.g. during per-item materialization) to
+    avoid retaining corpus-sized byte arrays on every execution state.
+    """
     if not isinstance(cache_dir, Path):
         raise TypeError("cache_dir must be a Path")
     if cache_index is not None and index is not None and cache_index is not index:
@@ -562,12 +569,16 @@ def _resolve_source_audio(
         bucket=bucket,
         expected_sha256=expected,
     )
-    content = read_verified_cache_body(
-        cache_dir,
-        verified_remote,
-        source_endpoint_sha256=endpoint,
-        bucket=bucket,
-        expected_sha256=expected,
+    content = (
+        read_verified_cache_body(
+            cache_dir,
+            verified_remote,
+            source_endpoint_sha256=endpoint,
+            bucket=bucket,
+            expected_sha256=expected,
+        )
+        if load_body
+        else None
     )
     duration_sec = inspect_source_audio(path).duration_sec
     return ResolvedSourceAudio(
@@ -1581,6 +1592,8 @@ def run_oaf_corpus(
         except (OSError, StrictJsonError, ValueError):
             return _fatal_outcome()
 
+    if run_path.exists() and not request.resume:
+        return _fatal_outcome()
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
         input_root.mkdir(parents=True, exist_ok=True)
@@ -1633,6 +1646,7 @@ def run_oaf_corpus(
                     source_endpoint_sha256 if isinstance(source_endpoint_sha256, str) else None
                 ),
                 source_bucket=source_bucket if isinstance(source_bucket, str) else None,
+                load_body=False,
             )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             _set_failed(state.snapshot, _source_failure_code(error), error)
