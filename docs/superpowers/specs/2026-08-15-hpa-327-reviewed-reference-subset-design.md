@@ -288,14 +288,15 @@ An initial preparation takes the first target-count rows from the deterministic 
 
 When `--prior-ledger` is supplied:
 
-1. parse the prior CSV by `simfile_id`;
-2. use the prior `source_row_sha256` only as a carry-forward guard, comparing it to the freshly derived current row hash;
-3. carry forward the 12 manual audit fields for rows whose source hash is unchanged and whose prior decision is `include` with a valid completed review;
-4. treat unchanged previously reviewed `exclude` rows as consumed so they are not offered again;
-5. if a prior candidate's source hash changed, do not carry its review and allow the current row to appear again as an unreviewed candidate;
-6. fill the remaining candidate slots from the deterministic candidate stream, skipping unchanged rows already reviewed in the prior ledger;
-7. preserve the previous relative order of carried included rows, then append replacement rows in deterministic stream order;
-8. stop at `REVIEW_TARGET_COUNT` or when no unused eligible rows remain.
+1. read the prior CSV bytes and compute `prior_review_ledger_sha256`;
+2. parse the prior CSV by `simfile_id`;
+3. use the prior `source_row_sha256` only as a carry-forward guard, comparing it to the freshly derived current row hash;
+4. carry forward the 12 manual audit fields for rows whose source hash is unchanged and whose prior decision is `include` with a valid completed review;
+5. treat unchanged previously reviewed `exclude` rows as consumed so they are not offered again;
+6. if a prior candidate's source hash changed, do not carry its review and allow the current row to appear again as an unreviewed candidate;
+7. fill the remaining candidate slots from the deterministic candidate stream, skipping unchanged rows already reviewed in the prior ledger;
+8. preserve the previous relative order of carried included rows, then append replacement rows in deterministic stream order;
+9. stop at `REVIEW_TARGET_COUNT` or when no unused eligible rows remain.
 
 This preserves scarce human listening work while keeping replacement choice independent of model scores. The seed and policy remain frozen.
 
@@ -312,6 +313,7 @@ Preparation writes:
 ```text
 review_policy_version
 selection_seed
+prior_review_ledger_sha256
 candidate_rank
 simfile_id
 source_reference_manifest_sha256
@@ -334,6 +336,8 @@ class_richness_band
 has_timing_warning
 selects_real_or_full_chart
 ```
+
+`prior_review_ledger_sha256` is empty for the initial slate and the exact SHA-256 of the supplied prior review CSV for a continuation slate.
 
 `selected_chart_cache_path` comes from the HPA-324 row.
 
@@ -414,7 +418,10 @@ Finalization consumes:
 --timing-manifest   same HPA-323 manifest used for preparation
 --review-file       completed candidate CSV
 --output-dir        publication root
+[--prior-ledger]    required only when this review file came from continuation preparation
 ```
+
+For a continuation ledger, finalization must receive the same prior ledger bytes used by preparation. It hashes those bytes and re-runs the same carry-forward/replacement selection before validating the current review. This is necessary because continuation membership depends on which earlier rows were already reviewed; the current HPA-323/HPA-324 manifests alone cannot reproduce that slate.
 
 ### Trust boundary
 
@@ -425,7 +432,7 @@ Finalization trusts only:
 - `simfile_id` to associate a review with a freshly reconstructed candidate row;
 - the 12 manual audit columns.
 
-It does **not** reject a review merely because a spreadsheet rewrote a generated boolean, decimal token, line ending, or hash cell. Instead it re-runs the selector/preflight and re-derives every generated value from HPA-323/HPA-324.
+It does **not** reject a review merely because a spreadsheet rewrote a generated boolean, decimal token, line ending, or hash cell. Instead it re-runs the selector/preflight, using the same optional prior ledger when applicable, and re-derives every generated value from HPA-323/HPA-324.
 
 `source_row_sha256` is read from a prior ledger only for the optional carry-forward guard described above; it is never accepted as current source identity without recomputation.
 
@@ -439,7 +446,8 @@ Before publication, require:
 6. excluded rows contain valid reasons;
 7. `other` rows have notes;
 8. included count is 20–30;
-9. every included row remains HPA-324 eligible with the same freshly reconstructed source identity.
+9. every included row remains HPA-324 eligible with the same freshly reconstructed source identity;
+10. continuation finalization's supplied prior-ledger hash matches the freshly reproduced slate lineage.
 
 A partially reviewed or stale-membership CSV is not publishable. The operator fixes it or generates a continuation ledger before looking at model scores. There is no repair engine.
 
@@ -470,6 +478,7 @@ Each accepted row carries:
 schema_version
 corpus_version
 review_policy_version
+prior_review_ledger_sha256
 review_ledger_sha256
 candidate_rank
 simfile_id
@@ -498,6 +507,8 @@ known_limitations
 reason_codes
 notes
 ```
+
+`prior_review_ledger_sha256` is null for an initial subset and the exact prior-ledger hash for a continuation subset.
 
 The six selection features plus both band labels remain in the published artifact so HPA-395, HPA-328, and HPA-329 can inspect why the fixed sample is diverse without re-deriving selection metadata from upstream manifests.
 
@@ -617,7 +628,8 @@ Fatal preparation/finalization errors include:
 - broken eligible event artifacts;
 - recomputed common-event count differing from HPA-324 `common_scored_event_count`;
 - fewer than 20 eligible/current candidates;
-- invalid prior-ledger review data;
+- invalid, unknown, or inconsistent prior-ledger review data;
+- missing/mismatched prior ledger during continuation finalization;
 - stale or duplicate review membership;
 - incomplete reviews;
 - invalid enums/reasons;
@@ -669,7 +681,8 @@ Test:
 - changed source-row hashes invalidate carry-forward and allow re-review;
 - replacement rows come only from the next unused deterministic candidates;
 - a prior ledger never changes the seed or selector policy;
-- malformed prior manual fields fail closed.
+- malformed prior manual fields fail closed;
+- continuation finalization requires the same prior ledger and rejects a different/missing prior hash.
 
 ### Finalization and manifest loading
 
@@ -684,7 +697,7 @@ Test:
 - accepted count remains 20–30;
 - canonical `review-ledger.csv` is regenerated from fresh generated fields plus review data;
 - subset rows contain all six features and both band labels;
-- `review_ledger_sha256` binds the manifest to the canonical complete audit ledger;
+- current and optional prior ledger hashes bind the manifest to the audit lineage;
 - `load_reviewed_subset_manifest()` uses `read_canonical_manifest_core()` and rejects noncanonical/mixed/duplicate input;
 - the schema golden is registered and validates through `test_schema_goldens.py`.
 
@@ -714,7 +727,7 @@ For the real corpus:
 2. manually inspect every candidate's selected chart, matching source audio, BGM alignment, mapping, and musical fidelity;
 3. record reviewer/timestamp/confirmations/fidelity/drum character/limitations/decision/reasons/notes;
 4. if review leaves fewer than 20 acceptable songs or clearly inadequate diagnostic coverage, generate a continuation ledger from `--prior-ledger` **before** consulting model scores, preserving unchanged included reviews and filling only deterministic unused replacements;
-5. finalize the immutable 20–30-song subset, canonical complete ledger, and schema-valid manifest;
+5. finalize the continuation with the same prior ledger, then preserve the immutable 20–30-song subset, canonical complete ledger, and schema-valid manifest;
 6. verify the published subset artifact itself shows materially different density, class-richness, timing-warning, `real`/`full` chart, and manually observed musical-character conditions;
 7. rescore the existing OaF run on that exact membership with event diagnostics for successful subset songs;
 8. preserve the reviewed-subset reports while leaving the broad run/reports unchanged.
@@ -729,7 +742,7 @@ Freeze membership from reference-only inputs and a code-owned seed. Seed both st
 
 ### Wasted manual review during replacement
 
-Use optional pre-score `--prior-ledger` continuation. Carry unchanged included audits forward and choose only replacement rows from the unused deterministic candidate stream.
+Use optional pre-score `--prior-ledger` continuation. Carry unchanged included audits forward and choose only replacement rows from the unused deterministic candidate stream. Continuation finalization receives the same prior ledger so the replacement slate is reproducible.
 
 ### Overengineering
 
@@ -737,7 +750,7 @@ Use six simple features, two rank bands, and one fixed selector. Leave genre/aco
 
 ### Review drift
 
-Finalization ignores editable generated cells as authority and reconstructs membership/source evidence from HPA-323/HPA-324. Manual review fields are the only operator-authored inputs.
+Finalization ignores editable generated cells as authority and reconstructs membership/source evidence from HPA-323/HPA-324 plus the explicit prior-ledger input for continuation. Manual review fields are the only operator-authored decisions.
 
 ### Source corrections
 
