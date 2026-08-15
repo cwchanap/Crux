@@ -2,32 +2,32 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Freeze and manually audit a deterministic 20–30-song reference subset before score-informed selection, publish it as a canonical manifest, and rescore the existing persisted OaF cohort on that exact membership with HPA-325 diagnostics.
+**Goal:** Freeze and manually audit a deterministic 20–30-song reference subset before score-informed selection, publish it as a canonical manifest, and rescore the existing persisted OaF cohort on that exact membership with HPA-325 event diagnostics.
 
-**Architecture:** Keep one model-independent HPA-327 module for selection, review CSV handling, subset publication, loading, and subset-score orchestration. First extract the two existing reusable seams from HPA-326 without changing behavior: reference/timing preflight moves to `reference_set_manifest.py`, and persisted cohort reconstruction becomes a public helper in `oaf_corpus_run.py`. New scoring still delegates to `score_cohort()` and `write_cohort_reports()`; candidate preparation never consumes run, prediction, or score inputs.
+**Architecture:** Keep HPA-327 as one model-independent module for candidate selection, review CSV handling, subset publication/loading, and subset-score orchestration. First land two no-behavior-change extractions from HPA-326: shared reference/timing preflight moves to `reference_set_manifest.py`, then persisted cohort reconstruction becomes a public helper in `oaf_corpus_run.py`. New scoring remains a thin filter over persisted artifacts and delegates to `score_cohort()` plus `write_cohort_reports()`.
 
-**Tech Stack:** Python 3.12, stdlib `csv`/`dataclasses`/`hashlib`, Click, pytest, existing Crux canonical JSON/JSONL helpers, HPA-323/HPA-324 reference manifests, HPA-325 scorer/report writer, HPA-326 persisted OaF run artifacts.
+**Tech Stack:** Python 3.12, stdlib `csv`/`dataclasses`/`hashlib`, Click, pytest, existing Crux canonical JSON/JSONL helpers, HPA-323/HPA-324 reference artifacts, HPA-325 scorer/report writer, HPA-326 persisted OaF artifacts.
 
 ## Global Constraints
 
 - `REVIEW_POLICY_VERSION = "hpa327-v1"`.
 - `REVIEW_TARGET_COUNT = 30`, `REVIEW_MIN_COUNT = 20`, `REVIEW_MAX_COUNT = 30`.
-- `REVIEW_SELECTION_SEED = "crux-hpa327-v1"`; no CLI seed/count overrides.
-- Candidate preparation accepts only HPA-323/HPA-324 inputs plus an optional prior HPA-327 review ledger. It has no model/run/prediction/report/score input.
-- Use the exact thirds formula `min(2, (i * 3) // n)` after sorting `(feature_value, simfile_id)`.
-- Order strata and candidates by seeded SHA-256, never lexicographic stratum labels.
-- Reconcile every eligible mapping with published HPA-324 `common_scored_event_count` before selection.
-- `timing_warnings` comes from the HPA-323 timing row, not `ReferenceSetRowView`.
+- `REVIEW_SELECTION_SEED = "crux-hpa327-v1"`; no seed/count CLI flags.
+- Candidate preparation accepts only HPA-323/HPA-324 inputs plus optional prior HPA-327 review evidence. It has no run/prediction/report/score/model parameter.
+- Assign thirds with `min(2, (i * 3) // n)` after `(feature_value, simfile_id)` sorting.
+- Order strata and members by seeded SHA-256, never lexical band labels.
+- Reconcile each eligible mapping with HPA-324 `common_scored_event_count` before selection.
+- Read `timing_warnings` from the matching HPA-323 row.
 - Use `selects_real_or_full_chart`; do not call `real.dtx` / `full.dtx` nonstandard.
-- CSV generated cells are display/evidence only. Finalization trusts current `simfile_id` membership plus the 12 manual fields and re-derives generated values.
-- A continuation pass uses the same optional prior ledger in both prepare and finalize; unchanged valid includes carry forward, unchanged excludes remain consumed, and replacements come only from the unused deterministic candidate stream.
-- Publish accepted rows as `crux.reviewed-reference-subset/v1` with six selection features plus both band labels, `review_ledger_sha256`, and optional `prior_review_ledger_sha256`.
-- `load_reviewed_subset_manifest()` must use `read_canonical_manifest_core()` and the schema must be registered in the existing golden registry.
-- HPA-325 owns scoring/report ordering. `candidate_rank` is provenance only; reports stay in `simfile_id` order.
+- CSV generated cells are reviewer hints/evidence, not authority. Finalization trusts current `simfile_id` membership plus the 12 manual fields and re-derives everything else.
+- Continuation prepare/finalize receives the same prior ledger. Unchanged valid includes carry forward, unchanged excludes remain consumed, and replacements come only from the unused deterministic stream.
+- Publish `crux.reviewed-reference-subset/v1` with source identities, the six selection features, both band labels, `review_ledger_sha256`, and optional `prior_review_ledger_sha256`.
+- `load_reviewed_subset_manifest()` uses `read_canonical_manifest_core()`; the schema is registered in the existing golden registry.
+- HPA-325 owns score/report order. `candidate_rank` remains provenance only.
 - Reviewed-subset scoring passes only successful selected IDs through `diagnostics_for`.
 - Do not instantiate `OafBackend` or rerun inference for subset scoring.
-- Do not add a DB, reviewer UI, sampling DSL, experiment framework, generic backend runner, second scorer, automatic chart repair, training, or backward-compatibility layer.
-- Real manual audit is operational acceptance, not an automated test. HPA-327 remains In Progress until that evidence exists.
+- Do not add a DB, reviewer UI, sampling DSL, experiment framework, generic runner, second scorer, automatic chart repair, training, or backward-compatibility layer.
+- Automated acceptance stays offline. The real human audit is an operational completion gate; HPA-327 remains In Progress until that evidence exists.
 
 ---
 
@@ -41,22 +41,19 @@
 - Verify unchanged: `tests/benchmark/test_oaf_corpus_run_acceptance.py`
 
 **Interfaces:**
-- Consumes: `LoadedReferenceSetManifest`, `LoadedReferenceTimingManifest`, `read_native_reference_events()`, `map_reference_events()`.
-- Produces:
 
-```python
-def preflight_reference_mappings(
+```text
+preflight_reference_mappings(
     reference_manifest: LoadedReferenceSetManifest,
     timing_manifest: LoadedReferenceTimingManifest,
     *,
     timing_output_root: Path,
-) -> dict[int, ReferenceMappingResult | None]:
-    ...
+) -> dict[int, ReferenceMappingResult | None]
 ```
 
-- HPA-326 and HPA-327 both use this one implementation. Do not place it in `reference_set.py`; `reference_set_manifest.py` already imports `map_reference_events()` from that module.
+HPA-326 and HPA-327 both consume this implementation from `reference_set_manifest.py`. Do not move it to `reference_set.py`; that would invert the existing `reference_set_manifest -> reference_set` import and create a cycle.
 
-- [ ] **Step 1: Add a failing public-seam test before moving code**
+- [ ] **Step 1: Add a red public-contract test**
 
 Add to `tests/benchmark/test_reference_set_manifest.py`:
 
@@ -67,21 +64,17 @@ def test_reference_mapping_preflight_is_public_model_independent_contract() -> N
     assert preflight_reference_mappings.__module__ == "src.benchmark.reference_set_manifest"
 ```
 
-This should fail before the extraction because the public function does not exist.
-
-- [ ] **Step 2: Run the focused red test**
-
-Run:
+- [ ] **Step 2: Verify the new public seam is initially red**
 
 ```bash
 uv run pytest tests/benchmark/test_reference_set_manifest.py::test_reference_mapping_preflight_is_public_model_independent_contract -q
 ```
 
-Expected: FAIL with import/name error for `preflight_reference_mappings`.
+Expected: FAIL because the public function does not exist.
 
-- [ ] **Step 3: Move the existing preflight implementation without semantic edits**
+- [ ] **Step 3: Move `_preflight_reference_mappings()` without semantic changes**
 
-Move the body of `oaf_corpus_run.py::_preflight_reference_mappings()` into `reference_set_manifest.py` under the public name above. Preserve all current checks:
+Move the existing HPA-326 function body to `reference_set_manifest.py` under the public name. Preserve its existing lineage check:
 
 ```python
 if (
@@ -92,7 +85,7 @@ if (
     raise ValueError("reference and timing manifests have different lineage")
 ```
 
-Keep the existing per-row identity checks for:
+Preserve per-row equality checks for:
 
 ```python
 (
@@ -106,23 +99,11 @@ Keep the existing per-row identity checks for:
 )
 ```
 
-Keep the existing `None` mapping behavior for legitimate quarantined rows and fatal failure for broken eligible artifacts.
+Preserve `None` mappings for legitimate quarantined rows and fatal failure for broken eligible artifacts.
 
-- [ ] **Step 4: Point HPA-326 at the promoted helper**
+- [ ] **Step 4: Point HPA-326 at the promoted helper and delete the private copy**
 
-In `src/benchmark/oaf_corpus_run.py`, import:
-
-```python
-from src.benchmark.reference_set_manifest import (
-    LoadedReferenceSetManifest,
-    LoadedReferenceSetRow,
-    load_reference_set_manifest,
-    preflight_reference_mappings,
-    read_native_reference_events,
-)
-```
-
-Replace the private call with:
+Import `preflight_reference_mappings` from `reference_set_manifest.py`, replace the private call, and remove `_preflight_reference_mappings()` entirely. The existing HPA-326 call remains:
 
 ```python
 mappings = preflight_reference_mappings(
@@ -132,19 +113,15 @@ mappings = preflight_reference_mappings(
 )
 ```
 
-Delete `_preflight_reference_mappings()` from `oaf_corpus_run.py`; do not leave an alias.
-
-- [ ] **Step 5: Run focused and unchanged HPA-326 acceptance coverage**
-
-Run:
+- [ ] **Step 5: Run focused + unchanged acceptance tests**
 
 ```bash
 uv run pytest tests/benchmark/test_reference_set_manifest.py tests/benchmark/test_oaf_corpus_run.py tests/benchmark/test_oaf_corpus_run_acceptance.py -q
 ```
 
-Expected: PASS with no fixture or expected-output changes needed for HPA-326.
+Expected: PASS with no HPA-326 expected-output changes.
 
-- [ ] **Step 6: Commit the no-behavior-change extraction**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/benchmark/reference_set_manifest.py src/benchmark/oaf_corpus_run.py tests/benchmark/test_reference_set_manifest.py
@@ -153,7 +130,7 @@ git commit -m "refactor: share reference mapping preflight"
 
 ---
 
-### Task 2: Extract persisted OaF cohort reconstruction with characterization coverage
+### Task 2: Extract persisted OaF cohort reconstruction with report-byte characterization
 
 **Files:**
 - Modify: `src/benchmark/oaf_corpus_run.py`
@@ -162,24 +139,21 @@ git commit -m "refactor: share reference mapping preflight"
 - Verify unchanged: `tests/benchmark/test_cohort_scoring_acceptance.py`
 
 **Interfaces:**
-- Consumes: validated HPA-326 snapshot, preflight mappings, immutable prediction artifacts, `_cohort_item_from_run_row()`.
-- Produces:
 
-```python
-def build_oaf_cohort_from_snapshot(
+```text
+build_oaf_cohort_from_snapshot(
     snapshot: Mapping[str, object],
     *,
     mappings: Mapping[int, ReferenceMappingResult | None],
     output_dir: Path,
-) -> tuple[CohortIdentity, tuple[CohortItem, ...]]:
-    ...
+) -> tuple[CohortIdentity, tuple[CohortItem, ...]]
 ```
 
-- Broad HPA-326 finalization keeps its current `output_dir or run_path.parents[2]` fallback before calling this helper. HPA-327 scoring passes `run_path.parents[2]` explicitly.
+Broad HPA-326 still resolves `output_dir or run_path.parents[2]` before calling this helper. HPA-327 passes `run_path.parents[2]` explicitly.
 
-- [ ] **Step 1: Add a characterization test for report-byte equivalence**
+- [ ] **Step 1: Add a red characterization path to HPA-326 acceptance**
 
-Using the existing persisted-run setup in `tests/benchmark/test_oaf_corpus_run_acceptance.py`, add an assertion path that constructs the expected reports through the new seam:
+Using the existing persisted-run setup in `tests/benchmark/test_oaf_corpus_run_acceptance.py`, construct expected reports through the new seam:
 
 ```python
 identity, cohort_items = build_oaf_cohort_from_snapshot(
@@ -217,21 +191,17 @@ assert outcome.skipped_count == expected_result.population.skipped_count
 assert outcome.quarantined_count == expected_result.population.quarantined_count
 ```
 
-Before extraction, the import of `build_oaf_cohort_from_snapshot` should fail.
-
-- [ ] **Step 2: Run the characterization test red**
-
-Run the specific acceptance test you extended:
+- [ ] **Step 2: Run the acceptance file red**
 
 ```bash
 uv run pytest tests/benchmark/test_oaf_corpus_run_acceptance.py -q
 ```
 
-Expected: FAIL only because `build_oaf_cohort_from_snapshot` is absent.
+Expected: FAIL because `build_oaf_cohort_from_snapshot` is absent.
 
-- [ ] **Step 3: Implement the narrow reconstruction helper**
+- [ ] **Step 3: Implement only reconstruction**
 
-Place it next to `_cohort_item_from_run_row()`:
+Place this next to `_cohort_item_from_run_row()`:
 
 ```python
 def build_oaf_cohort_from_snapshot(
@@ -261,11 +231,9 @@ def build_oaf_cohort_from_snapshot(
     return identity, cohort_items
 ```
 
-Do not move prediction parsing, failure mapping, or scoring into the new helper.
+Do not move prediction parsing, runner failure mapping, scoring, or reporting into this helper.
 
-- [ ] **Step 4: Make broad finalization call the helper**
-
-In `_finalize_scoring_and_outcome()` replace the inline identity/item reconstruction with:
+- [ ] **Step 4: Replace broad finalization's inline reconstruction**
 
 ```python
 resolved_output_dir = output_dir or run_path.parents[2]
@@ -281,17 +249,17 @@ except (TypeError, ValueError):
 score_result = score_cohort(identity, cohort_items, diagnostics_for=())
 ```
 
-Preserve every existing outcome/status/report behavior after that point.
+Keep the remainder of `_finalize_scoring_and_outcome()` unchanged.
 
-- [ ] **Step 5: Run characterization plus existing scorer acceptance**
+- [ ] **Step 5: Run broad/scorer characterization**
 
 ```bash
 uv run pytest tests/benchmark/test_oaf_corpus_run.py tests/benchmark/test_oaf_corpus_run_acceptance.py tests/benchmark/test_cohort_scoring_acceptance.py -q
 ```
 
-Expected: PASS; broad reports remain byte-identical.
+Expected: PASS and byte-identical broad reports.
 
-- [ ] **Step 6: Commit the second no-behavior-change extraction**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/benchmark/oaf_corpus_run.py tests/benchmark/test_oaf_corpus_run.py tests/benchmark/test_oaf_corpus_run_acceptance.py
@@ -300,7 +268,7 @@ git commit -m "refactor: expose persisted OaF cohort reconstruction"
 
 ---
 
-### Task 3: Establish HPA-327 schema rails and reusable synthetic reference fixture
+### Task 3: Add the reviewed-subset schema loader/golden and reusable synthetic reference fixture
 
 **Files:**
 - Create: `src/benchmark/reviewed_subset.py`
@@ -311,58 +279,39 @@ git commit -m "refactor: expose persisted OaF cohort reconstruction"
 - Modify: `tests/benchmark/test_schema_goldens.py`
 
 **Interfaces:**
-- Produces constants:
 
-```python
+```text
 REVIEWED_REFERENCE_SUBSET_SCHEMA = "crux.reviewed-reference-subset/v1"
 REVIEW_POLICY_VERSION = "hpa327-v1"
 REVIEW_TARGET_COUNT = 30
 REVIEW_MIN_COUNT = 20
 REVIEW_MAX_COUNT = 30
 REVIEW_SELECTION_SEED = "crux-hpa327-v1"
-```
 
-- Produces loader:
+load_reviewed_subset_manifest(path: Path) -> LoadedReviewedSubsetManifest
+validate_schema_golden(schema: str, content: bytes) -> None
 
-```python
-def load_reviewed_subset_manifest(path: Path) -> LoadedReviewedSubsetManifest:
-    ...
-```
-
-- Produces reusable test fixture interface:
-
-```python
-@dataclass(frozen=True)
-class ReviewedSubsetReferenceFixture:
-    reference_manifest_path: Path
-    timing_manifest_path: Path
-    timing_output_root: Path
-
-
-def build_reviewed_subset_reference_fixture(
+build_reviewed_subset_reference_fixture(
     tmp_path: Path,
     *,
     eligible_count: int = 36,
     reverse_rows: bool = False,
-) -> ReviewedSubsetReferenceFixture:
-    ...
+) -> ReviewedSubsetReferenceFixture
 ```
 
-Build that fixture by factoring the already-working canonical HPA-323/HPA-324 event/manifest construction from the existing OaF/reference-manifest tests into this shared test helper. Keep the produced manifest/event bytes equivalent; do not introduce a second fake schema.
+- [ ] **Step 1: Register the schema golden before implementation**
 
-- [ ] **Step 1: Register the new schema golden first**
-
-Append this canonical registry row to `tests/benchmark/schema_goldens/manifest.json` in the existing schema order:
+Add the canonical manifest-registry row:
 
 ```json
 {"golden_path":"tests/benchmark/schema_goldens/crux.reviewed-reference-subset-v1.jsonl","schema":"crux.reviewed-reference-subset/v1","validator_modules":["src.benchmark.reviewed_subset"]}
 ```
 
-Update the exact expected schema list in `test_schema_goldens.py` to include `crux.reviewed-reference-subset/v1` after the benchmark-reference manifest and before the OaF smoke oracle.
+Update `test_schema_goldens.py`'s exact schema list to place the new schema after `crux.benchmark-reference-manifest/v1` and before the OaF smoke oracle.
 
-- [ ] **Step 2: Add a one-row canonical accepted-subset golden**
+- [ ] **Step 2: Create a one-row schema golden**
 
-The row must include exactly these fields:
+The golden row contains exactly:
 
 ```text
 schema_version
@@ -398,43 +347,64 @@ reason_codes
 notes
 ```
 
-Use canonical scalar examples: candidate rank `1`, simfile `42`, one common class/event, `density_band="medium"`, `class_richness_band="low"`, `has_timing_warning=false`, `selects_real_or_full_chart=true`, `musical_fidelity="usable_with_limits"`, `drum_character="acoustic"`, `reason_codes=["chart_simplification"]`, and valid lowercase 64-character SHA-256 strings. Set `prior_review_ledger_sha256` to `null` in the v1 golden.
+Use candidate rank `1`, simfile `42`, valid lowercase 64-character hashes, `density_band="medium"`, `class_richness_band="low"`, `has_timing_warning=false`, `selects_real_or_full_chart=true`, `musical_fidelity="usable_with_limits"`, `drum_character="acoustic"`, `reason_codes=["chart_simplification"]`, and `prior_review_ledger_sha256=null`.
 
-- [ ] **Step 3: Add loader/golden tests before implementation**
+- [ ] **Step 3: Add a red golden-validator test and a separate 20-row loader test**
 
-In `tests/benchmark/test_reviewed_subset.py`:
+The one-row golden validates schema shape only:
 
 ```python
-def test_reviewed_subset_golden_loads_canonically(tmp_path: Path) -> None:
-    source = (
+def test_reviewed_subset_schema_golden_is_valid() -> None:
+    content = (
         Path(__file__).parent
         / "schema_goldens"
         / "crux.reviewed-reference-subset-v1.jsonl"
-    )
-    path = tmp_path / "subset.jsonl"
-    path.write_bytes(source.read_bytes())
-
-    loaded = load_reviewed_subset_manifest(path)
-
-    assert loaded.manifest_sha256 == sha256(path.read_bytes()).hexdigest()
-    assert len(loaded.rows) == 1
-    assert loaded.rows[0].view.simfile_id == 42
-    assert loaded.rows[0].view.candidate_rank == 1
+    ).read_bytes()
+    validate_schema_golden(REVIEWED_REFERENCE_SUBSET_SCHEMA, content)
 ```
 
-Also add tests that duplicate `simfile_id`, duplicate `candidate_rank`, mixed source manifest/timing identity, mixed `review_ledger_sha256`, unknown enum values, and noncanonical JSONL are rejected.
+Normal loading must still enforce the real 20–30 accepted population. Build 20 canonical rows from the golden template:
 
-- [ ] **Step 4: Run the schema/loader tests red**
+```python
+def test_reviewed_subset_loader_accepts_real_population(tmp_path: Path) -> None:
+    golden = (
+        Path(__file__).parent
+        / "schema_goldens"
+        / "crux.reviewed-reference-subset-v1.jsonl"
+    ).read_bytes()
+    source = strict_json_loads(golden[:-1], require_canonical=True)
+    assert isinstance(source, dict)
+
+    rows: list[dict[str, object]] = []
+    for offset in range(20):
+        row = dict(source)
+        row.pop("corpus_version", None)
+        row["simfile_id"] = 100 + offset
+        row["candidate_rank"] = offset + 1
+        rows.append(row)
+
+    rendered = render_manifest(tuple(rows))
+    path = tmp_path / "subset.jsonl"
+    path.write_bytes(rendered.content)
+    loaded = load_reviewed_subset_manifest(path)
+
+    assert loaded.manifest_sha256 == sha256(rendered.content).hexdigest()
+    assert len(loaded.rows) == 20
+```
+
+Also test duplicate simfile IDs/ranks, mixed source/timing identity, mixed ledger hash, invalid enum, fewer than 20 normal rows, more than 30 normal rows, and noncanonical JSONL.
+
+- [ ] **Step 4: Run red**
 
 ```bash
 uv run pytest tests/benchmark/test_schema_goldens.py tests/benchmark/test_reviewed_subset.py -q
 ```
 
-Expected: FAIL because `src.benchmark.reviewed_subset` and its loader/validator do not exist.
+Expected: FAIL because `reviewed_subset.py` is absent.
 
-- [ ] **Step 5: Implement the manifest types, exact-key validation, loader, and golden validator**
+- [ ] **Step 5: Implement closed types, exact row validation, loader, and golden validator**
 
-In `src/benchmark/reviewed_subset.py`, define closed types:
+Use:
 
 ```python
 Band = Literal["low", "medium", "high"]
@@ -453,9 +423,9 @@ ReviewReasonCode = Literal[
 ]
 ```
 
-Define `ReviewedSubsetRowView`, `LoadedReviewedSubsetRow`, and `LoadedReviewedSubsetManifest`. The loaded manifest must expose at least:
+Define `ReviewedSubsetRowView`, `LoadedReviewedSubsetRow`, and `LoadedReviewedSubsetManifest`. The loaded manifest exposes:
 
-```python
+```text
 manifest_sha256: str
 corpus_version: str
 review_policy_version: str
@@ -468,7 +438,7 @@ source_timing_manifest_version: str
 rows: tuple[LoadedReviewedSubsetRow, ...]
 ```
 
-Implement the loader through:
+Normal loading must call:
 
 ```python
 canonical = read_canonical_manifest_core(
@@ -478,22 +448,25 @@ canonical = read_canonical_manifest_core(
 )
 ```
 
-Require one shared source-reference identity, timing identity, review-policy version, review-ledger hash, and prior-ledger hash across rows; unique candidate ranks and simfile IDs; accepted population 20–30 in normal loader mode. Keep the schema-golden validator's fixed one-row fixture rule separate from normal population validation, matching existing golden-validator patterns.
+Require one shared source-reference identity, timing identity, policy version, review-ledger hash, and prior-ledger hash across rows; unique positive candidate ranks; unique simfile IDs; and 20–30 accepted rows. Do not require candidate ranks to be contiguous because excluded review candidates are absent from the accepted manifest.
 
-Expose:
+`validate_schema_golden()` validates the same single-row shape but deliberately does not apply the normal 20-row minimum.
+
+- [ ] **Step 6: Factor the reusable HPA-323/HPA-324 synthetic reference fixture now**
+
+Create:
 
 ```python
-def validate_schema_golden(schema: str, content: bytes) -> None:
-    ...
+@dataclass(frozen=True)
+class ReviewedSubsetReferenceFixture:
+    reference_manifest_path: Path
+    timing_manifest_path: Path
+    timing_output_root: Path
 ```
 
-It must reject a schema argument other than `REVIEWED_REFERENCE_SUBSET_SCHEMA` and validate the canonical one-row golden against the same row-shape validator.
+Factor the smallest already-working canonical timing/reference/event builders from existing HPA-323/HPA-324/HPA-326 tests into `reviewed_subset_fixtures.py`. Generate distinct simfile IDs and valid native event artifacts; `eligible_count` controls population size and `reverse_rows=True` reverses source manifest row input before publication. Existing owner tests may import the factored helper, but expected bytes/semantics must not change.
 
-- [ ] **Step 6: Factor the reusable HPA-323/HPA-324 test fixture early**
-
-Move the smallest existing canonical timing/reference/event builders needed by HPA-327 tests into `tests/benchmark/reviewed_subset_fixtures.py` under the interface above. Existing tests that owned those builders may import the shared helper; do not change their expected semantics. Support `eligible_count` by generating distinct simfile IDs and valid native event artifacts, and support `reverse_rows=True` by reversing input manifest row order before canonical publication.
-
-- [ ] **Step 7: Run schema, fixture-owner, and reference tests**
+- [ ] **Step 7: Run schema + existing fixture-owner coverage**
 
 ```bash
 uv run pytest tests/benchmark/test_schema_goldens.py tests/benchmark/test_reviewed_subset.py tests/benchmark/test_reference_set_manifest.py tests/benchmark/test_oaf_corpus_run_acceptance.py -q
@@ -501,7 +474,7 @@ uv run pytest tests/benchmark/test_schema_goldens.py tests/benchmark/test_review
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit the schema rails and early fixture**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/benchmark/reviewed_subset.py tests/benchmark/test_reviewed_subset.py tests/benchmark/reviewed_subset_fixtures.py tests/benchmark/schema_goldens tests/benchmark/test_schema_goldens.py
@@ -518,47 +491,36 @@ git commit -m "feat: define reviewed subset manifest contract"
 - Modify: `tests/benchmark/reviewed_subset_fixtures.py`
 
 **Interfaces:**
-- Produces request/outcome:
 
-```python
-@dataclass(frozen=True)
-class PrepareReviewedSubsetRequest:
-    reference_manifest_path: Path
-    timing_manifest_path: Path
-    output_file: Path
-    prior_ledger_path: Path | None = None
+```text
+PrepareReviewedSubsetRequest(
+    reference_manifest_path: Path,
+    timing_manifest_path: Path,
+    output_file: Path,
+    prior_ledger_path: Path | None = None,
+)
 
+PrepareReviewedSubsetOutcome(
+    exit_code: Literal[0, 2],
+    output_file: Path | None,
+    candidate_count: int,
+    carried_include_count: int,
+    replacement_count: int,
+)
 
-@dataclass(frozen=True)
-class PrepareReviewedSubsetOutcome:
-    exit_code: Literal[0, 2]
-    output_file: Path | None
-    candidate_count: int
-    carried_include_count: int
-    replacement_count: int
-```
-
-- Produces pure selection seams:
-
-```python
-def build_candidate_stream(
+build_candidate_stream(
     reference_manifest: LoadedReferenceSetManifest,
     timing_manifest: LoadedReferenceTimingManifest,
     *,
     mappings: Mapping[int, ReferenceMappingResult | None],
-) -> tuple[ReviewCandidate, ...]:
-    ...
+) -> tuple[ReviewCandidate, ...]
 
-
-def prepare_reviewed_subset(
+prepare_reviewed_subset(
     request: PrepareReviewedSubsetRequest,
-) -> PrepareReviewedSubsetOutcome:
-    ...
+) -> PrepareReviewedSubsetOutcome
 ```
 
-- [ ] **Step 1: Write selection tests for the frozen population rules and anti-bias API**
-
-Add tests using `build_reviewed_subset_reference_fixture()`:
+- [ ] **Step 1: Add red population/API tests**
 
 ```python
 def test_prepare_selects_exactly_30_without_model_inputs(tmp_path: Path) -> None:
@@ -584,11 +546,11 @@ def test_prepare_selects_exactly_30_without_model_inputs(tmp_path: Path) -> None
     assert [int(row["candidate_rank"]) for row in rows] == list(range(1, 31))
 ```
 
-Add separate tests for 20–29 selecting all and fewer than 20 returning exit 2 without producing a valid review file.
+Add cases for 20–29 selecting all and fewer than 20 returning exit 2.
 
-- [ ] **Step 2: Add deterministic feature/band/stratum tests**
+- [ ] **Step 2: Add feature/accounting tests**
 
-Cover:
+Assert:
 
 ```python
 assert candidate.common_event_count == loaded_reference.view.common_scored_event_count
@@ -599,13 +561,11 @@ assert candidate.source_audio_cache_path == (
 )
 ```
 
-Create one fixture whose HPA-323 timing row contains a warning and assert `has_timing_warning is True`. Create `real.dtx`, `full.dtx`, and `mas.dtx` rows and assert only the first two set `selects_real_or_full_chart`.
+Add fixtures for HPA-323 timing warnings and `real.dtx` / `full.dtx` / `mas.dtx`. Only `real`/`full` sets `selects_real_or_full_chart`. Add a deliberate `common_scored_event_count` mismatch and require exit 2.
 
-Add a mismatch fixture where the HPA-324 row's `common_scored_event_count` differs from the reconstructed mapping and assert preparation exits 2.
+- [ ] **Step 3: Add seeded-stratum regression**
 
-- [ ] **Step 3: Add the lexical-bias regression**
-
-Build a synthetic eligible population that populates more than 30 distinct strata/candidate positions. Assert the selected set is derived from seeded stratum hashes rather than lexical order by computing the expected first-round stratum order in the test:
+Build a population that creates more than 30 distinct nonempty strata/candidate positions. Compute expected stratum order in the test:
 
 ```python
 expected_order = sorted(
@@ -614,22 +574,22 @@ expected_order = sorted(
         f"{REVIEW_SELECTION_SEED}:{canonical_stratum_key(key)}".encode()
     ).hexdigest(),
 )
-assert selected_first_round_strata == tuple(expected_order[: len(selected_first_round_strata)])
+assert selected_first_round_strata == tuple(
+    expected_order[: len(selected_first_round_strata)]
+)
 ```
 
-Also assert reversing manifest input rows produces byte-identical candidate `simfile_id` order.
+Reverse input manifest rows and require identical selected simfile order.
 
-- [ ] **Step 4: Run the selector tests red**
+- [ ] **Step 4: Run selector tests red**
 
 ```bash
 uv run pytest tests/benchmark/test_reviewed_subset.py -k "prepare or candidate or stratum or band" -q
 ```
 
-Expected: FAIL because preparation/selection does not exist.
+Expected: FAIL because selection/preparation is absent.
 
-- [ ] **Step 5: Implement source-row hashing and feature extraction**
-
-Use:
+- [ ] **Step 5: Implement source hashing + feature extraction over the shared preflight**
 
 ```python
 def _source_row_sha256(source_row: Mapping[str, object]) -> str:
@@ -639,21 +599,21 @@ def _source_row_sha256(source_row: Mapping[str, object]) -> str:
     return sha256(canonical_json_bytes(payload)).hexdigest()
 ```
 
-Build a timing-row lookup from `LoadedReferenceTimingManifest.rows`, call `preflight_reference_mappings()` exactly once, require every eligible mapping to be non-`None`, and reconcile:
+Build the timing-row lookup once. Call `preflight_reference_mappings()` once. Every HPA-324 eligible row must have a non-`None` mapping and satisfy:
 
 ```python
 if len(mapping.common_events) != loaded.view.common_scored_event_count:
     raise ValueError("reference common event count does not match HPA-324")
 ```
 
-Compute span/density/class count only from `mapping.common_events`.
+Derive event span/density/class richness from `mapping.common_events`; derive warning state from the matching HPA-323 timing view.
 
-- [ ] **Step 6: Implement exact thirds and seeded round-robin**
-
-Use one small helper:
+- [ ] **Step 6: Implement thirds + seeded round-robin**
 
 ```python
-def _assign_bands(values: tuple[tuple[float, int], ...]) -> dict[int, Band]:
+def _assign_bands(
+    values: tuple[tuple[float | int, int], ...],
+) -> dict[int, Band]:
     ordered = sorted(values)
     count = len(ordered)
     labels: tuple[Band, Band, Band] = ("low", "medium", "high")
@@ -674,18 +634,18 @@ def canonical_stratum_key(candidate: ReviewCandidate) -> str:
     )
 ```
 
-Order strata and members by:
+Seeded ordering:
 
 ```python
 def _seeded_hash(value: str) -> str:
     return sha256(f"{REVIEW_SELECTION_SEED}:{value}".encode()).hexdigest()
 ```
 
-Continue the stream beyond row 30 so continuation can draw deterministic replacements.
+Produce a deterministic stream beyond the first 30 rows for continuation replacements.
 
-- [ ] **Step 7: Implement the exact review CSV boundary**
+- [ ] **Step 7: Implement exact CSV columns and canonical display tokens**
 
-Define stable generated and manual column tuples. Generated columns are:
+Generated columns:
 
 ```text
 review_policy_version
@@ -713,7 +673,7 @@ has_timing_warning
 selects_real_or_full_chart
 ```
 
-Manual columns are exactly:
+Manual columns:
 
 ```text
 reviewer
@@ -730,19 +690,17 @@ reason_codes
 notes
 ```
 
-Render floats with:
+Render numeric display values with:
 
 ```python
 canonical_json_bytes(quantize_six(value)).decode("ascii")
 ```
 
-Use `csv.DictWriter(..., lineterminator="\n")`. Leave manual cells empty for new candidates.
+Write with `csv.DictWriter(..., lineterminator="\n")`; leave manual cells blank for new candidates.
 
-- [ ] **Step 8: Add continuation tests before implementation**
+- [ ] **Step 8: Add red continuation tests**
 
-Prepare an initial 30-row CSV, fill manual reviews so 24 unchanged rows are valid `include` and 6 are valid `exclude`, then call prepare again with `prior_ledger_path`.
-
-Assert:
+Fill an initial 30-row CSV with 24 valid includes and 6 valid excludes. Re-prepare with `prior_ledger_path` and assert:
 
 ```python
 assert outcome.carried_include_count == 24
@@ -752,15 +710,11 @@ assert not excluded_ids & current_ids
 assert carried_ids <= current_ids
 ```
 
-Mutate one source row before the continuation run and assert that row's prior review is not carried. Assert replacements are exactly the next unused IDs from `build_candidate_stream()`.
-
-Malformed completed manual fields in the prior ledger must return exit 2 rather than silently dropping review evidence.
+Change one upstream row hash and assert its review is not carried. Require replacements to equal the next unused IDs from `build_candidate_stream()`. Malformed completed prior manual fields must return exit 2.
 
 - [ ] **Step 9: Implement prior-ledger carry-forward**
 
-Parse prior rows by canonical integer `simfile_id`. Read `source_row_sha256` only for the carry-forward guard. Validate completed manual review fields before carrying anything.
-
-Rules:
+Parse prior rows by canonical integer `simfile_id`; use prior `source_row_sha256` only as the carry-forward guard. Apply:
 
 ```text
 unchanged valid include -> carry manual fields
@@ -769,9 +723,9 @@ changed source hash -> do not carry; row may reappear unreviewed
 new/replacement row -> next unused deterministic stream candidate
 ```
 
-Preserve carried included rows' relative order, append replacements in stream order, and assign fresh `candidate_rank = 1..N` for the new prepared CSV.
+Keep carried includes in previous relative order, append replacements in deterministic stream order, then assign fresh `candidate_rank = 1..N` for the new CSV.
 
-- [ ] **Step 10: Run all selection/continuation tests**
+- [ ] **Step 10: Run selection + continuation tests**
 
 ```bash
 uv run pytest tests/benchmark/test_reviewed_subset.py -k "prepare or candidate or stratum or band or carry or prior" -q
@@ -779,7 +733,7 @@ uv run pytest tests/benchmark/test_reviewed_subset.py -k "prepare or candidate o
 
 Expected: PASS.
 
-- [ ] **Step 11: Commit selection and preparation**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add src/benchmark/reviewed_subset.py tests/benchmark/test_reviewed_subset.py tests/benchmark/reviewed_subset_fixtures.py
@@ -796,62 +750,55 @@ git commit -m "feat: prepare reviewed reference subset"
 - Create: `tests/benchmark/test_reviewed_subset_acceptance.py`
 
 **Interfaces:**
-- Produces:
 
-```python
-@dataclass(frozen=True)
-class FinalizeReviewedSubsetRequest:
-    reference_manifest_path: Path
-    timing_manifest_path: Path
-    review_file: Path
-    output_dir: Path
-    prior_ledger_path: Path | None = None
+```text
+FinalizeReviewedSubsetRequest(
+    reference_manifest_path: Path,
+    timing_manifest_path: Path,
+    review_file: Path,
+    output_dir: Path,
+    prior_ledger_path: Path | None = None,
+)
 
+FinalizeReviewedSubsetOutcome(
+    exit_code: Literal[0, 2],
+    manifest: PublishedManifest | None,
+    review_ledger_path: Path | None,
+    included_count: int,
+    excluded_count: int,
+)
 
-@dataclass(frozen=True)
-class FinalizeReviewedSubsetOutcome:
-    exit_code: Literal[0, 2]
-    manifest: PublishedManifest | None
-    review_ledger_path: Path | None
-    included_count: int
-    excluded_count: int
-```
-
-```python
-def finalize_reviewed_subset(
+finalize_reviewed_subset(
     request: FinalizeReviewedSubsetRequest,
-) -> FinalizeReviewedSubsetOutcome:
-    ...
+) -> FinalizeReviewedSubsetOutcome
 ```
 
-- [ ] **Step 1: Write review-validation tests first**
+- [ ] **Step 1: Add red closed-review validation tests**
 
-Use a prepared CSV and fill manual columns. Add tests for:
+Cover:
 
 ```text
 blank reviewer -> reject
-invalid/non-UTC reviewed_at -> reject
+reviewed_at not RFC3339 UTC -> reject
 invalid confirmation token -> reject
-include + any false confirmation -> reject
+include with any false confirmation -> reject
 include + not_representative -> reject
 exclude + empty reason_codes -> reject
-reason_codes containing other + empty notes -> reject
+other + empty notes -> reject
 unknown reason -> reject
 fewer than 20 includes -> reject
 20–30 valid includes -> publishable
 ```
 
-Use exact confirmation strings `true` / `false`, exact decision strings `include` / `exclude`, and semicolon-separated review reason tokens in the editing CSV.
+CSV confirmations are exact `true` / `false`; decisions are `include` / `exclude`; CSV reasons are semicolon-separated closed tokens.
 
-- [ ] **Step 2: Test that generated spreadsheet cells are non-authoritative**
+- [ ] **Step 2: Prove generated spreadsheet cells are non-authoritative**
 
-After preparation, deliberately rewrite generated cells such as density, hash display, booleans, and candidate rank while leaving `simfile_id` and manual review fields intact. Finalization must regenerate current evidence and still succeed when membership is current.
+Rewrite generated density/hash/boolean/rank display cells while leaving `simfile_id` and valid manual fields intact. Finalization should still succeed because it re-derives generated evidence. Change a `simfile_id` to an unknown/stale member and require exit 2.
 
-Then change a `simfile_id` to a stale/unknown member and assert finalization exits 2.
+- [ ] **Step 3: Pin continuation reproducibility**
 
-- [ ] **Step 3: Test continuation finalization requires the same prior ledger**
-
-Prepare a continuation CSV with `prior_ledger_path`. Assert:
+Prepare a continuation CSV with a prior ledger. Then:
 
 ```python
 without_prior = finalize_reviewed_subset(
@@ -863,33 +810,25 @@ with_prior = finalize_reviewed_subset(finalize_request)
 assert with_prior.exit_code == 0
 ```
 
-This pins replacement-membership reproducibility rather than trusting editable generated cells.
-
 - [ ] **Step 4: Run finalization tests red**
 
 ```bash
 uv run pytest tests/benchmark/test_reviewed_subset.py -k "finalize or review" -q
 ```
 
-Expected: FAIL because finalization is not implemented.
+Expected: FAIL because finalization is absent.
 
-- [ ] **Step 5: Implement one closed manual-review parser**
+- [ ] **Step 5: Implement one closed completed-review parser**
 
-Represent a completed review with a frozen dataclass and parse `reason_codes` into a sorted unique tuple. Validate all closed enums and RFC3339 UTC timestamps. Keep `known_limitations` / `notes` as strings. `other` requires nonempty notes.
-
-Do not validate generated CSV display values as source identity.
+Use a frozen review dataclass. Parse reasons into a sorted unique tuple. Require `reviewed_at` to parse as an RFC3339 timestamp with UTC offset zero and canonicalize it to `Z` for the published ledger. Validate the closed fidelity/character/decision/reason sets and `other -> nonempty notes` rule. Do not trust generated cells.
 
 - [ ] **Step 6: Reproduce current membership from authoritative inputs**
 
-Finalization must rerun the same prepare selection logic in memory using the same optional prior ledger. Build `expected_by_id` from the reproduced slate, then require the submitted CSV to contain exactly one manual review for every expected `simfile_id` and no extra IDs.
+Run the same in-memory candidate/continuation logic with the same optional prior ledger. Build `expected_by_id`, require exactly one submitted manual review for every expected ID, and reject extra/missing IDs. Use `expected_by_id` for current hashes/features/ranks.
 
-Current source identity/features come from `expected_by_id`, not from submitted generated cells.
+- [ ] **Step 7: Render the canonical complete audit ledger and bind its hashes**
 
-- [ ] **Step 7: Render and durably write the canonical complete audit ledger**
-
-Re-render `review-ledger.csv` from fresh generated fields + validated manual fields using UTF-8, stable header order, `\n`, and `csv.DictWriter` quoting. Write it beneath `output_dir` with the existing shared durable byte-replacement helper.
-
-Compute:
+Re-render `review-ledger.csv` from fresh generated values + validated manual values using UTF-8, stable header order, `\n`, and `csv.DictWriter` quoting. Publish it with the existing shared atomic byte-replacement helper.
 
 ```python
 review_ledger_sha256 = sha256(review_ledger_bytes).hexdigest()
@@ -902,20 +841,7 @@ prior_review_ledger_sha256 = (
 
 - [ ] **Step 8: Publish accepted rows on existing manifest rails**
 
-For each `include`, emit the exact reviewed-subset row contract from Task 3. Convert manual `reason_codes` to a JSON array. Carry selection evidence:
-
-```text
-common_event_count
-reference_event_span_sec
-common_event_density_per_sec
-common_class_count
-density_band
-class_richness_band
-has_timing_warning
-selects_real_or_full_chart
-```
-
-Render/publish through:
+For each valid `include`, emit the Task 3 row contract. Convert CSV `reason_codes` to a JSON array. Include all six features and both band labels. Then:
 
 ```python
 rendered = render_manifest(tuple(rows))
@@ -923,13 +849,15 @@ published = publish_manifest(request.output_dir, rendered)
 publish_latest_manifest(request.output_dir, published, "complete", clock())
 ```
 
-Bind `review_ledger_sha256` and `prior_review_ledger_sha256` into every accepted row.
+Every accepted row carries the same `review_ledger_sha256` and `prior_review_ledger_sha256`.
 
-- [ ] **Step 9: Add loader round-trip and ledger-hash acceptance assertions**
+- [ ] **Step 9: Add prepare -> finalize acceptance**
 
-In `tests/benchmark/test_reviewed_subset_acceptance.py`, exercise prepare -> fill reviews -> finalize and assert:
+In `tests/benchmark/test_reviewed_subset_acceptance.py`, run preparation, fill reviews, finalize, then assert:
 
 ```python
+assert outcome.manifest is not None
+assert outcome.review_ledger_path is not None
 loaded = load_reviewed_subset_manifest(outcome.manifest.path)
 assert 20 <= len(loaded.rows) <= 30
 assert loaded.review_ledger_sha256 == sha256(
@@ -938,7 +866,7 @@ assert loaded.review_ledger_sha256 == sha256(
 assert loaded.prior_review_ledger_sha256 is None
 ```
 
-Add a continuation variant and assert its `prior_review_ledger_sha256` matches the supplied prior ledger bytes.
+Add a continuation variant and require `loaded.prior_review_ledger_sha256 == sha256(prior_bytes).hexdigest()`.
 
 - [ ] **Step 10: Run finalization/schema acceptance**
 
@@ -948,7 +876,7 @@ uv run pytest tests/benchmark/test_reviewed_subset.py tests/benchmark/test_revie
 
 Expected: PASS.
 
-- [ ] **Step 11: Commit review finalization/publication**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add src/benchmark/reviewed_subset.py tests/benchmark/test_reviewed_subset.py tests/benchmark/test_reviewed_subset_acceptance.py
@@ -957,7 +885,7 @@ git commit -m "feat: publish reviewed reference subset"
 
 ---
 
-### Task 6: Rescore persisted OaF predictions on the reviewed subset with diagnostics
+### Task 6: Rescore persisted OaF predictions on exact reviewed membership
 
 **Files:**
 - Modify: `src/benchmark/reviewed_subset.py`
@@ -968,41 +896,36 @@ git commit -m "feat: publish reviewed reference subset"
 - Verify unchanged: `tests/benchmark/test_cohort_scoring_acceptance.py`
 
 **Interfaces:**
-- Produces:
 
-```python
-@dataclass(frozen=True)
-class ScoreReviewedSubsetRequest:
-    run_path: Path
-    reference_manifest_path: Path
-    timing_manifest_path: Path
-    subset_manifest_path: Path
-    output_dir: Path
+```text
+ScoreReviewedSubsetRequest(
+    run_path: Path,
+    reference_manifest_path: Path,
+    timing_manifest_path: Path,
+    subset_manifest_path: Path,
+    output_dir: Path,
+)
 
+ScoreReviewedSubsetOutcome(
+    exit_code: Literal[0, 1, 2],
+    cohort_id: str | None,
+    reports_path: Path | None,
+    success_count: int,
+    failed_count: int,
+    skipped_count: int,
+    quarantined_count: int,
+)
 
-@dataclass(frozen=True)
-class ScoreReviewedSubsetOutcome:
-    exit_code: Literal[0, 1, 2]
-    cohort_id: str | None
-    reports_path: Path | None
-    success_count: int
-    failed_count: int
-    skipped_count: int
-    quarantined_count: int
-```
-
-```python
-def score_oaf_reviewed_subset(
+score_oaf_reviewed_subset(
     request: ScoreReviewedSubsetRequest,
-) -> ScoreReviewedSubsetOutcome:
-    ...
+) -> ScoreReviewedSubsetOutcome
 ```
 
-- To keep preparation model-independent, import `parse_oaf_corpus_run` and `build_oaf_cohort_from_snapshot` lazily inside `score_oaf_reviewed_subset()` instead of at `reviewed_subset.py` module import time.
+Keep `reviewed_subset.py` model-independent at import time: import `parse_oaf_corpus_run` and `build_oaf_cohort_from_snapshot` locally inside `score_oaf_reviewed_subset()`.
 
-- [ ] **Step 1: Extend the reusable synthetic fixture with a persisted OaF run**
+- [ ] **Step 1: Extend the synthetic fixture with a persisted OaF run**
 
-Add a second fixture dataclass/interface in `tests/benchmark/reviewed_subset_fixtures.py` by factoring the smallest existing persisted-run construction from HPA-326 acceptance tests:
+Create:
 
 ```python
 @dataclass(frozen=True)
@@ -1014,11 +937,11 @@ class ReviewedSubsetOafFixture:
     oaf_output_dir: Path
 ```
 
-The fixture must include at least successful items and one selectable non-success item, with valid immutable prediction artifacts for successes. It must not invoke Docker, TensorFlow, network, or a real backend.
+Factor the smallest existing persisted-run/prediction-artifact setup from HPA-326 acceptance tests. Include successful items and at least one selectable non-success item. No Docker, TensorFlow, network, or backend invocation.
 
-- [ ] **Step 2: Write the no-inference subset-score test**
+- [ ] **Step 2: Add red no-inference test**
 
-Finalize a valid subset, then monkeypatch backend creation to fail if touched and score it:
+Finalize a valid subset, then:
 
 ```python
 def fail_backend(*args: object, **kwargs: object) -> object:
@@ -1029,27 +952,27 @@ outcome = score_oaf_reviewed_subset(request)
 assert outcome.exit_code in {0, 1}
 ```
 
-Also capture hashes of the parent run's existing report files before/after and assert they are unchanged.
+Hash parent-run report files before/after and require no change.
 
 - [ ] **Step 3: Add identity/membership failure tests**
 
-Assert exit 2 for:
+Require exit 2 for:
 
 ```text
 run reference-manifest SHA mismatch
 run timing-manifest SHA/version mismatch
 subset source-reference identity mismatch
 subset source-timing identity mismatch
-subset simfile missing from parent run population
+subset simfile missing from parent population
 noncanonical run snapshot
-unreadable prediction artifact needed by a selected success row
+unreadable selected-success prediction artifact
 ```
 
-Do not silently drop any selected failed/skipped/quarantined parent item.
+Selected failed/skipped/quarantined parent items remain in the subset; they are never silently dropped.
 
-- [ ] **Step 4: Add the diagnostics hook regression**
+- [ ] **Step 4: Add diagnostics regression**
 
-Patch/wrap `score_cohort` in `reviewed_subset.py` and capture `diagnostics_for`. Assert it equals the sorted successful selected IDs only:
+Wrap `score_cohort` and capture `diagnostics_for`:
 
 ```python
 assert diagnostics_for == tuple(
@@ -1057,9 +980,9 @@ assert diagnostics_for == tuple(
 )
 ```
 
-Then assert `event_diagnostics.jsonl` is nonempty for a fixture with at least one successful selected song containing scoreable events.
+For a successful fixture with scoreable events, require nonempty `event_diagnostics.jsonl`.
 
-- [ ] **Step 5: Run rescore tests red**
+- [ ] **Step 5: Run red**
 
 ```bash
 uv run pytest tests/benchmark/test_reviewed_subset.py tests/benchmark/test_reviewed_subset_acceptance.py -k "score or rescore or diagnostic" -q
@@ -1067,9 +990,9 @@ uv run pytest tests/benchmark/test_reviewed_subset.py tests/benchmark/test_revie
 
 Expected: FAIL because subset scoring is absent.
 
-- [ ] **Step 6: Implement exact persisted-run reconstruction and lineage checks**
+- [ ] **Step 6: Implement persisted reconstruction + exact lineage checks**
 
-Inside `score_oaf_reviewed_subset()`:
+Inside `score_oaf_reviewed_subset()` only:
 
 ```python
 from src.benchmark.oaf_corpus_run import (
@@ -1078,11 +1001,9 @@ from src.benchmark.oaf_corpus_run import (
 )
 ```
 
-Read `request.run_path`, parse canonically, load HPA-324/HPA-323, call `preflight_reference_mappings()`, and verify snapshot reference/timing hashes/versions against those loaded manifests.
+Parse the run bytes canonically. Load HPA-324/HPA-323 and call `preflight_reference_mappings()`. Require the run's reference SHA, timing SHA, and timing version to match the supplied manifests. Load HPA-327 with `load_reviewed_subset_manifest()` and require its source-reference/timing identities to match those same manifests.
 
-Load the subset with `load_reviewed_subset_manifest()` and require its source manifest/timing identities to match the same loaded HPA-324/HPA-323 artifacts.
-
-Reconstruct through:
+Reconstruct with:
 
 ```python
 parent_identity, parent_items = build_oaf_cohort_from_snapshot(
@@ -1094,11 +1015,9 @@ parent_identity, parent_items = build_oaf_cohort_from_snapshot(
 
 Do not call `run_oaf_corpus()`.
 
-- [ ] **Step 7: Filter exact membership while preserving HPA-325 canonical ordering**
+- [ ] **Step 7: Filter membership and derive only a new cohort ID**
 
-Build a set of subset IDs, require every ID in the parent population, and select the matching `CohortItem`s. Do not sort by `candidate_rank`; `score_cohort()` owns canonical item order.
-
-Derive:
+Require every subset ID in the parent population. Filter parent items by exact subset membership, retaining non-success states. Do not sort by `candidate_rank`.
 
 ```python
 subset_cohort_id = sha256(
@@ -1112,7 +1031,7 @@ subset_cohort_id = sha256(
 subset_identity = replace(parent_identity, cohort_id=subset_cohort_id)
 ```
 
-- [ ] **Step 8: Reuse HPA-325 scoring/reporting with successful-song diagnostics**
+- [ ] **Step 8: Reuse HPA-325 with successful selected diagnostics**
 
 ```python
 diagnostics_for = tuple(
@@ -1126,7 +1045,7 @@ result = score_cohort(
 write_cohort_reports(result, request.output_dir)
 ```
 
-Set exit 0 when every selected item succeeds, exit 1 when item-level failed/skipped/quarantined states remain, and exit 2 for identity/artifact/report failure.
+Exit 0 when every selected item succeeds, 1 when any selected item is failed/skipped/quarantined, and 2 for fatal identity/artifact/report failure.
 
 - [ ] **Step 9: Run subset + unchanged broad acceptance**
 
@@ -1134,9 +1053,9 @@ Set exit 0 when every selected item succeeds, exit 1 when item-level failed/skip
 uv run pytest tests/benchmark/test_reviewed_subset.py tests/benchmark/test_reviewed_subset_acceptance.py tests/benchmark/test_oaf_corpus_run_acceptance.py tests/benchmark/test_cohort_scoring_acceptance.py -q
 ```
 
-Expected: PASS. Broad reports remain unchanged; reviewed subset reports contain bounded diagnostics.
+Expected: PASS; broad reports stay unchanged and reviewed reports contain bounded diagnostics.
 
-- [ ] **Step 10: Commit persisted subset rescoring**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add src/benchmark/reviewed_subset.py tests/benchmark/reviewed_subset_fixtures.py tests/benchmark/test_reviewed_subset.py tests/benchmark/test_reviewed_subset_acceptance.py
@@ -1145,7 +1064,7 @@ git commit -m "feat: score persisted OaF reviewed subset"
 
 ---
 
-### Task 7: Wire the three thin CLI commands and run end-to-end/repository verification
+### Task 7: Wire three thin CLI commands and finish end-to-end verification
 
 **Files:**
 - Modify: `src/cli/benchmark.py`
@@ -1153,7 +1072,6 @@ git commit -m "feat: score persisted OaF reviewed subset"
 - Modify: `tests/benchmark/test_reviewed_subset_acceptance.py`
 
 **Interfaces:**
-- Adds commands:
 
 ```text
 crux benchmark prepare-reviewed-subset
@@ -1161,11 +1079,9 @@ crux benchmark finalize-reviewed-subset
 crux benchmark score-oaf-reviewed-subset
 ```
 
-- CLI callbacks only construct request dataclasses, call domain functions, render concise canonical JSON, and exit with the domain outcome's 0/1/2 code.
+- [ ] **Step 1: Add red help/option tests**
 
-- [ ] **Step 1: Write CLI help/option tests first**
-
-Assert exact command availability and required option names:
+Require:
 
 ```text
 prepare-reviewed-subset:
@@ -1189,13 +1105,13 @@ score-oaf-reviewed-subset:
   --output-dir
 ```
 
-Do not add `--seed`, `--target-count`, model IDs, score thresholds, or backend-selection flags.
+Assert there is no `--seed`, `--target-count`, score threshold, model ID, or backend selector.
 
-- [ ] **Step 2: Add callback forwarding tests**
+- [ ] **Step 2: Add callback forwarding + JSON-output tests**
 
-Monkeypatch each domain function and assert the Click callback builds exactly the request dataclass fields above. For prepare/finalize, verify omitted `--prior-ledger` becomes `None`.
+Monkeypatch each domain function and assert callbacks construct exactly the request dataclasses from Tasks 4–6. Omitted `--prior-ledger` becomes `None`.
 
-Assert JSON output includes stable operator-useful facts only:
+Output one canonical JSON object containing:
 
 ```text
 prepare: exit_code, candidate_count, carried_include_count, replacement_count, output_file
@@ -1203,42 +1119,37 @@ finalize: exit_code, included_count, excluded_count, manifest_path, review_ledge
 score: exit_code, cohort_id, success_count, failed_count, skipped_count, quarantined_count, reports_path
 ```
 
-Render float-derived values, if any are later added, through `quantize_six()` before canonical JSON; v1 outcomes above need no floats.
-
 - [ ] **Step 3: Run CLI tests red**
 
 ```bash
 uv run pytest tests/test_cli_benchmark.py -k "reviewed_subset" -q
 ```
 
-Expected: FAIL because commands are not registered.
+Expected: FAIL because the commands are absent.
 
-- [ ] **Step 4: Implement the three Click callbacks**
+- [ ] **Step 4: Implement Click callbacks only**
 
-Follow existing benchmark command option/path conventions (`click.Path(path_type=Path, ...)`, `click.IntRange` where already used elsewhere). Domain code stays in `src/benchmark/reviewed_subset.py`.
-
-Each callback should emit one canonical JSON object and then:
+Use existing benchmark path conventions. For input files use `click.Path(path_type=Path, exists=True, dir_okay=False)`; for output directories/files use `click.Path(path_type=Path)`. Call domain functions and render JSON through the existing canonical encoder:
 
 ```python
+click.echo(canonical_json_bytes(payload).decode("utf-8"))
 if outcome.exit_code:
     raise click.exceptions.Exit(outcome.exit_code)
 ```
 
-Do not catch domain failures and convert them to success.
+Do not add domain behavior to Click callbacks.
 
-- [ ] **Step 5: Make the synthetic acceptance chain runnable end-to-end**
+- [ ] **Step 5: Run the reusable synthetic chain end-to-end**
 
-In `tests/benchmark/test_reviewed_subset_acceptance.py`, use the reusable fixture to execute domain-level:
+In `test_reviewed_subset_acceptance.py`, execute domain-level:
 
 ```text
 prepare -> fill manual fields -> finalize -> score persisted OaF subset
 ```
 
-Then exercise the same flow through `CliRunner` and compare the resulting subset manifest/review-ledger/report bytes with the domain-level expectations where paths are normalized.
+Then exercise the same flow through `CliRunner`. Compare subset manifest, canonical review ledger, and report bytes where path-dependent CLI JSON fields are excluded from byte comparison. The test remains offline and backend-free.
 
-This test must remain offline and must not construct `OafBackend`.
-
-- [ ] **Step 6: Run all HPA-327 and touched-seam tests**
+- [ ] **Step 6: Run all HPA-327 + touched-seam tests**
 
 ```bash
 uv run pytest tests/benchmark/test_reviewed_subset.py tests/benchmark/test_reviewed_subset_acceptance.py tests/benchmark/test_reference_set_manifest.py tests/benchmark/test_oaf_corpus_run.py tests/benchmark/test_oaf_corpus_run_acceptance.py tests/benchmark/test_cohort_scoring_acceptance.py tests/benchmark/test_schema_goldens.py tests/test_cli_benchmark.py -q
@@ -1246,7 +1157,7 @@ uv run pytest tests/benchmark/test_reviewed_subset.py tests/benchmark/test_revie
 
 Expected: PASS.
 
-- [ ] **Step 7: Run repository-wide CI-equivalent verification**
+- [ ] **Step 7: Run repository-wide CI-equivalent gates**
 
 ```bash
 uv run pytest -q
@@ -1256,9 +1167,9 @@ uv run pylint --errors-only --disable=E1120,E0401 --jobs=1 src
 git diff --check
 ```
 
-Expected: all pass. Do not weaken coverage or lint gates to land HPA-327.
+Expected: all pass; do not weaken gates to land HPA-327.
 
-- [ ] **Step 8: Commit CLI and acceptance wiring**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/cli/benchmark.py tests/test_cli_benchmark.py tests/benchmark/test_reviewed_subset_acceptance.py
@@ -1267,30 +1178,29 @@ git commit -m "feat: add reviewed subset benchmark commands"
 
 ---
 
-## Operational Completion Gate (after code implementation)
+## Operational Completion Gate
 
-The repository does not contain the user's real HPA-323/HPA-324 local artifacts or the completed human review evidence, so implementation must not fabricate this gate.
+The repository does not contain the real local HPA-323/HPA-324 artifacts or completed human review evidence. Do not fabricate this gate in tests.
 
-After the implementation lands in an environment with the real manifests/cache, complete HPA-327 in this order:
+After code lands in an environment with those real artifacts:
 
-1. Run `prepare-reviewed-subset` against the exact HPA-324 manifest and its matching HPA-323 timing manifest **before using OaF song-level scores to make membership decisions**.
-2. Preserve the initial review CSV and manually inspect every candidate's selected chart, matching full mix, BGM alignment, mapping, and musical fidelity.
+1. Run `prepare-reviewed-subset` against the exact HPA-324 manifest and matching HPA-323 timing manifest before using OaF song-level scores for membership decisions.
+2. Preserve the generated CSV and manually inspect every candidate's chart, full mix, BGM alignment, mapping, and musical fidelity.
 3. Fill all 12 manual review fields.
-4. If fewer than 20 are acceptable or pre-score coverage is clearly inadequate, rerun prepare with `--prior-ledger` to preserve unchanged includes and draw only deterministic unused replacements; continue review without consulting model scores.
-5. Finalize with the same prior ledger used for that continuation pass. Preserve the canonical `review-ledger.csv` and `crux.reviewed-reference-subset/v1` manifest.
-6. Confirm the published accepted subset itself demonstrates materially different density/class-richness bands, timing-warning states, `real`/`full` chart selection, and manually recorded drum character.
-7. Run `score-oaf-reviewed-subset` against the existing HPA-326 `run.json`; do not rerun OaF inference.
-8. Preserve reviewed-subset reports, including event diagnostics for successful reviewed songs, without modifying the broad HPA-326 run or reports.
-9. Mark HPA-327 Done in Linear only after this real 20–30-song audit evidence exists.
+4. If fewer than 20 are acceptable or pre-score diagnostic coverage is clearly inadequate, rerun prepare with `--prior-ledger`; preserve unchanged includes and review only deterministic unused replacements without consulting model scores.
+5. Finalize with the same prior ledger used for that continuation pass. Preserve canonical `review-ledger.csv` plus `crux.reviewed-reference-subset/v1`.
+6. Confirm the accepted manifest itself demonstrates materially different density/class-richness bands, timing-warning states, `real`/`full` selection, and manually recorded drum character.
+7. Run `score-oaf-reviewed-subset` against the existing HPA-326 `run.json`; do not rerun inference.
+8. Preserve subset reports and event diagnostics without modifying broad HPA-326 artifacts.
+9. Mark HPA-327 Done only after the real 20–30-song audit evidence exists.
 
 ## Plan Self-Review Checklist
 
-Before implementation begins, verify these invariants remain true in this plan and the design spec:
-
-- Every new durable schema has one loader and one golden; no call site hand-parses subset JSONL.
-- Candidate preparation has no model/run/prediction/report/score parameter or import dependency on OaF execution code.
-- The two HPA-326 changes are independently characterized no-behavior-change refactors before HPA-327 depends on them.
-- Continuation selection is reproducible because prepare and finalize receive the same prior ledger and the final manifest binds its hash.
-- CSV generated cells never become authority; source identities/features are re-derived from HPA-323/HPA-324.
-- HPA-325 remains the only scorer/report path, preserves `simfile_id` ordering, and receives successful reviewed IDs through `diagnostics_for`.
+- Every durable schema has one loader and one golden; subset JSONL is never hand-parsed by consumers.
+- Normal subset loading enforces 20–30 rows; the one-row golden is validated only by the schema-golden validator.
+- Candidate preparation has no model/run/prediction/report/score parameter and no import-time dependency on OaF execution code.
+- Both HPA-326 changes are characterization-tested no-behavior-change refactors before HPA-327 depends on them.
+- Continuation prepare/finalize share the same prior ledger and the final manifest binds its hash.
+- CSV generated cells never become authority; current evidence is re-derived from HPA-323/HPA-324.
+- HPA-325 remains the sole scorer/report path, retains `simfile_id` order, and receives successful reviewed IDs via `diagnostics_for`.
 - No task adds training, chart repair, UI, DB, generic runners, sampling configuration, or backward-compatibility machinery.
