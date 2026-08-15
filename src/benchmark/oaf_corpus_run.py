@@ -1683,6 +1683,9 @@ def run_oaf_corpus(
                     stop_after_poison = True
                     break
                 continue
+            # The canonical input now exists on disk; release the raw corpus body
+            # so execution state does not retain audio bytes for the whole run.
+            state.source = replace(state.source, content=None)
             try:
                 exists, content = _read_existing_prediction(prediction_target)
                 item["input_view_id"] = audio.input_view_id
@@ -1757,6 +1760,7 @@ def run_oaf_corpus(
                         backend = backend_factory(
                             input_root=input_root,
                             timeout_seconds=OAF_CORPUS_REQUEST_TIMEOUT_SECONDS,
+                            close_timeout_seconds=OAF_WORKER_CLOSE_TIMEOUT_SECONDS,
                         )
                         backend_descriptor = backend.descriptor()
                         if not isinstance(backend_descriptor, BackendDescriptor):
@@ -1821,12 +1825,14 @@ def run_oaf_corpus(
                 stop_after_poison = True
             finally:
                 _remove_temporary_input(canonical_path, input_root)
+                try:
+                    _write_snapshot_checkpoint(
+                        run_path, header, (state.snapshot for state in states)
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError):
+                    fatal_run_error = True
+                    stop_after_poison = True
 
-            try:
-                _write_snapshot_checkpoint(run_path, header, (state.snapshot for state in states))
-            except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError):
-                fatal_run_error = True
-                stop_after_poison = True
             if stop_after_poison:
                 break
     except BaseException as error:  # pylint: disable=broad-exception-caught

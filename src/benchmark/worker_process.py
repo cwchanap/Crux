@@ -260,7 +260,10 @@ class WorkerProcess:
                 self._process.wait(timeout=max(self._close_timeout_seconds, 0.1))
             except subprocess.TimeoutExpired:
                 self._process.kill()
-                self._process.wait()
+                try:
+                    self._process.wait(timeout=max(self._close_timeout_seconds, 0.1))
+                except subprocess.TimeoutExpired as error:
+                    raise WorkerProcessError("worker close timed out") from error
         if self._stderr_thread is not None:
             self._stderr_thread.join(timeout=max(self._close_timeout_seconds, 0.1))
         for stream in (self._process.stdout, self._process.stderr):

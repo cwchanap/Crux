@@ -21,17 +21,19 @@ class _FakePopen:
         self.stdout = _FakeStream()
         self.stderr = _FakeStream()
         self.wait_calls: list[float | None] = []
+        self.killed = False
+        self.reap_after_kill = True
 
     def wait(self, timeout: float | None = None) -> None:
         self.wait_calls.append(timeout)
-        if timeout is not None:
+        if timeout is not None and not (self.killed and self.reap_after_kill):
             raise subprocess.TimeoutExpired("fake-worker", timeout)
 
     def terminate(self) -> None:
         pass
 
     def kill(self) -> None:
-        pass
+        self.killed = True
 
 
 class _RecordingThread:
@@ -63,10 +65,31 @@ def test_worker_process_close_uses_independent_close_timeout(
 
     worker.close()
 
-    assert process.wait_calls == [30.0, 30.0, None]
+    assert process.wait_calls == [30.0, 30.0, 30.0]
     assert _RecordingThread.instances[0].join_calls == [30.0]
     assert 3600.0 not in process.wait_calls
     assert 3600.0 not in _RecordingThread.instances[0].join_calls
+
+
+def test_worker_process_close_raises_when_killed_process_never_reaps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A killed process that cannot be reaped raises instead of hanging close()."""
+    _RecordingThread.instances.clear()
+    monkeypatch.setattr(worker_process.threading, "Thread", _RecordingThread)
+    process = _FakePopen()
+    process.reap_after_kill = False
+    worker = WorkerProcess(
+        process,
+        timeout_seconds=3600.0,
+        close_timeout_seconds=30.0,
+        ready={"type": "ready"},
+    )
+
+    with pytest.raises(WorkerProcessError, match="worker close timed out"):
+        worker.close()
+
+    assert process.wait_calls == [30.0, 30.0, 30.0]
 
 
 @pytest.mark.parametrize(

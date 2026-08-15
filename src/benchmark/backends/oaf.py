@@ -46,6 +46,7 @@ class OafBackend:
         image: str = IMAGE,
         process_factory: ProcessFactory = WorkerProcess.start,
         timeout_seconds: float = 30.0,
+        close_timeout_seconds: float = 30.0,
         descriptor: BackendDescriptor | None = None,
     ) -> None:
         if not isinstance(checkpoint_dir, Path) or not isinstance(input_root, Path):
@@ -54,11 +55,14 @@ class OafBackend:
             raise ValueError("image must be a nonempty string")
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if close_timeout_seconds <= 0:
+            raise ValueError("close_timeout_seconds must be positive")
         self._checkpoint_dir = checkpoint_dir
         self._input_root = input_root
         self._image = image
         self._process_factory = process_factory
         self._timeout_seconds = timeout_seconds
+        self._close_timeout_seconds = close_timeout_seconds
         self._process: Any | None = None
         self._closed = False
         self._descriptor = descriptor or _load_descriptor()
@@ -115,10 +119,14 @@ class OafBackend:
             image=self._image,
         )
         try:
-            process = self._process_factory(command, timeout_seconds=self._timeout_seconds)
+            process = self._process_factory(
+                command,
+                timeout_seconds=self._timeout_seconds,
+                close_timeout_seconds=self._close_timeout_seconds,
+            )
         except TypeError:
             # Tiny injected fakes commonly accept only the command.  The production
-            # WorkerProcess accepts the timeout keyword above.
+            # WorkerProcess accepts the timeout keywords above.
             process = self._process_factory(command)
         except (OSError, RuntimeError, ValueError) as error:
             raise OafBackendError(
@@ -186,6 +194,7 @@ def create_backend(
     image: str = IMAGE,
     process_factory: ProcessFactory = WorkerProcess.start,
     timeout_seconds: float = 30.0,
+    close_timeout_seconds: float = 30.0,
     descriptor: BackendDescriptor | None = None,
 ) -> OafBackend:
     config = _load_model_config()
@@ -202,6 +211,7 @@ def create_backend(
         image=image,
         process_factory=process_factory,
         timeout_seconds=timeout_seconds,
+        close_timeout_seconds=close_timeout_seconds,
         descriptor=descriptor,
     )
 

@@ -14,6 +14,7 @@ from src.benchmark.backends.oaf import OafBackendError
 from src.benchmark.oaf_corpus_run import (
     OAF_CORPUS_REQUEST_TIMEOUT_SECONDS,
     OAF_FULL_MIX_INPUT_VIEW_ID,
+    OAF_WORKER_CLOSE_TIMEOUT_SECONDS,
     OafCorpusRunRequest,
     ResolvedSourceAudio,
     _expected_oaf_descriptor,
@@ -108,12 +109,12 @@ def _install_fake_run_seams(
     reference_manifest, timing_manifest = _fake_manifests()
     monkeypatch.setattr(run_module, "load_reference_set_manifest", lambda _: reference_manifest)
     monkeypatch.setattr(run_module, "load_reference_timing_manifest", lambda _: timing_manifest)
-    empty_mappings = {
+    reference_mappings = {
         row.view.simfile_id: _reference_mapping(row.view.simfile_id)
         for row in reference_manifest.rows
     }
     monkeypatch.setattr(
-        run_module, "_preflight_reference_mappings", lambda *_args, **_kwargs: empty_mappings
+        run_module, "_preflight_reference_mappings", lambda *_args, **_kwargs: reference_mappings
     )
     monkeypatch.setattr(
         run_module,
@@ -273,6 +274,7 @@ def test_run_oaf_corpus_uses_one_persistent_backend_and_request_timeout(
         {
             "input_root": tmp_path / "output" / "runs" / outcome.run_id / "inputs",
             "timeout_seconds": OAF_CORPUS_REQUEST_TIMEOUT_SECONDS,
+            "close_timeout_seconds": OAF_WORKER_CLOSE_TIMEOUT_SECONDS,
         }
     ]
     assert transcribe_calls == [10, 20, 30]

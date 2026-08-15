@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import os
 import stat
 from pathlib import Path
 from uuid import uuid4
+
+_logger = logging.getLogger(__name__)
 
 
 def fsync_directory(path: Path) -> None:
@@ -35,14 +38,20 @@ def atomic_replace_bytes(path: Path, content: bytes) -> None:
         temporary_exists = False
         fsync_directory(path.parent)
         completed = True
-    except Exception:
+    except Exception as original_error:
         completed = False
+        _logger.debug("atomic replacement failed for %s", path, exc_info=original_error)
     finally:
         if temporary_exists:
             try:
                 temporary_path.unlink(missing_ok=True)
-            except Exception:
+            except Exception as cleanup_error:
                 cleanup_failed = True
+                _logger.debug(
+                    "atomic replacement cleanup failed for %s",
+                    temporary_path,
+                    exc_info=cleanup_error,
+                )
     if not completed or cleanup_failed:
         raise OSError("artifact publication failed")
 
