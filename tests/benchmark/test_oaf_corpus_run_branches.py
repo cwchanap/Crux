@@ -48,7 +48,6 @@ from src.benchmark.oaf_corpus_run import (
     _prediction_artifact_matches,
     _prediction_artifact_matches_run_row,
     _prediction_relative_path,
-    _preflight_reference_mappings,
     _project_runtime,
     _read_existing_prediction,
     _remote_from_source_mapping,
@@ -85,6 +84,7 @@ from src.benchmark.reference_set_manifest import (
     LoadedReferenceSetManifest,
     LoadedReferenceSetRow,
     ReferenceSetRowView,
+    preflight_reference_mappings,
 )
 from src.benchmark.reference_timing import NativeReferenceEvent
 from src.benchmark.reference_timing_manifest import (
@@ -759,7 +759,7 @@ def test_materialize_rejects_output_outside_input_root(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _preflight_reference_mappings
+# preflight_reference_mappings
 # ---------------------------------------------------------------------------
 
 
@@ -839,26 +839,26 @@ def _preflight_fixture(tmp_path: Path):
 def test_preflight_rejects_non_reference_manifest(tmp_path: Path) -> None:
     _, _, timing_manifest, _ = _preflight_fixture(tmp_path)
     with pytest.raises(TypeError, match="reference_manifest must be"):
-        _preflight_reference_mappings("bad", timing_manifest, timing_output_root=tmp_path)  # type: ignore[arg-type]
+        preflight_reference_mappings("bad", timing_manifest, timing_output_root=tmp_path)  # type: ignore[arg-type]
 
 
 def test_preflight_rejects_non_timing_manifest(tmp_path: Path) -> None:
     _, set_manifest, _, _ = _preflight_fixture(tmp_path)
     with pytest.raises(TypeError, match="timing_manifest must be"):
-        _preflight_reference_mappings(set_manifest, "bad", timing_output_root=tmp_path)  # type: ignore[arg-type]
+        preflight_reference_mappings(set_manifest, "bad", timing_output_root=tmp_path)  # type: ignore[arg-type]
 
 
 def test_preflight_rejects_non_path_output_root(tmp_path: Path) -> None:
     _, set_manifest, timing_manifest, _ = _preflight_fixture(tmp_path)
     with pytest.raises(TypeError, match="timing_output_root must be a Path"):
-        _preflight_reference_mappings(set_manifest, timing_manifest, timing_output_root="bad")  # type: ignore[arg-type]
+        preflight_reference_mappings(set_manifest, timing_manifest, timing_output_root="bad")  # type: ignore[arg-type]
 
 
 def test_preflight_rejects_lineage_mismatch(tmp_path: Path) -> None:
     _, set_manifest, timing_manifest, _ = _preflight_fixture(tmp_path)
     timing_manifest = replace(timing_manifest, manifest_sha256=SHA_C)
     with pytest.raises(ValueError, match="lineage"):
-        _preflight_reference_mappings(set_manifest, timing_manifest, timing_output_root=tmp_path)
+        preflight_reference_mappings(set_manifest, timing_manifest, timing_output_root=tmp_path)
 
 
 def test_preflight_non_eligible_without_timing_row_is_none(tmp_path: Path) -> None:
@@ -873,7 +873,7 @@ def test_preflight_non_eligible_without_timing_row_is_none(tmp_path: Path) -> No
         rows=(replace(set_manifest.rows[0], view=quarantined_view),),
     )
     timing_manifest = replace(timing_manifest, rows=())
-    mappings = _preflight_reference_mappings(
+    mappings = preflight_reference_mappings(
         set_manifest, timing_manifest, timing_output_root=tmp_path
     )
     assert mappings == {42: None}
@@ -883,7 +883,7 @@ def test_preflight_eligible_without_timing_row_is_fatal(tmp_path: Path) -> None:
     _, set_manifest, timing_manifest, _ = _preflight_fixture(tmp_path)
     timing_manifest = replace(timing_manifest, rows=())
     with pytest.raises(ValueError, match="eligible reference timing row is unavailable"):
-        _preflight_reference_mappings(set_manifest, timing_manifest, timing_output_root=tmp_path)
+        preflight_reference_mappings(set_manifest, timing_manifest, timing_output_root=tmp_path)
 
 
 def test_preflight_non_eligible_corrupt_artifact_is_none(tmp_path: Path) -> None:
@@ -901,7 +901,7 @@ def test_preflight_non_eligible_corrupt_artifact_is_none(tmp_path: Path) -> None
         set_manifest,
         rows=(replace(set_manifest.rows[0], view=quarantined_view),),
     )
-    mappings = _preflight_reference_mappings(set_manifest, timing_manifest, timing_output_root=root)
+    mappings = preflight_reference_mappings(set_manifest, timing_manifest, timing_output_root=root)
     assert mappings == {42: None}
 
 
@@ -1722,7 +1722,7 @@ def _install_run_seams(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(run_module, "load_reference_timing_manifest", lambda _: timing_manifest)
     monkeypatch.setattr(
         run_module,
-        "_preflight_reference_mappings",
+        "preflight_reference_mappings",
         lambda *_a, **_kw: {10: _reference_mapping(10)},
     )
     monkeypatch.setattr(
@@ -2004,7 +2004,7 @@ def test_run_oaf_corpus_rejects_source_body_mutated_after_preflight(
     monkeypatch.setattr(run_module, "load_reference_timing_manifest", lambda _: timing_manifest)
     monkeypatch.setattr(
         run_module,
-        "_preflight_reference_mappings",
+        "preflight_reference_mappings",
         lambda *_a, **_kw: {
             10: map_reference_events(
                 (

@@ -684,3 +684,9 @@ def test_reference_set_loader_rejects_empty_manifest(
 
     with pytest.raises(ValueError, match="no records"):
         load_reference_set_manifest(empty_path)
+
+
+def test_reference_mapping_preflight_is_public_model_independent_contract() -> None:
+    from src.benchmark.reference_set_manifest import preflight_reference_mappings
+
+    assert preflight_reference_mappings.__module__ == "src.benchmark.reference_set_manifest"
