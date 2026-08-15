@@ -321,6 +321,109 @@ def test_task_d_oaf_adapter_validates_ready_reuses_worker_and_closes(tmp_path: P
     assert worker.close_count == 1
 
 
+def test_task_d_oaf_adapter_forwards_only_factory_accepted_timeout_keywords(
+    tmp_path: Path,
+) -> None:
+    """A factory accepting only ``timeout_seconds`` must not receive ``close_timeout_seconds``."""
+    input_root = tmp_path / "input"
+    checkpoint = tmp_path / "checkpoint"
+    input_root.mkdir()
+    checkpoint.mkdir()
+    audio = _audio(input_root / "song.wav")
+    worker = _FakeWorker(
+        {"type": "ready", "backend_id": OAF_BACKEND_ID, "restored_tensor_count": 78},
+        {"events": ()},
+    )
+    captured: dict[str, object] = {}
+
+    def process_factory(command: object, *, timeout_seconds: float = 30.0) -> object:
+        del command
+        captured["timeout_seconds"] = timeout_seconds
+        return worker
+
+    backend = OafBackend(
+        checkpoint,
+        input_root,
+        process_factory=process_factory,
+        timeout_seconds=12.5,
+        close_timeout_seconds=45.0,
+    )
+    try:
+        assert backend.transcribe(audio).events == ()
+        assert captured["timeout_seconds"] == 12.5
+        assert "close_timeout_seconds" not in captured
+    finally:
+        backend.close()
+
+
+def test_task_d_oaf_adapter_forwards_only_factory_accepted_close_timeout_keyword(
+    tmp_path: Path,
+) -> None:
+    """A factory accepting only ``close_timeout_seconds`` must not receive ``timeout_seconds``."""
+    input_root = tmp_path / "input"
+    checkpoint = tmp_path / "checkpoint"
+    input_root.mkdir()
+    checkpoint.mkdir()
+    audio = _audio(input_root / "song.wav")
+    worker = _FakeWorker(
+        {"type": "ready", "backend_id": OAF_BACKEND_ID, "restored_tensor_count": 78},
+        {"events": ()},
+    )
+    captured: dict[str, object] = {}
+
+    def process_factory(command: object, *, close_timeout_seconds: float = 30.0) -> object:
+        del command
+        captured["close_timeout_seconds"] = close_timeout_seconds
+        return worker
+
+    backend = OafBackend(
+        checkpoint,
+        input_root,
+        process_factory=process_factory,
+        timeout_seconds=12.5,
+        close_timeout_seconds=45.0,
+    )
+    try:
+        assert backend.transcribe(audio).events == ()
+        assert captured["close_timeout_seconds"] == 45.0
+        assert "timeout_seconds" not in captured
+    finally:
+        backend.close()
+
+
+def test_task_d_oaf_adapter_skips_positional_only_timeout_keywords(tmp_path: Path) -> None:
+    """Positional-only timeout parameters cannot be forwarded by keyword."""
+    input_root = tmp_path / "input"
+    checkpoint = tmp_path / "checkpoint"
+    input_root.mkdir()
+    checkpoint.mkdir()
+    audio = _audio(input_root / "song.wav")
+    worker = _FakeWorker(
+        {"type": "ready", "backend_id": OAF_BACKEND_ID, "restored_tensor_count": 78},
+        {"events": ()},
+    )
+    captured: list[object] = []
+
+    def process_factory(command: object, timeout_seconds: float = 30.0, /) -> object:
+        captured.append(timeout_seconds)
+        return worker
+
+    backend = OafBackend(
+        checkpoint,
+        input_root,
+        process_factory=process_factory,
+        timeout_seconds=12.5,
+        close_timeout_seconds=45.0,
+    )
+    try:
+        assert backend.transcribe(audio).events == ()
+        # Positional-only params cannot be passed by keyword, so the factory
+        # is invoked with just ``command`` and its own default is used.
+        assert captured == [30.0]
+    finally:
+        backend.close()
+
+
 def test_task_d_oaf_adapter_rejects_ready_override_keyword() -> None:
     assert "ready" not in inspect.signature(OafBackend).parameters
 

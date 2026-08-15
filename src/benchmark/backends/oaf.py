@@ -121,22 +121,15 @@ class OafBackend:
         )
         try:
             factory_params = inspect.signature(self._process_factory).parameters
-            supports_timeout = any(
-                p.kind is inspect.Parameter.VAR_KEYWORD
-                or name in ("timeout_seconds", "close_timeout_seconds")
-                for name, p in factory_params.items()
-            )
         except (TypeError, ValueError):
-            supports_timeout = False
+            factory_params = {}
+        kwargs = _build_factory_kwargs(
+            factory_params,
+            timeout_seconds=self._timeout_seconds,
+            close_timeout_seconds=self._close_timeout_seconds,
+        )
         try:
-            if supports_timeout:
-                process = self._process_factory(
-                    command,
-                    timeout_seconds=self._timeout_seconds,
-                    close_timeout_seconds=self._close_timeout_seconds,
-                )
-            else:
-                process = self._process_factory(command)
+            process = self._process_factory(command, **kwargs)
         except (OSError, RuntimeError, ValueError) as error:
             raise OafBackendError(
                 "worker could not be started", code="worker_start_failed"
@@ -194,6 +187,37 @@ def build_docker_command(
         "--workdir=/input",
         image,
     ]
+
+
+def _build_factory_kwargs(
+    params: Mapping[str, inspect.Parameter],
+    *,
+    timeout_seconds: float,
+    close_timeout_seconds: float,
+) -> dict[str, float]:
+    """Forward only the timeout keywords the factory actually accepts.
+
+    ``process_factory`` is typed ``Callable[..., Any]`` and is not contracted to
+    accept both timeout keywords. Inspect the signature and forward a keyword
+    only when the factory declares it (and it is not positional-only) or accepts
+    ``**kwargs``; otherwise an injected factory such as
+    ``factory(command, timeout_seconds=30)`` would receive an unsupported
+    ``close_timeout_seconds`` and raise ``TypeError``.
+    """
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return {
+            "timeout_seconds": timeout_seconds,
+            "close_timeout_seconds": close_timeout_seconds,
+        }
+    kwargs: dict[str, float] = {}
+    for name, value in (
+        ("timeout_seconds", timeout_seconds),
+        ("close_timeout_seconds", close_timeout_seconds),
+    ):
+        param = params.get(name)
+        if param is not None and param.kind is not inspect.Parameter.POSITIONAL_ONLY:
+            kwargs[name] = value
+    return kwargs
 
 
 def create_backend(
