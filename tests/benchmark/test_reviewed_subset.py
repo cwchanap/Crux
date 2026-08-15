@@ -712,6 +712,65 @@ def test_prepare_rejects_malformed_completed_prior_manual_fields(tmp_path: Path)
     assert outcome.output_file is None
 
 
+def test_prepare_rejects_truncated_prior_row(tmp_path: Path) -> None:
+    fixture = build_reviewed_subset_reference_fixture(tmp_path, eligible_count=36)
+    output = tmp_path / "review.csv"
+    assert prepare_reviewed_subset(_prepare_request(fixture, output)).exit_code == 0
+    rows = list(csv.DictReader(output.open(encoding="utf-8", newline="")))
+    _fill_manual_fields(rows, include_ids={int(row["simfile_id"]) for row in rows})
+    prior_path = tmp_path / "prior.csv"
+    with prior_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=REVIEW_CSV_FIELDS, lineterminator="\n")
+        writer.writeheader()
+        writer.writerow(rows[0])
+        handle.write("v1,crux-hpa327-v1,sha256,1,123,abc\n")  # trailing cells cut off
+
+    outcome = prepare_reviewed_subset(
+        _prepare_request(fixture, tmp_path / "continued.csv", prior_ledger_path=prior_path)
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.output_file is None
+
+
+def test_prepare_rejects_prior_row_missing_simfile_id_cell(tmp_path: Path) -> None:
+    fixture = build_reviewed_subset_reference_fixture(tmp_path, eligible_count=36)
+    output = tmp_path / "review.csv"
+    assert prepare_reviewed_subset(_prepare_request(fixture, output)).exit_code == 0
+    rows = list(csv.DictReader(output.open(encoding="utf-8", newline="")))
+    _fill_manual_fields(rows, include_ids={int(row["simfile_id"]) for row in rows})
+    prior_path = tmp_path / "prior.csv"
+    with prior_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=REVIEW_CSV_FIELDS, lineterminator="\n")
+        writer.writeheader()
+        writer.writerow(rows[0])
+        handle.write("v1,crux-hpa327-v1,sha256,1\n")  # cut before the simfile_id column
+
+    outcome = prepare_reviewed_subset(
+        _prepare_request(fixture, tmp_path / "continued.csv", prior_ledger_path=prior_path)
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.output_file is None
+
+
+def test_prepare_rejects_leading_zero_prior_simfile_id(tmp_path: Path) -> None:
+    fixture = build_reviewed_subset_reference_fixture(tmp_path, eligible_count=36)
+    output = tmp_path / "review.csv"
+    assert prepare_reviewed_subset(_prepare_request(fixture, output)).exit_code == 0
+    rows = list(csv.DictReader(output.open(encoding="utf-8", newline="")))
+    _fill_manual_fields(rows, include_ids={int(row["simfile_id"]) for row in rows})
+    rows[0]["simfile_id"] = "0" + rows[0]["simfile_id"]
+    prior_path = _write_prior_ledger(tmp_path, rows)
+
+    outcome = prepare_reviewed_subset(
+        _prepare_request(fixture, tmp_path / "continued.csv", prior_ledger_path=prior_path)
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.output_file is None
+
+
 def test_prepare_rejects_duplicate_prior_simfile_ids(tmp_path: Path) -> None:
     fixture = build_reviewed_subset_reference_fixture(tmp_path, eligible_count=36)
     output = tmp_path / "review.csv"
