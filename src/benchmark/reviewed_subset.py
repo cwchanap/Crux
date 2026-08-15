@@ -704,7 +704,10 @@ def _candidate_csv_row(
 def _parse_prior_simfile_id(value: str) -> int:
     if not value.isascii() or not value.isdigit():
         raise ValueError("prior ledger contains an invalid simfile ID")
-    return int(value)
+    parsed = int(value)
+    if value != str(parsed):
+        raise ValueError("prior ledger contains a non-canonical simfile ID")
+    return parsed
 
 
 def _parse_prior_reasons(value: str) -> tuple[str, ...]:
@@ -764,6 +767,8 @@ def _parse_prior_ledger(content: bytes) -> dict[int, _PriorReview]:
         raise ValueError("prior ledger is missing required columns")
     reviews: dict[int, _PriorReview] = {}
     for source in reader:
+        if len(source) != len(reader.fieldnames) or None in source.values():
+            raise ValueError("prior ledger contains a truncated row")
         simfile_id = _parse_prior_simfile_id(source["simfile_id"])
         if simfile_id in reviews:
             raise ValueError("prior ledger contains duplicate simfile IDs")
