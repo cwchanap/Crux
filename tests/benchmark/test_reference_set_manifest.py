@@ -13,6 +13,7 @@ from src.benchmark.reference_set_manifest import (
     BENCHMARK_REFERENCE_MANIFEST_SCHEMA,
     LoadedReferenceSetManifest,
     ReferenceSetRequest,
+    _reference_set_row_view_from_row,
     failed_reference_set_outcome,
     load_reference_set_manifest,
     read_native_reference_events,
@@ -583,3 +584,103 @@ def test_schema_golden_validator_accepts_registered_shape(tmp_path: Path) -> Non
     rendered = render_manifest(tuple((ready, quarantined)))
 
     validate_schema_golden(BENCHMARK_REFERENCE_MANIFEST_SCHEMA, rendered.content)
+
+
+def _valid_view_row() -> dict[str, object]:
+    return {
+        "simfile_id": 42,
+        "reference_eligibility_status": "eligible",
+        "reference_eligibility_reason_codes": [],
+        "reference_eligibility_warnings": [],
+        "mapped_event_count": 1,
+        "common_scored_event_count": 1,
+        "ignored_event_count": 0,
+        "unmapped_event_count": 0,
+        "duplicate_common_event_count": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"simfile_id": True},
+        {"simfile_id": "42"},
+        {"reference_eligibility_status": 1},
+        {"reference_eligibility_reason_codes": "not-a-list"},
+        {"reference_eligibility_warnings": "not-a-list"},
+        {"reference_eligibility_reason_codes": [1]},
+        {"reference_eligibility_warnings": [1]},
+    ],
+)
+def test_reference_set_row_view_rejects_invalid_eligibility_row(
+    mutation: dict[str, object],
+) -> None:
+    row = _valid_view_row()
+    row.update(mutation)
+    with pytest.raises(ValueError, match="invalid eligibility row"):
+        _reference_set_row_view_from_row(row)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "mapped_event_count",
+        "common_scored_event_count",
+        "ignored_event_count",
+        "unmapped_event_count",
+        "duplicate_common_event_count",
+    ],
+)
+def test_reference_set_row_view_rejects_non_integer_event_counts(field: str) -> None:
+    row = _valid_view_row()
+    row[field] = True
+    with pytest.raises(ValueError, match="invalid event counts"):
+        _reference_set_row_view_from_row(row)
+
+
+def test_reference_set_loader_rejects_invalid_source_timing_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The loader's own identity check fires when row validation is bypassed."""
+    import src.benchmark.reference_set_manifest as rsm_module
+
+    _, reference_set_manifest_path = _write_reference_set_manifest(tmp_path)
+    row = json.loads(reference_set_manifest_path.read_text())
+    row["source_reference_timing_manifest_sha256"] = 123
+    malformed_path = tmp_path / "invalid-identity-reference-set.jsonl"
+    malformed_path.write_bytes(
+        render_manifest(
+            ({key: value for key, value in row.items() if key != "corpus_version"},)
+        ).content
+    )
+
+    # Bypass the stricter _validate_reference_set_row so the loader's own
+    # non-string identity guard (defensive check) is exercised directly.
+    monkeypatch.setattr(rsm_module, "_validate_reference_set_row", lambda _row: None)
+
+    with pytest.raises(ValueError, match="invalid source timing identity"):
+        load_reference_set_manifest(malformed_path)
+
+
+def test_reference_set_loader_rejects_empty_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The loader's no-records guard fires when the core returns zero rows."""
+    import src.benchmark.reference_set_manifest as rsm_module
+    from src.benchmark.reference_timing_manifest import CanonicalManifestRead
+
+    empty_path = tmp_path / "empty-reference-set.jsonl"
+    empty_path.write_bytes(b"placeholder\n")
+
+    monkeypatch.setattr(
+        rsm_module,
+        "read_canonical_manifest_core",
+        lambda _path, **_kwargs: CanonicalManifestRead(
+            manifest_sha256="a" * 64,
+            corpus_version="sha256:" + "b" * 64,
+            rows=(),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="no records"):
+        load_reference_set_manifest(empty_path)

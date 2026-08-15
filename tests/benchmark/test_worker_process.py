@@ -113,6 +113,27 @@ def test_worker_process_rejects_non_positive_timeouts(
         )
 
 
+@pytest.mark.parametrize(
+    ("timeout_seconds", "close_timeout_seconds", "message"),
+    [
+        (0.0, 30.0, "timeout_seconds must be positive"),
+        (30.0, 0.0, "close_timeout_seconds must be positive"),
+    ],
+)
+def test_worker_process_start_rejects_non_positive_timeouts(
+    timeout_seconds: float,
+    close_timeout_seconds: float,
+    message: str,
+) -> None:
+    """WorkerProcess.start validates both timeouts before spawning a subprocess."""
+    with pytest.raises(ValueError, match=message):
+        WorkerProcess.start(
+            [sys.executable, "-c", "pass"],
+            timeout_seconds=timeout_seconds,
+            close_timeout_seconds=close_timeout_seconds,
+        )
+
+
 def _script(
     tmp_path: Path, output: list[dict[str, object]], *, exit_after_ready: bool = False
 ) -> Path:
