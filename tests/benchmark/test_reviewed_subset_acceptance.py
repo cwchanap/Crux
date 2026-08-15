@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import csv
+import json
 from hashlib import sha256
 from pathlib import Path
+
+from click.testing import CliRunner
 
 from src.benchmark.backend_identity import strict_json_loads
 from src.benchmark.reviewed_subset import (
@@ -194,13 +197,7 @@ def _oaf_slate_rows(fixture: ReviewedSubsetOafFixture) -> list[dict[str, str]]:
     return list(csv.DictReader(prepared.open(encoding="utf-8", newline="")))
 
 
-def _oaf_review_file(
-    tmp_path: Path,
-    fixture: ReviewedSubsetOafFixture,
-    *,
-    include_ids: set[int],
-) -> Path:
-    rows = _oaf_slate_rows(fixture)
+def _fill_oaf_manual_fields(rows: list[dict[str, str]], *, include_ids: set[int]) -> None:
     for row in rows:
         if int(row["simfile_id"]) in include_ids:
             row.update(
@@ -236,6 +233,16 @@ def _oaf_review_file(
                     "notes": "",
                 }
             )
+
+
+def _oaf_review_file(
+    tmp_path: Path,
+    fixture: ReviewedSubsetOafFixture,
+    *,
+    include_ids: set[int],
+) -> Path:
+    rows = _oaf_slate_rows(fixture)
+    _fill_oaf_manual_fields(rows, include_ids=include_ids)
     review = tmp_path / "review.csv"
     _write_csv(review, rows)
     return review
@@ -272,6 +279,133 @@ def _oaf_all_success_includes(fixture: ReviewedSubsetOafFixture) -> set[int]:
         if len(include_ids) == 20:
             break
     return set(include_ids)
+
+
+def test_cli_chain_matches_domain_chain_bytes(tmp_path: Path) -> None:
+    """Run prepare → finalize → score through CliRunner and compare bytes.
+
+    Path-valued CLI output (``output_file``/``manifest_path``/``reports_path``)
+    is excluded from comparison; every durable artifact must be byte-identical
+    to the direct domain-function chain.
+    """
+    from src.cli.main import main
+
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path)
+    include_ids = _oaf_all_success_includes(fixture)
+
+    domain_review = _oaf_review_file(tmp_path, fixture, include_ids=include_ids)
+    domain_finalized = finalize_reviewed_subset(
+        FinalizeReviewedSubsetRequest(
+            reference_manifest_path=fixture.reference_manifest_path,
+            timing_manifest_path=fixture.timing_manifest_path,
+            review_file=domain_review,
+            output_dir=tmp_path / "domain-subset",
+        )
+    )
+    assert domain_finalized.exit_code == 0
+    assert domain_finalized.manifest is not None
+    assert domain_finalized.review_ledger_path is not None
+    domain_reports_dir = tmp_path / "domain-reports"
+    domain_scored = score_oaf_reviewed_subset(
+        ScoreReviewedSubsetRequest(
+            run_path=fixture.run_path,
+            reference_manifest_path=fixture.reference_manifest_path,
+            timing_manifest_path=fixture.timing_manifest_path,
+            subset_manifest_path=domain_finalized.manifest.path,
+            output_dir=domain_reports_dir,
+        )
+    )
+    assert domain_scored.exit_code == 0
+    assert domain_scored.reports_path is not None
+
+    runner = CliRunner()
+    cli_prepared = tmp_path / "cli-prepared.csv"
+    prepared = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "prepare-reviewed-subset",
+            "--manifest",
+            str(fixture.reference_manifest_path),
+            "--timing-manifest",
+            str(fixture.timing_manifest_path),
+            "--output-file",
+            str(cli_prepared),
+        ],
+        catch_exceptions=False,
+    )
+    assert prepared.exit_code == 0
+    assert json.loads(prepared.output)["exit_code"] == 0
+    domain_prepared = Path(fixture.oaf_output_dir).parent / "prepared.csv"
+    assert cli_prepared.read_bytes() == domain_prepared.read_bytes()
+
+    cli_rows = list(csv.DictReader(cli_prepared.open(encoding="utf-8", newline="")))
+    _fill_oaf_manual_fields(cli_rows, include_ids=include_ids)
+    cli_review = tmp_path / "cli-review.csv"
+    _write_csv(cli_review, cli_rows)
+
+    cli_subset_dir = tmp_path / "cli-subset"
+    finalized = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "finalize-reviewed-subset",
+            "--manifest",
+            str(fixture.reference_manifest_path),
+            "--timing-manifest",
+            str(fixture.timing_manifest_path),
+            "--review-file",
+            str(cli_review),
+            "--output-dir",
+            str(cli_subset_dir),
+        ],
+        catch_exceptions=False,
+    )
+    assert finalized.exit_code == 0
+    finalize_summary = json.loads(finalized.output)
+    assert finalize_summary["exit_code"] == 0
+    cli_manifest_path = Path(finalize_summary["manifest_path"])
+
+    cli_reports_dir = tmp_path / "cli-reports"
+    scored = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "score-oaf-reviewed-subset",
+            "--run",
+            str(fixture.run_path),
+            "--manifest",
+            str(fixture.reference_manifest_path),
+            "--timing-manifest",
+            str(fixture.timing_manifest_path),
+            "--subset-manifest",
+            str(cli_manifest_path),
+            "--output-dir",
+            str(cli_reports_dir),
+        ],
+        catch_exceptions=False,
+    )
+    assert scored.exit_code == 0
+    score_summary = json.loads(scored.output)
+    assert score_summary["exit_code"] == 0
+
+    assert cli_manifest_path.read_bytes() == domain_finalized.manifest.path.read_bytes()
+    assert (cli_subset_dir / "review-ledger.csv").read_bytes() == (
+        domain_finalized.review_ledger_path.read_bytes()
+    )
+    assert finalize_summary["included_count"] == domain_finalized.included_count
+    assert finalize_summary["excluded_count"] == domain_finalized.excluded_count
+    assert score_summary["cohort_id"] == domain_scored.cohort_id
+    assert score_summary["success_count"] == domain_scored.success_count
+    for name in (
+        "summary.json",
+        "items.csv",
+        "per_song.csv",
+        "per_class.csv",
+        "event_diagnostics.jsonl",
+        "summary.md",
+    ):
+        assert (cli_reports_dir / name).read_bytes() == (domain_reports_dir / name).read_bytes()
 
 
 def test_prepare_finalize_score_chain_rescores_exact_membership(tmp_path: Path) -> None:
