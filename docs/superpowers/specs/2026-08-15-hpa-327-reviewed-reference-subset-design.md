@@ -727,7 +727,7 @@ For the real corpus:
 2. manually inspect every candidate's selected chart, matching source audio, BGM alignment, mapping, and musical fidelity;
 3. record reviewer/timestamp/confirmations/fidelity/drum character/limitations/decision/reasons/notes;
 4. if review leaves fewer than 20 acceptable songs or clearly inadequate diagnostic coverage, generate a continuation ledger from `--prior-ledger` **before** consulting model scores, preserving unchanged included reviews and filling only deterministic unused replacements;
-5. finalize the continuation with the same prior ledger, then preserve the immutable 20–30-song subset, canonical complete ledger, and schema-valid manifest;
+5. finalize the initial ledger directly, or finalize a continuation with the same prior ledger used for its preparation; preserve the resulting immutable 20–30-song subset, canonical complete ledger, and schema-valid manifest;
 6. verify the published subset artifact itself shows materially different density, class-richness, timing-warning, `real`/`full` chart, and manually observed musical-character conditions;
 7. rescore the existing OaF run on that exact membership with event diagnostics for successful subset songs;
 8. preserve the reviewed-subset reports while leaving the broad run/reports unchanged.
