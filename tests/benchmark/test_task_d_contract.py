@@ -372,6 +372,29 @@ def test_task_d_oaf_adapter_rejects_outside_input(tmp_path: Path) -> None:
         OafBackend(checkpoint, root).transcribe(outside)
 
 
+@pytest.mark.parametrize(
+    ("timeout_seconds", "close_timeout_seconds", "message"),
+    [
+        (0.0, 30.0, "timeout_seconds must be positive"),
+        (30.0, 0.0, "close_timeout_seconds must be positive"),
+    ],
+)
+def test_task_d_oaf_adapter_rejects_non_positive_timeouts(
+    tmp_path: Path, timeout_seconds: float, close_timeout_seconds: float, message: str
+) -> None:
+    root = tmp_path / "input"
+    checkpoint = tmp_path / "checkpoint"
+    root.mkdir()
+    checkpoint.mkdir()
+    with pytest.raises(ValueError, match=message):
+        OafBackend(
+            checkpoint,
+            root,
+            timeout_seconds=timeout_seconds,
+            close_timeout_seconds=close_timeout_seconds,
+        )
+
+
 def test_task_d_oaf_launch_command_is_read_only_and_networkless(tmp_path: Path) -> None:
     command = build_docker_command(tmp_path / "checkpoint", tmp_path / "input")
     assert command[:6] == ["docker", "run", "--rm", "-i", "--network=none", "--read-only"]
