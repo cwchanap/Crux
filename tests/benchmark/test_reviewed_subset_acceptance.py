@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
 
@@ -26,43 +27,53 @@ from tests.benchmark.reviewed_subset_fixtures import (
     build_reviewed_subset_reference_fixture,
 )
 
+_INCLUDED_MANUAL_FIELDS: dict[str, str] = {
+    "reviewer": "auditor-1",
+    "reviewed_at": "2026-08-15T00:00:00Z",
+    "chart_selection_confirmed": "true",
+    "audio_revision_confirmed": "true",
+    "bgm_alignment_confirmed": "true",
+    "technical_mapping_confirmed": "true",
+    "musical_fidelity": "close",
+    "drum_character": "acoustic",
+    "known_limitations": "",
+    "decision": "include",
+    "reason_codes": "",
+    "notes": "",
+}
+_EXCLUDED_MANUAL_FIELDS: dict[str, str] = {
+    "reviewer": "auditor-1",
+    "reviewed_at": "2026-08-15T00:00:00Z",
+    "chart_selection_confirmed": "false",
+    "audio_revision_confirmed": "true",
+    "bgm_alignment_confirmed": "true",
+    "technical_mapping_confirmed": "true",
+    "musical_fidelity": "not_representative",
+    "drum_character": "unknown",
+    "known_limitations": "",
+    "decision": "exclude",
+    "reason_codes": "chart_selection_mismatch",
+    "notes": "",
+}
+
+
+def _apply_manual_review(
+    rows: list[dict[str, str]],
+    *,
+    include: Callable[[int, dict[str, str]], bool],
+) -> None:
+    """Stamp the shared include/exclude manual payload using ``include``.
+
+    ``include`` receives the zero-based row index and the row itself so the
+    two public wrappers can express their distinct inclusion rules without
+    duplicating the payload dictionaries.
+    """
+    for index, row in enumerate(rows):
+        row.update(_INCLUDED_MANUAL_FIELDS if include(index, row) else _EXCLUDED_MANUAL_FIELDS)
+
 
 def _fill_manual_fields(rows: list[dict[str, str]], *, include_count: int) -> None:
-    for index, row in enumerate(rows):
-        if index < include_count:
-            row.update(
-                {
-                    "reviewer": "auditor-1",
-                    "reviewed_at": "2026-08-15T00:00:00Z",
-                    "chart_selection_confirmed": "true",
-                    "audio_revision_confirmed": "true",
-                    "bgm_alignment_confirmed": "true",
-                    "technical_mapping_confirmed": "true",
-                    "musical_fidelity": "close",
-                    "drum_character": "acoustic",
-                    "known_limitations": "",
-                    "decision": "include",
-                    "reason_codes": "",
-                    "notes": "",
-                }
-            )
-        else:
-            row.update(
-                {
-                    "reviewer": "auditor-1",
-                    "reviewed_at": "2026-08-15T00:00:00Z",
-                    "chart_selection_confirmed": "false",
-                    "audio_revision_confirmed": "true",
-                    "bgm_alignment_confirmed": "true",
-                    "technical_mapping_confirmed": "true",
-                    "musical_fidelity": "not_representative",
-                    "drum_character": "unknown",
-                    "known_limitations": "",
-                    "decision": "exclude",
-                    "reason_codes": "chart_selection_mismatch",
-                    "notes": "",
-                }
-            )
+    _apply_manual_review(rows, include=lambda index, _row: index < include_count)
 
 
 def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
@@ -70,6 +81,16 @@ def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]), lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _read_csv_rows(
+    path: Path,
+    *,
+    encoding: str = "utf-8",
+    newline: str | None = "",
+) -> list[dict[str, str]]:
+    with path.open(encoding=encoding, newline=newline) as handle:
+        return list(csv.DictReader(handle))
 
 
 def _completed_review_file(
@@ -89,7 +110,7 @@ def _completed_review_file(
         )
     )
     assert outcome.exit_code == 0
-    rows = list(csv.DictReader(prepared.open(encoding="utf-8", newline="")))
+    rows = _read_csv_rows(prepared)
     _fill_manual_fields(rows, include_count=include_count)
     review = tmp_path / "review.csv"
     _write_csv(review, rows)
@@ -120,9 +141,7 @@ def test_prepare_to_finalize_publishes_initial_subset(tmp_path: Path) -> None:
         loaded.review_ledger_sha256 == sha256(outcome.review_ledger_path.read_bytes()).hexdigest()
     )
     assert loaded.prior_review_ledger_sha256 is None
-    ledger_rows = list(
-        csv.DictReader(outcome.review_ledger_path.open(encoding="utf-8", newline=""))
-    )
+    ledger_rows = _read_csv_rows(outcome.review_ledger_path)
     assert {row.view.simfile_id for row in loaded.rows} <= {
         int(row["simfile_id"]) for row in ledger_rows
     }
@@ -140,7 +159,7 @@ def test_prepare_to_finalize_continuation_binds_prior_ledger_hash(tmp_path: Path
         )
     )
     assert outcome.exit_code == 0
-    initial_rows = list(csv.DictReader(initial.open(encoding="utf-8", newline="")))
+    initial_rows = _read_csv_rows(initial)
     _fill_manual_fields(initial_rows, include_count=20)
     prior_path = tmp_path / "prior.csv"
     _write_csv(prior_path, initial_rows)
@@ -194,45 +213,11 @@ def _oaf_slate_rows(fixture: ReviewedSubsetOafFixture) -> list[dict[str, str]]:
         )
     )
     assert outcome.exit_code == 0
-    return list(csv.DictReader(prepared.open(encoding="utf-8", newline="")))
+    return _read_csv_rows(prepared)
 
 
 def _fill_oaf_manual_fields(rows: list[dict[str, str]], *, include_ids: set[int]) -> None:
-    for row in rows:
-        if int(row["simfile_id"]) in include_ids:
-            row.update(
-                {
-                    "reviewer": "auditor-1",
-                    "reviewed_at": "2026-08-15T00:00:00Z",
-                    "chart_selection_confirmed": "true",
-                    "audio_revision_confirmed": "true",
-                    "bgm_alignment_confirmed": "true",
-                    "technical_mapping_confirmed": "true",
-                    "musical_fidelity": "close",
-                    "drum_character": "acoustic",
-                    "known_limitations": "",
-                    "decision": "include",
-                    "reason_codes": "",
-                    "notes": "",
-                }
-            )
-        else:
-            row.update(
-                {
-                    "reviewer": "auditor-1",
-                    "reviewed_at": "2026-08-15T00:00:00Z",
-                    "chart_selection_confirmed": "false",
-                    "audio_revision_confirmed": "true",
-                    "bgm_alignment_confirmed": "true",
-                    "technical_mapping_confirmed": "true",
-                    "musical_fidelity": "not_representative",
-                    "drum_character": "unknown",
-                    "known_limitations": "",
-                    "decision": "exclude",
-                    "reason_codes": "chart_selection_mismatch",
-                    "notes": "",
-                }
-            )
+    _apply_manual_review(rows, include=lambda _index, row: int(row["simfile_id"]) in include_ids)
 
 
 def _oaf_review_file(
@@ -339,7 +324,7 @@ def test_cli_chain_matches_domain_chain_bytes(tmp_path: Path) -> None:
     domain_prepared = Path(fixture.oaf_output_dir).parent / "prepared.csv"
     assert cli_prepared.read_bytes() == domain_prepared.read_bytes()
 
-    cli_rows = list(csv.DictReader(cli_prepared.open(encoding="utf-8", newline="")))
+    cli_rows = _read_csv_rows(cli_prepared)
     _fill_oaf_manual_fields(cli_rows, include_ids=include_ids)
     cli_review = tmp_path / "cli-review.csv"
     _write_csv(cli_review, cli_rows)
@@ -483,7 +468,7 @@ def test_prepare_finalize_score_chain_rescores_exact_membership(tmp_path: Path) 
         "quarantined_count": 0,
         "reason_counts": {},
     }
-    items = list(csv.DictReader((tmp_path / "subset-reports" / "items.csv").open(encoding="utf-8")))
+    items = _read_csv_rows(tmp_path / "subset-reports" / "items.csv", newline=None)
     assert {row["simfile_id"] for row in items} == {str(simfile_id) for simfile_id in include_ids}
     diagnostic_lines = (
         (tmp_path / "subset-reports" / "event_diagnostics.jsonl").read_bytes().splitlines()
@@ -517,7 +502,7 @@ def test_prepare_finalize_score_chain_exits_1_with_non_success_member(
     assert outcome.exit_code == 1
     assert outcome.success_count == len(include_ids) - len(failed_ids)
     assert outcome.failed_count == len(failed_ids)
-    items = list(csv.DictReader((tmp_path / "subset-reports" / "items.csv").open(encoding="utf-8")))
+    items = _read_csv_rows(tmp_path / "subset-reports" / "items.csv", newline=None)
     failed_rows = {row["simfile_id"]: row for row in items if row["status"] == "failed"}
     assert set(failed_rows) == {str(simfile_id) for simfile_id in failed_ids}
     assert all(row["failure_reason"] == "inference_failed" for row in failed_rows.values())

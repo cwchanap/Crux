@@ -644,6 +644,37 @@ def test_prepare_rejects_common_event_count_mismatch(tmp_path: Path) -> None:
     assert outcome.output_file is None
 
 
+def test_prepare_rejects_all_quarantined_reference_manifest(tmp_path: Path) -> None:
+    fixture = build_reviewed_subset_reference_fixture(tmp_path, eligible_count=24)
+    # Rewrite every row as a valid no_scored_drum_events quarantine so the
+    # candidate stream has zero eligible rows and build_candidate_stream raises
+    # before any band assignment or stratum construction.
+    source_rows = list(_load_manifest_rows(fixture.reference_manifest_path))
+    for row in source_rows:
+        row["reference_eligibility_status"] = "quarantined"
+        row["reference_eligibility_reason_codes"] = ["no_scored_drum_events"]
+        row["reference_eligibility_warnings"] = []
+        row["mapped_event_count"] = 0
+        row["common_scored_event_count"] = 0
+        row["ignored_event_count"] = 0
+        row["unmapped_event_count"] = 0
+        row["duplicate_common_event_count"] = 0
+    quarantined_reference = tmp_path / "quarantined-reference.jsonl"
+    quarantined_reference.write_bytes(render_manifest(tuple(source_rows)).content)
+    reference = load_reference_set_manifest(quarantined_reference)
+    assert {row.view.eligibility_status for row in reference.rows} == {"quarantined"}
+
+    outcome = prepare_reviewed_subset(
+        _prepare_request(
+            fixture, tmp_path / "review.csv", reference_manifest_path=quarantined_reference
+        )
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.output_file is None
+    assert not (tmp_path / "review.csv").exists()
+
+
 def test_prepare_writes_exact_csv_boundary(tmp_path: Path) -> None:
     fixture = build_reviewed_subset_reference_fixture(tmp_path, eligible_count=24)
     reference = load_reference_set_manifest(fixture.reference_manifest_path)

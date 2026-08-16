@@ -127,7 +127,7 @@ REVIEW_CSV_FIELDS: tuple[str, ...] = (
 )
 
 #: The 12 operator-authored review columns (a subset of :data:`REVIEW_CSV_FIELDS`).
-REVIEW_MANUAL_FIELDS: tuple[str, ...] = REVIEW_CSV_FIELDS[24:]
+REVIEW_MANUAL_FIELDS: tuple[str, ...] = REVIEW_CSV_FIELDS[REVIEW_CSV_FIELDS.index("reviewer") :]
 
 #: Confirmation columns that must all be ``true`` for an included review.
 _CONFIRMATION_FIELDS = (
@@ -661,6 +661,9 @@ def build_candidate_stream(
             )
         )
 
+    if not eligible:
+        raise ValueError("no eligible reference rows are available for review selection")
+
     density_bands = _assign_bands(
         tuple((density, simfile_id) for density, simfile_id, _ in eligible)
     )
@@ -713,10 +716,10 @@ def _candidate_csv_row(
         "source_audio_key": candidate.source_audio_key,
         "source_audio_content_hash": candidate.source_audio_content_hash,
         "source_audio_cache_path": candidate.source_audio_cache_path,
-        "common_event_count": _csv_metric(candidate.common_event_count),
+        "common_event_count": str(candidate.common_event_count),
         "reference_event_span_sec": _csv_metric(candidate.reference_event_span_sec),
         "common_event_density_per_sec": _csv_metric(candidate.common_event_density_per_sec),
-        "common_class_count": _csv_metric(candidate.common_class_count),
+        "common_class_count": str(candidate.common_class_count),
         "density_band": candidate.density_band,
         "class_richness_band": candidate.class_richness_band,
         "has_timing_warning": _csv_bool(candidate.has_timing_warning),
@@ -1041,21 +1044,23 @@ def prepare_reviewed_subset(
             request.timing_manifest_path,
             request.prior_ledger_path,
         )
-        with request.output_file.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(
-                handle,
-                fieldnames=REVIEW_CSV_FIELDS,
-                lineterminator="\n",
+        buffer = io.StringIO()
+        writer = csv.DictWriter(
+            buffer,
+            fieldnames=REVIEW_CSV_FIELDS,
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        for rank, candidate in enumerate(selected, start=1):
+            row = _candidate_csv_row(
+                candidate,
+                rank=rank,
+                prior_ledger_sha256=prior_ledger_sha256,
             )
-            writer.writeheader()
-            for rank, candidate in enumerate(selected, start=1):
-                row = _candidate_csv_row(
-                    candidate,
-                    rank=rank,
-                    prior_ledger_sha256=prior_ledger_sha256,
-                )
-                row.update(carried_manual.get(candidate.simfile_id, {}))
-                writer.writerow(row)
+            row.update(carried_manual.get(candidate.simfile_id, {}))
+            writer.writerow(row)
+        ensure_durable_directory(request.output_file.parent)
+        atomic_replace_bytes(request.output_file, buffer.getvalue().encode("utf-8"))
     except (OSError, ValueError):
         return PrepareReviewedSubsetOutcome(
             exit_code=2,
