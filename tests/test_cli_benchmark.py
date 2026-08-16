@@ -5,6 +5,7 @@ import struct
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+import click
 from click.testing import CliRunner
 
 from src.benchmark.backend_identity import (
@@ -522,32 +523,46 @@ def test_run_oaf_corpus_non_positive_scope_is_canonical_fatal(tmp_path: Path, mo
 
 def test_reviewed_subset_commands_declare_exact_options() -> None:
     expected_options = {
-        "prepare-reviewed-subset": (
+        "prepare-reviewed-subset": {
             "--manifest",
             "--timing-manifest",
             "--output-file",
             "--prior-ledger",
-        ),
-        "finalize-reviewed-subset": (
+        },
+        "finalize-reviewed-subset": {
             "--manifest",
             "--timing-manifest",
             "--review-file",
             "--output-dir",
             "--prior-ledger",
-        ),
-        "score-oaf-reviewed-subset": (
+        },
+        "score-oaf-reviewed-subset": {
             "--run",
             "--manifest",
             "--timing-manifest",
             "--subset-manifest",
             "--output-dir",
-        ),
+        },
     }
-    for command, options in expected_options.items():
+    benchmark_group = main.commands["benchmark"]
+    for command, expected in expected_options.items():
+        declared = {
+            opt
+            for param in benchmark_group.commands[command].params
+            if isinstance(param, click.Option)
+            for opt in param.opts
+            if opt.startswith("--")
+        }
+        assert declared == expected, (
+            f"{command} declared options {sorted(declared)} != expected {sorted(expected)}"
+        )
+        # The help output must agree with the introspected option set and must
+        # not advertise any unsupported selector such as --model-path.
         result = CliRunner().invoke(main, ["benchmark", command, "--help"])
         assert result.exit_code == 0
-        for option in options:
+        for option in expected:
             assert option in result.output
+        assert "--model-path" not in result.output
         for selector in ("--seed", "--count", "--threshold", "--model", "--backend"):
             assert selector not in result.output
 

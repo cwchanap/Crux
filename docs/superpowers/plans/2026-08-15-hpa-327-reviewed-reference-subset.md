@@ -6,7 +6,7 @@
 
 **Architecture:** Keep HPA-327 as one model-independent module for candidate selection, review CSV handling, subset publication/loading, and subset-score orchestration. First land two no-behavior-change extractions from HPA-326: shared reference/timing preflight moves to `reference_set_manifest.py`, then persisted cohort reconstruction becomes a public helper in `oaf_corpus_run.py`. New scoring remains a thin filter over persisted artifacts and delegates to `score_cohort()` plus `write_cohort_reports()`.
 
-**Tech Stack:** Python 3.12, stdlib `csv`/`dataclasses`/`hashlib`, Click, pytest, existing Crux canonical JSON/JSONL helpers, HPA-323/HPA-324 reference artifacts, HPA-325 scorer/report writer, HPA-326 persisted OaF artifacts.
+**Tech Stack:** Python 3.13, stdlib `csv`/`dataclasses`/`hashlib`, Click, pytest, existing Crux canonical JSON/JSONL helpers, HPA-323/HPA-324 reference artifacts, HPA-325 scorer/report writer, HPA-326 persisted OaF artifacts.
 
 ## Global Constraints
 
