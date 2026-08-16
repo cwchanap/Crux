@@ -405,11 +405,6 @@ def _materialize_oaf_full_mix(
     )
 
 
-def _resolve_source_audio(*args: object, **kwargs: object) -> ResolvedSourceAudio:
-    """Route OaF source resolution through the shared cache seam."""
-    return resolve_source_audio(*args, **kwargs)
-
-
 def classify_oaf_backend_error(code: str) -> tuple[str | None, str]:
     """Map a backend code to runner failure family and lifecycle disposition."""
     if not isinstance(code, str):
@@ -1371,7 +1366,7 @@ def run_oaf_corpus(
             "source_bucket": source_bucket if isinstance(source_bucket, str) else None,
         }
         try:
-            source = _resolve_source_audio(
+            source = resolve_source_audio(
                 source_row,
                 request.cache_dir,
                 cache_index,
@@ -1421,7 +1416,7 @@ def run_oaf_corpus(
             # validation and inference must be rejected rather than silently
             # inferred against the original digest.
             try:
-                state.source = _resolve_source_audio(
+                state.source = resolve_source_audio(
                     state.loaded.source_row,
                     request.cache_dir,
                     cache_index,
