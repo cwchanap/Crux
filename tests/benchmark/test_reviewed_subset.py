@@ -554,6 +554,7 @@ def test_prepare_selects_all_eligible_between_20_and_29(tmp_path: Path) -> None:
     assert outcome.exit_code == 0
     assert outcome.output_file == output
     assert outcome.candidate_count == 24
+    assert outcome.replacement_count == 0
     assert len(rows) == 24
     assert [int(row["candidate_rank"]) for row in rows] == list(range(1, 25))
 
@@ -845,6 +846,55 @@ def test_prepare_continuation_drops_review_when_source_hash_changes(tmp_path: Pa
     if changed_cell is not None:
         assert changed_cell["reviewer"] == ""
         assert changed_cell["decision"] == ""
+
+
+def test_prepare_continuation_accepts_utc_zero_offset_prior_timestamps(tmp_path: Path) -> None:
+    fixture = build_reviewed_subset_reference_fixture(tmp_path, eligible_count=36)
+    output = tmp_path / "review.csv"
+    assert prepare_reviewed_subset(_prepare_request(fixture, output)).exit_code == 0
+    initial_rows = list(csv.DictReader(output.open(encoding="utf-8", newline="")))
+    carried_ids = {int(row["simfile_id"]) for row in initial_rows[:24]}
+    _fill_manual_fields(initial_rows, include_ids=carried_ids)
+    for row in initial_rows:
+        if row["reviewed_at"]:
+            row["reviewed_at"] = row["reviewed_at"].replace("Z", "+00:00")
+    prior_path = _write_prior_ledger(tmp_path, initial_rows)
+
+    continued = prepare_reviewed_subset(
+        _prepare_request(fixture, tmp_path / "continued.csv", prior_ledger_path=prior_path)
+    )
+
+    assert continued.exit_code == 0
+    assert continued.carried_include_count == 24
+
+
+def test_prepare_continuation_does_not_count_reoffered_unreviewed_as_replacements(
+    tmp_path: Path,
+) -> None:
+    fixture = build_reviewed_subset_reference_fixture(tmp_path, eligible_count=36)
+    output = tmp_path / "review.csv"
+    assert prepare_reviewed_subset(_prepare_request(fixture, output)).exit_code == 0
+    initial_rows = list(csv.DictReader(output.open(encoding="utf-8", newline="")))
+    include_ids = {int(row["simfile_id"]) for row in initial_rows[:20]}
+    _fill_manual_fields(initial_rows, include_ids=include_ids)
+    # rows 20-23 are excludes (freed slots); rows 24-29 stay unreviewed (re-offered)
+    for row in initial_rows[24:]:
+        for field in REVIEW_MANUAL_FIELDS:
+            row[field] = ""
+    prior_path = _write_prior_ledger(tmp_path, initial_rows)
+
+    continued_output = tmp_path / "continued.csv"
+    continued = prepare_reviewed_subset(
+        _prepare_request(fixture, continued_output, prior_ledger_path=prior_path)
+    )
+    current = list(csv.DictReader(continued_output.open(encoding="utf-8", newline="")))
+
+    assert continued.exit_code == 0
+    assert continued.carried_include_count == 20
+    assert continued.replacement_count == 4
+    unreviewed_ids = {int(row["simfile_id"]) for row in initial_rows[24:]}
+    current_ids = {int(row["simfile_id"]) for row in current}
+    assert unreviewed_ids <= current_ids
 
 
 def test_prepare_rejects_malformed_completed_prior_manual_fields(tmp_path: Path) -> None:

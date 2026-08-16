@@ -754,7 +754,7 @@ def _validate_prior_manual(manual: Mapping[str, str]) -> None:
     if not manual["reviewer"]:
         raise ValueError("prior ledger contains an incomplete reviewer")
     try:
-        parse_manifest_timestamp(manual["reviewed_at"])
+        _parse_reviewed_at(manual["reviewed_at"])
     except ValueError:
         raise ValueError("prior ledger contains an invalid reviewed_at") from None
     if any(manual[field] not in {"true", "false"} for field in _CONFIRMATION_FIELDS):
@@ -973,7 +973,7 @@ def _current_candidate_slate(
     reference_manifest_path: Path,
     timing_manifest_path: Path,
     prior_ledger_path: Path | None,
-) -> tuple[tuple[ReviewCandidate, ...], dict[int, dict[str, str]], str]:
+) -> tuple[tuple[ReviewCandidate, ...], dict[int, dict[str, str]], str, int]:
     """Reproduce the current candidate slate exactly as preparation would.
 
     Loads HPA-323/HPA-324 through their canonical loaders, reconstructs the
@@ -981,9 +981,10 @@ def _current_candidate_slate(
     applies the optional prior-ledger continuation (carry forward unchanged
     valid includes, consume unchanged excludes, replace from the stream).
     Returns the slate in rank order, the carried manual fields by simfile ID
-    (empty when no prior ledger), and the prior-ledger SHA-256 (``""`` when
-    none).  Both prepare and finalize call this so continuation membership
-    and ranks come from a single implementation.
+    (empty when no prior ledger), the prior-ledger SHA-256 (``""`` when
+    none), and the number of continuation replacements drawn from the stream
+    (``0`` for a fresh preparation).  Both prepare and finalize call this so
+    continuation membership and ranks come from a single implementation.
     """
     reference = load_reference_set_manifest(reference_manifest_path)
     timing = load_reference_timing_manifest(timing_manifest_path)
@@ -997,11 +998,14 @@ def _current_candidate_slate(
         raise ValueError("eligible population is below the review minimum")
 
     if prior_ledger_path is None:
-        return stream[:REVIEW_TARGET_COUNT], {}, ""
+        return stream[:REVIEW_TARGET_COUNT], {}, "", 0
 
     prior_bytes = prior_ledger_path.read_bytes()
     prior_ledger_sha256 = sha256(prior_bytes).hexdigest()
     prior_reviews = _parse_prior_ledger(prior_bytes)
+    prior_unreviewed_ids = {
+        prior_id for prior_id, prior in prior_reviews.items() if prior.decision is None
+    }
     current = {candidate.simfile_id: candidate for candidate in stream}
     consumed: set[int] = set()
     carried: list[tuple[ReviewCandidate, dict[str, str]]] = []
@@ -1024,7 +1028,13 @@ def _current_candidate_slate(
     if len(selected) < REVIEW_MIN_COUNT:
         raise ValueError("continuation population is below the review minimum")
     carried_manual = {candidate.simfile_id: manual for candidate, manual in carried}
-    return tuple(selected), carried_manual, prior_ledger_sha256
+    replacement_count = sum(
+        1
+        for candidate in selected
+        if candidate.simfile_id not in carried_manual
+        and candidate.simfile_id not in prior_unreviewed_ids
+    )
+    return tuple(selected), carried_manual, prior_ledger_sha256, replacement_count
 
 
 def prepare_reviewed_subset(
@@ -1039,7 +1049,7 @@ def prepare_reviewed_subset(
     lineage/population/continuation/write failure exits 2.
     """
     try:
-        selected, carried_manual, prior_ledger_sha256 = _current_candidate_slate(
+        selected, carried_manual, prior_ledger_sha256, replacement_count = _current_candidate_slate(
             request.reference_manifest_path,
             request.timing_manifest_path,
             request.prior_ledger_path,
@@ -1074,7 +1084,7 @@ def prepare_reviewed_subset(
         output_file=request.output_file,
         candidate_count=len(selected),
         carried_include_count=len(carried_manual),
-        replacement_count=len(selected) - len(carried_manual),
+        replacement_count=replacement_count,
     )
 
 
@@ -1276,7 +1286,7 @@ def finalize_reviewed_subset(
     exits 2.
     """
     try:
-        slate, _, prior_ledger_sha256 = _current_candidate_slate(
+        slate, _, prior_ledger_sha256, _ = _current_candidate_slate(
             request.reference_manifest_path,
             request.timing_manifest_path,
             request.prior_ledger_path,
