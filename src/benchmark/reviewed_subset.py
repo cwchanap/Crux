@@ -395,7 +395,7 @@ def _validate_reviewed_subset_row(row: Mapping[str, object]) -> None:
     except ValueError:
         raise ValueError("reviewed subset manifest row has an invalid reviewed_at") from None
 
-    if row["musical_fidelity"] not in _MUSICAL_FIDELITIES:
+    if row["musical_fidelity"] not in {"close", "usable_with_limits"}:
         raise ValueError("reviewed subset manifest row has an invalid musical fidelity")
     if row["drum_character"] not in _DRUM_CHARACTERS:
         raise ValueError("reviewed subset manifest row has an invalid drum character")
