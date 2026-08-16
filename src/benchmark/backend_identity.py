@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
@@ -36,6 +37,29 @@ OAF_DESCRIPTOR_IDENTITIES = {
     "native_output_space_id": "magenta-oaf-midi88-a0-v1",
     "prediction_schema": "crux.drum-prediction-events/v2",
     "training_data_map_id": "magenta-egmd-data-8hit-94529798-v1",
+}
+MUSCRIPTOR_BACKEND_ID = "muscriptor-v0.3.0-drums-v1"
+MUSCRIPTOR_DESCRIPTOR_SCHEMA = "crux.transcription-backend-descriptor/v2"
+MUSCRIPTOR_MODEL_ID_RE = re.compile(r"muscriptor-(medium|small)-[0-9a-f]{12}-[0-9a-f]{12}\Z")
+MUSCRIPTOR_DESCRIPTOR_KEYS = frozenset(OAF_DESCRIPTOR_KEYS)
+MUSCRIPTOR_DESCRIPTOR_IDENTITIES = {
+    "architecture_id": "muscriptor-transformer-v0.3.0",
+    "backend_id": MUSCRIPTOR_BACKEND_ID,
+    "descriptor_schema": MUSCRIPTOR_DESCRIPTOR_SCHEMA,
+    "native_metadata_schema_id": "muscriptor-note-start-metadata-v1",
+    "native_output_space_id": "muscriptor-drums-midi128-v1",
+    "prediction_schema": "crux.drum-prediction-events/v2",
+    "training_data_map_id": "muscriptor-training-data-v0.3.0",
+}
+
+
+_DESCRIPTOR_POLICIES = {
+    OAF_BACKEND_ID: (OAF_DESCRIPTOR_KEYS, OAF_DESCRIPTOR_IDENTITIES, {}),
+    MUSCRIPTOR_BACKEND_ID: (
+        MUSCRIPTOR_DESCRIPTOR_KEYS,
+        MUSCRIPTOR_DESCRIPTOR_IDENTITIES,
+        {"model_id": MUSCRIPTOR_MODEL_ID_RE},
+    ),
 }
 
 
@@ -119,19 +143,16 @@ def build_descriptor(
     )
 
 
-# The frozen OaF descriptor shape keeps all identity checks in one shared validator.
+# The two frozen descriptor families keep all identity checks in one shared validator.
 # pylint: disable-next=too-many-branches
 def normalize_known_backend_descriptor(value: Mapping[str, object]) -> dict[str, str]:
     backend_id = value.get("backend_id")
-    if backend_id != OAF_BACKEND_ID:
+    policy = _DESCRIPTOR_POLICIES.get(backend_id) if isinstance(backend_id, str) else None
+    if policy is None:
         raise StrictJsonError("descriptor backend_id is unknown")
-    expected_schema = OAF_DESCRIPTOR_SCHEMA
-    expected_keys = OAF_DESCRIPTOR_KEYS
-    expected_identities = OAF_DESCRIPTOR_IDENTITIES
+    expected_keys, expected_identities, pattern_fields = policy
     if set(value) != set(expected_keys):
         raise StrictJsonError("descriptor must contain the exact key set")
-    if value.get("descriptor_schema") != expected_schema:
-        raise StrictJsonError(f"descriptor_schema must be {expected_schema}")
     descriptor: dict[str, str] = {}
     for field, field_value in value.items():
         if not isinstance(field_value, str) or not field_value:
@@ -140,10 +161,20 @@ def normalize_known_backend_descriptor(value: Mapping[str, object]) -> dict[str,
     for field, expected in expected_identities.items():
         if descriptor[field] != expected:
             raise StrictJsonError(f"descriptor {field} does not match frozen identity")
+    for field, pattern in pattern_fields.items():
+        if pattern.fullmatch(descriptor[field]) is None:
+            raise StrictJsonError(f"descriptor {field} does not match frozen pattern")
     commit = descriptor["upstream_source_commit"]
     if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
         raise StrictJsonError("descriptor upstream_source_commit must be lowercase Git identity")
     return descriptor
+
+
+def expected_muscriptor_model_id(lock: object) -> str:
+    """Derive the exact MuScriptor descriptor model ID from its frozen lock."""
+    from src.benchmark.muscriptor_model import derive_muscriptor_model_id
+
+    return derive_muscriptor_model_id(lock)
 
 
 def validate_schema_golden(schema: str, content: bytes) -> None:

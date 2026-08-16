@@ -9,7 +9,7 @@ from statistics import fmean, median
 from typing import Literal, get_args
 
 from src.benchmark import scoring
-from src.benchmark.backend_identity import OAF_BACKEND_ID, require_sha256
+from src.benchmark.backend_identity import MUSCRIPTOR_BACKEND_ID, OAF_BACKEND_ID, require_sha256
 from src.benchmark.models import BenchmarkEvent, ScoreSummary
 from src.benchmark.prediction_artifact import PredictionArtifact, read_prediction_artifact
 from src.benchmark.reference_set import (
@@ -24,6 +24,7 @@ from src.benchmark.scoring import ScoreResult, score_events_with_alignment
 from src.benchmark.taxonomy import (
     DTX_LANE_MAP,
     DTX_LANE_MAP_VERSION,
+    MUSCRIPTOR_PREDICTION_MAP_ID,
     OAF_PREDICTION_MAP_ID,
     TAXONOMY_VERSION,
     project_to_common,
@@ -32,6 +33,10 @@ from src.benchmark.taxonomy import (
 SCORING_VERSION = "crux.single-cohort-scoring/v1"
 DEFAULT_TOLERANCES_MS = (30, 50, 100)
 SCORE_MODES = ("raw", "aligned")
+ZERO_HIT_PREDICTION_MAPS = {
+    OAF_BACKEND_ID: OAF_PREDICTION_MAP_ID,
+    MUSCRIPTOR_BACKEND_ID: MUSCRIPTOR_PREDICTION_MAP_ID,
+}
 _ORIGINAL_PREDICTION_TIME_METADATA_KEY = "_crux_original_prediction_time_sec"
 
 CohortExecutionStatus = Literal["success", "failed", "skipped", "quarantined"]
@@ -250,9 +255,9 @@ def cohort_item_from_artifacts(
     """Build one successful item while retaining artifact identity in memory.
 
     The persisted artifacts remain the source of descriptor, model, backend,
-    input-view, map, and song identity.  Empty prediction artifacts use the
-    existing OaF backend map identity because their event records carry no map
-    field of their own.
+    input-view, map, and song identity. Empty prediction artifacts use the
+    closed backend-to-map identity table because their event records carry no
+    map field of their own.
     """
     if not isinstance(identity, CohortIdentity):
         raise TypeError("identity must be CohortIdentity")
@@ -372,9 +377,7 @@ def validate_cohort_items(
             _validate_artifact_identity(identity, item.artifact_identity, item.simfile_id)
             _validate_success_artifact_binding(identity, item)
             if item.coverage.prediction_native_event_count is None:
-                raise ValueError(  # pragma: no cover
-                    "success item requires prediction coverage"
-                )
+                raise ValueError("success item requires prediction coverage")  # pragma: no cover
             if item.coverage.prediction_mapped_event_count != len(item.prediction_events):
                 raise ValueError(  # pragma: no cover
                     "prediction mapped count must match prediction_events"
@@ -497,8 +500,8 @@ def _artifact_identity_from_artifacts(
         raise ValueError("prediction artifact has mixed prediction_map_version values")
     if event_map_versions:
         prediction_map_version = next(iter(event_map_versions))
-    elif backend_id == OAF_BACKEND_ID:
-        prediction_map_version = OAF_PREDICTION_MAP_ID
+    elif backend_id in ZERO_HIT_PREDICTION_MAPS:
+        prediction_map_version = ZERO_HIT_PREDICTION_MAPS[backend_id]
     else:
         raise ValueError("empty prediction artifact has no prediction_map_version")
 

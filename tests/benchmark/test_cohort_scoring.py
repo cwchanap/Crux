@@ -1771,3 +1771,58 @@ def test_original_prediction_time_rejects_aligned_without_provenance() -> None:
     event = BenchmarkEvent("1", 1.0, "kick", "prediction", metadata={})
     with pytest.raises(ValueError, match="original time provenance"):
         cohort_scoring._original_prediction_time(event, "aligned")
+
+
+def _muscriptor_empty_artifact_for_song(tmp_path: Path, simfile_id: str) -> PredictionArtifact:
+    payload = {
+        "architecture_id": "muscriptor-transformer-v0.3.0",
+        "backend_id": "muscriptor-v0.3.0-drums-v1",
+        "descriptor_schema": "crux.transcription-backend-descriptor/v2",
+        "model_id": "muscriptor-medium-0123456789ab-fedcba987654",
+        "native_metadata_schema_id": "muscriptor-note-start-metadata-v1",
+        "native_output_space_id": "muscriptor-drums-midi128-v1",
+        "prediction_schema": "crux.drum-prediction-events/v2",
+        "training_data_map_id": "muscriptor-training-data-v0.3.0",
+        "upstream_source_commit": "d73147e75e5b9b0c0a79ebe154587db4fd603e0c",
+    }
+    descriptor = build_descriptor(payload, frozenset(payload), OAF_DESCRIPTOR_SCHEMA)
+    artifact = _artifact_for_song(tmp_path, simfile_id)
+    prediction = dataclasses.replace(
+        artifact.prediction,
+        descriptor=descriptor,
+        events=(),
+    )
+    return read_prediction_artifact(render_prediction_artifact(prediction))
+
+
+def test_empty_muscriptor_artifact_uses_only_its_closed_zero_hit_map_identity(
+    tmp_path: Path,
+) -> None:
+    artifact = _muscriptor_empty_artifact_for_song(tmp_path, "42")
+    identity = dataclasses.replace(
+        build_identity(),
+        cohort_id="muscriptor-v1",
+        backend_id="muscriptor-v0.3.0-drums-v1",
+        model_id="muscriptor-medium-0123456789ab-fedcba987654",
+        backend_descriptor_sha256=artifact.prediction.descriptor.sha256,
+        prediction_map_version="crux.prediction-map/muscriptor-drums-v1",
+    )
+
+    item = cohort_scoring.cohort_item_from_artifacts(
+        identity,
+        "42",
+        build_reference_mapping(),
+        artifact,
+    )
+
+    assert item.artifact_identity is not None
+    assert item.artifact_identity.prediction_map_version == (
+        "crux.prediction-map/muscriptor-drums-v1"
+    )
+    with pytest.raises(ValueError, match="prediction_map_version"):
+        cohort_scoring.cohort_item_from_artifacts(
+            dataclasses.replace(identity, prediction_map_version=OAF_PREDICTION_MAP_ID),
+            "42",
+            build_reference_mapping(),
+            artifact,
+        )
