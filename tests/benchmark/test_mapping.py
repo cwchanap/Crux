@@ -1,10 +1,21 @@
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+from src.benchmark.backend_identity import build_descriptor
+from src.benchmark.backends import CanonicalAudio, NativeEvent, NativePrediction
 from src.benchmark.mapping import (
     DEFAULT_MIDI_NOTE_MAP,
     DTX_LANE_MAP,
+    MUSCRIPTOR_PREDICTION_MAP,
     map_dtx_events,
     map_midi_events,
+    map_muscriptor_prediction,
 )
 from src.benchmark.models import BenchmarkEvent
+from src.benchmark.prediction_artifact import read_prediction_artifact, render_prediction_artifact
+from src.benchmark.taxonomy import MUSCRIPTOR_PREDICTION_MAP_ID
 
 
 def test_default_dtx_mapping_supports_drumery_editor_lanes():
@@ -70,3 +81,118 @@ def test_map_midi_events_respects_explicit_empty_note_map():
 
     assert mapped == []
     assert diagnostics.unmapped == {"36": 1}
+
+
+def _muscriptor_descriptor():
+    payload = {
+        "architecture_id": "muscriptor-transformer-v0.3.0",
+        "backend_id": "muscriptor-v0.3.0-drums-v1",
+        "descriptor_schema": "crux.transcription-backend-descriptor/v2",
+        "model_id": "muscriptor-medium-0123456789ab-fedcba987654",
+        "native_metadata_schema_id": "muscriptor-note-start-metadata-v1",
+        "native_output_space_id": "muscriptor-drums-midi128-v1",
+        "prediction_schema": "crux.drum-prediction-events/v2",
+        "training_data_map_id": "muscriptor-training-data-v0.3.0",
+        "upstream_source_commit": "d73147e75e5b9b0c0a79ebe154587db4fd603e0c",
+    }
+    return build_descriptor(payload, frozenset(payload), payload["descriptor_schema"])
+
+
+def _muscriptor_prediction(notes: tuple[int, ...]) -> NativePrediction:
+    return NativePrediction(
+        audio=CanonicalAudio(
+            path=Path(),
+            source_audio_id="song",
+            source_audio_sha256="a" * 64,
+            input_view_id="full-mix-v1",
+            input_audio_sha256="b" * 64,
+            byte_length=46,
+            sample_rate=44100,
+            channel_count=1,
+            sample_width_bytes=2,
+            audio_frame_count=1,
+        ),
+        descriptor=_muscriptor_descriptor(),
+        events=tuple(
+            NativeEvent(
+                time_sec=float(index),
+                native_class_id=f"drums:midi_{note}",
+                model_output_bin=None,
+                native_midi_note=note,
+                native_metadata={"instrument_group": "drums"},
+                confidence=None,
+                velocity_midi=None,
+            )
+            for index, note in enumerate(notes)
+        ),
+    )
+
+
+def test_muscriptor_map_is_one_string_keyed_frozen_pitch_map():
+    assert MUSCRIPTOR_PREDICTION_MAP.map_id == MUSCRIPTOR_PREDICTION_MAP_ID
+    assert all(isinstance(key, str) for key in MUSCRIPTOR_PREDICTION_MAP.classes)
+    assert len(MUSCRIPTOR_PREDICTION_MAP.classes) == 18
+    assert MUSCRIPTOR_PREDICTION_MAP.classes["35"].canonical_class == "kick"
+    assert MUSCRIPTOR_PREDICTION_MAP.classes["40"].canonical_class == "snare"
+    assert MUSCRIPTOR_PREDICTION_MAP.classes["44"].common_class == "hihat"
+    assert MUSCRIPTOR_PREDICTION_MAP.classes["53"].canonical_class == "ride"
+    assert MUSCRIPTOR_PREDICTION_MAP.classes["57"].canonical_class == "crash"
+
+
+def test_map_muscriptor_prediction_preserves_mapped_aliases_and_unmapped_hits():
+    prediction = _muscriptor_prediction((35, 40, 44, 53, 57, 37, 55))
+
+    mapped, diagnostics = map_muscriptor_prediction(prediction)
+
+    assert [event.native.native_midi_note for event in mapped.events] == [
+        35,
+        40,
+        44,
+        53,
+        57,
+        37,
+        55,
+    ]
+    assert [(event.canonical_class, event.common_class) for event in mapped.events] == [
+        ("kick", "kick"),
+        ("snare", "snare"),
+        ("closed_hihat", "hihat"),
+        ("ride", "ride"),
+        ("crash", "crash"),
+        (None, None),
+        (None, None),
+    ]
+    assert [event.mapping_status for event in mapped.events] == [
+        "mapped",
+        "mapped",
+        "mapped",
+        "mapped",
+        "mapped",
+        "unmapped",
+        "unmapped",
+    ]
+    assert diagnostics.unmapped == {"37": 1, "55": 1}
+    assert all(
+        event.prediction_map_version == MUSCRIPTOR_PREDICTION_MAP_ID for event in mapped.events
+    )
+    persisted = read_prediction_artifact(render_prediction_artifact(mapped)).prediction.events
+    assert len(persisted) == 7
+    assert [event.mapping_status for event in persisted[-2:]] == ["unmapped", "unmapped"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"backend_id": "other-backend"},
+        {"native_output_space_id": "other-output-space"},
+    ],
+)
+def test_map_muscriptor_prediction_rejects_identity_mismatch(change: dict[str, str]):
+    prediction = _muscriptor_prediction((38,))
+    descriptor = replace(
+        prediction.descriptor,
+        payload={**prediction.descriptor.payload, **change},
+    )
+
+    with pytest.raises(ValueError):
+        map_muscriptor_prediction(replace(prediction, descriptor=descriptor))
