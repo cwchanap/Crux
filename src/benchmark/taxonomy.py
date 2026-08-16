@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal, TypeAlias
 
-from src.benchmark.backend_identity import OAF_BACKEND_ID
+from src.benchmark.backend_identity import MUSCRIPTOR_BACKEND_ID, OAF_BACKEND_ID
 
 DetailedDrumClass: TypeAlias = Literal[
     "kick",
@@ -102,6 +102,34 @@ OAF_PREDICTION_MAP = PredictionMap(
             "ride_bell": ClassMapping("ride", "ride"),
             "crash": ClassMapping("crash", "crash"),
             "sticks": ClassMapping(None, None),
+        }
+    ),
+)
+
+MUSCRIPTOR_PREDICTION_MAP = PredictionMap(
+    map_id=MUSCRIPTOR_PREDICTION_MAP_ID,
+    backend_id=MUSCRIPTOR_BACKEND_ID,
+    native_output_space_id="muscriptor-drums-midi128-v1",
+    classes=MappingProxyType(
+        {
+            "35": ClassMapping("kick", "kick"),
+            "36": ClassMapping("kick", "kick"),
+            "38": ClassMapping("snare", "snare"),
+            "40": ClassMapping("snare", "snare"),
+            "41": ClassMapping("low_or_floor_tom", "tom"),
+            "43": ClassMapping("low_or_floor_tom", "tom"),
+            "45": ClassMapping("low_or_floor_tom", "tom"),
+            "47": ClassMapping("low_or_floor_tom", "tom"),
+            "48": ClassMapping("high_tom", "tom"),
+            "50": ClassMapping("high_tom", "tom"),
+            "42": ClassMapping("closed_hihat", "hihat"),
+            "44": ClassMapping("closed_hihat", "hihat"),
+            "46": ClassMapping("open_hihat", "hihat"),
+            "49": ClassMapping("crash", "crash"),
+            "57": ClassMapping("crash", "crash"),
+            "51": ClassMapping("ride", "ride"),
+            "53": ClassMapping("ride", "ride"),
+            "59": ClassMapping("ride", "ride"),
         }
     ),
 )
