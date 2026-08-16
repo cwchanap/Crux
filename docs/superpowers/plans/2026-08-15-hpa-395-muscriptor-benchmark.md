@@ -275,7 +275,7 @@ Add/retain tests for:
 - output/input-root `Path` type rejection;
 - output escaping `input_root` rejection.
 
-Keep the existing OaF config type test at the OaF call-site boundary; the neutral helper receives only `max_input_audio_frames`.
+Keep the existing OaF config type test at the OaF boundary. After extraction, replace its direct private-helper call with a test that the OaF materialization call path rejects/never passes an invalid `OafModelConfig` before invoking `materialize_full_mix_audio()`; the neutral helper itself receives only `max_input_audio_frames`.
 
 - [ ] **Step 2: Run the exact materializer branch tests before refactor**
 
