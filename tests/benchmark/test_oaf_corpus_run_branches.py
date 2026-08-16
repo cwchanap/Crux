@@ -671,6 +671,12 @@ def test_source_audio_parts_requires_content_hash() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_oaf_run_has_no_private_source_resolution_alias() -> None:
+    import src.benchmark.oaf_corpus_run as run_module
+
+    assert not hasattr(run_module, "_resolve_source_audio")
+
+
 def test_resolve_source_audio_rejects_non_path_cache_dir() -> None:
     with pytest.raises(TypeError, match="cache_dir must be a Path"):
         resolve_source_audio(

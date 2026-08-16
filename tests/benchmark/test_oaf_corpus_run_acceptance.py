@@ -122,7 +122,7 @@ def _install_fake_run_seams(
     )
     monkeypatch.setattr(
         run_module,
-        "_resolve_source_audio",
+        "resolve_source_audio",
         lambda source, *_args, **_kwargs: ResolvedSourceAudio(
             path=tmp_path / "source.wav",
             source_audio_id=source["source_audio_key"],
@@ -197,7 +197,7 @@ def test_run_oaf_corpus_uses_one_persistent_backend_and_request_timeout(
     )
     monkeypatch.setattr(
         run_module,
-        "_resolve_source_audio",
+        "resolve_source_audio",
         lambda source, *_args, **_kwargs: ResolvedSourceAudio(
             path=tmp_path / "source.wav",
             source_audio_id=source["source_audio_key"],
@@ -1151,7 +1151,7 @@ def test_poison_stops_the_worker_and_resume_reuses_exact_prediction(
     )
     monkeypatch.setattr(
         run_module,
-        "_resolve_source_audio",
+        "resolve_source_audio",
         lambda source, *_args, **_kwargs: ResolvedSourceAudio(
             path=tmp_path / "source.wav",
             source_audio_id=source["source_audio_key"],
