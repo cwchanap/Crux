@@ -525,6 +525,37 @@ def test_poisoned_model_state_stops_later_items(
     assert rows[30]["runner_failure_code"] == "worker_protocol_failed"
 
 
+@pytest.mark.parametrize(
+    "construction_error",
+    [ValueError("locked device is unavailable"), ImportError("muscriptor package is missing")],
+)
+def test_backend_construction_failure_is_fatal_without_reports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    construction_error: Exception,
+) -> None:
+    _install_seams(monkeypatch, tmp_path)
+
+    def factory(**_: object):
+        raise construction_error
+
+    outcome = run_muscriptor_corpus(
+        _request(tmp_path),
+        backend_factory=factory,
+        perf_counter=lambda: 0.0,
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+
+    assert outcome.overall_status == "failed"
+    assert outcome.exit_code == 2
+    assert outcome.run_id is not None
+    assert outcome.run_path is not None
+    assert outcome.reports_path is None
+    assert outcome.fatal_reason is not None
+    assert str(construction_error) in outcome.fatal_reason
+    assert not (outcome.run_path.parent / "reports").exists()
+
+
 def test_fatal_scope_preflight_does_not_construct_backend(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -618,6 +649,10 @@ def test_resume_rejects_edited_input_evidence_without_constructing_backend(
 
 
 def test_backend_error_policy_keeps_item_local_and_poison_paths_closed() -> None:
+    assert MUSCRIPTOR_BACKEND_ERROR_POLICY["worker_start_failed"] == (
+        None,
+        "fatal_preflight",
+    )
     assert MUSCRIPTOR_BACKEND_ERROR_POLICY["inference_failed"] == (
         "inference_failed",
         "item_local",
