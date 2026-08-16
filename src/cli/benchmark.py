@@ -723,6 +723,118 @@ def run_oaf_corpus_command(
         ctx.exit(outcome.exit_code)
 
 
+@benchmark.command("run-muscriptor-corpus")
+@click.option(
+    "--manifest",
+    "reference_manifest_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required path to an immutable local HPA-324 reference-set manifest (JSONL).",
+)
+@click.option(
+    "--timing-manifest",
+    "timing_manifest_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required path to the source HPA-323 reference-timing manifest (JSONL).",
+)
+@click.option(
+    "--cache-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+    help="Required local HPA-321 corpus/audio cache root.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+    help="Directory where the MuScriptor corpus run and reports are written.",
+)
+@click.option(
+    "--include-simfile-id",
+    "include_simfile_ids",
+    type=click.IntRange(0, MAX_SIMFILE_ID),
+    multiple=True,
+)
+@click.option(
+    "--exclude-simfile-id",
+    "exclude_simfile_ids",
+    type=click.IntRange(0, MAX_SIMFILE_ID),
+    multiple=True,
+)
+@click.option("--resume", is_flag=True)
+@click.pass_context
+def run_muscriptor_corpus_command(
+    ctx: click.Context,
+    reference_manifest_path: Path,
+    timing_manifest_path: Path,
+    cache_dir: Path,
+    output_dir: Path,
+    include_simfile_ids: tuple[int, ...],
+    exclude_simfile_ids: tuple[int, ...],
+    resume: bool,
+) -> None:
+    """Run the frozen MuScriptor backend over an HPA-324 corpus scope."""
+    from src.benchmark.muscriptor_corpus_run import (
+        MuscriptorCorpusRunOutcome,
+        MuscriptorCorpusRunRequest,
+        run_muscriptor_corpus,
+    )
+
+    try:
+        request = MuscriptorCorpusRunRequest(
+            reference_manifest_path=reference_manifest_path,
+            timing_manifest_path=timing_manifest_path,
+            cache_dir=cache_dir,
+            output_dir=output_dir,
+            include_simfile_ids=include_simfile_ids,
+            exclude_simfile_ids=exclude_simfile_ids,
+            resume=resume,
+        )
+    except (TypeError, ValueError):
+        outcome = MuscriptorCorpusRunOutcome(
+            overall_status="failed",
+            exit_code=2,
+            run_id=None,
+            run_path=None,
+            reports_path=None,
+            success_count=0,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+            aggregate_rtf=None,
+            projected_full_wall_time_sec=None,
+        )
+    else:
+        outcome = run_muscriptor_corpus(request)
+    payload = {
+        "aggregate_rtf": (
+            None if outcome.aggregate_rtf is None else quantize_six(outcome.aggregate_rtf)
+        ),
+        "device_peak_memory_bytes": outcome.device_peak_memory_bytes,
+        "exit_code": outcome.exit_code,
+        "failed_count": outcome.failed_count,
+        "peak_process_rss_bytes": outcome.peak_process_rss_bytes,
+        "projected_full_wall_time_sec": (
+            None
+            if outcome.projected_full_wall_time_sec is None
+            else quantize_six(outcome.projected_full_wall_time_sec)
+        ),
+        "quarantined_count": outcome.quarantined_count,
+        "reports_path": None if outcome.reports_path is None else str(outcome.reports_path),
+        "run_id": outcome.run_id,
+        "run_path": None if outcome.run_path is None else str(outcome.run_path),
+        "skipped_count": outcome.skipped_count,
+        "status": outcome.overall_status,
+        "success_count": outcome.success_count,
+    }
+    standard_output = click.get_binary_stream("stdout")
+    standard_output.write(canonical_json_bytes(payload, trailing_newline=True))
+    standard_output.flush()
+    if outcome.exit_code:
+        ctx.exit(outcome.exit_code)
+
+
 @benchmark.command("sync-r2-corpus")
 @click.option(
     "--cache-dir",
@@ -968,6 +1080,78 @@ def score_oaf_reviewed_subset_command(
     )
 
     outcome = score_oaf_reviewed_subset(
+        ScoreReviewedSubsetRequest(
+            run_path=run_path,
+            reference_manifest_path=reference_manifest_path,
+            timing_manifest_path=timing_manifest_path,
+            subset_manifest_path=subset_manifest_path,
+            output_dir=output_dir,
+        )
+    )
+    payload = {
+        "cohort_id": outcome.cohort_id,
+        "exit_code": outcome.exit_code,
+        "failed_count": outcome.failed_count,
+        "quarantined_count": outcome.quarantined_count,
+        "reports_path": None if outcome.reports_path is None else str(outcome.reports_path),
+        "skipped_count": outcome.skipped_count,
+        "success_count": outcome.success_count,
+    }
+    click.echo(canonical_json_bytes(payload).decode("utf-8"))
+    if outcome.exit_code:
+        raise click.exceptions.Exit(outcome.exit_code)
+
+
+@benchmark.command("score-muscriptor-reviewed-subset")
+@click.option(
+    "--run",
+    "run_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required path to a persisted crux.muscriptor-corpus-run/v1 run.json snapshot.",
+)
+@click.option(
+    "--manifest",
+    "reference_manifest_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required path to an immutable local HPA-324 reference-set manifest (JSONL).",
+)
+@click.option(
+    "--timing-manifest",
+    "timing_manifest_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required path to the source HPA-323 reference-timing manifest (JSONL).",
+)
+@click.option(
+    "--subset-manifest",
+    "subset_manifest_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required path to the accepted crux.reviewed-reference-subset/v1 manifest (JSONL).",
+)
+@click.option(
+    "--output-dir",
+    "output_dir",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Directory where the subset cohort reports are written.",
+)
+def score_muscriptor_reviewed_subset_command(
+    run_path: Path,
+    reference_manifest_path: Path,
+    timing_manifest_path: Path,
+    subset_manifest_path: Path,
+    output_dir: Path,
+) -> None:
+    """Rescore one persisted MuScriptor run on the exact reviewed subset membership."""
+    from src.benchmark.reviewed_subset import (
+        ScoreReviewedSubsetRequest,
+        score_muscriptor_reviewed_subset,
+    )
+
+    outcome = score_muscriptor_reviewed_subset(
         ScoreReviewedSubsetRequest(
             run_path=run_path,
             reference_manifest_path=reference_manifest_path,

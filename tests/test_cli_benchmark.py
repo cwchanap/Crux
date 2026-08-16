@@ -521,6 +521,175 @@ def test_run_oaf_corpus_non_positive_scope_is_canonical_fatal(tmp_path: Path, mo
     assert json.loads(result.output)["status"] == "failed"
 
 
+def test_run_muscriptor_corpus_builds_frozen_request_and_emits_summary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.muscriptor_corpus_run as runner_module
+    from src.benchmark.muscriptor_corpus_run import MuscriptorCorpusRunOutcome
+
+    manifest_path = tmp_path / "hpa324.jsonl"
+    timing_manifest_path = tmp_path / "hpa323.jsonl"
+    cache_dir = tmp_path / "cache"
+    output_dir = tmp_path / "output"
+    run_path = output_dir / "runs" / "run-123" / "run.json"
+    reports_path = output_dir / "runs" / "run-123" / "reports"
+    captured: list[object] = []
+
+    def fake_run(request: object) -> MuscriptorCorpusRunOutcome:
+        captured.append(request)
+        return MuscriptorCorpusRunOutcome(
+            overall_status="complete",
+            exit_code=0,
+            run_id="run-123",
+            run_path=run_path,
+            reports_path=reports_path,
+            success_count=2,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+            aggregate_rtf=1.23456789,
+            projected_full_wall_time_sec=12.34567891,
+            peak_process_rss_bytes=123,
+            device_peak_memory_bytes=None,
+        )
+
+    monkeypatch.setattr(runner_module, "run_muscriptor_corpus", fake_run)
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "run-muscriptor-corpus",
+            "--manifest",
+            str(manifest_path),
+            "--timing-manifest",
+            str(timing_manifest_path),
+            "--cache-dir",
+            str(cache_dir),
+            "--output-dir",
+            str(output_dir),
+            "--include-simfile-id",
+            "10",
+            "--include-simfile-id",
+            "20",
+            "--exclude-simfile-id",
+            "30",
+            "--resume",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.reference_manifest_path == manifest_path
+    assert request.timing_manifest_path == timing_manifest_path
+    assert request.cache_dir == cache_dir
+    assert request.output_dir == output_dir
+    assert request.include_simfile_ids == (10, 20)
+    assert request.exclude_simfile_ids == (30,)
+    assert request.resume is True
+
+    summary = json.loads(result.output)
+    assert set(summary) == {
+        "aggregate_rtf",
+        "device_peak_memory_bytes",
+        "exit_code",
+        "failed_count",
+        "peak_process_rss_bytes",
+        "projected_full_wall_time_sec",
+        "quarantined_count",
+        "reports_path",
+        "run_id",
+        "run_path",
+        "skipped_count",
+        "status",
+        "success_count",
+    }
+    assert summary["status"] == "complete"
+    assert summary["exit_code"] == 0
+    assert summary["aggregate_rtf"] == 1.234568
+    assert summary["projected_full_wall_time_sec"] == 12.345679
+    assert summary["peak_process_rss_bytes"] == 123
+    assert summary["device_peak_memory_bytes"] is None
+    assert summary["run_path"] == str(run_path)
+    assert summary["reports_path"] == str(reports_path)
+
+
+def test_score_muscriptor_reviewed_subset_command_builds_request_and_emits_summary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.reviewed_subset as reviewed_module
+
+    run_path = tmp_path / "run.json"
+    reference_manifest_path = tmp_path / "hpa324.jsonl"
+    timing_manifest_path = tmp_path / "hpa323.jsonl"
+    subset_manifest_path = tmp_path / "subset.jsonl"
+    output_dir = tmp_path / "reports"
+    for path in (
+        run_path,
+        reference_manifest_path,
+        timing_manifest_path,
+        subset_manifest_path,
+    ):
+        path.write_bytes(b"x")
+    captured: list[object] = []
+
+    def fake_score(request: object) -> ScoreReviewedSubsetOutcome:
+        captured.append(request)
+        return ScoreReviewedSubsetOutcome(
+            exit_code=0,
+            cohort_id="c" * 64,
+            reports_path=output_dir,
+            success_count=20,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+        )
+
+    monkeypatch.setattr(reviewed_module, "score_muscriptor_reviewed_subset", fake_score)
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "score-muscriptor-reviewed-subset",
+            "--run",
+            str(run_path),
+            "--manifest",
+            str(reference_manifest_path),
+            "--timing-manifest",
+            str(timing_manifest_path),
+            "--subset-manifest",
+            str(subset_manifest_path),
+            "--output-dir",
+            str(output_dir),
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.run_path == run_path
+    assert request.reference_manifest_path == reference_manifest_path
+    assert request.timing_manifest_path == timing_manifest_path
+    assert request.subset_manifest_path == subset_manifest_path
+    assert request.output_dir == output_dir
+
+    summary = json.loads(result.output)
+    assert set(summary) == {
+        "cohort_id",
+        "exit_code",
+        "failed_count",
+        "quarantined_count",
+        "reports_path",
+        "skipped_count",
+        "success_count",
+    }
+    assert summary["cohort_id"] == "c" * 64
+    assert summary["success_count"] == 20
+    assert summary["reports_path"] == str(output_dir)
+
+
 def test_reviewed_subset_commands_declare_exact_options() -> None:
     expected_options = {
         "prepare-reviewed-subset": {
@@ -543,6 +712,22 @@ def test_reviewed_subset_commands_declare_exact_options() -> None:
             "--subset-manifest",
             "--output-dir",
         },
+        "run-muscriptor-corpus": {
+            "--manifest",
+            "--timing-manifest",
+            "--cache-dir",
+            "--output-dir",
+            "--include-simfile-id",
+            "--exclude-simfile-id",
+            "--resume",
+        },
+        "score-muscriptor-reviewed-subset": {
+            "--run",
+            "--manifest",
+            "--timing-manifest",
+            "--subset-manifest",
+            "--output-dir",
+        },
     }
     benchmark_group = main.commands["benchmark"]
     for command, expected in expected_options.items():
@@ -553,9 +738,9 @@ def test_reviewed_subset_commands_declare_exact_options() -> None:
             for opt in param.opts
             if opt.startswith("--")
         }
-        assert declared == expected, (
-            f"{command} declared options {sorted(declared)} != expected {sorted(expected)}"
-        )
+        message = f"{command} declared options {sorted(declared)}"
+        message += f" != expected {sorted(expected)}"
+        assert declared == expected, message
         # The help output must agree with the introspected option set and must
         # not advertise any unsupported selector such as --model-path.
         result = CliRunner().invoke(main, ["benchmark", command, "--help"])
@@ -563,7 +748,20 @@ def test_reviewed_subset_commands_declare_exact_options() -> None:
         for option in expected:
             assert option in result.output
         assert "--model-path" not in result.output
-        for selector in ("--seed", "--count", "--threshold", "--model", "--backend"):
+        for selector in (
+            "--seed",
+            "--count",
+            "--threshold",
+            "--model",
+            "--backend",
+            "--model-size",
+            "--device",
+            "--dtype",
+            "--temperature",
+            "--beam",
+            "--instrument",
+            "--map-version",
+        ):
             assert selector not in result.output
 
 

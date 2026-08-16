@@ -45,7 +45,7 @@ from src.benchmark.backend_identity import (
     require_sha256,
     strict_json_loads,
 )
-from src.benchmark.cohort_scoring import score_cohort
+from src.benchmark.cohort_scoring import CohortIdentity, CohortItem, score_cohort
 from src.benchmark.corpus_manifest import (
     ManifestPublicationError,
     publish_latest_manifest,
@@ -831,9 +831,9 @@ class FinalizeReviewedSubsetOutcome:
 
 @dataclass(frozen=True)
 class ScoreReviewedSubsetRequest:
-    """Local inputs for rescoring one persisted OaF run on a reviewed subset.
+    """Local inputs for rescoring one persisted backend run on a reviewed subset.
 
-    ``run_path`` names the persisted ``crux.oaf-corpus-run/v1`` snapshot;
+    ``run_path`` names a persisted OaF or MuScriptor corpus-run snapshot;
     ``output_dir`` receives the HPA-325 report artifacts for the subset cohort.
     """
 
@@ -864,6 +864,68 @@ def _fatal_score_outcome() -> ScoreReviewedSubsetOutcome:
         failed_count=0,
         skipped_count=0,
         quarantined_count=0,
+    )
+
+
+def score_reviewed_subset_cohort(
+    parent_identity: CohortIdentity,
+    parent_items: tuple[CohortItem, ...],
+    reference: LoadedReferenceSetManifest,
+    timing: LoadedReferenceTimingManifest,
+    subset: LoadedReviewedSubsetManifest,
+    *,
+    output_dir: Path,
+) -> ScoreReviewedSubsetOutcome:
+    """Score one reviewed subset from an already reconstructed parent cohort."""
+    if subset.source_reference_manifest_sha256 != reference.manifest_sha256 or (
+        subset.source_reference_manifest_version != reference.corpus_version
+    ):
+        raise ValueError("reviewed subset reference identity does not match the supplied manifest")
+    if subset.source_timing_manifest_sha256 != timing.manifest_sha256 or (
+        subset.source_timing_manifest_version != timing.corpus_version
+    ):
+        raise ValueError("reviewed subset timing identity does not match the supplied manifest")
+
+    subset_ids = {str(row.view.simfile_id) for row in subset.rows}
+    parent_ids = {item.simfile_id for item in parent_items}
+    missing = sorted(subset_ids - parent_ids)
+    if missing:
+        raise ValueError("reviewed subset members are absent from the parent population")
+
+    selected_items = tuple(item for item in parent_items if item.simfile_id in subset_ids)
+    subset_cohort_id = sha256(
+        canonical_json_bytes(
+            {
+                "parent_run_id": parent_identity.cohort_id,
+                "reviewed_subset_manifest_sha256": subset.manifest_sha256,
+            }
+        )
+    ).hexdigest()
+    subset_identity = replace(parent_identity, cohort_id=subset_cohort_id)
+    diagnostics_for = tuple(
+        sorted(item.simfile_id for item in selected_items if item.status == "success")
+    )
+    result = score_cohort(
+        subset_identity,
+        selected_items,
+        diagnostics_for=diagnostics_for,
+    )
+    write_cohort_reports(result, output_dir)
+    population = result.population
+    return ScoreReviewedSubsetOutcome(
+        exit_code=(
+            0
+            if population.failed_count == 0
+            and population.skipped_count == 0
+            and population.quarantined_count == 0
+            else 1
+        ),
+        cohort_id=subset_cohort_id,
+        reports_path=output_dir,
+        success_count=population.success_count,
+        failed_count=population.failed_count,
+        skipped_count=population.skipped_count,
+        quarantined_count=population.quarantined_count,
     )
 
 
@@ -904,69 +966,78 @@ def score_oaf_reviewed_subset(
         snapshot = parse_oaf_corpus_run(read_regular_file_no_follow(request.run_path))
         if snapshot.get("reference_manifest_sha256") != reference.manifest_sha256:
             raise ValueError("run snapshot reference manifest does not match the supplied manifest")
+        if snapshot.get("reference_manifest_version") != reference.corpus_version:
+            raise ValueError("run snapshot reference version does not match the supplied manifest")
         if snapshot.get("reference_timing_manifest_sha256") != timing.manifest_sha256:
             raise ValueError("run snapshot timing manifest does not match the supplied manifest")
         if snapshot.get("reference_timing_version") != timing.corpus_version:
             raise ValueError("run snapshot timing version does not match the supplied manifest")
 
         subset = load_reviewed_subset_manifest(request.subset_manifest_path)
-        if subset.source_reference_manifest_sha256 != reference.manifest_sha256 or (
-            subset.source_reference_manifest_version != reference.corpus_version
-        ):
-            raise ValueError(
-                "reviewed subset reference identity does not match the supplied manifest"
-            )
-        if subset.source_timing_manifest_sha256 != timing.manifest_sha256 or (
-            subset.source_timing_manifest_version != timing.corpus_version
-        ):
-            raise ValueError("reviewed subset timing identity does not match the supplied manifest")
-
         parent_identity, parent_items = build_oaf_cohort_from_snapshot(
             snapshot,
             mappings=mappings,
             output_dir=request.run_path.parents[2],
         )
-        subset_ids = {str(row.view.simfile_id) for row in subset.rows}
-        missing = sorted(subset_ids - {item.simfile_id for item in parent_items})
-        if missing:
-            raise ValueError("reviewed subset members are absent from the parent population")
-        selected_items = tuple(item for item in parent_items if item.simfile_id in subset_ids)
-        subset_cohort_id = sha256(
-            canonical_json_bytes(
-                {
-                    "parent_run_id": parent_identity.cohort_id,
-                    "reviewed_subset_manifest_sha256": subset.manifest_sha256,
-                }
-            )
-        ).hexdigest()
-        subset_identity = replace(parent_identity, cohort_id=subset_cohort_id)
-        diagnostics_for = tuple(
-            sorted(item.simfile_id for item in selected_items if item.status == "success")
+        return score_reviewed_subset_cohort(
+            parent_identity,
+            parent_items,
+            reference,
+            timing,
+            subset,
+            output_dir=request.output_dir,
         )
-        result = score_cohort(
-            subset_identity,
-            selected_items,
-            diagnostics_for=diagnostics_for,
-        )
-        write_cohort_reports(result, request.output_dir)
     except (OSError, StrictJsonError, ValueError):
         return _fatal_score_outcome()
-    population = result.population
-    return ScoreReviewedSubsetOutcome(
-        exit_code=(
-            0
-            if population.failed_count == 0
-            and population.skipped_count == 0
-            and population.quarantined_count == 0
-            else 1
-        ),
-        cohort_id=subset_cohort_id,
-        reports_path=request.output_dir,
-        success_count=population.success_count,
-        failed_count=population.failed_count,
-        skipped_count=population.skipped_count,
-        quarantined_count=population.quarantined_count,
+
+
+def score_muscriptor_reviewed_subset(
+    request: ScoreReviewedSubsetRequest,
+) -> ScoreReviewedSubsetOutcome:
+    """Rescore a persisted MuScriptor run on the exact reviewed subset membership."""
+    from src.benchmark.muscriptor_corpus_run import (  # pylint: disable=import-outside-toplevel
+        build_muscriptor_cohort_from_snapshot,
+        parse_muscriptor_corpus_run,
     )
+
+    try:
+        if request.output_dir.resolve() == (request.run_path.parent / "reports").resolve():
+            raise ValueError(
+                "subset report output directory must not alias the parent run's broad reports"
+            )
+        reference = load_reference_set_manifest(request.reference_manifest_path)
+        timing = load_reference_timing_manifest(request.timing_manifest_path)
+        mappings = preflight_reference_mappings(
+            reference,
+            timing,
+            timing_output_root=request.timing_manifest_path.parent.parent,
+        )
+        snapshot = parse_muscriptor_corpus_run(read_regular_file_no_follow(request.run_path))
+        if snapshot.get("reference_manifest_sha256") != reference.manifest_sha256:
+            raise ValueError("run snapshot reference manifest does not match the supplied manifest")
+        if snapshot.get("reference_manifest_version") != reference.corpus_version:
+            raise ValueError("run snapshot reference version does not match the supplied manifest")
+        if snapshot.get("reference_timing_manifest_sha256") != timing.manifest_sha256:
+            raise ValueError("run snapshot timing manifest does not match the supplied manifest")
+        if snapshot.get("reference_timing_version") != timing.corpus_version:
+            raise ValueError("run snapshot timing version does not match the supplied manifest")
+
+        subset = load_reviewed_subset_manifest(request.subset_manifest_path)
+        parent_identity, parent_items = build_muscriptor_cohort_from_snapshot(
+            snapshot,
+            mappings=mappings,
+            output_dir=request.run_path.parents[2],
+        )
+        return score_reviewed_subset_cohort(
+            parent_identity,
+            parent_items,
+            reference,
+            timing,
+            subset,
+            output_dir=request.output_dir,
+        )
+    except (OSError, StrictJsonError, ValueError):
+        return _fatal_score_outcome()
 
 
 def _current_candidate_slate(

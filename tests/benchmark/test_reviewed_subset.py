@@ -9,6 +9,7 @@ from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,6 +40,7 @@ from src.benchmark.reviewed_subset import (
     load_reviewed_subset_manifest,
     prepare_reviewed_subset,
     score_oaf_reviewed_subset,
+    score_reviewed_subset_cohort,
     validate_schema_golden,
 )
 from tests.benchmark.reviewed_subset_fixtures import (
@@ -1334,6 +1336,162 @@ def test_score_request_and_outcome_shapes() -> None:
     }
 
 
+def _core_inputs(
+    fixture: ReviewedSubsetOafFixture,
+    subset_path: Path,
+) -> tuple[object, tuple[object, ...], object, object, LoadedReviewedSubsetManifest]:
+    from src.benchmark.oaf_corpus_run import build_oaf_cohort_from_snapshot, parse_oaf_corpus_run
+
+    reference = load_reference_set_manifest(fixture.reference_manifest_path)
+    timing = load_reference_timing_manifest(fixture.timing_manifest_path)
+    mappings = preflight_reference_mappings(
+        reference,
+        timing,
+        timing_output_root=fixture.timing_output_root,
+    )
+    parent_identity, parent_items = build_oaf_cohort_from_snapshot(
+        parse_oaf_corpus_run(fixture.run_path.read_bytes()),
+        mappings=mappings,
+        output_dir=fixture.oaf_output_dir,
+    )
+    return (
+        parent_identity,
+        parent_items,
+        reference,
+        timing,
+        load_reviewed_subset_manifest(subset_path),
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "source_reference_manifest_sha256",
+        "source_reference_manifest_version",
+        "source_timing_manifest_sha256",
+        "source_timing_manifest_version",
+    ],
+)
+def test_score_reviewed_subset_cohort_rejects_subset_lineage_mismatch(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path)
+    subset_path = _finalize_subset(tmp_path, fixture, include_ids=_all_success_includes(fixture))
+    rows = list(_load_manifest_rows(subset_path))
+    for row in rows:
+        row[field] = "sha256:" + "9" * 64 if "version" in field else "9" * 64
+    mutated_path = tmp_path / "mutated-subset.jsonl"
+    mutated_path.write_bytes(render_manifest(tuple(rows)).content)
+    parent_identity, parent_items, reference, timing, subset = _core_inputs(fixture, mutated_path)
+
+    with pytest.raises(ValueError, match="reviewed subset .* identity"):
+        score_reviewed_subset_cohort(
+            parent_identity,
+            parent_items,
+            reference,
+            timing,
+            subset,
+            output_dir=tmp_path / "subset-reports",
+        )
+
+
+def test_score_reviewed_subset_cohort_rejects_missing_parent_member(tmp_path: Path) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path)
+    subset_path = _finalize_subset(tmp_path, fixture, include_ids=_all_success_includes(fixture))
+    rows = list(_load_manifest_rows(subset_path))
+    rows[0]["simfile_id"] = 999
+    mutated_path = tmp_path / "foreign-subset.jsonl"
+    mutated_path.write_bytes(render_manifest(tuple(rows)).content)
+    parent_identity, parent_items, reference, timing, subset = _core_inputs(fixture, mutated_path)
+
+    with pytest.raises(ValueError, match="reviewed subset members are absent"):
+        score_reviewed_subset_cohort(
+            parent_identity,
+            parent_items,
+            reference,
+            timing,
+            subset,
+            output_dir=tmp_path / "subset-reports",
+        )
+
+
+def test_score_muscriptor_reviewed_subset_delegates_persisted_cohort_without_inference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.benchmark.muscriptor_corpus_run as run_module
+    import src.benchmark.reviewed_subset as reviewed_module
+
+    run_path = tmp_path / "output" / "runs" / "run-1" / "run.json"
+    request = ScoreReviewedSubsetRequest(
+        run_path=run_path,
+        reference_manifest_path=tmp_path / "reference.jsonl",
+        timing_manifest_path=tmp_path / "timing.jsonl",
+        subset_manifest_path=tmp_path / "subset.jsonl",
+        output_dir=tmp_path / "subset-reports",
+    )
+    reference = SimpleNamespace(manifest_sha256="a" * 64, corpus_version="sha256:" + "b" * 64)
+    timing = SimpleNamespace(manifest_sha256="c" * 64, corpus_version="sha256:" + "d" * 64)
+    subset = SimpleNamespace(
+        source_reference_manifest_sha256=reference.manifest_sha256,
+        source_reference_manifest_version=reference.corpus_version,
+        source_timing_manifest_sha256=timing.manifest_sha256,
+        source_timing_manifest_version=timing.corpus_version,
+    )
+    snapshot = {
+        "reference_manifest_sha256": reference.manifest_sha256,
+        "reference_manifest_version": reference.corpus_version,
+        "reference_timing_manifest_sha256": timing.manifest_sha256,
+        "reference_timing_version": timing.corpus_version,
+    }
+    parent_identity = object()
+    parent_items = object()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(reviewed_module, "load_reference_set_manifest", lambda path: reference)
+    monkeypatch.setattr(reviewed_module, "load_reference_timing_manifest", lambda path: timing)
+    monkeypatch.setattr(
+        reviewed_module,
+        "preflight_reference_mappings",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(reviewed_module, "read_regular_file_no_follow", lambda path: b"run")
+    monkeypatch.setattr(reviewed_module, "load_reviewed_subset_manifest", lambda path: subset)
+    monkeypatch.setattr(run_module, "parse_muscriptor_corpus_run", lambda content: snapshot)
+
+    def fake_build(snapshot_arg, *, mappings, output_dir):
+        captured["snapshot"] = snapshot_arg
+        captured["mappings"] = mappings
+        captured["output_dir"] = output_dir
+        return parent_identity, parent_items
+
+    monkeypatch.setattr(run_module, "build_muscriptor_cohort_from_snapshot", fake_build)
+    expected = ScoreReviewedSubsetOutcome(
+        exit_code=0,
+        cohort_id="e" * 64,
+        reports_path=request.output_dir,
+        success_count=20,
+        failed_count=0,
+        skipped_count=0,
+        quarantined_count=0,
+    )
+
+    def fake_core(*args, **kwargs):
+        captured["core_args"] = args
+        captured["core_kwargs"] = kwargs
+        return expected
+
+    monkeypatch.setattr(reviewed_module, "score_reviewed_subset_cohort", fake_core)
+
+    assert reviewed_module.score_muscriptor_reviewed_subset(request) == expected
+    assert captured["snapshot"] is snapshot
+    assert captured["mappings"] == {}
+    assert captured["output_dir"] == run_path.parents[2]
+    assert captured["core_args"] == (parent_identity, parent_items, reference, timing, subset)
+    assert captured["core_kwargs"] == {"output_dir": request.output_dir}
+
+
 def test_score_reviewed_subset_never_constructs_backend_and_preserves_parent_reports(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1398,10 +1556,16 @@ def test_score_reviewed_subset_exits_0_with_derived_cohort_id_and_reports(
     "mutate",
     [
         lambda snapshot: snapshot.update(reference_manifest_sha256="0" * 64),
+        lambda snapshot: snapshot.update(reference_manifest_version="sha256:" + "0" * 64),
         lambda snapshot: snapshot.update(reference_timing_manifest_sha256="0" * 64),
         lambda snapshot: snapshot.update(reference_timing_version="sha256:" + "0" * 64),
     ],
-    ids=["run-reference-sha", "run-timing-sha", "run-timing-version"],
+    ids=[
+        "run-reference-sha",
+        "run-reference-version",
+        "run-timing-sha",
+        "run-timing-version",
+    ],
 )
 def test_score_reviewed_subset_exits_2_on_run_lineage_mismatch(
     tmp_path: Path,
