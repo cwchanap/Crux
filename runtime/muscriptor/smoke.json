@@ -1,0 +1,1 @@
+{"cases":[{"reason":"short","simfile_id":1},{"reason":"long","simfile_id":2},{"reason":"dense","simfile_id":3},{"reason":"sparse","simfile_id":4},{"reason":"non_drum_heavy","simfile_id":5}],"schema":"crux.muscriptor-smoke/v1"}

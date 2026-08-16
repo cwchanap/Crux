@@ -39,6 +39,7 @@ tfjs = [
 r2 = [
     "boto3>=1.42,<2",
 ]
+muscriptor = ["muscriptor==0.3.0"]
 
 [project.scripts]
 convert-checkpoint = "src.cli.convert:main"
