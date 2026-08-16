@@ -1133,3 +1133,72 @@ def test_run_oaf_corpus_rejects_out_of_range_id_as_click_error(tmp_path: Path, m
 
     assert result.exit_code == 2
     assert "Invalid value for '--include-simfile-id'" in result.output
+
+
+def test_compare_oaf_muscriptor_command_builds_request_and_emits_summary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.muscriptor_comparison as comparison_module
+
+    oaf_run = tmp_path / "oaf" / "run.json"
+    muscriptor_run = tmp_path / "muscriptor" / "run.json"
+    manifest = tmp_path / "hpa324.jsonl"
+    timing_manifest = tmp_path / "hpa323.jsonl"
+    output_dir = tmp_path / "comparison"
+    for path in (oaf_run, muscriptor_run, manifest, timing_manifest):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture")
+    captured: list[object] = []
+
+    def fake_compare(request: object):
+        captured.append(request)
+        return type(
+            "Outcome",
+            (),
+            {
+                "exit_code": 0,
+                "output_dir": output_dir,
+                "pairable_success_count": 7,
+                "paired_song_count": 14,
+                "paired_class_count": 28,
+            },
+        )()
+
+    monkeypatch.setattr(comparison_module, "compare_oaf_muscriptor", fake_compare)
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "compare-oaf-muscriptor",
+            "--oaf-run",
+            str(oaf_run),
+            "--muscriptor-run",
+            str(muscriptor_run),
+            "--manifest",
+            str(manifest),
+            "--timing-manifest",
+            str(timing_manifest),
+            "--output-dir",
+            str(output_dir),
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.oaf_run_path == oaf_run
+    assert request.muscriptor_run_path == muscriptor_run
+    assert request.reference_manifest_path == manifest
+    assert request.timing_manifest_path == timing_manifest
+    assert request.output_dir == output_dir
+    assert request.subset_manifest_path is None
+
+    summary = json.loads(result.output)
+    assert summary == {
+        "exit_code": 0,
+        "output_dir": str(output_dir),
+        "paired_class_count": 28,
+        "paired_song_count": 14,
+        "pairable_success_count": 7,
+    }
