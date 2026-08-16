@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
@@ -13,6 +13,8 @@ from pathlib import Path, PurePosixPath
 from threading import Lock
 from uuid import uuid4
 
+from src.benchmark.backend_identity import require_sha256
+from src.benchmark.corpus_manifest import ManifestRowView
 from src.benchmark.durability import ensure_durable_directory, fsync_directory
 from src.benchmark.r2_corpus_models import (
     CACHE_INDEX_SCHEMA,
@@ -80,6 +82,17 @@ class CacheIndexEntry:
 class CacheValidation:
     state: str
     entry: CacheIndexEntry | None
+
+
+@dataclass(frozen=True)
+class ResolvedSourceAudio:
+    """One locally verified source-audio body and its header duration."""
+
+    path: Path
+    source_audio_id: str
+    source_audio_sha256: str
+    duration_sec: float
+    content: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -303,6 +316,168 @@ def read_verified_cache_body(
     if validation.state != "verified" or content is None:
         raise ValueError("verified cache body unavailable")
     return content
+
+
+def _remote_from_source_mapping(
+    source: Mapping[str, object],
+    *,
+    source_audio_key: str,
+) -> RemoteObject:
+    raw_objects = source.get("objects")
+    if not isinstance(raw_objects, list):
+        raise ValueError("source manifest does not contain an object inventory")
+    for raw_object in raw_objects:
+        if not isinstance(raw_object, Mapping) or raw_object.get("key") != source_audio_key:
+            continue
+        try:
+            return RemoteObject(
+                key=source_audio_key,
+                size=raw_object["size"],  # type: ignore[arg-type]
+                etag=raw_object["etag"],  # type: ignore[arg-type]
+                etag_is_weak=raw_object["etag_is_weak"],  # type: ignore[arg-type]
+                last_modified=parse_manifest_timestamp(raw_object["last_modified"]),
+                content_type=raw_object["content_type"],  # type: ignore[arg-type]
+                cache_status=raw_object["cache_status"],  # type: ignore[arg-type]
+                sha256=raw_object["sha256"],  # type: ignore[arg-type]
+                cache_path=raw_object["cache_path"],  # type: ignore[arg-type]
+            )
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("source manifest contains an invalid audio object") from None
+    raise ValueError("source audio key is absent from the source inventory")
+
+
+def _source_audio_parts(
+    source: RemoteObject | ManifestRowView | Mapping[str, object],
+    *,
+    source_audio_key: str | None,
+    source_audio_content_hash: str | None,
+    source_endpoint_sha256: str | None,
+    source_bucket: str | None,
+) -> tuple[RemoteObject, str, str, str]:
+    if isinstance(source, ManifestRowView):
+        endpoint = source_endpoint_sha256 or source.source_endpoint_sha256
+        bucket = source_bucket or source.source_bucket
+        key = source_audio_key
+        if key is None:
+            raise ValueError("source_audio_key is required")
+        remote = next((item for item in source.inventory.objects if item.key == key), None)
+        if remote is None:
+            raise ValueError("source audio key is absent from the source inventory")
+        expected = source_audio_content_hash
+    elif isinstance(source, RemoteObject):
+        endpoint = source_endpoint_sha256
+        bucket = source_bucket
+        key = source_audio_key or source.key
+        remote = source
+        expected = source_audio_content_hash
+    elif isinstance(source, Mapping):
+        key = source_audio_key or source.get("source_audio_key")
+        endpoint = source_endpoint_sha256 or source.get("source_endpoint_sha256")
+        bucket = source_bucket or source.get("source_bucket")
+        expected = source_audio_content_hash
+        if not isinstance(key, str):
+            raise ValueError("source_audio_key is required")
+        remote = _remote_from_source_mapping(source, source_audio_key=key)
+    else:
+        raise TypeError("source must be a RemoteObject, ManifestRowView, or mapping")
+
+    if not isinstance(endpoint, str) or not endpoint:
+        raise ValueError("source_endpoint_sha256 is required")
+    if not isinstance(bucket, str) or not bucket:
+        raise ValueError("source_bucket is required")
+    if not isinstance(key, str) or not key:
+        raise ValueError("source_audio_key is required")
+    if not isinstance(expected, str):
+        raise ValueError("source_audio_content_hash is required")
+    require_sha256(expected, "source_audio_content_hash")
+    return remote, endpoint, bucket, expected
+
+
+def inspect_source_audio(path: Path):
+    from src.benchmark.reference_timing import inspect_source_audio as inspect
+
+    return inspect(path)
+
+
+# pylint: disable=too-many-arguments,too-many-locals
+def resolve_source_audio(
+    source: RemoteObject | ManifestRowView | Mapping[str, object],
+    cache_dir: Path,
+    cache_index: CacheIndexStore | None = None,
+    *,
+    index: CacheIndexStore | None = None,
+    source_audio_key: str | None = None,
+    source_audio_content_hash: str | None = None,
+    source_endpoint_sha256: str | None = None,
+    source_bucket: str | None = None,
+    load_body: bool = True,
+) -> ResolvedSourceAudio:
+    """Resolve one source body from the verified local HPA-321 cache only.
+
+    When *load_body* is ``False`` the verified path, digest, and duration are
+    resolved but the full audio body is not read into memory.  The caller may
+    read the body later from ``path`` (e.g. during per-item materialization) to
+    avoid retaining corpus-sized byte arrays on every execution state.
+    """
+    if not isinstance(cache_dir, Path):
+        raise TypeError("cache_dir must be a Path")
+    if cache_index is not None and index is not None and cache_index is not index:
+        raise ValueError("cache index arguments disagree")
+    cache_index = cache_index or index or CacheIndexStore.load(cache_dir)
+    remote, endpoint, bucket, expected = _source_audio_parts(
+        source,
+        source_audio_key=source_audio_key,
+        source_audio_content_hash=source_audio_content_hash,
+        source_endpoint_sha256=source_endpoint_sha256,
+        source_bucket=source_bucket,
+    )
+
+    verified_remote = remote
+    if remote.cache_status != "verified":
+        entry = cache_index.get(endpoint, bucket, remote.key)
+        if not cache_entry_matches_remote(entry, remote, endpoint=endpoint, bucket=bucket):
+            raise ValueError("verified source audio unavailable")
+        validation = validate_cached_body(cache_dir, entry)
+        if validation.state != "verified" or entry is None:
+            raise ValueError("verified source audio unavailable")
+        verified_remote = replace(
+            remote,
+            cache_status="verified",
+            sha256=entry.sha256,
+            cache_path=entry.cache_path,
+        )
+
+    if verified_remote.sha256 != expected:
+        raise ValueError("source audio digest does not match reference timing manifest")
+    path = resolve_verified_cache_body(
+        cache_dir,
+        verified_remote,
+        source_endpoint_sha256=endpoint,
+        bucket=bucket,
+        expected_sha256=expected,
+    )
+    content = (
+        read_verified_cache_body(
+            cache_dir,
+            verified_remote,
+            source_endpoint_sha256=endpoint,
+            bucket=bucket,
+            expected_sha256=expected,
+        )
+        if load_body
+        else None
+    )
+    duration_sec = inspect_source_audio(path).duration_sec
+    return ResolvedSourceAudio(
+        path=path,
+        source_audio_id=remote.key,
+        source_audio_sha256=expected,
+        duration_sec=duration_sec,
+        content=content,
+    )
+
+
+# pylint: enable=too-many-arguments,too-many-locals
 
 
 def _verified_cache_entry(

@@ -23,7 +23,13 @@ from src.benchmark.backend_identity import (
 )
 from src.benchmark.backends.base import CanonicalAudio, NativePrediction
 from src.benchmark.cohort_scoring import CohortIdentity
-from src.benchmark.corpus_cache import CacheIndexStore
+from src.benchmark.corpus_cache import (
+    CacheIndexStore,
+    ResolvedSourceAudio,
+    _remote_from_source_mapping,
+    _source_audio_parts,
+    resolve_source_audio,
+)
 from src.benchmark.corpus_manifest import ManifestRowView
 from src.benchmark.mapping import map_oaf_prediction
 from src.benchmark.oaf_corpus_run import (
@@ -33,7 +39,6 @@ from src.benchmark.oaf_corpus_run import (
     OAF_PREDICTION_MAP_ID,
     OafCorpusRunOutcome,
     OafCorpusRunRequest,
-    ResolvedSourceAudio,
     _bounded_close_error,
     _bounded_error,
     _cohort_identity_from_snapshot,
@@ -50,10 +55,7 @@ from src.benchmark.oaf_corpus_run import (
     _prediction_relative_path,
     _project_runtime,
     _read_existing_prediction,
-    _remote_from_source_mapping,
     _remove_temporary_input,
-    _resolve_source_audio,
-    _source_audio_parts,
     _source_failure_code,
     _timestamp,
     _utc_now,
@@ -64,13 +66,13 @@ from src.benchmark.oaf_corpus_run import (
     compute_model_lock_sha256,
     inference_config_sha256,
     parse_oaf_corpus_run,
-    prediction_path,
     render_oaf_corpus_run,
     write_oaf_corpus_run,
 )
 from src.benchmark.prediction_artifact import (
     MappedPrediction,
     PredictionArtifact,
+    prediction_path,
     read_prediction_artifact,
     render_prediction_artifact,
 )
@@ -665,13 +667,13 @@ def test_source_audio_parts_requires_content_hash() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _resolve_source_audio
+# resolve_source_audio
 # ---------------------------------------------------------------------------
 
 
 def test_resolve_source_audio_rejects_non_path_cache_dir() -> None:
     with pytest.raises(TypeError, match="cache_dir must be a Path"):
-        _resolve_source_audio(
+        resolve_source_audio(
             _source_remote(),
             "not-a-path",  # type: ignore[arg-type]
             source_audio_key="42/bgm.wav",
@@ -685,7 +687,7 @@ def test_resolve_source_audio_rejects_disagreeing_index_args(tmp_path: Path) -> 
     idx_a = CacheIndexStore(tmp_path, {})
     idx_b = CacheIndexStore(tmp_path, {})
     with pytest.raises(ValueError, match="cache index arguments disagree"):
-        _resolve_source_audio(
+        resolve_source_audio(
             _source_remote(),
             tmp_path,
             idx_a,
@@ -698,24 +700,25 @@ def test_resolve_source_audio_rejects_disagreeing_index_args(tmp_path: Path) -> 
 
 
 # ---------------------------------------------------------------------------
-# _materialize_oaf_full_mix
+# materialize_full_mix_audio
 # ---------------------------------------------------------------------------
 
 
 def test_materialize_rejects_non_resolved_source(tmp_path: Path) -> None:
-    with pytest.raises(TypeError, match="source_audio must be ResolvedSourceAudio"):
-        from src.benchmark.oaf_corpus_run import _materialize_oaf_full_mix
+    from src.benchmark.input_view import materialize_full_mix_audio
 
-        _materialize_oaf_full_mix(
+    with pytest.raises(TypeError, match="source_audio must be ResolvedSourceAudio"):
+        materialize_full_mix_audio(
             "not-source",  # type: ignore[arg-type]
             tmp_path / "out.wav",
             input_root=tmp_path,
-            config=load_model_config(),
+            input_view_id=OAF_FULL_MIX_INPUT_VIEW_ID,
+            max_input_audio_frames=None,
         )
 
 
 def test_materialize_rejects_non_path_args(tmp_path: Path) -> None:
-    from src.benchmark.oaf_corpus_run import _materialize_oaf_full_mix
+    from src.benchmark.input_view import materialize_full_mix_audio
 
     source = ResolvedSourceAudio(
         path=tmp_path / "s.wav",
@@ -724,12 +727,27 @@ def test_materialize_rejects_non_path_args(tmp_path: Path) -> None:
         duration_sec=1.0,
     )
     with pytest.raises(TypeError, match="output_path and input_root must be Paths"):
-        _materialize_oaf_full_mix(source, "out", input_root=tmp_path, config=load_model_config())  # type: ignore[arg-type]
+        materialize_full_mix_audio(
+            source,
+            "out",  # type: ignore[arg-type]
+            input_root=tmp_path,
+            input_view_id=OAF_FULL_MIX_INPUT_VIEW_ID,
+            max_input_audio_frames=None,
+        )
 
 
-def test_materialize_rejects_non_model_config(tmp_path: Path) -> None:
-    from src.benchmark.oaf_corpus_run import _materialize_oaf_full_mix
+def test_materialize_rejects_non_model_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.benchmark import oaf_corpus_run as run_module
 
+    calls: list[object] = []
+
+    def materialize(*args: object, **kwargs: object) -> object:
+        calls.append((args, kwargs))
+        raise AssertionError("neutral materializer must not receive an invalid config")
+
+    monkeypatch.setattr(run_module, "materialize_full_mix_audio", materialize)
     source = ResolvedSourceAudio(
         path=tmp_path / "s.wav",
         source_audio_id="42/bgm.wav",
@@ -737,11 +755,18 @@ def test_materialize_rejects_non_model_config(tmp_path: Path) -> None:
         duration_sec=1.0,
     )
     with pytest.raises(TypeError, match="config must be OafModelConfig"):
-        _materialize_oaf_full_mix(source, tmp_path / "out.wav", input_root=tmp_path, config="bad")  # type: ignore[arg-type]
+        run_module._materialize_oaf_full_mix(
+            source,
+            tmp_path / "out.wav",
+            input_root=tmp_path,
+            config="bad",  # type: ignore[arg-type]
+        )
+
+    assert calls == []
 
 
 def test_materialize_rejects_output_outside_input_root(tmp_path: Path) -> None:
-    from src.benchmark.oaf_corpus_run import _materialize_oaf_full_mix
+    from src.benchmark.input_view import materialize_full_mix_audio
 
     source = ResolvedSourceAudio(
         path=tmp_path / "s.wav",
@@ -750,11 +775,12 @@ def test_materialize_rejects_output_outside_input_root(tmp_path: Path) -> None:
         duration_sec=1.0,
     )
     with pytest.raises(ValueError, match="beneath input_root"):
-        _materialize_oaf_full_mix(
+        materialize_full_mix_audio(
             source,
             tmp_path / "elsewhere" / "out.wav",
             input_root=tmp_path / "inputs",
-            config=load_model_config(),
+            input_view_id=OAF_FULL_MIX_INPUT_VIEW_ID,
+            max_input_audio_frames=None,
         )
 
 
@@ -1727,7 +1753,7 @@ def _install_run_seams(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     )
     monkeypatch.setattr(
         run_module,
-        "_resolve_source_audio",
+        "resolve_source_audio",
         lambda *_a, **_kw: ResolvedSourceAudio(
             path=tmp_path / "source.wav",
             source_audio_id="10/audio.wav",
@@ -1878,7 +1904,7 @@ def test_run_oaf_corpus_source_resolve_failure_marks_item_failed(
     def fail_resolve(*_a, **_kw):
         raise OSError("source audio unavailable")
 
-    monkeypatch.setattr(run_module, "_resolve_source_audio", fail_resolve)
+    monkeypatch.setattr(run_module, "resolve_source_audio", fail_resolve)
 
     outcome = run_oaf_corpus(
         _request(tmp_path),
@@ -2031,7 +2057,7 @@ def test_run_oaf_corpus_rejects_source_body_mutated_after_preflight(
     # replace the cache body so the per-item re-pin (load_body=True) sees mutated
     # bytes. _materialize_oaf_full_mix is left real so a missing re-pin would
     # actually infer the wrong bytes against the original digest.
-    real_resolve = run_module._resolve_source_audio
+    real_resolve = run_module.resolve_source_audio
     corrupted = False
 
     def resolve_wrapper(*args, **kwargs):
@@ -2042,7 +2068,7 @@ def test_run_oaf_corpus_rejects_source_body_mutated_after_preflight(
             corrupted = True
         return resolved
 
-    monkeypatch.setattr(run_module, "_resolve_source_audio", resolve_wrapper)
+    monkeypatch.setattr(run_module, "resolve_source_audio", resolve_wrapper)
 
     descriptor = _descriptor()
     outcome = run_oaf_corpus(

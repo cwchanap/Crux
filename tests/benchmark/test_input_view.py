@@ -10,11 +10,13 @@ from pathlib import Path
 
 import pytest
 
+from src.benchmark.corpus_cache import ResolvedSourceAudio
 from src.benchmark.input_view import (
     InputViewManifest,
     load_derived_audio,
     load_direct_audio,
     load_materialized_audio,
+    materialize_full_mix_audio,
     parse_canonical_wav,
 )
 
@@ -152,6 +154,40 @@ def test_direct_audio_rejects_empty_stable_ids(tmp_path: Path, field: str) -> No
 
     with pytest.raises(ValueError, match=field):
         load_direct_audio(audio_path, max_input_audio_frames=1, **arguments)
+
+
+def test_materialize_full_mix_audio_preserves_identity_and_canonical_metadata(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.wav"
+    source_content = canonical_wav_bytes(sample_frames=441)
+    source_path.write_bytes(source_content)
+    source = ResolvedSourceAudio(
+        path=source_path,
+        source_audio_id="song-42-source-v1",
+        source_audio_sha256=sha256(source_content).hexdigest(),
+        duration_sec=0.01,
+    )
+    input_root = tmp_path / "inputs"
+    output_path = input_root / "42" / "full-mix.wav"
+
+    audio = materialize_full_mix_audio(
+        source,
+        output_path,
+        input_root=input_root,
+        input_view_id="full-mix-canonical-wav-v1",
+        max_input_audio_frames=441,
+    )
+
+    assert audio.path == output_path
+    assert audio.source_audio_id == source.source_audio_id
+    assert audio.source_audio_sha256 == source.source_audio_sha256
+    assert audio.input_view_id == "full-mix-canonical-wav-v1"
+    assert audio.input_audio_sha256 == sha256(output_path.read_bytes()).hexdigest()
+    assert audio.sample_rate == 44100
+    assert audio.channel_count == 1
+    assert audio.sample_width_bytes == 2
+    assert audio.audio_frame_count == 441
 
 
 def test_materialized_audio_preserves_source_identity_and_hashes_input(tmp_path: Path) -> None:
