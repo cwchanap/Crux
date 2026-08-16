@@ -30,6 +30,7 @@ CommonDrumClass: TypeAlias = Literal[
 TAXONOMY_VERSION = "crux.drum-taxonomy/v1"
 DTX_LANE_MAP_VERSION = "crux.dtx-lane-map/v1"
 OAF_PREDICTION_MAP_ID = "crux.prediction-map/oaf-egmd-8hit-v1"
+MUSCRIPTOR_PREDICTION_MAP_ID = "crux.prediction-map/muscriptor-drums-v1"
 
 DETAILED_TO_COMMON: Mapping[DetailedDrumClass, CommonDrumClass] = MappingProxyType(
     {

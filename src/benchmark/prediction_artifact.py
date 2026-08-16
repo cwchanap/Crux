@@ -1,4 +1,4 @@
-"""Canonical JSONL persistence for mapped OaF predictions."""
+"""Canonical JSONL persistence for mapped drum predictions."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from src.benchmark.artifact_io import (
     read_regular_file_no_follow,
 )
 from src.benchmark.backend_identity import (
+    MUSCRIPTOR_BACKEND_ID,
     OAF_BACKEND_ID,
     BackendDescriptor,
     JsonValue,
@@ -32,10 +33,14 @@ from src.benchmark.backends import CanonicalAudio, NativeEvent
 
 PREDICTION_SCHEMA = "crux.drum-prediction-events/v2"
 OAF_METADATA_SCHEMA = "magenta-oaf-native-metadata-v1"
+MUSCRIPTOR_METADATA_SCHEMA = "muscriptor-note-start-metadata-v1"
 OAF_GROUP_IDS = frozenset(
     {"kick", "snare", "toms", "hihat", "ride", "ride_bell", "crash", "sticks"}
 )
-NATIVE_METADATA_SCHEMAS = {OAF_METADATA_SCHEMA: {"upstream_8hit_group_id": OAF_GROUP_IDS | {None}}}
+NATIVE_METADATA_SCHEMAS = {
+    OAF_METADATA_SCHEMA: {"upstream_8hit_group_id": OAF_GROUP_IDS | {None}},
+    MUSCRIPTOR_METADATA_SCHEMA: {"instrument_group": {"drums"}},
+}
 HEADER_KEYS = frozenset(
     {
         "architecture_id",
@@ -167,8 +172,9 @@ def render_prediction_artifact(prediction: MappedPrediction) -> bytes:
     try:
         header = _build_header(prediction)
         metadata_schema = cast(str, header["native_metadata_schema_id"])
+        backend_id = cast(str, prediction.descriptor.payload["backend_id"])
         events = sorted(
-            (_normalize_event(event, metadata_schema) for event in prediction.events),
+            (_normalize_event(event, metadata_schema, backend_id) for event in prediction.events),
             key=lambda event: event.sort_key,
         )
         for first, second in zip(events, events[1:], strict=False):
@@ -293,8 +299,6 @@ def _build_header(prediction: MappedPrediction) -> dict[str, JsonValue]:
         normalize_known_backend_descriptor(descriptor_payload)
     except StrictJsonError as error:
         raise PredictionArtifactError(str(error)) from None
-    if descriptor_payload["backend_id"] != OAF_BACKEND_ID:
-        raise PredictionArtifactError("backend_id must be the OaF backend")
     if descriptor_payload["prediction_schema"] != PREDICTION_SCHEMA:
         raise PredictionArtifactError(f"prediction_schema must be {PREDICTION_SCHEMA}")
     metadata_schema = descriptor_payload["native_metadata_schema_id"]
@@ -339,7 +343,11 @@ def _build_header(prediction: MappedPrediction) -> dict[str, JsonValue]:
     }
 
 
-def _normalize_event(event: MappedPredictionEvent, metadata_schema: str) -> _NormalizedEvent:
+def _normalize_event(
+    event: MappedPredictionEvent,
+    metadata_schema: str,
+    backend_id: str,
+) -> _NormalizedEvent:
     native = event.native
     if type(native.time_sec) is not float or native.time_sec < 0:
         raise PredictionArtifactError("time_sec must be a nonnegative binary float")
@@ -353,17 +361,30 @@ def _normalize_event(event: MappedPredictionEvent, metadata_schema: str) -> _Nor
     _require_optional_int_range(native.velocity_midi, "velocity_midi", 0, 127)
     confidence = _normalize_confidence(native.confidence)
     metadata = _validate_metadata(native.native_metadata, metadata_schema)
-    if (
-        native.model_output_bin is None
-        or native.native_midi_note is None
-        or confidence is None
-        or native.velocity_midi is None
-    ):
-        raise PredictionArtifactError("oaf_event_nullability")
-    if native.native_midi_note != native.model_output_bin + 21:
-        raise PredictionArtifactError("oaf_native_identity")
-    if native.native_class_id != f"midi_{native.native_midi_note}":
-        raise PredictionArtifactError("oaf_native_identity")
+    if backend_id == OAF_BACKEND_ID:
+        if (
+            native.model_output_bin is None
+            or native.native_midi_note is None
+            or confidence is None
+            or native.velocity_midi is None
+        ):
+            raise PredictionArtifactError("oaf_event_nullability")
+        if native.native_midi_note != native.model_output_bin + 21:
+            raise PredictionArtifactError("oaf_native_identity")
+        if native.native_class_id != f"midi_{native.native_midi_note}":
+            raise PredictionArtifactError("oaf_native_identity")
+    elif backend_id == MUSCRIPTOR_BACKEND_ID:
+        if (
+            native.model_output_bin is not None
+            or native.native_midi_note is None
+            or confidence is not None
+            or native.velocity_midi is not None
+            or native.native_metadata != {"instrument_group": "drums"}
+            or native.native_class_id != f"drums:midi_{native.native_midi_note}"
+        ):
+            raise PredictionArtifactError("muscriptor_native_identity")
+    else:  # pragma: no cover - descriptor normalization rejects unknown families.
+        raise PredictionArtifactError("unknown_backend")
     _validate_mapping_values(event)
     return _NormalizedEvent(event, time_sec, confidence, metadata)
 
@@ -478,8 +499,6 @@ def _validate_header(header: dict[str, JsonValue]) -> None:
         normalize_known_backend_descriptor(descriptor)
     except StrictJsonError as error:
         raise PredictionArtifactError(str(error)) from None
-    if descriptor.get("backend_id") != OAF_BACKEND_ID:
-        raise PredictionArtifactError("backend_id must be the OaF backend")
     for field in (
         "architecture_id",
         "model_id",
