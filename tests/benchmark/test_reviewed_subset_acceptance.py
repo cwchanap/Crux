@@ -19,6 +19,7 @@ from src.benchmark.reviewed_subset import (
     load_reviewed_subset_manifest,
     prepare_reviewed_subset,
     score_oaf_reviewed_subset,
+    score_reviewed_subset_cohort,
 )
 from tests.benchmark.reviewed_subset_fixtures import (
     ReviewedSubsetOafFixture,
@@ -478,6 +479,45 @@ def test_prepare_finalize_score_chain_rescores_exact_membership(tmp_path: Path) 
         diagnostic = strict_json_loads(line, require_canonical=True)
         assert diagnostic["cohort_id"] == outcome.cohort_id
         assert diagnostic["simfile_id"] in {str(simfile_id) for simfile_id in include_ids}
+
+
+def test_core_score_chain_publishes_subset_reports(tmp_path: Path) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path)
+    include_ids = _oaf_all_success_includes(fixture)
+    subset_path = _oaf_subset_manifest(tmp_path, fixture, include_ids=include_ids)
+
+    from src.benchmark.oaf_corpus_run import build_oaf_cohort_from_snapshot, parse_oaf_corpus_run
+    from src.benchmark.reference_set_manifest import (
+        load_reference_set_manifest,
+        preflight_reference_mappings,
+    )
+    from src.benchmark.reference_timing_manifest import load_reference_timing_manifest
+
+    reference = load_reference_set_manifest(fixture.reference_manifest_path)
+    timing = load_reference_timing_manifest(fixture.timing_manifest_path)
+    mappings = preflight_reference_mappings(
+        reference,
+        timing,
+        timing_output_root=fixture.timing_output_root,
+    )
+    parent_identity, parent_items = build_oaf_cohort_from_snapshot(
+        parse_oaf_corpus_run(fixture.run_path.read_bytes()),
+        mappings=mappings,
+        output_dir=fixture.oaf_output_dir,
+    )
+    outcome = score_reviewed_subset_cohort(
+        parent_identity,
+        parent_items,
+        reference,
+        timing,
+        load_reviewed_subset_manifest(subset_path),
+        output_dir=tmp_path / "subset-reports",
+    )
+
+    assert outcome.exit_code == 0
+    assert outcome.success_count == len(include_ids)
+    assert outcome.failed_count == 0
+    assert (tmp_path / "subset-reports" / "summary.json").exists()
 
 
 def test_prepare_finalize_score_chain_exits_1_with_non_success_member(
