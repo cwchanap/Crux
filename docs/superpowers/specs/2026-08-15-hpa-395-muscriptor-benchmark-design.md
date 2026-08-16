@@ -486,9 +486,10 @@ The core validates:
 - subset source-reference hash/version == supplied HPA-324 manifest;
 - subset source-timing hash/version == supplied HPA-323 manifest;
 - every subset member exists in the parent population;
-- output does not alias the parent's broad report directory when that constraint is supplied by the wrapper;
 - subset cohort ID derives from parent cohort ID + subset manifest SHA;
 - HPA-325 diagnostics are requested only for successful selected songs.
+
+Output-directory alias protection remains in the model-specific wrapper because only that wrapper knows the parent run's broad report path.
 
 Model-specific wrappers own only:
 
@@ -496,6 +497,8 @@ Model-specific wrappers own only:
 parse_*_corpus_run()
 snapshot ↔ supplied HPA-323/HPA-324 validation
 build_*_cohort_from_snapshot()
+parent broad-report output alias protection
+delegation
 ```
 
 Then they delegate to the shared core. No inference occurs during subset scoring.
@@ -509,8 +512,10 @@ Do **not** re-score persisted events inside HPA-395 comparison. HPA-325 already 
 ```text
 <oaf reports>/per_song.csv
 <oaf reports>/per_class.csv
+<oaf reports>/items.csv
 <muscriptor reports>/per_song.csv
 <muscriptor reports>/per_class.csv
+<muscriptor reports>/items.csv
 ```
 
 and the two run snapshots.
@@ -555,7 +560,7 @@ Join successful `per_class.csv` rows on:
 
 and emit paired per-class precision/recall/F1 deltas. Missing class support stays explicit rather than inventing a zero row unless HPA-325 already published one.
 
-Report each model's full success/failure population from its existing HPA-325 reports/run evidence, plus paired/intersection/exclusion counts. Optional reviewed-subset comparison filters the exact HPA-327 IDs before the joins.
+Report each model's full success/failure population from `items.csv`/run evidence, plus paired/intersection/exclusion counts. Optional reviewed-subset comparison filters the exact HPA-327 IDs before the joins.
 
 No significance testing, ranking, bootstrap intervals, arbitrary model labels, or second scoring path. HPA-562 can generalize later.
 
