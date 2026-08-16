@@ -17,12 +17,8 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
-from io import BytesIO
 from pathlib import Path
 from typing import Callable, Literal, TypeAlias
-
-import librosa
-import soundfile
 
 from runtime.oaf_tf1.model import OafModelConfig, load_model_config
 from src.benchmark.artifact_io import (
@@ -61,25 +57,18 @@ from src.benchmark.cohort_scoring import (
     score_cohort,
     validate_cohort_items,
 )
-from src.benchmark.corpus_cache import (
-    CacheIndexStore,
-    cache_entry_matches_remote,
-    read_verified_cache_body,
-    resolve_verified_cache_body,
-    validate_cached_body,
-)
-from src.benchmark.corpus_manifest import ManifestRowView
+from src.benchmark.corpus_cache import CacheIndexStore, ResolvedSourceAudio, resolve_source_audio
 from src.benchmark.durability import atomic_replace_bytes
-from src.benchmark.input_view import load_materialized_audio
+from src.benchmark.input_view import materialize_full_mix_audio
 from src.benchmark.mapping import map_oaf_prediction
 from src.benchmark.prediction_artifact import (
     PredictionArtifact,
     PredictionArtifactError,
+    prediction_path,
     publish_prediction_artifact,
     read_prediction_artifact,
     render_prediction_artifact,
 )
-from src.benchmark.r2_corpus_models import RemoteObject, parse_manifest_timestamp
 from src.benchmark.reference_set import ReferenceMappingResult
 from src.benchmark.reference_set_manifest import (
     LoadedReferenceSetManifest,
@@ -87,7 +76,6 @@ from src.benchmark.reference_set_manifest import (
     load_reference_set_manifest,
     preflight_reference_mappings,
 )
-from src.benchmark.reference_timing import inspect_source_audio
 from src.benchmark.reference_timing_manifest import (
     LoadedReferenceTimingManifest,
     load_reference_timing_manifest,
@@ -106,17 +94,6 @@ OAF_WORKER_CLOSE_TIMEOUT_SECONDS = 30.0
 
 OafRunStatus: TypeAlias = Literal["complete", "partial", "failed"]
 OafRunExitCode: TypeAlias = Literal[0, 1, 2]
-
-
-@dataclass(frozen=True)
-class ResolvedSourceAudio:
-    """One locally verified source-audio body and its header duration."""
-
-    path: Path
-    source_audio_id: str
-    source_audio_sha256: str
-    duration_sec: float
-    content: bytes | None = None
 
 
 # pylint: disable=too-many-instance-attributes
@@ -407,190 +384,6 @@ def build_run_id(
 
 
 # pylint: enable=too-many-arguments,too-many-positional-arguments,redefined-outer-name
-# pylint: disable=redefined-outer-name
-def prediction_path(
-    output_dir: Path,
-    *,
-    simfile_id: int,
-    source_audio_sha256: str,
-    backend_descriptor_sha256: str,
-    inference_config_sha256: str,
-) -> Path:
-    """Return the source-keyed immutable prediction-v2 location."""
-    if not isinstance(output_dir, Path):
-        raise TypeError("output_dir must be a Path")
-    if isinstance(simfile_id, bool) or not isinstance(simfile_id, int) or simfile_id <= 0:
-        raise ValueError("simfile_id must be a positive integer")
-    source_sha = _require_hash(source_audio_sha256, "source_audio_sha256")
-    descriptor_sha = _require_hash(backend_descriptor_sha256, "backend_descriptor_sha256")
-    config_sha = _require_hash(inference_config_sha256, "inference_config_sha256")
-    return (
-        output_dir
-        / "predictions"
-        / str(simfile_id)
-        / source_sha
-        / descriptor_sha
-        / f"{config_sha}.jsonl"
-    )
-
-
-# pylint: enable=redefined-outer-name
-
-
-def _remote_from_source_mapping(
-    source: Mapping[str, object],
-    *,
-    source_audio_key: str,
-) -> RemoteObject:
-    raw_objects = source.get("objects")
-    if not isinstance(raw_objects, list):
-        raise ValueError("source manifest does not contain an object inventory")
-    for raw_object in raw_objects:
-        if not isinstance(raw_object, Mapping) or raw_object.get("key") != source_audio_key:
-            continue
-        try:
-            return RemoteObject(
-                key=source_audio_key,
-                size=raw_object["size"],  # type: ignore[arg-type]
-                etag=raw_object["etag"],  # type: ignore[arg-type]
-                etag_is_weak=raw_object["etag_is_weak"],  # type: ignore[arg-type]
-                last_modified=parse_manifest_timestamp(raw_object["last_modified"]),
-                content_type=raw_object["content_type"],  # type: ignore[arg-type]
-                cache_status=raw_object["cache_status"],  # type: ignore[arg-type]
-                sha256=raw_object["sha256"],  # type: ignore[arg-type]
-                cache_path=raw_object["cache_path"],  # type: ignore[arg-type]
-            )
-        except (KeyError, TypeError, ValueError):
-            raise ValueError("source manifest contains an invalid audio object") from None
-    raise ValueError("source audio key is absent from the source inventory")
-
-
-def _source_audio_parts(
-    source: RemoteObject | ManifestRowView | Mapping[str, object],
-    *,
-    source_audio_key: str | None,
-    source_audio_content_hash: str | None,
-    source_endpoint_sha256: str | None,
-    source_bucket: str | None,
-) -> tuple[RemoteObject, str, str, str]:
-    if isinstance(source, ManifestRowView):
-        endpoint = source_endpoint_sha256 or source.source_endpoint_sha256
-        bucket = source_bucket or source.source_bucket
-        key = source_audio_key
-        if key is None:
-            raise ValueError("source_audio_key is required")
-        remote = next((item for item in source.inventory.objects if item.key == key), None)
-        if remote is None:
-            raise ValueError("source audio key is absent from the source inventory")
-        expected = source_audio_content_hash
-    elif isinstance(source, RemoteObject):
-        endpoint = source_endpoint_sha256
-        bucket = source_bucket
-        key = source_audio_key or source.key
-        remote = source
-        expected = source_audio_content_hash
-    elif isinstance(source, Mapping):
-        key = source_audio_key or source.get("source_audio_key")
-        endpoint = source_endpoint_sha256 or source.get("source_endpoint_sha256")
-        bucket = source_bucket or source.get("source_bucket")
-        expected = source_audio_content_hash
-        if not isinstance(key, str):
-            raise ValueError("source_audio_key is required")
-        remote = _remote_from_source_mapping(source, source_audio_key=key)
-    else:
-        raise TypeError("source must be a RemoteObject, ManifestRowView, or mapping")
-
-    if not isinstance(endpoint, str) or not endpoint:
-        raise ValueError("source_endpoint_sha256 is required")
-    if not isinstance(bucket, str) or not bucket:
-        raise ValueError("source_bucket is required")
-    if not isinstance(key, str) or not key:
-        raise ValueError("source_audio_key is required")
-    if not isinstance(expected, str):
-        raise ValueError("source_audio_content_hash is required")
-    require_sha256(expected, "source_audio_content_hash")
-    return remote, endpoint, bucket, expected
-
-
-# pylint: disable=too-many-arguments,too-many-locals
-def _resolve_source_audio(
-    source: RemoteObject | ManifestRowView | Mapping[str, object],
-    cache_dir: Path,
-    cache_index: CacheIndexStore | None = None,
-    *,
-    index: CacheIndexStore | None = None,
-    source_audio_key: str | None = None,
-    source_audio_content_hash: str | None = None,
-    source_endpoint_sha256: str | None = None,
-    source_bucket: str | None = None,
-    load_body: bool = True,
-) -> ResolvedSourceAudio:
-    """Resolve one source body from the verified local HPA-321 cache only.
-
-    When *load_body* is ``False`` the verified path, digest, and duration are
-    resolved but the full audio body is not read into memory.  The caller may
-    read the body later from ``path`` (e.g. during per-item materialization) to
-    avoid retaining corpus-sized byte arrays on every execution state.
-    """
-    if not isinstance(cache_dir, Path):
-        raise TypeError("cache_dir must be a Path")
-    if cache_index is not None and index is not None and cache_index is not index:
-        raise ValueError("cache index arguments disagree")
-    cache_index = cache_index or index or CacheIndexStore.load(cache_dir)
-    remote, endpoint, bucket, expected = _source_audio_parts(
-        source,
-        source_audio_key=source_audio_key,
-        source_audio_content_hash=source_audio_content_hash,
-        source_endpoint_sha256=source_endpoint_sha256,
-        source_bucket=source_bucket,
-    )
-
-    verified_remote = remote
-    if remote.cache_status != "verified":
-        entry = cache_index.get(endpoint, bucket, remote.key)
-        if not cache_entry_matches_remote(entry, remote, endpoint=endpoint, bucket=bucket):
-            raise ValueError("verified source audio unavailable")
-        validation = validate_cached_body(cache_dir, entry)
-        if validation.state != "verified" or entry is None:
-            raise ValueError("verified source audio unavailable")
-        verified_remote = replace(
-            remote,
-            cache_status="verified",
-            sha256=entry.sha256,
-            cache_path=entry.cache_path,
-        )
-
-    if verified_remote.sha256 != expected:
-        raise ValueError("source audio digest does not match reference timing manifest")
-    path = resolve_verified_cache_body(
-        cache_dir,
-        verified_remote,
-        source_endpoint_sha256=endpoint,
-        bucket=bucket,
-        expected_sha256=expected,
-    )
-    content = (
-        read_verified_cache_body(
-            cache_dir,
-            verified_remote,
-            source_endpoint_sha256=endpoint,
-            bucket=bucket,
-            expected_sha256=expected,
-        )
-        if load_body
-        else None
-    )
-    duration_sec = inspect_source_audio(path).duration_sec
-    return ResolvedSourceAudio(
-        path=path,
-        source_audio_id=remote.key,
-        source_audio_sha256=expected,
-        duration_sec=duration_sec,
-        content=content,
-    )
-
-
-# pylint: enable=too-many-arguments,too-many-locals
 
 
 def _materialize_oaf_full_mix(
@@ -600,44 +393,21 @@ def _materialize_oaf_full_mix(
     input_root: Path,
     config: OafModelConfig,
 ) -> CanonicalAudio:
-    """Materialize one temporary, canonical OaF full-mix input."""
-    if not isinstance(source_audio, ResolvedSourceAudio):
-        raise TypeError("source_audio must be ResolvedSourceAudio")
-    if not isinstance(output_path, Path) or not isinstance(input_root, Path):
-        raise TypeError("output_path and input_root must be Paths")
+    """Validate OaF config before calling the model-neutral materializer."""
     if not isinstance(config, OafModelConfig):
         raise TypeError("config must be OafModelConfig")
-    root = input_root.resolve()
-    destination = output_path.resolve()
-    try:
-        destination.relative_to(root)
-    except ValueError:
-        raise ValueError("canonical input must be beneath input_root") from None
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    source_input = (
-        BytesIO(source_audio.content) if source_audio.content is not None else source_audio.path
-    )
-    samples, _ = librosa.load(
-        source_input,
-        sr=44100,
-        mono=True,
-        res_type="soxr_hq",
-    )
-    soundfile.write(
+    return materialize_full_mix_audio(
+        source_audio,
         output_path,
-        samples,
-        44100,
-        format="WAV",
-        subtype="PCM_16",
-    )
-    return load_materialized_audio(
-        path=output_path,
-        source_audio_id=source_audio.source_audio_id,
-        source_audio_sha256=source_audio.source_audio_sha256,
+        input_root=input_root,
         input_view_id=OAF_FULL_MIX_INPUT_VIEW_ID,
         max_input_audio_frames=config.max_input_audio_frames,
     )
+
+
+def _resolve_source_audio(*args: object, **kwargs: object) -> ResolvedSourceAudio:
+    """Route OaF source resolution through the shared cache seam."""
+    return resolve_source_audio(*args, **kwargs)
 
 
 def classify_oaf_backend_error(code: str) -> tuple[str | None, str]:
@@ -1952,14 +1722,12 @@ __all__ = [
     "RUNNER_FAILURE_TO_COHORT_REASON",
     "OafCorpusRunOutcome",
     "OafCorpusRunRequest",
-    "ResolvedSourceAudio",
     "build_inference_config",
     "build_run_id",
     "classify_oaf_backend_error",
     "compute_model_lock_sha256",
     "inference_config_sha256",
     "parse_oaf_corpus_run",
-    "prediction_path",
     "render_oaf_corpus_run",
     "run_oaf_corpus",
     "write_oaf_corpus_run",

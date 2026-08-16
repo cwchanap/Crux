@@ -4,12 +4,17 @@ import os
 import stat
 import struct
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Literal
+
+import librosa
+import soundfile
 
 from src.benchmark.artifact_io import read_regular_file_no_follow
 from src.benchmark.backend_identity import require_sha256, sha256_hex, strict_json_loads
 from src.benchmark.backends import CanonicalAudio
+from src.benchmark.corpus_cache import ResolvedSourceAudio
 
 _MANIFEST_SCHEMA = "crux.input-view-manifest/v1"
 _MANIFEST_KEYS = frozenset(
@@ -194,6 +199,41 @@ def load_materialized_audio(
         channel_count=wav.channel_count,
         sample_width_bytes=wav.sample_width_bytes,
         audio_frame_count=wav.audio_frame_count,
+    )
+
+
+def materialize_full_mix_audio(
+    source_audio: ResolvedSourceAudio,
+    output_path: Path,
+    *,
+    input_root: Path,
+    input_view_id: str,
+    max_input_audio_frames: int | None,
+) -> CanonicalAudio:
+    """Materialize one temporary canonical audio input beneath ``input_root``."""
+    if not isinstance(source_audio, ResolvedSourceAudio):
+        raise TypeError("source_audio must be ResolvedSourceAudio")
+    if not isinstance(output_path, Path) or not isinstance(input_root, Path):
+        raise TypeError("output_path and input_root must be Paths")
+    root = input_root.resolve()
+    destination = output_path.resolve()
+    try:
+        destination.relative_to(root)
+    except ValueError:
+        raise ValueError("canonical input must be beneath input_root") from None
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    source_input = (
+        BytesIO(source_audio.content) if source_audio.content is not None else source_audio.path
+    )
+    samples, _ = librosa.load(source_input, sr=44100, mono=True, res_type="soxr_hq")
+    soundfile.write(output_path, samples, 44100, format="WAV", subtype="PCM_16")
+    return load_materialized_audio(
+        path=output_path,
+        source_audio_id=source_audio.source_audio_id,
+        source_audio_sha256=source_audio.source_audio_sha256,
+        input_view_id=input_view_id,
+        max_input_audio_frames=max_input_audio_frames,
     )
 
 

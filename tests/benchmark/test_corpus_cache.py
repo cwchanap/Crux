@@ -3,6 +3,7 @@ import errno
 import json
 import os
 import stat
+import struct
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -18,11 +19,13 @@ import pytest
 from src.benchmark.corpus_cache import (
     CacheIndexEntry,
     CacheIndexStore,
+    ResolvedSourceAudio,
     _open_regular_file_at,
     cache_writer_lock,
     is_chart_key,
     is_selected,
     is_set_def_key,
+    resolve_source_audio,
     resolve_verified_cache_body,
     sync_cache,
     sync_explicit_cache_keys,
@@ -283,6 +286,58 @@ def install_cached_body(cache_dir: Path, body: bytes = b"chart") -> Path:
     path.parent.mkdir(parents=True)
     path.write_bytes(body)
     return path
+
+
+def test_resolve_source_audio_returns_verified_body_and_duration(tmp_path: Path) -> None:
+    data = b"\0\0" * 441
+    fmt = struct.pack("<HHIIHH", 1, 1, 44100, 88200, 2, 16)
+    chunks = b"fmt " + struct.pack("<I", len(fmt)) + fmt
+    chunks += b"data" + struct.pack("<I", len(data)) + data
+    content = b"RIFF" + struct.pack("<I", 4 + len(chunks)) + b"WAVE" + chunks
+    digest = sha256(content).hexdigest()
+    cache_path = tmp_path / "sha256" / digest[:2] / digest
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_bytes(content)
+    remote = RemoteObject(
+        key="42/audio.wav",
+        size=len(content),
+        etag="etag",
+        etag_is_weak=False,
+        last_modified=FIXED_MTIME,
+        content_type="audio/wav",
+        cache_status="verified",
+        sha256=digest,
+        cache_path=cache_path.relative_to(tmp_path).as_posix(),
+    )
+
+    resolved = resolve_source_audio(
+        remote,
+        tmp_path,
+        CacheIndexStore(tmp_path, {}),
+        source_endpoint_sha256="a" * 64,
+        source_bucket="simfile-dtx",
+        source_audio_content_hash=digest,
+    )
+
+    assert isinstance(resolved, ResolvedSourceAudio)
+    assert resolved.path == cache_path
+    assert resolved.source_audio_id == "42/audio.wav"
+    assert resolved.source_audio_sha256 == digest
+    assert resolved.duration_sec == pytest.approx(0.01)
+    assert resolved.content == content
+
+    without_body = resolve_source_audio(
+        remote,
+        tmp_path,
+        CacheIndexStore(tmp_path, {}),
+        source_endpoint_sha256="a" * 64,
+        source_bucket="simfile-dtx",
+        source_audio_content_hash=digest,
+        load_body=False,
+    )
+    assert without_body.path == cache_path
+    assert without_body.duration_sec == pytest.approx(0.01)
+    assert without_body.content is None
 
 
 def assert_verified_body_unavailable(

@@ -84,6 +84,38 @@ class PredictionArtifactError(ValueError):
     pass
 
 
+def _require_hash(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        raise StrictJsonError(f"{field} must be lowercase SHA-256")
+    return require_sha256(value, field)
+
+
+def prediction_path(
+    output_dir: Path,
+    *,
+    simfile_id: int,
+    source_audio_sha256: str,
+    backend_descriptor_sha256: str,
+    inference_config_sha256: str,
+) -> Path:
+    """Return the source-keyed immutable prediction-v2 location."""
+    if not isinstance(output_dir, Path):
+        raise TypeError("output_dir must be a Path")
+    if isinstance(simfile_id, bool) or not isinstance(simfile_id, int) or simfile_id <= 0:
+        raise ValueError("simfile_id must be a positive integer")
+    source_sha = _require_hash(source_audio_sha256, "source_audio_sha256")
+    descriptor_sha = _require_hash(backend_descriptor_sha256, "backend_descriptor_sha256")
+    config_sha = _require_hash(inference_config_sha256, "inference_config_sha256")
+    return (
+        output_dir
+        / "predictions"
+        / str(simfile_id)
+        / source_sha
+        / descriptor_sha
+        / f"{config_sha}.jsonl"
+    )
+
+
 @dataclass(frozen=True)
 class MappedPredictionEvent:
     native: NativeEvent
@@ -589,6 +621,7 @@ __all__ = [
     "PredictionArtifact",
     "PredictionArtifactError",
     "PREDICTION_SCHEMA",
+    "prediction_path",
     "publish_prediction_artifact",
     "read_prediction_artifact",
     "render_prediction_artifact",

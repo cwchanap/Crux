@@ -26,8 +26,14 @@ from src.benchmark.cohort_scoring import (
     CohortIdentity,
     validate_cohort_items,
 )
-from src.benchmark.corpus_cache import CacheIndexEntry, CacheIndexStore
+from src.benchmark.corpus_cache import (
+    CacheIndexEntry,
+    CacheIndexStore,
+    ResolvedSourceAudio,
+    resolve_source_audio,
+)
 from src.benchmark.corpus_manifest import render_manifest
+from src.benchmark.input_view import materialize_full_mix_audio
 from src.benchmark.oaf_corpus_run import (
     OAF_BACKEND_ERROR_POLICY,
     OAF_CANONICALIZATION_REVISION,
@@ -39,11 +45,8 @@ from src.benchmark.oaf_corpus_run import (
     RUNNER_FAILURE_TO_COHORT_REASON,
     OafCorpusRunOutcome,
     OafCorpusRunRequest,
-    ResolvedSourceAudio,
     _cohort_item_from_run_row,
-    _materialize_oaf_full_mix,
     _project_runtime,
-    _resolve_source_audio,
     _validate_scope,
     build_inference_config,
     build_oaf_cohort_from_snapshot,
@@ -52,10 +55,10 @@ from src.benchmark.oaf_corpus_run import (
     compute_model_lock_sha256,
     inference_config_sha256,
     parse_oaf_corpus_run,
-    prediction_path,
     render_oaf_corpus_run,
     write_oaf_corpus_run,
 )
+from src.benchmark.prediction_artifact import prediction_path
 from src.benchmark.r2_corpus_models import RemoteObject
 from src.benchmark.reference_set import ReferenceMappingResult, map_reference_events
 from src.benchmark.reference_set_manifest import (
@@ -419,7 +422,7 @@ def test_resolve_source_audio_uses_carried_verified_remote_and_probes_duration(
         cache_path=path.relative_to(tmp_path).as_posix(),
     )
 
-    resolved = _resolve_source_audio(
+    resolved = resolve_source_audio(
         remote,
         tmp_path,
         CacheIndexStore(tmp_path, {}),
@@ -446,7 +449,7 @@ def test_resolve_source_audio_requires_hpa323_timing_hash(
     )
 
     with pytest.raises(ValueError, match="source_audio_content_hash is required"):
-        _resolve_source_audio(
+        resolve_source_audio(
             remote,
             tmp_path,
             CacheIndexStore(tmp_path, {}),
@@ -473,7 +476,7 @@ def test_resolve_source_audio_rehydrates_matching_stale_cache_index_entry(
         cache_path=path.relative_to(tmp_path).as_posix(),
     )
 
-    resolved = _resolve_source_audio(
+    resolved = resolve_source_audio(
         remote,
         tmp_path,
         CacheIndexStore(tmp_path, {(SHA_B, "simfile-dtx", remote.key): entry}),
@@ -504,7 +507,7 @@ def test_resolve_source_audio_rejects_changed_remote_identity(tmp_path: Path) ->
     )
 
     with pytest.raises(ValueError, match="verified source audio unavailable"):
-        _resolve_source_audio(
+        resolve_source_audio(
             remote,
             tmp_path,
             CacheIndexStore(tmp_path, {(SHA_B, "simfile-dtx", remote.key): entry}),
@@ -539,7 +542,7 @@ def test_resolve_source_audio_rejects_missing_or_corrupt_cache_body(
     )
 
     with pytest.raises(ValueError, match="verified source audio unavailable"):
-        _resolve_source_audio(
+        resolve_source_audio(
             remote,
             tmp_path,
             CacheIndexStore(tmp_path, {(SHA_B, "simfile-dtx", remote.key): entry}),
@@ -585,7 +588,7 @@ def test_resolve_source_audio_rejects_digest_mismatch_against_timing_manifest(
     )
 
     with pytest.raises(ValueError, match="digest does not match"):
-        _resolve_source_audio(
+        resolve_source_audio(
             remote,
             tmp_path,
             CacheIndexStore(tmp_path, {}),
@@ -606,15 +609,15 @@ def test_resolve_source_audio_duration_probe_failure_is_item_local(
         digest=digest,
         cache_path=path.relative_to(tmp_path).as_posix(),
     )
-    import src.benchmark.oaf_corpus_run as run_module
+    import src.benchmark.corpus_cache as cache_module
 
     def fail_probe(_: Path):
         raise OSError("unreadable source audio")
 
-    monkeypatch.setattr(run_module, "inspect_source_audio", fail_probe)
+    monkeypatch.setattr(cache_module, "inspect_source_audio", fail_probe)
 
     with pytest.raises(OSError, match="unreadable source audio"):
-        _resolve_source_audio(
+        resolve_source_audio(
             remote,
             tmp_path,
             CacheIndexStore(tmp_path, {}),
@@ -647,11 +650,10 @@ def test_materialize_oaf_full_mix_uses_pinned_resampling_and_canonical_wav(
     )
     input_root = tmp_path / "inputs"
     output_path = input_root / "42" / "full-mix.wav"
-    config = load_model_config()
-    import src.benchmark.oaf_corpus_run as run_module
+    import src.benchmark.input_view as input_view_module
 
-    original_load = run_module.librosa.load
-    original_write = run_module.soundfile.write
+    original_load = input_view_module.librosa.load
+    original_write = input_view_module.soundfile.write
     load_calls: list[tuple[Path, dict[str, object]]] = []
     write_calls: list[tuple[Path, int, dict[str, object]]] = []
 
@@ -663,14 +665,15 @@ def test_materialize_oaf_full_mix_uses_pinned_resampling_and_canonical_wav(
         write_calls.append((path, samplerate, kwargs))
         original_write(path, data, samplerate, **kwargs)
 
-    monkeypatch.setattr(run_module.librosa, "load", wrapped_load)
-    monkeypatch.setattr(run_module.soundfile, "write", wrapped_write)
+    monkeypatch.setattr(input_view_module.librosa, "load", wrapped_load)
+    monkeypatch.setattr(input_view_module.soundfile, "write", wrapped_write)
 
-    audio = _materialize_oaf_full_mix(
+    audio = materialize_full_mix_audio(
         source,
         output_path=output_path,
         input_root=input_root,
-        config=config,
+        input_view_id=OAF_FULL_MIX_INPUT_VIEW_ID,
+        max_input_audio_frames=None,
     )
 
     assert isinstance(audio, CanonicalAudio)
@@ -706,7 +709,7 @@ def test_materialize_uses_verified_source_bytes_after_cache_path_replacement(
         digest=digest,
         cache_path=source_path.relative_to(tmp_path).as_posix(),
     )
-    resolved = _resolve_source_audio(
+    resolved = resolve_source_audio(
         remote,
         tmp_path,
         CacheIndexStore(tmp_path, {}),
@@ -717,9 +720,9 @@ def test_materialize_uses_verified_source_bytes_after_cache_path_replacement(
     source_path.write_bytes(_source_wav_bytes(frames=44100))
     assert getattr(resolved, "content", None) == original_content
 
-    import src.benchmark.oaf_corpus_run as run_module
+    import src.benchmark.input_view as input_view_module
 
-    original_load = run_module.librosa.load
+    original_load = input_view_module.librosa.load
     load_inputs: list[object] = []
 
     def wrapped_load(source: object, **kwargs: object):
@@ -732,13 +735,14 @@ def test_materialize_uses_verified_source_bytes_after_cache_path_replacement(
             assert source.read_bytes() == original_content  # type: ignore[union-attr]
         return original_load(source, **kwargs)
 
-    monkeypatch.setattr(run_module.librosa, "load", wrapped_load)
+    monkeypatch.setattr(input_view_module.librosa, "load", wrapped_load)
     output_path = tmp_path / "inputs" / "42" / "full-mix.wav"
-    audio = _materialize_oaf_full_mix(
+    audio = materialize_full_mix_audio(
         resolved,
         output_path=output_path,
         input_root=tmp_path / "inputs",
-        config=load_model_config(),
+        input_view_id=OAF_FULL_MIX_INPUT_VIEW_ID,
+        max_input_audio_frames=None,
     )
 
     assert isinstance(audio, CanonicalAudio)
