@@ -156,6 +156,7 @@ class MuscriptorCorpusRunOutcome:
     projected_full_wall_time_sec: float | None
     peak_process_rss_bytes: int | None = None
     device_peak_memory_bytes: int | None = None
+    fatal_reason: str | None = None
 
     def __post_init__(self) -> None:
         if self.overall_status not in {"complete", "partial", "failed"}:
@@ -186,6 +187,10 @@ class MuscriptorCorpusRunOutcome:
                 isinstance(value, bool) or not isinstance(value, int) or value < 0
             ):
                 raise ValueError(f"{field} must be a nonnegative integer or None")
+        if self.fatal_reason is not None and (
+            not isinstance(self.fatal_reason, str) or not self.fatal_reason
+        ):
+            raise ValueError("fatal_reason must be a nonempty string or None")
 
 
 MUSCRIPTOR_BACKEND_ERROR_POLICY: dict[str, tuple[str | None, str]] = {
@@ -194,7 +199,7 @@ MUSCRIPTOR_BACKEND_ERROR_POLICY: dict[str, tuple[str | None, str]] = {
     "invalid_request": ("inference_failed", "item_local"),
     "backend_closed": ("worker_protocol_failed", "poison"),
     "worker_error": ("worker_protocol_failed", "poison"),
-    "worker_start_failed": ("backend_unavailable", "poison"),
+    "worker_start_failed": (None, "fatal_preflight"),
     "backend_unavailable": ("backend_unavailable", "poison"),
     "worker_response_invalid": ("worker_protocol_failed", "poison"),
     "descriptor_invalid": (None, "fatal_preflight"),
@@ -813,6 +818,7 @@ def _write_snapshot_checkpoint(
     runtime: Mapping[str, object] | None = None,
     peak_process_rss_bytes: int | None = None,
     device_peak_memory_bytes: int | None = None,
+    fatal_reason: str | None = None,
 ) -> None:
     snapshot: dict[str, object] = dict(header)
     snapshot["items"] = [
@@ -827,6 +833,8 @@ def _write_snapshot_checkpoint(
         snapshot["close_error"] = dict(close_error)
     if runtime:
         snapshot.update(runtime)
+    if fatal_reason is not None:
+        snapshot["fatal_reason"] = fatal_reason
     if overall_status is not None:
         snapshot["peak_process_rss_bytes"] = peak_process_rss_bytes
         snapshot["device_peak_memory_bytes"] = device_peak_memory_bytes
@@ -1206,12 +1214,17 @@ def _build_run_header(
     }
 
 
-def _fatal_outcome() -> MuscriptorCorpusRunOutcome:
+def _fatal_outcome(
+    *,
+    fatal_reason: str | None = None,
+    run_id: str | None = None,
+    run_path: Path | None = None,
+) -> MuscriptorCorpusRunOutcome:
     return MuscriptorCorpusRunOutcome(
         overall_status="failed",
         exit_code=2,
-        run_id=None,
-        run_path=None,
+        run_id=run_id,
+        run_path=run_path,
         reports_path=None,
         success_count=0,
         failed_count=0,
@@ -1219,6 +1232,7 @@ def _fatal_outcome() -> MuscriptorCorpusRunOutcome:
         quarantined_count=0,
         aggregate_rtf=None,
         projected_full_wall_time_sec=None,
+        fatal_reason=fatal_reason,
     )
 
 
@@ -1563,6 +1577,7 @@ def run_muscriptor_corpus(
     backend_descriptor = descriptor
     stop_after_poison = False
     fatal_backend_error = False
+    fatal_reason: str | None = None
     fatal_run_error = False
     interrupted_error: BaseException | None = None
     close_error: dict[str, str] | None = None
@@ -1750,9 +1765,10 @@ def run_muscriptor_corpus(
                             )
                     except MuscriptorBackendError:
                         raise
-                    except (OSError, RuntimeError, TypeError, ValueError) as error:
+                    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
                         raise MuscriptorBackendError(
-                            _bounded_error(error), code="worker_start_failed"
+                            f"backend construction failed: {_bounded_error(error)}",
+                            code="worker_start_failed",
                         ) from error
 
                 started = perf_counter()
@@ -1792,6 +1808,7 @@ def run_muscriptor_corpus(
                 runner_code, disposition = classify_muscriptor_backend_error(error.code)
                 if disposition == "fatal_preflight":
                     fatal_backend_error = True
+                    fatal_reason = f"{error.code}: {_bounded_error(error)}"
                     stop_after_poison = True
                     _set_failed(item, "backend_unavailable", error)
                 else:
@@ -1876,9 +1893,17 @@ def run_muscriptor_corpus(
             runtime=runtime,
             peak_process_rss_bytes=peak_process_rss,
             device_peak_memory_bytes=device_peak_memory,
+            fatal_reason=fatal_reason,
         )
     except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError):
         return _fatal_outcome()
+
+    if fatal_backend_error:
+        return _fatal_outcome(
+            fatal_reason=fatal_reason,
+            run_id=run_id,
+            run_path=run_path,
+        )
 
     try:
         final_snapshot = parse_muscriptor_corpus_run(

@@ -14,6 +14,8 @@ from typing import Literal
 
 from src.benchmark.artifact_io import read_regular_file_no_follow
 from src.benchmark.backend_identity import (
+    MUSCRIPTOR_BACKEND_ID,
+    OAF_BACKEND_ID,
     StrictJsonError,
     canonical_json_bytes,
     require_sha256,
@@ -207,6 +209,7 @@ class ComparisonOutcome:
 class _RunIdentity:
     cohort_id: str
     model_id: str
+    backend_id: str
     model_lock_sha256: str
     prediction_map_version: str
     input_view_id: str
@@ -481,7 +484,9 @@ def _parse_run_identity(snapshot: Mapping[str, object]) -> _RunIdentity:
     cohort_id = _text(snapshot.get("run_id"), "run_id")
     descriptor = snapshot.get("backend_descriptor")
     descriptor_model = descriptor.get("model_id") if isinstance(descriptor, Mapping) else None
+    descriptor_backend = descriptor.get("backend_id") if isinstance(descriptor, Mapping) else None
     model_id = _text(snapshot.get("model_id", descriptor_model), "model_id")
+    backend_id = _text(descriptor_backend, "backend_descriptor.backend_id")
     inference_config = snapshot.get("inference_config")
     configured_map = (
         inference_config.get("prediction_map_version")
@@ -506,6 +511,7 @@ def _parse_run_identity(snapshot: Mapping[str, object]) -> _RunIdentity:
     return _RunIdentity(
         cohort_id,
         model_id,
+        backend_id,
         _hash(snapshot.get("model_lock_sha256"), "model_lock_sha256"),
         _text(prediction_map, "prediction_map_version"),
         _text(input_view, "input_view_id"),
@@ -623,6 +629,14 @@ def _validate_manifest_lineage(
         identity.reference_timing_version,
     ) != (timing_sha, timing_version):
         _fail("run snapshot reference timing identity does not match supplied manifest")
+
+
+def _validate_backend_family(
+    identity: _RunIdentity, *, expected_backend_id: str, argument: str
+) -> None:
+    if identity.backend_id != expected_backend_id:
+        family = "OaF" if expected_backend_id == OAF_BACKEND_ID else "MuScriptor"
+        _fail(f"{argument} must contain {family} backend identity")
 
 
 def _validate_pair_run_identity(oaf: _RunIdentity, muscriptor: _RunIdentity) -> None:
@@ -879,12 +893,12 @@ def _summary(
         "models": {
             "oaf": {
                 **oaf.identity.report_values(),
-                "population": _population(oaf, selected_ids),
+                "population": _population(oaf, None),
                 "runtime": _runtime(oaf.snapshot),
             },
             "muscriptor": {
                 **muscriptor.identity.report_values(),
-                "population": _population(muscriptor, selected_ids),
+                "population": _population(muscriptor, None),
                 "runtime": _runtime(muscriptor.snapshot),
             },
         },
@@ -993,6 +1007,16 @@ def compare_oaf_muscriptor(request: ComparisonRequest) -> ComparisonOutcome:
         timing_manifest = load_reference_timing_manifest(request.timing_manifest_path)
         oaf = _load_evidence(request.oaf_run_path)
         muscriptor = _load_evidence(request.muscriptor_run_path)
+        _validate_backend_family(
+            oaf.identity,
+            expected_backend_id=OAF_BACKEND_ID,
+            argument="--oaf-run",
+        )
+        _validate_backend_family(
+            muscriptor.identity,
+            expected_backend_id=MUSCRIPTOR_BACKEND_ID,
+            argument="--muscriptor-run",
+        )
         _validate_manifest_lineage(oaf, reference_manifest, timing_manifest)
         _validate_manifest_lineage(muscriptor, reference_manifest, timing_manifest)
         _validate_pair_run_identity(oaf.identity, muscriptor.identity)
@@ -1039,19 +1063,10 @@ def compare_oaf_muscriptor(request: ComparisonRequest) -> ComparisonOutcome:
     )
 
 
-# The aliases keep the module's public vocabulary usable from small callers while
-# the CLI and current tests use the concise request/function names above.
-MuscriptorComparisonRequest = ComparisonRequest
-MuscriptorComparisonOutcome = ComparisonOutcome
-compare_published_reports = compare_oaf_muscriptor
-
 __all__ = [
     "COMPARISON_SCHEMA",
     "ComparisonIntegrityError",
     "ComparisonOutcome",
     "ComparisonRequest",
-    "MuscriptorComparisonOutcome",
-    "MuscriptorComparisonRequest",
     "compare_oaf_muscriptor",
-    "compare_published_reports",
 ]

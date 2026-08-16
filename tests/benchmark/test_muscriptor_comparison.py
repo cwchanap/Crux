@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from src.benchmark.backend_identity import MUSCRIPTOR_BACKEND_ID, OAF_BACKEND_ID
 from src.benchmark.muscriptor_comparison import (
     ComparisonIntegrityError,
     ComparisonRequest,
@@ -104,7 +105,19 @@ def _snapshot(
     input_audio: str = "c" * 64,
     source_audio: str = "d" * 64,
     disposition: str = "inferred",
+    item_ids: tuple[int, ...] = (1,),
+    item_dispositions: dict[int, str] | None = None,
 ) -> bytes:
+    dispositions = item_dispositions or {simfile_id: disposition for simfile_id in item_ids}
+    items = [
+        {
+            "simfile_id": simfile_id,
+            "execution_disposition": dispositions[simfile_id],
+            "source_audio_sha256": source_audio,
+            "input_audio_sha256": input_audio,
+        }
+        for simfile_id in item_ids
+    ]
     snapshot = {
         "schema": schema,
         "run_id": run_id,
@@ -112,23 +125,23 @@ def _snapshot(
         "reference_manifest_version": "hpa324-v1",
         "reference_timing_manifest_sha256": "b" * 64,
         "reference_timing_version": "hpa323-v1",
+        "backend_descriptor": {
+            "backend_id": OAF_BACKEND_ID
+            if schema == OAF_CORPUS_RUN_SCHEMA
+            else MUSCRIPTOR_BACKEND_ID
+        },
         "model_id": model_id,
         "model_lock_sha256": model_lock,
         "prediction_map_version": prediction_map,
         "input_view_id": input_view,
-        "items": [
-            {
-                "simfile_id": 1,
-                "execution_disposition": disposition,
-                "source_audio_sha256": source_audio,
-                "input_audio_sha256": input_audio,
-            }
-        ],
+        "items": items,
         "overall_status": "complete",
-        "success_count": 1 if disposition == "inferred" else 0,
-        "failed_count": 1 if disposition == "failed" else 0,
-        "skipped_count": 1 if disposition == "skipped" else 0,
-        "quarantined_count": 1 if disposition == "quarantined" else 0,
+        "success_count": sum(dispositions[simfile_id] == "inferred" for simfile_id in item_ids),
+        "failed_count": sum(dispositions[simfile_id] == "failed" for simfile_id in item_ids),
+        "skipped_count": sum(dispositions[simfile_id] == "skipped" for simfile_id in item_ids),
+        "quarantined_count": sum(
+            dispositions[simfile_id] == "quarantined" for simfile_id in item_ids
+        ),
     }
     if schema == OAF_CORPUS_RUN_SCHEMA:
         return render_oaf_corpus_run(snapshot)
@@ -143,7 +156,7 @@ def _write_run(
     schema: str,
     lock: str,
     prediction_map: str,
-    **kwargs: str,
+    **kwargs: object,
 ) -> Path:
     run_path = root / "run.json"
     run_path.parent.mkdir(parents=True)
@@ -169,7 +182,15 @@ def _write_csv(path: Path, fields: tuple[str, ...], rows: list[dict[str, str]]) 
 
 
 def _reports(
-    root: Path, cohort: str, model: str, lock: str, prediction_map: str, *, precision: str
+    root: Path,
+    cohort: str,
+    model: str,
+    lock: str,
+    prediction_map: str,
+    *,
+    precision: str,
+    item_ids: tuple[int, ...] = (1,),
+    failed_item_ids: frozenset[int] = frozenset(),
 ):
     reports = root / "reports"
     identity = {
@@ -187,14 +208,15 @@ def _reports(
             {
                 **{field: "" for field in _ITEM_FIELDS},
                 "cohort_id": cohort,
-                "simfile_id": "1",
-                "status": "success",
+                "simfile_id": str(simfile_id),
+                "status": "failed" if simfile_id in failed_item_ids else "success",
                 "reference_native_event_count": "1",
                 "reference_common_event_count": "1",
                 "reference_ignored_event_count": "0",
                 "reference_unmapped_event_count": "0",
                 "reference_duplicate_collapsed_count": "0",
             }
+            for simfile_id in item_ids
         ],
     )
     _write_csv(
@@ -218,7 +240,9 @@ def _reports(
                 "offset_ms": "0",
                 "warnings": "",
             }
-        ],
+        ]
+        if 1 not in failed_item_ids
+        else [],
     )
     _write_csv(
         reports / "per_class.csv",
@@ -239,7 +263,9 @@ def _reports(
                 "recall": "0.5",
                 "f1": "0.5",
             }
-        ],
+        ]
+        if 1 not in failed_item_ids
+        else [],
     )
 
 
@@ -316,6 +342,87 @@ def test_compare_joins_published_song_and_class_rows_without_rescoring(
     assert "summary.md" in {path.name for path in result.output_dir.iterdir()}
 
 
+def test_subset_filters_pairing_but_keeps_full_model_populations(
+    tmp_path: Path,
+    manifest_loaders,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    oaf_root = tmp_path / "oaf"
+    muscriptor_root = tmp_path / "muscriptor"
+    common_kwargs = {
+        "item_ids": (1, 2),
+        "item_dispositions": {1: "inferred", 2: "failed"},
+    }
+    oaf = _write_run(
+        oaf_root,
+        model="oaf-model",
+        run_id="oaf-run",
+        schema=OAF_CORPUS_RUN_SCHEMA,
+        lock="e" * 64,
+        prediction_map="oaf-map",
+        **common_kwargs,
+    )
+    muscriptor = _write_run(
+        muscriptor_root,
+        model="muscriptor-model",
+        run_id="muscriptor-run",
+        schema=MUSCRIPTOR_CORPUS_RUN_SCHEMA,
+        lock="f" * 64,
+        prediction_map="muscriptor-map",
+        **common_kwargs,
+    )
+    _reports(
+        oaf_root,
+        "oaf-run",
+        "oaf-model",
+        "e" * 64,
+        "oaf-map",
+        precision="0.5",
+        item_ids=(1, 2),
+        failed_item_ids=frozenset({2}),
+    )
+    _reports(
+        muscriptor_root,
+        "muscriptor-run",
+        "muscriptor-model",
+        "f" * 64,
+        "muscriptor-map",
+        precision="0.8",
+        item_ids=(1, 2),
+        failed_item_ids=frozenset({2}),
+    )
+
+    import src.benchmark.muscriptor_comparison as comparison
+
+    monkeypatch.setattr(
+        comparison,
+        "load_reviewed_subset_manifest",
+        lambda _path: SimpleNamespace(
+            source_reference_manifest_sha256="a" * 64,
+            source_reference_manifest_version="hpa324-v1",
+            source_timing_manifest_sha256="b" * 64,
+            source_timing_manifest_version="hpa323-v1",
+            rows=(SimpleNamespace(view=SimpleNamespace(simfile_id=1)),),
+        ),
+    )
+    result = compare_oaf_muscriptor(
+        _request(tmp_path, oaf, muscriptor, subset=tmp_path / "subset.json")
+    )
+
+    summary = json.loads((result.output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["models"]["oaf"]["population"] == {
+        "total_count": 2,
+        "eligible_count": 2,
+        "success_count": 1,
+        "failed_count": 1,
+        "skipped_count": 0,
+        "quarantined_count": 0,
+    }
+    assert summary["models"]["muscriptor"]["population"] == summary["models"]["oaf"]["population"]
+    assert summary["subset_manifest"] == str(tmp_path / "subset.json")
+    assert result.pairable_success_count == 1
+
+
 def test_compare_rejects_duplicate_score_keys_and_bad_numbers(
     tmp_path: Path, manifest_loaders
 ) -> None:
@@ -361,6 +468,53 @@ def test_compare_rejects_duplicate_score_keys_and_bad_numbers(
         encoding="utf-8",
     )
     with pytest.raises(ComparisonIntegrityError, match="numeric"):
+        compare_oaf_muscriptor(_request(tmp_path, oaf, muscriptor))
+
+
+@pytest.mark.parametrize(
+    ("oaf_schema", "muscriptor_schema", "message"),
+    [
+        (MUSCRIPTOR_CORPUS_RUN_SCHEMA, OAF_CORPUS_RUN_SCHEMA, "--oaf-run.*OaF"),
+        (OAF_CORPUS_RUN_SCHEMA, OAF_CORPUS_RUN_SCHEMA, "--muscriptor-run.*MuScriptor"),
+        (MUSCRIPTOR_CORPUS_RUN_SCHEMA, MUSCRIPTOR_CORPUS_RUN_SCHEMA, "--oaf-run.*OaF"),
+    ],
+)
+def test_compare_rejects_swapped_or_same_family_runs(
+    tmp_path: Path,
+    manifest_loaders,
+    oaf_schema: str,
+    muscriptor_schema: str,
+    message: str,
+) -> None:
+    oaf_root = tmp_path / "oaf"
+    muscriptor_root = tmp_path / "muscriptor"
+    oaf = _write_run(
+        oaf_root,
+        model="oaf-model",
+        run_id="oaf-run",
+        schema=oaf_schema,
+        lock="e" * 64,
+        prediction_map="oaf-map",
+    )
+    muscriptor = _write_run(
+        muscriptor_root,
+        model="muscriptor-model",
+        run_id="muscriptor-run",
+        schema=muscriptor_schema,
+        lock="f" * 64,
+        prediction_map="muscriptor-map",
+    )
+    _reports(oaf_root, "oaf-run", "oaf-model", "e" * 64, "oaf-map", precision="0.5")
+    _reports(
+        muscriptor_root,
+        "muscriptor-run",
+        "muscriptor-model",
+        "f" * 64,
+        "muscriptor-map",
+        precision="0.8",
+    )
+
+    with pytest.raises(ComparisonIntegrityError, match=message):
         compare_oaf_muscriptor(_request(tmp_path, oaf, muscriptor))
 
 
