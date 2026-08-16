@@ -6,51 +6,49 @@
 
 ## Decision summary
 
-Implement MuScriptor as a **benchmark comparator only**, not a new production backend architecture:
+Implement MuScriptor as a **benchmark comparator only**, not a production backend architecture:
 
-1. freeze official MuScriptor `v0.3.0` plus one exact gated Hugging Face checkpoint before any scored run;
-2. add one `MuscriptorBackend` implementing the existing `TranscriptionBackend` protocol and consume its native `NoteStartEvent` stream with hard `instruments=["drums"]`;
-3. reuse the exact HPA-326 44.1 kHz mono PCM16 full-mix materialization so OaF and MuScriptor are bound to identical pre-model input bytes;
-4. keep `crux.drum-prediction-events/v2` and HPA-325 scoring, extending only their frozen backend-specific identity/validation seams;
-5. freeze one explicit MuScriptor MIDI-pitch mapping before inference, seeded from the existing MIDI map plus only clear General MIDI aliases;
-6. promote the already-model-neutral source resolver and prediction-path helper now that they have a second caller, while keeping two concrete runners;
-7. add one MuScriptor-specific persisted corpus runner, reuse HPA-327 reviewed-subset membership, and publish a narrow exact-identity OaF-vs-MuScriptor delta report.
+1. freeze official MuScriptor `v0.3.0` plus one exact gated Hugging Face checkpoint before scored inference;
+2. add one optional `MuscriptorBackend` implementing the existing `TranscriptionBackend` protocol and consume native `NoteStartEvent` onsets with hard `instruments=["drums"]`;
+3. promote the three model-neutral execution seams that now have two concrete callers: verified source resolution, canonical full-mix materialization, and immutable prediction-path construction;
+4. keep `crux.drum-prediction-events/v2`, extending both write- and read-path validation for exactly two known backend families while preserving every OaF invariant;
+5. freeze one code-owned MuScriptor MIDI-pitch map before inference and persist unsupported pitches as unmapped evidence;
+6. add one concrete `muscriptor_corpus_run.py`, reuse HPA-325/HPA-327 reporting, and compare OaF/MuScriptor by joining the already-published HPA-325 score CSVs rather than re-scoring them.
 
-Do **not** add a generic experiment runner, model registry, plugin framework, production backend selector, second scorer, database, job queue, MIDI round-trip, beat-grid correction, stem separation, model tuning, or fine-tuning.
+Do **not** add a generic runner/base class, production registry entry, second prediction schema, mapping DSL, database, queue, second scorer, model-selection DSL, stem separation, tuning, or fine-tuning.
 
 ## Why HPA-395 is next
 
-HPA-395 is the highest-priority unstarted Crux issue whose dependency chain is complete. HPA-325 scoring, HPA-326 broad OaF inference, and HPA-327 reviewed-subset work are all complete. HPA-395 is High priority and blocks HPA-329 final findings.
+HPA-395 is the highest-priority unstarted Crux issue whose dependency chain is complete. HPA-325 scoring, HPA-326 broad OaF inference, and HPA-327 reviewed-subset work are complete. HPA-395 is High priority and blocks HPA-329 final findings.
 
-HPA-328 is also unblocked but Medium priority. HPA-396 still depends on HPA-328. HPA-562 becomes more useful once a second comparison population exists. HPA-395 therefore gives the next useful model-quality signal without opening another prerequisite chain.
+HPA-328 is also unblocked but Medium priority. HPA-396 still depends on HPA-328. HPA-562 becomes useful once a second comparison population exists.
 
 ## Goals
 
 HPA-395 must provide:
 
 - one reproducible MuScriptor package/checkpoint/config identity;
-- hard drum-only decoding with no post-score tuning;
+- hard drum-only deterministic decoding with no post-score tuning;
 - raw native onset and MIDI-pitch provenance;
-- a frozen, versioned native-pitch-to-Crux mapping decided before scored results;
 - the same authoritative source/reference identity and byte-identical Crux canonical full-mix input as OaF;
 - HPA-325 broad and HPA-327 reviewed-subset reports at 30/50/100 ms, raw and aligned;
-- visible mapped/unmapped native drum-pitch coverage;
+- visible mapped/unmapped native pitch coverage;
 - immutable resumable prediction artifacts and explicit per-song failures;
-- exact-identity paired OaF deltas;
-- wall time/RTF/device/dtype/peak-memory evidence;
+- paired per-song **and per-class** OaF deltas derived from the published HPA-325 report artifacts;
+- runtime/device/dtype/memory evidence where cheap;
 - separate code-license and weight-license evidence.
 
 ## Non-goals
 
 This ticket does not:
 
-- replace OaF as the baseline;
+- replace OaF as the primary baseline;
 - expose MuScriptor through `default_backend_registry()` or the production API;
-- select a checkpoint or decoding setting by benchmark F1;
+- benchmark several checkpoints and choose by F1;
 - use `transcribe_to_midi()` or beat/downbeat correction;
 - change HPA-323/HPA-324/HPA-327 membership or lineage;
-- change the reference taxonomy, tolerance windows, matcher, or report semantics;
-- generalize comparison to arbitrary N models; HPA-562 owns that later.
+- change HPA-325 tolerance, matcher, alignment, or aggregate semantics;
+- generalize comparison to arbitrary models; HPA-562 owns that later.
 
 ## Frozen upstream boundary
 
@@ -81,50 +79,105 @@ TranscriptionModel.transcribe(
 )
 ```
 
-The event stream contains `NoteStartEvent`, `NoteEndEvent`, and `ProgressEvent`; drum hits carry `instrument == "drums"`, native MIDI `pitch`, and `start_time`. Upstream splits audio into five-second chunks and internally targets 16 kHz audio.
+The event stream contains `NoteStartEvent`, `NoteEndEvent`, and `ProgressEvent`. Drum hits carry `instrument == "drums"`, native MIDI `pitch`, and `start_time`. Upstream splits audio into five-second chunks and internally targets 16 kHz audio.
 
-The planning-time upstream documentation identifies code and model weights under different licenses. The scored preflight must verify the exact official weight-license metadata and persist it separately; a missing or contradictory license is fatal before inference.
+The official code and model weights have different licenses. Missing or contradictory weight-license evidence is fatal before inference.
 
-## Exact checkpoint freeze
+## Exact checkpoint and model identity
 
-MuScriptor's convenient `"medium"`/`hf://...` flow resolves Hugging Face content without an explicit immutable revision. That is unsuitable as the scored benchmark identity.
+MuScriptor's convenient `"medium"` / unqualified `hf://...` path follows mutable repository state. Scored runs must instead use an exact local checkpoint.
 
-Add a one-time acquisition script that:
+The one-time freeze script must:
 
-1. resolves `MuScriptor/muscriptor-medium` to an exact Hugging Face commit SHA;
-2. downloads `model.safetensors` and companion `config.json` at that exact revision;
-3. computes SHA-256 and byte size for both;
-4. verifies official model-license metadata;
-5. writes `runtime/muscriptor/model.json` only from those resolved values.
+1. resolve `MuScriptor/muscriptor-medium` to an exact Hugging Face commit SHA;
+2. download `model.safetensors` and `config.json` at that exact revision;
+3. compute SHA-256 and byte length for both;
+4. verify official weight-license metadata;
+5. write `runtime/muscriptor/model.json` from the resolved evidence.
 
-Scored code loads MuScriptor with the verified **local safetensors path**, never a mutable alias.
+Medium is the first candidate. It may be replaced once by small only when a pre-score feasibility run demonstrates that medium is impractical on the selected hardware. F1 must not participate in that decision.
 
-Mirror the existing OaF model-lock rail with a closed `crux.muscriptor-model/v1` object containing package/source identity, checkpoint repo/revision/files/hashes/sizes, code/weight licenses, device/dtype, internal sample rate/chunk duration, exact decoding arguments, output/metadata-space identities, and adapter/inference identity inputs.
+### `model_id` grammar
 
-No scored CLI flag overrides these fields. An intentional configuration change creates a different lock/config/run identity.
+The descriptor cannot contain an unspecified future string. Freeze the grammar now:
 
-### Medium-first feasibility rule
+```text
+muscriptor-<variant>-<revision12>-<checkpoint12>
+```
 
-Medium is the fixed first candidate. Before broad/reviewed scoring, run a committed pre-score smoke set chosen only from reference/audit/source evidence. Medium may be replaced once by small only when runtime/memory/device stability makes medium technically impractical. Do not compare checkpoint F1 to make that choice.
+where:
+
+```text
+variant      = medium | small
+revision12   = first 12 lowercase hex characters of checkpoint_revision
+checkpoint12 = first 12 lowercase hex characters of checkpoint_sha256
+```
+
+Examples are shape-only; the actual digest fragments come from the authenticated freeze:
+
+```text
+muscriptor-medium-0123456789ab-fedcba987654
+muscriptor-small-0123456789ab-fedcba987654
+```
+
+`normalize_known_backend_descriptor()` validates that grammar for MuScriptor. The MuScriptor runner separately derives the exact expected `model_id` from the loaded model lock and requires descriptor equality. OaF keeps its existing exact constant-equality validation.
+
+## Model lock remains explicit
+
+Keep a closed `crux.muscriptor-model/v1` lock. HPA-395 explicitly requires the lock to contain both acquired identity and the deterministic execution contract, so do **not** remove fixed decode/preprocessing fields merely because they have one valid v1 value.
+
+The lock contains at minimum:
+
+```text
+package_name/package_version
+upstream_source_commit
+code_license
+weight_license
+checkpoint_repo_id
+checkpoint_revision
+checkpoint_filename/checkpoint_sha256/checkpoint_byte_length
+checkpoint_config_filename/checkpoint_config_sha256/checkpoint_config_byte_length
+checkpoint_variant
+model_id
+device
+dtype
+input_sample_rate_hz
+chunk_duration_sec
+use_sampling
+temperature
+cfg_coef
+instruments
+batch_size
+no_eos_is_ok
+beam_size
+prelude_forcing
+native_output_space_id
+native_metadata_schema_id
+training_data_map_id
+```
+
+The same inference-semantic values are folded into `crux.muscriptor-inference-config/v1` and its hash. Duplication here is intentional evidence required by the ticket: the model lock records the frozen chosen backend contract; the run config binds that contract to a concrete cohort execution.
+
+No scored CLI flag overrides these fields.
 
 ## Dependency isolation
 
-Add MuScriptor only as an optional benchmark dependency:
+Add MuScriptor as an optional benchmark dependency:
 
 ```toml
 [project.optional-dependencies]
 muscriptor = ["muscriptor==0.3.0"]
 ```
 
-The adapter lazily imports MuScriptor. Normal Crux CLI/API/tests must work without PyTorch/MuScriptor installed. Unit tests inject fake model/event objects; CI does not authenticate to Hugging Face or fetch the real checkpoint.
+The adapter lazily imports MuScriptor. Normal Crux CLI/API/tests work without MuScriptor installed. CI uses fake model/event objects and never downloads gated weights.
 
-If `uv lock` proves the package cannot coexist with the current Python 3.12 environment, introduce a small dedicated runtime only then. A subprocess protocol is not part of the initial design.
+If `uv lock` proves MuScriptor cannot coexist with Python 3.12, add a small subprocess runtime only then. Do not preemptively create a second image/protocol.
 
-## Existing seams to reuse
+## Existing seams and required promotions
 
-### `TranscriptionBackend`
+### Backend protocol
 
-Reuse `src/benchmark/backends/base.py`:
+Reuse unchanged from `src/benchmark/backends/base.py`:
 
 ```text
 CanonicalAudio
@@ -133,67 +186,57 @@ NativePrediction
 TranscriptionBackend
 ```
 
-`MuscriptorBackend` lives at `src/benchmark/backends/muscriptor.py` and is not added to the default production registry.
+`MuscriptorBackend` lives at `src/benchmark/backends/muscriptor.py` and is not registered in `default_backend_registry()`.
 
-### Exact full-mix input
+### Verified source resolution
 
-HPA-326 currently materializes authoritative source audio as:
+`oaf_corpus_run.py` currently owns model-neutral `ResolvedSourceAudio`, `_remote_from_source_mapping()`, `_source_audio_parts()`, and `_resolve_source_audio()` while importing the OaF runtime at module load.
 
-```text
-44,100 Hz
-mono
-WAV PCM_16
-librosa res_type="soxr_hq"
+Now that MuScriptor is a second caller, move that resolver/value object to `src/benchmark/corpus_cache.py` and expose only:
+
+```python
+resolve_source_audio(..., load_body: bool = True) -> ResolvedSourceAudio
 ```
 
-Promote only this model-neutral materialization to `src/benchmark/input_view.py` and characterize output bytes before moving it. Preserve the existing historical input-view ID:
+Preserve current cache-index fallback, exact source digest binding, header-duration probe, `load_body=False`, and per-item re-pin behavior. Both concrete runners use this one implementation.
+
+### Canonical full-mix materialization
+
+Promote the current OaF conversion to `src/benchmark/input_view.py` **with the path-containment guard intact**:
+
+```python
+def materialize_full_mix_audio(
+    source_audio: ResolvedSourceAudio,
+    output_path: Path,
+    *,
+    input_root: Path,
+    input_view_id: str,
+    max_input_audio_frames: int | None,
+) -> CanonicalAudio:
+    ...
+```
+
+The helper must:
+
+- require `ResolvedSourceAudio` and `Path` arguments;
+- require `output_path.resolve()` to stay beneath `input_root.resolve()`;
+- preserve `librosa.load(..., sr=44100, mono=True, res_type="soxr_hq")`;
+- preserve `soundfile.write(..., 44100, format="WAV", subtype="PCM_16")`;
+- call `load_materialized_audio()` for exact WAV validation/hash.
+
+Keep the historical persisted input-view ID exactly:
 
 ```text
 crux.oaf-full-mix-mono44k1-pcm16/v1
 ```
 
-The name remains OaF-shaped because it is already persisted evidence. Renaming it would destroy exact pairing with HPA-326.
+MuScriptor receives the exact same canonical WAV bytes. Its 16 kHz preprocessing remains model-internal. Renaming the historical input-view ID would destroy pairing with persisted HPA-326 evidence.
 
-MuScriptor receives this canonical WAV path. Its 16 kHz resampling remains internal model preprocessing. The result is a shared `input_audio_sha256` before model-native preprocessing diverges.
+The OaF call site still validates/loads its `OafModelConfig` and passes `config.max_input_audio_frames`; the neutral helper does not import OaF config types.
 
-### Verified source resolution
+### Immutable prediction path
 
-`oaf_corpus_run.py` also currently owns a model-neutral `ResolvedSourceAudio` value plus verified-cache resolution/re-pin helpers. A second corpus runner makes this a real two-caller seam, and importing it from `oaf_corpus_run.py` would pull the OaF runtime into the MuScriptor path at module load.
-
-Move the existing behavior, without semantic changes, to `src/benchmark/corpus_cache.py`:
-
-```python
-@dataclass(frozen=True)
-class ResolvedSourceAudio:
-    path: Path
-    source_audio_id: str
-    source_audio_sha256: str
-    duration_sec: float
-    content: bytes | None = None
-
-
-def resolve_source_audio(
-    source: RemoteObject | ManifestRowView | Mapping[str, object],
-    cache_dir: Path,
-    cache_index: CacheIndexStore | None = None,
-    *,
-    index: CacheIndexStore | None = None,
-    source_audio_key: str | None = None,
-    source_audio_content_hash: str | None = None,
-    source_endpoint_sha256: str | None = None,
-    source_bucket: str | None = None,
-    load_body: bool = True,
-) -> ResolvedSourceAudio:
-    ...
-```
-
-Move the private `_remote_from_source_mapping()` and `_source_audio_parts()` with it as implementation details. OaF and MuScriptor both call the neutral helper. There is still no shared runner class.
-
-### Prediction artifact location
-
-`oaf_corpus_run.prediction_path()` is already backend-neutral: it keys immutable prediction v2 bytes by song, source hash, backend descriptor hash, and inference-config hash.
-
-Move it unchanged to `src/benchmark/prediction_artifact.py`:
+Move the existing descriptor/config/source-keyed `prediction_path()` unchanged from `oaf_corpus_run.py` to `src/benchmark/prediction_artifact.py`:
 
 ```python
 def prediction_path(
@@ -207,20 +250,7 @@ def prediction_path(
     ...
 ```
 
-Both concrete runners reuse it. Do not create a second path convention.
-
-### Reference/scoring/subset rails
-
-Reuse unchanged where possible:
-
-- `load_reference_set_manifest()`;
-- `preflight_reference_mappings()`;
-- `load_reference_timing_manifest()`;
-- `score_cohort()`;
-- `write_cohort_reports()`;
-- `load_reviewed_subset_manifest()`.
-
-Do not parse DTX again and do not create a MuScriptor-specific scorer.
+Both runners use that exact path convention. Do not introduce a path strategy abstraction.
 
 ## MuScriptor adapter
 
@@ -242,20 +272,20 @@ NativeEvent(
 
 Rules:
 
-- instrument must be exactly `"drums"` after requesting hard drum-only decoding;
-- pitch must be integer MIDI 0..127;
-- onset must be finite and nonnegative;
-- `NoteEndEvent` is stream integrity/provenance only and creates no hit;
+- `instrument` must be exactly `"drums"`;
+- pitch is integer MIDI `0..127`;
+- onset is finite and nonnegative;
+- `NoteEndEvent` does not create a second hit;
 - `ProgressEvent` is ignored for scoring;
-- no synthetic confidence/velocity;
-- no MIDI serialization/reparse;
-- no beat/downbeat timing correction.
+- do not synthesize confidence/velocity;
+- do not serialize/reparse MIDI;
+- do not apply beat/downbeat timing correction.
 
 ## Descriptor and prediction-v2 compatibility
 
-Keep descriptor schema `crux.transcription-backend-descriptor/v2`. Extend `normalize_known_backend_descriptor()` from one frozen OaF family to exactly two known families: existing OaF and MuScriptor v0.3.0.
+Keep descriptor schema `crux.transcription-backend-descriptor/v2`. Extend `normalize_known_backend_descriptor()` to exactly two known families.
 
-MuScriptor identities are:
+MuScriptor fixed identities are:
 
 ```text
 backend_id: muscriptor-v0.3.0-drums-v1
@@ -265,63 +295,113 @@ native_metadata_schema_id: muscriptor-note-start-metadata-v1
 prediction_schema: crux.drum-prediction-events/v2
 ```
 
-`model_id` is derived from the frozen checkpoint variant/revision/hash in `runtime/muscriptor/model.json`; the MuScriptor runner requires the descriptor to match that lock-derived model identity exactly. `training_data_map_id` is an opaque upstream-version identity, not a claim about training composition that the official release does not precisely publish.
+`model_id` follows the grammar above. `training_data_map_id` is an opaque upstream-version identity rather than an unsupported claim about training composition.
 
-Keep prediction schema v2. The extension must cover **both header and event validation**:
+Use a small per-family descriptor policy:
 
-1. add `muscriptor-note-start-metadata-v1` to `NATIVE_METADATA_SCHEMAS` with exactly `{"instrument_group": {"drums"}}`;
-2. `_build_header()` still calls `normalize_known_backend_descriptor()`, but after that succeeds it no longer has an extra `backend_id must be OaF` guard;
-3. `_build_header()` still requires the descriptor's `prediction_schema == crux.drum-prediction-events/v2` and a known metadata schema;
-4. `_normalize_event()` dispatches by the already-validated backend ID, not by global nullability;
-5. OaF retains every existing non-null bin/MIDI/confidence/velocity, `midi_<note>`, and metadata invariant;
-6. MuScriptor requires native MIDI, null bin/confidence/velocity, exact drum metadata, and `native_class_id == "drums:midi_<pitch>"`.
+```text
+family -> exact key set + exact constant identities + optional patterned fields
+```
 
-Do not make OaF-required fields optional globally.
+OaF has no patterned fields and keeps current constant equality. MuScriptor pattern-checks only `model_id`; its runner later checks the exact lock-derived value.
 
-The current prediction-v2 schema golden is one complete OaF artifact and the schema-golden registry intentionally has one fixed entry per schema. **Keep that golden and manifest unchanged.** Add MuScriptor canonical render/read/render coverage in focused prediction-artifact tests instead of mixing two backend headers into one golden or adding a duplicate schema entry.
+### Write path and read path must both dispatch
 
-### Zero-hit scorer closure
+Prediction v2 currently contains two redundant OaF-only backend guards. Remove both after the shared descriptor normalizer succeeds:
 
-HPA-325 currently infers the prediction-map ID for empty prediction artifacts only for OaF. Make the internal artifact-identity reconstruction accept the expected `CohortIdentity`; for an empty but otherwise valid artifact use `identity.prediction_map_version`. This is a model-neutral closure and leaves non-empty artifact validation unchanged.
+1. `_build_header()` write-path OaF-only `backend_id` guard;
+2. `_validate_header()` read-path OaF-only `backend_id` guard.
+
+Do **not** alter `_validate_header()`'s model-neutral descriptor↔header equality checks for:
+
+```text
+architecture_id
+model_id
+native_metadata_schema_id
+native_output_space_id
+training_data_map_id
+upstream_source_commit
+```
+
+Add `muscriptor-note-start-metadata-v1` to `NATIVE_METADATA_SCHEMAS` with exactly:
+
+```python
+{"instrument_group": {"drums"}}
+```
+
+Then dispatch native event invariants by the already-validated backend family:
+
+- OaF keeps all existing non-null bin/MIDI/confidence/velocity, `midi_<note>`, and metadata invariants;
+- MuScriptor requires MIDI pitch, null bin/confidence/velocity, exact drum metadata, and `native_class_id == "drums:midi_<pitch>"`.
+
+Never make OaF-required fields globally optional.
+
+Keep the existing prediction-v2 schema golden and registry **byte-for-byte unchanged**. MuScriptor canonical render/read/render coverage belongs in focused tests.
+
+### Zero-hit prediction-map identity
+
+Do not source an empty artifact's map identity from the expected cohort identity; that would make the later identity comparison tautological and weaken OaF.
+
+Keep `_artifact_identity_from_artifacts()` signature unchanged and add one closed backend-to-map table:
+
+```python
+ZERO_HIT_PREDICTION_MAPS = {
+    OAF_BACKEND_ID: OAF_PREDICTION_MAP_ID,
+    MUSCRIPTOR_BACKEND_ID: MUSCRIPTOR_PREDICTION_MAP_ID,
+}
+```
+
+For non-empty artifacts, continue deriving the map from event records and reject mixed maps. For empty artifacts, look up by validated `backend_id`; an unknown backend still raises `ValueError("empty prediction artifact has no prediction_map_version")`. `_validate_artifact_identity()` remains the independent comparison against `CohortIdentity.prediction_map_version`.
 
 ## Frozen MuScriptor pitch mapping
 
-The pitch table is part of the scored model identity because HPA-325 scores only mapped prediction events. Therefore HPA-395 freezes the mapping **before any scored MuScriptor result is inspected**.
-
-Use:
+The mapping is part of the scored model identity because HPA-325 scores only mapped prediction events. Freeze it before real inference:
 
 ```text
 MUSCRIPTOR_PREDICTION_MAP_ID = crux.prediction-map/muscriptor-drums-v1
 ```
 
-Seed the table from the existing `DEFAULT_MIDI_NOTE_MAP`, then add only clear General MIDI aliases that collapse into the existing Crux classes:
+Define **one** string-keyed `PredictionMap.classes` table. Do not also define a second integer-keyed copy.
 
-| MIDI | GM name | Detailed class | Common class |
+| MIDI key | GM name | Detailed class | Common class |
 | ---: | --- | --- | --- |
-| 35 | Acoustic Bass Drum | `kick` | `kick` |
-| 36 | Bass Drum 1 | `kick` | `kick` |
-| 38 | Acoustic Snare | `snare` | `snare` |
-| 40 | Electric Snare | `snare` | `snare` |
-| 41 | Low Floor Tom | `low_or_floor_tom` | `tom` |
-| 43 | High Floor Tom | `low_or_floor_tom` | `tom` |
-| 45 | Low Tom | `low_or_floor_tom` | `tom` |
-| 47 | Low-Mid Tom | `low_or_floor_tom` | `tom` |
-| 48 | Hi-Mid Tom | `high_tom` | `tom` |
-| 50 | High Tom | `high_tom` | `tom` |
-| 42 | Closed Hi-Hat | `closed_hihat` | `hihat` |
-| 44 | Pedal Hi-Hat | `closed_hihat` | `hihat` |
-| 46 | Open Hi-Hat | `open_hihat` | `hihat` |
-| 49 | Crash Cymbal 1 | `crash` | `crash` |
-| 57 | Crash Cymbal 2 | `crash` | `crash` |
-| 51 | Ride Cymbal 1 | `ride` | `ride` |
-| 53 | Ride Bell | `ride` | `ride` |
-| 59 | Ride Cymbal 2 | `ride` | `ride` |
+| `35` | Acoustic Bass Drum | `kick` | `kick` |
+| `36` | Bass Drum 1 | `kick` | `kick` |
+| `38` | Acoustic Snare | `snare` | `snare` |
+| `40` | Electric Snare | `snare` | `snare` |
+| `41` | Low Floor Tom | `low_or_floor_tom` | `tom` |
+| `43` | High Floor Tom | `low_or_floor_tom` | `tom` |
+| `45` | Low Tom | `low_or_floor_tom` | `tom` |
+| `47` | Low-Mid Tom | `low_or_floor_tom` | `tom` |
+| `48` | Hi-Mid Tom | `high_tom` | `tom` |
+| `50` | High Tom | `high_tom` | `tom` |
+| `42` | Closed Hi-Hat | `closed_hihat` | `hihat` |
+| `44` | Pedal Hi-Hat | `closed_hihat` | `hihat` |
+| `46` | Open Hi-Hat | `open_hihat` | `hihat` |
+| `49` | Crash Cymbal 1 | `crash` | `crash` |
+| `57` | Crash Cymbal 2 | `crash` | `crash` |
+| `51` | Ride Cymbal 1 | `ride` | `ride` |
+| `53` | Ride Bell | `ride` | `ride` |
+| `59` | Ride Cymbal 2 | `ride` | `ride` |
 
-Everything else is intentionally unmapped in v1, including side-stick, clap, splash/Chinese cymbal, cowbell, tambourine, and other percussion for which the frozen Crux taxonomy has no unambiguous detailed class.
+Everything else is intentionally unmapped in v1, including side-stick, clap, splash/Chinese cymbal, cowbell, tambourine, and other percussion without an unambiguous existing Crux detailed class.
 
-Implement the table as a closed code-owned mapping in `taxonomy.py`; do not expose a config file or mapping DSL. `map_muscriptor_prediction()` follows `map_oaf_prediction()` semantics: every native hit is retained in the artifact, and unsupported pitches are emitted with `mapping_status="unmapped"` and null canonical/common classes. Do **not** reuse `map_midi_events()`, which drops unmapped notes.
+`map_muscriptor_prediction()` follows `map_oaf_prediction()` semantics and begins with the same two identity guards:
 
-Changing this table later requires a new prediction-map ID and rescoring newly mapped artifacts. The implementation must not publish scores against an unfrozen map.
+```python
+prediction.descriptor.payload["backend_id"] == prediction_map.backend_id
+prediction.descriptor.payload["native_output_space_id"] == prediction_map.native_output_space_id
+```
+
+For each native hit, look up:
+
+```python
+key = str(native.native_midi_note)
+```
+
+Every event is retained. Unsupported pitches get `mapping_status="unmapped"` and null canonical/common classes. Do not reuse `map_midi_events()`, which drops unmapped notes.
+
+Changing the table later requires a new prediction-map ID and newly mapped prediction artifacts.
 
 ## MuScriptor corpus run
 
@@ -332,16 +412,22 @@ crux.muscriptor-corpus-run/v1
 crux.muscriptor-inference-config/v1
 ```
 
-Keep it separate from the large OaF runner instead of creating a generic runner base class.
+Keep two concrete runners. No base class.
 
-Required shared seams are now explicit:
+Run identity binds:
 
-- verified source-audio resolution/re-pin from `corpus_cache.py`;
-- shared full-mix materialization from `input_view.py`;
-- descriptor/config/source-keyed immutable prediction path from `prediction_artifact.py`;
-- HPA-325 cohort/report assembly.
-
-Run identity binds reference/timing manifests, model-lock SHA, checkpoint revision/SHA, descriptor SHA, inference-config SHA, input-view ID, adapter revision, Crux commit, and include/exclude scope.
+```text
+reference/timing identities
+model-lock SHA
+checkpoint revision/SHA
+backend descriptor SHA
+inference-config SHA
+MUSCRIPTOR_PREDICTION_MAP_ID
+shared input-view ID
+adapter revision
+Crux commit
+include/exclude scope
+```
 
 Execution order mirrors HPA-326 semantically:
 
@@ -349,16 +435,16 @@ Execution order mirrors HPA-326 semantically:
 preflight
 -> durable initial snapshot
 -> verified source pass
--> per-item re-pin/materialize/resume-or-infer/map/publish/checkpoint
--> close model
+-> per-item re-pin
+-> canonical materialize
+-> resume-or-infer
+-> map/publish/checkpoint
+-> close
 -> runtime evidence
--> persisted CohortItems
 -> HPA-325 broad score/report
 ```
 
-Per-song source/decode/inference/publication problems remain explicit item failures when the model identity is still trustworthy. Model/checkpoint/descriptor/config integrity failures stop the run.
-
-No shared runner base class, restart engine, queue, worker protocol, or generic error-policy framework is introduced.
+Per-song source/decode/inference/publication failures remain item-local while model identity remains trustworthy. Model/checkpoint/descriptor/config integrity failures stop the run.
 
 ## Fixed smoke gate
 
@@ -372,45 +458,117 @@ sparse
 non_drum_heavy
 ```
 
-Verify package/checkpoint/device readiness, drum-only events, native pitch/onset validity, repeatability on at least one repeated song, behavior near five-second chunk boundaries, resume identity, runtime, and memory. The smoke gate can reject medium for feasibility but cannot tune by F1.
+At the end of the model-lock implementation task, perform one authenticated freeze/preflight run against the official gated source. This verifies the assumed companion filenames, exact revision resolution, and license metadata shape before the descriptor/runner implementation is considered ready to execute against real weights.
 
-The smoke must run only after the `MUSCRIPTOR_PREDICTION_MAP_ID` and exact v1 pitch table above are committed.
+If credentials are unavailable in an implementation environment, offline unit work may continue, but the task remains operationally incomplete and **no real inference or scored result may run** until this preflight succeeds.
+
+The smoke gate verifies package/checkpoint/device readiness, hard drum-only output, native pitch/onset validity, repeatability, five-second boundary behavior, resume identity, runtime, and memory. It may reject medium for feasibility but may not tune by F1.
 
 ## Reviewed-subset scoring
 
-Keep HPA-327 membership immutable. Extract one small model-neutral core from `reviewed_subset.py` that receives a reconstructed parent `CohortIdentity`/`CohortItem` population plus the loaded subset, filters exact IDs, derives the subset cohort ID, and invokes HPA-325 with event diagnostics for successful selected songs.
+Keep HPA-327 membership immutable. Extract one model-neutral core that owns both subset lineage and filtering/scoring:
 
-Existing OaF and new MuScriptor wrappers each remain responsible for parsing their own run and validating HPA-323/HPA-324/HPA-327 lineage before calling the core.
+```python
+def score_reviewed_subset_cohort(
+    parent_identity: CohortIdentity,
+    parent_items: tuple[CohortItem, ...],
+    reference: LoadedReferenceSetManifest,
+    timing: LoadedReferenceTimingManifest,
+    subset: LoadedReviewedSubsetManifest,
+    *,
+    output_dir: Path,
+) -> ScoreReviewedSubsetOutcome:
+    ...
+```
 
-## Narrow OaF pairing
+The core validates:
 
-Add `muscriptor_comparison.py` and `compare-oaf-muscriptor` only for this ticket. Reconstruct persisted OaF and MuScriptor cohorts and pair a song only when both succeeded and all of these match:
+- subset source-reference hash/version == supplied HPA-324 manifest;
+- subset source-timing hash/version == supplied HPA-323 manifest;
+- every subset member exists in the parent population;
+- output does not alias the parent's broad report directory when that constraint is supplied by the wrapper;
+- subset cohort ID derives from parent cohort ID + subset manifest SHA;
+- HPA-325 diagnostics are requested only for successful selected songs.
+
+Model-specific wrappers own only:
+
+```text
+parse_*_corpus_run()
+snapshot ↔ supplied HPA-323/HPA-324 validation
+build_*_cohort_from_snapshot()
+```
+
+Then they delegate to the shared core. No inference occurs during subset scoring.
+
+## Narrow OaF pairing from published reports
+
+Do **not** re-score persisted events inside HPA-395 comparison. HPA-325 already published the authoritative score rows.
+
+`muscriptor_comparison.py` reads:
+
+```text
+<oaf reports>/per_song.csv
+<oaf reports>/per_class.csv
+<muscriptor reports>/per_song.csv
+<muscriptor reports>/per_class.csv
+```
+
+and the two run snapshots.
+
+Before joining, validate each report's identity columns against its run snapshot/cohort identity, including model ID, model-lock SHA, prediction-map version, input-view ID, scoring version, and cohort ID. Reject malformed/duplicate score keys.
+
+Pairing identity comes from the run snapshots, not score CSV rows:
+
+### Run-level identity
+
+```text
+reference_manifest_sha256
+reference_timing_manifest_sha256/reference_timing_version
+input_view_id (or the run-level inference config field that carries it)
+```
+
+### Successful item-level identity
 
 ```text
 simfile_id
-reference manifest identity
-timing manifest identity
 source_audio_sha256
-input_view_id
 input_audio_sha256
 ```
 
-For the same `simfile_id` and source-audio identity, an `input_view_id` or `input_audio_sha256` difference is a **fatal canonical-input integrity error**, not a silent exclusion: HPA-395 explicitly claims byte-identical Crux input before model-native preprocessing.
+`input_view_id` is **not** read from an item row.
 
-For each 30/50/100 ms tolerance and raw/aligned mode emit per-song OaF F1, MuScriptor F1, and `MuScriptor - OaF` delta plus pair count and mean/median delta. Optional HPA-327 filtering reuses the exact subset manifest.
+For the same `simfile_id` + source-audio identity, any run-level input-view mismatch or item-level input-audio hash mismatch is a fatal canonical-input integrity error, not a silent exclusion.
 
-Do not add significance testing, ranking, bootstrap intervals, or arbitrary model labels; HPA-562 can generalize later.
+Join successful `per_song.csv` rows on:
+
+```text
+(simfile_id, tolerance_ms, mode)
+```
+
+and emit `MuScriptor - OaF` precision/recall/F1 deltas.
+
+Join successful `per_class.csv` rows on:
+
+```text
+(simfile_id, tolerance_ms, mode, common_class)
+```
+
+and emit paired per-class precision/recall/F1 deltas. Missing class support stays explicit rather than inventing a zero row unless HPA-325 already published one.
+
+Report each model's full success/failure population from its existing HPA-325 reports/run evidence, plus paired/intersection/exclusion counts. Optional reviewed-subset comparison filters the exact HPA-327 IDs before the joins.
+
+No significance testing, ranking, bootstrap intervals, arbitrary model labels, or second scoring path. HPA-562 can generalize later.
 
 ## Runtime evidence
 
-Persist cheap operational evidence:
+Persist only cheap evidence:
 
 - device/dtype;
 - checkpoint identity/size;
-- measured wall time and audio duration;
-- aggregate RTF and projected full wall time when coverage is complete;
-- peak process RSS where cheaply available;
-- accelerator peak memory only when the selected PyTorch device exposes it directly.
+- measured wall time/audio duration;
+- aggregate RTF and projected wall time when duration coverage is complete;
+- peak process RSS where cheap;
+- accelerator peak memory only when directly exposed.
 
 Missing device-specific memory is `None`, not a failure. No telemetry subsystem.
 
@@ -424,32 +582,49 @@ crux benchmark score-muscriptor-reviewed-subset
 crux benchmark compare-oaf-muscriptor
 ```
 
-The runner mirrors HPA-326 manifest/timing/cache/output/include/exclude/resume flags. Model size, temperature, beam, instrument list, device, dtype, and mapping version are frozen and are not CLI knobs.
+`run-muscriptor-corpus` mirrors HPA-326 manifest/timing/cache/output/include/exclude/resume flags. Model size, device, dtype, temperature, beam, instrument list, and mapping version remain frozen, not CLI knobs.
 
-CLI coverage extends the existing `tests/test_cli_benchmark.py`; do not create a second CLI harness.
+Extend the existing `tests/test_cli_benchmark.py`; do not create a second CLI harness.
 
 ## Failure policy
 
 Fatal before inference:
 
 - malformed/unfrozen model lock;
-- wrong package version;
+- wrong package/source identity;
 - missing/inconsistent license evidence;
-- checkpoint/config hash/size mismatch;
+- checkpoint/config hash or size mismatch;
 - unavailable locked device/dtype;
 - reference/timing lineage mismatch;
 - invalid scope;
-- descriptor/config hash mismatch;
-- MuScriptor prediction-map identity/table does not match the frozen v1 contract.
+- descriptor/config/map identity mismatch.
 
-Item-local where model integrity remains valid:
+Item-local while model integrity remains valid:
 
 - source decode/materialization failure;
-- per-song MuScriptor inference failure;
+- per-song inference failure;
 - invalid native event for that song;
 - immutable prediction publication failure.
 
-If a failure invalidates the loaded model state, stop instead of pretending later rows are independent successes.
+If a failure invalidates loaded model state, stop rather than pretending later rows are independent successes.
+
+## Acceptance
+
+HPA-395 is complete when:
+
+- exact package/checkpoint/config/license/device/dtype/decode settings are frozen before scores;
+- the authenticated freeze path has been exercised against the official gated source;
+- inference always uses hard drum-only settings;
+- raw MuScriptor onset + native pitch persist directly in prediction v2;
+- the exact v1 pitch map is committed before real inference and unsupported pitches remain visible;
+- both prediction-v2 write and read paths accept MuScriptor while existing OaF invariants/golden remain unchanged;
+- zero-hit OaF and MuScriptor artifacts retain independently derived map identity;
+- shared source resolution/materialization/path helpers preserve existing OaF behavior and containment guards;
+- overlapping same-source OaF/MuScriptor rows have identical run-level input-view and item-level canonical-input hash;
+- broad and HPA-327 reviewed reports use unchanged HPA-325 semantics;
+- comparison joins the published per-song/per-class reports rather than re-scoring;
+- paired per-song/per-class deltas, population failures, runtime evidence, and license constraints are reported;
+- no score-informed checkpoint, decode, mapping, or post-processing choice occurs.
 
 ## Reuse survey
 
@@ -457,62 +632,20 @@ If a failure invalidates the loaded model state, stop instead of pretending late
 | --- | --- | --- |
 | backend protocol | REUSE | `backends/base.py` |
 | production registry | DO NOT EXTEND | `backend_registry.py` |
-| model lock / freeze | EXTEND PATTERN | OaF lock shape; OaF zip acquisition remains model-specific |
-| full-mix bytes | PROMOTE REQUIRED | OaF materializer -> `input_view.py` |
-| source resolve/re-pin | PROMOTE REQUIRED | `oaf_corpus_run.py` -> `corpus_cache.py` |
-| prediction path | PROMOTE REQUIRED | `oaf_corpus_run.py` -> `prediction_artifact.py` |
-| descriptor | EXTEND | `backend_identity.py` two frozen families |
-| prediction artifact | EXTEND | v2 header + event backend dispatch; OaF golden unchanged |
-| seed MIDI mapping | REUSE + FREEZE | `mapping.DEFAULT_MIDI_NOTE_MAP` |
-| MuScriptor pitch map | EXTEND | explicit table above; persist-unmapped semantics from `map_oaf_prediction()` |
-| zero-hit map identity | EXTEND | `cohort_scoring.py` uses expected cohort map for empty artifacts |
-| scoring/reports | REUSE | HPA-325 |
-| reviewed membership | REUSE + small core extraction | HPA-327 |
-| corpus execution | NEW concrete module | no generic runner |
-| paired deltas | NEW narrow helper | OaF/MuScriptor only |
+| model lock | EXTEND pattern | OaF model lock; MuScriptor source is different |
+| source resolution | PROMOTE | `oaf_corpus_run.py` -> `corpus_cache.py` |
+| full-mix bytes | PROMOTE | OaF materializer -> `input_view.py`, keep containment guard |
+| prediction path | PROMOTE | `oaf_corpus_run.py` -> `prediction_artifact.py` |
+| descriptor | EXTEND | two frozen families; MuScriptor `model_id` patterned + lock-bound |
+| prediction v2 | EXTEND | both `_build_header()` and `_validate_header()` + event dispatch |
+| zero-hit map | EXTEND | closed backend→map dict; preserve independent check |
+| pitch mapping | EXTEND | one string-keyed `PredictionMap`; persist unmapped |
+| scoring/reports | REUSE | HPA-325 published CSVs |
+| reviewed subset | EXTEND narrow core | lineage + membership + score delegation |
+| corpus runner | NEW concrete module | no generic runner |
+| paired deltas | NEW narrow join | published `per_song.csv` + `per_class.csv`, no re-score |
 | CLI tests | EXTEND | `tests/test_cli_benchmark.py` |
 
-## Acceptance
+## Explicitly rejected review suggestion
 
-HPA-395 is complete when:
-
-- the exact package/checkpoint/config/licenses are frozen before scores;
-- inference always uses the frozen hard drum-only settings;
-- the exact MuScriptor v1 pitch table/map ID is frozen before inference and is present in every persisted event identity;
-- raw MuScriptor onset + native pitch persist directly in prediction v2;
-- unsupported pitches remain visible as unmapped coverage rather than disappearing from the artifact;
-- paired OaF/MuScriptor songs have byte-identical Crux canonical full-mix input identity;
-- no same-source OaF/MuScriptor row has an input-view or input-audio hash mismatch;
-- broad and HPA-327 reviewed reports use unchanged HPA-325 semantics;
-- complete per-model success/failure counts remain visible separately from paired intersections;
-- narrow paired deltas are reproducible from persisted artifacts without rerunning inference;
-- runtime/device/dtype/memory and code/weight-license evidence are recorded;
-- no score-informed checkpoint, decoding, mapping, or post-processing change occurred.
-
-## Stop conditions
-
-Do not publish scored results while any of these is unresolved:
-
-- checkpoint/license/revision/hash is not exact;
-- medium/small choice is not frozen from pre-score feasibility evidence;
-- hard `instruments=["drums"]` is unavailable in pinned v0.3.0;
-- `MUSCRIPTOR_PREDICTION_MAP_ID` or the exact v1 pitch table is not committed/frozen;
-- shared canonical full-mix bytes differ from the current OaF output for the same source;
-- a same-source OaF/MuScriptor row has a different input-view or input-audio hash;
-- existing OaF prediction-v2 golden changes;
-- HPA-323/HPA-324/HPA-327 lineage does not match;
-- implementation starts copying the neutral source resolver or prediction-path logic instead of sharing the now-two-caller seam;
-- a proposed abstraction exists only for hypothetical future models rather than two current callers.
-
-## Expected long-lived additions
-
-Keep new production modules to the concrete ticket needs:
-
-```text
-src/benchmark/muscriptor_model.py
-src/benchmark/backends/muscriptor.py
-src/benchmark/muscriptor_corpus_run.py
-src/benchmark/muscriptor_comparison.py
-```
-
-Existing modules receive narrow extensions/extractions only. If implementation starts creating a generic model registry, experiment object model, shared runner base class, or second report stack, stop and simplify.
+Do not remove the deterministic decode/preprocessing fields from `runtime/muscriptor/model.json`. HPA-395's Linear contract explicitly requires the MuScriptor model lock to contain device/dtype, audio decoding/resampling behavior, `instruments=["drums"]`, deterministic decode settings, chunk duration/boundary behavior, and adapter identity. Moving those facts exclusively to code constants/run config would make the implementation smaller but would no longer satisfy the ticket's frozen-lock evidence contract.
