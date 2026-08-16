@@ -1174,6 +1174,98 @@ def score_muscriptor_reviewed_subset_command(
         raise click.exceptions.Exit(outcome.exit_code)
 
 
+@benchmark.command("compare-oaf-muscriptor")
+@click.option(
+    "--oaf-run",
+    "oaf_run_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required path to a persisted crux.oaf-corpus-run/v1 run.json snapshot.",
+)
+@click.option(
+    "--muscriptor-run",
+    "muscriptor_run_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required path to a persisted crux.muscriptor-corpus-run/v1 run.json snapshot.",
+)
+@click.option(
+    "--manifest",
+    "reference_manifest_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required HPA-324 reference-set manifest used by both runs.",
+)
+@click.option(
+    "--timing-manifest",
+    "timing_manifest_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required HPA-323 reference-timing manifest used by both runs.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Directory where the paired comparison reports are written.",
+)
+@click.option(
+    "--subset-manifest",
+    "subset_manifest_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    default=None,
+    help="Optional accepted HPA-327 subset manifest.",
+)
+@click.pass_context
+def compare_oaf_muscriptor_command(
+    ctx: click.Context,
+    oaf_run_path: Path,
+    muscriptor_run_path: Path,
+    reference_manifest_path: Path,
+    timing_manifest_path: Path,
+    output_dir: Path,
+    subset_manifest_path: Path | None,
+) -> None:
+    """Join published OaF and MuScriptor HPA-325 reports without re-scoring."""
+    from src.benchmark.muscriptor_comparison import (
+        ComparisonIntegrityError,
+        ComparisonRequest,
+        compare_oaf_muscriptor,
+    )
+
+    try:
+        outcome = compare_oaf_muscriptor(
+            ComparisonRequest(
+                oaf_run_path=oaf_run_path,
+                muscriptor_run_path=muscriptor_run_path,
+                reference_manifest_path=reference_manifest_path,
+                timing_manifest_path=timing_manifest_path,
+                output_dir=output_dir,
+                subset_manifest_path=subset_manifest_path,
+            )
+        )
+    except (ComparisonIntegrityError, OSError, TypeError, ValueError) as error:
+        payload = {
+            "error": str(error),
+            "exit_code": 2,
+            "output_dir": None,
+            "paired_class_count": 0,
+            "paired_song_count": 0,
+            "pairable_success_count": 0,
+        }
+        click.echo(canonical_json_bytes(payload).decode("utf-8"))
+        ctx.exit(2)
+
+    payload = {
+        "exit_code": outcome.exit_code,
+        "output_dir": str(outcome.output_dir),
+        "paired_class_count": outcome.paired_class_count,
+        "paired_song_count": outcome.paired_song_count,
+        "pairable_success_count": outcome.pairable_success_count,
+    }
+    click.echo(canonical_json_bytes(payload).decode("utf-8"))
+
+
 @benchmark.command("prepare-corpus")
 @raw_dir_option
 @run_name_option
