@@ -12,7 +12,7 @@ from src.benchmark.muscriptor_corpus_run import (
     run_muscriptor_corpus,
 )
 from src.benchmark.reports import write_cohort_reports
-from tests.benchmark.test_muscriptor_corpus_run import (
+from tests.benchmark.muscriptor_run_fixtures import (
     _install_seams,
     _manifests,
     _mapping,

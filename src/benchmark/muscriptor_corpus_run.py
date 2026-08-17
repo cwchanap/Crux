@@ -45,9 +45,7 @@ from src.benchmark.backends.muscriptor import (
     MuscriptorBackend,
     MuscriptorBackendError,
     create_backend,
-)
-from src.benchmark.backends.muscriptor import (
-    _descriptor_for_lock as _adapter_descriptor_for_lock,
+    descriptor_for_lock,
 )
 from src.benchmark.cohort_scoring import (
     COHORT_FAILURE_REASONS,
@@ -648,7 +646,7 @@ def _checkpoint_dir() -> Path:
 
 def _expected_muscriptor_descriptor(lock: MuscriptorModelLock) -> BackendDescriptor:
     """Use the adapter's lock-derived descriptor construction, not a fork."""
-    descriptor = _adapter_descriptor_for_lock(lock)
+    descriptor = descriptor_for_lock(lock)
     if not isinstance(descriptor, BackendDescriptor):
         raise StrictJsonError("MuScriptor descriptor is invalid")
     try:
@@ -1267,20 +1265,6 @@ def _cohort_identity_from_snapshot(snapshot: Mapping[str, object]) -> CohortIden
     return CohortIdentity(**values)  # type: ignore[arg-type]
 
 
-def _item_counts(items: Iterable[CohortItem]) -> dict[str, int]:
-    counts = {field: 0 for field in _SNAPSHOT_COUNTS}
-    for item in items:
-        if item.status == "success":
-            counts["success_count"] += 1
-        elif item.status == "failed":
-            counts["failed_count"] += 1
-        elif item.status == "skipped":
-            counts["skipped_count"] += 1
-        elif item.status == "quarantined":
-            counts["quarantined_count"] += 1
-    return counts
-
-
 def _finalize_scoring_and_outcome(
     snapshot: Mapping[str, object],
     *,
@@ -1307,16 +1291,13 @@ def _finalize_scoring_and_outcome(
     )
     score_result = score_cohort(identity, cohort_items, diagnostics_for=())
     write_cohort_reports(score_result, reports_path)
-    counts = (
-        {
-            "success_count": score_result.population.success_count,
-            "failed_count": score_result.population.failed_count,
-            "skipped_count": score_result.population.skipped_count,
-            "quarantined_count": score_result.population.quarantined_count,
-        }
-        if hasattr(score_result, "population")
-        else _item_counts(cohort_items)
-    )
+    population = score_result.population
+    counts = {
+        "success_count": population.success_count,
+        "failed_count": population.failed_count,
+        "skipped_count": population.skipped_count,
+        "quarantined_count": population.quarantined_count,
+    }
     status = snapshot.get("overall_status")
     if status not in {"complete", "partial", "failed"}:
         status = "partial"
@@ -1585,6 +1566,8 @@ def run_muscriptor_corpus(
 
     try:
         for state in eligible_states:
+            if stop_after_poison:
+                break
             item = state.snapshot
             if item.get("execution_disposition") == "failed" or state.source is None:
                 continue

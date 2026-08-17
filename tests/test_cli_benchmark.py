@@ -728,6 +728,14 @@ def test_reviewed_subset_commands_declare_exact_options() -> None:
             "--subset-manifest",
             "--output-dir",
         },
+        "compare-oaf-muscriptor": {
+            "--oaf-run",
+            "--muscriptor-run",
+            "--manifest",
+            "--timing-manifest",
+            "--output-dir",
+            "--subset-manifest",
+        },
     }
     benchmark_group = main.commands["benchmark"]
     for command, expected in expected_options.items():

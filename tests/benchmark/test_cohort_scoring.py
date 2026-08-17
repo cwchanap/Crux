@@ -1773,7 +1773,7 @@ def test_original_prediction_time_rejects_aligned_without_provenance() -> None:
         cohort_scoring._original_prediction_time(event, "aligned")
 
 
-def _muscriptor_empty_artifact_for_song(tmp_path: Path, simfile_id: str) -> PredictionArtifact:
+def build_empty_muscriptor_artifact_for_song(tmp_path: Path, simfile_id: str) -> PredictionArtifact:
     payload = {
         "architecture_id": "muscriptor-transformer-v0.3.0",
         "backend_id": "muscriptor-v0.3.0-drums-v1",
@@ -1798,7 +1798,7 @@ def _muscriptor_empty_artifact_for_song(tmp_path: Path, simfile_id: str) -> Pred
 def test_empty_muscriptor_artifact_uses_only_its_closed_zero_hit_map_identity(
     tmp_path: Path,
 ) -> None:
-    artifact = _muscriptor_empty_artifact_for_song(tmp_path, "42")
+    artifact = build_empty_muscriptor_artifact_for_song(tmp_path, "42")
     identity = dataclasses.replace(
         build_identity(),
         cohort_id="muscriptor-v1",

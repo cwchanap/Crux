@@ -126,9 +126,9 @@ def _snapshot(
         "reference_timing_manifest_sha256": "b" * 64,
         "reference_timing_version": "hpa323-v1",
         "backend_descriptor": {
-            "backend_id": OAF_BACKEND_ID
-            if schema == OAF_CORPUS_RUN_SCHEMA
-            else MUSCRIPTOR_BACKEND_ID
+            "backend_id": (
+                OAF_BACKEND_ID if schema == OAF_CORPUS_RUN_SCHEMA else MUSCRIPTOR_BACKEND_ID
+            )
         },
         "model_id": model_id,
         "model_lock_sha256": model_lock,
@@ -222,50 +222,54 @@ def _reports(
     _write_csv(
         reports / "per_song.csv",
         _SONG_FIELDS,
-        [
-            {
-                **identity,
-                "simfile_id": "1",
-                "tolerance_ms": "50",
-                "mode": "raw",
-                "tp": "1",
-                "fp": "1",
-                "fn": "1",
-                "precision": precision,
-                "recall": "0.4",
-                "f1": "0.4",
-                "prediction_to_reference_ratio": "1",
-                "median_abs_error_ms": "",
-                "p95_abs_error_ms": "",
-                "offset_ms": "0",
-                "warnings": "",
-            }
-        ]
-        if 1 not in failed_item_ids
-        else [],
+        (
+            [
+                {
+                    **identity,
+                    "simfile_id": "1",
+                    "tolerance_ms": "50",
+                    "mode": "raw",
+                    "tp": "1",
+                    "fp": "1",
+                    "fn": "1",
+                    "precision": precision,
+                    "recall": "0.4",
+                    "f1": "0.4",
+                    "prediction_to_reference_ratio": "1",
+                    "median_abs_error_ms": "",
+                    "p95_abs_error_ms": "",
+                    "offset_ms": "0",
+                    "warnings": "",
+                }
+            ]
+            if 1 not in failed_item_ids
+            else []
+        ),
     )
     _write_csv(
         reports / "per_class.csv",
         _CLASS_FIELDS,
-        [
-            {
-                **identity,
-                "simfile_id": "1",
-                "tolerance_ms": "50",
-                "mode": "raw",
-                "common_class": "kick",
-                "tp": "1",
-                "fp": "0",
-                "fn": "1",
-                "reference_support": "2",
-                "prediction_support": "1",
-                "precision": precision,
-                "recall": "0.5",
-                "f1": "0.5",
-            }
-        ]
-        if 1 not in failed_item_ids
-        else [],
+        (
+            [
+                {
+                    **identity,
+                    "simfile_id": "1",
+                    "tolerance_ms": "50",
+                    "mode": "raw",
+                    "common_class": "kick",
+                    "tp": "1",
+                    "fp": "0",
+                    "fn": "1",
+                    "reference_support": "2",
+                    "prediction_support": "1",
+                    "precision": precision,
+                    "recall": "0.5",
+                    "f1": "0.5",
+                }
+            ]
+            if 1 not in failed_item_ids
+            else []
+        ),
     )
 
 
@@ -468,6 +472,48 @@ def test_compare_rejects_duplicate_score_keys_and_bad_numbers(
         encoding="utf-8",
     )
     with pytest.raises(ComparisonIntegrityError, match="numeric"):
+        compare_oaf_muscriptor(_request(tmp_path, oaf, muscriptor))
+
+
+def test_compare_rejects_report_identity_mismatch_in_published_rows(
+    tmp_path: Path, manifest_loaders
+) -> None:
+    oaf_root = tmp_path / "oaf"
+    muscriptor_root = tmp_path / "muscriptor"
+    oaf = _write_run(
+        oaf_root,
+        model="oaf-model",
+        run_id="oaf-run",
+        schema=OAF_CORPUS_RUN_SCHEMA,
+        lock="e" * 64,
+        prediction_map="oaf-map",
+    )
+    muscriptor = _write_run(
+        muscriptor_root,
+        model="muscriptor-model",
+        run_id="muscriptor-run",
+        schema=MUSCRIPTOR_CORPUS_RUN_SCHEMA,
+        lock="f" * 64,
+        prediction_map="muscriptor-map",
+    )
+    _reports(oaf_root, "oaf-run", "oaf-model", "e" * 64, "oaf-map", precision="0.5")
+    _reports(
+        muscriptor_root,
+        "muscriptor-run",
+        "muscriptor-model",
+        "f" * 64,
+        "muscriptor-map",
+        precision="0.8",
+    )
+    # The altered cohort identity reaches per_song.csv, so the joined report
+    # identity no longer matches the run snapshot.
+    song_path = oaf_root / "reports" / "per_song.csv"
+    song_path.write_text(
+        song_path.read_text(encoding="utf-8").replace("oaf-run,", "other-run,"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ComparisonIntegrityError, match="identity mismatch"):
         compare_oaf_muscriptor(_request(tmp_path, oaf, muscriptor))
 
 

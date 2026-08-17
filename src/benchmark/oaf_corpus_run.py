@@ -523,9 +523,7 @@ def render_oaf_corpus_run(snapshot: Mapping[str, object]) -> bytes:
         raise TypeError("run snapshot must be a mapping")
     normalized = _normalize_snapshot_value(snapshot)
     if not isinstance(normalized, dict):
-        raise StrictJsonError(  # pragma: no cover
-            "run snapshot must be an object"
-        )
+        raise StrictJsonError("run snapshot must be an object")  # pragma: no cover
     return canonical_json_bytes(_validate_snapshot(normalized))
 
 
