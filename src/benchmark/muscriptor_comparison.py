@@ -646,9 +646,9 @@ def _subset_ids(
     reference_manifest: object,
     timing_manifest: object,
     evidence: Iterable[_RunEvidence],
-) -> set[str] | None:
+) -> tuple[set[str] | None, object | None]:
     if subset_path is None:
-        return None
+        return None, None
     try:
         subset = load_reviewed_subset_manifest(subset_path)
     except (OSError, StrictJsonError, TypeError, ValueError) as error:
@@ -666,7 +666,7 @@ def _subset_ids(
     for run in evidence:
         if not ids <= set(run.items):
             _fail("subset manifest member is absent from a run population")
-    return ids
+    return ids, subset
 
 
 def _pairable_ids(
@@ -729,18 +729,27 @@ def _csv_decimal(value: Decimal | None) -> str:
     return rendered or "0"
 
 
+def _song_key_sort_key(value: tuple[str, int, str]) -> tuple[int, int, int]:
+    return int(value[0]), value[1], _MODES[value[2]]
+
+
 def _paired_song_rows(
     oaf: Mapping[tuple[str, int, str], _SongRow],
     muscriptor: Mapping[tuple[str, int, str], _SongRow],
     pairable_ids: set[str],
 ) -> list[dict[str, str]]:
+    oaf_keys = {key for key in oaf if key[0] in pairable_ids}
+    muscriptor_keys = {key for key in muscriptor if key[0] in pairable_ids}
+    if oaf_keys != muscriptor_keys:
+        missing_from_muscriptor = sorted(oaf_keys - muscriptor_keys, key=_song_key_sort_key)
+        missing_from_oaf = sorted(muscriptor_keys - oaf_keys, key=_song_key_sort_key)
+        _fail(
+            "per_song score key grid mismatch for pairable songs"
+            f" (missing from MuScriptor: {missing_from_muscriptor},"
+            f" missing from OaF: {missing_from_oaf})"
+        )
     rows: list[dict[str, str]] = []
-    for key in sorted(
-        set(oaf) & set(muscriptor),
-        key=lambda value: (int(value[0]), value[1], _MODES[value[2]]),
-    ):
-        if key[0] not in pairable_ids:
-            continue
+    for key in sorted(oaf_keys, key=_song_key_sort_key):
         left, right = oaf[key], muscriptor[key]
         rows.append(
             {
@@ -869,6 +878,7 @@ def _summary(
     reference_manifest: object,
     timing_manifest: object,
     subset_path: Path | None,
+    subset_manifest: object | None,
 ) -> dict[str, object]:
     return {
         "schema": COMPARISON_SCHEMA,
@@ -879,7 +889,17 @@ def _summary(
             "reference_timing_version": getattr(timing_manifest, "corpus_version"),
             "input_view_id": oaf.identity.input_view_id,
         },
-        "subset_manifest": None if subset_path is None else str(subset_path),
+        "subset_manifest": (
+            None
+            if subset_path is None
+            else {
+                "path": str(subset_path),
+                "manifest_sha256": getattr(subset_manifest, "manifest_sha256"),
+                "corpus_version": getattr(subset_manifest, "corpus_version"),
+                "review_policy_version": getattr(subset_manifest, "review_policy_version"),
+                "review_ledger_sha256": getattr(subset_manifest, "review_ledger_sha256"),
+            }
+        ),
         "models": {
             "oaf": {
                 **oaf.identity.report_values(),
@@ -1010,7 +1030,7 @@ def compare_oaf_muscriptor(request: ComparisonRequest) -> ComparisonOutcome:
         _validate_manifest_lineage(oaf, reference_manifest, timing_manifest)
         _validate_manifest_lineage(muscriptor, reference_manifest, timing_manifest)
         _validate_pair_run_identity(oaf.identity, muscriptor.identity)
-        selected_ids = _subset_ids(
+        selected_ids, subset_manifest = _subset_ids(
             request.subset_manifest_path,
             reference_manifest,
             timing_manifest,
@@ -1034,6 +1054,7 @@ def compare_oaf_muscriptor(request: ComparisonRequest) -> ComparisonOutcome:
             reference_manifest,
             timing_manifest,
             request.subset_manifest_path,
+            subset_manifest,
         )
         request.output_dir.mkdir(parents=True, exist_ok=True)
         names = ("paired_per_song.csv", "paired_per_class.csv", "summary.json", "summary.md")

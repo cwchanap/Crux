@@ -402,6 +402,10 @@ def test_subset_filters_pairing_but_keeps_full_model_populations(
         comparison,
         "load_reviewed_subset_manifest",
         lambda _path: SimpleNamespace(
+            manifest_sha256="s" * 64,
+            corpus_version="hpa327-v1",
+            review_policy_version="crux.review-policy/v1",
+            review_ledger_sha256="t" * 64,
             source_reference_manifest_sha256="a" * 64,
             source_reference_manifest_version="hpa324-v1",
             source_timing_manifest_sha256="b" * 64,
@@ -423,7 +427,8 @@ def test_subset_filters_pairing_but_keeps_full_model_populations(
         "quarantined_count": 0,
     }
     assert summary["models"]["muscriptor"]["population"] == summary["models"]["oaf"]["population"]
-    assert summary["subset_manifest"] == str(tmp_path / "subset.json")
+    assert summary["subset_manifest"]["path"] == str(tmp_path / "subset.json")
+    assert summary["subset_manifest"]["manifest_sha256"] == "s" * 64
     assert result.pairable_success_count == 1
 
 
@@ -599,3 +604,127 @@ def test_compare_rejects_canonical_input_mismatch_before_joining(
 
     with pytest.raises(ComparisonIntegrityError, match="canonical-input"):
         compare_oaf_muscriptor(_request(tmp_path, oaf, muscriptor))
+
+
+def test_compare_rejects_one_sided_missing_per_song_row(tmp_path: Path, manifest_loaders) -> None:
+    """A missing per_song row on one side is corrupted evidence, not an exclusion."""
+    oaf_root = tmp_path / "oaf"
+    muscriptor_root = tmp_path / "muscriptor"
+    oaf = _write_run(
+        oaf_root,
+        model="oaf-model",
+        run_id="oaf-run",
+        schema=OAF_CORPUS_RUN_SCHEMA,
+        lock="e" * 64,
+        prediction_map="oaf-map",
+    )
+    muscriptor = _write_run(
+        muscriptor_root,
+        model="muscriptor-model",
+        run_id="muscriptor-run",
+        schema=MUSCRIPTOR_CORPUS_RUN_SCHEMA,
+        lock="f" * 64,
+        prediction_map="muscriptor-map",
+    )
+    _reports(oaf_root, "oaf-run", "oaf-model", "e" * 64, "oaf-map", precision="0.5")
+    _reports(
+        muscriptor_root,
+        "muscriptor-run",
+        "muscriptor-model",
+        "f" * 64,
+        "muscriptor-map",
+        precision="0.8",
+    )
+    # Remove the only per_song row from MuScriptor, simulating a one-sided
+    # missing score row for an otherwise pairable successful song.
+    song_path = muscriptor_root / "reports" / "per_song.csv"
+    lines = song_path.read_text(encoding="utf-8").splitlines()
+    song_path.write_text(lines[0] + "\n", encoding="utf-8")
+
+    with pytest.raises(ComparisonIntegrityError, match="per_song.*key grid"):
+        compare_oaf_muscriptor(_request(tmp_path, oaf, muscriptor))
+
+
+def test_compare_persists_subset_identity_in_summary(
+    tmp_path: Path,
+    manifest_loaders,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """summary.json records the immutable subset identity, not only the path."""
+    oaf_root = tmp_path / "oaf"
+    muscriptor_root = tmp_path / "muscriptor"
+    common_kwargs = {
+        "item_ids": (1, 2),
+        "item_dispositions": {1: "inferred", 2: "failed"},
+    }
+    oaf = _write_run(
+        oaf_root,
+        model="oaf-model",
+        run_id="oaf-run",
+        schema=OAF_CORPUS_RUN_SCHEMA,
+        lock="e" * 64,
+        prediction_map="oaf-map",
+        **common_kwargs,
+    )
+    muscriptor = _write_run(
+        muscriptor_root,
+        model="muscriptor-model",
+        run_id="muscriptor-run",
+        schema=MUSCRIPTOR_CORPUS_RUN_SCHEMA,
+        lock="f" * 64,
+        prediction_map="muscriptor-map",
+        **common_kwargs,
+    )
+    _reports(
+        oaf_root,
+        "oaf-run",
+        "oaf-model",
+        "e" * 64,
+        "oaf-map",
+        precision="0.5",
+        item_ids=(1, 2),
+        failed_item_ids=frozenset({2}),
+    )
+    _reports(
+        muscriptor_root,
+        "muscriptor-run",
+        "muscriptor-model",
+        "f" * 64,
+        "muscriptor-map",
+        precision="0.8",
+        item_ids=(1, 2),
+        failed_item_ids=frozenset({2}),
+    )
+
+    import src.benchmark.muscriptor_comparison as comparison
+
+    subset_sha = "a" * 64
+    subset_corpus_version = "hpa327-v1"
+    subset_policy_version = "crux.review-policy/v1"
+    subset_ledger_sha = "b" * 64
+    monkeypatch.setattr(
+        comparison,
+        "load_reviewed_subset_manifest",
+        lambda _path: SimpleNamespace(
+            manifest_sha256=subset_sha,
+            corpus_version=subset_corpus_version,
+            review_policy_version=subset_policy_version,
+            review_ledger_sha256=subset_ledger_sha,
+            source_reference_manifest_sha256="a" * 64,
+            source_reference_manifest_version="hpa324-v1",
+            source_timing_manifest_sha256="b" * 64,
+            source_timing_manifest_version="hpa323-v1",
+            rows=(SimpleNamespace(view=SimpleNamespace(simfile_id=1)),),
+        ),
+    )
+    result = compare_oaf_muscriptor(
+        _request(tmp_path, oaf, muscriptor, subset=tmp_path / "subset.json")
+    )
+
+    summary = json.loads((result.output_dir / "summary.json").read_text(encoding="utf-8"))
+    subset_manifest = summary["subset_manifest"]
+    assert subset_manifest["path"] == str(tmp_path / "subset.json")
+    assert subset_manifest["manifest_sha256"] == subset_sha
+    assert subset_manifest["corpus_version"] == subset_corpus_version
+    assert subset_manifest["review_policy_version"] == subset_policy_version
+    assert subset_manifest["review_ledger_sha256"] == subset_ledger_sha
