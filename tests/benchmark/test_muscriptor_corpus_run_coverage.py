@@ -708,11 +708,13 @@ def test_project_runtime_skips_rows_missing_timing() -> None:
 
 def test_process_peak_rss_returns_int_on_darwin(monkeypatch: pytest.MonkeyPatch) -> None:
     import resource as resource_module
+    import sys as sys_module
 
     class FakeRusage:
         ru_maxrss = 123456
 
     monkeypatch.setattr(resource_module, "getrusage", lambda _who: FakeRusage())
+    monkeypatch.setattr(sys_module, "platform", "darwin")
     assert _process_peak_rss_bytes() == 123456
 
 
