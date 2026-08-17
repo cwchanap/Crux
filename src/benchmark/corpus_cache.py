@@ -330,20 +330,47 @@ def _remote_from_source_mapping(
         if not isinstance(raw_object, Mapping) or raw_object.get("key") != source_audio_key:
             continue
         try:
-            return RemoteObject(
-                key=source_audio_key,
-                size=raw_object["size"],  # type: ignore[arg-type]
-                etag=raw_object["etag"],  # type: ignore[arg-type]
-                etag_is_weak=raw_object["etag_is_weak"],  # type: ignore[arg-type]
-                last_modified=parse_manifest_timestamp(raw_object["last_modified"]),
-                content_type=raw_object["content_type"],  # type: ignore[arg-type]
-                cache_status=raw_object["cache_status"],  # type: ignore[arg-type]
-                sha256=raw_object["sha256"],  # type: ignore[arg-type]
-                cache_path=raw_object["cache_path"],  # type: ignore[arg-type]
-            )
+            return _validated_source_audio_object(raw_object, source_audio_key)
         except (KeyError, TypeError, ValueError):
             raise ValueError("source manifest contains an invalid audio object") from None
     raise ValueError("source audio key is absent from the source inventory")
+
+
+def _validated_source_audio_object(
+    raw_object: Mapping[str, object],
+    source_audio_key: str,
+) -> RemoteObject:
+    """Build one RemoteObject after validating every untrusted row field."""
+    size = raw_object["size"]
+    etag = raw_object["etag"]
+    etag_is_weak = raw_object["etag_is_weak"]
+    content_type = raw_object["content_type"]
+    cache_status = raw_object["cache_status"]
+    sha256 = raw_object["sha256"]
+    cache_path = raw_object["cache_path"]
+    if (
+        isinstance(size, bool)
+        or not isinstance(size, int)
+        or size < 0
+        or not isinstance(etag, str)
+        or not isinstance(etag_is_weak, bool)
+        or (content_type is not None and not isinstance(content_type, str))
+        or cache_status not in {"not_selected", "verified", "failed"}
+        or (sha256 is not None and not _is_lower_hex_sha256(sha256))
+        or (cache_path is not None and (not isinstance(cache_path, str) or not cache_path))
+    ):
+        raise ValueError("source manifest object field is invalid")
+    return RemoteObject(
+        key=source_audio_key,
+        size=size,
+        etag=etag,
+        etag_is_weak=etag_is_weak,
+        last_modified=parse_manifest_timestamp(raw_object["last_modified"]),
+        content_type=content_type,
+        cache_status=cache_status,
+        sha256=sha256,
+        cache_path=cache_path,
+    )
 
 
 def _source_audio_parts(
@@ -383,6 +410,7 @@ def _source_audio_parts(
 
     if not isinstance(endpoint, str) or not endpoint:
         raise ValueError("source_endpoint_sha256 is required")
+    require_sha256(endpoint, "source_endpoint_sha256")
     if not isinstance(bucket, str) or not bucket:
         raise ValueError("source_bucket is required")
     if not isinstance(key, str) or not key:

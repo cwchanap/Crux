@@ -64,7 +64,7 @@ class MuscriptorBackend:
             raise ValueError("dtype does not match the model lock")
 
         weights_path = verify_muscriptor_checkpoint(lock, checkpoint_dir)
-        expected_descriptor = _descriptor_for_lock(lock)
+        expected_descriptor = descriptor_for_lock(lock)
         if descriptor is None:
             descriptor = expected_descriptor
         else:
@@ -155,7 +155,7 @@ def _load_lock(model_lock_path: Path | MuscriptorModelLock | None) -> Muscriptor
     return load_muscriptor_model_lock(model_lock_path)
 
 
-def _descriptor_for_lock(lock: MuscriptorModelLock) -> BackendDescriptor:
+def descriptor_for_lock(lock: MuscriptorModelLock) -> BackendDescriptor:
     payload = dict(MUSCRIPTOR_DESCRIPTOR_IDENTITIES)
     payload.update(
         {

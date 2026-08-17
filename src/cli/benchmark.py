@@ -1216,9 +1216,7 @@ def score_muscriptor_reviewed_subset_command(
     default=None,
     help="Optional accepted HPA-327 subset manifest.",
 )
-@click.pass_context
 def compare_oaf_muscriptor_command(
-    ctx: click.Context,
     oaf_run_path: Path,
     muscriptor_run_path: Path,
     reference_manifest_path: Path,
@@ -1246,15 +1244,16 @@ def compare_oaf_muscriptor_command(
         )
     except (ComparisonIntegrityError, OSError, TypeError, ValueError) as error:
         payload = {
-            "error": str(error),
+            "error": type(error).__name__,
             "exit_code": 2,
             "output_dir": None,
             "paired_class_count": 0,
             "paired_song_count": 0,
             "pairable_success_count": 0,
         }
+        click.echo(str(error), err=True)
         click.echo(canonical_json_bytes(payload).decode("utf-8"))
-        ctx.exit(2)
+        raise click.exceptions.Exit(2)
 
     payload = {
         "exit_code": outcome.exit_code,

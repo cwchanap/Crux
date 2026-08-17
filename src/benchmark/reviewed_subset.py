@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import csv
 import io
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
@@ -929,6 +929,55 @@ def score_reviewed_subset_cohort(
     )
 
 
+def _score_reviewed_subset_from_run(
+    request: ScoreReviewedSubsetRequest,
+    *,
+    parse_run: Callable[[bytes], Mapping[str, object]],
+    build_cohort: Callable[..., tuple[CohortIdentity, tuple[CohortItem, ...]]],
+) -> ScoreReviewedSubsetOutcome:
+    """Shared lineage/scoring flow for one persisted backend run."""
+    try:
+        if len(request.run_path.parents) < 3:
+            raise ValueError("run path must live inside a persisted run directory tree")
+        if request.output_dir.resolve() == (request.run_path.parent / "reports").resolve():
+            raise ValueError(
+                "subset report output directory must not alias the parent run's broad reports"
+            )
+        reference = load_reference_set_manifest(request.reference_manifest_path)
+        timing = load_reference_timing_manifest(request.timing_manifest_path)
+        mappings = preflight_reference_mappings(
+            reference,
+            timing,
+            timing_output_root=request.timing_manifest_path.parent.parent,
+        )
+        snapshot = parse_run(read_regular_file_no_follow(request.run_path))
+        if snapshot.get("reference_manifest_sha256") != reference.manifest_sha256:
+            raise ValueError("run snapshot reference manifest does not match the supplied manifest")
+        if snapshot.get("reference_manifest_version") != reference.corpus_version:
+            raise ValueError("run snapshot reference version does not match the supplied manifest")
+        if snapshot.get("reference_timing_manifest_sha256") != timing.manifest_sha256:
+            raise ValueError("run snapshot timing manifest does not match the supplied manifest")
+        if snapshot.get("reference_timing_version") != timing.corpus_version:
+            raise ValueError("run snapshot timing version does not match the supplied manifest")
+
+        subset = load_reviewed_subset_manifest(request.subset_manifest_path)
+        parent_identity, parent_items = build_cohort(
+            snapshot,
+            mappings=mappings,
+            output_dir=request.run_path.parents[2],
+        )
+        return score_reviewed_subset_cohort(
+            parent_identity,
+            parent_items,
+            reference,
+            timing,
+            subset,
+            output_dir=request.output_dir,
+        )
+    except (OSError, StrictJsonError, ValueError):
+        return _fatal_score_outcome()
+
+
 def score_oaf_reviewed_subset(
     request: ScoreReviewedSubsetRequest,
 ) -> ScoreReviewedSubsetOutcome:
@@ -951,44 +1000,11 @@ def score_oaf_reviewed_subset(
         parse_oaf_corpus_run,
     )
 
-    try:
-        if request.output_dir.resolve() == (request.run_path.parent / "reports").resolve():
-            raise ValueError(
-                "subset report output directory must not alias the parent run's broad reports"
-            )
-        reference = load_reference_set_manifest(request.reference_manifest_path)
-        timing = load_reference_timing_manifest(request.timing_manifest_path)
-        mappings = preflight_reference_mappings(
-            reference,
-            timing,
-            timing_output_root=request.timing_manifest_path.parent.parent,
-        )
-        snapshot = parse_oaf_corpus_run(read_regular_file_no_follow(request.run_path))
-        if snapshot.get("reference_manifest_sha256") != reference.manifest_sha256:
-            raise ValueError("run snapshot reference manifest does not match the supplied manifest")
-        if snapshot.get("reference_manifest_version") != reference.corpus_version:
-            raise ValueError("run snapshot reference version does not match the supplied manifest")
-        if snapshot.get("reference_timing_manifest_sha256") != timing.manifest_sha256:
-            raise ValueError("run snapshot timing manifest does not match the supplied manifest")
-        if snapshot.get("reference_timing_version") != timing.corpus_version:
-            raise ValueError("run snapshot timing version does not match the supplied manifest")
-
-        subset = load_reviewed_subset_manifest(request.subset_manifest_path)
-        parent_identity, parent_items = build_oaf_cohort_from_snapshot(
-            snapshot,
-            mappings=mappings,
-            output_dir=request.run_path.parents[2],
-        )
-        return score_reviewed_subset_cohort(
-            parent_identity,
-            parent_items,
-            reference,
-            timing,
-            subset,
-            output_dir=request.output_dir,
-        )
-    except (OSError, StrictJsonError, ValueError):
-        return _fatal_score_outcome()
+    return _score_reviewed_subset_from_run(
+        request,
+        parse_run=parse_oaf_corpus_run,
+        build_cohort=build_oaf_cohort_from_snapshot,
+    )
 
 
 def score_muscriptor_reviewed_subset(
@@ -1000,44 +1016,11 @@ def score_muscriptor_reviewed_subset(
         parse_muscriptor_corpus_run,
     )
 
-    try:
-        if request.output_dir.resolve() == (request.run_path.parent / "reports").resolve():
-            raise ValueError(
-                "subset report output directory must not alias the parent run's broad reports"
-            )
-        reference = load_reference_set_manifest(request.reference_manifest_path)
-        timing = load_reference_timing_manifest(request.timing_manifest_path)
-        mappings = preflight_reference_mappings(
-            reference,
-            timing,
-            timing_output_root=request.timing_manifest_path.parent.parent,
-        )
-        snapshot = parse_muscriptor_corpus_run(read_regular_file_no_follow(request.run_path))
-        if snapshot.get("reference_manifest_sha256") != reference.manifest_sha256:
-            raise ValueError("run snapshot reference manifest does not match the supplied manifest")
-        if snapshot.get("reference_manifest_version") != reference.corpus_version:
-            raise ValueError("run snapshot reference version does not match the supplied manifest")
-        if snapshot.get("reference_timing_manifest_sha256") != timing.manifest_sha256:
-            raise ValueError("run snapshot timing manifest does not match the supplied manifest")
-        if snapshot.get("reference_timing_version") != timing.corpus_version:
-            raise ValueError("run snapshot timing version does not match the supplied manifest")
-
-        subset = load_reviewed_subset_manifest(request.subset_manifest_path)
-        parent_identity, parent_items = build_muscriptor_cohort_from_snapshot(
-            snapshot,
-            mappings=mappings,
-            output_dir=request.run_path.parents[2],
-        )
-        return score_reviewed_subset_cohort(
-            parent_identity,
-            parent_items,
-            reference,
-            timing,
-            subset,
-            output_dir=request.output_dir,
-        )
-    except (OSError, StrictJsonError, ValueError):
-        return _fatal_score_outcome()
+    return _score_reviewed_subset_from_run(
+        request,
+        parse_run=parse_muscriptor_corpus_run,
+        build_cohort=build_muscriptor_cohort_from_snapshot,
+    )
 
 
 def _current_candidate_slate(

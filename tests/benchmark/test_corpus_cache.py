@@ -288,6 +288,74 @@ def install_cached_body(cache_dir: Path, body: bytes = b"chart") -> Path:
     return path
 
 
+def _source_mapping_row(digest: str) -> dict[str, object]:
+    return {
+        "source_audio_key": "42/audio.wav",
+        "source_endpoint_sha256": "a" * 64,
+        "source_bucket": "simfile-dtx",
+        "objects": [
+            {
+                "key": "42/audio.wav",
+                "size": 1,
+                "etag": '"etag-42"',
+                "etag_is_weak": False,
+                "last_modified": "2026-07-25T00:00:00Z",
+                "content_type": "audio/wav",
+                "cache_status": "verified",
+                "sha256": digest,
+                "cache_path": f"sha256/{digest[:2]}/{digest}",
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("size", "1"),
+        ("size", -1),
+        ("etag", 42),
+        ("etag_is_weak", "false"),
+        ("last_modified", "not-a-timestamp"),
+        ("content_type", 7),
+        ("cache_status", "unknown"),
+        ("sha256", "nothex"),
+        ("cache_path", ""),
+        ("etag", None),
+    ],
+)
+def test_resolve_source_audio_rejects_malformed_mapping_object_fields(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    row = _source_mapping_row(sha256(b"body").hexdigest())
+    row["objects"][0][field] = value  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="source manifest contains an invalid audio object"):
+        resolve_source_audio(
+            row,
+            tmp_path,
+            CacheIndexStore(tmp_path, {}),
+            source_audio_content_hash=sha256(b"body").hexdigest(),
+        )
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ["short", "A" * 64, "z" * 64],
+)
+def test_resolve_source_audio_requires_lowercase_sha256_endpoint_hash(
+    tmp_path: Path, endpoint: str
+) -> None:
+    with pytest.raises(ValueError, match="source_endpoint_sha256"):
+        resolve_source_audio(
+            _source_mapping_row(sha256(b"body").hexdigest()),
+            tmp_path,
+            CacheIndexStore(tmp_path, {}),
+            source_audio_content_hash=sha256(b"body").hexdigest(),
+            source_endpoint_sha256=endpoint,
+        )
+
+
 def test_resolve_source_audio_returns_verified_body_and_duration(tmp_path: Path) -> None:
     data = b"\0\0" * 441
     fmt = struct.pack("<HHIIHH", 1, 1, 44100, 88200, 2, 16)

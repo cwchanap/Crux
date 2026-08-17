@@ -83,7 +83,7 @@ def test_map_midi_events_respects_explicit_empty_note_map():
     assert diagnostics.unmapped == {"36": 1}
 
 
-def _muscriptor_descriptor():
+def build_muscriptor_descriptor():
     payload = {
         "architecture_id": "muscriptor-transformer-v0.3.0",
         "backend_id": "muscriptor-v0.3.0-drums-v1",
@@ -98,7 +98,7 @@ def _muscriptor_descriptor():
     return build_descriptor(payload, frozenset(payload), payload["descriptor_schema"])
 
 
-def _muscriptor_prediction(notes: tuple[int, ...]) -> NativePrediction:
+def build_muscriptor_prediction(notes: tuple[int, ...]) -> NativePrediction:
     return NativePrediction(
         audio=CanonicalAudio(
             path=Path(),
@@ -112,7 +112,7 @@ def _muscriptor_prediction(notes: tuple[int, ...]) -> NativePrediction:
             sample_width_bytes=2,
             audio_frame_count=1,
         ),
-        descriptor=_muscriptor_descriptor(),
+        descriptor=build_muscriptor_descriptor(),
         events=tuple(
             NativeEvent(
                 time_sec=float(index),
@@ -140,7 +140,7 @@ def test_muscriptor_map_is_one_string_keyed_frozen_pitch_map():
 
 
 def test_map_muscriptor_prediction_preserves_mapped_aliases_and_unmapped_hits():
-    prediction = _muscriptor_prediction((35, 40, 44, 53, 57, 37, 55))
+    prediction = build_muscriptor_prediction((35, 40, 44, 53, 57, 37, 55))
 
     mapped, diagnostics = map_muscriptor_prediction(prediction)
 
@@ -188,7 +188,7 @@ def test_map_muscriptor_prediction_preserves_mapped_aliases_and_unmapped_hits():
     ],
 )
 def test_map_muscriptor_prediction_rejects_identity_mismatch(change: dict[str, str]):
-    prediction = _muscriptor_prediction((38,))
+    prediction = build_muscriptor_prediction((38,))
     descriptor = replace(
         prediction.descriptor,
         payload={**prediction.descriptor.payload, **change},

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import csv
 import io
+import os
+import tempfile
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -526,7 +528,7 @@ def _parse_run_identity(snapshot: Mapping[str, object]) -> _RunIdentity:
     )
 
 
-def _parse_run(path: Path) -> tuple[Mapping[str, object], _RunIdentity]:
+def _parse_run(path: Path) -> tuple[Mapping[str, object], _RunIdentity, dict[str, _RunItem]]:
     snapshot: Mapping[str, object] = {}
     try:
         content = read_regular_file_no_follow(path)
@@ -576,24 +578,13 @@ def _parse_run(path: Path) -> tuple[Mapping[str, object], _RunIdentity]:
         elif input_hash is not None and not isinstance(input_hash, str):
             _fail("input_audio_sha256 is malformed")
         parsed_items[simfile_id] = _RunItem(simfile_id, status, source_hash, input_hash)
-    return snapshot, identity
+    return snapshot, identity, parsed_items
 
 
 def _load_evidence(run_path: Path) -> _RunEvidence:
-    snapshot, identity = _parse_run(run_path)
+    snapshot, identity, run_items = _parse_run(run_path)
     reports_path = run_path.parent / "reports"
     items_report = _parse_items(reports_path / "items.csv", identity)
-    run_items: dict[str, _RunItem] = {}
-    raw_items = snapshot["items"]
-    assert isinstance(raw_items, list)
-    for raw in raw_items:
-        assert isinstance(raw, Mapping)
-        simfile_id = str(raw["simfile_id"])
-        disposition = raw["execution_disposition"]
-        status = _STATUS_BY_DISPOSITION[disposition]
-        source_hash = raw.get("source_audio_sha256")
-        input_hash = raw.get("input_audio_sha256")
-        run_items[simfile_id] = _RunItem(simfile_id, status, source_hash, input_hash)
     if set(items_report) != set(run_items):
         _fail("items report population does not match run snapshot")
     if any(items_report[item_id] != item.status for item_id, item in run_items.items()):
@@ -871,7 +862,6 @@ def _runtime(snapshot: Mapping[str, object]) -> dict[str, object]:
 def _summary(
     oaf: _RunEvidence,
     muscriptor: _RunEvidence,
-    selected_ids: set[str] | None,
     pairable_ids: set[str],
     exclusions: Mapping[str, int],
     song_rows: list[dict[str, str]],
@@ -1037,7 +1027,6 @@ def compare_oaf_muscriptor(request: ComparisonRequest) -> ComparisonOutcome:
         summary = _summary(
             oaf,
             muscriptor,
-            selected_ids,
             pairable_ids,
             exclusions,
             song_rows,
@@ -1047,10 +1036,17 @@ def compare_oaf_muscriptor(request: ComparisonRequest) -> ComparisonOutcome:
             request.subset_manifest_path,
         )
         request.output_dir.mkdir(parents=True, exist_ok=True)
-        _write_csv(request.output_dir / "paired_per_song.csv", _SONG_OUTPUT_FIELDS, song_rows)
-        _write_csv(request.output_dir / "paired_per_class.csv", _CLASS_OUTPUT_FIELDS, class_rows)
-        (request.output_dir / "summary.json").write_bytes(canonical_json_bytes(summary))
-        _write_markdown(request.output_dir / "summary.md", summary)
+        names = ("paired_per_song.csv", "paired_per_class.csv", "summary.json", "summary.md")
+        with tempfile.TemporaryDirectory(
+            prefix=".comparison-stage-", dir=request.output_dir
+        ) as stage_name:
+            staged = Path(stage_name)
+            _write_csv(staged / "paired_per_song.csv", _SONG_OUTPUT_FIELDS, song_rows)
+            _write_csv(staged / "paired_per_class.csv", _CLASS_OUTPUT_FIELDS, class_rows)
+            (staged / "summary.json").write_bytes(canonical_json_bytes(summary))
+            _write_markdown(staged / "summary.md", summary)
+            for name in names:
+                os.replace(staged / name, request.output_dir / name)
     except ComparisonIntegrityError:
         raise
     except (OSError, StrictJsonError, TypeError, ValueError) as error:
