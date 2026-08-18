@@ -21,6 +21,7 @@ from src.benchmark.backend_identity import (
 )
 from src.benchmark.cohort_scoring import SCORING_VERSION, CohortIdentity
 from src.benchmark.published_comparison import (
+    COMPARISON_SCHEMA,
     ComparisonIntegrityError,
     _aggregate_rows,
     _csv_decimal,
@@ -68,8 +69,6 @@ def load_reviewed_subset_manifest(path: Path):
 
     return load_manifest(path)
 
-
-COMPARISON_SCHEMA = "crux.oaf-muscriptor-comparison/v1"
 
 _REPORT_IDENTITY_FIELDS = (
     "cohort_id",
@@ -349,11 +348,7 @@ def _validate_report_identity(row: Mapping[str, str], identity: _RunIdentity) ->
 
 def _parse_items(path: Path, identity: _RunIdentity) -> dict[str, str]:
     try:
-        rows = _parse_item_rows(
-            path,
-            _compat_report_identity(identity),
-            strict_semantics=False,
-        )
+        rows = _parse_item_rows(path, _compat_report_identity(identity))
     except ReportIntegrityError as error:
         _fail(str(error))
     return {row.simfile_id: row.status for row in rows}
@@ -522,52 +517,52 @@ def _report_identity_from_snapshot(snapshot: Mapping[str, object]) -> CohortIden
     raise AssertionError("unreachable")
 
 
-def _load_evidence(run_path: Path) -> _RunEvidence:
+def _load_evidence(
+    run_path: Path,
+    *,
+    expected_backend_id: str | None = None,
+    argument: str | None = None,
+) -> _RunEvidence:
     snapshot, identity, run_items = _parse_run(run_path)
+    if expected_backend_id is not None:
+        _validate_backend_family(
+            identity,
+            expected_backend_id=expected_backend_id,
+            argument=argument or "run",
+        )
     reports_path = run_path.parent / "reports"
-    summary_path = reports_path / "summary.json"
-    if summary_path.exists():
-        try:
-            published = read_cohort_reports(
-                reports_path,
-                expected_identity=_report_identity_from_snapshot(snapshot),
-            )
-        except ReportIntegrityError as error:
-            _fail(str(error))
-        items_report = {row.simfile_id: row.status for row in published.items}
-    else:
-        # Keep old in-memory comparison fixtures readable while all published
-        # report directories take the strict reader path above.
-        items_report = _parse_items(reports_path / "items.csv", identity)
+    try:
+        published = read_cohort_reports(
+            reports_path,
+            expected_identity=_report_identity_from_snapshot(snapshot),
+        )
+    except ReportIntegrityError as error:
+        _fail(str(error))
+    items_report = {row.simfile_id: row.status for row in published.items}
     if set(items_report) != set(run_items):
         _fail("items report population does not match run snapshot")
     if any(items_report[item_id] != item.status for item_id, item in run_items.items()):
         _fail("items report status does not match run snapshot")
-    successful_ids = {item_id for item_id, item in run_items.items() if item.status == "success"}
-    if summary_path.exists():
-        songs_report = {
-            (row.simfile_id, row.tolerance_ms, row.mode): _SongRow(
-                row.simfile_id, row.tolerance_ms, row.mode, row.precision, row.recall, row.f1
-            )
-            for row in published.songs
-        }
-        classes_report = {
-            (row.simfile_id, row.tolerance_ms, row.mode, row.common_class): _ClassRow(
-                row.simfile_id,
-                row.tolerance_ms,
-                row.mode,
-                row.common_class,
-                row.reference_support,
-                row.prediction_support,
-                row.precision,
-                row.recall,
-                row.f1,
-            )
-            for row in published.classes
-        }
-    else:
-        songs_report = _parse_song_rows(reports_path / "per_song.csv", identity, successful_ids)
-        classes_report = _parse_class_rows(reports_path / "per_class.csv", identity, successful_ids)
+    songs_report = {
+        (row.simfile_id, row.tolerance_ms, row.mode): _SongRow(
+            row.simfile_id, row.tolerance_ms, row.mode, row.precision, row.recall, row.f1
+        )
+        for row in published.songs
+    }
+    classes_report = {
+        (row.simfile_id, row.tolerance_ms, row.mode, row.common_class): _ClassRow(
+            row.simfile_id,
+            row.tolerance_ms,
+            row.mode,
+            row.common_class,
+            row.reference_support,
+            row.prediction_support,
+            row.precision,
+            row.recall,
+            row.f1,
+        )
+        for row in published.classes
+    }
     reports = _Reports(
         items_report,
         songs_report,
@@ -687,8 +682,16 @@ def compare_oaf_muscriptor(request: ComparisonRequest) -> ComparisonOutcome:
     try:
         reference_manifest = load_reference_set_manifest(request.reference_manifest_path)
         timing_manifest = load_reference_timing_manifest(request.timing_manifest_path)
-        oaf = _load_evidence(request.oaf_run_path)
-        muscriptor = _load_evidence(request.muscriptor_run_path)
+        oaf = _load_evidence(
+            request.oaf_run_path,
+            expected_backend_id=OAF_BACKEND_ID,
+            argument="--oaf-run",
+        )
+        muscriptor = _load_evidence(
+            request.muscriptor_run_path,
+            expected_backend_id=MUSCRIPTOR_BACKEND_ID,
+            argument="--muscriptor-run",
+        )
         _validate_backend_family(
             oaf.identity,
             expected_backend_id=OAF_BACKEND_ID,

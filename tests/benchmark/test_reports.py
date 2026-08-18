@@ -455,3 +455,47 @@ def test_read_cohort_reports_rejects_score_row_for_non_success_item(tmp_path: Pa
 
     with pytest.raises(ReportIntegrityError, match="non-success item"):
         read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_incomplete_success_song_grid(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "per_song.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    path.write_text("\n".join([lines[0], *lines[2:]]) + "\n", encoding="utf-8")
+
+    with pytest.raises(ReportIntegrityError, match="score grid"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_incomplete_aggregate_mode_grid(tmp_path: Path) -> None:
+    artifacts = write_cohort_reports(_result(), tmp_path)
+    summary = strict_json_loads(artifacts.summary_json.read_bytes(), require_canonical=True)
+    summary["aggregates"] = summary["aggregates"][:1]
+    artifacts.summary_json.write_bytes(canonical_json_bytes(summary))
+
+    with pytest.raises(ReportIntegrityError, match="mode grid"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+@pytest.mark.parametrize(
+    ("needle", "replacement"),
+    (
+        (",50,raw,", ",050,raw,"),
+        (",0.5,", ",0.50,"),
+        (
+            ",50,raw,1,0,0,1,1,1,1,0,",
+            ",50,raw,1,0,0,1e-1,1,1,1,0,",
+        ),
+    ),
+)
+def test_read_cohort_reports_rejects_noncanonical_csv_numbers(
+    tmp_path: Path, needle: str, replacement: str
+) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "per_song.csv"
+    content = path.read_text(encoding="utf-8")
+    assert needle in content
+    path.write_text(content.replace(needle, replacement, 1), encoding="utf-8")
+
+    with pytest.raises(ReportIntegrityError, match="canonical"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())

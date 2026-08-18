@@ -51,8 +51,10 @@ from src.benchmark.muscriptor_corpus_run import MUSCRIPTOR_CORPUS_RUN_SCHEMA
 from src.benchmark.oaf_corpus_run import OAF_CORPUS_RUN_SCHEMA
 from src.benchmark.published_comparison import (
     PublishedRunEvidence,
+    comparison_summary,
     pairable_success_ids,
     paired_song_rows,
+    write_markdown,
 )
 from tests.benchmark.test_muscriptor_comparison import (
     _CLASS_FIELDS,
@@ -139,6 +141,22 @@ def _items_row(
             "reference_duplicate_collapsed_count": "0",
         }
     )
+    if status == "success":
+        row.update(
+            {
+                "prediction_native_event_count": "1",
+                "prediction_mapped_event_count": "1",
+                "prediction_unmapped_event_count": "0",
+                "prediction_mapping_coverage": "1",
+                "prediction_native_class_counts": "kick=1",
+            }
+        )
+    elif status == "failed":
+        row["failure_reason"] = "prediction_missing"
+    elif status == "skipped":
+        row["failure_reason"] = "explicitly_skipped"
+    elif status == "quarantined":
+        row["failure_reason"] = "reference_quarantined"
     row.update(overrides)
     return row
 
@@ -659,8 +677,25 @@ def test_load_evidence_rejects_population_mismatch(tmp_path: Path) -> None:
         prediction_map=_MAP,
         item_ids=(1, 2),
     )
+    _reports(run.parent, _COHORT, _MODEL, _MODEL_LOCK, _MAP, precision="0.5", item_ids=(1, 2))
     _write_items(run.parent / "reports", [_items_row(simfile_id="1")])
     with pytest.raises(ComparisonIntegrityError, match="population does not match"):
+        _load_evidence(run)
+
+
+def test_load_evidence_rejects_live_report_without_summary(tmp_path: Path) -> None:
+    run = _write_run(
+        tmp_path / "oaf",
+        model=_MODEL,
+        run_id=_COHORT,
+        schema=OAF_CORPUS_RUN_SCHEMA,
+        lock=_MODEL_LOCK,
+        prediction_map=_MAP,
+    )
+    _reports(run.parent, _COHORT, _MODEL, _MODEL_LOCK, _MAP, precision="0.5")
+    (run.parent / "reports" / "summary.json").unlink(missing_ok=True)
+
+    with pytest.raises(ComparisonIntegrityError, match="summary.json"):
         _load_evidence(run)
 
 
@@ -675,7 +710,15 @@ def test_load_evidence_rejects_status_mismatch(tmp_path: Path) -> None:
         item_ids=(1,),
         item_dispositions={1: "inferred"},
     )
-    _write_items(run.parent / "reports", [_items_row(simfile_id="1", status="failed")])
+    _reports(
+        run.parent,
+        _COHORT,
+        _MODEL,
+        _MODEL_LOCK,
+        _MAP,
+        precision="0.5",
+        failed_item_ids=frozenset({1}),
+    )
     with pytest.raises(ComparisonIntegrityError, match="status does not match"):
         _load_evidence(run)
 
@@ -828,6 +871,23 @@ def test_shared_pairing_can_allow_distinct_derived_input_hashes() -> None:
     }
 
 
+@pytest.mark.parametrize("source_hash", [None, "", "not-a-sha256"])
+def test_shared_pairing_rejects_missing_or_invalid_source_hash(source_hash: str | None) -> None:
+    left = PublishedRunEvidence(
+        identity=_identity(),
+        items={"1": _RunItem("1", "success", source_hash, "c" * 64)},
+        reports=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    right = PublishedRunEvidence(
+        identity=_identity(),
+        items={"1": _RunItem("1", "success", source_hash, "d" * 64)},
+        reports=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ComparisonIntegrityError, match="source_audio_sha256"):
+        pairable_success_ids(left, right, None, require_identical_input_hash=False)
+
+
 def test_shared_song_join_parameterizes_only_output_labels() -> None:
     key = ("1", 50, "raw")
     left = {key: _SongRow("1", 50, "raw", Decimal("0.5"), Decimal("0.4"), Decimal("0.4"))}
@@ -844,6 +904,78 @@ def test_shared_song_join_parameterizes_only_output_labels() -> None:
     assert rows[0]["full_mix_precision"] == "0.5"
     assert rows[0]["spleeter_precision"] == "0.8"
     assert rows[0]["delta_precision"] == "0.3"
+
+
+def test_shared_summary_parameterizes_schema_identity_and_labels() -> None:
+    left = PublishedRunEvidence(
+        identity=_identity(),
+        items={"1": _RunItem("1", "success", "a" * 64, "c" * 64)},
+        reports=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    right = PublishedRunEvidence(
+        identity=_identity(),
+        items={"1": _RunItem("1", "success", "a" * 64, "d" * 64)},
+        reports=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+
+    summary = comparison_summary(
+        left,
+        right,
+        {"1"},
+        {"source_audio_mismatch": 0},
+        [],
+        [],
+        SimpleNamespace(manifest_sha256="r" * 64, corpus_version="ref-v1"),
+        SimpleNamespace(manifest_sha256="t" * 64, corpus_version="timing-v1"),
+        None,
+        None,
+        schema="crux.oaf-separation-comparison/v1",
+        identity={"input_views": {"full_mix": "crux.full-mix/v1", "spleeter": "crux.spleeter/v1"}},
+        left_label="full_mix",
+        right_label="spleeter",
+    )
+
+    assert summary["schema"] == "crux.oaf-separation-comparison/v1"
+    assert summary["identity"] == {
+        "input_views": {"full_mix": "crux.full-mix/v1", "spleeter": "crux.spleeter/v1"}
+    }
+    assert set(summary["models"]) == {"full_mix", "spleeter"}
+
+
+def test_shared_markdown_parameterizes_heading_and_labels(tmp_path: Path) -> None:
+    population = {
+        "total_count": 0,
+        "eligible_count": 0,
+        "success_count": 0,
+        "failed_count": 0,
+        "skipped_count": 0,
+        "quarantined_count": 0,
+    }
+    summary = {
+        "identity": {"input_views": "full-mix-vs-spleeter"},
+        "models": {"full_mix": {"population": population}, "spleeter": {"population": population}},
+        "pairing": {
+            "pairable_success_intersection": 0,
+            "paired_song_row_count": 0,
+            "paired_class_row_count": 0,
+            "exclusions": {},
+        },
+        "aggregates": {"song": [], "class": []},
+    }
+    path = tmp_path / "summary.md"
+
+    write_markdown(
+        path,
+        summary,
+        title="Full Mix vs Spleeter",
+        left_label="full_mix",
+        right_label="spleeter",
+    )
+
+    rendered = path.read_text(encoding="utf-8")
+    assert rendered.startswith("# Full Mix vs Spleeter\n")
+    assert "| full_mix |" in rendered
+    assert "| spleeter |" in rendered
 
 
 def test_metric_delta_returns_none_for_missing_side() -> None:
