@@ -20,6 +20,7 @@ from src.benchmark.reference_set_manifest import load_reference_set_manifest
 from src.benchmark.reference_timing_manifest import load_reference_timing_manifest
 from src.benchmark.reviewed_subset import (
     ScoreReviewedSubsetOutcome,
+    _source_row_sha256,
     load_reviewed_subset_manifest,
 )
 from src.benchmark.separators import HTDEMUCS_SEPARATOR_ID, SPLEETER_SEPARATOR_ID
@@ -46,9 +47,7 @@ def _subset_path(tmp_path: Path, fixture: object) -> Path:
                 "source_reference_manifest_version": reference.corpus_version,
                 "source_timing_manifest_sha256": timing.manifest_sha256,
                 "source_timing_manifest_version": timing.corpus_version,
-                "source_row_sha256": hashlib.sha256(
-                    canonical_json_bytes({"simfile_id": loaded.view.simfile_id})
-                ).hexdigest(),
+                "source_row_sha256": _source_row_sha256(loaded.source_row),
                 "selected_chart_key": loaded.source_row["selected_chart_key"],
                 "selected_chart_content_hash": loaded.source_row["selected_chart_content_hash"],
                 "source_audio_key": loaded.source_row["source_audio_key"],
@@ -90,6 +89,22 @@ def _install_fixture_locks(monkeypatch: pytest.MonkeyPatch) -> None:
             HTDEMUCS_SEPARATOR_ID: FIXTURE_ROOT / "htdemucs-model.json",
         },
     )
+
+
+def _runtime_sentinels() -> dict[str, object]:
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("fatal preflight touched an execution seam")
+
+    return {
+        "backend_factory": explode,
+        "spleeter_runner": explode,
+        "htdemucs_runner": explode,
+        "perf_counter": explode,
+    }
+
+
+def _run_with_runtime_sentinels(run: object, request: object) -> object:
+    return run(request, **_runtime_sentinels())  # type: ignore[operator]
 
 
 def test_request_exposes_only_the_fixed_pilot_controls() -> None:
@@ -138,10 +153,13 @@ def test_lineage_preflight_fails_before_full_mix_control_or_runtime_touch(
 
     from src.benchmark.separation_pilot import run_oaf_separation_pilot
 
-    outcome = run_oaf_separation_pilot(replace(request, subset_manifest_path=broken))
+    outcome = _run_with_runtime_sentinels(
+        run_oaf_separation_pilot,
+        replace(request, subset_manifest_path=broken),
+    )
 
-    assert outcome.exit_code == 2
-    assert outcome.run_path is None
+    assert outcome.exit_code == 2  # type: ignore[attr-defined]
+    assert outcome.run_path is None  # type: ignore[attr-defined]
     assert not calls
 
 
@@ -174,8 +192,11 @@ def test_other_fatal_preflight_cases_never_call_public_control(
     missing_member = tmp_path / "missing-member.jsonl"
     missing_member.write_bytes(render_manifest(tuple(missing_member_rows)).content)
     assert (
-        run_oaf_separation_pilot(replace(request, subset_manifest_path=missing_member)).exit_code
-        == 2
+        _run_with_runtime_sentinels(
+            run_oaf_separation_pilot,
+            replace(request, subset_manifest_path=missing_member),
+        ).exit_code
+        == 2  # type: ignore[attr-defined]
     )
 
     _install_fixture_locks(monkeypatch)
@@ -186,11 +207,18 @@ def test_other_fatal_preflight_cases_never_call_public_control(
             HTDEMUCS_SEPARATOR_ID: FIXTURE_ROOT / "htdemucs-model.json",
         },
     )
-    assert run_oaf_separation_pilot(request).exit_code == 2
+    outcome = _run_with_runtime_sentinels(run_oaf_separation_pilot, request)
+    assert outcome.exit_code == 2  # type: ignore[attr-defined]
 
     _install_fixture_locks(monkeypatch)
     aliased_output = fixture.run_path.parent / "reports"
-    assert run_oaf_separation_pilot(replace(request, output_dir=aliased_output)).exit_code == 2
+    assert (
+        _run_with_runtime_sentinels(
+            run_oaf_separation_pilot,
+            replace(request, output_dir=aliased_output),
+        ).exit_code
+        == 2  # type: ignore[attr-defined]
+    )
     assert not calls
 
 
@@ -297,4 +325,96 @@ def test_parent_mixed_oaf_identity_is_fatal(
 
     from src.benchmark.separation_pilot import run_oaf_separation_pilot
 
-    assert run_oaf_separation_pilot(request).exit_code == 2
+    outcome = _run_with_runtime_sentinels(run_oaf_separation_pilot, request)
+    assert outcome.exit_code == 2  # type: ignore[attr-defined]
+
+
+def test_forged_parent_run_id_is_fatal_before_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    _install_fixture_locks(monkeypatch)
+    parent = parse_oaf_corpus_run(fixture.run_path.read_bytes())
+    parent["run_id"] = "oaf-forged-parent-id"
+    from src.benchmark.oaf_corpus_run import write_oaf_corpus_run
+
+    write_oaf_corpus_run(fixture.run_path, parent)
+    monkeypatch.setattr(
+        "src.benchmark.separation_pilot.score_oaf_reviewed_subset",
+        lambda _request: pytest.fail("forged parent identity must fail before scoring"),
+    )
+
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    outcome = _run_with_runtime_sentinels(run_oaf_separation_pilot, request)
+    assert outcome.exit_code == 2  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("lineage", ["subset_source_row", "parent_source_audio"])
+def test_source_lineage_mismatch_is_fatal_before_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lineage: str,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    _install_fixture_locks(monkeypatch)
+    monkeypatch.setattr(
+        "src.benchmark.separation_pilot.score_oaf_reviewed_subset",
+        lambda _request: pytest.fail("source lineage mismatch must fail before scoring"),
+    )
+
+    if lineage == "subset_source_row":
+        rows = [
+            strict_json_loads(line[:-1], require_canonical=True)
+            for line in subset.read_bytes().splitlines(keepends=True)
+        ]
+        assert isinstance(rows[0], dict)
+        rows[0]["source_row_sha256"] = "e" * 64
+        for row in rows:
+            assert isinstance(row, dict)
+            row.pop("corpus_version", None)
+        foreign = tmp_path / "foreign-source-row.jsonl"
+        foreign.write_bytes(render_manifest(tuple(rows)).content)
+        request = replace(request, subset_manifest_path=foreign)
+    else:
+        parent = parse_oaf_corpus_run(fixture.run_path.read_bytes())
+        assert isinstance(parent["items"], list)
+        assert isinstance(parent["items"][0], dict)
+        parent["items"][0]["source_audio_sha256"] = "e" * 64
+        from src.benchmark.oaf_corpus_run import write_oaf_corpus_run
+
+        write_oaf_corpus_run(fixture.run_path, parent)
+
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    outcome = _run_with_runtime_sentinels(run_oaf_separation_pilot, request)
+    assert outcome.exit_code == 2  # type: ignore[attr-defined]
+
+
+def test_missing_crux_commit_is_fatal_before_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    _install_fixture_locks(monkeypatch)
+    monkeypatch.setattr(
+        "src.benchmark.separation_pilot.score_oaf_reviewed_subset",
+        lambda _request: pytest.fail("missing Crux provenance must fail before scoring"),
+    )
+
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    assert (
+        _run_with_runtime_sentinels(
+            run_oaf_separation_pilot,
+            replace(request, crux_commit=None),
+        ).exit_code
+        == 2  # type: ignore[attr-defined]
+    )
