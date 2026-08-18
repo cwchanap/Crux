@@ -736,6 +736,24 @@ def test_reviewed_subset_commands_declare_exact_options() -> None:
             "--output-dir",
             "--subset-manifest",
         },
+        "run-oaf-separation-pilot": {
+            "--manifest",
+            "--timing-manifest",
+            "--subset-manifest",
+            "--oaf-run",
+            "--cache-dir",
+            "--output-dir",
+            "--spleeter-python",
+            "--demucs-python",
+            "--resume",
+        },
+        "finalize-oaf-separation-pilot": {
+            "--run",
+            "--subset-manifest",
+            "--output-manifest",
+            "--decision",
+            "--rationale",
+        },
     }
     benchmark_group = main.commands["benchmark"]
     for command, expected in expected_options.items():
@@ -769,8 +787,286 @@ def test_reviewed_subset_commands_declare_exact_options() -> None:
             "--beam",
             "--instrument",
             "--map-version",
+            "--model-path",
+            "--model-id",
+            "--model-lock",
+            "--qc",
+            "--qc-policy",
+            "--tolerance",
+            "--tolerance-ms",
+            "--full-corpus",
+            "--third-separator",
+            "--third-separator-python",
+            "--cost-rate",
+            "--cost-per-minute",
+            "--dollar-cost-rate",
         ):
             assert selector not in result.output
+
+
+def test_separation_pilot_commands_keep_domain_imports_lazy() -> None:
+    import sys
+
+    assert "src.benchmark.separation_pilot" not in sys.modules
+    assert "src.benchmark.separation_handoff" not in sys.modules
+    for command in ("run-oaf-separation-pilot", "finalize-oaf-separation-pilot"):
+        result = CliRunner().invoke(main, ["benchmark", command, "--help"])
+        assert result.exit_code == 0
+
+
+def test_run_oaf_separation_pilot_command_builds_request_and_propagates_partial_exit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.separation_pilot as pilot_module
+
+    manifest = tmp_path / "reference.jsonl"
+    timing_manifest = tmp_path / "timing.jsonl"
+    subset_manifest = tmp_path / "subset.jsonl"
+    oaf_run = tmp_path / "oaf" / "run.json"
+    cache_dir = tmp_path / "cache"
+    output_dir = tmp_path / "output"
+    spleeter_python = tmp_path / "spleeter-python"
+    demucs_python = tmp_path / "demucs-python"
+    for path in (manifest, timing_manifest, subset_manifest, spleeter_python, demucs_python):
+        path.write_bytes(b"fixture")
+    oaf_run.parent.mkdir()
+    oaf_run.write_bytes(b"fixture")
+    cache_dir.mkdir()
+    output_dir.mkdir()
+    captured: list[object] = []
+    run_path = output_dir / "runs" / "pilot" / "run.json"
+
+    def fake_run(request: object) -> pilot_module.OafSeparationPilotOutcome:
+        captured.append(request)
+        return pilot_module.OafSeparationPilotOutcome(
+            overall_status="partial",
+            exit_code=1,
+            run_id="oaf-separation-1234567890abcdef",
+            run_path=run_path,
+            reports_path=run_path.parent / "reports",
+            full_mix_reports_path=run_path.parent / "full-mix-reports",
+            success_count=3,
+            failed_count=1,
+            skipped_count=2,
+            quarantined_count=4,
+        )
+
+    monkeypatch.setattr(pilot_module, "run_oaf_separation_pilot", fake_run)
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "run-oaf-separation-pilot",
+            "--manifest",
+            str(manifest),
+            "--timing-manifest",
+            str(timing_manifest),
+            "--subset-manifest",
+            str(subset_manifest),
+            "--oaf-run",
+            str(oaf_run),
+            "--cache-dir",
+            str(cache_dir),
+            "--output-dir",
+            str(output_dir),
+            "--spleeter-python",
+            str(spleeter_python),
+            "--demucs-python",
+            str(demucs_python),
+            "--resume",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 1
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.reference_manifest_path == manifest
+    assert request.timing_manifest_path == timing_manifest
+    assert request.subset_manifest_path == subset_manifest
+    assert request.oaf_run_path == oaf_run
+    assert request.cache_dir == cache_dir
+    assert request.output_dir == output_dir
+    assert request.spleeter_python == spleeter_python
+    assert request.demucs_python == demucs_python
+    assert request.resume is True
+    assert json.loads(result.output) == {
+        "exit_code": 1,
+        "failed_count": 1,
+        "full_mix_reports_path": str(run_path.parent / "full-mix-reports"),
+        "quarantined_count": 4,
+        "reports_path": str(run_path.parent / "reports"),
+        "run_id": "oaf-separation-1234567890abcdef",
+        "run_path": str(run_path),
+        "skipped_count": 2,
+        "status": "partial",
+        "success_count": 3,
+    }
+
+
+def test_run_oaf_separation_pilot_command_preserves_complete_and_fatal_exit_codes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.separation_pilot as pilot_module
+
+    outcomes = [
+        pilot_module.OafSeparationPilotOutcome(
+            overall_status="complete",
+            exit_code=0,
+            run_id="oaf-separation-1234567890abcdef",
+            run_path=tmp_path / "complete.json",
+            reports_path=None,
+            full_mix_reports_path=None,
+            success_count=20,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+        ),
+        pilot_module.OafSeparationPilotOutcome(
+            overall_status="failed",
+            exit_code=2,
+            run_id=None,
+            run_path=None,
+            reports_path=None,
+            full_mix_reports_path=None,
+            success_count=0,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+        ),
+    ]
+
+    def fake_run(_request: object) -> pilot_module.OafSeparationPilotOutcome:
+        return outcomes.pop(0)
+
+    monkeypatch.setattr(pilot_module, "run_oaf_separation_pilot", fake_run)
+    args = [
+        "benchmark",
+        "run-oaf-separation-pilot",
+        "--manifest",
+        str(tmp_path / "reference.jsonl"),
+        "--timing-manifest",
+        str(tmp_path / "timing.jsonl"),
+        "--subset-manifest",
+        str(tmp_path / "subset.jsonl"),
+        "--oaf-run",
+        str(tmp_path / "oaf-run.json"),
+        "--cache-dir",
+        str(tmp_path / "cache"),
+        "--output-dir",
+        str(tmp_path / "output"),
+        "--spleeter-python",
+        str(tmp_path / "spleeter-python"),
+        "--demucs-python",
+        str(tmp_path / "demucs-python"),
+    ]
+
+    complete = CliRunner().invoke(main, args, catch_exceptions=False)
+    fatal = CliRunner().invoke(main, args, catch_exceptions=False)
+
+    assert complete.exit_code == 0
+    assert json.loads(complete.output)["exit_code"] == 0
+    assert fatal.exit_code == 2
+    assert json.loads(fatal.output)["exit_code"] == 2
+
+
+def test_finalize_oaf_separation_pilot_command_publishes_manifest_summary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.separation_handoff as handoff_module
+
+    run_path = tmp_path / "run.json"
+    subset_manifest = tmp_path / "subset.jsonl"
+    output_manifest = tmp_path / "handoff.jsonl"
+    run_path.write_bytes(b"fixture")
+    subset_manifest.write_bytes(b"fixture")
+    published_path = tmp_path / "manifests" / ("a" * 64 + ".jsonl")
+    published = type(
+        "Published",
+        (),
+        {"path": published_path, "manifest_sha256": "a" * 64},
+    )()
+    captured: list[object] = []
+
+    def fake_finalize(request: object) -> handoff_module.FinalizeSeparationPilotOutcome:
+        captured.append(request)
+        return handoff_module.FinalizeSeparationPilotOutcome(exit_code=0, manifest=published)
+
+    monkeypatch.setattr(handoff_module, "finalize_separation_pilot", fake_finalize)
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "finalize-oaf-separation-pilot",
+            "--run",
+            str(run_path),
+            "--subset-manifest",
+            str(subset_manifest),
+            "--output-manifest",
+            str(output_manifest),
+            "--decision",
+            "use_htdemucs",
+            "--rationale",
+            "The retained evidence supports the reviewed HTDemucs choice.",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.run_path == run_path
+    assert request.subset_manifest_path == subset_manifest
+    assert request.output_manifest == output_manifest
+    assert request.decision == "use_htdemucs"
+    assert request.rationale == "The retained evidence supports the reviewed HTDemucs choice."
+    assert json.loads(result.output) == {
+        "exit_code": 0,
+        "manifest_path": str(published_path),
+        "manifest_sha256": "a" * 64,
+    }
+
+
+def test_finalize_oaf_separation_pilot_command_rejects_unpublished_success(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.separation_handoff as handoff_module
+
+    run_path = tmp_path / "run.json"
+    subset_manifest = tmp_path / "subset.jsonl"
+    output_manifest = tmp_path / "handoff.jsonl"
+    run_path.write_bytes(b"fixture")
+    subset_manifest.write_bytes(b"fixture")
+
+    def fake_finalize(_request: object) -> handoff_module.FinalizeSeparationPilotOutcome:
+        return handoff_module.FinalizeSeparationPilotOutcome(exit_code=0, manifest=None)
+
+    monkeypatch.setattr(handoff_module, "finalize_separation_pilot", fake_finalize)
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "finalize-oaf-separation-pilot",
+            "--run",
+            str(run_path),
+            "--subset-manifest",
+            str(subset_manifest),
+            "--output-manifest",
+            str(output_manifest),
+            "--decision",
+            "keep_full_mix",
+            "--rationale",
+            "No immutable decision artifact was published.",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.output) == {
+        "exit_code": 2,
+        "manifest_path": None,
+        "manifest_sha256": None,
+    }
 
 
 def test_prepare_reviewed_subset_command_builds_request_and_emits_canonical_summary(

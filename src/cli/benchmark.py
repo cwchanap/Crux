@@ -1267,6 +1267,193 @@ def compare_oaf_muscriptor_command(
     click.echo(canonical_json_bytes(payload).decode("utf-8"))
 
 
+@benchmark.command("run-oaf-separation-pilot")
+@click.option(
+    "--manifest",
+    "reference_manifest_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required HPA-324 reference-set manifest for the fixed reviewed subset.",
+)
+@click.option(
+    "--timing-manifest",
+    "timing_manifest_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required HPA-323 reference-timing manifest for the fixed reviewed subset.",
+)
+@click.option(
+    "--subset-manifest",
+    "subset_manifest_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required immutable HPA-327 reviewed-subset manifest.",
+)
+@click.option(
+    "--oaf-run",
+    "oaf_run_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required persisted full-mix OaF run snapshot.",
+)
+@click.option(
+    "--cache-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+    help="Required local corpus/audio cache root.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+    help="Directory where the mutable separation pilot run is written.",
+)
+@click.option(
+    "--spleeter-python",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required isolated Spleeter interpreter.",
+)
+@click.option(
+    "--demucs-python",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required isolated Demucs interpreter.",
+)
+@click.option("--resume", is_flag=True)
+@click.pass_context
+def run_oaf_separation_pilot_command(
+    ctx: click.Context,
+    reference_manifest_path: Path,
+    timing_manifest_path: Path,
+    subset_manifest_path: Path,
+    oaf_run_path: Path,
+    cache_dir: Path,
+    output_dir: Path,
+    spleeter_python: Path,
+    demucs_python: Path,
+    resume: bool,
+) -> None:
+    """Run the fixed HPA-328 OaF separation pilot."""
+    from src.benchmark.separation_pilot import (
+        OafSeparationPilotOutcome,
+        OafSeparationPilotRequest,
+        run_oaf_separation_pilot,
+    )
+
+    try:
+        request = OafSeparationPilotRequest(
+            reference_manifest_path=reference_manifest_path,
+            timing_manifest_path=timing_manifest_path,
+            subset_manifest_path=subset_manifest_path,
+            oaf_run_path=oaf_run_path,
+            cache_dir=cache_dir,
+            output_dir=output_dir,
+            spleeter_python=spleeter_python,
+            demucs_python=demucs_python,
+            resume=resume,
+        )
+    except (TypeError, ValueError):
+        outcome = OafSeparationPilotOutcome(
+            overall_status="failed",
+            exit_code=2,
+            run_id=None,
+            run_path=None,
+            reports_path=None,
+            full_mix_reports_path=None,
+            success_count=0,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+        )
+    else:
+        outcome = run_oaf_separation_pilot(request)
+
+    payload = {
+        "exit_code": outcome.exit_code,
+        "failed_count": outcome.failed_count,
+        "full_mix_reports_path": (
+            None if outcome.full_mix_reports_path is None else str(outcome.full_mix_reports_path)
+        ),
+        "quarantined_count": outcome.quarantined_count,
+        "reports_path": None if outcome.reports_path is None else str(outcome.reports_path),
+        "run_id": outcome.run_id,
+        "run_path": None if outcome.run_path is None else str(outcome.run_path),
+        "skipped_count": outcome.skipped_count,
+        "status": outcome.overall_status,
+        "success_count": outcome.success_count,
+    }
+    click.echo(canonical_json_bytes(payload).decode("utf-8"))
+    if outcome.exit_code:
+        ctx.exit(outcome.exit_code)
+
+
+@benchmark.command("finalize-oaf-separation-pilot")
+@click.option(
+    "--run",
+    "run_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required closed HPA-328 separation pilot run snapshot.",
+)
+@click.option(
+    "--subset-manifest",
+    "subset_manifest_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required immutable HPA-327 reviewed-subset manifest.",
+)
+@click.option(
+    "--output-manifest",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Requested path for the immutable HPA-396 handoff manifest.",
+)
+@click.option("--decision", required=True, type=str)
+@click.option("--rationale", required=True, type=str)
+@click.pass_context
+def finalize_oaf_separation_pilot_command(
+    ctx: click.Context,
+    run_path: Path,
+    subset_manifest_path: Path,
+    output_manifest: Path,
+    decision: str,
+    rationale: str,
+) -> None:
+    """Publish one immutable HPA-396 handoff for a closed HPA-328 run."""
+    from src.benchmark.separation_handoff import (
+        FinalizeSeparationPilotOutcome,
+        FinalizeSeparationPilotRequest,
+        finalize_separation_pilot,
+    )
+
+    try:
+        request = FinalizeSeparationPilotRequest(
+            run_path=run_path,
+            subset_manifest_path=subset_manifest_path,
+            output_manifest=output_manifest,
+            decision=decision,
+            rationale=rationale,
+        )
+    except (TypeError, ValueError):
+        outcome = FinalizeSeparationPilotOutcome(exit_code=2, manifest=None)
+    else:
+        outcome = finalize_separation_pilot(request)
+
+    manifest = outcome.manifest
+    exit_code = outcome.exit_code
+    if exit_code == 0 and manifest is None:
+        exit_code = 2
+    payload = {
+        "exit_code": exit_code,
+        "manifest_path": None if manifest is None else str(manifest.path),
+        "manifest_sha256": None if manifest is None else manifest.manifest_sha256,
+    }
+    click.echo(canonical_json_bytes(payload).decode("utf-8"))
+    if exit_code:
+        ctx.exit(exit_code)
+
+
 @benchmark.command("prepare-corpus")
 @raw_dir_option
 @run_name_option
