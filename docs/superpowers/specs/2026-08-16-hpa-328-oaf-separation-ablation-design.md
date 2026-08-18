@@ -9,187 +9,154 @@
 
 Implement HPA-328 as one fixed paired-input experiment around the validated OaF benchmark path:
 
-1. use the **entire canonical HPA-327 reviewed subset** as pilot membership;
-2. reuse the persisted HPA-326 full-mix OaF run as the control and never rerun full-mix OaF;
-3. run exactly **Spleeter 4-stem drums** and **standard `htdemucs` drums** in v1;
-4. keep both separators outside Crux's Python dependency graph and invoke two concrete pinned external commands;
-5. retain exact separator-produced WAV bytes by authoritative source SHA-256 plus separator-lock SHA-256;
-6. canonicalize retained stems through the existing 44.1 kHz mono PCM16 OaF input boundary while keeping source, stem, and canonical-input identities distinct;
-7. reuse the exact OaF inference write path: `backend.transcribe()` → `map_oaf_prediction()` → `publish_prediction_artifact()` with `classify_oaf_backend_error()` for backend failures;
-8. reuse HPA-325 scoring and reports without adding a scorer or failure-reason enum;
-9. compare full mix against each separator only on their paired-success intersections, while keeping independent population counts visible;
-10. publish an immutable HPA-396 handoff containing the exact HTDemucs stem and OaF-on-HTDemucs identities;
-11. record the recommendation explicitly as an operator decision rather than implementing an automatic winner formula.
+1. use the entire canonical HPA-327 reviewed subset as pilot membership;
+2. reuse persisted HPA-326 full-mix OaF predictions as the control and never rerun full-mix OaF;
+3. compare exactly Spleeter 4-stem drums and standard `htdemucs` drums;
+4. keep both separators in isolated external runtimes;
+5. retain exact separator-produced WAV stems for HPA-396;
+6. canonicalize stems through the existing 44.1 kHz mono PCM16 OaF boundary while keeping source, stem, and canonical-input identity distinct;
+7. reuse the existing OaF transcribe → map → publish path and HPA-325 scorer;
+8. reuse shared persisted-artifact matching and published-report comparison primitives instead of creating HPA-328 copies;
+9. compare each separator with full mix on the exact paired-success population;
+10. publish one immutable HPA-396 handoff and one operator-recorded recommendation.
 
-Do **not** build a separator plugin registry, generic experiment runner, RPC/service layer, queue, worker pool, database, third separator, SDR scorer, bootstrap/significance layer, retry/tuning engine, or full-corpus separator mode.
+Do not add a separator plugin registry, generic experiment runner, RPC/service layer, queue, database, third separator, SDR scorer, significance/bootstrap layer, model tuning, or a full-corpus separator path.
 
 ## Latest review resolution
 
-The latest review is accepted in full. It tightens implementation bindings but does not change the experiment.
+The latest review is **accepted except for one deliberately narrowed refactor**. The experiment does not change.
 
-### 1. Derived-view resume must not reuse the full-mix-only matcher
+### 1. Share the existing comparison engine, not only its report reader
 
-Current `oaf_corpus_run._prediction_artifact_matches()` rejects any prediction whose `input_view_id` is not `OAF_FULL_MIX_INPUT_VIEW_ID`, then separately compares it with the materialized `CanonicalAudio.input_view_id`. That helper is therefore correct for HPA-326 but wrong for HPA-328 derived views.
+`muscriptor_comparison.py` already owns the mechanical pieces HPA-328 needs: successful-population intersection, metric deltas, per-song/per-class joins, deterministic CSV writing, canonical summary writing, and Markdown rendering.
 
-HPA-328 must not copy or call that full-mix equality. Resume validation instead has two layers:
+Task 8A therefore promotes the model-neutral pieces into a focused `src/benchmark/published_comparison.py` beside the new `read_cohort_reports()` boundary. MuScriptor keeps its existing behavior and output bytes through characterization tests.
 
-1. reuse the existing view-agnostic `_prediction_artifact_matches_run_row()` to bind raw persisted bytes to the prior run-row evidence;
-2. validate the artifact against the current materialized `CanonicalAudio`, requiring descriptor/source/input SHA identity and:
-
-```python
-prediction.audio.input_view_id == audio.input_view_id
-```
-
-The expected view comes from the materialized derived input, never from `OAF_FULL_MIX_INPUT_VIEW_ID`.
-
-### 2. Derived inference uses the existing OaF write path exactly
-
-A prediction path helper is only a location function. HPA-328 must not invent a second publisher or bypass native-event mapping.
-
-For every prediction miss the live path is exactly:
+The one real policy difference becomes explicit:
 
 ```python
-native = backend.transcribe(audio)
-mapped, diagnostics = map_oaf_prediction(native)
-published = publish_prediction_artifact(prediction_target, mapped)
+def pairable_success_ids(
+    left: PublishedRunEvidence,
+    right: PublishedRunEvidence,
+    selected_ids: set[str] | None,
+    *,
+    require_identical_input_hash: bool = True,
+) -> tuple[set[str], dict[str, int]]: ...
 ```
 
-`OafBackendError` is handled through `classify_oaf_backend_error()`. `ArtifactPublicationError` / `PredictionArtifactError` remain prediction-artifact failures. No generic runner extraction is needed.
+MuScriptor uses the default `True`, because both models consume the same canonical full-mix bytes. HPA-328 passes `False`, because different derived `input_audio_sha256` values are the experiment; source-audio SHA equality remains required.
 
-### 3. Full-mix control uses the existing high-level reviewed-subset scorer
+Shared helpers also cover deterministic metric deltas, paired song/class row construction, CSV writing, and Markdown rendering. HPA-328-specific comparison code is limited to:
 
-`score_oaf_reviewed_subset()` already owns:
+- two pair drivers: full mix ↔ Spleeter and full mix ↔ HTDemucs;
+- paired event-micro TP/FP/FN aggregation;
+- FP/FN per minute;
+- native HPA-328 failure-code histograms;
+- runtime and retained-byte totals.
 
-- parsing the persisted HPA-326 run;
-- HPA-323/HPA-324 lineage checks;
-- parent cohort reconstruction through `build_oaf_cohort_from_snapshot()`;
-- exact HPA-327 membership filtering;
-- selected-song diagnostics;
-- HPA-325 report writing.
+Use the established filenames `paired_per_song.csv` and `paired_per_class.csv`. Because HPA-328 has two comparisons, write them under:
 
-HPA-328 therefore calls:
+```text
+comparison/spleeter/paired_per_song.csv
+comparison/spleeter/paired_per_class.csv
+comparison/htdemucs/paired_per_song.csv
+comparison/htdemucs/paired_per_class.csv
+comparison/summary.json
+comparison/summary.md
+```
+
+### 2. Promote view-aware prediction matching instead of writing a third matcher
+
+The current OaF artifact matcher contains a redundant full-mix equality immediately before comparing the artifact view with the supplied `CanonicalAudio.input_view_id`. Its current caller always supplies full-mix audio, so removing the redundant equality preserves HPA-326 behavior and makes the check useful for derived inputs.
+
+Move the model-neutral matching logic next to `PredictionArtifact` in `prediction_artifact.py`:
 
 ```python
-score_oaf_reviewed_subset(
-    ScoreReviewedSubsetRequest(
-        reference_manifest_path=...,
-        timing_manifest_path=...,
-        subset_manifest_path=...,
-        run_path=oaf_run_path,
-        output_dir=run_dir / "views" / "full_mix" / "reports",
-    )
-)
+def prediction_artifact_matches_audio(
+    artifact: PredictionArtifact,
+    *,
+    source_audio_id: str,
+    source_audio_sha256: str,
+    audio: CanonicalAudio,
+    descriptor: BackendDescriptor,
+    prediction_map_version: str,
+) -> bool: ...
+
+
+def prediction_artifact_matches_run_row(
+    artifact: PredictionArtifact,
+    row: Mapping[str, object],
+    *,
+    expected_input_view_id: str,
+) -> bool: ...
 ```
 
-HPA-328 still parses the parent run snapshot separately for run identity and per-row full-mix evidence, but does not restitch `score_reviewed_subset_cohort()` itself.
+OaF, MuScriptor, and HPA-328 call these public helpers. HPA-328 does not import runner-private symbols or hand-write another identity boolean.
 
-### 4. HPA-325 failure reasons stay closed
+### 3. Do not move all runner helpers into `run_snapshot_common.py`
 
-Do not extend `CohortFailureReason`. HPA-328 retains detailed separator/runtime failure codes in its own `run.json`, then collapses them to the existing scorer vocabulary with one frozen table:
+The review correctly identifies duplication between the OaF and MuScriptor corpus runners, but moving all eighteen byte-identical helpers is wider than HPA-328 needs. Several encode the existing flat corpus-run shape (`include/exclude`, flat item dispositions, skip/quarantine helpers) and are not natural inputs to HPA-328's fixed membership plus nested Spleeter/HTDemucs state.
+
+HPA-328 instead:
+
+- reuses existing public primitives such as `require_sha256()`, `format_manifest_timestamp()`, `read_regular_file_no_follow()`, `atomic_replace_bytes()`, `prediction_path()`, the promoted prediction matchers, and the promoted scorer bridge;
+- promotes only functions that gain a real third caller;
+- keeps `crux.oaf-separation-run/v1` parse/render/nullability logic local to `separation_pilot.py`.
+
+This avoids both a third copy of useful leaf behavior and an unnecessary run framework.
+
+### 4. Add a pre-implementation separator feasibility gate
+
+Before implementation work begins, stand up both isolated runtimes and run one known WAV through each official `-m` command. The gate only proves:
 
 ```text
-separation_failed          -> inference_failed
-stem_invalid               -> inference_failed
-canonical_input_failed     -> inference_failed
-inference_failed           -> inference_failed
-prediction_invalid         -> prediction_artifact_invalid
-prediction_output_conflict -> prediction_artifact_invalid
-prediction_publish_failed  -> prediction_artifact_invalid
+interpreter exists
+module imports
+command exits successfully
+drums.wav exists and decodes
 ```
 
-`success` and `resumed` become HPA-325 success rows. No separator-specific reason reaches HPA-325.
+It does not hash model files or create benchmark locks. If either required separator cannot be reproduced, stop and revise the design before building the two-separator run schema.
 
-### 5. Headline comparison aggregates use paired-success membership
+Real package/repository/model hashing and production lock generation remain at the final pre-score gate.
 
-HPA-325 `summary.json` aggregates are correct independent cohort evidence, but two summary event-micro F1 values cannot simply be subtracted if successful memberships differ.
+### 5. Add a fixed one-shot separator timeout
 
-The shared report reader therefore includes the independent summary aggregates, including per-tolerance/mode event-micro `tp/fp/fn/precision/recall/f1`.
+Spleeter and Demucs are one-shot child processes, so do not reuse `WorkerProcess`. Use one fixed ceiling:
 
-For each HPA-328 comparison:
+```python
+SEPARATOR_TIMEOUT_SECONDS = 1800.0
+SEPARATOR_TERMINATE_GRACE_SECONDS = 5.0
+```
+
+The timeout is not a CLI option. Spawn in a new process session; on timeout terminate the process group, wait the grace interval, then kill if required. Persist native detail code `separator_timeout`, set the view status to `separation_failed`, checkpoint, and continue with the other view/song.
+
+### 6. Preserve native failure families in comparison output
+
+HPA-325 correctly collapses separator/stem/canonical-input failures into `inference_failed`, but HPA-328 still needs to explain whether lost population came from separation, stem QC, canonicalization, OaF inference, or prediction publication.
+
+`comparison/summary.json` and `summary.md` therefore include, for each derived view, a histogram of the native HPA-328 failure codes from `run.json`, alongside the paired-success size and the independent HPA-325 population counts.
+
+### 7. Remove speculative dollar-cost and top-five plumbing
+
+Do not persist or expose compute/storage rate configuration. HPA-328 records the evidence it actually measures:
 
 ```text
-full_mix vs spleeter
-full_mix vs htdemucs
+separator wall time seconds
+OaF wall time seconds
+retained stem bytes
+prediction/report bytes
 ```
 
-headline paired event-micro metrics are recomputed from the **published per-song TP/FP/FN counts** on the exact successful-song intersection. This is aggregation of published counts, not event rescoring.
+No `CostRates`, no `--compute-cost-per-hour`, no `--storage-cost-per-gb-month`, and no cost fields in the immutable handoff. A future consumer can derive dollars if a real marginal rate exists.
 
-Independent view populations and independent HPA-325 summary aggregates remain visible separately.
+Also do not materialize separate top-five helped/harmed lists. The pilot has at most 30 reviewed songs; deterministic paired CSVs already expose the complete sorted evidence.
 
-### 6. Separate implementation schema work from real runtime freezing
+## Existing decisions retained
 
-Unit development does not require installed Spleeter or Demucs. The lock parser/freeze script task uses synthetic fixture locks and tests only.
+### Fixed membership and control
 
-Actual upstream smoke reproduction, model-file hashing, and real checked-in `runtime/separators/*/model.json` generation happen at the final operational gate, before any benchmark scores are inspected.
-
-The report-reader extraction and HPA-328 comparison are also separate reviewable tasks: first preserve MuScriptor comparison behavior while promoting `read_cohort_reports()`, then implement the HPA-328-specific joins.
-
-## Why HPA-328 is next
-
-HPA-328 is fully unblocked: HPA-325, HPA-326, and HPA-327 are complete. It directly blocks HPA-396 and contributes required evidence to HPA-329. HPA-395 is merged, so implementation starts directly from current `main`.
-
-## Non-goals
-
-HPA-328 does not:
-
-- train or fine-tune a separator or OaF;
-- treat separator SDR as the outcome metric;
-- add a third separator;
-- process the approximately 400-song corpus;
-- change OaF checkpoint, threshold, peak picking, taxonomy, prediction map, or scoring tolerances;
-- run Inverse Drum Machine;
-- add a new scorer or `CohortFailureReason` value;
-- add significance/bootstrap analysis;
-- build distributed execution;
-- add backward compatibility for an experimental artifact schema.
-
-## Existing seams to reuse
-
-Use current `main` directly:
-
-```text
-src.benchmark.corpus_cache.resolve_source_audio
-src.benchmark.corpus_cache.ResolvedSourceAudio
-src.benchmark.input_view.materialize_full_mix_audio
-src.benchmark.input_view.load_materialized_audio
-src.benchmark.prediction_artifact.prediction_path
-src.benchmark.prediction_artifact.read_prediction_artifact
-src.benchmark.prediction_artifact.publish_prediction_artifact
-src.benchmark.mapping.map_oaf_prediction
-src.benchmark.oaf_corpus_run.classify_oaf_backend_error
-src.benchmark.oaf_corpus_run._prediction_artifact_matches_run_row
-src.benchmark.reviewed_subset.score_oaf_reviewed_subset
-src.benchmark.reference_set_manifest.preflight_reference_mappings
-src.benchmark.cohort_scoring.score_cohort
-src.benchmark.reports.write_cohort_reports
-src.benchmark.artifact_io.publish_immutable_file
-src.benchmark.corpus_manifest.render_manifest
-src.benchmark.corpus_manifest.publish_manifest
-```
-
-Two small shared extractions remain justified:
-
-1. the scorer-local prediction-source adaptation and non-success `CohortItem` construction duplicated by OaF and MuScriptor, because HPA-328 becomes a third caller;
-2. model-neutral reading of already-published HPA-325 reports, because `muscriptor_comparison.py` currently duplicates schemas owned by `reports.py` and HPA-328 becomes another reader.
-
-Do not generalize corpus runners or pairing policies.
-
-## Fixed pilot membership
-
-Use every row in the supplied canonical `crux.reviewed-reference-subset/v1` manifest. HPA-327 already enforces a reviewed 20–30-song population selected without model scores, so HPA-328 adds no sample, seed, replacement, or score-aware filter.
-
-Require exact lineage equality among:
-
-```text
-HPA-327 reviewed subset
-HPA-324 reference manifest
-HPA-323 timing manifest
-HPA-326 persisted OaF run
-```
-
-Persist each HPA-327 row's `source_row_sha256` into HPA-328 `run.json` and the final handoff. A subset member missing from HPA-326 is fatal preflight. A persisted full-mix failure remains an explicit control failure; membership is never replaced.
-
-## Full-mix control
+Use every row in `crux.reviewed-reference-subset/v1`. Require exact HPA-327/HPA-324/HPA-323 lineage and require every subset member to exist in the parent HPA-326 run.
 
 Use `score_oaf_reviewed_subset()` to write:
 
@@ -197,31 +164,11 @@ Use `score_oaf_reviewed_subset()` to write:
 <run>/views/full_mix/reports/
 ```
 
-The request points to the exact HPA-324 manifest, HPA-323 timing manifest, HPA-327 subset, and HPA-326 `run.json`.
+Parse HPA-326 `run.json` separately only for parent/run-row identity evidence. Never create an OaF backend for the full-mix control.
 
-Separately parse the HPA-326 snapshot for:
+### Separator lock
 
-- parent run ID;
-- OaF descriptor/model-lock/checkpoint/config identity;
-- full-mix per-row status;
-- source/input/prediction hashes required in HPA-328 `run.json` and final HPA-396 handoff.
-
-No full-mix backend is created.
-
-## Separator lock and runtime contract
-
-### Frozen v1 choices
-
-```text
-Spleeter: official 4-stem configuration, drums stem
-Demucs: standard htdemucs model, drums stem
-```
-
-Do not compare model variants, shift counts, overlap values, clip modes, or multiple Spleeter configurations and choose from benchmark scores.
-
-### Canonical lock schema
-
-Each real separator lock eventually uses `crux.separator-lock/v1`:
+Each real separator uses one canonical `crux.separator-lock/v1` containing:
 
 ```text
 separator_id
@@ -238,70 +185,31 @@ expected_drum_stem_relative_path
 output_container
 ```
 
-`argv` contains score-relevant arguments after the interpreter executable. Absolute machine paths do not enter identity. The canonical lock bytes' SHA-256 are the separator config identity.
+Unit tasks use synthetic fixture locks. The final pre-score gate generates and commits the real locks from reproduced runtimes before benchmark scores are inspected.
 
-During unit implementation, use fixture locks under `tests/fixtures/separators/`. Do not require or fake production hashes in `runtime/separators/`.
+### Stem cache and QC
 
-At the operational gate:
-
-1. reproduce one known-audio Spleeter command;
-2. reproduce one known-audio HTDemucs command;
-3. capture exact package/repository/model files actually used;
-4. generate canonical real lock files through `scripts/freeze_separator_runtime.py`;
-5. commit the lock JSON files before running HPA-328 against reference scores.
-
-Use exactly two public adapter functions:
-
-```python
-run_spleeter_drums(...)
-run_htdemucs_drums(...)
-```
-
-Tests inject subprocess runners; CI never installs separators.
-
-For deterministic output discovery, stage the authoritative source under a fixed temporary basename such as `input.wav`.
-
-## Exact stem cache
-
-For a source and lock, derive the cache identity from:
-
-```python
-{
-    "source_audio_sha256": source_audio_sha256,
-    "separator_id": separator_id,
-    "separator_config_sha256": lock.sha256,
-}
-```
-
-Persist exact produced WAV bytes at:
+Store exact native WAV bytes at:
 
 ```text
 derived/stems/<separator-id>/<source-sha>/<separator-lock-sha>/drums.wav
 ```
 
-Publish with `publish_immutable_file()`. A cache hit requires matching source/config identity, exact persisted stem SHA, readable regular bytes, and successful QC revalidation. A conflicting file at the same identity fails closed.
+Publish through `publish_immutable_file()`. Cache hits require matching identity, exact bytes, and QC revalidation.
 
-Retain the native lossless WAV through HPA-396. The canonical OaF WAV remains temporary.
+Fixed QC:
 
-## Practical fixed stem QC
+- readable nonempty decodable file;
+- finite samples;
+- one or two channels;
+- duration delta `<= max(0.5 sec, source_duration * 0.005)`;
+- RMS above `-80 dBFS`;
+- clipping at absolute peak `>= 0.9999` recorded as warning/evidence, not an automatic rejection;
+- no reference or OaF score is consulted.
 
-Validate every generated or resumed stem before OaF:
+### OaF derived views
 
-1. readable regular nonempty file;
-2. decodable audio with at least one frame;
-3. finite samples only;
-4. one or two channels only;
-5. record sample rate/channel count; non-44.1 kHz or mono is a warning;
-6. fail when duration difference exceeds `max(0.5 sec, source_duration * 0.005)`;
-7. fail at RMS `<= -80 dBFS`;
-8. record clipping warning and clipped-sample fraction at absolute peak `>= 0.9999`;
-9. never inspect DTX references or OaF scores during QC.
-
-These thresholds are frozen constants, not CLI flags.
-
-## OaF derived-input contract
-
-Keep the existing full-mix view:
+Keep:
 
 ```text
 crux.oaf-full-mix-mono44k1-pcm16/v1
@@ -314,208 +222,43 @@ crux.oaf-spleeter4-drums-mono44k1-pcm16/v1
 crux.oaf-htdemucs-drums-mono44k1-pcm16/v1
 ```
 
-For every derived item preserve three separate identities:
+`build_inference_config()` gains only an explicit `input_view_id` parameter, defaulting to full mix. The field remains part of the inference-config hash, so the immutable `prediction_path()` cannot collide across views. `build_run_id()` stays full-mix-specific; HPA-328 owns its own run identity.
 
-```text
-authoritative source:
-  source_audio_id
-  source_audio_sha256
+### Derived inference
 
-retained separator artifact:
-  stem_path
-  stem_sha256
-
-canonical OaF input:
-  input_view_id
-  input_audio_sha256
-```
-
-Do not replace authoritative `source_audio_sha256` with the stem hash.
-
-Add `materialize_derived_audio()` beside `materialize_full_mix_audio()`. It reads the retained stem, uses the same `librosa` `soxr_hq` mono 44.1-kHz conversion and `soundfile` PCM16 writer, then calls `load_materialized_audio()` with the authoritative source identity. Factor only the canonicalization body necessary to keep full-mix behavior byte-identical.
-
-Extend OaF's inference config builder only with:
-
-```python
-input_view_id: str = OAF_FULL_MIX_INPUT_VIEW_ID
-```
-
-All other inference identity fields remain unchanged. `build_run_id()` stays full-mix-specific; HPA-328 owns its own run ID.
-
-## Run snapshot and resume
-
-Use one mutable canonical `crux.oaf-separation-run/v1` snapshot. Run identity binds:
-
-```text
-reviewed-subset/reference/timing hashes
-parent HPA-326 run ID
-OaF descriptor/model-lock/checkpoint identities
-Spleeter lock SHA
-HTDemucs lock SHA
-both derived input-view IDs
-SCORING_VERSION
-Crux commit
-```
-
-Rows are sorted by `simfile_id` and contain:
-
-```text
-source_row_sha256
-source audio ID/SHA/duration
-full-mix parent status/input/prediction identity
-Spleeter status + failure code + stem/QC/runtime + canonical input + prediction/runtime
-HTDemucs status + failure code + stem/QC/runtime + canonical input + prediction/runtime
-```
-
-Closed derived statuses remain:
-
-```text
-pending
-separation_failed
-stem_invalid
-inference_failed
-prediction_invalid
-success
-resumed
-```
-
-Detailed run failure codes may additionally include `canonical_input_failed`, `prediction_output_conflict`, and `prediction_publish_failed`.
-
-### Resume validation
-
-A matching stem is reused only after exact hash and QC validation.
-
-For a prediction candidate:
-
-1. read with `read_prediction_artifact()`;
-2. use `_prediction_artifact_matches_run_row()` when prior persisted prediction evidence exists;
-3. require descriptor equality with the frozen OaF descriptor;
-4. require source ID/SHA equality with the resolved authoritative source;
-5. require `prediction.audio.input_view_id == audio.input_view_id`;
-6. require `prediction.audio.input_audio_sha256 == audio.input_audio_sha256`;
-7. require all event `prediction_map_version` values equal `OAF_PREDICTION_MAP_ID`.
-
-Never call or copy `_prediction_artifact_matches()`'s `OAF_FULL_MIX_INPUT_VIEW_ID` guard for derived views.
-
-## Derived inference execution
-
-Use one persistent OaF backend for all prediction misses, constructed lazily.
-
-Per successful stem:
+For every prediction miss use exactly:
 
 ```python
 native = backend.transcribe(audio)
-if not isinstance(native, NativePrediction):
-    raise OafBackendError("native prediction is invalid", code="native_event_invalid")
-
 mapped, _ = map_oaf_prediction(native)
 published = publish_prediction_artifact(prediction_target, mapped)
 ```
 
-Backend exceptions go through `classify_oaf_backend_error()`. Publication/artifact errors map to HPA-328 prediction failure codes. No second mapper/publisher or generic inference abstraction is introduced.
+Route `OafBackendError` through `classify_oaf_backend_error()`. Do not create another mapper, publisher, or runner base class.
 
-Separator failures remain independent: Spleeter failure does not prevent HTDemucs for the same song and vice versa. A poisoned OaF worker stops later inference in that invocation and leaves resumable state; it does not trigger automatic restart/tuning.
+### Scoring and failure mapping
 
-## Persisted prediction → scorer bridge
+Promote the scorer-local source-ID adaptation already duplicated by OaF and MuScriptor. Persisted artifacts keep authoritative source-object identity; scorer-local artifacts may change only `source_audio_id` to `simfile_id` after persisted bytes have been validated.
 
-Persisted OaF prediction artifacts keep the authoritative source object key. HPA-325 requires scorer-facing artifacts to use `source_audio_id == simfile_id`.
-
-Promote the already duplicated OaF/MuScriptor in-memory adaptation into one model-neutral helper in `cohort_scoring.py`. The helper assumes the caller already validated raw persisted bytes against its run row, then changes only scorer-local `source_audio_id`, rerenders/reloads the temporary artifact, and calls `cohort_item_from_artifacts()`.
-
-Also promote the duplicated non-success `CohortItem` constructor. Do not weaken `_artifact_identity_from_artifacts()` or mutate persisted bytes.
-
-### Frozen HPA-328 failure mapping
-
-Before calling HPA-325, use exactly:
-
-```python
-SEPARATION_FAILURE_TO_COHORT_REASON = {
-    "separation_failed": "inference_failed",
-    "stem_invalid": "inference_failed",
-    "canonical_input_failed": "inference_failed",
-    "inference_failed": "inference_failed",
-    "prediction_invalid": "prediction_artifact_invalid",
-    "prediction_output_conflict": "prediction_artifact_invalid",
-    "prediction_publish_failed": "prediction_artifact_invalid",
-}
-```
-
-No new `CohortFailureReason` is allowed.
-
-## Scoring
-
-Preflight HPA-324/HPA-323 once with `preflight_reference_mappings()` before separator execution.
-
-Publish:
+Do not extend `CohortFailureReason`. Freeze:
 
 ```text
-views/full_mix/reports
-views/spleeter4_drums/reports
-views/htdemucs_drums/reports
+separation_failed          -> inference_failed
+stem_invalid               -> inference_failed
+canonical_input_failed     -> inference_failed
+inference_failed           -> inference_failed
+prediction_invalid         -> prediction_artifact_invalid
+prediction_output_conflict -> prediction_artifact_invalid
+prediction_publish_failed  -> prediction_artifact_invalid
 ```
 
-Full mix is produced through `score_oaf_reviewed_subset()`.
+Detailed native codes remain in HPA-328 `run.json`.
 
-Derived views construct HPA-325 items through the scorer bridge and frozen failure map above, then call only:
+### Paired comparison
 
-```python
-score_cohort(...)
-write_cohort_reports(...)
-```
+Independent HPA-325 `summary.json` aggregates remain independent evidence. Headline comparison metrics are recomputed from published per-song TP/FP/FN counts on the exact paired-success population; this is aggregation, not event rescoring.
 
-HPA-325 remains the sole owner of 30/50/100-ms raw/aligned event matching, diagnostics, per-class scoring, cohort aggregates, and report rendering.
-
-## Shared published-report reader
-
-`reports.py` owns the HPA-325 writer schemas. `muscriptor_comparison.py` currently duplicates those schemas and parsers.
-
-Promote one model-neutral `read_cohort_reports()` boundary in a separate implementation task. It reads:
-
-```text
-summary.json
-items.csv
-per_song.csv
-per_class.csv
-```
-
-It validates exact schemas, canonical numeric domains, report identity, duplicates, and successful-item score membership.
-
-The typed result includes:
-
-- `CohortIdentity`;
-- independent population evidence;
-- per-tolerance/mode independent summary aggregates, including event-micro TP/FP/FN/precision/recall/F1;
-- item rows;
-- per-song rows including TP/FP/FN and timing diagnostics;
-- per-class rows.
-
-Retarget MuScriptor comparison to this reader with characterization tests requiring unchanged published outputs. Backend-family checks, run parsing, source/input pairability, and MuScriptor-specific labels stay local to `muscriptor_comparison.py`.
-
-## HPA-328 comparison semantics
-
-HPA-328 owns only two fixed comparisons:
-
-```text
-full_mix vs spleeter
-full_mix vs htdemucs
-```
-
-For each:
-
-1. report independent full-view populations and independent HPA-325 summary aggregates;
-2. derive the paired-success song set from both `items.csv` populations;
-3. require matching score key grids on that paired set;
-4. emit per-song and per-class precision/recall/F1 deltas;
-5. recompute headline event-micro TP/FP/FN on that paired set by summing the **published per-song counts** for each tolerance/mode;
-6. derive paired precision/recall/F1 from those summed counts and report `derived - full_mix` headline deltas.
-
-Do not subtract independent cohort event-micro F1 values when successful memberships differ.
-
-This aggregation does not reopen prediction artifacts or run event matching.
-
-### FP/FN per minute
-
-For every paired per-song row:
+Derive FP/FN per minute using authoritative source duration:
 
 ```python
 minutes = source_duration_sec / 60
@@ -523,24 +266,30 @@ fp_per_min = fp / minutes
 fn_per_min = fn / minutes
 ```
 
-`source_duration_sec` comes from authoritative HPA-328 run-row evidence and must be positive and finite. Emit absolute values and derived-minus-full-mix deltas using six-place canonical numeric conventions.
+### HPA-396 handoff
 
-Also carry HPA-325 timing diagnostics, bounded most-helped/most-harmed cases, separator/OaF wall time and RTF, retained stem/prediction/report bytes, and optional explicit compute/storage cost rates.
-
-Do not add significance tests or automatic winner ranking.
-
-Comparison output remains:
+Publish `crux.oaf-separation-pilot/v1` through existing `render_manifest()` / `publish_manifest()` rails. Every HPA-327 member remains present. Rows bind:
 
 ```text
-comparison/summary.json
-comparison/per_song_delta.csv
-comparison/per_class_delta.csv
-comparison/summary.md
+simfile_id
+source_row_sha256
+subset/reference/timing identities
+source audio ID/SHA
+OaF backend/model/model-lock/checkpoint/adapter identities
+full-mix status/input/prediction identity
+Spleeter status/lock/stem/input/prediction identity
+HTDemucs status/lock/stem/input/prediction identity
+comparison artifact hashes
+decision
+rationale
+Crux commit
 ```
 
-## Recommendation/finalization
+No dollar-cost fields are part of v1.
 
-After frozen reports are reviewed, record exactly one operator decision:
+### Operator decision
+
+Final decision remains one of:
 
 ```text
 keep_full_mix
@@ -550,47 +299,14 @@ gather_more_evidence
 prioritize_another_model
 ```
 
-Store a nonempty rationale and optional nonnegative compute/storage cost rates. Rates affect display/evidence only.
-
-## Immutable HPA-396 handoff
-
-Publish canonical `crux.oaf-separation-pilot/v1` JSONL through existing manifest rails.
-
-Every HPA-327 song is present, including failed views. Each row includes:
-
-```text
-simfile_id
-source_row_sha256
-reviewed subset SHA
-reference manifest SHA/version
-reference timing SHA/version
-taxonomy/lane/prediction-map/scoring versions
-source audio ID/SHA
-OaF descriptor/model/model-lock/checkpoint/adapter identities
-full-mix status/input/prediction path+SHA
-Spleeter status/lock/stem/input/prediction identities
-HTDemucs status/lock/stem/input/prediction identities
-comparison artifact hashes
-decision/rationale/cost rates
-Crux commit
-```
-
-Success/resume requires all relevant artifact identities. Failed views require unavailable fields to be null. Finalization re-reads and hashes retained stems, predictions, and comparison files before publication.
-
-The handoff exposes exact HTDemucs stem and OaF prediction identities to HPA-396 without requiring mutable HPA-328 state or an input-view manifest. HPA-396 may rematerialize from the retained native stem through `materialize_derived_audio()`.
+The finalizer records a nonempty rationale. No automatic winner rule is added.
 
 ## CLI
 
-Add only:
+Run command:
 
 ```text
 crux benchmark run-oaf-separation-pilot
-crux benchmark finalize-oaf-separation-pilot
-```
-
-Run inputs:
-
-```text
 --manifest
 --timing-manifest
 --subset-manifest
@@ -602,70 +318,31 @@ Run inputs:
 --resume
 ```
 
-Finalize inputs:
+Finalize command:
 
 ```text
+crux benchmark finalize-oaf-separation-pilot
 --run
 --subset-manifest
 --output-manifest
 --decision
 --rationale
---compute-cost-per-hour
---storage-cost-per-gb-month
 ```
 
-No model/QC/tolerance/third-separator/full-corpus flags. Run exit codes follow the existing 0 complete / 1 partial / 2 fatal convention.
+No separator model/QC/tolerance/full-corpus/third-separator/cost-rate flags.
 
-## Testing and implementation gates
+## Testing and acceptance gates
 
-Use TDD around existing seams:
+- **Task 0 feasibility:** both isolated required separators produce decodable `drums.wav` before implementation begins.
+- **Full-mix regression:** full-mix OaF materialization/config/prediction resume stays byte/identity compatible.
+- **Matcher regression:** OaF and MuScriptor resume behavior remains unchanged after public matcher extraction; derived views pass the same matcher through supplied input-view identity.
+- **MuScriptor comparison regression:** shared comparison primitive extraction preserves existing published comparison output.
+- **Timeout:** injected timeout terminates the one-shot separator child and checkpoints `separation_failed` without blocking the other view.
+- **Population:** every HPA-327 member appears in all three HPA-325 population ledgers.
+- **Comparison:** paired-success sizes, native failure histograms, paired TP/FP/FN/F1, FP/FN-per-minute, runtime, and retained bytes are explicit.
+- **Handoff:** HPA-396 can obtain exact HTDemucs stem/path/hash and OaF-on-HTDemucs prediction identity without mutable HPA-328 state.
+- **Operational freeze:** real separator locks are generated and committed before scored execution.
 
-- characterize OaF/MuScriptor scorer adaptation before extraction;
-- characterize full-mix OaF inference/config bytes before derived-input work;
-- unit-test separator lock schema/freeze script with fixture locks only;
-- unit-test cache/QC/process behavior with injected subprocess runners;
-- acceptance-test that full-mix reports come from `score_oaf_reviewed_subset()` and no full-mix backend call occurs;
-- test derived resume with a Spleeter/HTDemucs input view and prove the full-mix-only `_prediction_artifact_matches()` is not used;
-- test derived inference calls the existing map/publish/error-classification path;
-- test the exact HPA-328 failure-code → HPA-325 reason table;
-- characterize MuScriptor comparison before extracting `read_cohort_reports()`;
-- test shared reader preserves independent summary aggregates;
-- test paired headline event-micro metrics are summed from paired-success per-song counts;
-- test HPA-396 handoff consumes exact HTDemucs stem/prediction identities;
-- keep real separator smoke/model acquisition outside CI.
+## Explicit non-goals
 
-### Final operational gate
-
-Before any separator benchmark scores are inspected:
-
-1. reproduce real Spleeter and HTDemucs known-audio smoke runs;
-2. freeze exact real model/package/repository evidence;
-3. generate and commit `runtime/separators/spleeter/model.json` and `runtime/separators/htdemucs/model.json`;
-4. record the HPA-328 implementation commit and both lock hashes;
-5. run the exact HPA-327 pilot;
-6. review required evidence and finalize one closed decision;
-7. run repository-wide pytest, Ruff, format, Pylint errors-only, and `git diff --check`.
-
-## Risks and gates
-
-- **Dependency conflict:** isolated interpreter commands only.
-- **Resume identity bug:** derived view is matched to materialized `CanonicalAudio.input_view_id`; never full-mix constant.
-- **Write-path drift:** derived predictions use existing OaF transcribe/map/publish/classify functions.
-- **Source/scorer identity mismatch:** persisted bytes validated first, then scorer-local source-ID adaptation.
-- **Failure-vocabulary drift:** one frozen HPA-328 → HPA-325 reason table; no enum extension.
-- **Comparison membership bug:** independent summaries are not used as paired headlines; paired TP/FP/FN are summed from the success intersection.
-- **Comparison-schema drift:** one reader beside the HPA-325 writer; no third field-schema copy.
-- **Selection bias:** exact HPA-327 membership only.
-- **Artifact drift:** source/config/stem/input/prediction hashes checked on resume/finalize.
-- **Runaway compute:** no full-corpus path or third separator.
-- **Over-abstraction:** shared extractions stop at real duplicated seams; runners and comparison policies remain concrete.
-
-## Acceptance mapping
-
-- Same fixed songs and OaF configuration → HPA-327 membership + frozen OaF identity.
-- Full mix/Spleeter/HTDemucs results → existing full-mix subset scorer + two derived HPA-325 cohorts.
-- Separation cache and explicit failures → content-addressed stems + per-view run ledger.
-- Accuracy/runtime/storage/cost → independent and paired-success comparison evidence.
-- FP/FN per minute → published per-song counts normalized by authoritative source duration.
-- HTDemucs handoff → immutable rows with exact native stem and OaF prediction identities.
-- No training/full-corpus/framework expansion → explicit non-goals and narrow CLI.
+No `run_snapshot_common.py` sweep, generic comparison framework, separator plugin system, cloud execution, retry/backoff engine, full-corpus separator processing, dollar-cost model, or presentation-only top-five ranking.
