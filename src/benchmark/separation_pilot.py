@@ -1187,6 +1187,7 @@ def _stem_evidence(stem: SeparatedStem, cache_root: Path) -> dict[str, object]:
         "separator_id": stem.separator_id,
         "source_audio_sha256": stem.source_audio_sha256,
         "separator_lock_sha256": stem.separator_lock_sha256,
+        "owner_root": str(cache_root.resolve()),
         "path": _relative_artifact_path(stem.path, cache_root),
         "sha256": stem.sha256,
         "cache_hit": stem.cache_hit,
