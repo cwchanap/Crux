@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -48,6 +49,11 @@ from src.benchmark.muscriptor_comparison import (
 )
 from src.benchmark.muscriptor_corpus_run import MUSCRIPTOR_CORPUS_RUN_SCHEMA
 from src.benchmark.oaf_corpus_run import OAF_CORPUS_RUN_SCHEMA
+from src.benchmark.published_comparison import (
+    PublishedRunEvidence,
+    pairable_success_ids,
+    paired_song_rows,
+)
 from tests.benchmark.test_muscriptor_comparison import (
     _CLASS_FIELDS,
     _ITEM_FIELDS,
@@ -789,6 +795,55 @@ def test_pairable_ids_counts_source_audio_mismatch() -> None:
     pairable, exclusions = _pairable_ids(oaf, muscriptor, None)
     assert pairable == set()
     assert exclusions["source_audio_mismatch"] == 1
+
+
+def test_shared_pairing_can_allow_distinct_derived_input_hashes() -> None:
+    left = PublishedRunEvidence(
+        identity=_identity(),
+        items={"1": _RunItem("1", "success", "a" * 64, "c" * 64)},
+        reports=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    right = PublishedRunEvidence(
+        identity=_identity(),
+        items={"1": _RunItem("1", "success", "a" * 64, "d" * 64)},
+        reports=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ComparisonIntegrityError, match="canonical-input"):
+        pairable_success_ids(left, right, None)
+
+    pairable, exclusions = pairable_success_ids(
+        left,
+        right,
+        None,
+        require_identical_input_hash=False,
+        left_label="full_mix",
+        right_label="spleeter",
+    )
+    assert pairable == {"1"}
+    assert exclusions == {
+        "full_mix_only_success": 0,
+        "spleeter_only_success": 0,
+        "source_audio_mismatch": 0,
+    }
+
+
+def test_shared_song_join_parameterizes_only_output_labels() -> None:
+    key = ("1", 50, "raw")
+    left = {key: _SongRow("1", 50, "raw", Decimal("0.5"), Decimal("0.4"), Decimal("0.4"))}
+    right = {key: _SongRow("1", 50, "raw", Decimal("0.8"), Decimal("0.4"), Decimal("0.4"))}
+
+    rows = paired_song_rows(
+        left,
+        right,
+        {"1"},
+        left_label="full_mix",
+        right_label="spleeter",
+    )
+
+    assert rows[0]["full_mix_precision"] == "0.5"
+    assert rows[0]["spleeter_precision"] == "0.8"
+    assert rows[0]["delta_precision"] == "0.3"
 
 
 def test_metric_delta_returns_none_for_missing_side() -> None:
