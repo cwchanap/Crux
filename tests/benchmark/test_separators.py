@@ -211,11 +211,13 @@ class _FakePopen:
         write_output: object | None = None,
         timeout: bool = False,
         terminate_wait_timeout: bool = False,
+        leader_exits_after_term: bool = False,
     ) -> None:
         self.returncode = returncode
         self.write_output = write_output
         self.timeout = timeout
         self.terminate_wait_timeout = terminate_wait_timeout
+        self.leader_exits_after_term = leader_exits_after_term
         self.pid = 4321
         self.argv: list[str] = []
         self.kwargs: dict[str, object] = {}
@@ -233,6 +235,8 @@ class _FakePopen:
 
     def wait(self, timeout: float | None = None) -> None:
         self.wait_calls.append(timeout)
+        if self.leader_exits_after_term and len(self.wait_calls) == 1:
+            return
         if self.terminate_wait_timeout and len(self.wait_calls) == 1:
             raise subprocess.TimeoutExpired(self.argv or "separator", timeout)
 
@@ -487,6 +491,72 @@ def test_separator_cache_hit_still_rejects_near_silent_cached_bytes(
     assert raised.value.detail_code == "stem_near_silent"
 
 
+def test_separator_qc_uses_captured_fresh_stem_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = _source_wav(tmp_path)
+    fake = _FakePopen(
+        write_output=lambda workdir: _write_stem(
+            workdir,
+            separator_id=SPLEETER_SEPARATOR_ID,
+            samples=np.full((44100, 1), 0.25, dtype=np.float32),
+        )
+    )
+    _install_fake_popen(monkeypatch, fake)
+    original_read = separators.read_regular_file_no_follow
+
+    def mutate_after_capture(path: Path) -> bytes:
+        content = original_read(path)
+        if path.name == "drums.wav":
+            sf.write(path, np.zeros((44100, 1), dtype=np.float32), 44100, format="WAV")
+        return content
+
+    monkeypatch.setattr(separators, "read_regular_file_no_follow", mutate_after_capture)
+
+    result = _run_separator(SPLEETER_SEPARATOR_ID, source_path, cache_root=tmp_path / "cache")
+
+    assert result.qc.rms_dbfs > -80.0
+    assert result.path.read_bytes() != b""
+
+
+def test_separator_qc_uses_captured_cached_stem_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = _source_wav(tmp_path)
+    first_fake = _FakePopen(
+        write_output=lambda workdir: _write_stem(
+            workdir,
+            separator_id=SPLEETER_SEPARATOR_ID,
+            samples=np.full((44100, 1), 0.25, dtype=np.float32),
+        )
+    )
+    _install_fake_popen(monkeypatch, first_fake)
+    cache_root = tmp_path / "cache"
+    first = _run_separator(SPLEETER_SEPARATOR_ID, source_path, cache_root=cache_root)
+    captured_bytes = first.path.read_bytes()
+    original_read = separators.read_regular_file_no_follow
+
+    def mutate_after_capture(path: Path) -> bytes:
+        content = original_read(path)
+        if path == first.path:
+            sf.write(path, np.zeros((44100, 1), dtype=np.float32), 44100, format="WAV")
+        return content
+
+    monkeypatch.setattr(separators, "read_regular_file_no_follow", mutate_after_capture)
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("cache hit must bypass separator subprocess"),
+    )
+
+    result = _run_separator(SPLEETER_SEPARATOR_ID, source_path, cache_root=cache_root)
+
+    assert result.qc.rms_dbfs > -80.0
+    assert result.sha256 == hashlib.sha256(captured_bytes).hexdigest()
+
+
 def test_separator_maps_immutable_publication_conflict_to_stable_detail(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -537,3 +607,27 @@ def test_separator_timeout_terminates_process_group_then_kills_after_grace(
     assert fake.wait_calls == [5.0, None]
     assert fake.terminate_calls == 0
     assert fake.kill_calls == 0
+
+
+def test_separator_timeout_kills_group_even_when_leader_exits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = _source_wav(tmp_path)
+    fake = _FakePopen(timeout=True, leader_exits_after_term=True)
+    _install_fake_popen(monkeypatch, fake)
+    killpg_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda process_group, signal_number: killpg_calls.append((process_group, signal_number)),
+    )
+
+    with pytest.raises(ValueError, match="separator_timeout"):
+        _run_separator(SPLEETER_SEPARATOR_ID, source_path, cache_root=tmp_path / "cache")
+
+    assert killpg_calls == [
+        (fake.pid, signal.SIGTERM),
+        (fake.pid, signal.SIGKILL),
+    ]
+    assert fake.wait_calls == [5.0]

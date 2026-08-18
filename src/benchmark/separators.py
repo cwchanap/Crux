@@ -9,6 +9,7 @@ import signal
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import numpy as np
@@ -128,15 +129,6 @@ class StemQc:
     clipping_detected: bool
     warnings: tuple[str, ...] = ()
 
-    @property
-    def duration_seconds(self) -> float:
-        """Compatibility spelling for callers that use seconds in field names."""
-        return self.duration_sec
-
-    @property
-    def clipped(self) -> bool:
-        return self.clipping_detected
-
 
 @dataclass(frozen=True)
 class SeparatedStem:
@@ -150,22 +142,6 @@ class SeparatedStem:
     qc: StemQc
     cache_hit: bool
     warnings: tuple[str, ...] = ()
-
-    @property
-    def stem_path(self) -> Path:
-        return self.path
-
-    @property
-    def native_wav_path(self) -> Path:
-        return self.path
-
-    @property
-    def source_sha256(self) -> str:
-        return self.source_audio_sha256
-
-    @property
-    def lock_sha256(self) -> str:
-        return self.separator_lock_sha256
 
 
 @dataclass(frozen=True)
@@ -425,7 +401,7 @@ def _run_separator_drums(
 
     cached_bytes = _read_cached_stem(cache_path)
     if cached_bytes is not None:
-        qc = _read_and_qc_stem(cache_path, source_duration_sec)
+        qc = _qc_stem_bytes(cached_bytes, source_duration_sec)
         digest = sha256_hex(cached_bytes)
         return SeparatedStem(
             separator_id=separator_id,
@@ -469,7 +445,7 @@ def _run_separator_drums(
                     "separator_output_missing",
                     "expected drum stem WAV is unavailable",
                 ) from error
-            qc = _read_and_qc_stem(output_path, source_duration_sec)
+            qc = _qc_stem_bytes(stem_bytes, source_duration_sec)
     except SeparatorExecutionError:
         raise
     except OSError as error:
@@ -626,24 +602,25 @@ def _stop_separator_process_group(process: subprocess.Popen[bytes]) -> None:
         os.killpg(process.pid, signal.SIGTERM)
     except (OSError, ProcessLookupError):
         pass
+    leader_reaped = True
     try:
         process.wait(timeout=SEPARATOR_TERMINATE_GRACE_SECONDS)
-        return
     except subprocess.TimeoutExpired:
-        pass
+        leader_reaped = False
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except (OSError, ProcessLookupError):
         pass
-    try:
-        process.wait()
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    if not leader_reaped:
+        try:
+            process.wait()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
-def _read_and_qc_stem(path: Path, source_duration_sec: float) -> StemQc:
+def _qc_stem_bytes(content: bytes, source_duration_sec: float) -> StemQc:
     try:
-        samples, sample_rate = soundfile.read(path, always_2d=True, dtype="float32")
+        samples, sample_rate = soundfile.read(BytesIO(content), always_2d=True, dtype="float32")
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         raise SeparatorExecutionError(
             "stem_decode_failed",
