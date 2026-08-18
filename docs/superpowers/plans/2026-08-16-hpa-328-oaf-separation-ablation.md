@@ -4,26 +4,28 @@
 
 **Goal:** Run one fixed 20–30-song OaF input ablation comparing the persisted full-mix baseline with Spleeter 4-stem drums and standard HTDemucs drums, then publish paired HPA-325 evidence and an immutable HTDemucs handoff for HPA-396.
 
-**Architecture:** Start from current `main` (`d9a124835a020b630db088112fa733b33baee619` or newer), where HPA-395 has already landed the neutral source/materialization/prediction/subset-scoring seams. Keep HPA-328 concrete: two isolated separator commands, one fixed-subset pilot runner, normal OaF prediction-v2 artifacts, HPA-325 scoring, one HPA-328 comparison, and one downstream handoff. Promote only two shared areas now justified by a third consumer: the scorer-local persisted-artifact bridge duplicated by OaF/MuScriptor, and the HPA-325 report reader currently embedded in `muscriptor_comparison.py`.
+**Architecture:** Start from current `main` (`d9a124835a020b630db088112fa733b33baee619` or newer). Keep HPA-328 concrete: two isolated separator commands, one fixed-subset pilot runner, the existing OaF transcribe→map→publish path, HPA-325 scoring, one fixed comparison, and one downstream handoff. Promote only two real duplicated seams: the scorer-local persisted-artifact bridge used by OaF/MuScriptor/HPA-328, and a model-neutral reader for HPA-325 reports whose schemas are already owned by `reports.py`.
 
 **Tech Stack:** Python 3.12 Crux host, Click, existing canonical JSON/JSONL/CSV helpers, NumPy/librosa/soundfile, isolated Spleeter runtime, isolated Demucs runtime, existing OaF TF1 worker, pytest/Ruff/Pylint.
 
 ## Global Constraints
 
-- Current `main` already contains HPA-395 PR #24. Do not wait for or recreate its promoted seams.
 - Pilot membership is exactly the supplied HPA-327 `crux.reviewed-reference-subset/v1` population. No second selector, seed, replacement, or score-aware filter.
 - Full-mix OaF is never rerun by HPA-328.
+- Full-mix reviewed reports are produced through `score_oaf_reviewed_subset()`, not by restitching its lower-level helpers.
 - Required separators are exactly official Spleeter 4-stem drums and standard `htdemucs` drums. No third separator in v1.
 - Spleeter and Demucs stay out of Crux's main Python dependency graph.
-- Freeze exact separator package/repository/model bytes and command arguments before scored results are inspected.
+- Real separator package/repository/model bytes are frozen before scored pilot results are inspected, but live freezing is deferred to Task 11; unit tasks use fixture locks.
 - Fixed QC constants: duration difference `<= max(0.5s, source_duration * 0.005)`, near-silent failure at RMS `<= -80 dBFS`, clipping evidence at absolute peak `>= 0.9999`. None are CLI flags.
-- Retain exact separator-produced WAV bytes through HPA-396.
+- Retain exact separator-produced WAV bytes through HPA-396. Canonical OaF WAVs are temporary.
 - Derived OaF view IDs are `crux.oaf-spleeter4-drums-mono44k1-pcm16/v1` and `crux.oaf-htdemucs-drums-mono44k1-pcm16/v1`.
 - OaF descriptor/model lock/checkpoint/adapter/prediction map and HPA-325 scoring configuration remain unchanged across views.
+- Derived prediction resume must never use the `OAF_FULL_MIX_INPUT_VIEW_ID` equality inside `_prediction_artifact_matches()`.
 - Persisted prediction artifacts keep authoritative source-object identity; scorer-local artifacts may normalize only `source_audio_id` to `simfile_id` after persisted bytes are validated.
-- Per-view failures remain in population accounting. Paired deltas use matching successful songs only and report independent failure counts separately.
-- FP/FN-per-minute is derived only as `fp_or_fn / (source_duration_sec / 60)` from persisted HPA-325 counts and authoritative source duration. It is not a new scorer.
-- No full-corpus separator mode, generic experiment runner, plugin registry, queue/worker pool, database, retry framework, SDR scorer, model tuning, or compatibility layer.
+- Do not extend `CohortFailureReason`; use the frozen HPA-328 failure-code mapping in Task 7.
+- Independent view populations remain visible. Headline paired event-micro metrics are recomputed from published per-song TP/FP/FN counts on the exact paired-success intersection.
+- FP/FN-per-minute is derived only from persisted HPA-325 counts and authoritative source duration. It is not a new scorer.
+- No full-corpus separator mode, generic experiment runner, plugin registry, RPC, queue/worker pool, database, retry framework, SDR scorer, bootstrap/significance layer, model tuning, or compatibility layer.
 
 ---
 
@@ -32,20 +34,28 @@
 **Shared seams modified narrowly**
 
 - `src/benchmark/cohort_scoring.py` — scorer-local prediction-source normalization and model-neutral non-success item construction.
-- `src/benchmark/oaf_corpus_run.py` — retarget scorer bridge; parameterize OaF inference-config `input_view_id` while preserving full-mix defaults.
+- `src/benchmark/oaf_corpus_run.py` — retarget scorer bridge; parameterize OaF inference-config `input_view_id`; keep full-mix run ID and full-mix matcher unchanged.
 - `src/benchmark/muscriptor_corpus_run.py` — retarget only the shared scorer bridge; no MuScriptor behavior change.
 - `src/benchmark/input_view.py` — derived-stem canonicalization while preserving authoritative source identity.
-- `src/benchmark/reports.py` — shared typed reader for already-published HPA-325 report directories.
-- `src/benchmark/muscriptor_comparison.py` — use shared report reader; keep model-family/pairing logic local and output unchanged.
+- `src/benchmark/reports.py` — shared typed reader for published HPA-325 `summary.json` + CSV artifacts.
+- `src/benchmark/muscriptor_comparison.py` — consume shared report reader; pairing behavior/output unchanged.
 - `src/cli/benchmark.py` — two thin HPA-328 commands.
 
 **New HPA-328 modules**
 
 - `src/benchmark/separators.py` — separator lock validation, concrete Spleeter/HTDemucs execution, exact stem cache, and QC.
-- `src/benchmark/separation_pilot.py` — fixed-subset preflight, run snapshot/resume, derived OaF inference, and HPA-325 cohort publication.
-- `src/benchmark/separation_comparison.py` — fixed full-mix↔separator joins, FP/FN-per-minute, runtime/storage/cost summary.
+- `src/benchmark/separation_pilot.py` — fixed-subset preflight, run snapshot/resume, exact OaF derived inference, and derived HPA-325 cohort publication.
+- `src/benchmark/separation_comparison.py` — fixed full-mix↔separator joins, paired-success event-micro aggregation, FP/FN-per-minute, runtime/storage/cost summary.
 - `src/benchmark/separation_handoff.py` — canonical `crux.oaf-separation-pilot/v1` finalization/loader for HPA-396.
-- `scripts/freeze_separator_runtime.py` — mechanical lock generator for reproduced isolated runtimes.
+- `scripts/freeze_separator_runtime.py` — mechanical real-runtime lock generator.
+
+**Fixture-only lock files created before Task 11**
+
+- `tests/fixtures/separators/spleeter-model.json`
+- `tests/fixtures/separators/htdemucs-model.json`
+
+**Real lock files created and committed in Task 11 before scored execution**
+
 - `runtime/separators/spleeter/model.json`
 - `runtime/separators/htdemucs/model.json`
 
@@ -57,8 +67,6 @@
 - `tests/benchmark/test_separation_comparison.py`
 - `tests/benchmark/test_separation_handoff.py`
 - `tests/benchmark/schema_goldens/oaf-separation-pilot-v1.jsonl`
-
-Existing OaF/MuScriptor/scoring/report/CLI tests change only where the public seam is deliberately promoted.
 
 ---
 
@@ -96,11 +104,9 @@ def cohort_item_without_prediction(
 ) -> CohortItem: ...
 ```
 
-`cohort_item_from_validated_prediction_artifact()` assumes the caller has already validated persisted bytes against its run row. It changes only the scorer-local `CanonicalAudio.source_audio_id` when necessary; it does not write or replace the persisted artifact.
+`cohort_item_from_validated_prediction_artifact()` assumes the caller has already validated raw persisted bytes against its run-row evidence. It changes only scorer-local `CanonicalAudio.source_audio_id` when required.
 
-- [ ] **Step 1: Characterize the current OaF and MuScriptor scorer adaptation**
-
-Run current tests before edits:
+- [ ] **Step 1: Characterize current OaF and MuScriptor scorer adaptation**
 
 ```bash
 uv run pytest -q \
@@ -109,11 +115,11 @@ uv run pytest -q \
   tests/benchmark/test_muscriptor_corpus_run.py
 ```
 
-Expected: PASS.
+Expected: PASS before refactor.
 
-- [ ] **Step 2: Add failing helper tests**
+- [ ] **Step 2: Add failing source-ID adaptation test**
 
-Add a test with an artifact whose persisted `source_audio_id="songs/42/audio.ogg"` and `simfile_id="42"`:
+Use a persisted artifact with `source_audio_id="songs/42/audio.ogg"` and `simfile_id="42"`:
 
 ```python
 item = cohort_item_from_validated_prediction_artifact(
@@ -134,11 +140,20 @@ assert item.prediction_artifact.prediction.audio.input_audio_sha256 == (
 )
 ```
 
-Also test `cohort_item_without_prediction()` for `failed/inference_failed`, `skipped/explicitly_skipped`, and `quarantined/reference_quarantined` with existing HPA-325 validation.
+- [ ] **Step 3: Add non-success constructor tests**
 
-- [ ] **Step 3: Implement the minimal bridge**
+Cover only existing legal HPA-325 combinations:
 
-The source-ID adaptation is exactly:
+```python
+("failed", "inference_failed")
+("failed", "prediction_artifact_invalid")
+("failed", "prediction_missing")
+("failed", "backend_unavailable")
+("skipped", "explicitly_skipped")
+("quarantined", "reference_quarantined")
+```
+
+- [ ] **Step 4: Implement the minimal scorer-local bridge**
 
 ```python
 scorer_artifact = prediction
@@ -157,13 +172,11 @@ return cohort_item_from_artifacts(
 
 Do not relax `_artifact_identity_from_artifacts()` or change persisted source semantics.
 
-- [ ] **Step 4: Retarget OaF and MuScriptor only after run-row validation**
+- [ ] **Step 5: Retarget OaF and MuScriptor after their existing raw-artifact checks**
 
-Replace each runner's duplicated scorer-local `replace(... source_audio_id=simfile_id)` block with `cohort_item_from_validated_prediction_artifact()`. Replace duplicated `_cohort_item_without_prediction()` bodies with the shared helper.
+Replace only the duplicated scorer-local `replace(... source_audio_id=simfile_id)` block and duplicated non-success constructor. Keep each runner's persisted-artifact-vs-run-row validation unchanged and before the shared scorer helper.
 
-Keep each runner's persisted-artifact-vs-run-row checks exactly where they are.
-
-- [ ] **Step 5: Verify no behavior change**
+- [ ] **Step 6: Verify no behavior change**
 
 ```bash
 uv run pytest -q \
@@ -174,7 +187,7 @@ uv run pytest -q \
   tests/benchmark/test_muscriptor_corpus_run_acceptance.py
 ```
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/benchmark/cohort_scoring.py src/benchmark/oaf_corpus_run.py \
@@ -184,7 +197,7 @@ git commit -m "refactor: share persisted cohort scoring bridge"
 
 ---
 
-### Task 2: Support derived OaF input views without changing full-mix identity
+### Task 2: Support derived OaF inputs without changing full-mix identity
 
 **Files:**
 - Modify: `src/benchmark/input_view.py`
@@ -217,25 +230,19 @@ def build_inference_config(
 ) -> dict[str, str]: ...
 ```
 
-- [ ] **Step 1: Characterize current full-mix bytes and config identity**
-
-Keep/add assertions:
+- [ ] **Step 1: Characterize existing full-mix bytes and config**
 
 ```python
-payload = build_inference_config(config, descriptor, "a" * 64)
-assert payload["input_view_id"] == OAF_FULL_MIX_INPUT_VIEW_ID
-assert payload["canonicalization_revision"] == OAF_CANONICALIZATION_REVISION
+full = build_inference_config(config, descriptor, "a" * 64)
+assert full["input_view_id"] == OAF_FULL_MIX_INPUT_VIEW_ID
+assert full["canonicalization_revision"] == OAF_CANONICALIZATION_REVISION
 ```
-
-Run:
 
 ```bash
 uv run pytest -q tests/benchmark/test_input_view.py tests/benchmark/test_oaf_corpus_run.py
 ```
 
-Expected: PASS.
-
-- [ ] **Step 2: Add failing derived-view tests**
+- [ ] **Step 2: Add derived-view config test**
 
 ```python
 stem = build_inference_config(
@@ -244,26 +251,32 @@ stem = build_inference_config(
     "a" * 64,
     input_view_id="crux.oaf-htdemucs-drums-mono44k1-pcm16/v1",
 )
-full = build_inference_config(config, descriptor, "a" * 64)
 assert stem["input_view_id"] != full["input_view_id"]
 assert {k: v for k, v in stem.items() if k != "input_view_id"} == {
     k: v for k, v in full.items() if k != "input_view_id"
 }
 ```
 
-Add a stereo/non-44.1-kHz stem fixture and assert `materialize_derived_audio()` outputs 44.1-kHz mono PCM16, preserves the authoritative source ID/SHA, and hashes the canonical stem bytes as `input_audio_sha256`.
+- [ ] **Step 3: Add derived materialization test**
 
-- [ ] **Step 3: Factor only the shared canonicalization body**
+Use a stereo/non-44.1-kHz stem. Assert 44.1-kHz mono PCM16 output, authoritative source ID/SHA preserved, derived view ID preserved, and canonical stem bytes hashed into `input_audio_sha256`.
 
-Keep `materialize_full_mix_audio()` byte-identical. Both wrappers may call one private helper that performs the existing `librosa.load(... sr=44100, mono=True, res_type="soxr_hq")` + `soundfile.write(... subtype="PCM_16")` sequence.
+- [ ] **Step 4: Factor only the shared canonicalization body**
 
-`materialize_derived_audio()` reads `derived_audio_path`, not `source_audio.path`; `source_audio` supplies only authoritative identity and limits.
+Both public materializers may call a private helper implementing the existing:
 
-- [ ] **Step 4: Parameterize only `input_view_id` in OaF inference config**
+```python
+samples, _ = librosa.load(source, sr=44100, mono=True, res_type="soxr_hq")
+soundfile.write(output_path, samples, 44100, format="WAV", subtype="PCM_16")
+```
 
-Reject empty/non-string values. `build_run_id()` remains full-mix-specific and unchanged.
+Keep full-mix bytes unchanged. `materialize_derived_audio()` reads `derived_audio_path`; `source_audio` supplies authoritative identity.
 
-- [ ] **Step 5: Verify HPA-326 regressions**
+- [ ] **Step 5: Parameterize only `input_view_id` in `build_inference_config()`**
+
+Reject empty/non-string IDs. Do not change `build_run_id()`; it remains full-mix-specific.
+
+- [ ] **Step 6: Verify HPA-326 regressions**
 
 ```bash
 uv run pytest -q \
@@ -273,7 +286,7 @@ uv run pytest -q \
   tests/benchmark/test_oaf_corpus_run_branches.py
 ```
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/benchmark/input_view.py src/benchmark/oaf_corpus_run.py tests/benchmark
@@ -282,14 +295,16 @@ git commit -m "refactor: support derived OaF input views"
 
 ---
 
-### Task 3: Freeze the two external separator identities
+### Task 3: Define separator lock schema, fixture locks, and freeze script
 
 **Files:**
 - Create: `src/benchmark/separators.py`
 - Create: `scripts/freeze_separator_runtime.py`
-- Create: `runtime/separators/spleeter/model.json`
-- Create: `runtime/separators/htdemucs/model.json`
-- Test: `tests/benchmark/test_separators.py`
+- Create: `tests/fixtures/separators/spleeter-model.json`
+- Create: `tests/fixtures/separators/htdemucs-model.json`
+- Create: `tests/benchmark/test_separators.py`
+
+**Do not create real `runtime/separators/*/model.json` yet.** Those require reproduced real environments and are Task 11 evidence.
 
 **Interfaces:**
 
@@ -325,17 +340,19 @@ def load_separator_lock(path: Path) -> SeparatorLock: ...
 
 - [ ] **Step 1: Write lock parser/hash tests**
 
-Reject unknown/missing keys, noncanonical JSON, duplicate/absolute model filenames, malformed hashes, unsupported separator IDs, and command/model mismatches. Require `spleeter:4stems` for Spleeter and `-n htdemucs` for Demucs.
+Reject unknown/missing keys, noncanonical JSON, duplicate/absolute model filenames, malformed hashes, unsupported separator IDs, and command/model mismatch. Require `spleeter:4stems` for Spleeter and `-n htdemucs` for Demucs.
 
-- [ ] **Step 2: Implement the closed canonical lock**
+- [ ] **Step 2: Implement closed canonical lock parsing**
 
-Reuse `strict_json_loads()`, `canonical_json_bytes()`, and `require_sha256()`. `SeparatorLock.sha256` is the SHA-256 of canonical lock bytes.
+Reuse `strict_json_loads()`, `canonical_json_bytes()`, and `require_sha256()`. `SeparatorLock.sha256` is the SHA-256 of exact canonical lock bytes.
 
-- [ ] **Step 3: Implement mechanical runtime freezing**
+- [ ] **Step 3: Add canonical fixture locks with synthetic model hashes**
 
-`freeze_separator_runtime.py` receives an isolated interpreter, repository URL/revision, model ID, explicit downloaded model files, and licenses. It queries package version through that interpreter, hashes supplied model files, strips machine-local directories to basenames, renders canonical JSON, and round-trips through `load_separator_lock()`.
+Fixtures must pass the same loader as future production locks but are explicitly test data. Example model hashes may use repeated hex tokens; they must never be copied into `runtime/separators/`.
 
-Package probe:
+- [ ] **Step 4: Implement mechanical freeze script**
+
+The script accepts an isolated interpreter, repository URL/revision, model ID, explicit downloaded model files, and licenses. It queries package version through that interpreter, hashes supplied model files, strips directories to basenames, renders canonical JSON, and round-trips through `load_separator_lock()`.
 
 ```python
 subprocess.run(
@@ -346,18 +363,9 @@ subprocess.run(
 )
 ```
 
-- [ ] **Step 4: Reproduce both upstream smoke commands before freezing**
+No separator inference or benchmark scoring occurs in this task.
 
-Use a fixed staged input basename `input.wav` so expected output paths are deterministic.
-
-```text
-python -m spleeter separate -p spleeter:4stems -o <output> input.wav
-python -m demucs -n htdemucs -o <output> input.wav
-```
-
-Require decodable `drums.wav` output from each. Capture the exact package/revision/model files actually used. Do not inspect benchmark scores.
-
-- [ ] **Step 5: Generate real checked-in locks and verify**
+- [ ] **Step 5: Verify**
 
 ```bash
 uv run pytest -q tests/benchmark/test_separators.py
@@ -369,17 +377,17 @@ uv run ruff check src/benchmark/separators.py scripts/freeze_separator_runtime.p
 
 ```bash
 git add src/benchmark/separators.py scripts/freeze_separator_runtime.py \
-  runtime/separators tests/benchmark/test_separators.py
-git commit -m "feat: freeze separation runtimes"
+  tests/fixtures/separators tests/benchmark/test_separators.py
+git commit -m "feat: define frozen separator identities"
 ```
 
 ---
 
-### Task 4: Cache exact stems and apply practical fixed QC
+### Task 4: Cache exact stems and apply fixed practical QC
 
 **Files:**
 - Modify: `src/benchmark/separators.py`
-- Test: `tests/benchmark/test_separators.py`
+- Modify: `tests/benchmark/test_separators.py`
 
 **Interfaces:**
 
@@ -416,9 +424,9 @@ def run_spleeter_drums(...) -> SeparatedStem: ...
 def run_htdemucs_drums(...) -> SeparatedStem: ...
 ```
 
-- [ ] **Step 1: Add failing cache/QC/process tests**
+- [ ] **Step 1: Add cache/QC/process tests**
 
-Cover exact cache identity, matching reuse, conflicting existing bytes, nonzero process exit, missing stem, decode failure, zero/near-silent stem, large duration mismatch, >2 channels, sample-rate/channel warnings, clipping evidence, and finite-sample validation.
+Cover cache identity, matching reuse, conflicting bytes, process nonzero exit, missing output, decode failure, near-silent stem, duration mismatch, >2 channels, nonfinite samples, sample-rate/channel warnings, and clipping evidence.
 
 - [ ] **Step 2: Implement deterministic cache path**
 
@@ -426,9 +434,13 @@ Cover exact cache identity, matching reuse, conflicting existing bytes, nonzero 
 output_root / "derived" / "stems" / lock.separator_id / source_sha / lock.sha256 / "drums.wav"
 ```
 
-Run each separator in a private temporary directory with staged `input.wav`, read exact output bytes, and publish through existing `publish_immutable_file()`.
+Use existing `publish_immutable_file()` for exact stem bytes.
 
-- [ ] **Step 3: Implement fixed QC**
+- [ ] **Step 3: Stage deterministic separator input**
+
+Each process receives a private temporary directory with the authoritative source staged as `input.wav`. Only source/output paths vary; model/config arguments come from the validated lock.
+
+- [ ] **Step 4: Implement fixed QC**
 
 ```python
 samples, sample_rate = soundfile.read(path, always_2d=True, dtype="float32")
@@ -441,15 +453,11 @@ peak_abs = float(np.max(abs_samples))
 clipped_fraction = float(np.mean(abs_samples >= STEM_CLIP_ABS))
 ```
 
-Fail for channel count outside `{1,2}`, nonfinite samples, `rms_dbfs <= -80`, or duration mismatch above `max(0.5, source_duration * 0.005)`. Warn for non-44.1-kHz output, mono output, or peak `>= 0.9999`.
-
-- [ ] **Step 4: Implement exactly two command renderers**
-
-Only source/output paths vary at runtime. No model/shift/overlap/clip-mode flags are exposed.
+Fail for channels outside `{1, 2}`, nonfinite samples, `rms_dbfs <= -80`, or duration delta above `max(0.5, source_duration * 0.005)`. Warn for non-44.1-kHz, mono, or peak `>= 0.9999`.
 
 - [ ] **Step 5: Prove cache hit bypasses subprocess**
 
-Seed matching immutable stem bytes, inject a runner that raises if invoked, and assert the cache/QC path returns the existing stem.
+Seed matching immutable bytes, inject a runner that raises if invoked, and assert QC/reuse succeeds without execution.
 
 - [ ] **Step 6: Verify and commit**
 
@@ -461,7 +469,7 @@ git commit -m "feat: cache and validate drum stems"
 
 ---
 
-### Task 5: Define fixed-subset preflight, run identity, and snapshot
+### Task 5: Define fixed-subset preflight, run identity, snapshot, and full-mix control
 
 **Files:**
 - Create: `src/benchmark/separation_pilot.py`
@@ -487,28 +495,17 @@ class OafSeparationPilotRequest:
     demucs_python: Path
     resume: bool = False
     crux_commit: str | None = None
-
-@dataclass(frozen=True)
-class OafSeparationPilotOutcome:
-    overall_status: Literal["complete", "partial", "failed"]
-    exit_code: Literal[0, 1, 2]
-    run_id: str | None
-    run_path: Path | None
-    full_mix_reports_path: Path | None
-    spleeter_reports_path: Path | None
-    htdemucs_reports_path: Path | None
-    comparison_path: Path | None
 ```
 
 - [ ] **Step 1: Add fatal-preflight tests with process/backend sentinels**
 
-Neither separator nor OaF may be touched for subset/reference mismatch, subset/timing mismatch, parent HPA-326 mismatch, subset member absent from parent population, invalid separator lock, mixed OaF identity, or protected-output aliasing.
+Neither separator nor OaF may be touched for subset/reference mismatch, subset/timing mismatch, parent HPA-326 mismatch, subset member absent from parent population, invalid fixture lock, mixed OaF identity, or protected output alias.
 
 - [ ] **Step 2: Add exact-membership test**
 
-A canonical 20-row reviewed subset produces exactly those 20 sorted run rows. There is no selector/seed/count field on the request.
+A canonical 20-row reviewed subset produces exactly those 20 sorted run rows. No sampler field exists on the request.
 
-- [ ] **Step 3: Bind deterministic run identity**
+- [ ] **Step 3: Bind deterministic HPA-328 run identity**
 
 Hash exactly:
 
@@ -535,7 +532,7 @@ Run ID: `"oaf-separation-" + sha256(canonical_json_bytes(payload)).hexdigest()[:
 
 - [ ] **Step 4: Persist closed per-view state**
 
-Allowed derived statuses:
+Statuses:
 
 ```text
 pending
@@ -547,40 +544,51 @@ success
 resumed
 ```
 
-Each row also stores `source_row_sha256`, authoritative source ID/SHA/duration, parent full-mix status/prediction identity, and nested Spleeter/HTDemucs lock/stem/QC/runtime/canonical-input/prediction evidence.
+Detailed failure codes may additionally record `canonical_input_failed`, `prediction_output_conflict`, and `prediction_publish_failed`.
 
-- [ ] **Step 5: Implement strict snapshot parse/render/write**
+Each row stores `source_row_sha256`, authoritative source ID/SHA/duration, full-mix parent status/input/prediction identity, and nested Spleeter/HTDemucs lock/stem/QC/runtime/input/prediction evidence.
 
-Follow HPA-326 canonical JSON + six-place numeric normalization + `atomic_replace_bytes()` + sorted items + exact resume identity. Keep this HPA-328-specific; do not extract a run framework.
+- [ ] **Step 5: Implement strict canonical snapshot parse/render/write**
 
-- [ ] **Step 6: Reconstruct full-mix control reports without backend execution**
+Follow HPA-326 canonical JSON, six-place normalization, `atomic_replace_bytes()`, sorted items, exact resume identity, and status/nullability checks. Do not extract a run framework.
 
-Use `score_reviewed_subset_cohort()` on the persisted HPA-326 parent cohort and write:
+- [ ] **Step 6: Produce full-mix reports through the existing public wrapper**
 
-```text
-<run>/views/full_mix/reports/
+Construct:
+
+```python
+score_request = ScoreReviewedSubsetRequest(
+    reference_manifest_path=request.reference_manifest_path,
+    timing_manifest_path=request.timing_manifest_path,
+    subset_manifest_path=request.subset_manifest_path,
+    run_path=request.oaf_run_path,
+    output_dir=run_dir / "views" / "full_mix" / "reports",
+)
+outcome = score_oaf_reviewed_subset(score_request)
 ```
 
-A fake backend that raises must never be called.
+Require `outcome.exit_code != 2`. A fake backend that raises must never be called.
+
+Still parse the HPA-326 parent snapshot separately for HPA-328 run/header/item identities; do not use `score_reviewed_subset_cohort()` directly for full mix.
 
 - [ ] **Step 7: Verify and commit**
 
 ```bash
-uv run pytest -q tests/benchmark/test_separation_pilot.py
+uv run pytest -q tests/benchmark/test_separation_pilot.py tests/benchmark/test_reviewed_subset.py
 git add src/benchmark/separation_pilot.py tests/benchmark/test_separation_pilot.py
 git commit -m "feat: define OaF separation pilot run"
 ```
 
 ---
 
-### Task 6: Execute and resume the two derived views through frozen OaF
+### Task 6: Execute and resume derived views through the exact OaF write path
 
 **Files:**
 - Modify: `src/benchmark/separation_pilot.py`
 - Modify: `tests/benchmark/test_separation_pilot.py`
 - Create: `tests/benchmark/test_separation_pilot_acceptance.py`
 
-**Interfaces:**
+**Interface:**
 
 ```python
 def run_oaf_separation_pilot(
@@ -598,59 +606,111 @@ def run_oaf_separation_pilot(
 
 Fake backend records `CanonicalAudio.input_view_id`; calls contain only the two derived IDs and never `OAF_FULL_MIX_INPUT_VIEW_ID`.
 
-- [ ] **Step 2: Add resume matrix tests**
+- [ ] **Step 2: Add the derived resume matrix**
 
-Cover exact stem+prediction hit (`resumed`, no process/backend), valid stem+missing prediction (OaF only), wrong stem hash (regenerate/fail according to immutable identity), prediction input/config/descriptor mismatch (no reuse), and conflicting immutable prediction (`prediction_invalid`, no overwrite).
+Cover:
+
+```text
+valid stem + valid derived prediction -> resumed, no separator/backend
+valid stem + missing prediction       -> OaF only
+wrong stem hash                       -> no reuse
+run-row prediction evidence mismatch  -> prediction_invalid
+materialized input SHA mismatch       -> prediction_invalid
+wrong descriptor/model                -> prediction_invalid
+wrong derived input_view_id           -> prediction_invalid
+conflicting immutable prediction      -> prediction_invalid, never overwrite
+```
+
+Add a regression whose artifact uses `HTDEMUCS_INPUT_VIEW_ID`; it must resume successfully even though `_prediction_artifact_matches()` would reject it.
 
 - [ ] **Step 3: Resolve all authoritative sources before expensive work**
 
-Use `resolve_source_audio(..., load_body=False)` and persist source ID/SHA/duration. Failure for a fixed member is fatal preflight; never shrink membership.
+Use `resolve_source_audio(..., load_body=False)` and persist source ID/SHA/duration. Failure for a fixed member is fatal; never shrink membership.
 
-- [ ] **Step 4: Build two OaF inference configs differing only by view**
+- [ ] **Step 4: Build two OaF configs differing only by view**
 
 ```python
 spleeter_config = build_inference_config(
-    oaf_config,
-    descriptor,
-    model_lock_sha,
-    input_view_id=SPLEETER_INPUT_VIEW_ID,
+    oaf_config, descriptor, model_lock_sha, input_view_id=SPLEETER_INPUT_VIEW_ID
 )
 htdemucs_config = build_inference_config(
-    oaf_config,
-    descriptor,
-    model_lock_sha,
-    input_view_id=HTDEMUCS_INPUT_VIEW_ID,
+    oaf_config, descriptor, model_lock_sha, input_view_id=HTDEMUCS_INPUT_VIEW_ID
 )
 ```
 
-Assert every other field equals the frozen full-mix config.
+- [ ] **Step 5: Implement view-aware prediction reuse**
 
-- [ ] **Step 5: Checkpoint each durable boundary**
+Read candidate with `read_prediction_artifact()`.
+
+When prior persisted prediction evidence exists, call the existing view-agnostic:
+
+```python
+if not _prediction_artifact_matches_run_row(artifact, prior_row):
+    fail("prediction_invalid")
+```
+
+Then compare against current materialized audio explicitly:
+
+```python
+prediction = artifact.prediction
+matches_current_audio = (
+    prediction.descriptor.sha256 == descriptor.sha256
+    and dict(prediction.descriptor.payload) == dict(descriptor.payload)
+    and prediction.audio.source_audio_id == source.source_audio_id
+    and prediction.audio.source_audio_sha256 == source.source_audio_sha256
+    and prediction.audio.input_view_id == audio.input_view_id
+    and prediction.audio.input_audio_sha256 == audio.input_audio_sha256
+    and all(
+        event.prediction_map_version == OAF_PREDICTION_MAP_ID
+        for event in prediction.events
+    )
+)
+```
+
+Do **not** call or copy `_prediction_artifact_matches()`'s full-mix constant check.
+
+- [ ] **Step 6: Use the existing OaF inference/write functions exactly**
+
+On a prediction miss:
+
+```python
+started = perf_counter()
+try:
+    native = backend.transcribe(audio)
+finally:
+    elapsed = max(0.0, perf_counter() - started)
+
+if not isinstance(native, NativePrediction):
+    raise OafBackendError("native prediction is invalid", code="native_event_invalid")
+
+mapped, _ = map_oaf_prediction(native)
+published = publish_prediction_artifact(prediction_target, mapped)
+```
+
+Catch `OafBackendError` and call `classify_oaf_backend_error(error.code)`. Catch `ArtifactPublicationError` / `PredictionArtifactError` as `prediction_publish_failed`. Do not add another prediction publisher or mapper.
+
+- [ ] **Step 7: Checkpoint every durable boundary**
 
 Per view:
 
-1. run or validate cached exact stem;
+1. run/validate cached stem;
 2. checkpoint stem/QC/separation runtime;
-3. materialize temporary canonical OaF WAV under `<run>/inputs/<simfile_id>/`;
-4. run or validate immutable prediction-v2 artifact via `prediction_path()`;
+3. materialize temporary canonical OaF WAV;
+4. reuse or create prediction through Steps 5–6;
 5. checkpoint input hash, prediction path/hash, OaF runtime/status;
 6. delete only temporary canonical WAV in `finally`.
 
-Never delete retained stem.
+- [ ] **Step 8: Keep separator failures independent and OaF poison behavior unchanged**
 
-- [ ] **Step 6: Use one persistent OaF backend for all misses**
+Spleeter failure must not prevent HTDemucs for the same song. One persistent OaF backend handles misses; poison stops later inference in the invocation and leaves resume state. No automatic restart.
 
-Construct lazily. Reuse HPA-326 error classification. Item-local errors fail current view; poison checkpoints and stops later OaF inference in the invocation; no automatic restart.
-
-- [ ] **Step 7: Keep separator failures independent**
-
-Spleeter failure must not prevent HTDemucs for the same song and vice versa.
-
-- [ ] **Step 8: Verify and commit**
+- [ ] **Step 9: Verify and commit**
 
 ```bash
 uv run pytest -q tests/benchmark/test_separation_pilot.py \
-  tests/benchmark/test_separation_pilot_acceptance.py
+  tests/benchmark/test_separation_pilot_acceptance.py \
+  tests/benchmark/test_oaf_corpus_run.py
+
 git add src/benchmark/separation_pilot.py tests/benchmark/test_separation_pilot.py \
   tests/benchmark/test_separation_pilot_acceptance.py
 git commit -m "feat: run OaF on separated drum views"
@@ -658,33 +718,61 @@ git commit -m "feat: run OaF on separated drum views"
 
 ---
 
-### Task 7: Score both derived cohorts through HPA-325 unchanged
+### Task 7: Score derived cohorts with the frozen HPA-325 reason map
 
 **Files:**
 - Modify: `src/benchmark/separation_pilot.py`
 - Modify: `tests/benchmark/test_separation_pilot_acceptance.py`
 - Test: `tests/benchmark/test_cohort_scoring.py`
 
-**Consumes:** `cohort_item_from_validated_prediction_artifact()`, `cohort_item_without_prediction()`, `score_cohort()`, `write_cohort_reports()`.
+**Interfaces:**
 
-**Produces:**
+```python
+SEPARATION_FAILURE_TO_COHORT_REASON: dict[str, CohortFailureReason] = {
+    "separation_failed": "inference_failed",
+    "stem_invalid": "inference_failed",
+    "canonical_input_failed": "inference_failed",
+    "inference_failed": "inference_failed",
+    "prediction_invalid": "prediction_artifact_invalid",
+    "prediction_output_conflict": "prediction_artifact_invalid",
+    "prediction_publish_failed": "prediction_artifact_invalid",
+}
+```
+
+Produces:
 
 ```text
 <run>/views/spleeter4_drums/reports/
 <run>/views/htdemucs_drums/reports/
 ```
 
-- [ ] **Step 1: Add mixed-success population test**
+- [ ] **Step 1: Pin the exact mapping table in a test**
 
-Use three songs: both-success, Spleeter-fail/HTDemucs-success, Spleeter-success/HTDemucs-fail. Each view's `items.csv` contains all three with correct failure counts.
+```python
+assert SEPARATION_FAILURE_TO_COHORT_REASON == {
+    "separation_failed": "inference_failed",
+    "stem_invalid": "inference_failed",
+    "canonical_input_failed": "inference_failed",
+    "inference_failed": "inference_failed",
+    "prediction_invalid": "prediction_artifact_invalid",
+    "prediction_output_conflict": "prediction_artifact_invalid",
+    "prediction_publish_failed": "prediction_artifact_invalid",
+}
+```
 
-- [ ] **Step 2: Build view cohort identity from frozen OaF identity**
+Assert the table values are a subset of `COHORT_FAILURE_REASONS`. Do not modify `CohortFailureReason`.
+
+- [ ] **Step 2: Add mixed-success population test**
+
+Use three songs: both-success, Spleeter-fail/HTDemucs-success, Spleeter-success/HTDemucs-fail. Each view `items.csv` contains all three.
+
+- [ ] **Step 3: Build view `CohortIdentity` from frozen OaF identity**
 
 Only `cohort_id` and `input_view_id` differ. Taxonomy/lane/prediction-map/model/model-lock/descriptor/scoring version stay fixed.
 
-- [ ] **Step 3: Validate persisted prediction before scorer adaptation**
+- [ ] **Step 4: Build success/resume rows through the shared scorer bridge**
 
-For success/resume, require run-row artifact SHA/source SHA/input-view/input SHA/descriptor/config identity to match the immutable prediction bytes. Then call:
+After Task 6 raw persisted validation:
 
 ```python
 item = cohort_item_from_validated_prediction_artifact(
@@ -696,44 +784,59 @@ item = cohort_item_from_validated_prediction_artifact(
 )
 ```
 
-Assert persisted source object ID remains unchanged while `item.prediction_artifact.prediction.audio.source_audio_id == str(simfile_id)`.
+- [ ] **Step 5: Build failure rows through `cohort_item_without_prediction()`**
 
-- [ ] **Step 4: Build non-success rows through the shared constructor**
+Translate only through `SEPARATION_FAILURE_TO_COHORT_REASON`. Detailed separator codes/messages remain in HPA-328 `run.json`.
 
-Map separator/materialization/OaF/prediction failures to existing HPA-325 closed reasons. Detailed separator codes/messages remain only in HPA-328 `run.json`.
-
-- [ ] **Step 5: Score/write with no new knobs**
+- [ ] **Step 6: Score/write with no new knobs**
 
 ```python
 result = score_cohort(identity, cohort_items, diagnostics_for=successful_subset_ids)
 write_cohort_reports(result, reports_path)
 ```
 
-- [ ] **Step 6: Verify and commit**
+- [ ] **Step 7: Verify and commit**
 
 ```bash
 uv run pytest -q tests/benchmark/test_separation_pilot_acceptance.py \
   tests/benchmark/test_cohort_scoring.py
+
 git add src/benchmark/separation_pilot.py tests/benchmark/test_separation_pilot_acceptance.py
 git commit -m "feat: score separated OaF cohorts"
 ```
 
 ---
 
-### Task 8: Share HPA-325 report reading and publish the fixed comparison
+### Task 8A: Promote model-neutral HPA-325 report reading
 
 **Files:**
 - Modify: `src/benchmark/reports.py`
 - Modify: `src/benchmark/muscriptor_comparison.py`
+- Modify/Create reader-focused tests in `tests/benchmark/test_reports.py`
 - Test: `tests/benchmark/test_muscriptor_comparison.py`
 - Test: `tests/benchmark/test_muscriptor_comparison_coverage.py`
-- Create: `src/benchmark/separation_comparison.py`
-- Create: `tests/benchmark/test_separation_comparison.py`
-- Modify: `src/benchmark/separation_pilot.py`
 
-**Shared report-reader interfaces:**
+**Interfaces:**
 
 ```python
+@dataclass(frozen=True)
+class PublishedEventMicro:
+    tp: int
+    fp: int
+    fn: int
+    precision: Decimal | None
+    recall: Decimal | None
+    f1: Decimal | None
+
+@dataclass(frozen=True)
+class PublishedAggregateRow:
+    tolerance_ms: int
+    mode: ScoreMode
+    event_micro: PublishedEventMicro
+    song_macro_f1: Decimal | None
+    class_macro_f1: Decimal | None
+    successful_song_count: int
+
 @dataclass(frozen=True)
 class PublishedItemRow:
     simfile_id: str
@@ -750,7 +853,7 @@ class PublishedSongRow:
     precision: Decimal | None
     recall: Decimal | None
     f1: Decimal | None
-    prediction_to_reference_ratio: Decimal
+    prediction_to_reference_ratio: Decimal | None
     median_abs_error_ms: Decimal | None
     p95_abs_error_ms: Decimal | None
     offset_ms: Decimal | None
@@ -770,6 +873,8 @@ class PublishedClassRow:
 @dataclass(frozen=True)
 class PublishedCohortReports:
     identity: CohortIdentity
+    population: PopulationSummary
+    aggregates: tuple[PublishedAggregateRow, ...]
     items: tuple[PublishedItemRow, ...]
     songs: tuple[PublishedSongRow, ...]
     classes: tuple[PublishedClassRow, ...]
@@ -782,7 +887,62 @@ def read_cohort_reports(
 ) -> PublishedCohortReports: ...
 ```
 
-**HPA-328 interface:**
+- [ ] **Step 1: Characterize MuScriptor comparison before any refactor**
+
+```bash
+uv run pytest -q tests/benchmark/test_muscriptor_comparison.py \
+  tests/benchmark/test_muscriptor_comparison_coverage.py
+```
+
+Capture any golden/fixture output bytes already pinned by those tests.
+
+- [ ] **Step 2: Move field-name ownership to `reports.py` only**
+
+Keep `_ITEM_FIELDNAMES`, `_PER_SONG_FIELDNAMES`, and `_PER_CLASS_FIELDNAMES` as the writer/reader single source. Remove the copies from `muscriptor_comparison.py` after the reader lands.
+
+- [ ] **Step 3: Add strict summary reader tests**
+
+Read canonical `summary.json`; require `REPORT_SCHEMA`, exact expected identity, tolerance set, population fields, and aggregate rows. For every aggregate require event-micro `tp/fp/fn/precision/recall/f1`, macro values, and successful-song count.
+
+- [ ] **Step 4: Add strict CSV reader tests**
+
+Reject wrong/missing columns, malformed numeric tokens, duplicate item/song/class keys, score rows for non-success items, and row identity mismatches.
+
+- [ ] **Step 5: Implement `read_cohort_reports()`**
+
+It reads only HPA-325 published report files. It does not parse run snapshots, choose pairable IDs, know backend families, or write comparison output.
+
+- [ ] **Step 6: Retarget MuScriptor comparison**
+
+Keep its existing run parsing, backend-family validation, source/input pairability, subset handling, output names, labels, and aggregate policy. Replace only private CSV/report parsers with `read_cohort_reports()`.
+
+- [ ] **Step 7: Require unchanged MuScriptor outputs**
+
+```bash
+uv run pytest -q tests/benchmark/test_reports.py \
+  tests/benchmark/test_muscriptor_comparison.py \
+  tests/benchmark/test_muscriptor_comparison_coverage.py
+```
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/benchmark/reports.py src/benchmark/muscriptor_comparison.py \
+  tests/benchmark/test_reports.py tests/benchmark/test_muscriptor_comparison.py \
+  tests/benchmark/test_muscriptor_comparison_coverage.py
+git commit -m "refactor: share published cohort report reading"
+```
+
+---
+
+### Task 8B: Write the fixed HPA-328 paired comparison
+
+**Files:**
+- Create: `src/benchmark/separation_comparison.py`
+- Create: `tests/benchmark/test_separation_comparison.py`
+- Modify: `src/benchmark/separation_pilot.py`
+
+**Interfaces:**
 
 ```python
 @dataclass(frozen=True)
@@ -800,64 +960,70 @@ class SeparationComparisonArtifacts:
 
 def write_separation_comparison(
     *,
-    full_mix_reports: Path,
-    spleeter_reports: Path,
-    htdemucs_reports: Path,
-    full_mix_identity: CohortIdentity,
-    spleeter_identity: CohortIdentity,
-    htdemucs_identity: CohortIdentity,
+    full_mix_reports: PublishedCohortReports,
+    spleeter_reports: PublishedCohortReports,
+    htdemucs_reports: PublishedCohortReports,
     run_snapshot: Mapping[str, object],
     output_dir: Path,
     cost_rates: CostRates = CostRates(),
 ) -> SeparationComparisonArtifacts: ...
 ```
 
-- [ ] **Step 1: Run existing MuScriptor comparison tests before refactor**
+- [ ] **Step 1: Add identity tests**
 
-```bash
-uv run pytest -q tests/benchmark/test_muscriptor_comparison.py \
-  tests/benchmark/test_muscriptor_comparison_coverage.py
+Require reference/timing/taxonomy/lane/prediction-map/OaF/scoring identity equality. The three `input_view_id` values intentionally differ.
+
+- [ ] **Step 2: Add independent-population test**
+
+`summary.json` must retain each view's independent HPA-325 population and independent summary aggregates, even when success memberships differ.
+
+- [ ] **Step 3: Add pairable-success intersection test**
+
+For each pair, pairable IDs are exactly:
+
+```python
+full_success_ids & derived_success_ids
 ```
 
-Expected: PASS.
+Delta CSV rows contain only those IDs and require identical score key grids on the paired set.
 
-- [ ] **Step 2: Add failing `read_cohort_reports()` tests**
+- [ ] **Step 4: Recompute paired event-micro from published per-song counts**
 
-Reject wrong/missing columns, malformed canonical numeric tokens, duplicate item/song/class keys, score rows for non-success items, summary identity mismatch, and row identity mismatch. Accept the current HPA-325 report fixture without changing report schema.
+For every tolerance/mode and pairable set:
 
-- [ ] **Step 3: Move only report parsing into `reports.py`**
+```python
+def paired_event_micro(rows: Iterable[PublishedSongRow]) -> ScoreSummary:
+    tp = sum(row.tp for row in rows)
+    fp = sum(row.fp for row in rows)
+    fn = sum(row.fn for row in rows)
+    return ScoreSummary(tp, fp, fn)
+```
 
-Use the existing `_ITEM_FIELDNAMES`, `_PER_SONG_FIELDNAMES`, and `_PER_CLASS_FIELDNAMES` as the single schema definitions. Do not move run parsing, backend-family checks, pairable-intersection rules, or MuScriptor labels out of `muscriptor_comparison.py`.
+Build separate `ScoreSummary` values for full mix and derived view using the same paired IDs, then persist TP/FP/FN/precision/recall/F1 and `derived - full_mix` F1.
 
-- [ ] **Step 4: Retarget MuScriptor comparison with unchanged outputs**
+Do not subtract the independent `PublishedAggregateRow.event_micro.f1` values as the headline when memberships differ.
 
-`muscriptor_comparison.py` still validates its OaF/MuScriptor run snapshots and exact source/input pairing, then passes expected cohort identities to `read_cohort_reports()`. Run the full existing comparison tests and require byte-identical fixture outputs where existing tests pin them.
+- [ ] **Step 5: Join per-song and per-class published rows**
 
-- [ ] **Step 5: Add HPA-328 report-identity tests**
+Emit source values and `derived - full_mix` precision/recall/F1 deltas for matching tolerance/mode/song/class keys.
 
-Reject reference/timing/taxonomy/lane/prediction-map/OaF/scoring identity mismatches. The three expected input-view IDs are different by design; all other frozen identity fields must match.
+- [ ] **Step 6: Derive FP/FN per minute**
 
-- [ ] **Step 6: Join published HPA-325 rows without rescoring**
-
-Produce full-mix↔Spleeter and full-mix↔HTDemucs intersections. Emit source values plus `derived - full_mix` precision/recall/F1 deltas for matching tolerance/mode/song/class keys. Independent failure populations remain in summary counts.
-
-- [ ] **Step 7: Derive FP/FN per minute**
-
-For each per-song score row, require positive finite `source_duration_sec` from the HPA-328 snapshot:
+For each paired per-song row require positive finite `source_duration_sec` from HPA-328 run evidence:
 
 ```python
 minutes = Decimal(str(source_duration_sec)) / Decimal("60")
-fp_per_min = Decimal(fp) / minutes
-fn_per_min = Decimal(fn) / minutes
+fp_per_min = Decimal(row.fp) / minutes
+fn_per_min = Decimal(row.fn) / minutes
 ```
 
-Render six-place canonical tokens and derived-minus-full-mix deltas.
+Persist absolute rates plus derived-minus-full-mix deltas using six-place canonical tokens.
 
-- [ ] **Step 8: Carry timing diagnostics and bounded helped/harmed cases**
+- [ ] **Step 7: Carry timing diagnostics and bounded helped/harmed cases**
 
-Carry `median_abs_error_ms`, `p95_abs_error_ms`, and `offset_ms`. For each view/tolerance/mode, list at most five most helped and five most harmed songs sorted by F1 delta then `simfile_id`; include per-class direction without statistical-significance machinery.
+Carry `median_abs_error_ms`, `p95_abs_error_ms`, `offset_ms`. Per view/tolerance/mode list at most five most helped and five most harmed songs sorted by F1 delta then `simfile_id`; include per-class direction.
 
-- [ ] **Step 9: Add runtime/storage/cost arithmetic**
+- [ ] **Step 8: Add runtime/storage/cost evidence**
 
 ```python
 compute_cost = Decimal(str(total_wall_time_sec)) / Decimal("3600") * compute_rate
@@ -867,7 +1033,7 @@ storage_monthly_cost = storage_gb * storage_rate
 
 Rates default to zero and affect display only.
 
-- [ ] **Step 10: Render deterministic artifacts**
+- [ ] **Step 9: Render deterministic comparison artifacts**
 
 ```text
 comparison/summary.json
@@ -876,18 +1042,15 @@ comparison/per_class_delta.csv
 comparison/summary.md
 ```
 
-- [ ] **Step 11: Verify and commit**
+- [ ] **Step 10: Verify and commit**
 
 ```bash
-uv run pytest -q \
-  tests/benchmark/test_muscriptor_comparison.py \
-  tests/benchmark/test_muscriptor_comparison_coverage.py \
-  tests/benchmark/test_separation_comparison.py \
+uv run pytest -q tests/benchmark/test_separation_comparison.py \
   tests/benchmark/test_separation_pilot_acceptance.py
-git add src/benchmark/reports.py src/benchmark/muscriptor_comparison.py \
-  src/benchmark/separation_comparison.py src/benchmark/separation_pilot.py \
-  tests/benchmark
-git commit -m "refactor: share published benchmark report reading"
+
+git add src/benchmark/separation_comparison.py src/benchmark/separation_pilot.py \
+  tests/benchmark/test_separation_comparison.py
+git commit -m "feat: compare OaF separation views"
 ```
 
 ---
@@ -920,17 +1083,13 @@ class FinalizeSeparationPilotRequest:
     rationale: str
     compute_cost_per_hour: Decimal = Decimal("0")
     storage_cost_per_gb_month: Decimal = Decimal("0")
-
-
-def finalize_separation_pilot(request: FinalizeSeparationPilotRequest) -> PublishedManifest: ...
-def load_separation_pilot_manifest(path: Path) -> LoadedSeparationPilotManifest: ...
 ```
 
-- [ ] **Step 1: Add schema golden/parser tests**
+- [ ] **Step 1: Add one-row schema golden and production population tests**
 
-Golden validates exact one-row shape/canonical bytes. Production loader/finalizer validates exact HPA-327 20–30 membership.
+Golden validates exact row shape/canonical bytes. Production finalization requires exact HPA-327 20–30 membership.
 
-- [ ] **Step 2: Freeze row identity and nullability**
+- [ ] **Step 2: Freeze row identity/nullability**
 
 Every row includes:
 
@@ -951,19 +1110,17 @@ decision/rationale/cost rates
 Crux commit
 ```
 
-`source_row_sha256` must equal the exact HPA-327 row's persisted source-row hash.
+- [ ] **Step 3: Re-read/hash durable artifacts before publication**
 
-- [ ] **Step 3: Re-read/hash artifacts before publication**
+Verify stems, predictions, and comparison files against run evidence. Missing/edited successful HTDemucs evidence prevents finalization.
 
-Verify retained stems, prediction artifacts, and comparison files against persisted paths/hashes. Missing or edited HTDemucs bytes prevent publication of a successful HTDemucs row.
+- [ ] **Step 4: Publish through existing manifest rails**
 
-- [ ] **Step 4: Publish through existing canonical manifest rails**
-
-Reuse `render_manifest()`/`publish_manifest()` style helpers. Repeat shared fields across 20–30 rows rather than creating a header/database protocol.
+Reuse `render_manifest()` / `publish_manifest()`. Do not create a header/database protocol.
 
 - [ ] **Step 5: Add HPA-396 consumer test**
 
-For each successful HTDemucs row, downstream code obtains without mutable `run.json`:
+For every successful HTDemucs row downstream obtains without mutable `run.json`:
 
 ```python
 (
@@ -976,6 +1133,8 @@ For each successful HTDemucs row, downstream code obtains without mutable `run.j
     row.htdemucs_prediction_sha256,
 )
 ```
+
+No input-view manifest is required; HPA-396 can rematerialize from retained native stems.
 
 - [ ] **Step 6: Verify and commit**
 
@@ -1025,13 +1184,13 @@ Finalize command exposes only:
 
 Assert no model/shift/overlap/QC/tolerance/full-corpus/third-separator flags.
 
-- [ ] **Step 2: Add lazy imports**
+- [ ] **Step 2: Keep imports lazy**
 
-Keep external/heavy benchmark modules behind the Click command boundary.
+Separator/pilot/finalization modules import behind the Click command boundary.
 
-- [ ] **Step 3: Emit canonical summaries and stable exit codes**
+- [ ] **Step 3: Emit canonical summaries and stable exits**
 
-Run uses 0 complete / 1 partial / 2 fatal. Finalize exits 0 only after immutable publication. `--decision` is one of the five frozen values; rationale is nonempty; rates are nonnegative.
+Run uses 0 complete / 1 partial / 2 fatal. Finalize exits 0 only after immutable publication. Decision is one of five frozen values; rationale nonempty; rates nonnegative.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -1043,23 +1202,62 @@ git commit -m "feat: add separation pilot commands"
 
 ---
 
-### Task 11: Run the real frozen pilot and close verification
+### Task 11: Freeze real separator runtimes, run the pilot, and close verification
 
 **Files:**
-- Generated benchmark artifacts stay outside git.
+- Create and commit before scoring: `runtime/separators/spleeter/model.json`
+- Create and commit before scoring: `runtime/separators/htdemucs/model.json`
+- Generated stems, predictions, reports, and handoff outputs stay outside git.
 
-- [ ] **Step 1: Freeze execution evidence before scoring**
+- [ ] **Step 1: Reproduce real Spleeter known-audio smoke**
+
+Using the isolated intended interpreter, stage a known non-benchmark audio file as `input.wav` and run:
+
+```bash
+"$SPLEETER_PYTHON" -m spleeter separate -p spleeter:4stems \
+  -o "$SPLEETER_SMOKE_OUT" "$SMOKE_DIR/input.wav"
+```
+
+Require a decodable drum stem. Record exact package version, repository revision, model files, licenses, and command semantics. Do not inspect HPA-328 scores.
+
+- [ ] **Step 2: Reproduce real HTDemucs known-audio smoke**
+
+```bash
+"$DEMUCS_PYTHON" -m demucs -n htdemucs \
+  -o "$HTDEMUCS_SMOKE_OUT" "$SMOKE_DIR/input.wav"
+```
+
+Require decodable `drums.wav` and record exact package/repository/model files and licenses.
+
+- [ ] **Step 3: Generate canonical production locks**
+
+Run `scripts/freeze_separator_runtime.py` with the exact reproduced interpreters/revisions/model files. Round-trip both results through `load_separator_lock()`.
+
+```bash
+uv run python scripts/freeze_separator_runtime.py ... \
+  --output runtime/separators/spleeter/model.json
+uv run python scripts/freeze_separator_runtime.py ... \
+  --output runtime/separators/htdemucs/model.json
+```
+
+- [ ] **Step 4: Commit real locks before any reference-score execution**
+
+```bash
+uv run pytest -q tests/benchmark/test_separators.py
+git add runtime/separators/spleeter/model.json runtime/separators/htdemucs/model.json
+git commit -m "chore: freeze separator benchmark runtimes"
+```
+
+Record:
 
 ```bash
 git rev-parse HEAD
 sha256sum runtime/separators/spleeter/model.json runtime/separators/htdemucs/model.json
 ```
 
-Confirm no separator model/QC/scoring tuning flags exist.
+After this point do not alter separator model/config/QC/scoring semantics based on pilot scores.
 
-- [ ] **Step 2: Run exact reviewed subset**
-
-Resolve the existing HPA-324/HPA-323/HPA-327/HPA-326/HPA-321 artifact paths and isolated interpreters once, then run:
+- [ ] **Step 5: Run exact HPA-327 pilot**
 
 ```bash
 uv run crux benchmark run-oaf-separation-pilot \
@@ -1073,13 +1271,25 @@ uv run crux benchmark run-oaf-separation-pilot \
   --demucs-python "$DEMUCS_PYTHON"
 ```
 
-If interrupted, repeat the exact command with `--resume`; do not alter locks/config after partial scores are visible.
+If interrupted, repeat exactly with `--resume`.
 
-- [ ] **Step 3: Review required evidence**
+- [ ] **Step 6: Review required evidence only**
 
-Require all HPA-327 members in every population ledger; full-mix/Spleeter/HTDemucs HPA-325 reports; exact stem/prediction identities; 30/50/100-ms per-song/per-class deltas; FP/FN per minute; timing/offset diagnostics; separator/OaF runtime; retained bytes; cost display; bounded helped/harmed cases.
+Require:
 
-- [ ] **Step 4: Finalize one closed decision**
+- all HPA-327 members in all three population ledgers;
+- full-mix/Spleeter/HTDemucs HPA-325 reports;
+- exact stem/input/prediction identities;
+- independent population and summary aggregates;
+- paired-success per-song/per-class deltas;
+- paired-success event-micro TP/FP/FN/precision/recall/F1;
+- FP/FN per minute;
+- timing/offset diagnostics;
+- separator + derived OaF runtime/RTF;
+- retained bytes and cost display;
+- bounded helped/harmed examples.
+
+- [ ] **Step 7: Finalize one closed decision**
 
 ```bash
 uv run crux benchmark finalize-oaf-separation-pilot \
@@ -1092,9 +1302,9 @@ uv run crux benchmark finalize-oaf-separation-pilot \
   --storage-cost-per-gb-month "$STORAGE_RATE"
 ```
 
-Use zero rates for local sunk hardware/storage; otherwise use actual marginal rates. Handoff must expose exact HTDemucs stem hashes/paths and OaF-on-HTDemucs prediction identities.
+Use zero rates for local sunk hardware/storage or actual marginal rates otherwise.
 
-- [ ] **Step 5: Run repository-wide verification**
+- [ ] **Step 8: Run repository-wide verification**
 
 ```bash
 uv run pytest -q
@@ -1105,24 +1315,28 @@ git diff --check
 git status --short
 ```
 
-Real separator execution is operational acceptance, not a CI dependency.
-
-- [ ] **Step 6: Scope audit**
+- [ ] **Step 9: Scope audit**
 
 ```bash
 git diff --stat origin/main...HEAD
 ```
 
-Confirm no full-corpus separator path, generic experiment/plugin framework, bundled model weights, or committed audio/stem/result artifact.
+Confirm no full-corpus separator path, generic experiment/plugin framework, bundled model weights, committed audio/stems/results, new scorer, or new HPA-325 failure enum.
 
 ---
 
 ## Plan Self-Review
 
-**Latest-main coverage:** Task 1 explicitly closes the scorer-source mismatch found on current `main`; Task 8 reuses the report parsing introduced by HPA-395 rather than duplicating its CSV contracts. Task 2 consumes the final landed neutral materialization/prediction seams without recreating them.
+**Review finding 1 — derived resume:** Task 6 explicitly rejects `_prediction_artifact_matches()` for derived views, reuses `_prediction_artifact_matches_run_row()`, and binds the view to the current materialized `CanonicalAudio.input_view_id`.
 
-**Spec coverage:** Tasks 5–6 freeze exact membership and reuse the persisted control; Tasks 3–4 freeze/cache/QC both separators; Task 7 reuses HPA-325; Task 8 covers paired accuracy, FP/FN per minute, timing, runtime, storage, and cost; Task 9 provides row-level HPA-327 lineage plus exact HTDemucs/OaF handoff; Task 10 keeps operator surfaces narrow; Task 11 performs the real frozen gate.
+**Review finding 2 — OaF write path:** Task 6 explicitly calls `backend.transcribe()` → `map_oaf_prediction()` → `publish_prediction_artifact()` and routes backend failures through `classify_oaf_backend_error()`.
 
-**Scope:** The two shared extractions are justified by current duplication and a third caller. OaF/MuScriptor/HPA-328 runners stay concrete; pairing policies stay model/experiment-specific.
+**Review finding 3 — full-mix control:** Task 5 calls `score_oaf_reviewed_subset()` with `ScoreReviewedSubsetRequest.output_dir=<run>/views/full_mix/reports`; parent snapshot parsing remains identity evidence only.
 
-**Stable names:** `cohort_item_from_validated_prediction_artifact`, `cohort_item_without_prediction`, `materialize_derived_audio`, `read_cohort_reports`, `SeparatorLock`, `SeparatedStem`, `StemQc`, `OafSeparationPilotRequest`, `OafSeparationPilotOutcome`, `run_oaf_separation_pilot`, `write_separation_comparison`, `FinalizeSeparationPilotRequest`, `finalize_separation_pilot`, `SPLEETER_INPUT_VIEW_ID`, and `HTDEMUCS_INPUT_VIEW_ID` are the shared names used across tasks, CLI, and tests.
+**Review finding 4 — failure vocabulary:** Task 7 pins the exact HPA-328 failure-code → existing `CohortFailureReason` table and prohibits enum growth.
+
+**Review finding 5 — paired F1:** Task 8A reads independent HPA-325 summary aggregates; Task 8B recomputes headline paired event-micro metrics by summing published per-song counts on the successful-song intersection.
+
+**Review finding 6 — sequencing:** Task 3 is schema/freeze-script/fixture-only. Task 8 is split into independent 8A reader extraction and 8B comparison implementation. Task 11 reproduces/freeze real separator runtimes before scored pilot execution.
+
+**Scope:** Same experiment and same non-goals. Shared extractions stop at real third-caller duplication; runners, resume policy, and pair-specific comparison logic remain concrete.
