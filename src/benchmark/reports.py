@@ -828,7 +828,16 @@ def _csv_int(value: object, field: str, *, positive: bool = False) -> int:
     parsed = int(value)
     if (positive and parsed <= 0) or parsed < 0:
         _report_error(f"{field} numeric field is malformed")
+    if str(parsed) != value:
+        _report_error(f"{field} numeric field is not canonical")
     return parsed
+
+
+def _canonical_csv_decimal(value: Decimal) -> str:
+    if value.is_zero():
+        return "0"
+    rendered = format(value, "f").rstrip("0").rstrip(".")
+    return rendered or "0"
 
 
 def _parse_csv_decimal(value: object, field: str, *, optional: bool = False) -> Decimal | None:
@@ -842,6 +851,8 @@ def _parse_csv_decimal(value: object, field: str, *, optional: bool = False) -> 
         _report_error(f"{field} numeric field is malformed")
     if not parsed.is_finite():
         _report_error(f"{field} numeric field is malformed")
+    if _canonical_csv_decimal(parsed) != value:
+        _report_error(f"{field} numeric field is not canonical")
     return parsed
 
 
@@ -1041,8 +1052,6 @@ def _validate_report_identity(row: Mapping[str, str], identity: CohortIdentity) 
 def _parse_item_rows(
     path: Path,
     identity: CohortIdentity,
-    *,
-    strict_semantics: bool = True,
 ) -> tuple[PublishedItemRow, ...]:
     rows = _read_report_csv(path, _ITEM_FIELDNAMES)
     parsed: list[PublishedItemRow] = []
@@ -1079,12 +1088,12 @@ def _parse_item_rows(
             )
         )
         native_class_counts = _parse_native_class_counts(row["prediction_native_class_counts"])
-        if strict_semantics and status == "success":
+        if status == "success":
             if failure_reason:
                 _report_error("successful item contains a failure_reason")
             if any(value is None for value in prediction_counts):
                 _report_error("successful item is missing prediction coverage")
-        elif strict_semantics:
+        else:
             expected_reason = {
                 "failed": {
                     "backend_unavailable",
@@ -1248,6 +1257,12 @@ def read_cohort_reports(
     aggregates = _parse_aggregates(summary["aggregates"])
     if {aggregate.tolerance_ms for aggregate in aggregates} != set(parsed_tolerances):
         _report_error("summary aggregate tolerances do not match tolerances_ms")
+    expected_aggregate_keys = {
+        (tolerance_ms, mode) for tolerance_ms in parsed_tolerances for mode in _MODES
+    }
+    actual_aggregate_keys = {(aggregate.tolerance_ms, aggregate.mode) for aggregate in aggregates}
+    if actual_aggregate_keys != expected_aggregate_keys:
+        _report_error("summary aggregate mode grid is incomplete")
 
     items = _parse_item_rows(report_dir / "items.csv", identity)
     status_counts = Counter(row.status for row in items)
@@ -1272,6 +1287,15 @@ def read_cohort_reports(
     successful_ids = {row.simfile_id for row in items if row.status == "success"}
     songs = _parse_song_rows(report_dir / "per_song.csv", identity, successful_ids)
     classes = _parse_class_rows(report_dir / "per_class.csv", identity, successful_ids)
+    expected_song_keys = {
+        (simfile_id, tolerance_ms, mode)
+        for simfile_id in successful_ids
+        for tolerance_ms in parsed_tolerances
+        for mode in _MODES
+    }
+    actual_song_keys = {(row.simfile_id, row.tolerance_ms, row.mode) for row in songs}
+    if actual_song_keys != expected_song_keys:
+        _report_error("per_song score grid is incomplete")
     return PublishedCohortReports(
         identity=identity,
         population=population,

@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import csv
 import json
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from src.benchmark.backend_identity import MUSCRIPTOR_BACKEND_ID, OAF_BACKEND_ID
+from src.benchmark.backend_identity import (
+    MUSCRIPTOR_BACKEND_ID,
+    OAF_BACKEND_ID,
+    canonical_json_bytes,
+)
 from src.benchmark.muscriptor_comparison import (
     ComparisonIntegrityError,
     ComparisonRequest,
@@ -18,6 +23,8 @@ from src.benchmark.muscriptor_corpus_run import (
     render_muscriptor_corpus_run,
 )
 from src.benchmark.oaf_corpus_run import OAF_CORPUS_RUN_SCHEMA, render_oaf_corpus_run
+from src.benchmark.reports import REPORT_SCHEMA
+from src.benchmark.taxonomy import DTX_LANE_MAP_VERSION, TAXONOMY_VERSION
 
 _REPORT_IDENTITY = (
     "cohort_id",
@@ -130,6 +137,7 @@ def _snapshot(
                 OAF_BACKEND_ID if schema == OAF_CORPUS_RUN_SCHEMA else MUSCRIPTOR_BACKEND_ID
             )
         },
+        "backend_descriptor_sha256": "a" * 64,
         "model_id": model_id,
         "model_lock_sha256": model_lock,
         "prediction_map_version": prediction_map,
@@ -144,6 +152,7 @@ def _snapshot(
         ),
     }
     if schema == OAF_CORPUS_RUN_SCHEMA:
+        snapshot["inference_config"] = {"prediction_map_version": prediction_map}
         return render_oaf_corpus_run(snapshot)
     return render_muscriptor_corpus_run(snapshot)
 
@@ -210,11 +219,17 @@ def _reports(
                 "cohort_id": cohort,
                 "simfile_id": str(simfile_id),
                 "status": "failed" if simfile_id in failed_item_ids else "success",
+                "failure_reason": ("prediction_missing" if simfile_id in failed_item_ids else ""),
                 "reference_native_event_count": "1",
                 "reference_common_event_count": "1",
                 "reference_ignored_event_count": "0",
                 "reference_unmapped_event_count": "0",
                 "reference_duplicate_collapsed_count": "0",
+                "prediction_native_event_count": ("" if simfile_id in failed_item_ids else "1"),
+                "prediction_mapped_event_count": "" if simfile_id in failed_item_ids else "1",
+                "prediction_unmapped_event_count": "" if simfile_id in failed_item_ids else "0",
+                "prediction_mapping_coverage": "" if simfile_id in failed_item_ids else "1",
+                "prediction_native_class_counts": "" if simfile_id in failed_item_ids else "kick=1",
             }
             for simfile_id in item_ids
         ],
@@ -226,9 +241,9 @@ def _reports(
             [
                 {
                     **identity,
-                    "simfile_id": "1",
+                    "simfile_id": str(simfile_id),
                     "tolerance_ms": "50",
-                    "mode": "raw",
+                    "mode": mode,
                     "tp": "1",
                     "fp": "1",
                     "fn": "1",
@@ -241,9 +256,10 @@ def _reports(
                     "offset_ms": "0",
                     "warnings": "",
                 }
+                for simfile_id in item_ids
+                if simfile_id not in failed_item_ids
+                for mode in ("raw", "aligned")
             ]
-            if 1 not in failed_item_ids
-            else []
         ),
     )
     _write_csv(
@@ -253,9 +269,9 @@ def _reports(
             [
                 {
                     **identity,
-                    "simfile_id": "1",
+                    "simfile_id": str(simfile_id),
                     "tolerance_ms": "50",
-                    "mode": "raw",
+                    "mode": mode,
                     "common_class": "kick",
                     "tp": "1",
                     "fp": "0",
@@ -266,11 +282,78 @@ def _reports(
                     "recall": "0.5",
                     "f1": "0.5",
                 }
+                for simfile_id in item_ids
+                if simfile_id not in failed_item_ids
+                for mode in ("raw", "aligned")
             ]
-            if 1 not in failed_item_ids
-            else []
         ),
     )
+    success_count = len(set(item_ids) - set(failed_item_ids))
+    backend_id = MUSCRIPTOR_BACKEND_ID if "muscriptor" in model else OAF_BACKEND_ID
+    summary_identity = {
+        "cohort_id": cohort,
+        "reference_manifest_sha256": "a" * 64,
+        "reference_timing_version": "hpa323-v1",
+        "taxonomy_version": TAXONOMY_VERSION,
+        "lane_map_version": DTX_LANE_MAP_VERSION,
+        "backend_id": backend_id,
+        "model_id": model,
+        "model_lock_sha256": lock,
+        "backend_descriptor_sha256": "a" * 64,
+        "prediction_map_version": prediction_map,
+        "input_view_id": "crux.full-mix/v1",
+        "scoring_version": "crux.single-cohort-scoring/v1",
+    }
+    metric = {
+        "tp": 1,
+        "fp": 1,
+        "fn": 1,
+        "precision": Decimal("0.5"),
+        "recall": Decimal("0.5"),
+        "f1": Decimal("0.5"),
+    }
+    aggregate = {
+        "tolerance_ms": 50,
+        "mode": "raw",
+        "event_micro": metric,
+        "song_macro_f1": Decimal("0.5") if success_count else None,
+        "class_macro_f1": Decimal("0.5") if success_count else None,
+        "song_f1_distribution": {
+            field: Decimal("0.5") if success_count else None
+            for field in ("minimum", "p10", "p25", "median", "p75", "p90", "maximum")
+        },
+        "per_class": [
+            {
+                "common_class": "kick",
+                **metric,
+                "reference_support": 2,
+                "prediction_support": 1,
+            }
+        ]
+        if success_count
+        else [],
+        "successful_song_count": success_count,
+    }
+    summary = {
+        "schema": REPORT_SCHEMA,
+        "identity": summary_identity,
+        "tolerances_ms": [50],
+        "population": {
+            "total_count": len(item_ids),
+            "success_count": success_count,
+            "failed_count": len(failed_item_ids),
+            "skipped_count": 0,
+            "quarantined_count": 0,
+            "reason_counts": {"prediction_missing": len(failed_item_ids)}
+            if failed_item_ids
+            else {},
+        },
+        "aggregates": [
+            aggregate,
+            {**aggregate, "mode": "aligned"},
+        ],
+    }
+    (reports / "summary.json").write_bytes(canonical_json_bytes(summary))
 
 
 def _request(tmp_path: Path, oaf: Path, muscriptor: Path, subset: Path | None = None):
@@ -341,8 +424,14 @@ def test_compare_joins_published_song_and_class_rows_without_rescoring(
     assert class_rows[0]["delta_precision"] == "0.3"
 
     summary = json.loads((result.output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["schema"] == "crux.oaf-muscriptor-comparison/v1"
     assert summary["pairing"]["pairable_success_intersection"] == 1
     assert summary["aggregates"]["song"][0]["mean_delta_precision"] == 0.3
+    assert (
+        (result.output_dir / "summary.md")
+        .read_text(encoding="utf-8")
+        .startswith("# OaF/MuScriptor Published Report Comparison\n")
+    )
     assert "summary.md" in {path.name for path in result.output_dir.iterdir()}
 
 
@@ -641,7 +730,7 @@ def test_compare_rejects_one_sided_missing_per_song_row(tmp_path: Path, manifest
     lines = song_path.read_text(encoding="utf-8").splitlines()
     song_path.write_text(lines[0] + "\n", encoding="utf-8")
 
-    with pytest.raises(ComparisonIntegrityError, match="per_song.*key grid"):
+    with pytest.raises(ComparisonIntegrityError, match="per_song.*score grid"):
         compare_oaf_muscriptor(_request(tmp_path, oaf, muscriptor))
 
 

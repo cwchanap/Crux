@@ -12,7 +12,7 @@ from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 from statistics import mean, median
 
-from src.benchmark.backend_identity import canonical_json_bytes
+from src.benchmark.backend_identity import StrictJsonError, canonical_json_bytes, require_sha256
 from src.benchmark.reports import (
     PublishedClassRow,
     PublishedCohortReports,
@@ -21,6 +21,8 @@ from src.benchmark.reports import (
 
 _MODES = {"raw": 0, "aligned": 1}
 _SIX_PLACES = Decimal("0.000001")
+COMPARISON_SCHEMA = "crux.oaf-muscriptor-comparison/v1"
+COMPARISON_TITLE = "OaF/MuScriptor Published Report Comparison"
 
 
 class ComparisonIntegrityError(ValueError):
@@ -76,6 +78,13 @@ def _item_hash(item: object, field_name: str) -> str | None:
     value = getattr(item, field_name, None)
     if value is not None and not isinstance(value, str):
         _fail(f"{field_name} is malformed")
+    if field_name == "source_audio_sha256":
+        if value is None:
+            _fail("source_audio_sha256 is missing")
+        try:
+            require_sha256(value, field_name)
+        except StrictJsonError as error:
+            _fail(str(error))
     return value
 
 
@@ -368,20 +377,29 @@ def comparison_summary(
     subset_path: Path | None,
     subset_manifest: object | None,
     *,
+    schema: str = COMPARISON_SCHEMA,
+    identity: Mapping[str, object] | None = None,
     left_label: str = "oaf",
     right_label: str = "muscriptor",
 ) -> dict[str, object]:
+    schema = _label(schema, "schema")
     left_label = _label(left_label, "left_label")
     right_label = _label(right_label, "right_label")
-    return {
-        "schema": "crux.oaf-muscriptor-comparison/v1",
-        "identity": {
+    if identity is None:
+        summary_identity: Mapping[str, object] = {
             "reference_manifest_sha256": getattr(reference_manifest, "manifest_sha256"),
             "reference_manifest_version": getattr(reference_manifest, "corpus_version"),
             "reference_timing_manifest_sha256": getattr(timing_manifest, "manifest_sha256"),
             "reference_timing_version": getattr(timing_manifest, "corpus_version"),
             "input_view_id": getattr(left.identity, "input_view_id"),
-        },
+        }
+    elif isinstance(identity, Mapping):
+        summary_identity = dict(identity)
+    else:
+        raise TypeError("identity must be a mapping")
+    return {
+        "schema": schema,
+        "identity": summary_identity,
         "subset_manifest": (
             None
             if subset_path is None
@@ -437,9 +455,11 @@ def write_markdown(
     path: Path,
     summary: Mapping[str, object],
     *,
+    title: str = COMPARISON_TITLE,
     left_label: str = "oaf",
     right_label: str = "muscriptor",
 ) -> None:
+    title = _label(title, "title")
     left_label = _label(left_label, "left_label")
     right_label = _label(right_label, "right_label")
     identity = summary["identity"]
@@ -451,7 +471,7 @@ def write_markdown(
     assert isinstance(pairing, Mapping)
     assert isinstance(aggregates, Mapping)
     lines = [
-        "# OaF/MuScriptor Published Report Comparison",
+        f"# {title}",
         "",
         "## Identity",
         "",
@@ -516,6 +536,7 @@ def write_comparison_artifacts(
     class_rows: list[dict[str, str]],
     summary: Mapping[str, object],
     *,
+    title: str = COMPARISON_TITLE,
     left_label: str = "oaf",
     right_label: str = "muscriptor",
 ) -> None:
@@ -565,6 +586,7 @@ def write_comparison_artifacts(
         write_markdown(
             staged / names[3],
             summary,
+            title=title,
             left_label=left_label,
             right_label=right_label,
         )
@@ -588,6 +610,8 @@ _write_markdown = write_markdown
 
 
 __all__ = [
+    "COMPARISON_SCHEMA",
+    "COMPARISON_TITLE",
     "ComparisonIntegrityError",
     "PublishedRunItem",
     "PublishedRunEvidence",
