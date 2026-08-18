@@ -50,8 +50,6 @@ from src.benchmark.oaf_corpus_run import (
     _model_lock_path,
     _normalize_scope,
     _normalize_snapshot_value,
-    _prediction_artifact_matches,
-    _prediction_artifact_matches_run_row,
     _prediction_relative_path,
     _project_runtime,
     _read_existing_prediction,
@@ -72,6 +70,8 @@ from src.benchmark.oaf_corpus_run import (
 from src.benchmark.prediction_artifact import (
     MappedPrediction,
     PredictionArtifact,
+    prediction_artifact_matches_audio,
+    prediction_artifact_matches_run_row,
     prediction_path,
     read_prediction_artifact,
     render_prediction_artifact,
@@ -1217,7 +1217,7 @@ def test_read_existing_prediction_returns_true_none_on_os_error(
 
 
 # ---------------------------------------------------------------------------
-# _prediction_artifact_matches
+# prediction_artifact_matches_audio
 # ---------------------------------------------------------------------------
 
 
@@ -1226,8 +1226,13 @@ def test_prediction_artifact_matches_rejects_descriptor_sha_mismatch() -> None:
     artifact = _prediction_artifact(descriptor=descriptor)
     source = _resolved_source()
     wrong_descriptor = replace(descriptor, sha256=SHA_C)
-    assert not _prediction_artifact_matches(
-        artifact, source=source, audio=_canonical_audio(), descriptor=wrong_descriptor
+    assert not prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id=source.source_audio_id,
+        source_audio_sha256=source.source_audio_sha256,
+        audio=_canonical_audio(),
+        descriptor=wrong_descriptor,
+        prediction_map_version=OAF_PREDICTION_MAP_ID,
     )
 
 
@@ -1236,8 +1241,13 @@ def test_prediction_artifact_matches_rejects_descriptor_payload_mismatch() -> No
     artifact = _prediction_artifact(descriptor=descriptor)
     source = _resolved_source()
     wrong_descriptor = replace(descriptor, payload={**descriptor.payload, "model_id": "other"})
-    assert not _prediction_artifact_matches(
-        artifact, source=source, audio=_canonical_audio(), descriptor=wrong_descriptor
+    assert not prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id=source.source_audio_id,
+        source_audio_sha256=source.source_audio_sha256,
+        audio=_canonical_audio(),
+        descriptor=wrong_descriptor,
+        prediction_map_version=OAF_PREDICTION_MAP_ID,
     )
 
 
@@ -1246,8 +1256,13 @@ def test_prediction_artifact_matches_rejects_source_audio_id_mismatch() -> None:
     audio = _canonical_audio(source_audio_id="10/audio.wav")
     artifact = _prediction_artifact(audio=audio, descriptor=descriptor)
     source = _resolved_source(source_audio_id="99/audio.wav")
-    assert not _prediction_artifact_matches(
-        artifact, source=source, audio=audio, descriptor=descriptor
+    assert not prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id=source.source_audio_id,
+        source_audio_sha256=source.source_audio_sha256,
+        audio=audio,
+        descriptor=descriptor,
+        prediction_map_version=OAF_PREDICTION_MAP_ID,
     )
 
 
@@ -1256,8 +1271,13 @@ def test_prediction_artifact_matches_rejects_source_sha_mismatch() -> None:
     audio = _canonical_audio()
     artifact = _prediction_artifact(audio=audio, descriptor=descriptor)
     source = _resolved_source(source_audio_sha256=SHA_C)
-    assert not _prediction_artifact_matches(
-        artifact, source=source, audio=audio, descriptor=descriptor
+    assert not prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id=source.source_audio_id,
+        source_audio_sha256=source.source_audio_sha256,
+        audio=audio,
+        descriptor=descriptor,
+        prediction_map_version=OAF_PREDICTION_MAP_ID,
     )
 
 
@@ -1267,8 +1287,13 @@ def test_prediction_artifact_matches_rejects_input_view_mismatch() -> None:
     artifact = _prediction_artifact(audio=audio, descriptor=descriptor)
     source = _resolved_source()
     wrong_audio = replace(audio, input_view_id="other/v1")
-    assert not _prediction_artifact_matches(
-        artifact, source=source, audio=wrong_audio, descriptor=descriptor
+    assert not prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id=source.source_audio_id,
+        source_audio_sha256=source.source_audio_sha256,
+        audio=wrong_audio,
+        descriptor=descriptor,
+        prediction_map_version=OAF_PREDICTION_MAP_ID,
     )
 
 
@@ -1278,8 +1303,13 @@ def test_prediction_artifact_matches_rejects_input_sha_mismatch() -> None:
     artifact = _prediction_artifact(audio=audio, descriptor=descriptor)
     source = _resolved_source()
     wrong_audio = replace(audio, input_audio_sha256=SHA_C)
-    assert not _prediction_artifact_matches(
-        artifact, source=source, audio=wrong_audio, descriptor=descriptor
+    assert not prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id=source.source_audio_id,
+        source_audio_sha256=source.source_audio_sha256,
+        audio=wrong_audio,
+        descriptor=descriptor,
+        prediction_map_version=OAF_PREDICTION_MAP_ID,
     )
 
 
@@ -1290,8 +1320,13 @@ def test_prediction_artifact_matches_rejects_audio_source_id_mismatch() -> None:
     artifact = _prediction_artifact(audio=audio, descriptor=descriptor)
     source = _resolved_source()
     mismatched_audio = replace(audio, source_audio_id="99/audio.wav")
-    assert not _prediction_artifact_matches(
-        artifact, source=source, audio=mismatched_audio, descriptor=descriptor
+    assert not prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id=source.source_audio_id,
+        source_audio_sha256=source.source_audio_sha256,
+        audio=mismatched_audio,
+        descriptor=descriptor,
+        prediction_map_version=OAF_PREDICTION_MAP_ID,
     )
 
 
@@ -1302,28 +1337,45 @@ def test_prediction_artifact_matches_rejects_audio_source_sha_mismatch() -> None
     artifact = _prediction_artifact(audio=audio, descriptor=descriptor)
     source = _resolved_source()
     mismatched_audio = replace(audio, source_audio_sha256=SHA_C)
-    assert not _prediction_artifact_matches(
-        artifact, source=source, audio=mismatched_audio, descriptor=descriptor
+    assert not prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id=source.source_audio_id,
+        source_audio_sha256=source.source_audio_sha256,
+        audio=mismatched_audio,
+        descriptor=descriptor,
+        prediction_map_version=OAF_PREDICTION_MAP_ID,
     )
 
 
 # ---------------------------------------------------------------------------
-# _prediction_artifact_matches_run_row
+# prediction_artifact_matches_run_row
 # ---------------------------------------------------------------------------
 
 
 def test_prediction_artifact_matches_run_row_rejects_non_artifact() -> None:
-    assert not _prediction_artifact_matches_run_row("not-artifact", {"simfile_id": 10})  # type: ignore[arg-type]
+    assert not prediction_artifact_matches_run_row(
+        "not-artifact",  # type: ignore[arg-type]
+        {"simfile_id": 10},
+        expected_input_view_id=OAF_FULL_MIX_INPUT_VIEW_ID,
+    )
 
 
 def test_prediction_artifact_matches_run_row_rejects_non_mapping_row() -> None:
     artifact = _prediction_artifact()
-    assert not _prediction_artifact_matches_run_row(artifact, "not-a-mapping")  # type: ignore[arg-type]
+    assert not prediction_artifact_matches_run_row(
+        artifact,
+        "not-a-mapping",  # type: ignore[arg-type]
+        expected_input_view_id=OAF_FULL_MIX_INPUT_VIEW_ID,
+    )
 
 
 def test_prediction_artifact_matches_run_row_rejects_missing_fields() -> None:
     artifact = _prediction_artifact()
-    assert not _prediction_artifact_matches_run_row(artifact, {"simfile_id": 10})
+    assert not prediction_artifact_matches_run_row(
+        artifact,
+        {"simfile_id": 10},
+        expected_input_view_id=OAF_FULL_MIX_INPUT_VIEW_ID,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1609,16 +1661,21 @@ def test_project_runtime_skips_non_finite_duration() -> None:
     assert runtime["eligible_audio_duration_coverage_count"] == 0
 
 
-def test_prediction_artifact_matches_rejects_non_oaf_input_view() -> None:
-    """Artifact whose input_view_id is not OAF_FULL_MIX_INPUT_VIEW_ID is rejected."""
+def test_prediction_artifact_matches_accepts_a_non_full_mix_input_view() -> None:
+    """The shared matcher accepts a view when artifact and audio identities agree."""
     descriptor = _descriptor()
     audio = _canonical_audio()
-    mapped = _mapped_prediction(audio=audio, descriptor=descriptor)
-    wrong = replace(mapped, audio=replace(audio, input_view_id="other/v1"))
-    artifact = read_prediction_artifact(render_prediction_artifact(wrong))
+    derived_audio = replace(audio, input_view_id="other/v1")
+    mapped = _mapped_prediction(audio=derived_audio, descriptor=descriptor)
+    artifact = read_prediction_artifact(render_prediction_artifact(mapped))
     source = _resolved_source()
-    assert not _prediction_artifact_matches(
-        artifact, source=source, audio=audio, descriptor=descriptor
+    assert prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id=source.source_audio_id,
+        source_audio_sha256=source.source_audio_sha256,
+        audio=derived_audio,
+        descriptor=descriptor,
+        prediction_map_version=OAF_PREDICTION_MAP_ID,
     )
 
 

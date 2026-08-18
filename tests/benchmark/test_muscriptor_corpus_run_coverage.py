@@ -15,7 +15,7 @@ from src.benchmark.backend_identity import (
     StrictJsonError,
 )
 from src.benchmark.backends.base import CanonicalAudio, NativeEvent, NativePrediction
-from src.benchmark.cohort_scoring import CohortIdentity
+from src.benchmark.cohort_scoring import CohortIdentity, cohort_item_without_prediction
 from src.benchmark.corpus_cache import ResolvedSourceAudio
 from src.benchmark.muscriptor_corpus_run import (
     MUSCRIPTOR_CORPUS_RUN_SCHEMA,
@@ -28,13 +28,11 @@ from src.benchmark.muscriptor_corpus_run import (
     _bounded_error,
     _cohort_identity_from_snapshot,
     _cohort_item_from_run_row,
-    _cohort_item_without_prediction,
     _device_peak_memory_bytes,
     _expected_muscriptor_descriptor,
     _finite_positive,
     _normalize_scope,
     _normalize_snapshot_value,
-    _prediction_artifact_matches,
     _prior_source_matches,
     _process_peak_rss_bytes,
     _project_runtime,
@@ -58,6 +56,7 @@ from src.benchmark.muscriptor_corpus_run import (
     run_muscriptor_corpus,
     write_muscriptor_corpus_run,
 )
+from src.benchmark.prediction_artifact import prediction_artifact_matches_audio
 from src.benchmark.taxonomy import (
     DTX_LANE_MAP_VERSION,
     TAXONOMY_VERSION,
@@ -841,7 +840,7 @@ def test_read_existing_prediction_returns_none_on_unreadable(tmp_path: Path) -> 
 
 
 # ---------------------------------------------------------------------------
-# _prediction_artifact_matches
+# prediction_artifact_matches_audio
 # ---------------------------------------------------------------------------
 
 
@@ -886,48 +885,90 @@ def test_prediction_artifact_matches_detects_each_mismatch(
     )
     artifact = _publish_artifact(tmp_path, audio, descriptor)
 
-    assert _prediction_artifact_matches(artifact, source=source, audio=audio, descriptor=descriptor)
+    assert prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id=source.source_audio_id,
+        source_audio_sha256=source.source_audio_sha256,
+        audio=audio,
+        descriptor=descriptor,
+        prediction_map_version=MUSCRIPTOR_PREDICTION_MAP_ID,
+    )
 
     # descriptor sha256 mismatch
     other_descriptor = replace(descriptor, sha256="c" * 64)
-    assert not _prediction_artifact_matches(
-        artifact, source=source, audio=audio, descriptor=other_descriptor
+    assert not prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id=source.source_audio_id,
+        source_audio_sha256=source.source_audio_sha256,
+        audio=audio,
+        descriptor=other_descriptor,
+        prediction_map_version=MUSCRIPTOR_PREDICTION_MAP_ID,
     )
 
     # descriptor payload mismatch
     other_descriptor = replace(descriptor, payload={**dict(descriptor.payload), "model_id": "x"})
-    assert not _prediction_artifact_matches(
-        artifact, source=source, audio=audio, descriptor=other_descriptor
+    assert not prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id=source.source_audio_id,
+        source_audio_sha256=source.source_audio_sha256,
+        audio=audio,
+        descriptor=other_descriptor,
+        prediction_map_version=MUSCRIPTOR_PREDICTION_MAP_ID,
     )
 
     # source_audio_id mismatch
     other_source = replace(source, source_audio_id="99/audio.wav")
-    assert not _prediction_artifact_matches(
-        artifact, source=other_source, audio=audio, descriptor=descriptor
+    assert not prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id=other_source.source_audio_id,
+        source_audio_sha256=other_source.source_audio_sha256,
+        audio=audio,
+        descriptor=descriptor,
+        prediction_map_version=MUSCRIPTOR_PREDICTION_MAP_ID,
     )
 
     # source_audio_sha256 mismatch
     other_source = replace(source, source_audio_sha256="z" * 64)
-    assert not _prediction_artifact_matches(
-        artifact, source=other_source, audio=audio, descriptor=descriptor
+    assert not prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id=other_source.source_audio_id,
+        source_audio_sha256=other_source.source_audio_sha256,
+        audio=audio,
+        descriptor=descriptor,
+        prediction_map_version=MUSCRIPTOR_PREDICTION_MAP_ID,
     )
 
     # input_view_id mismatch on prediction
     other_audio = replace(audio, input_view_id="other-view")
-    assert not _prediction_artifact_matches(
-        artifact, source=source, audio=other_audio, descriptor=descriptor
+    assert not prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id=source.source_audio_id,
+        source_audio_sha256=source.source_audio_sha256,
+        audio=other_audio,
+        descriptor=descriptor,
+        prediction_map_version=MUSCRIPTOR_PREDICTION_MAP_ID,
     )
 
     # input_audio_sha256 mismatch
     other_audio = replace(audio, input_audio_sha256="q" * 64)
-    assert not _prediction_artifact_matches(
-        artifact, source=source, audio=other_audio, descriptor=descriptor
+    assert not prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id=source.source_audio_id,
+        source_audio_sha256=source.source_audio_sha256,
+        audio=other_audio,
+        descriptor=descriptor,
+        prediction_map_version=MUSCRIPTOR_PREDICTION_MAP_ID,
     )
 
     # source_audio_id mismatch on audio
     other_audio = replace(audio, source_audio_id="99/audio.wav")
-    assert not _prediction_artifact_matches(
-        artifact, source=source, audio=other_audio, descriptor=descriptor
+    assert not prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id=source.source_audio_id,
+        source_audio_sha256=source.source_audio_sha256,
+        audio=other_audio,
+        descriptor=descriptor,
+        prediction_map_version=MUSCRIPTOR_PREDICTION_MAP_ID,
     )
 
 
@@ -967,16 +1008,16 @@ def _publish_artifact(tmp_path: Path, audio: CanonicalAudio, descriptor: Backend
 
 
 # ---------------------------------------------------------------------------
-# _cohort_item_without_prediction / _cohort_item_from_run_row
+# cohort_item_without_prediction / _cohort_item_from_run_row
 # ---------------------------------------------------------------------------
 
 
 def test_cohort_item_without_prediction_handles_missing_mapping() -> None:
     identity = _cohort_identity()
-    item = _cohort_item_without_prediction(
+    item = cohort_item_without_prediction(
         identity,
         "10",
-        mapping=None,
+        reference=None,
         status="failed",
         failure_reason="inference_failed",
     )
