@@ -125,3 +125,47 @@ size, native evidence fields, and retained byte totals.
   operator-decision work remain untouched.
 - The comparison consumes the strict Task 8A HPA-325 report reader and does
   not add a legacy/partial-report fallback or alter Task 8A reader semantics.
+
+## Review remediation: authoritative durations
+
+Round-1 review identified that invalid or missing pairable-song durations were
+omitted from the FP/FN-per-minute denominator while their published counts
+remained in the numerator. The event-micro aggregator now validates every
+pairable song before deriving any rate or returning comparison evidence. A
+missing, null, nonfinite, zero, or negative authoritative duration raises
+`ComparisonIntegrityError`, so the comparison fails before `_write_outputs`.
+
+### RED
+
+The new regression was run before the guard was added:
+
+```text
+uv run pytest -q tests/benchmark/test_separation_comparison.py -k positive_finite_duration
+5 failed, 4 deselected
+```
+
+Each case incorrectly completed without raising: missing, null, nonfinite,
+zero, and negative duration.
+
+### GREEN
+
+After the narrow validation guard:
+
+```text
+uv run pytest -q tests/benchmark/test_separation_comparison.py -k positive_finite_duration
+5 passed, 4 deselected
+
+uv run pytest -q tests/benchmark/test_separation_comparison.py tests/benchmark/test_separation_pilot_acceptance.py
+12 passed
+```
+
+Focused Ruff, Ruff format, Pylint `--errors-only`, and `git diff --check`
+also passed. The repository commit hooks passed the same checks.
+
+### Remediation hashes
+
+- Remediation commit: `64e6b305773db8a6fd50caaaf47b9836680a0897`
+- `src/benchmark/separation_comparison.py`:
+  `fdeacc142e15397cddf95c3c508b2a2c127e6ff788ac80ea36ac1545a9db8102`
+- `tests/benchmark/test_separation_comparison.py`:
+  `e8e5db6c3ddc8820debfeda8fde99f4564f9f34f1a5c9f9b05f9e67d3b567671`
