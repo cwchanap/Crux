@@ -100,6 +100,10 @@ from src.benchmark.reviewed_subset import (
     load_reviewed_subset_manifest,
     score_oaf_reviewed_subset,
 )
+from src.benchmark.separation_comparison import (
+    SeparationComparisonRequest,
+    compare_oaf_separation,
+)
 from src.benchmark.separators import (
     HTDEMUCS_SEPARATOR_ID,
     SPLEETER_SEPARATOR_ID,
@@ -157,6 +161,15 @@ SEPARATOR_LOCK_PATHS: dict[str, Path] = {
     SPLEETER_SEPARATOR_ID: _REPO_ROOT / "runtime" / "separators" / "spleeter" / "model.json",
     HTDEMUCS_SEPARATOR_ID: _REPO_ROOT / "runtime" / "separators" / "htdemucs" / "model.json",
 }
+
+_COMPARISON_REPORT_NAMES = (
+    "summary.json",
+    "items.csv",
+    "per_song.csv",
+    "per_class.csv",
+    "event_diagnostics.jsonl",
+    "summary.md",
+)
 
 
 PilotStatus = Literal["complete", "partial", "failed"]
@@ -253,6 +266,15 @@ def _fatal_outcome() -> OafSeparationPilotOutcome:
         failed_count=0,
         skipped_count=0,
         quarantined_count=0,
+    )
+
+
+def _comparison_reports_ready(run_dir: Path) -> bool:
+    """Gate Task 8B on the six published reports for every fixed view."""
+    return all(
+        (run_dir / "views" / view_name / "reports" / report_name).is_file()
+        for view_name in ("full_mix", "spleeter", "htdemucs")
+        for report_name in _COMPARISON_REPORT_NAMES
     )
 
 
@@ -1910,6 +1932,17 @@ def run_oaf_separation_pilot(
             view_name="htdemucs",
             input_view_id=HTDEMUCS_INPUT_VIEW_ID,
         )
+        if _comparison_reports_ready(run_dir):
+            compare_oaf_separation(
+                SeparationComparisonRequest(
+                    run_path=run_path,
+                    reference_manifest_path=request.reference_manifest_path,
+                    timing_manifest_path=request.timing_manifest_path,
+                    subset_manifest_path=request.subset_manifest_path,
+                    output_dir=run_dir / "comparison",
+                    cache_dir=request.cache_dir,
+                )
+            )
         derived_failed = any(
             isinstance(item.get(view_name), Mapping)
             and item[view_name].get("status")  # type: ignore[index]
