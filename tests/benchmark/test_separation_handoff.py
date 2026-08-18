@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from src.benchmark.backend_identity import strict_json_loads
+from src.benchmark.corpus_manifest import render_manifest
 from src.benchmark.separation_handoff import (
     SEPARATION_PILOT_SCHEMA,
     FinalizeSeparationPilotRequest,
@@ -154,6 +156,162 @@ def test_finalize_rejects_edited_htdemucs_evidence(
     assert outcome.exit_code == 2
     assert outcome.manifest is None
     assert not output_manifest.exists()
+
+
+@pytest.mark.parametrize("evidence", ["stem", "prediction"])
+def test_finalize_rejects_missing_recorded_evidence_even_with_decoy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evidence: str,
+) -> None:
+    request, subset_path, run_path = _successful_pilot(tmp_path, monkeypatch)
+    snapshot = json.loads(run_path.read_text(encoding="utf-8"))
+    target = snapshot["items"][0]["htdemucs"][evidence]
+    if evidence == "stem":
+        recorded = request.cache_dir / target["path"]
+    else:
+        recorded = request.output_dir / target["path"]
+    decoy = tmp_path / target["path"]
+    decoy.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(recorded, decoy)
+    recorded.unlink()
+
+    outcome = finalize_separation_pilot(
+        FinalizeSeparationPilotRequest(
+            run_path=run_path,
+            subset_manifest_path=subset_path,
+            output_manifest=tmp_path / "missing-recorded-handoff" / "manifest.jsonl",
+            decision="gather_more_evidence",
+            rationale="A missing recorded artifact cannot be replaced by a decoy.",
+        )
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.manifest is None
+
+
+def test_finalize_rejects_snapshot_lineage_stale_against_subset_source_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, subset_path, run_path = _successful_pilot(tmp_path, monkeypatch)
+    import src.benchmark.separation_handoff as handoff
+
+    loaded_subset = handoff.load_reviewed_subset_manifest(subset_path)
+    stale_subset = replace(
+        loaded_subset,
+        source_reference_manifest_sha256="0" * 64,
+    )
+    monkeypatch.setattr(handoff, "load_reviewed_subset_manifest", lambda _path: stale_subset)
+
+    outcome = finalize_separation_pilot(
+        FinalizeSeparationPilotRequest(
+            run_path=run_path,
+            subset_manifest_path=subset_path,
+            output_manifest=tmp_path / "stale-lineage-handoff" / "manifest.jsonl",
+            decision="keep_full_mix",
+            rationale="The subset source lineage must be exact.",
+        )
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.manifest is None
+
+
+def test_finalize_accepts_partial_full_mix_input_with_successful_htdemucs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, subset_path, run_path = _successful_pilot(tmp_path, monkeypatch)
+    snapshot = json.loads(run_path.read_text(encoding="utf-8"))
+    full_mix = dict(snapshot["items"][0]["full_mix"])
+    full_mix["status"] = "failed"
+    full_mix["failure_code"] = "inference_failed"
+    full_mix["prediction"] = None
+    snapshot["items"][0]["full_mix"] = full_mix
+    snapshot["overall_status"] = "partial"
+    from src.benchmark.separation_pilot import write_oaf_separation_run
+
+    write_oaf_separation_run(run_path, snapshot)
+
+    outcome = finalize_separation_pilot(
+        FinalizeSeparationPilotRequest(
+            run_path=run_path,
+            subset_manifest_path=subset_path,
+            output_manifest=tmp_path / "partial-handoff" / "manifest.jsonl",
+            decision="use_htdemucs",
+            rationale="A successful HTDemucs row remains usable in a partial pilot.",
+        )
+    )
+
+    assert outcome.exit_code == 0
+    assert outcome.manifest is not None
+    row = load_separation_pilot_manifest(outcome.manifest.path).rows[0]
+    assert row["full_mix"]["status"] == "failed"
+    assert row["full_mix"]["failure_code"] == "inference_failed"
+    assert row["full_mix"]["input"] is not None
+    assert row["full_mix"]["prediction"] is None
+    assert row["htdemucs"]["status"] in {"success", "resumed"}
+
+
+def test_loader_rejects_successful_view_failure_code() -> None:
+    rows = [
+        strict_json_loads(line, require_canonical=True)
+        for line in _GOLDEN.read_bytes().splitlines()
+    ]
+    broken = dict(rows[0])
+    broken_htdemucs = dict(broken["htdemucs"])
+    broken_htdemucs["failure_code"] = "stale_failure"
+    broken["htdemucs"] = broken_htdemucs
+    content = render_manifest(
+        ({key: value for key, value in broken.items() if key != "corpus_version"},)
+    ).content
+    with pytest.raises(ValueError, match="failure_code"):
+        validate_schema_golden(SEPARATION_PILOT_SCHEMA, content)
+
+
+def test_loader_rejects_contradictory_parent_or_comparison_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, subset_path, run_path = _successful_pilot(tmp_path, monkeypatch)
+    outcome = finalize_separation_pilot(
+        FinalizeSeparationPilotRequest(
+            run_path=run_path,
+            subset_manifest_path=subset_path,
+            output_manifest=tmp_path / "identity-handoff" / "manifest.jsonl",
+            decision="use_htdemucs",
+            rationale="The canonical handoff keeps one parent identity.",
+        )
+    )
+    assert outcome.manifest is not None
+    rows = [
+        strict_json_loads(line, require_canonical=True)
+        for line in outcome.manifest.path.read_bytes().splitlines()
+    ]
+    assert len(rows) >= 2
+
+    for field in ("oaf_model_id", "oaf_inference_config_sha256", "comparison_artifacts"):
+        broken_rows = [dict(row) for row in rows]
+        broken = broken_rows[1]
+        if field == "comparison_artifacts":
+            comparison = dict(broken[field])
+            artifact = dict(comparison["summary.json"])
+            artifact["sha256"] = "f" * 64
+            comparison["summary.json"] = artifact
+            broken[field] = comparison
+        elif field.endswith("sha256"):
+            broken[field] = "e" * 64
+        else:
+            broken[field] = "different-oaf-model"
+        content = render_manifest(
+            tuple(
+                {key: value for key, value in row.items() if key != "corpus_version"}
+                for row in broken_rows
+            )
+        ).content
+        with pytest.raises(ValueError, match="mixed run or decision identity"):
+            validate_schema_golden(SEPARATION_PILOT_SCHEMA, content)
 
 
 def test_loader_enforces_success_evidence_nullability() -> None:

@@ -352,12 +352,13 @@ def _validate_view(
     input_evidence = value["input"]
     prediction = value["prediction"]
     successful = status in {"inferred", "success", "resumed"}
+    if successful and failure_code is not None:
+        _fail(f"successful {field} failure_code must be null")
     if field == "full_mix":
-        if successful and (stem is not None or input_evidence is None or prediction is None):
-            _fail("successful full_mix evidence has invalid nullability")
-        if not successful and any(
-            evidence is not None for evidence in (stem, input_evidence, prediction)
-        ):
+        if successful:
+            if stem is not None or input_evidence is None or prediction is None:
+                _fail("successful full_mix evidence has invalid nullability")
+        elif stem is not None or prediction is not None:
             _fail("non-successful full_mix evidence has invalid nullability")
     elif successful:
         if stem is None:
@@ -417,6 +418,20 @@ def _validate_comparison_artifacts(value: object) -> None:
             _fail(f"comparison_artifacts.{key} path is invalid")
         _path(artifact["path"], f"comparison_artifacts.{key}")
         _hash(artifact["sha256"], f"comparison_artifacts.{key}.sha256")
+
+
+def _comparison_identity(value: object) -> tuple[tuple[str, str, str], ...]:
+    """Return the canonical comparison-file identity for cross-row checks."""
+    _validate_comparison_artifacts(value)
+    if not isinstance(value, Mapping):  # pragma: no cover - validated above
+        raise AssertionError("comparison artifacts must be a mapping")
+    identity: list[tuple[str, str, str]] = []
+    for key in _COMPARISON_ARTIFACT_KEYS:
+        artifact = value[key]
+        if not isinstance(artifact, Mapping):  # pragma: no cover - validated above
+            raise AssertionError("comparison artifact must be a mapping")
+        identity.append((key, artifact["path"], artifact["sha256"]))
+    return tuple(identity)
 
 
 def _validate_row(row: Mapping[str, object], *, allow_corpus_version: bool) -> dict[str, object]:
@@ -515,23 +530,30 @@ def _parse_manifest_content(
             _fail("separation handoff rows must be unique and sorted")
     # Decision and lineage are run-level facts, repeated on each row because a
     # manifest has no mutable/header protocol.
+    identity_fields = (
+        "separation_run_id",
+        "reviewed_subset_manifest_sha256",
+        "reviewed_subset_manifest_version",
+        "reference_manifest_sha256",
+        "reference_manifest_version",
+        "reference_timing_manifest_sha256",
+        "reference_timing_version",
+        "parent_oaf_run_id",
+        "oaf_backend_descriptor_sha256",
+        "oaf_model_id",
+        "oaf_model_lock_sha256",
+        "oaf_checkpoint_archive_sha256",
+        "oaf_adapter_revision",
+        "oaf_canonicalization_revision",
+        "oaf_inference_config_sha256",
+        "oaf_prediction_map_version",
+        "crux_commit",
+        "decision",
+        "rationale",
+    )
     identities = {
-        tuple(
-            row[field]
-            for field in (
-                "separation_run_id",
-                "reviewed_subset_manifest_sha256",
-                "reviewed_subset_manifest_version",
-                "reference_manifest_sha256",
-                "reference_manifest_version",
-                "reference_timing_manifest_sha256",
-                "reference_timing_version",
-                "parent_oaf_run_id",
-                "crux_commit",
-                "decision",
-                "rationale",
-            )
-        )
+        tuple(row[field] for field in identity_fields)
+        + (_comparison_identity(row["comparison_artifacts"]),)
         for row in rows
     }
     if len(identities) != 1:
@@ -562,36 +584,26 @@ def load_separation_pilot_manifest(path: Path) -> LoadedSeparationPilotManifest:
     )
 
 
-def _candidate_paths(raw_path: str, *, run_path: Path, subset_path: Path) -> tuple[Path, ...]:
-    parsed = PurePosixPath(raw_path)
-    if parsed.is_absolute() or any(part in {"", ".", ".."} for part in parsed.parts):
-        _fail("retained artifact path is unsafe")
-    roots: list[Path] = []
-    for source in (run_path, subset_path):
-        for parent in (source.parent, *tuple(source.parents)[:4]):
-            if parent not in roots:
-                roots.append(parent)
-    try:
-        common_root = Path(os.path.commonpath((run_path.parent, subset_path.parent)))
-    except ValueError:
-        common_root = None
-    if common_root is not None and common_root not in roots:
-        roots.append(common_root)
-    candidates: list[Path] = []
-    for root in roots:
-        direct = root.joinpath(*parsed.parts)
-        if direct not in candidates:
-            candidates.append(direct)
-    if common_root is not None:
-        try:
-            children = tuple(common_root.iterdir())
-        except OSError:
-            children = ()
-        for child in children:
-            candidate = child.joinpath(*parsed.parts)
-            if candidate not in candidates:
-                candidates.append(candidate)
-    return tuple(candidates)
+def _recorded_artifact_path(raw_path: object, *, field: str, run_path: Path) -> Path:
+    """Resolve one persisted path from its fixed HPA-328 owner root.
+
+    The pilot records stem paths relative to the established sibling ``cache``
+    directory, prediction paths relative to the separation output root, and
+    comparison paths relative to the run directory. Each path therefore has
+    one owner; no directory discovery is permitted at finalization time.
+    """
+    path = _path(raw_path, field)
+    parsed = PurePosixPath(path)
+    if field.startswith("comparison_artifacts."):
+        root = run_path.parent
+    elif field.endswith(".prediction"):
+        root = run_path.parents[2]
+    elif field.endswith(".stem"):
+        root = run_path.parents[3] / "cache"
+    else:
+        _fail(f"{field} has no retained artifact owner")
+        raise AssertionError("unreachable")
+    return root.joinpath(*parsed.parts)
 
 
 def _read_matching_artifact(
@@ -602,25 +614,18 @@ def _read_matching_artifact(
     run_path: Path,
     subset_path: Path,
 ) -> tuple[Path, bytes]:
-    path = _path(raw_path, field)
+    del subset_path
+    path = _recorded_artifact_path(raw_path, field=field, run_path=run_path)
     expected = _hash(expected_sha256, f"{field}.sha256")
-    found = False
-    for candidate in _candidate_paths(path, run_path=run_path, subset_path=subset_path):
-        try:
-            content = read_regular_file_no_follow(candidate)
-        except (FileNotFoundError, NotADirectoryError):
-            continue
-        except (OSError, TypeError) as error:
-            raise SeparationHandoffError(f"{field} is unreadable") from error
-        found = True
-        actual = sha256(content).hexdigest()
-        if actual != expected:
-            _fail(f"{field} bytes do not match retained SHA-256")
-        return candidate, content
-    if found:
+    try:
+        content = read_regular_file_no_follow(path)
+    except (FileNotFoundError, NotADirectoryError) as error:
+        raise SeparationHandoffError(f"{field} artifact is missing") from error
+    except (OSError, TypeError) as error:
+        raise SeparationHandoffError(f"{field} is unreadable") from error
+    if sha256(content).hexdigest() != expected:
         _fail(f"{field} bytes do not match retained SHA-256")
-    _fail(f"{field} artifact is missing")
-    raise AssertionError("unreachable")
+    return path, content
 
 
 def _prediction_payload(
@@ -634,10 +639,11 @@ def _prediction_payload(
     source_audio_sha256: str,
     input_audio_sha256: str,
 ) -> dict[str, object]:
+    artifact_field = f"{field}.prediction"
     path, content = _read_matching_artifact(
         raw_prediction.get("path"),
         raw_prediction.get("artifact_sha256"),
-        field=field,
+        field=artifact_field,
         run_path=run_path,
         subset_path=subset_path,
     )
@@ -656,7 +662,9 @@ def _prediction_payload(
         _fail(f"{field} prediction identity does not match run evidence")
     return {
         "path": _path(raw_prediction.get("path"), field),
-        "artifact_sha256": _hash(raw_prediction.get("artifact_sha256"), f"{field}.artifact_sha256"),
+        "artifact_sha256": _hash(
+            raw_prediction.get("artifact_sha256"), f"{artifact_field}.artifact_sha256"
+        ),
         "source_audio_id": audio.source_audio_id,
         "source_audio_sha256": audio.source_audio_sha256,
         "input_view_id": audio.input_view_id,
@@ -696,16 +704,17 @@ def _stem_payload(
     source_audio_sha256: str,
     separator_lock_sha256: str,
 ) -> dict[str, object]:
+    artifact_field = f"{field}.stem"
     _read_matching_artifact(
         raw_stem.get("path"),
         raw_stem.get("sha256"),
-        field=field,
+        field=artifact_field,
         run_path=run_path,
         subset_path=subset_path,
     )
     return {
         "path": _path(raw_stem.get("path"), field),
-        "sha256": _hash(raw_stem.get("sha256"), f"{field}.sha256"),
+        "sha256": _hash(raw_stem.get("sha256"), f"{artifact_field}.sha256"),
         "source_audio_sha256": source_audio_sha256,
         "separator_lock_sha256": separator_lock_sha256,
     }
@@ -953,6 +962,26 @@ def _build_rows(
     expected_subset_sha = getattr(subset, "manifest_sha256")
     if snapshot.get("reviewed_subset_manifest_sha256") != expected_subset_sha:
         _fail("run/subset manifest lineage does not match")
+    for snapshot_field, subset_field in (
+        (
+            "reference_manifest_sha256",
+            "source_reference_manifest_sha256",
+        ),
+        (
+            "reference_manifest_version",
+            "source_reference_manifest_version",
+        ),
+        (
+            "reference_timing_manifest_sha256",
+            "source_timing_manifest_sha256",
+        ),
+        (
+            "reference_timing_version",
+            "source_timing_manifest_version",
+        ),
+    ):
+        if snapshot.get(snapshot_field) != getattr(subset, subset_field):
+            _fail("run/subset source lineage does not match")
     for field in ("reference_manifest_version", "reference_timing_version"):
         _version(snapshot[field], field)
     for field in (
