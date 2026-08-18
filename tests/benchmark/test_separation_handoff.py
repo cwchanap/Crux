@@ -227,6 +227,36 @@ def test_finalize_rejects_full_mix_decoy_when_parent_prediction_is_missing(
     assert outcome.manifest is None
 
 
+def test_finalize_rejects_copied_parent_snapshot_and_prediction_decoy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, subset_path, run_path = _successful_pilot(tmp_path, monkeypatch)
+    snapshot = json.loads(run_path.read_text(encoding="utf-8"))
+    relative = snapshot["items"][0]["full_mix"]["prediction"]["path"]
+    parent_prediction = request.oaf_run_path.parent.parent.parent / relative
+    separation_prediction = request.output_dir / relative
+    assert parent_prediction.exists() and separation_prediction.exists()
+    parent_prediction.unlink()
+
+    copied_parent = request.output_dir / "runs" / snapshot["parent_oaf_run_id"] / "run.json"
+    copied_parent.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(request.oaf_run_path, copied_parent)
+
+    outcome = finalize_separation_pilot(
+        FinalizeSeparationPilotRequest(
+            run_path=run_path,
+            subset_manifest_path=subset_path,
+            output_manifest=tmp_path / "copied-parent-handoff" / "manifest.jsonl",
+            decision="keep_full_mix",
+            rationale="A copied parent snapshot cannot move parent-owned evidence.",
+        )
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.manifest is None
+
+
 def test_finalize_uses_caller_supplied_cache_owner_for_retained_stems(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

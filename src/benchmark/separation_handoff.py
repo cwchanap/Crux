@@ -848,61 +848,24 @@ def _comparison_payload(run_path: Path, subset_path: Path) -> dict[str, object]:
     return result
 
 
-def _parent_snapshot_candidates(run_path: Path, parent_run_id: str) -> tuple[Path, ...]:
-    """Find the sibling parent OaF snapshot without adding a new request field."""
-    candidates: list[Path] = []
-    seen: set[Path] = set()
-    roots = (run_path.parent, *tuple(run_path.parents)[:4])
-    parent_ancestors = tuple(run_path.parents)
-    common_root = parent_ancestors[3] if len(parent_ancestors) > 3 else None
-    for root in roots:
-        if root == Path("/"):
-            continue
-        possible = [root / "runs" / parent_run_id / "run.json"]
-        for candidate in possible:
-            if candidate not in seen:
-                seen.add(candidate)
-                candidates.append(candidate)
-    if common_root is not None:
-        try:
-            children = tuple(common_root.iterdir())
-        except OSError:
-            children = ()
-        for child in children:
-            candidate = child / "runs" / parent_run_id / "run.json"
-            if candidate not in seen:
-                seen.add(candidate)
-                candidates.append(candidate)
-    return tuple(candidates)
-
-
-def _oaf_parent_identity(
-    snapshot: Mapping[str, object], *, run_path: Path
-) -> tuple[dict[str, str], Path]:
+def _oaf_parent_identity(snapshot: Mapping[str, object]) -> tuple[dict[str, str], Path]:
     """Load the immutable OaF identity needed by the handoff row.
 
-    HPA-328 intentionally stores the parent run ID and hash identities in its
-    own snapshot, while the parent OaF snapshot owns the model and inference
-    configuration fields.  The two runs are sibling outputs in the existing
-    workflow, so the latter is discovered by its frozen run ID rather than by
-    widening the finalizer request interface.
+    HPA-328 persists the exact parent run path in its authenticated run
+    identity. The parent OaF snapshot owns the model and inference
+    configuration fields, while its output root owns inherited predictions.
+    No run-id-based directory discovery is permitted at finalization time.
     """
     parent_run_id = _text(snapshot.get("parent_oaf_run_id"), "parent_oaf_run_id")
-    parent: Mapping[str, object] = snapshot
-    parent_path: Path | None = None
-    for candidate in _parent_snapshot_candidates(run_path, parent_run_id):
-        try:
-            content = read_regular_file_no_follow(candidate)
-            candidate_value = strict_json_loads(content, require_canonical=True)
-        except (OSError, TypeError, StrictJsonError):
-            continue
-        if isinstance(candidate_value, Mapping) and candidate_value.get("run_id") == parent_run_id:
-            parent = candidate_value
-            parent_path = candidate
-            break
-
-    if parent.get("run_id") != parent_run_id or parent_path is None:
+    parent_path = _owner_root(snapshot.get("parent_oaf_run_path"), "parent_oaf_run_path")
+    try:
+        parent_content = read_regular_file_no_follow(parent_path)
+        parent_value = strict_json_loads(parent_content, require_canonical=True)
+    except (OSError, TypeError, StrictJsonError) as error:
+        raise SeparationHandoffError("parent OaF run identity is unavailable") from error
+    if not isinstance(parent_value, Mapping) or parent_value.get("run_id") != parent_run_id:
         _fail("parent OaF run identity is unavailable")
+    parent: Mapping[str, object] = parent_value
     try:
         parent_output_root = parent_path.parents[2]
     except IndexError:
@@ -1040,7 +1003,7 @@ def _build_rows(
         _hash(snapshot[field], field)
     _text(snapshot["parent_oaf_run_id"], "parent_oaf_run_id")
     _commit(snapshot["crux_commit"])
-    parent_identity, parent_prediction_root = _oaf_parent_identity(snapshot, run_path=run_path)
+    parent_identity, parent_prediction_root = _oaf_parent_identity(snapshot)
     artifact_roots["parent_prediction"] = parent_prediction_root
     run_id = _text(snapshot.get("run_id"), "run_id")
     if _RUN_ID_RE.fullmatch(run_id) is None:

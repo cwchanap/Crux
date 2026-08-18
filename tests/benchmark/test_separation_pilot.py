@@ -912,6 +912,7 @@ def test_exact_subset_is_sorted_identity_bound_and_full_mix_uses_public_wrapper(
             fixture.timing_manifest_path
         ).manifest_sha256,
         "parent_oaf_run_id": parent["run_id"],
+        "parent_oaf_run_path": str(request.oaf_run_path.resolve()),
         "oaf_backend_descriptor_sha256": parent["backend_descriptor_sha256"],
         "oaf_model_lock_sha256": parent["model_lock_sha256"],
         "oaf_checkpoint_archive_sha256": parent["checkpoint_archive_sha256"],

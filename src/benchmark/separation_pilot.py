@@ -293,6 +293,18 @@ def _require_nonempty_string(value: object, field: str) -> str:
     return value
 
 
+def _require_absolute_path(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise SeparationRunError(f"{field} must be an absolute path")
+    path = Path(value)
+    try:
+        if not path.is_absolute() or path != path.resolve():
+            raise SeparationRunError(f"{field} must be an absolute path")
+    except (OSError, RuntimeError) as error:
+        raise SeparationRunError(f"{field} must be an absolute path") from error
+    return value
+
+
 def _require_crux_commit(value: object) -> str:
     if not isinstance(value, str) or _COMMIT_RE.fullmatch(value) is None:
         raise SeparationRunError("crux_commit must be a lowercase 40-character commit")
@@ -389,6 +401,7 @@ def _validate_snapshot(snapshot: dict[str, JsonValue]) -> dict[str, JsonValue]:
         raise SeparationRunError("htdemucs input view identity is invalid")
     if snapshot["scoring_version"] != SCORING_VERSION:
         raise SeparationRunError("scoring_version is invalid")
+    _require_absolute_path(snapshot.get("parent_oaf_run_path"), "parent_oaf_run_path")
     _require_crux_commit(snapshot.get("crux_commit"))
     started_at = snapshot.get("started_at")
     try:
@@ -407,6 +420,7 @@ def _validate_snapshot(snapshot: dict[str, JsonValue]) -> dict[str, JsonValue]:
             "reference_manifest_sha256",
             "reference_timing_manifest_sha256",
             "parent_oaf_run_id",
+            "parent_oaf_run_path",
             "oaf_backend_descriptor_sha256",
             "oaf_model_lock_sha256",
             "oaf_checkpoint_archive_sha256",
@@ -804,6 +818,7 @@ def _identity_payload(
         "reference_manifest_sha256": reference.manifest_sha256,
         "reference_timing_manifest_sha256": timing.manifest_sha256,
         "parent_oaf_run_id": parent["run_id"],
+        "parent_oaf_run_path": str(request.oaf_run_path.resolve()),
         "oaf_backend_descriptor_sha256": parent["backend_descriptor_sha256"],
         "oaf_model_lock_sha256": parent["model_lock_sha256"],
         "oaf_checkpoint_archive_sha256": parent["checkpoint_archive_sha256"],
@@ -843,6 +858,7 @@ def _build_snapshot(
         "reference_timing_manifest_sha256": timing.manifest_sha256,
         "reference_timing_version": timing.corpus_version,
         "parent_oaf_run_id": parent["run_id"],
+        "parent_oaf_run_path": str(request.oaf_run_path.resolve()),
         "oaf_backend_descriptor_sha256": parent["backend_descriptor_sha256"],
         "oaf_model_lock_sha256": parent["model_lock_sha256"],
         "oaf_checkpoint_archive_sha256": parent["checkpoint_archive_sha256"],
