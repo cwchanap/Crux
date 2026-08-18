@@ -1400,11 +1400,13 @@ def _execute_derived_view(
     interpreter: Path,
     backend_factory: Callable[..., object],
     backend: object | None,
+    backend_ref: list[object | None],
     descriptor: BackendDescriptor,
     perf_counter: Callable[[], float],
     stop_disposition: list[str],
 ) -> object | None:
     """Execute one fixed view for one member and checkpoint each boundary."""
+    backend_ref[0] = backend
     view = item.get(view_name)
     if not isinstance(view, dict):
         raise SeparationRunError("derived view row is invalid")
@@ -1493,6 +1495,12 @@ def _execute_derived_view(
 
     runtime["separator_wall_time_sec"] = max(0.0, perf_counter() - separator_started)
     runtime["separator_rtf"] = runtime["separator_wall_time_sec"] / source.duration_sec
+    if isinstance(prior_view, Mapping):
+        prior_runtime = prior_view.get("runtime")
+        if isinstance(prior_runtime, Mapping):
+            for field in ("separator_wall_time_sec", "separator_rtf"):
+                if field in prior_runtime:
+                    runtime[field] = prior_runtime[field]
     view["runtime"] = runtime
     write_oaf_separation_run(run_path, snapshot)
 
@@ -1661,6 +1669,7 @@ def _execute_derived_view(
                     timeout_seconds=OAF_CORPUS_REQUEST_TIMEOUT_SECONDS,
                     close_timeout_seconds=OAF_WORKER_CLOSE_TIMEOUT_SECONDS,
                 )
+                backend_ref[0] = backend
                 actual_descriptor = backend.descriptor()  # type: ignore[attr-defined]
                 if not isinstance(actual_descriptor, BackendDescriptor) or (
                     actual_descriptor.sha256 != descriptor.sha256
@@ -1711,8 +1720,10 @@ def _execute_derived_view(
             runtime=runtime,
         )
         if disposition in {"poison", "fatal_preflight"}:
-            _close_backend(backend)
+            backend_to_close = backend
             backend = None
+            backend_ref[0] = None
+            _close_backend(backend_to_close)
             stop_disposition.append(disposition)
     except (ArtifactPublicationError, PredictionArtifactError):
         _set_view_failure(
@@ -1731,6 +1742,7 @@ def _execute_derived_view(
     finally:
         write_oaf_separation_run(run_path, snapshot)
         canonical_path.unlink(missing_ok=True)
+    backend_ref[0] = backend
     return backend
 
 
@@ -1761,6 +1773,8 @@ def run_oaf_separation_pilot(
         )
     ):
         raise TypeError("execution seams must be callable")
+    backend: object | None = None
+    backend_ref: list[object | None] = [None]
     try:
         _require_crux_commit(request.crux_commit)
         _validate_output_paths(request)
@@ -1861,7 +1875,6 @@ def run_oaf_separation_pilot(
             for row in prior_items
             if isinstance(row, Mapping) and isinstance(row.get("simfile_id"), int)
         }
-        backend: object | None = None
         stop_disposition: list[str] = []
         for item in rows:
             simfile_id = item.get("simfile_id")
@@ -1887,6 +1900,7 @@ def run_oaf_separation_pilot(
                 interpreter=request.spleeter_python,
                 backend_factory=bound_backend_factory,
                 backend=backend,
+                backend_ref=backend_ref,
                 descriptor=descriptor,
                 perf_counter=selected_perf_counter,  # type: ignore[arg-type]
                 stop_disposition=stop_disposition,
@@ -1911,6 +1925,7 @@ def run_oaf_separation_pilot(
                 interpreter=request.demucs_python,
                 backend_factory=bound_backend_factory,
                 backend=backend,
+                backend_ref=backend_ref,
                 descriptor=descriptor,
                 perf_counter=selected_perf_counter,  # type: ignore[arg-type]
                 stop_disposition=stop_disposition,
@@ -1924,7 +1939,6 @@ def run_oaf_separation_pilot(
             write_oaf_separation_run(run_path, snapshot)
             if disposition == "fatal_preflight":
                 return _fatal_outcome()
-        _close_backend(backend)
         _score_derived_cohort(
             request,
             run_dir,
@@ -1987,6 +2001,8 @@ def run_oaf_separation_pilot(
         )
     except (OSError, RuntimeError, StrictJsonError, SeparationRunError, TypeError, ValueError):
         return _fatal_outcome()
+    finally:
+        _close_backend(backend_ref[0])
 
 
 __all__ = [

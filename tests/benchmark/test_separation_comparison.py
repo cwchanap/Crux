@@ -243,9 +243,11 @@ def test_comparison_publishes_paired_csvs_summary_and_native_evidence(
     for view_name in ("spleeter", "htdemucs"):
         assert summary["pairing"][view_name]["pairable_success_intersection"] == 20
         assert summary["models"][view_name]["failure_code_histogram"] == {}
+        assert summary["models"][view_name]["reason_counts"] == {}
         resources = summary["models"][view_name]["resources"]
         assert resources["retained_stem_bytes"] > 0
         assert resources["retained_prediction_bytes"] > 0
         assert resources["retained_report_bytes"] > 0
         assert summary["comparisons"][view_name]["event_micro"]
     assert "cost" not in (comparison_dir / "summary.json").read_text(encoding="utf-8")
+    assert "reason_counts" in (comparison_dir / "summary.md").read_text(encoding="utf-8")
