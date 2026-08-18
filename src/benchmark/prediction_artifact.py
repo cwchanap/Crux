@@ -223,6 +223,73 @@ def publish_prediction_artifact(
     return published
 
 
+def prediction_artifact_matches_audio(
+    artifact: PredictionArtifact,
+    *,
+    source_audio_id: str,
+    source_audio_sha256: str,
+    audio: CanonicalAudio,
+    descriptor: BackendDescriptor,
+    prediction_map_version: str,
+) -> bool:
+    """Check persisted prediction identity against one canonical audio input."""
+    if not isinstance(artifact, PredictionArtifact):
+        return False
+    if not isinstance(audio, CanonicalAudio) or not isinstance(descriptor, BackendDescriptor):
+        return False
+    if not all(
+        isinstance(value, str) and value
+        for value in (source_audio_id, source_audio_sha256, prediction_map_version)
+    ):
+        return False
+    prediction = artifact.prediction
+    return (
+        prediction.descriptor.sha256 == descriptor.sha256
+        and dict(prediction.descriptor.payload) == dict(descriptor.payload)
+        and prediction.audio.source_audio_id == source_audio_id
+        and prediction.audio.source_audio_sha256 == source_audio_sha256
+        and prediction.audio.input_view_id == audio.input_view_id
+        and prediction.audio.input_audio_sha256 == audio.input_audio_sha256
+        and prediction.audio.source_audio_id == audio.source_audio_id
+        and prediction.audio.source_audio_sha256 == audio.source_audio_sha256
+        and all(
+            event.prediction_map_version == prediction_map_version for event in prediction.events
+        )
+    )
+
+
+def prediction_artifact_matches_run_row(
+    artifact: PredictionArtifact,
+    row: Mapping[str, object],
+    *,
+    expected_input_view_id: str,
+) -> bool:
+    """Bind raw persisted prediction bytes to persisted row evidence and view policy."""
+    if not isinstance(artifact, PredictionArtifact) or not isinstance(row, Mapping):
+        return False
+    if not isinstance(expected_input_view_id, str) or not expected_input_view_id:
+        return False
+    values = (
+        row.get("prediction_artifact_sha256"),
+        row.get("source_audio_id"),
+        row.get("source_audio_sha256"),
+        row.get("input_audio_sha256"),
+    )
+    if not all(isinstance(value, str) and value for value in values):
+        return False
+    row_input_view_id = row.get("input_view_id")
+    if row_input_view_id is not None and row_input_view_id != expected_input_view_id:
+        return False
+    prediction = artifact.prediction
+    return (
+        artifact.artifact_sha256 == values[0]
+        and prediction.audio.source_audio_id == values[1]
+        and prediction.audio.source_audio_sha256 == values[2]
+        and prediction.audio.input_view_id == expected_input_view_id
+        and prediction.audio.input_audio_sha256 == values[3]
+    )
+
+
 def _read_prediction_artifact(content: bytes) -> PredictionArtifact:
     if not isinstance(content, bytes):
         raise PredictionArtifactError("prediction artifact must be bytes")
@@ -640,6 +707,8 @@ __all__ = [
     "PredictionArtifact",
     "PredictionArtifactError",
     "PREDICTION_SCHEMA",
+    "prediction_artifact_matches_audio",
+    "prediction_artifact_matches_run_row",
     "prediction_path",
     "publish_prediction_artifact",
     "read_prediction_artifact",

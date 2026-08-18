@@ -1027,6 +1027,16 @@ def test_inference_config_has_exact_keys_and_deterministic_hash() -> None:
     assert first_hash != inference_config_sha256({**payload, "checkpoint_archive_sha256": SHA_C})
     assert first_hash != inference_config_sha256({**payload, "backend_descriptor_sha256": SHA_C})
 
+    derived_view = "crux.oaf-spleeter4-drums-mono44k1-pcm16/v1"
+    derived_payload = build_inference_config(
+        config,
+        descriptor,
+        SHA_B,
+        input_view_id=derived_view,
+    )
+    assert derived_payload == {**payload, "input_view_id": derived_view}
+    assert inference_config_sha256(derived_payload) != first_hash
+
 
 def test_run_id_is_deterministic_and_binds_reference_and_scope() -> None:
     common = dict(

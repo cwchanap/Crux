@@ -12,6 +12,8 @@ from src.benchmark.prediction_artifact import (
     MappedPrediction,
     MappedPredictionEvent,
     PredictionArtifactError,
+    prediction_artifact_matches_audio,
+    prediction_artifact_matches_run_row,
     prediction_path,
     read_prediction_artifact,
     render_prediction_artifact,
@@ -103,6 +105,57 @@ def test_muscriptor_prediction_round_trip_is_byte_identical() -> None:
     round_tripped = read_prediction_artifact(content)
 
     assert render_prediction_artifact(round_tripped.prediction) == content
+
+
+def test_prediction_matchers_accept_a_non_full_mix_view_and_explicit_row_policy() -> None:
+    prediction = _muscriptor_prediction()
+    derived_audio = replace(
+        prediction.audio,
+        input_view_id="crux.oaf-spleeter4-drums-mono44k1-pcm16/v1",
+        input_audio_sha256="c" * 64,
+    )
+    artifact = read_prediction_artifact(
+        render_prediction_artifact(replace(prediction, audio=derived_audio))
+    )
+
+    assert prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id="song",
+        source_audio_sha256="f" * 64,
+        audio=derived_audio,
+        descriptor=prediction.descriptor,
+        prediction_map_version=MUSCRIPTOR_PREDICTION_MAP_ID,
+    )
+    assert not prediction_artifact_matches_audio(
+        artifact,
+        source_audio_id="song",
+        source_audio_sha256="f" * 64,
+        audio=replace(derived_audio, input_audio_sha256="d" * 64),
+        descriptor=prediction.descriptor,
+        prediction_map_version=MUSCRIPTOR_PREDICTION_MAP_ID,
+    )
+    row = {
+        "prediction_artifact_sha256": artifact.artifact_sha256,
+        "source_audio_id": "song",
+        "source_audio_sha256": "f" * 64,
+        "input_view_id": "crux.oaf-spleeter4-drums-mono44k1-pcm16/v1",
+        "input_audio_sha256": "c" * 64,
+    }
+    assert prediction_artifact_matches_run_row(
+        artifact,
+        row,
+        expected_input_view_id="crux.oaf-spleeter4-drums-mono44k1-pcm16/v1",
+    )
+    assert not prediction_artifact_matches_run_row(
+        artifact,
+        row,
+        expected_input_view_id="full-mix-v1",
+    )
+    assert not prediction_artifact_matches_run_row(
+        artifact,
+        {**row, "input_view_id": "full-mix-v1"},
+        expected_input_view_id="crux.oaf-spleeter4-drums-mono44k1-pcm16/v1",
+    )
 
 
 @pytest.mark.parametrize(

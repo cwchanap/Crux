@@ -16,6 +16,7 @@ from src.benchmark.input_view import (
     load_derived_audio,
     load_direct_audio,
     load_materialized_audio,
+    materialize_derived_audio,
     materialize_full_mix_audio,
     parse_canonical_wav,
 )
@@ -187,6 +188,43 @@ def test_materialize_full_mix_audio_preserves_identity_and_canonical_metadata(
     assert audio.sample_rate == 44100
     assert audio.channel_count == 1
     assert audio.sample_width_bytes == 2
+    assert audio.audio_frame_count == 441
+
+
+def test_materialize_derived_audio_uses_retained_stem_and_authoritative_source_identity(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.flac"
+    source_content = b"authoritative source bytes"
+    source_path.write_bytes(source_content)
+    source = ResolvedSourceAudio(
+        path=source_path,
+        source_audio_id="song-42-source-v1",
+        source_audio_sha256=sha256(source_content).hexdigest(),
+        duration_sec=0.01,
+    )
+    derived_audio_path = tmp_path / "retained" / "drums.wav"
+    derived_content = canonical_wav_bytes(sample_frames=441)
+    derived_audio_path.parent.mkdir()
+    derived_audio_path.write_bytes(derived_content)
+    input_root = tmp_path / "inputs"
+    output_path = input_root / "42" / "spleeter.wav"
+
+    audio = materialize_derived_audio(
+        source,
+        derived_audio_path,
+        output_path,
+        input_root=input_root,
+        input_view_id="crux.oaf-spleeter4-drums-mono44k1-pcm16/v1",
+        max_input_audio_frames=441,
+    )
+
+    assert audio.path == output_path
+    assert audio.source_audio_id == source.source_audio_id
+    assert audio.source_audio_sha256 == source.source_audio_sha256
+    assert audio.input_view_id == "crux.oaf-spleeter4-drums-mono44k1-pcm16/v1"
+    assert audio.input_audio_sha256 == sha256(output_path.read_bytes()).hexdigest()
+    assert audio.input_audio_sha256 != source.source_audio_sha256
     assert audio.audio_frame_count == 441
 
 
