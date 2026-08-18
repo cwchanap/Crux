@@ -213,6 +213,53 @@ def materialize_full_mix_audio(
     """Materialize one temporary canonical audio input beneath ``input_root``."""
     if not isinstance(source_audio, ResolvedSourceAudio):
         raise TypeError("source_audio must be ResolvedSourceAudio")
+    source_input = (
+        BytesIO(source_audio.content) if source_audio.content is not None else source_audio.path
+    )
+    return _materialize_canonical_audio(
+        source_audio,
+        source_input,
+        output_path,
+        input_root=input_root,
+        input_view_id=input_view_id,
+        max_input_audio_frames=max_input_audio_frames,
+    )
+
+
+def materialize_derived_audio(
+    source_audio: ResolvedSourceAudio,
+    derived_audio_path: Path,
+    output_path: Path,
+    *,
+    input_root: Path,
+    input_view_id: str,
+    max_input_audio_frames: int | None,
+) -> CanonicalAudio:
+    """Canonicalize one retained derived stem with authoritative source identity."""
+    if not isinstance(derived_audio_path, Path):
+        raise TypeError("derived_audio_path must be a Path")
+    return _materialize_canonical_audio(
+        source_audio,
+        derived_audio_path,
+        output_path,
+        input_root=input_root,
+        input_view_id=input_view_id,
+        max_input_audio_frames=max_input_audio_frames,
+    )
+
+
+def _materialize_canonical_audio(
+    source_audio: ResolvedSourceAudio,
+    source_input: BytesIO | Path,
+    output_path: Path,
+    *,
+    input_root: Path,
+    input_view_id: str,
+    max_input_audio_frames: int | None,
+) -> CanonicalAudio:
+    """Canonicalize one source input while retaining the verified source identity."""
+    if not isinstance(source_audio, ResolvedSourceAudio):
+        raise TypeError("source_audio must be ResolvedSourceAudio")
     if not isinstance(output_path, Path) or not isinstance(input_root, Path):
         raise TypeError("output_path and input_root must be Paths")
     root = input_root.resolve()
@@ -223,9 +270,6 @@ def materialize_full_mix_audio(
         raise ValueError("canonical input must be beneath input_root") from None
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    source_input = (
-        BytesIO(source_audio.content) if source_audio.content is not None else source_audio.path
-    )
     samples, _ = librosa.load(source_input, sr=44100, mono=True, res_type="soxr_hq")
     soundfile.write(output_path, samples, 44100, format="WAV", subtype="PCM_16")
     return load_materialized_audio(

@@ -60,8 +60,9 @@ from src.benchmark.durability import atomic_replace_bytes
 from src.benchmark.input_view import materialize_full_mix_audio
 from src.benchmark.mapping import map_oaf_prediction
 from src.benchmark.prediction_artifact import (
-    PredictionArtifact,
     PredictionArtifactError,
+    prediction_artifact_matches_audio,
+    prediction_artifact_matches_run_row,
     prediction_path,
     publish_prediction_artifact,
     read_prediction_artifact,
@@ -255,6 +256,8 @@ def build_inference_config(
     config: OafModelConfig,
     descriptor: BackendDescriptor,
     model_lock_sha256: str,
+    *,
+    input_view_id: str = OAF_FULL_MIX_INPUT_VIEW_ID,
 ) -> dict[str, str]:
     """Build the closed, inference-semantic identity payload."""
     if not isinstance(config, OafModelConfig):
@@ -263,6 +266,8 @@ def build_inference_config(
         raise TypeError("descriptor must be BackendDescriptor")
     descriptor_sha256 = _require_hash(descriptor.sha256, "backend_descriptor_sha256")
     model_lock = _require_hash(model_lock_sha256, "model_lock_sha256")
+    if not isinstance(input_view_id, str) or not input_view_id:
+        raise ValueError("input_view_id must be a nonempty string")
     checkpoint = _require_hash(
         config.checkpoint.archive_sha256,
         "checkpoint_archive_sha256",
@@ -274,7 +279,7 @@ def build_inference_config(
         "checkpoint_archive_sha256": checkpoint,
         "adapter_revision": OAF_ADAPTER_REVISION,
         "prediction_map_version": OAF_PREDICTION_MAP_ID,
-        "input_view_id": OAF_FULL_MIX_INPUT_VIEW_ID,
+        "input_view_id": input_view_id,
         "canonicalization_revision": OAF_CANONICALIZATION_REVISION,
     }
 
@@ -787,70 +792,6 @@ def _read_existing_prediction(path: Path) -> tuple[bool, bytes | None]:
         return True, None
 
 
-def _prediction_artifact_matches(
-    artifact: PredictionArtifact,
-    *,
-    source: ResolvedSourceAudio,
-    audio: CanonicalAudio,
-    descriptor: BackendDescriptor,
-) -> bool:
-    prediction = artifact.prediction
-    if prediction.descriptor.sha256 != descriptor.sha256:
-        return False
-    if dict(prediction.descriptor.payload) != dict(descriptor.payload):
-        return False
-    if prediction.audio.source_audio_id != source.source_audio_id:
-        return False
-    if prediction.audio.source_audio_sha256 != source.source_audio_sha256:
-        return False
-    if prediction.audio.input_view_id != OAF_FULL_MIX_INPUT_VIEW_ID:
-        return False
-    if prediction.audio.input_view_id != audio.input_view_id:
-        return False
-    if prediction.audio.input_audio_sha256 != audio.input_audio_sha256:
-        return False
-    if prediction.audio.source_audio_id != audio.source_audio_id:
-        return False
-    if prediction.audio.source_audio_sha256 != audio.source_audio_sha256:
-        return False
-    if prediction.descriptor.payload.get("model_id") != descriptor.payload.get("model_id"):
-        return False  # pragma: no cover
-    return all(event.prediction_map_version == OAF_PREDICTION_MAP_ID for event in prediction.events)
-
-
-def _prediction_artifact_matches_run_row(
-    artifact: PredictionArtifact,
-    row: Mapping[str, object],
-) -> bool:
-    """Bind raw persisted prediction bytes to their persisted run-row evidence."""
-    if not isinstance(artifact, PredictionArtifact) or not isinstance(row, Mapping):
-        return False
-    artifact_sha = row.get("prediction_artifact_sha256")
-    source_audio_id = row.get("source_audio_id")
-    source_audio_sha256 = row.get("source_audio_sha256")
-    input_view_id = row.get("input_view_id")
-    input_audio_sha256 = row.get("input_audio_sha256")
-    if not all(
-        isinstance(value, str) and value
-        for value in (
-            artifact_sha,
-            source_audio_id,
-            source_audio_sha256,
-            input_view_id,
-            input_audio_sha256,
-        )
-    ):
-        return False
-    prediction = artifact.prediction
-    return (
-        artifact.artifact_sha256 == artifact_sha
-        and prediction.audio.source_audio_id == source_audio_id
-        and prediction.audio.source_audio_sha256 == source_audio_sha256
-        and prediction.audio.input_view_id == input_view_id
-        and prediction.audio.input_audio_sha256 == input_audio_sha256
-    )
-
-
 def _cohort_item_from_run_row(
     identity: CohortIdentity,
     row: Mapping[str, object],
@@ -925,7 +866,11 @@ def _cohort_item_from_run_row(
             )
         try:
             prediction = read_prediction_artifact(content)
-            if not _prediction_artifact_matches_run_row(prediction, row):
+            if not prediction_artifact_matches_run_row(
+                prediction,
+                row,
+                expected_input_view_id=OAF_FULL_MIX_INPUT_VIEW_ID,
+            ):
                 return cohort_item_without_prediction(
                     identity,
                     simfile_id,
@@ -1433,8 +1378,10 @@ def run_oaf_corpus(
                             "input_audio_sha256",
                         )
                     )
-                    artifact_matches_run_row = _prediction_artifact_matches_run_row(
-                        artifact, prior_row
+                    artifact_matches_run_row = prediction_artifact_matches_run_row(
+                        artifact,
+                        prior_row,
+                        expected_input_view_id=OAF_FULL_MIX_INPUT_VIEW_ID,
                     )
                     if has_persisted_artifact_evidence and not artifact_matches_run_row:
                         _set_failed(
@@ -1443,11 +1390,13 @@ def run_oaf_corpus(
                             "prediction artifact does not match persisted run evidence",
                         )
                         continue
-                    if not _prediction_artifact_matches(
+                    if not prediction_artifact_matches_audio(
                         artifact,
-                        source=state.source,
+                        source_audio_id=state.source.source_audio_id,
+                        source_audio_sha256=state.source.source_audio_sha256,
                         audio=audio,
                         descriptor=backend_descriptor,
+                        prediction_map_version=OAF_PREDICTION_MAP_ID,
                     ):
                         _set_failed(
                             item,

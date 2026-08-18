@@ -65,8 +65,9 @@ from src.benchmark.muscriptor_model import (
     verify_muscriptor_checkpoint,
 )
 from src.benchmark.prediction_artifact import (
-    PredictionArtifact,
     PredictionArtifactError,
+    prediction_artifact_matches_audio,
+    prediction_artifact_matches_run_row,
     prediction_path,
     publish_prediction_artifact,
     read_prediction_artifact,
@@ -884,62 +885,6 @@ def _read_existing_prediction(path: Path) -> tuple[bool, bytes | None]:
         return True, None
 
 
-def _prediction_artifact_matches(
-    artifact: PredictionArtifact,
-    *,
-    source: ResolvedSourceAudio,
-    audio: CanonicalAudio,
-    descriptor: BackendDescriptor,
-) -> bool:
-    prediction = artifact.prediction
-    if prediction.descriptor.sha256 != descriptor.sha256:
-        return False
-    if dict(prediction.descriptor.payload) != dict(descriptor.payload):
-        return False
-    if prediction.audio.source_audio_id != source.source_audio_id:
-        return False
-    if prediction.audio.source_audio_sha256 != source.source_audio_sha256:
-        return False
-    if prediction.audio.input_view_id != MUSCRIPTOR_FULL_MIX_INPUT_VIEW_ID:
-        return False
-    if prediction.audio.input_view_id != audio.input_view_id:
-        return False
-    if prediction.audio.input_audio_sha256 != audio.input_audio_sha256:
-        return False
-    if prediction.audio.source_audio_id != audio.source_audio_id:
-        return False
-    if prediction.audio.source_audio_sha256 != audio.source_audio_sha256:
-        return False
-    return all(
-        event.prediction_map_version == MUSCRIPTOR_PREDICTION_MAP_ID for event in prediction.events
-    )
-
-
-def _prediction_artifact_matches_run_row(
-    artifact: PredictionArtifact,
-    row: Mapping[str, object],
-) -> bool:
-    """Bind raw persisted prediction bytes to persisted row evidence."""
-    if not isinstance(artifact, PredictionArtifact) or not isinstance(row, Mapping):
-        return False
-    values = (
-        row.get("prediction_artifact_sha256"),
-        row.get("source_audio_id"),
-        row.get("source_audio_sha256"),
-        row.get("input_audio_sha256"),
-    )
-    if not all(isinstance(value, str) and value for value in values):
-        return False
-    prediction = artifact.prediction
-    return (
-        artifact.artifact_sha256 == values[0]
-        and prediction.audio.source_audio_id == values[1]
-        and prediction.audio.source_audio_sha256 == values[2]
-        and prediction.audio.input_view_id == MUSCRIPTOR_FULL_MIX_INPUT_VIEW_ID
-        and prediction.audio.input_audio_sha256 == values[3]
-    )
-
-
 def _cohort_item_from_run_row(
     identity: CohortIdentity,
     row: Mapping[str, object],
@@ -1014,7 +959,11 @@ def _cohort_item_from_run_row(
             )
         try:
             artifact = read_prediction_artifact(content)
-            if not _prediction_artifact_matches_run_row(artifact, row):
+            if not prediction_artifact_matches_run_row(
+                artifact,
+                row,
+                expected_input_view_id=MUSCRIPTOR_FULL_MIX_INPUT_VIEW_ID,
+            ):
                 return cohort_item_without_prediction(
                     identity,
                     simfile_id,
@@ -1631,8 +1580,10 @@ def run_muscriptor_corpus(
                             "input_audio_sha256",
                         )
                     )
-                    if has_persisted_artifact_evidence and not _prediction_artifact_matches_run_row(
-                        artifact, prior_row
+                    if has_persisted_artifact_evidence and not prediction_artifact_matches_run_row(
+                        artifact,
+                        prior_row,
+                        expected_input_view_id=MUSCRIPTOR_FULL_MIX_INPUT_VIEW_ID,
                     ):
                         _set_failed(
                             item,
@@ -1640,11 +1591,13 @@ def run_muscriptor_corpus(
                             "prediction artifact does not match persisted run evidence",
                         )
                         continue
-                    if not _prediction_artifact_matches(
+                    if not prediction_artifact_matches_audio(
                         artifact,
-                        source=state.source,
+                        source_audio_id=state.source.source_audio_id,
+                        source_audio_sha256=state.source.source_audio_sha256,
                         audio=audio,
                         descriptor=backend_descriptor,
+                        prediction_map_version=MUSCRIPTOR_PREDICTION_MAP_ID,
                     ):
                         _set_failed(
                             item,
