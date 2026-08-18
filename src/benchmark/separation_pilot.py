@@ -14,21 +14,28 @@ either runtime during preflight.
 # pylint: disable=too-many-arguments,too-many-positional-arguments
 # pylint: disable=too-many-branches,too-many-locals,too-many-statements
 # pylint: disable=too-many-instance-attributes
+# pylint: disable=too-many-lines,redefined-outer-name,too-many-return-statements
 
 from __future__ import annotations
 
 import math
 import re
+import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 from typing import Callable, Literal
 
-from src.benchmark.artifact_io import read_regular_file_no_follow
+from src.benchmark.artifact_io import (
+    ArtifactPublicationError,
+    PublishedArtifact,
+    read_regular_file_no_follow,
+)
 from src.benchmark.backend_identity import (
+    BackendDescriptor,
     JsonValue,
     StrictJsonError,
     canonical_json_bytes,
@@ -37,14 +44,31 @@ from src.benchmark.backend_identity import (
     require_sha256,
     strict_json_loads,
 )
+from src.benchmark.backends.base import CanonicalAudio, NativePrediction
+from src.benchmark.backends.oaf import OafBackendError, create_backend
 from src.benchmark.cohort_scoring import SCORING_VERSION
+from src.benchmark.corpus_cache import CacheIndexStore, ResolvedSourceAudio, resolve_source_audio
 from src.benchmark.durability import atomic_replace_bytes
+from src.benchmark.input_view import materialize_derived_audio
+from src.benchmark.mapping import map_oaf_prediction
 from src.benchmark.oaf_corpus_run import (
+    OAF_CORPUS_REQUEST_TIMEOUT_SECONDS,
     OAF_CORPUS_RUN_SCHEMA,
     OAF_FULL_MIX_INPUT_VIEW_ID,
+    OAF_PREDICTION_MAP_ID,
+    OAF_WORKER_CLOSE_TIMEOUT_SECONDS,
     build_run_id,
+    classify_oaf_backend_error,
     inference_config_sha256,
     parse_oaf_corpus_run,
+)
+from src.benchmark.prediction_artifact import (
+    PredictionArtifactError,
+    prediction_artifact_matches_audio,
+    prediction_artifact_matches_run_row,
+    prediction_path,
+    publish_prediction_artifact,
+    read_prediction_artifact,
 )
 from src.benchmark.r2_corpus_models import format_manifest_timestamp, parse_manifest_timestamp
 from src.benchmark.reference_set_manifest import (
@@ -67,8 +91,12 @@ from src.benchmark.reviewed_subset import (
 from src.benchmark.separators import (
     HTDEMUCS_SEPARATOR_ID,
     SPLEETER_SEPARATOR_ID,
+    SeparatedStem,
+    SeparatorExecutionError,
     SeparatorLock,
     load_separator_lock,
+    run_htdemucs_drums,
+    run_spleeter_drums,
 )
 
 SEPARATION_RUN_SCHEMA = "crux.oaf-separation-run/v1"
@@ -281,9 +309,9 @@ def _validate_view_row(value: object, *, field: str, derived: bool) -> None:
             _require_hash(input_sha, f"{field}.input.input_audio_sha256")
     prediction_evidence = value.get("prediction")
     if isinstance(prediction_evidence, Mapping):
-        prediction_path = prediction_evidence.get("path")
-        if prediction_path is not None and (
-            not isinstance(prediction_path, str) or not prediction_path
+        prediction_path_value = prediction_evidence.get("path")
+        if prediction_path_value is not None and (
+            not isinstance(prediction_path_value, str) or not prediction_path_value
         ):
             raise SeparationRunError(f"{field} prediction path is invalid")
         prediction_sha = prediction_evidence.get("artifact_sha256")
@@ -807,6 +835,561 @@ def _score_full_mix_control(
     return outcome
 
 
+def _source_audio_kwargs(source_row: Mapping[str, object]) -> dict[str, str | None]:
+    """Pass only the HPA-321 source identity fields to the cache resolver."""
+    return {
+        "source_audio_key": (
+            source_row["source_audio_key"]
+            if isinstance(source_row.get("source_audio_key"), str)
+            else None
+        ),
+        "source_audio_content_hash": (
+            source_row["source_audio_content_hash"]
+            if isinstance(source_row.get("source_audio_content_hash"), str)
+            else None
+        ),
+        "source_endpoint_sha256": (
+            source_row["source_endpoint_sha256"]
+            if isinstance(source_row.get("source_endpoint_sha256"), str)
+            else None
+        ),
+        "source_bucket": (
+            source_row["source_bucket"]
+            if isinstance(source_row.get("source_bucket"), str)
+            else None
+        ),
+    }
+
+
+def _resolve_pilot_sources(
+    request: OafSeparationPilotRequest,
+    subset: LoadedReviewedSubsetManifest,
+    rows: tuple[dict[str, object], ...],
+) -> dict[int, ResolvedSourceAudio]:
+    """Resolve every fixed member's authoritative source before execution."""
+    cache_index = CacheIndexStore.load(request.cache_dir)
+    loaded_by_id = {loaded.view.simfile_id: loaded for loaded in subset.rows}
+    sources: dict[int, ResolvedSourceAudio] = {}
+    for row in rows:
+        simfile_id = row["simfile_id"]
+        if not isinstance(simfile_id, int):
+            raise SeparationRunError("pilot row simfile_id is invalid")
+        loaded = loaded_by_id.get(simfile_id)
+        if loaded is None:
+            raise SeparationRunError("pilot row source member is unavailable")
+        source = resolve_source_audio(
+            loaded.source_row,
+            request.cache_dir,
+            cache_index,
+            **_source_audio_kwargs(loaded.source_row),
+            load_body=False,
+        )
+        if not isinstance(source, ResolvedSourceAudio):
+            raise SeparationRunError("source resolver returned an invalid result")
+        if source.source_audio_id != row.get(
+            "source_audio_id"
+        ) or source.source_audio_sha256 != row.get("source_audio_sha256"):
+            raise SeparationRunError("resolved source identity does not match fixed membership")
+        row["source_audio_id"] = source.source_audio_id
+        row["source_audio_sha256"] = source.source_audio_sha256
+        row["source_duration_sec"] = source.duration_sec
+        sources[simfile_id] = source
+    return sources
+
+
+def _view_inference_config(
+    parent: Mapping[str, object],
+    input_view_id: str,
+) -> tuple[dict[str, str], str]:
+    """Derive one view config with the sole semantic change being its view ID."""
+    full_mix = parent.get("inference_config")
+    if not isinstance(full_mix, Mapping):
+        raise SeparationRunError("parent inference config is unavailable")
+    config = dict(full_mix)
+    if not isinstance(input_view_id, str) or not input_view_id:
+        raise SeparationRunError("derived input view identity is invalid")
+    config["input_view_id"] = input_view_id
+    try:
+        config_sha = inference_config_sha256(config)
+    except (StrictJsonError, TypeError, ValueError) as error:
+        raise SeparationRunError("derived inference config is invalid") from error
+    return config, config_sha
+
+
+def _relative_artifact_path(path: Path, root: Path) -> str:
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _stem_evidence(stem: SeparatedStem, cache_root: Path) -> dict[str, object]:
+    if not isinstance(stem, SeparatedStem):
+        raise SeparationRunError("separator returned an invalid stem")
+    return {
+        "separator_id": stem.separator_id,
+        "source_audio_sha256": stem.source_audio_sha256,
+        "separator_lock_sha256": stem.separator_lock_sha256,
+        "path": _relative_artifact_path(stem.path, cache_root),
+        "sha256": stem.sha256,
+        "cache_hit": stem.cache_hit,
+        "qc": asdict(stem.qc),
+        "warnings": list(stem.warnings),
+    }
+
+
+def _resolve_retained_stem(
+    raw_stem: Mapping[str, object],
+    *,
+    cache_root: Path,
+    source: ResolvedSourceAudio,
+    lock: SeparatorLock,
+) -> Path:
+    path_value = raw_stem.get("path")
+    digest = raw_stem.get("sha256", raw_stem.get("artifact_sha256"))
+    if not isinstance(path_value, str) or not path_value:
+        raise SeparatorExecutionError("stem_identity_invalid", "retained stem path is missing")
+    if not isinstance(digest, str) or not digest:
+        raise SeparatorExecutionError("stem_identity_invalid", "retained stem hash is missing")
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = cache_root / path
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(cache_root.resolve())
+    except (OSError, ValueError):
+        raise SeparatorExecutionError(
+            "stem_identity_invalid", "retained stem is outside the native cache"
+        ) from None
+    try:
+        content = read_regular_file_no_follow(resolved)
+    except (OSError, TypeError) as error:
+        raise SeparatorExecutionError(
+            "stem_identity_invalid", "retained stem is unreadable"
+        ) from error
+    if sha256(content).hexdigest() != digest:
+        raise SeparatorExecutionError(
+            "stem_identity_invalid", "retained stem bytes do not match checkpoint evidence"
+        )
+    if raw_stem.get("source_audio_sha256") != source.source_audio_sha256:
+        raise SeparatorExecutionError(
+            "stem_identity_invalid", "retained stem source identity does not match"
+        )
+    if raw_stem.get("separator_lock_sha256") != lock.sha256:
+        raise SeparatorExecutionError(
+            "stem_identity_invalid", "retained stem separator identity does not match"
+        )
+    return resolved
+
+
+def _prediction_row_from_view(
+    item: Mapping[str, object], view: Mapping[str, object]
+) -> dict[str, object]:
+    input_evidence = view.get("input")
+    prediction_evidence = view.get("prediction")
+    input_sha = (
+        input_evidence.get("input_audio_sha256") if isinstance(input_evidence, Mapping) else None
+    )
+    prediction_sha = (
+        prediction_evidence.get("artifact_sha256")
+        if isinstance(prediction_evidence, Mapping)
+        else None
+    )
+    return {
+        "prediction_artifact_sha256": prediction_sha,
+        "source_audio_id": item.get("source_audio_id"),
+        "source_audio_sha256": item.get("source_audio_sha256"),
+        "input_audio_sha256": input_sha,
+        "input_view_id": view.get("input_view_id"),
+    }
+
+
+def _set_view_failure(
+    view: dict[str, object],
+    *,
+    status: str,
+    failure_code: str,
+    runtime: Mapping[str, object] | None = None,
+) -> None:
+    view["status"] = status
+    view["failure_code"] = failure_code
+    if runtime is not None:
+        view["runtime"] = dict(runtime)
+
+
+def _separator_failure_status(code: str) -> str:
+    if code in {
+        "stem_decode_failed",
+        "stem_channel_count",
+        "stem_nonfinite",
+        "stem_duration_invalid",
+        "stem_duration_mismatch",
+        "stem_near_silent",
+        "stem_identity_invalid",
+    }:
+        return "stem_invalid"
+    return "separation_failed"
+
+
+def _close_backend(backend: object | None) -> None:
+    if backend is None:
+        return
+    try:
+        backend.close()  # type: ignore[attr-defined]
+    except (OSError, RuntimeError, TypeError, ValueError):
+        pass
+
+
+def _execute_derived_view(
+    request: OafSeparationPilotRequest,
+    run_path: Path,
+    run_dir: Path,
+    snapshot: dict[str, object],
+    item: dict[str, object],
+    source: ResolvedSourceAudio,
+    *,
+    view_name: str,
+    input_view_id: str,
+    separator_lock: SeparatorLock,
+    inference_config: Mapping[str, str],
+    inference_config_sha: str,
+    prior_item: Mapping[str, object] | None,
+    separator_runner: Callable[..., object],
+    interpreter: Path,
+    backend_factory: Callable[..., object],
+    backend: object | None,
+    descriptor: BackendDescriptor,
+    perf_counter: Callable[[], float],
+) -> object | None:
+    """Execute one fixed view for one member and checkpoint each boundary."""
+    view = item.get(view_name)
+    if not isinstance(view, dict):
+        raise SeparationRunError("derived view row is invalid")
+    view["input_view_id"] = input_view_id
+    view["inference_config"] = dict(inference_config)
+    view["inference_config_sha256"] = inference_config_sha
+    input_root = run_dir / "inputs"
+    canonical_path = input_root / str(item["simfile_id"]) / f"{view_name}.wav"
+    prior_view = (
+        prior_item.get(view_name)
+        if isinstance(prior_item, Mapping) and isinstance(prior_item.get(view_name), Mapping)
+        else None
+    )
+    runtime: dict[str, object] = {}
+    stem_path: Path | None = None
+
+    separator_started = perf_counter()
+    try:
+        if (
+            request.resume
+            and isinstance(prior_view, Mapping)
+            and prior_view.get("stem") is not None
+        ):
+            raw_stem = prior_view.get("stem")
+            if not isinstance(raw_stem, Mapping):
+                raise SeparatorExecutionError("stem_identity_invalid", "stem evidence is invalid")
+            stem_path = _resolve_retained_stem(
+                raw_stem,
+                cache_root=request.cache_dir,
+                source=source,
+                lock=separator_lock,
+            )
+            view["stem"] = dict(raw_stem)
+            runtime["separator_cache_hit"] = True
+        else:
+            stem = separator_runner(
+                source.path,
+                source_audio_sha256=source.source_audio_sha256,
+                source_duration_sec=source.duration_sec,
+                interpreter=interpreter,
+                lock_path=SEPARATOR_LOCK_PATHS[separator_lock.separator_id],
+                cache_root=request.cache_dir,
+            )
+            if not isinstance(stem, SeparatedStem):
+                raise SeparatorExecutionError(
+                    "stem_identity_invalid", "separator returned invalid data"
+                )
+            if stem.source_audio_sha256 != source.source_audio_sha256:
+                raise SeparatorExecutionError(
+                    "stem_identity_invalid", "separator source identity changed"
+                )
+            if stem.separator_lock_sha256 != separator_lock.sha256:
+                raise SeparatorExecutionError(
+                    "stem_identity_invalid", "separator lock identity changed"
+                )
+            stem_path = stem.path
+            view["stem"] = _stem_evidence(stem, request.cache_dir)
+            runtime["separator_cache_hit"] = stem.cache_hit
+    except SeparatorExecutionError as error:
+        elapsed = max(0.0, perf_counter() - separator_started)
+        runtime.update(
+            {
+                "separator_wall_time_sec": elapsed,
+                "separator_rtf": elapsed / source.duration_sec if source.duration_sec > 0 else None,
+            }
+        )
+        _set_view_failure(
+            view,
+            status=_separator_failure_status(error.code),
+            failure_code=error.code,
+            runtime=runtime,
+        )
+        write_oaf_separation_run(run_path, snapshot)
+        return backend
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        elapsed = max(0.0, perf_counter() - separator_started)
+        runtime.update({"separator_wall_time_sec": elapsed})
+        _set_view_failure(
+            view,
+            status="separation_failed",
+            failure_code=type(error).__name__,
+            runtime=runtime,
+        )
+        write_oaf_separation_run(run_path, snapshot)
+        return backend
+
+    runtime["separator_wall_time_sec"] = max(0.0, perf_counter() - separator_started)
+    runtime["separator_rtf"] = runtime["separator_wall_time_sec"] / source.duration_sec
+    view["runtime"] = runtime
+    write_oaf_separation_run(run_path, snapshot)
+
+    assert stem_path is not None
+    try:
+        audio = materialize_derived_audio(
+            source,
+            stem_path,
+            canonical_path,
+            input_root=input_root,
+            input_view_id=input_view_id,
+            max_input_audio_frames=None,
+        )
+        if not isinstance(audio, CanonicalAudio):
+            raise TypeError("derived materializer returned invalid audio")
+        if (
+            audio.source_audio_id != source.source_audio_id
+            or audio.source_audio_sha256 != source.source_audio_sha256
+            or audio.input_view_id != input_view_id
+        ):
+            raise ValueError("derived audio identity is invalid")
+        view["input"] = {
+            "path": _relative_artifact_path(audio.path, input_root),
+            "input_view_id": audio.input_view_id,
+            "input_audio_sha256": audio.input_audio_sha256,
+            "source_audio_id": audio.source_audio_id,
+            "source_audio_sha256": audio.source_audio_sha256,
+            "byte_length": audio.byte_length,
+            "sample_rate": audio.sample_rate,
+            "channel_count": audio.channel_count,
+            "sample_width_bytes": audio.sample_width_bytes,
+            "audio_frame_count": audio.audio_frame_count,
+        }
+        write_oaf_separation_run(run_path, snapshot)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        _set_view_failure(
+            view,
+            status="inference_failed",
+            failure_code="canonical_input_failed",
+            runtime=runtime,
+        )
+        write_oaf_separation_run(run_path, snapshot)
+        canonical_path.unlink(missing_ok=True)
+        return backend
+
+    prediction_target = prediction_path(
+        run_dir.parent.parent,
+        simfile_id=item["simfile_id"],  # type: ignore[arg-type]
+        source_audio_sha256=source.source_audio_sha256,
+        backend_descriptor_sha256=descriptor.sha256,
+        inference_config_sha256=inference_config_sha,
+    )
+    existing_content: bytes | None = None
+    try:
+        existing_content = read_regular_file_no_follow(prediction_target)
+    except FileNotFoundError:
+        existing_content = None
+    except (OSError, TypeError):
+        _set_view_failure(
+            view,
+            status="prediction_invalid",
+            failure_code="prediction_artifact_invalid",
+            runtime=runtime,
+        )
+        write_oaf_separation_run(run_path, snapshot)
+        canonical_path.unlink(missing_ok=True)
+        return backend
+
+    if existing_content is not None:
+        if not request.resume:
+            _set_view_failure(
+                view,
+                status="prediction_invalid",
+                failure_code="prediction_output_conflict",
+                runtime=runtime,
+            )
+            write_oaf_separation_run(run_path, snapshot)
+            canonical_path.unlink(missing_ok=True)
+            return backend
+        prior_prediction = prior_view.get("prediction") if isinstance(prior_view, Mapping) else None
+        prior_artifact_sha = (
+            prior_prediction.get("artifact_sha256")
+            if isinstance(prior_prediction, Mapping)
+            else None
+        )
+        if isinstance(prior_artifact_sha, str) and sha256(existing_content).hexdigest() != (
+            prior_artifact_sha
+        ):
+            _set_view_failure(
+                view,
+                status="prediction_invalid",
+                failure_code="prediction_output_conflict",
+                runtime=runtime,
+            )
+            write_oaf_separation_run(run_path, snapshot)
+            canonical_path.unlink(missing_ok=True)
+            return backend
+        try:
+            artifact = read_prediction_artifact(existing_content)
+        except (PredictionArtifactError, StrictJsonError, TypeError, ValueError):
+            _set_view_failure(
+                view,
+                status="prediction_invalid",
+                failure_code="prediction_artifact_invalid",
+                runtime=runtime,
+            )
+            write_oaf_separation_run(run_path, snapshot)
+            canonical_path.unlink(missing_ok=True)
+            return backend
+        prior_row = (
+            _prediction_row_from_view(prior_item, prior_view)
+            if isinstance(prior_item, Mapping) and isinstance(prior_view, Mapping)
+            else {}
+        )
+        matches_run_row = prediction_artifact_matches_run_row(
+            artifact,
+            prior_row,
+            expected_input_view_id=input_view_id,
+        )
+        if not matches_run_row:
+            _set_view_failure(
+                view,
+                status="prediction_invalid",
+                failure_code="prediction_output_conflict",
+                runtime=runtime,
+            )
+            write_oaf_separation_run(run_path, snapshot)
+            canonical_path.unlink(missing_ok=True)
+            return backend
+        if not prediction_artifact_matches_audio(
+            artifact,
+            source_audio_id=source.source_audio_id,
+            source_audio_sha256=source.source_audio_sha256,
+            audio=audio,
+            descriptor=descriptor,
+            prediction_map_version=OAF_PREDICTION_MAP_ID,
+        ):
+            _set_view_failure(
+                view,
+                status="prediction_invalid",
+                failure_code="prediction_artifact_invalid",
+                runtime=runtime,
+            )
+            write_oaf_separation_run(run_path, snapshot)
+            canonical_path.unlink(missing_ok=True)
+            return backend
+        prior_runtime = prior_view.get("runtime") if isinstance(prior_view, Mapping) else None
+        if isinstance(prior_runtime, Mapping):
+            runtime.update(dict(prior_runtime))
+        view["prediction"] = {
+            "path": _relative_artifact_path(prediction_target, run_dir.parent.parent),
+            "artifact_sha256": artifact.artifact_sha256,
+        }
+        view["status"] = "resumed"
+        view["failure_code"] = None
+        view["runtime"] = runtime
+        write_oaf_separation_run(run_path, snapshot)
+        canonical_path.unlink(missing_ok=True)
+        return backend
+
+    try:
+        if backend is None:
+            try:
+                backend = backend_factory(
+                    input_root=input_root,
+                    timeout_seconds=OAF_CORPUS_REQUEST_TIMEOUT_SECONDS,
+                    close_timeout_seconds=OAF_WORKER_CLOSE_TIMEOUT_SECONDS,
+                )
+                actual_descriptor = backend.descriptor()  # type: ignore[attr-defined]
+                if not isinstance(actual_descriptor, BackendDescriptor) or (
+                    actual_descriptor.sha256 != descriptor.sha256
+                    or dict(actual_descriptor.payload) != dict(descriptor.payload)
+                ):
+                    raise OafBackendError(
+                        "backend descriptor identity changed",
+                        code="descriptor_invalid",
+                    )
+            except OafBackendError:
+                raise
+            except (OSError, RuntimeError, TypeError, ValueError, AttributeError) as error:
+                raise OafBackendError(
+                    "backend could not be started", code="worker_start_failed"
+                ) from error
+        started = perf_counter()
+        try:
+            native = backend.transcribe(audio)  # type: ignore[attr-defined]
+        except OafBackendError:
+            raise
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            raise OafBackendError("worker request failed", code="worker_error") from error
+        elapsed = max(0.0, perf_counter() - started)
+        if not isinstance(native, NativePrediction):
+            raise OafBackendError("native prediction is invalid", code="native_event_invalid")
+        try:
+            mapped, _ = map_oaf_prediction(native)
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            raise OafBackendError(
+                "worker response mapping failed", code="worker_response_invalid"
+            ) from error
+        published: PublishedArtifact = publish_prediction_artifact(prediction_target, mapped)
+        runtime["wall_time_sec"] = elapsed
+        runtime["rtf"] = elapsed / source.duration_sec if source.duration_sec > 0 else None
+        view["prediction"] = {
+            "path": _relative_artifact_path(prediction_target, run_dir.parent.parent),
+            "artifact_sha256": published.sha256,
+        }
+        view["status"] = "success"
+        view["failure_code"] = None
+        view["runtime"] = runtime
+    except OafBackendError as error:
+        runner_code, disposition = classify_oaf_backend_error(error.code)
+        _set_view_failure(
+            view,
+            status="inference_failed",
+            failure_code=runner_code or error.code,
+            runtime=runtime,
+        )
+        if disposition in {"poison", "fatal_preflight"}:
+            _close_backend(backend)
+            backend = None
+    except (ArtifactPublicationError, PredictionArtifactError):
+        _set_view_failure(
+            view,
+            status="prediction_invalid",
+            failure_code="prediction_publish_failed",
+            runtime=runtime,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        _set_view_failure(
+            view,
+            status="prediction_invalid",
+            failure_code="prediction_artifact_invalid",
+            runtime=runtime,
+        )
+    finally:
+        write_oaf_separation_run(run_path, snapshot)
+        canonical_path.unlink(missing_ok=True)
+    return backend
+
+
 def run_oaf_separation_pilot(
     request: OafSeparationPilotRequest,
     *,
@@ -816,16 +1399,24 @@ def run_oaf_separation_pilot(
     perf_counter: object | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> OafSeparationPilotOutcome:
-    """Preflight HPA-328 and publish the persisted full-mix control.
-
-    The execution keyword parameters are accepted as the stable Task 6 seam,
-    but are intentionally unused in this Task 5 implementation.  No
-    separator process or OaF backend is touched here.
-    """
-    del backend_factory, spleeter_runner, htdemucs_runner, perf_counter
+    """Run the frozen full-mix control plus both fixed derived OaF views."""
     if not isinstance(request, OafSeparationPilotRequest):
         raise TypeError("request must be OafSeparationPilotRequest")
     selected_clock = clock or (lambda: datetime.now(timezone.utc))
+    selected_perf_counter = perf_counter or time.perf_counter
+    selected_backend_factory = backend_factory or create_backend
+    selected_spleeter_runner = spleeter_runner or run_spleeter_drums
+    selected_htdemucs_runner = htdemucs_runner or run_htdemucs_drums
+    if not all(
+        callable(seam)
+        for seam in (
+            selected_perf_counter,
+            selected_backend_factory,
+            selected_spleeter_runner,
+            selected_htdemucs_runner,
+        )
+    ):
+        raise TypeError("execution seams must be callable")
     try:
         _require_crux_commit(request.crux_commit)
         _validate_output_paths(request)
@@ -866,6 +1457,15 @@ def run_oaf_separation_pilot(
         reports_path = run_dir / "views" / "full_mix" / "reports"
         if reports_path.resolve() == (request.oaf_run_path.resolve().parent / "reports").resolve():
             raise SeparationRunError("full-mix reports alias parent run reports")
+        run_path = run_dir / "run.json"
+        prior_snapshot: Mapping[str, object] | None = None
+        if run_path.exists():
+            if not request.resume:
+                raise SeparationRunError("HPA-328 run already exists without resume")
+            prior_snapshot = parse_oaf_separation_run(
+                read_regular_file_no_follow(run_path),
+                expected_run_id=run_id,
+            )
         snapshot = _build_snapshot(
             request,
             reference,
@@ -882,17 +1482,101 @@ def run_oaf_separation_pilot(
         # scorer.  A malformed parent evidence row is still fatal preflight;
         # it must not cause even the full-mix control wrapper to run.
         render_oaf_separation_run(snapshot)
-        # Publish the control only after every fatal identity check has passed.
+        # Resolve all authoritative source identities before either report
+        # scoring or an expensive separator/OaF operation.
+        sources = _resolve_pilot_sources(request, subset, rows)
+        write_oaf_separation_run(run_path, snapshot)
+
+        # Publish the control only after every fatal identity and source check
+        # has passed.  This is the persisted full-mix report path; no full-mix
+        # audio is ever sent through the injected backend below.
         control = _score_full_mix_control(request, run_dir)
-        snapshot["overall_status"] = "complete" if control.exit_code == 0 else "partial"
-        write_oaf_separation_run(run_dir / "run.json", snapshot)
-        status: PilotStatus = "complete" if control.exit_code == 0 else "partial"
-        exit_code: PilotExitCode = 0 if control.exit_code == 0 else 1
+        snapshot["overall_status"] = "pending" if control.exit_code == 0 else "partial"
+        write_oaf_separation_run(run_path, snapshot)
+
+        raw_descriptor = parent.get("backend_descriptor")
+        if not isinstance(raw_descriptor, Mapping):
+            raise SeparationRunError("parent backend descriptor is unavailable")
+        descriptor = BackendDescriptor(
+            payload=dict(raw_descriptor),
+            sha256=parent["backend_descriptor_sha256"],  # type: ignore[arg-type]
+        )
+        view_configs = {
+            "spleeter": _view_inference_config(parent, SPLEETER_INPUT_VIEW_ID),
+            "htdemucs": _view_inference_config(parent, HTDEMUCS_INPUT_VIEW_ID),
+        }
+        prior_items = prior_snapshot.get("items", []) if isinstance(prior_snapshot, Mapping) else []
+        prior_by_id = {
+            row["simfile_id"]: row
+            for row in prior_items
+            if isinstance(row, Mapping) and isinstance(row.get("simfile_id"), int)
+        }
+        backend: object | None = None
+        for item in rows:
+            simfile_id = item.get("simfile_id")
+            source = sources.get(simfile_id) if isinstance(simfile_id, int) else None
+            if source is None:
+                raise SeparationRunError("resolved source is unavailable")
+            prior_item = prior_by_id.get(simfile_id)
+            backend = _execute_derived_view(
+                request,
+                run_path,
+                run_dir,
+                snapshot,
+                item,
+                source,
+                view_name="spleeter",
+                input_view_id=SPLEETER_INPUT_VIEW_ID,
+                separator_lock=spleeter,
+                inference_config=view_configs["spleeter"][0],
+                inference_config_sha=view_configs["spleeter"][1],
+                prior_item=prior_item,
+                separator_runner=selected_spleeter_runner,  # type: ignore[arg-type]
+                interpreter=request.spleeter_python,
+                backend_factory=selected_backend_factory,  # type: ignore[arg-type]
+                backend=backend,
+                descriptor=descriptor,
+                perf_counter=selected_perf_counter,  # type: ignore[arg-type]
+            )
+            backend = _execute_derived_view(
+                request,
+                run_path,
+                run_dir,
+                snapshot,
+                item,
+                source,
+                view_name="htdemucs",
+                input_view_id=HTDEMUCS_INPUT_VIEW_ID,
+                separator_lock=htdemucs,
+                inference_config=view_configs["htdemucs"][0],
+                inference_config_sha=view_configs["htdemucs"][1],
+                prior_item=prior_item,
+                separator_runner=selected_htdemucs_runner,  # type: ignore[arg-type]
+                interpreter=request.demucs_python,
+                backend_factory=selected_backend_factory,  # type: ignore[arg-type]
+                backend=backend,
+                descriptor=descriptor,
+                perf_counter=selected_perf_counter,  # type: ignore[arg-type]
+            )
+        _close_backend(backend)
+        derived_failed = any(
+            isinstance(item.get(view_name), Mapping)
+            and item[view_name].get("status")  # type: ignore[index]
+            in {"separation_failed", "stem_invalid", "inference_failed", "prediction_invalid"}
+            for item in rows
+            for view_name in ("spleeter", "htdemucs")
+        )
+        status: PilotStatus = (
+            "complete" if control.exit_code == 0 and not derived_failed else "partial"
+        )
+        exit_code: PilotExitCode = 0 if status == "complete" else 1
+        snapshot["overall_status"] = status
+        write_oaf_separation_run(run_path, snapshot)
         return OafSeparationPilotOutcome(
             overall_status=status,
             exit_code=exit_code,
             run_id=run_id,
-            run_path=run_dir / "run.json",
+            run_path=run_path,
             reports_path=reports_path,
             full_mix_reports_path=reports_path,
             success_count=control.success_count,

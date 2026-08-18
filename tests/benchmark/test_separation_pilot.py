@@ -2,12 +2,13 @@
 
 # Fixtures intentionally import the production seam inside tests so the
 # baseline collection remains free of the optional runtime modules.
-# pylint: disable=import-outside-toplevel,too-many-locals,duplicate-code
+# pylint: disable=import-outside-toplevel,too-many-locals,duplicate-code,too-many-arguments
 
 from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import fields, replace
 from pathlib import Path
 
@@ -15,7 +16,7 @@ import pytest
 
 from src.benchmark.backend_identity import canonical_json_bytes, strict_json_loads
 from src.benchmark.corpus_manifest import render_manifest
-from src.benchmark.oaf_corpus_run import parse_oaf_corpus_run
+from src.benchmark.oaf_corpus_run import OAF_FULL_MIX_INPUT_VIEW_ID, parse_oaf_corpus_run
 from src.benchmark.reference_set_manifest import load_reference_set_manifest
 from src.benchmark.reference_timing_manifest import load_reference_timing_manifest
 from src.benchmark.reviewed_subset import (
@@ -23,6 +24,7 @@ from src.benchmark.reviewed_subset import (
     _source_row_sha256,
     load_reviewed_subset_manifest,
 )
+from src.benchmark.separation_pilot import HTDEMUCS_INPUT_VIEW_ID, SPLEETER_INPUT_VIEW_ID
 from src.benchmark.separators import HTDEMUCS_SEPARATOR_ID, SPLEETER_SEPARATOR_ID
 from tests.benchmark.reviewed_subset_fixtures import build_reviewed_subset_oaf_fixture
 
@@ -105,6 +107,440 @@ def _runtime_sentinels() -> dict[str, object]:
 
 def _run_with_runtime_sentinels(run: object, request: object) -> object:
     return run(request, **_runtime_sentinels())  # type: ignore[operator]
+
+
+def _task6_seams(
+    tmp_path: Path,
+    fixture: object,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    spleeter_error: Exception | None = None,
+) -> dict[str, list[object]]:
+    """Install fake source, separator, materializer, scorer, and OaF seams."""
+    import src.benchmark.separation_pilot as pilot
+    from src.benchmark.backend_identity import BackendDescriptor
+    from src.benchmark.backends.base import CanonicalAudio, NativeEvent, NativePrediction
+    from src.benchmark.corpus_cache import ResolvedSourceAudio
+    from src.benchmark.separators import SeparatedStem, StemQc
+
+    parent = parse_oaf_corpus_run(fixture.run_path.read_bytes())
+    descriptor = BackendDescriptor(
+        payload=parent["backend_descriptor"],  # type: ignore[arg-type]
+        sha256=parent["backend_descriptor_sha256"],  # type: ignore[arg-type]
+    )
+    calls: dict[str, list[object]] = {
+        "resolve": [],
+        "separate": [],
+        "materialize": [],
+        "backend": [],
+        "transcribe": [],
+        "score": [],
+    }
+
+    def resolve(source: object, *_args: object, **kwargs: object) -> ResolvedSourceAudio:
+        calls["resolve"].append(kwargs.get("load_body"))
+        assert isinstance(source, Mapping)
+        source_id = source["source_audio_key"]
+        source_sha = source["source_audio_content_hash"]
+        return ResolvedSourceAudio(
+            path=tmp_path / "authoritative-source.wav",
+            source_audio_id=source_id,
+            source_audio_sha256=source_sha,
+            duration_sec=1.0,
+        )
+
+    def stem(separator_id: str, source_sha: str) -> SeparatedStem:
+        stem_path = (
+            tmp_path
+            / "cache"
+            / "derived"
+            / "stems"
+            / separator_id
+            / source_sha
+            / ("spleeter-lock" if separator_id == SPLEETER_SEPARATOR_ID else "htdemucs-lock")
+            / "drums.wav"
+        )
+        stem_path.parent.mkdir(parents=True, exist_ok=True)
+        stem_bytes = f"native-{separator_id}-{source_sha}".encode()
+        stem_path.write_bytes(stem_bytes)
+        return SeparatedStem(
+            separator_id=separator_id,
+            source_audio_sha256=source_sha,
+            separator_lock_sha256=(
+                "84b478def61f9c78320e76a7a49afeb341a22dc5e02dd1b0c666bb8cc3667a95"
+                if separator_id == SPLEETER_SEPARATOR_ID
+                else "7db5a9bfb64d7ec4b2f55e134ddd720cf6e64b1c97343a50fd7dce1f0b81b5e0"
+            ),
+            path=stem_path,
+            sha256=hashlib.sha256(stem_bytes).hexdigest(),
+            qc=StemQc(
+                sample_rate=44100,
+                frame_count=44100,
+                channel_count=1,
+                duration_sec=1.0,
+                rms_dbfs=-20.0,
+                peak_abs=0.2,
+                clipping_detected=False,
+            ),
+            cache_hit=False,
+        )
+
+    def spleeter(source: Path, **kwargs: object) -> SeparatedStem:
+        del source
+        calls["separate"].append(SPLEETER_INPUT_VIEW_ID)
+        if spleeter_error is not None:
+            raise spleeter_error
+        return stem(SPLEETER_SEPARATOR_ID, kwargs["source_audio_sha256"])  # type: ignore[arg-type]
+
+    def htdemucs(source: Path, **kwargs: object) -> SeparatedStem:
+        del source
+        calls["separate"].append(HTDEMUCS_INPUT_VIEW_ID)
+        return stem(HTDEMUCS_SEPARATOR_ID, kwargs["source_audio_sha256"])  # type: ignore[arg-type]
+
+    def materialize(
+        source: ResolvedSourceAudio,
+        native_stem: Path,
+        output_path: Path,
+        *,
+        input_root: Path,
+        input_view_id: str,
+        max_input_audio_frames: int | None,
+    ) -> CanonicalAudio:
+        del input_root, native_stem, max_input_audio_frames
+        calls["materialize"].append(input_view_id)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"temporary-canonical-input")
+        input_sha = "c" * 64 if input_view_id == SPLEETER_INPUT_VIEW_ID else "d" * 64
+        return CanonicalAudio(
+            path=output_path,
+            source_audio_id=source.source_audio_id,
+            source_audio_sha256=source.source_audio_sha256,
+            input_view_id=input_view_id,
+            input_audio_sha256=input_sha,
+            byte_length=88244,
+            sample_rate=44100,
+            channel_count=1,
+            sample_width_bytes=2,
+            audio_frame_count=44100,
+        )
+
+    def fake_score(score_request: object) -> ScoreReviewedSubsetOutcome:
+        calls["score"].append(score_request)
+        score_request.output_dir.mkdir(parents=True, exist_ok=True)  # type: ignore[attr-defined]
+        return ScoreReviewedSubsetOutcome(
+            exit_code=0,
+            cohort_id="subset-cohort",
+            reports_path=score_request.output_dir,  # type: ignore[attr-defined]
+            success_count=20,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+        )
+
+    class FakeBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            calls["transcribe"].append(audio.input_view_id)
+            return NativePrediction(
+                audio=audio,
+                descriptor=descriptor,
+                events=(
+                    NativeEvent(
+                        time_sec=0.25,
+                        native_class_id="midi_36",
+                        model_output_bin=15,
+                        native_midi_note=36,
+                        native_metadata={"upstream_8hit_group_id": "kick"},
+                        confidence=0.9,
+                        velocity_midi=100,
+                    ),
+                ),
+            )
+
+        def close(self) -> None:
+            return None
+
+    def backend_factory(**_kwargs: object) -> FakeBackend:
+        calls["backend"].append(True)
+        return FakeBackend()
+
+    monkeypatch.setattr(pilot, "resolve_source_audio", resolve, raising=False)
+    monkeypatch.setattr(pilot, "run_spleeter_drums", spleeter, raising=False)
+    monkeypatch.setattr(pilot, "run_htdemucs_drums", htdemucs, raising=False)
+    monkeypatch.setattr(pilot, "materialize_derived_audio", materialize, raising=False)
+    monkeypatch.setattr(pilot, "score_oaf_reviewed_subset", fake_score)
+    monkeypatch.setattr(
+        pilot,
+        "SEPARATOR_LOCK_PATHS",
+        {
+            SPLEETER_SEPARATOR_ID: FIXTURE_ROOT / "spleeter-model.json",
+            HTDEMUCS_SEPARATOR_ID: FIXTURE_ROOT / "htdemucs-model.json",
+        },
+    )
+    calls["factory"] = [backend_factory]
+    return calls
+
+
+def test_task6_infers_only_the_two_derived_views_after_resolving_membership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    ticks = iter(float(index) for index in range(200))
+    outcome = run_oaf_separation_pilot(
+        request,
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+        perf_counter=lambda: next(ticks),
+    )
+
+    assert outcome.exit_code == 0
+    assert len(calls["resolve"]) == 20
+    assert set(calls["resolve"]) == {False}
+    assert set(calls["separate"]) == {SPLEETER_INPUT_VIEW_ID, HTDEMUCS_INPUT_VIEW_ID}
+    assert set(calls["materialize"]) == {SPLEETER_INPUT_VIEW_ID, HTDEMUCS_INPUT_VIEW_ID}
+    assert set(calls["transcribe"]) == {SPLEETER_INPUT_VIEW_ID, HTDEMUCS_INPUT_VIEW_ID}
+    assert all(view_id != OAF_FULL_MIX_INPUT_VIEW_ID for view_id in calls["transcribe"])
+    assert len(calls["score"]) == 1
+
+    assert outcome.run_path is not None
+    snapshot = json.loads(outcome.run_path.read_text(encoding="utf-8"))
+    assert all(item["spleeter"]["status"] == "success" for item in snapshot["items"])
+    assert all(item["htdemucs"]["status"] == "success" for item in snapshot["items"])
+    parent = parse_oaf_corpus_run(fixture.run_path.read_bytes())
+    full_config = parent["inference_config"]
+    for item in snapshot["items"]:
+        for view_id, view_name in (
+            (SPLEETER_INPUT_VIEW_ID, "spleeter"),
+            (HTDEMUCS_INPUT_VIEW_ID, "htdemucs"),
+        ):
+            view = item[view_name]
+            assert view["input_view_id"] == view_id
+            assert view["input"]["input_view_id"] == view_id
+            assert view["input"]["input_audio_sha256"] in {"c" * 64, "d" * 64}
+            assert view["inference_config"] == {**full_config, "input_view_id": view_id}
+
+
+def test_task6_resume_exact_stem_and_prediction_skips_separator_and_oaf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    first = run_oaf_separation_pilot(
+        request,
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+    assert first.exit_code == 0
+    calls["separate"].clear()
+    calls["transcribe"].clear()
+    second = run_oaf_separation_pilot(
+        replace(request, resume=True),
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+
+    assert second.exit_code == 0
+    assert not calls["separate"]
+    assert not calls["transcribe"]
+    assert second.run_path is not None
+    snapshot = json.loads(second.run_path.read_text(encoding="utf-8"))
+    assert {item["spleeter"]["status"] for item in snapshot["items"]} == {"resumed"}
+    assert {item["htdemucs"]["status"] for item in snapshot["items"]} == {"resumed"}
+
+
+def test_task6_resume_valid_stem_without_prediction_reinfers_only_missing_view(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    first = run_oaf_separation_pilot(
+        request,
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+    assert first.run_path is not None
+    snapshot = json.loads(first.run_path.read_text(encoding="utf-8"))
+    target = snapshot["items"][0]["spleeter"]["prediction"]["path"]
+    (request.output_dir / target).unlink()
+    calls["separate"].clear()
+    calls["transcribe"].clear()
+
+    second = run_oaf_separation_pilot(
+        replace(request, resume=True),
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+
+    assert second.exit_code == 0
+    assert not calls["separate"]
+    assert calls["transcribe"] == [SPLEETER_INPUT_VIEW_ID]
+    assert second.run_path is not None
+    resumed = json.loads(second.run_path.read_text(encoding="utf-8"))
+    assert resumed["items"][0]["spleeter"]["status"] == "success"
+    assert all(item["htdemucs"]["status"] == "resumed" for item in resumed["items"])
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_status", "expected_code"),
+    [
+        ("stem_hash", "stem_invalid", "stem_identity_invalid"),
+        ("run_row_identity", "prediction_invalid", "prediction_output_conflict"),
+    ],
+)
+def test_task6_resume_rejects_immutable_identity_mismatches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_status: str,
+    expected_code: str,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot, write_oaf_separation_run
+
+    first = run_oaf_separation_pilot(
+        request,
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+    assert first.run_path is not None
+    snapshot = json.loads(first.run_path.read_text(encoding="utf-8"))
+    view = snapshot["items"][0]["spleeter"]
+    if mutation == "stem_hash":
+        view["stem"]["sha256"] = "e" * 64
+    else:
+        view["input"]["input_audio_sha256"] = "e" * 64
+    write_oaf_separation_run(first.run_path, snapshot)
+
+    second = run_oaf_separation_pilot(
+        replace(request, resume=True),
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+
+    assert second.exit_code == 1
+    assert second.run_path is not None
+    resumed = json.loads(second.run_path.read_text(encoding="utf-8"))
+    assert resumed["items"][0]["spleeter"]["status"] == expected_status
+    assert resumed["items"][0]["spleeter"]["failure_code"] == expected_code
+
+
+def test_task6_resume_rejects_current_audio_identity_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    from src.benchmark.prediction_artifact import (
+        read_prediction_artifact,
+        render_prediction_artifact,
+    )
+    from src.benchmark.separation_pilot import (
+        run_oaf_separation_pilot,
+        write_oaf_separation_run,
+    )
+
+    first = run_oaf_separation_pilot(
+        request,
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+    assert first.run_path is not None
+    snapshot = json.loads(first.run_path.read_text(encoding="utf-8"))
+    view = snapshot["items"][0]["spleeter"]
+    target = request.output_dir / view["prediction"]["path"]
+    artifact = read_prediction_artifact(target.read_bytes())
+    mismatched_audio = replace(artifact.prediction.audio, input_audio_sha256="e" * 64)
+    mismatched_prediction = replace(artifact.prediction, audio=mismatched_audio)
+    content = render_prediction_artifact(mismatched_prediction)
+    target.write_bytes(content)
+    view["input"]["input_audio_sha256"] = "e" * 64
+    view["prediction"]["artifact_sha256"] = hashlib.sha256(content).hexdigest()
+    write_oaf_separation_run(first.run_path, snapshot)
+
+    second = run_oaf_separation_pilot(
+        replace(request, resume=True),
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+
+    assert second.exit_code == 1
+    assert second.run_path is not None
+    resumed = json.loads(second.run_path.read_text(encoding="utf-8"))
+    assert resumed["items"][0]["spleeter"]["status"] == "prediction_invalid"
+    assert resumed["items"][0]["spleeter"]["failure_code"] == "prediction_artifact_invalid"
+
+
+def test_task6_resume_detects_immutable_prediction_conflict_before_mapping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    first = run_oaf_separation_pilot(
+        request,
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+    assert first.run_path is not None
+    snapshot = json.loads(first.run_path.read_text(encoding="utf-8"))
+    target = request.output_dir / snapshot["items"][0]["spleeter"]["prediction"]["path"]
+    target.write_bytes(b"different immutable prediction bytes\n")
+
+    second = run_oaf_separation_pilot(
+        replace(request, resume=True),
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+
+    assert second.exit_code == 1
+    assert second.run_path is not None
+    resumed = json.loads(second.run_path.read_text(encoding="utf-8"))
+    assert resumed["items"][0]["spleeter"]["status"] == "prediction_invalid"
+    assert resumed["items"][0]["spleeter"]["failure_code"] == "prediction_output_conflict"
+
+
+def test_task6_source_resolution_failure_is_fatal_before_control_or_runtimes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    import src.benchmark.separation_pilot as pilot
+
+    def fail_source(*_args: object, **_kwargs: object) -> object:
+        raise ValueError("authoritative source unavailable")
+
+    monkeypatch.setattr(pilot, "resolve_source_audio", fail_source)
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    outcome = run_oaf_separation_pilot(
+        request,
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+
+    assert outcome.exit_code == 2
+    assert not calls["score"]
+    assert not calls["separate"]
+    assert not calls["transcribe"]
 
 
 def test_request_exposes_only_the_fixed_pilot_controls() -> None:
@@ -230,6 +666,7 @@ def test_exact_subset_is_sorted_identity_bound_and_full_mix_uses_public_wrapper(
     subset = _subset_path(tmp_path, fixture)
     request = _request(tmp_path, fixture, subset)
     _install_fixture_locks(monkeypatch)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
     captured: list[object] = []
 
     def fake_score(score_request: object) -> ScoreReviewedSubsetOutcome:
@@ -251,7 +688,10 @@ def test_exact_subset_is_sorted_identity_bound_and_full_mix_uses_public_wrapper(
         run_oaf_separation_pilot,
     )
 
-    outcome = run_oaf_separation_pilot(request)
+    outcome = run_oaf_separation_pilot(
+        request,
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
 
     assert outcome.exit_code == 0
     assert outcome.run_id is not None
