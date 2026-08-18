@@ -30,10 +30,10 @@ added.
     remains mandatory; the explicit opt-out supports derived input views.
 - `src/benchmark/muscriptor_comparison.py`
   - Retains backend-family, run-lineage, and subset-policy validation locally.
-  - Retargets report parsing and model-neutral comparison calls to the shared
-    modules. A compatibility-only private parser path remains for existing
-    in-memory fixtures that predate `summary.json`; published directories with
-    `summary.json` always use the strict reader.
+  - Retargets every production report-directory load and model-neutral
+    comparison call to the shared modules. The private parser wrappers used by
+    direct coverage tests also delegate to the strict reader; incomplete or
+    legacy live report directories have no comparison fallback.
 - Tests cover valid round-trip reading, independent event-micro parsing,
   malformed schema/numbers/identities/duplicates/non-success score rows, and
   label/input-hash parameterization.
@@ -114,3 +114,95 @@ rtk uv run pytest -q tests/benchmark/test_reports.py \
 - The strict reader intentionally covers the four published report files
   needed by Task 8A and does not parse `event_diagnostics.jsonl` or
   `summary.md`.
+
+## Remediation round 1
+
+The first review identified five strictness and reuse gaps. This remediation
+keeps the same narrow Task8A surface and does not add HPA-328 comparison
+outputs.
+
+### RED evidence
+
+The characterization baseline before the remediation changes was:
+
+```text
+rtk uv run pytest -q tests/benchmark/test_reports.py \
+  tests/benchmark/test_muscriptor_comparison.py \
+  tests/benchmark/test_muscriptor_comparison_coverage.py
+97 passed in 2.52s
+```
+
+New regressions were then run before their production fixes:
+
+```text
+rtk uv run pytest -q tests/benchmark/test_reports.py -k 'incomplete or noncanonical'
+5 failed
+rtk uv run pytest -q tests/benchmark/test_muscriptor_comparison_coverage.py \
+  -k 'source_hash or shared_summary or shared_markdown or without_summary'
+5 failed, 1 passed
+```
+
+The failures covered missing summary rejection, missing/invalid source audio
+identity, incomplete per-song and aggregate grids, schema/identity/label
+parameterization, and canonical CSV tokens.
+
+### GREEN evidence
+
+The remediation now:
+
+- always loads a live report directory through `read_cohort_reports()`;
+  missing or legacy `summary.json` therefore fails rather than falling back to
+  partial CSV parsing;
+- validates every successful pair's source audio identity as a nonempty,
+  lowercase SHA-256 before applying the optional input-hash policy;
+- requires the complete tolerance × raw/aligned aggregate grid and the
+  complete successful-item × tolerance × raw/aligned `per_song` grid;
+- exposes shared schema, summary identity, title, and both comparison labels
+  while retaining MuScriptor's exact default schema, artifact names, CSV shape,
+  and Markdown heading; and
+- rejects noncanonical CSV integer/decimal spellings such as `01`, `0.50`,
+  and `1e-1`.
+
+The focused GREEN run was:
+
+```text
+rtk uv run pytest -q tests/benchmark/test_reports.py \
+  tests/benchmark/test_muscriptor_comparison.py \
+  tests/benchmark/test_muscriptor_comparison_coverage.py
+108 passed in 2.78s
+```
+
+Additional checks:
+
+```text
+rtk uv run ruff check src/benchmark/reports.py \
+  src/benchmark/published_comparison.py src/benchmark/muscriptor_comparison.py \
+  tests/benchmark/test_reports.py tests/benchmark/test_muscriptor_comparison.py \
+  tests/benchmark/test_muscriptor_comparison_coverage.py
+All checks passed!
+rtk uv run ruff format --check src/benchmark/reports.py \
+  src/benchmark/published_comparison.py src/benchmark/muscriptor_comparison.py \
+  tests/benchmark/test_reports.py tests/benchmark/test_muscriptor_comparison.py \
+  tests/benchmark/test_muscriptor_comparison_coverage.py
+6 files already formatted
+rtk git diff --check
+PASS
+```
+
+### Remediation limitations and hash
+
+The remediation is verified with deterministic local report/run fixtures only;
+no production corpus, backend, checkpoint, or separator runtime was invoked.
+Task8B comparison output publication and later HPA-328 handoff work remain
+untouched. The strict reader still intentionally excludes
+`event_diagnostics.jsonl` and `summary.md`.
+
+Remediation commit and final file hashes are recorded after commit:
+
+- Commit: `d747926a92ff8e4da13c3ff840e95faf3bf3494e`
+- `src/benchmark/reports.py`: `47de6be16f15e8b8e9b2583084e81ae06101b1570d3b762cda48ccdffe2ac655`
+- `src/benchmark/published_comparison.py`: `7a95620fd56a01839a49756590c97bab75fb36ff4ccd633ab92644e919bad16e`
+- `src/benchmark/muscriptor_comparison.py`: `9b3ce4a7d4a75af084a11e70b2c3292beb1c8d17748d6b2f0f79b9aaf28b872e`
+- `tests/benchmark/test_reports.py`: `42ca9056f1ada6dfbfc660f0e647670d3a340d88ffe0f6194c8ddca78dad87df`
+- `tests/benchmark/test_muscriptor_comparison.py`: `e43de918e94aa44d57e97f67f785af700ea5a36da2d29a78b3715817916bb79e`
+- `tests/benchmark/test_muscriptor_comparison_coverage.py`: `ace1e215e6523c288b73aef69b6cccea02a7ea7fbd01deeef66c6b63d8342bea`
