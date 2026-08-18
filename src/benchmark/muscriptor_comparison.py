@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-import csv
-import io
 import os
 import tempfile
-from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
-from statistics import mean, median
 from typing import Literal
 
 from src.benchmark.artifact_io import read_regular_file_no_follow
@@ -23,9 +19,45 @@ from src.benchmark.backend_identity import (
     require_sha256,
     strict_json_loads,
 )
-from src.benchmark.cohort_scoring import SCORING_VERSION
+from src.benchmark.cohort_scoring import SCORING_VERSION, CohortIdentity
+from src.benchmark.published_comparison import (
+    ComparisonIntegrityError,
+    _aggregate_rows,
+    _csv_decimal,
+    _markdown_metric,
+    _metric_delta,
+    _paired_class_rows,
+    _paired_song_rows,
+    _population,
+    _runtime,
+    _summary,
+    _write_csv,
+    _write_markdown,
+    pairable_success_ids,
+    selected_rows,
+)
 from src.benchmark.reference_set_manifest import load_reference_set_manifest
 from src.benchmark.reference_timing_manifest import load_reference_timing_manifest
+from src.benchmark.reports import (
+    _ITEM_FIELDNAMES,
+    _PER_CLASS_FIELDNAMES,
+    _PER_SONG_FIELDNAMES,
+    ReportIntegrityError,
+    _bounded_csv_metric,
+    _csv_int,
+    _json_text,
+    _parse_csv_decimal,
+    _parse_item_rows,
+    _read_report_csv,
+    read_cohort_reports,
+)
+from src.benchmark.reports import (
+    _parse_class_rows as _parse_published_class_rows,
+)
+from src.benchmark.reports import (
+    _parse_song_rows as _parse_published_song_rows,
+)
+from src.benchmark.taxonomy import DTX_LANE_MAP_VERSION, TAXONOMY_VERSION
 
 
 def load_reviewed_subset_manifest(path: Path):
@@ -47,65 +79,10 @@ _REPORT_IDENTITY_FIELDS = (
     "input_view_id",
     "scoring_version",
 )
-_ITEM_FIELDS = (
-    "cohort_id",
-    "simfile_id",
-    "status",
-    "failure_reason",
-    "warnings",
-    "reference_native_event_count",
-    "reference_common_event_count",
-    "reference_ignored_event_count",
-    "reference_unmapped_event_count",
-    "reference_duplicate_collapsed_count",
-    "prediction_native_event_count",
-    "prediction_mapped_event_count",
-    "prediction_unmapped_event_count",
-    "prediction_mapping_coverage",
-    "prediction_native_class_counts",
-)
-_SONG_FIELDS = (
-    "cohort_id",
-    "model_id",
-    "model_lock_sha256",
-    "prediction_map_version",
-    "input_view_id",
-    "scoring_version",
-    "simfile_id",
-    "tolerance_ms",
-    "mode",
-    "tp",
-    "fp",
-    "fn",
-    "precision",
-    "recall",
-    "f1",
-    "prediction_to_reference_ratio",
-    "median_abs_error_ms",
-    "p95_abs_error_ms",
-    "offset_ms",
-    "warnings",
-)
-_CLASS_FIELDS = (
-    "cohort_id",
-    "model_id",
-    "model_lock_sha256",
-    "prediction_map_version",
-    "input_view_id",
-    "scoring_version",
-    "simfile_id",
-    "tolerance_ms",
-    "mode",
-    "common_class",
-    "tp",
-    "fp",
-    "fn",
-    "reference_support",
-    "prediction_support",
-    "precision",
-    "recall",
-    "f1",
-)
+# Compatibility aliases for the existing tests; report.py owns the schemas.
+_ITEM_FIELDS = _ITEM_FIELDNAMES
+_SONG_FIELDS = _PER_SONG_FIELDNAMES
+_CLASS_FIELDS = _PER_CLASS_FIELDNAMES
 _SONG_OUTPUT_FIELDS = (
     "simfile_id",
     "tolerance_ms",
@@ -149,10 +126,6 @@ _STATUS_BY_DISPOSITION = {
 }
 _SCORE_COUNT_FIELDS = ("tp", "fp", "fn")
 _SIX_PLACES = Decimal("0.000001")
-
-
-class ComparisonIntegrityError(ValueError):
-    """Raised when published comparison evidence cannot be joined safely."""
 
 
 @dataclass(frozen=True)
@@ -282,10 +255,30 @@ def _fail(message: str) -> None:
     raise ComparisonIntegrityError(message)
 
 
+def _compat_report_identity(identity: _RunIdentity) -> CohortIdentity:
+    """Build the report-reader identity for legacy private-parser callers."""
+    return CohortIdentity(
+        cohort_id=identity.cohort_id,
+        reference_manifest_sha256=identity.reference_manifest_sha256,
+        reference_timing_version=identity.reference_timing_version,
+        taxonomy_version=TAXONOMY_VERSION,
+        lane_map_version=DTX_LANE_MAP_VERSION,
+        backend_id=identity.backend_id,
+        model_id=identity.model_id,
+        model_lock_sha256=identity.model_lock_sha256,
+        backend_descriptor_sha256="0" * 64,
+        prediction_map_version=identity.prediction_map_version,
+        input_view_id=identity.input_view_id,
+        scoring_version=identity.scoring_version,
+    )
+
+
 def _text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value:
-        _fail(f"{field} must be a nonempty string")
-    return value
+    try:
+        return _json_text(value, field)
+    except ReportIntegrityError as error:
+        _fail(str(error))
+    raise AssertionError("unreachable")
 
 
 def _hash(value: object, field: str) -> str:
@@ -306,63 +299,45 @@ def _parse_simfile_id(value: object, field: str = "simfile_id") -> str:
 
 
 def _parse_int(value: object, field: str, *, positive: bool = False) -> int:
-    if not isinstance(value, str) or not value.isascii() or not value.isdigit():
-        _fail(f"{field} numeric field is malformed")
-    parsed = int(value)
-    if (positive and parsed <= 0) or parsed < 0:
-        _fail(f"{field} numeric field is malformed")
-    return parsed
+    try:
+        return _csv_int(value, field, positive=positive)
+    except ReportIntegrityError as error:
+        _fail(str(error))
+    raise AssertionError("unreachable")
 
 
 def _parse_decimal(value: object, field: str, *, optional: bool = False) -> Decimal | None:
-    if value == "" and optional:
-        return None
-    if not isinstance(value, str) or not value or value != value.strip():
-        _fail(f"{field} numeric field is malformed")
     try:
-        parsed = Decimal(value)
-    except (InvalidOperation, ValueError):
-        _fail(f"{field} numeric field is malformed")
-    if not parsed.is_finite():
-        _fail(f"{field} numeric field is malformed")
-    return parsed
+        return _parse_csv_decimal(value, field, optional=optional)
+    except ReportIntegrityError as error:
+        _fail(str(error))
+    raise AssertionError("unreachable")
 
 
 def _parse_metric(value: object, field: str, *, optional: bool = True) -> Decimal | None:
-    parsed = _parse_decimal(value, field, optional=optional)
-    if parsed is not None and field in {"precision", "recall", "f1"} and not 0 <= parsed <= 1:
-        _fail(f"{field} numeric field is out of range")
-    if (
-        parsed is not None
-        and field
-        in {
-            "prediction_to_reference_ratio",
-            "median_abs_error_ms",
-            "p95_abs_error_ms",
-        }
-        and parsed < 0
-    ):
-        _fail(f"{field} numeric field is out of range")
-    return parsed
+    try:
+        if field in {"precision", "recall", "f1"}:
+            return _bounded_csv_metric(value, field)
+        parsed = _parse_csv_decimal(value, field, optional=optional)
+        if (
+            parsed is not None
+            and field
+            in {"prediction_to_reference_ratio", "median_abs_error_ms", "p95_abs_error_ms"}
+            and parsed < 0
+        ):
+            _fail(f"{field} numeric field is out of range")
+        return parsed
+    except ReportIntegrityError as error:
+        _fail(str(error))
+    raise AssertionError("unreachable")
 
 
 def _read_csv(path: Path, fields: tuple[str, ...]) -> list[dict[str, str]]:
     try:
-        content = read_regular_file_no_follow(path).decode("utf-8")
-    except (OSError, UnicodeDecodeError) as error:
-        _fail(f"cannot read report {path.name}: {error}")
-    reader = csv.DictReader(io.StringIO(content, newline=""))
-    if reader.fieldnames is None or tuple(reader.fieldnames) != fields:
-        _fail(f"{path.name} has an invalid column schema")
-    rows: list[dict[str, str]] = []
-    try:
-        for row in reader:
-            if None in row or any(value is None for value in row.values()):
-                _fail(f"{path.name} contains a malformed row")
-            rows.append({key: value for key, value in row.items() if key is not None})
-    except csv.Error as error:
-        _fail(f"{path.name} contains malformed CSV: {error}")
-    return rows
+        return _read_report_csv(path, fields)
+    except ReportIntegrityError as error:
+        _fail(str(error))
+    raise AssertionError("unreachable")
 
 
 def _validate_report_identity(row: Mapping[str, str], identity: _RunIdentity) -> None:
@@ -373,42 +348,15 @@ def _validate_report_identity(row: Mapping[str, str], identity: _RunIdentity) ->
 
 
 def _parse_items(path: Path, identity: _RunIdentity) -> dict[str, str]:
-    items: dict[str, str] = {}
-    for row in _read_csv(path, _ITEM_FIELDS):
-        if row["cohort_id"] != identity.cohort_id:
-            _fail("items report identity mismatch for cohort_id")
-        simfile_id = _parse_simfile_id(row["simfile_id"])
-        if simfile_id in items:
-            _fail("items report contains duplicate simfile_id")
-        status = row["status"]
-        if status not in {"success", "failed", "skipped", "quarantined"}:
-            _fail("items report contains an invalid status")
-        for field in (
-            "reference_native_event_count",
-            "reference_common_event_count",
-            "reference_ignored_event_count",
-            "reference_unmapped_event_count",
-            "reference_duplicate_collapsed_count",
-        ):
-            _parse_int(row[field], field)
-        for field in (
-            "prediction_native_event_count",
-            "prediction_mapped_event_count",
-            "prediction_unmapped_event_count",
-        ):
-            if row[field] != "":
-                _parse_int(row[field], field)
-        _parse_metric(row["prediction_mapping_coverage"], "prediction_mapping_coverage")
-        if row["prediction_native_class_counts"]:
-            for value in row["prediction_native_class_counts"].split("|"):
-                if "=" not in value:
-                    _fail("prediction_native_class_counts numeric field is malformed")
-                native_class, count = value.rsplit("=", 1)
-                if not native_class:
-                    _fail("prediction_native_class_counts numeric field is malformed")
-                _parse_int(count, "prediction_native_class_counts")
-        items[simfile_id] = status
-    return items
+    try:
+        rows = _parse_item_rows(
+            path,
+            _compat_report_identity(identity),
+            strict_semantics=False,
+        )
+    except ReportIntegrityError as error:
+        _fail(str(error))
+    return {row.simfile_id: row.status for row in rows}
 
 
 def _parse_song_rows(
@@ -416,30 +364,18 @@ def _parse_song_rows(
     identity: _RunIdentity,
     successful_ids: set[str],
 ) -> dict[tuple[str, int, str], _SongRow]:
-    rows: dict[tuple[str, int, str], _SongRow] = {}
-    for row in _read_csv(path, _SONG_FIELDS):
-        _validate_report_identity(row, identity)
-        simfile_id = _parse_simfile_id(row["simfile_id"])
-        if simfile_id not in successful_ids:
-            _fail("per_song report contains a non-success item")
-        tolerance_ms = _parse_int(row["tolerance_ms"], "tolerance_ms", positive=True)
-        mode = row["mode"]
-        if mode not in _MODES:
-            _fail("per_song report contains an invalid mode")
-        for field in _SCORE_COUNT_FIELDS:
-            _parse_int(row[field], field)
-        precision = _parse_metric(row["precision"], "precision")
-        recall = _parse_metric(row["recall"], "recall")
-        f1 = _parse_metric(row["f1"], "f1")
-        _parse_metric(row["prediction_to_reference_ratio"], "prediction_to_reference_ratio")
-        _parse_metric(row["median_abs_error_ms"], "median_abs_error_ms")
-        _parse_metric(row["p95_abs_error_ms"], "p95_abs_error_ms")
-        _parse_metric(row["offset_ms"], "offset_ms")
-        key = (simfile_id, tolerance_ms, mode)
-        if key in rows:
-            _fail("per_song report contains duplicate score key")
-        rows[key] = _SongRow(simfile_id, tolerance_ms, mode, precision, recall, f1)
-    return rows
+    try:
+        published = _parse_published_song_rows(
+            path, _compat_report_identity(identity), successful_ids
+        )
+    except ReportIntegrityError as error:
+        _fail(str(error))
+    return {
+        (row.simfile_id, row.tolerance_ms, row.mode): _SongRow(
+            row.simfile_id, row.tolerance_ms, row.mode, row.precision, row.recall, row.f1
+        )
+        for row in published
+    }
 
 
 def _parse_class_rows(
@@ -447,39 +383,26 @@ def _parse_class_rows(
     identity: _RunIdentity,
     successful_ids: set[str],
 ) -> dict[tuple[str, int, str, str], _ClassRow]:
-    rows: dict[tuple[str, int, str, str], _ClassRow] = {}
-    for row in _read_csv(path, _CLASS_FIELDS):
-        _validate_report_identity(row, identity)
-        simfile_id = _parse_simfile_id(row["simfile_id"])
-        if simfile_id not in successful_ids:
-            _fail("per_class report contains a non-success item")
-        tolerance_ms = _parse_int(row["tolerance_ms"], "tolerance_ms", positive=True)
-        mode = row["mode"]
-        if mode not in _MODES:
-            _fail("per_class report contains an invalid mode")
-        common_class = row["common_class"]
-        if not common_class:
-            _fail("per_class report contains an invalid common_class")
-        for field in _SCORE_COUNT_FIELDS + ("reference_support", "prediction_support"):
-            _parse_int(row[field], field)
-        precision = _parse_metric(row["precision"], "precision")
-        recall = _parse_metric(row["recall"], "recall")
-        f1 = _parse_metric(row["f1"], "f1")
-        key = (simfile_id, tolerance_ms, mode, common_class)
-        if key in rows:
-            _fail("per_class report contains duplicate score key")
-        rows[key] = _ClassRow(
-            simfile_id,
-            tolerance_ms,
-            mode,
-            common_class,
-            _parse_int(row["reference_support"], "reference_support"),
-            _parse_int(row["prediction_support"], "prediction_support"),
-            precision,
-            recall,
-            f1,
+    try:
+        published = _parse_published_class_rows(
+            path, _compat_report_identity(identity), successful_ids
         )
-    return rows
+    except ReportIntegrityError as error:
+        _fail(str(error))
+    return {
+        (row.simfile_id, row.tolerance_ms, row.mode, row.common_class): _ClassRow(
+            row.simfile_id,
+            row.tolerance_ms,
+            row.mode,
+            row.common_class,
+            row.reference_support,
+            row.prediction_support,
+            row.precision,
+            row.recall,
+            row.f1,
+        )
+        for row in published
+    }
 
 
 def _parse_run_identity(snapshot: Mapping[str, object]) -> _RunIdentity:
@@ -581,19 +504,74 @@ def _parse_run(path: Path) -> tuple[Mapping[str, object], _RunIdentity, dict[str
     return snapshot, identity, parsed_items
 
 
+def _report_identity_from_snapshot(snapshot: Mapping[str, object]) -> CohortIdentity:
+    schema = snapshot.get("schema")
+    try:
+        if schema == "crux.oaf-corpus-run/v1":
+            from src.benchmark.oaf_corpus_run import _cohort_identity_from_snapshot
+
+            return _cohort_identity_from_snapshot(snapshot)
+        elif schema == "crux.muscriptor-corpus-run/v1":
+            from src.benchmark.muscriptor_corpus_run import _cohort_identity_from_snapshot
+
+            return _cohort_identity_from_snapshot(snapshot)
+        else:
+            _fail("run snapshot schema is unsupported")
+    except (TypeError, ValueError, StrictJsonError) as error:
+        _fail(f"run snapshot cohort identity is invalid: {error}")
+    raise AssertionError("unreachable")
+
+
 def _load_evidence(run_path: Path) -> _RunEvidence:
     snapshot, identity, run_items = _parse_run(run_path)
     reports_path = run_path.parent / "reports"
-    items_report = _parse_items(reports_path / "items.csv", identity)
+    summary_path = reports_path / "summary.json"
+    if summary_path.exists():
+        try:
+            published = read_cohort_reports(
+                reports_path,
+                expected_identity=_report_identity_from_snapshot(snapshot),
+            )
+        except ReportIntegrityError as error:
+            _fail(str(error))
+        items_report = {row.simfile_id: row.status for row in published.items}
+    else:
+        # Keep old in-memory comparison fixtures readable while all published
+        # report directories take the strict reader path above.
+        items_report = _parse_items(reports_path / "items.csv", identity)
     if set(items_report) != set(run_items):
         _fail("items report population does not match run snapshot")
     if any(items_report[item_id] != item.status for item_id, item in run_items.items()):
         _fail("items report status does not match run snapshot")
     successful_ids = {item_id for item_id, item in run_items.items() if item.status == "success"}
+    if summary_path.exists():
+        songs_report = {
+            (row.simfile_id, row.tolerance_ms, row.mode): _SongRow(
+                row.simfile_id, row.tolerance_ms, row.mode, row.precision, row.recall, row.f1
+            )
+            for row in published.songs
+        }
+        classes_report = {
+            (row.simfile_id, row.tolerance_ms, row.mode, row.common_class): _ClassRow(
+                row.simfile_id,
+                row.tolerance_ms,
+                row.mode,
+                row.common_class,
+                row.reference_support,
+                row.prediction_support,
+                row.precision,
+                row.recall,
+                row.f1,
+            )
+            for row in published.classes
+        }
+    else:
+        songs_report = _parse_song_rows(reports_path / "per_song.csv", identity, successful_ids)
+        classes_report = _parse_class_rows(reports_path / "per_class.csv", identity, successful_ids)
     reports = _Reports(
         items_report,
-        _parse_song_rows(reports_path / "per_song.csv", identity, successful_ids),
-        _parse_class_rows(reports_path / "per_class.csv", identity, successful_ids),
+        songs_report,
+        classes_report,
     )
     return _RunEvidence(identity, run_items, reports, snapshot)
 
@@ -674,338 +652,32 @@ def _pairable_ids(
     muscriptor: _RunEvidence,
     selected_ids: set[str] | None,
 ) -> tuple[set[str], dict[str, int]]:
-    oaf_success = {
-        item_id
-        for item_id, item in oaf.items.items()
-        if item.status == "success" and (selected_ids is None or item_id in selected_ids)
-    }
-    muscriptor_success = {
-        item_id
-        for item_id, item in muscriptor.items.items()
-        if item.status == "success" and (selected_ids is None or item_id in selected_ids)
-    }
-    common = oaf_success & muscriptor_success
-    source_mismatch = 0
-    pairable: set[str] = set()
-    for simfile_id in sorted(common, key=int):
-        oaf_item = oaf.items[simfile_id]
-        muscriptor_item = muscriptor.items[simfile_id]
-        if oaf_item.source_audio_sha256 != muscriptor_item.source_audio_sha256:
-            source_mismatch += 1
-            continue
-        if oaf_item.input_audio_sha256 != muscriptor_item.input_audio_sha256:
-            _fail(
-                "canonical-input integrity error: input_audio_sha256 mismatch for "
-                f"simfile_id={simfile_id} source_audio_sha256={oaf_item.source_audio_sha256}"
-            )
-        pairable.add(simfile_id)
-    exclusions = {
-        "oaf_only_success": len(oaf_success - muscriptor_success),
-        "muscriptor_only_success": len(muscriptor_success - oaf_success),
-        "source_audio_mismatch": source_mismatch,
-    }
-    return pairable, exclusions
+    return pairable_success_ids(
+        oaf,
+        muscriptor,
+        selected_ids,
+        require_identical_input_hash=True,
+        left_label="oaf",
+        right_label="muscriptor",
+    )
 
 
 def _selected_rows[T](rows: Mapping[T, object], selected_ids: set[str] | None) -> dict[T, object]:
-    if selected_ids is None:
-        return dict(rows)
-    return {key: row for key, row in rows.items() if key[0] in selected_ids}  # type: ignore[index]
+    return selected_rows(rows, selected_ids)
 
 
-def _metric_delta(oaf: Decimal | None, muscriptor: Decimal | None) -> Decimal | None:
-    if oaf is None or muscriptor is None:
-        return None
-    value = (muscriptor - oaf).quantize(_SIX_PLACES, rounding=ROUND_HALF_EVEN)
-    return Decimal(0) if value.is_zero() else value
-
-
-def _csv_decimal(value: Decimal | None) -> str:
-    if value is None:
-        return ""
-    if value.is_zero():
-        return "0"
-    rendered = format(value, "f").rstrip("0").rstrip(".")
-    return rendered or "0"
-
-
-def _song_key_sort_key(value: tuple[str, int, str]) -> tuple[int, int, int]:
-    return int(value[0]), value[1], _MODES[value[2]]
-
-
-def _paired_song_rows(
-    oaf: Mapping[tuple[str, int, str], _SongRow],
-    muscriptor: Mapping[tuple[str, int, str], _SongRow],
-    pairable_ids: set[str],
-) -> list[dict[str, str]]:
-    oaf_keys = {key for key in oaf if key[0] in pairable_ids}
-    muscriptor_keys = {key for key in muscriptor if key[0] in pairable_ids}
-    if oaf_keys != muscriptor_keys:
-        missing_from_muscriptor = sorted(oaf_keys - muscriptor_keys, key=_song_key_sort_key)
-        missing_from_oaf = sorted(muscriptor_keys - oaf_keys, key=_song_key_sort_key)
-        _fail(
-            "per_song score key grid mismatch for pairable songs"
-            f" (missing from MuScriptor: {missing_from_muscriptor},"
-            f" missing from OaF: {missing_from_oaf})"
-        )
-    rows: list[dict[str, str]] = []
-    for key in sorted(oaf_keys, key=_song_key_sort_key):
-        left, right = oaf[key], muscriptor[key]
-        rows.append(
-            {
-                "simfile_id": key[0],
-                "tolerance_ms": str(key[1]),
-                "mode": key[2],
-                "oaf_precision": _csv_decimal(left.precision),
-                "muscriptor_precision": _csv_decimal(right.precision),
-                "delta_precision": _csv_decimal(_metric_delta(left.precision, right.precision)),
-                "oaf_recall": _csv_decimal(left.recall),
-                "muscriptor_recall": _csv_decimal(right.recall),
-                "delta_recall": _csv_decimal(_metric_delta(left.recall, right.recall)),
-                "oaf_f1": _csv_decimal(left.f1),
-                "muscriptor_f1": _csv_decimal(right.f1),
-                "delta_f1": _csv_decimal(_metric_delta(left.f1, right.f1)),
-            }
-        )
-    return rows
-
-
-def _paired_class_rows(
-    oaf: Mapping[tuple[str, int, str, str], _ClassRow],
-    muscriptor: Mapping[tuple[str, int, str, str], _ClassRow],
-    pairable_ids: set[str],
-) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    for key in sorted(
-        set(oaf) & set(muscriptor),
-        key=lambda value: (int(value[0]), value[1], _MODES[value[2]], value[3]),
-    ):
-        if key[0] not in pairable_ids:
-            continue
-        left, right = oaf[key], muscriptor[key]
-        rows.append(
-            {
-                "simfile_id": key[0],
-                "tolerance_ms": str(key[1]),
-                "mode": key[2],
-                "common_class": key[3],
-                "oaf_reference_support": str(left.reference_support),
-                "muscriptor_reference_support": str(right.reference_support),
-                "oaf_prediction_support": str(left.prediction_support),
-                "muscriptor_prediction_support": str(right.prediction_support),
-                "oaf_precision": _csv_decimal(left.precision),
-                "muscriptor_precision": _csv_decimal(right.precision),
-                "delta_precision": _csv_decimal(_metric_delta(left.precision, right.precision)),
-                "oaf_recall": _csv_decimal(left.recall),
-                "muscriptor_recall": _csv_decimal(right.recall),
-                "delta_recall": _csv_decimal(_metric_delta(left.recall, right.recall)),
-                "oaf_f1": _csv_decimal(left.f1),
-                "muscriptor_f1": _csv_decimal(right.f1),
-                "delta_f1": _csv_decimal(_metric_delta(left.f1, right.f1)),
-            }
-        )
-    return rows
-
-
-def _aggregate_rows(rows: Iterable[Mapping[str, str]]) -> list[dict[str, object]]:
-    grouped: dict[tuple[int, str], list[Mapping[str, str]]] = defaultdict(list)
-    for row in rows:
-        grouped[(int(row["tolerance_ms"]), row["mode"])].append(row)
-    result: list[dict[str, object]] = []
-    for tolerance_ms, mode in sorted(grouped, key=lambda value: (value[0], _MODES[value[1]])):
-        group = grouped[(tolerance_ms, mode)]
-        aggregate: dict[str, object] = {
-            "tolerance_ms": tolerance_ms,
-            "mode": mode,
-            "row_count": len(group),
-        }
-        for metric in ("precision", "recall", "f1"):
-            values = [
-                Decimal(row[f"delta_{metric}"]) for row in group if row[f"delta_{metric}"] != ""
-            ]
-            aggregate[f"mean_delta_{metric}"] = (
-                Decimal(str(mean(values))).quantize(_SIX_PLACES, rounding=ROUND_HALF_EVEN)
-                if values
-                else None
-            )
-            aggregate[f"median_delta_{metric}"] = (
-                Decimal(str(median(values))).quantize(_SIX_PLACES, rounding=ROUND_HALF_EVEN)
-                if values
-                else None
-            )
-        result.append(aggregate)
-    return result
-
-
-def _population(run: _RunEvidence, selected_ids: set[str] | None) -> dict[str, int]:
-    statuses = [
-        item.status
-        for item_id, item in run.items.items()
-        if selected_ids is None or item_id in selected_ids
-    ]
-    counts = Counter(statuses)
-    return {
-        "total_count": len(statuses),
-        "eligible_count": len(statuses) - counts["quarantined"],
-        "success_count": counts["success"],
-        "failed_count": counts["failed"],
-        "skipped_count": counts["skipped"],
-        "quarantined_count": counts["quarantined"],
-    }
-
-
-def _runtime(snapshot: Mapping[str, object]) -> dict[str, object]:
-    fields = (
-        "aggregate_rtf",
-        "projected_full_wall_time_sec",
-        "measured_wall_time_sec",
-        "measured_audio_duration_sec",
-        "peak_process_rss_bytes",
-        "device_peak_memory_bytes",
-        "device",
-        "dtype",
-    )
-    return {field: snapshot[field] for field in fields if field in snapshot}
-
-
-def _summary(
-    oaf: _RunEvidence,
-    muscriptor: _RunEvidence,
-    pairable_ids: set[str],
-    exclusions: Mapping[str, int],
-    song_rows: list[dict[str, str]],
-    class_rows: list[dict[str, str]],
-    reference_manifest: object,
-    timing_manifest: object,
-    subset_path: Path | None,
-    subset_manifest: object | None,
-) -> dict[str, object]:
-    return {
-        "schema": COMPARISON_SCHEMA,
-        "identity": {
-            "reference_manifest_sha256": getattr(reference_manifest, "manifest_sha256"),
-            "reference_manifest_version": getattr(reference_manifest, "corpus_version"),
-            "reference_timing_manifest_sha256": getattr(timing_manifest, "manifest_sha256"),
-            "reference_timing_version": getattr(timing_manifest, "corpus_version"),
-            "input_view_id": oaf.identity.input_view_id,
-        },
-        "subset_manifest": (
-            None
-            if subset_path is None
-            else {
-                "path": str(subset_path),
-                "manifest_sha256": getattr(subset_manifest, "manifest_sha256"),
-                "corpus_version": getattr(subset_manifest, "corpus_version"),
-                "review_policy_version": getattr(subset_manifest, "review_policy_version"),
-                "review_ledger_sha256": getattr(subset_manifest, "review_ledger_sha256"),
-            }
-        ),
-        "models": {
-            "oaf": {
-                **oaf.identity.report_values(),
-                "population": _population(oaf, None),
-                "runtime": _runtime(oaf.snapshot),
-            },
-            "muscriptor": {
-                **muscriptor.identity.report_values(),
-                "population": _population(muscriptor, None),
-                "runtime": _runtime(muscriptor.snapshot),
-            },
-        },
-        "pairing": {
-            "pairable_success_intersection": len(pairable_ids),
-            "paired_song_row_count": len(song_rows),
-            "paired_class_row_count": len(class_rows),
-            "exclusions": dict(exclusions),
-        },
-        "aggregates": {
-            "song": _aggregate_rows(song_rows),
-            "class": _aggregate_rows(class_rows),
-        },
-    }
-
-
-def _write_csv(path: Path, fields: tuple[str, ...], rows: Iterable[Mapping[str, str]]) -> None:
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def _markdown_metric(value: object) -> str:
-    if value is None:
-        return "N/A"
-    if isinstance(value, Decimal):
-        return _csv_decimal(value)
-    return str(value)
-
-
-def _write_markdown(path: Path, summary: Mapping[str, object]) -> None:
-    identity = summary["identity"]
-    models = summary["models"]
-    pairing = summary["pairing"]
-    aggregates = summary["aggregates"]
-    assert isinstance(identity, Mapping)
-    assert isinstance(models, Mapping)
-    assert isinstance(pairing, Mapping)
-    assert isinstance(aggregates, Mapping)
-    lines = [
-        "# OaF/MuScriptor Published Report Comparison",
-        "",
-        "## Identity",
-        "",
-        *[f"- {field}: `{identity[field]}`" for field in identity],
-        "",
-        "## Population",
-        "",
-        "| model | total | eligible | success | failed | skipped | quarantined |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    for model_name in ("oaf", "muscriptor"):
-        model = models[model_name]
-        population = model["population"]
-        lines.append(
-            f"| {model_name} | {population['total_count']} | {population['eligible_count']} | "
-            f"{population['success_count']} | {population['failed_count']} | "
-            f"{population['skipped_count']} | {population['quarantined_count']} |"
-        )
-    lines.extend(
-        [
-            "",
-            "## Pairing",
-            "",
-            f"- pairable_success_intersection: {pairing['pairable_success_intersection']}",
-            f"- paired_song_row_count: {pairing['paired_song_row_count']}",
-            f"- paired_class_row_count: {pairing['paired_class_row_count']}",
-            "",
-            "### Exclusions",
-            "",
-        ]
-    )
-    exclusions = pairing["exclusions"]
-    lines.extend(f"- {key}: {value}" for key, value in exclusions.items())
-    for label in ("song", "class"):
-        lines.extend(
-            [
-                "",
-                f"## {label.title()} Delta Aggregates",
-                "",
-                "| tolerance_ms | mode | rows | mean Δ precision | median Δ precision | "
-                "mean Δ recall | median Δ recall | mean Δ F1 | median Δ F1 |",
-                "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-            ]
-        )
-        for row in aggregates[label]:
-            lines.append(
-                f"| {row['tolerance_ms']} | {row['mode']} | {row['row_count']} | "
-                f"{_markdown_metric(row['mean_delta_precision'])} | "
-                f"{_markdown_metric(row['median_delta_precision'])} | "
-                f"{_markdown_metric(row['mean_delta_recall'])} | "
-                f"{_markdown_metric(row['median_delta_recall'])} | "
-                f"{_markdown_metric(row['mean_delta_f1'])} | "
-                f"{_markdown_metric(row['median_delta_f1'])} |"
-            )
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+# The model-neutral comparison implementation lives in published_comparison.py.
+_metric_delta = _metric_delta
+_csv_decimal = _csv_decimal
+_paired_song_rows = _paired_song_rows
+_paired_class_rows = _paired_class_rows
+_aggregate_rows = _aggregate_rows
+_population = _population
+_runtime = _runtime
+_summary = _summary
+_write_csv = _write_csv
+_markdown_metric = _markdown_metric
+_write_markdown = _write_markdown
 
 
 def compare_oaf_muscriptor(request: ComparisonRequest) -> ComparisonOutcome:

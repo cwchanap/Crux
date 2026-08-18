@@ -12,6 +12,7 @@ from src.benchmark.backend_identity import (
     OAF_DESCRIPTOR_SCHEMA,
     StrictJsonError,
     build_descriptor,
+    canonical_json_bytes,
     strict_json_loads,
 )
 from src.benchmark.backends import CanonicalAudio, NativeEvent, NativePrediction
@@ -33,8 +34,10 @@ from src.benchmark.reference_timing import NativeReferenceEvent
 from src.benchmark.reports import (
     REPORT_SCHEMA,
     ReportArtifacts,
+    ReportIntegrityError,
     _csv_decimal,
     _report_decimal,
+    read_cohort_reports,
     write_cohort_reports,
 )
 from src.benchmark.taxonomy import DTX_LANE_MAP_VERSION, TAXONOMY_VERSION
@@ -365,3 +368,90 @@ def test_write_cohort_reports_renders_empty_markdown_sections_for_zero_success(
 def test_write_cohort_reports_rejects_non_cohort_score_result(tmp_path: Path) -> None:
     with pytest.raises(TypeError, match="result must be CohortScoreResult"):
         write_cohort_reports("not a result", tmp_path)  # type: ignore[arg-type]
+
+
+def test_read_cohort_reports_parses_all_published_rows_and_summary_aggregates(
+    tmp_path: Path,
+) -> None:
+    artifacts = write_cohort_reports(_result(), tmp_path)
+
+    reports = read_cohort_reports(tmp_path, expected_identity=_identity())
+
+    assert reports.identity == _identity()
+    assert reports.population.total_count == 4
+    assert reports.population.success_count == 3
+    assert [row.simfile_id for row in reports.items] == ["1", "2", "3", "4"]
+    assert reports.items[2].failure_reason == "prediction_missing"
+    assert reports.songs[0].simfile_id == "1"
+    assert reports.songs[0].precision == Decimal("0.5")
+    assert reports.classes[0].common_class == "kick"
+    assert reports.aggregates[0].event_micro.true_positives == 2
+    assert reports.aggregates[0].event_micro.false_positives == 1
+    assert artifacts.summary_json.exists()
+
+
+def test_read_cohort_reports_uses_summary_event_micro_without_recomputing_csv(
+    tmp_path: Path,
+) -> None:
+    artifacts = write_cohort_reports(_result(), tmp_path)
+    summary = strict_json_loads(artifacts.summary_json.read_bytes(), require_canonical=True)
+    summary["aggregates"][0]["event_micro"]["tp"] = 99
+    artifacts.summary_json.write_bytes(canonical_json_bytes(summary))
+
+    reports = read_cohort_reports(tmp_path, expected_identity=_identity())
+
+    assert reports.aggregates[0].event_micro.true_positives == 99
+
+
+def test_read_cohort_reports_rejects_invalid_csv_schema(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "items.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    path.write_text("wrong\n" + "\n".join(lines[1:]) + "\n", encoding="utf-8")
+
+    with pytest.raises(ReportIntegrityError, match="invalid column schema"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_bad_number(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "per_song.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    lines[1] = lines[1].replace(",0.5,", ",not-a-number,")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(ReportIntegrityError, match="numeric"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_identity_mismatch(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "per_song.csv"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("oaf-full-mix-v1,", "other-cohort,", 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReportIntegrityError, match="identity mismatch"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_duplicate_score_rows(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "per_song.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    path.write_text("\n".join(lines + [lines[1]]) + "\n", encoding="utf-8")
+
+    with pytest.raises(ReportIntegrityError, match="duplicate"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_score_row_for_non_success_item(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "per_song.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    failed_row = lines[1].replace(",1,", ",3,", 1)
+    path.write_text("\n".join(lines + [failed_row]) + "\n", encoding="utf-8")
+
+    with pytest.raises(ReportIntegrityError, match="non-success item"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
