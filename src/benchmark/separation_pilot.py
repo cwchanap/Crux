@@ -48,7 +48,13 @@ from src.benchmark.backend_identity import (
 )
 from src.benchmark.backends.base import CanonicalAudio, NativePrediction
 from src.benchmark.backends.oaf import OafBackendError, create_backend
-from src.benchmark.cohort_scoring import SCORING_VERSION
+from src.benchmark.cohort_scoring import (
+    SCORING_VERSION,
+    CohortIdentity,
+    cohort_item_from_validated_prediction_artifact,
+    cohort_item_without_prediction,
+    score_cohort,
+)
 from src.benchmark.corpus_cache import CacheIndexStore, ResolvedSourceAudio, resolve_source_audio
 from src.benchmark.durability import atomic_replace_bytes
 from src.benchmark.input_view import materialize_derived_audio
@@ -75,6 +81,7 @@ from src.benchmark.prediction_artifact import (
     read_prediction_artifact,
 )
 from src.benchmark.r2_corpus_models import format_manifest_timestamp, parse_manifest_timestamp
+from src.benchmark.reference_set import ReferenceMappingResult
 from src.benchmark.reference_set_manifest import (
     LoadedReferenceSetManifest,
     load_reference_set_manifest,
@@ -84,6 +91,7 @@ from src.benchmark.reference_timing_manifest import (
     LoadedReferenceTimingManifest,
     load_reference_timing_manifest,
 )
+from src.benchmark.reports import write_cohort_reports
 from src.benchmark.reviewed_subset import (
     LoadedReviewedSubsetManifest,
     ScoreReviewedSubsetOutcome,
@@ -102,10 +110,21 @@ from src.benchmark.separators import (
     run_htdemucs_drums,
     run_spleeter_drums,
 )
+from src.benchmark.taxonomy import DTX_LANE_MAP_VERSION, TAXONOMY_VERSION
 
 SEPARATION_RUN_SCHEMA = "crux.oaf-separation-run/v1"
 SPLEETER_INPUT_VIEW_ID = "crux.oaf-spleeter4-drums-mono44k1-pcm16/v1"
 HTDEMUCS_INPUT_VIEW_ID = "crux.oaf-htdemucs-drums-mono44k1-pcm16/v1"
+
+SEPARATION_FAILURE_TO_COHORT_REASON = {
+    "separation_failed": "inference_failed",
+    "stem_invalid": "inference_failed",
+    "canonical_input_failed": "inference_failed",
+    "inference_failed": "inference_failed",
+    "prediction_invalid": "prediction_artifact_invalid",
+    "prediction_output_conflict": "prediction_artifact_invalid",
+    "prediction_publish_failed": "prediction_artifact_invalid",
+}
 
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 _RUN_ID_RE = re.compile(r"oaf-separation-[0-9a-f]{16}\Z")
@@ -873,6 +892,184 @@ def _score_full_mix_control(
     return outcome
 
 
+def _derived_cohort_identity(
+    snapshot: Mapping[str, object],
+    reference: LoadedReferenceSetManifest,
+    timing: LoadedReferenceTimingManifest,
+    descriptor: BackendDescriptor,
+    *,
+    input_view_id: str,
+) -> CohortIdentity:
+    """Build one HPA-325 identity for a fixed derived input view."""
+    backend_id = descriptor.payload.get("backend_id")
+    model_id = descriptor.payload.get("model_id")
+    if not isinstance(model_id, str) or not model_id:
+        model_id = snapshot.get("model_id")
+    if not isinstance(backend_id, str) or not backend_id:
+        raise SeparationRunError("derived cohort backend identity is unavailable")
+    if not isinstance(model_id, str) or not model_id:
+        raise SeparationRunError("derived cohort model identity is unavailable")
+    run_id = snapshot.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise SeparationRunError("derived cohort parent run identity is unavailable")
+    cohort_id = sha256(
+        canonical_json_bytes(
+            {
+                "parent_oaf_run_id": run_id,
+                "input_view_id": input_view_id,
+            }
+        )
+    ).hexdigest()
+    return CohortIdentity(
+        cohort_id=cohort_id,
+        reference_manifest_sha256=reference.manifest_sha256,
+        reference_timing_version=timing.corpus_version,
+        taxonomy_version=TAXONOMY_VERSION,
+        lane_map_version=DTX_LANE_MAP_VERSION,
+        backend_id=backend_id,
+        model_id=model_id,
+        model_lock_sha256=_require_hash(
+            snapshot.get("oaf_model_lock_sha256"), "oaf_model_lock_sha256"
+        ),
+        backend_descriptor_sha256=_require_hash(
+            snapshot.get("oaf_backend_descriptor_sha256"),
+            "oaf_backend_descriptor_sha256",
+        ),
+        prediction_map_version=OAF_PREDICTION_MAP_ID,
+        input_view_id=input_view_id,
+    )
+
+
+def _derived_failure_reason(status: object, failure_code: object) -> str:
+    if isinstance(failure_code, str):
+        reason = SEPARATION_FAILURE_TO_COHORT_REASON.get(failure_code)
+        if reason is not None:
+            return reason
+    if isinstance(status, str):
+        reason = SEPARATION_FAILURE_TO_COHORT_REASON.get(status)
+        if reason is not None:
+            return reason
+        if status in {"pending", "separation_failed", "stem_invalid", "inference_failed"}:
+            return SEPARATION_FAILURE_TO_COHORT_REASON["inference_failed"]
+        if status == "prediction_invalid":
+            return SEPARATION_FAILURE_TO_COHORT_REASON["prediction_invalid"]
+    raise SeparationRunError("derived view has no supported HPA-325 failure reason")
+
+
+def _read_derived_prediction_artifact(
+    request: OafSeparationPilotRequest,
+    item: Mapping[str, object],
+    view: Mapping[str, object],
+    *,
+    input_view_id: str,
+) -> object:
+    prediction = view.get("prediction")
+    if not isinstance(prediction, Mapping):
+        raise PredictionArtifactError("derived prediction evidence is missing")
+    path_value = prediction.get("path")
+    if not isinstance(path_value, str) or not path_value:
+        raise PredictionArtifactError("derived prediction path is missing")
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = request.output_dir / path
+    artifact = read_prediction_artifact(read_regular_file_no_follow(path))
+    if not prediction_artifact_matches_run_row(
+        artifact,
+        _prediction_row_from_view(item, view),
+        expected_input_view_id=input_view_id,
+    ):
+        raise PredictionArtifactError("derived prediction does not match run evidence")
+    return artifact
+
+
+def _derived_cohort_item(
+    identity: CohortIdentity,
+    request: OafSeparationPilotRequest,
+    item: Mapping[str, object],
+    view: Mapping[str, object],
+    mapping: ReferenceMappingResult | None,
+    *,
+    input_view_id: str,
+) -> object:
+    raw_simfile_id = item.get("simfile_id")
+    if isinstance(raw_simfile_id, bool) or not isinstance(raw_simfile_id, int):
+        raise SeparationRunError("derived cohort item simfile_id is invalid")
+    simfile_id = str(raw_simfile_id)
+    status = view.get("status")
+    if status in {"success", "resumed"} and mapping is not None:
+        try:
+            artifact = _read_derived_prediction_artifact(
+                request,
+                item,
+                view,
+                input_view_id=input_view_id,
+            )
+            return cohort_item_from_validated_prediction_artifact(
+                identity,
+                simfile_id,
+                mapping,
+                artifact,  # type: ignore[arg-type]
+            )
+        except (OSError, PredictionArtifactError, StrictJsonError, TypeError, ValueError):
+            failure_reason = SEPARATION_FAILURE_TO_COHORT_REASON["prediction_invalid"]
+    elif status in {"success", "resumed"}:
+        failure_reason = SEPARATION_FAILURE_TO_COHORT_REASON["prediction_invalid"]
+    else:
+        failure_reason = _derived_failure_reason(status, view.get("failure_code"))
+    return cohort_item_without_prediction(
+        identity,
+        simfile_id,
+        mapping,
+        status="failed",
+        failure_reason=failure_reason,  # type: ignore[arg-type]
+    )
+
+
+def _score_derived_cohort(
+    request: OafSeparationPilotRequest,
+    run_dir: Path,
+    snapshot: Mapping[str, object],
+    rows: tuple[dict[str, object], ...],
+    mappings: Mapping[int, ReferenceMappingResult | None],
+    reference: LoadedReferenceSetManifest,
+    timing: LoadedReferenceTimingManifest,
+    descriptor: BackendDescriptor,
+    *,
+    view_name: str,
+    input_view_id: str,
+) -> None:
+    """Rebuild one complete derived population and publish HPA-325 reports."""
+    identity = _derived_cohort_identity(
+        snapshot,
+        reference,
+        timing,
+        descriptor,
+        input_view_id=input_view_id,
+    )
+    items: list[object] = []
+    for item in rows:
+        view = item.get(view_name)
+        if not isinstance(view, Mapping):
+            raise SeparationRunError("derived cohort view evidence is unavailable")
+        simfile_id = item.get("simfile_id")
+        if isinstance(simfile_id, bool) or not isinstance(simfile_id, int):
+            raise SeparationRunError("derived cohort item simfile_id is invalid")
+        items.append(
+            _derived_cohort_item(
+                identity,
+                request,
+                item,
+                view,
+                mappings.get(simfile_id),
+                input_view_id=input_view_id,
+            )
+        )
+    cohort_items = tuple(items)  # type: ignore[arg-type]
+    successful_ids = tuple(item.simfile_id for item in cohort_items if item.status == "success")
+    result = score_cohort(identity, cohort_items, diagnostics_for=successful_ids)
+    write_cohort_reports(result, run_dir / "views" / view_name / "reports")
+
+
 def _source_audio_kwargs(source_row: Mapping[str, object]) -> dict[str, str | None]:
     """Pass only the HPA-321 source identity fields to the cache resolver."""
     return {
@@ -1545,7 +1742,7 @@ def run_oaf_separation_pilot(
         # Reconstruct the exact HPA-323/HPA-324 mapping once at the fatal
         # boundary.  The returned mapping is intentionally not used to score
         # full mix: the public wrapper owns that operation.
-        preflight_reference_mappings(
+        reference_mappings = preflight_reference_mappings(
             reference,
             timing,
             timing_output_root=request.timing_manifest_path.parent.parent,
@@ -1689,6 +1886,30 @@ def run_oaf_separation_pilot(
             if disposition == "fatal_preflight":
                 return _fatal_outcome()
         _close_backend(backend)
+        _score_derived_cohort(
+            request,
+            run_dir,
+            snapshot,
+            rows,
+            reference_mappings,
+            reference,
+            timing,
+            descriptor,
+            view_name="spleeter",
+            input_view_id=SPLEETER_INPUT_VIEW_ID,
+        )
+        _score_derived_cohort(
+            request,
+            run_dir,
+            snapshot,
+            rows,
+            reference_mappings,
+            reference,
+            timing,
+            descriptor,
+            view_name="htdemucs",
+            input_view_id=HTDEMUCS_INPUT_VIEW_ID,
+        )
         derived_failed = any(
             isinstance(item.get(view_name), Mapping)
             and item[view_name].get("status")  # type: ignore[index]
@@ -1722,6 +1943,7 @@ __all__ = [
     "HTDEMUCS_INPUT_VIEW_ID",
     "OafSeparationPilotOutcome",
     "OafSeparationPilotRequest",
+    "SEPARATION_FAILURE_TO_COHORT_REASON",
     "SEPARATION_RUN_SCHEMA",
     "SEPARATOR_LOCK_PATHS",
     "SPLEETER_INPUT_VIEW_ID",
