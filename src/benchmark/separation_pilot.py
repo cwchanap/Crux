@@ -19,6 +19,7 @@ either runtime during preflight.
 from __future__ import annotations
 
 import math
+import os
 import re
 import time
 from collections.abc import Mapping
@@ -29,6 +30,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Callable, Literal
 
+from runtime.oaf_tf1.model import load_model_config
 from src.benchmark.artifact_io import (
     ArtifactPublicationError,
     PublishedArtifact,
@@ -57,8 +59,10 @@ from src.benchmark.oaf_corpus_run import (
     OAF_FULL_MIX_INPUT_VIEW_ID,
     OAF_PREDICTION_MAP_ID,
     OAF_WORKER_CLOSE_TIMEOUT_SECONDS,
+    _model_lock_path,
     build_run_id,
     classify_oaf_backend_error,
+    compute_model_lock_sha256,
     inference_config_sha256,
     parse_oaf_corpus_run,
 )
@@ -814,6 +818,40 @@ def _build_snapshot(
     }
 
 
+def _recover_prior_derived_evidence(
+    snapshot: dict[str, object], prior_snapshot: Mapping[str, object]
+) -> None:
+    """Carry the prior per-view ledger into the next durable snapshot."""
+    current_items = snapshot.get("items")
+    prior_items = prior_snapshot.get("items")
+    if not isinstance(current_items, list) or not isinstance(prior_items, list):
+        raise SeparationRunError("run snapshot items are unavailable")
+    prior_by_id: dict[int, Mapping[str, object]] = {}
+    for prior_item in prior_items:
+        if not isinstance(prior_item, Mapping) or not isinstance(prior_item.get("simfile_id"), int):
+            raise SeparationRunError("prior run snapshot item is invalid")
+        prior_by_id[prior_item["simfile_id"]] = prior_item
+    for item in current_items:
+        if not isinstance(item, dict) or not isinstance(item.get("simfile_id"), int):
+            raise SeparationRunError("run snapshot item is invalid")
+        prior_item = prior_by_id.get(item["simfile_id"])
+        if prior_item is None:
+            raise SeparationRunError("prior run snapshot membership is incomplete")
+        for field in ("source_row_sha256", "source_audio_id", "source_audio_sha256"):
+            if prior_item.get(field) != item.get(field):
+                raise SeparationRunError("prior run source identity does not match")
+        for view_name in ("spleeter", "htdemucs"):
+            prior_view = prior_item.get(view_name)
+            if not isinstance(prior_view, Mapping):
+                raise SeparationRunError("prior derived view evidence is invalid")
+            recovered_view = dict(prior_view)
+            for evidence_name in ("stem", "input", "prediction", "runtime"):
+                evidence = prior_view.get(evidence_name)
+                if isinstance(evidence, Mapping):
+                    recovered_view[evidence_name] = dict(evidence)
+            item[view_name] = recovered_view
+
+
 def _score_full_mix_control(
     request: OafSeparationPilotRequest,
     run_dir: Path,
@@ -1040,6 +1078,74 @@ def _close_backend(backend: object | None) -> None:
         pass
 
 
+def _validate_frozen_oaf_binding(parent: Mapping[str, object]) -> Path:
+    """Bind OaF construction to the parent run's exact local model identity."""
+    model_lock_sha256 = parent.get("model_lock_sha256")
+    checkpoint_archive_sha256 = parent.get("checkpoint_archive_sha256")
+    if not isinstance(model_lock_sha256, str) or not isinstance(checkpoint_archive_sha256, str):
+        raise OafBackendError("parent OaF model identity is unavailable", code="descriptor_invalid")
+    model_lock_path = _model_lock_path()
+    try:
+        current_lock_sha256 = compute_model_lock_sha256(model_lock_path)
+        current_config = load_model_config(model_lock_path)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise OafBackendError(
+            "parent OaF model lock cannot be verified", code="descriptor_invalid"
+        ) from error
+    if current_lock_sha256 != model_lock_sha256:
+        raise OafBackendError(
+            "current OaF model lock differs from the parent run",
+            code="descriptor_invalid",
+        )
+    if current_config.checkpoint.archive_sha256 != checkpoint_archive_sha256:
+        raise OafBackendError(
+            "current OaF checkpoint differs from the parent run",
+            code="descriptor_invalid",
+        )
+    cache_root = Path(
+        os.environ.get("CRUX_OAF_CHECKPOINT_CACHE", "artifacts/benchmark/model-cache")
+    )
+    return cache_root / "sha256" / checkpoint_archive_sha256
+
+
+def _bind_oaf_backend_factory(
+    backend_factory: Callable[..., object],
+    parent: Mapping[str, object],
+    descriptor: BackendDescriptor,
+) -> Callable[..., object]:
+    """Forward frozen checkpoint and descriptor identity to one backend factory."""
+
+    def bound_factory(**kwargs: object) -> object:
+        bound_kwargs = dict(kwargs)
+        bound_kwargs["checkpoint_dir"] = _validate_frozen_oaf_binding(parent)
+        bound_kwargs["descriptor"] = descriptor
+        return backend_factory(**bound_kwargs)
+
+    return bound_factory
+
+
+def _mark_outstanding_derived_views(snapshot: dict[str, object]) -> None:
+    """Persist the native poison disposition for all views not yet attempted."""
+    items = snapshot.get("items")
+    if not isinstance(items, list):
+        raise SeparationRunError("run snapshot items are unavailable")
+    for item in items:
+        if not isinstance(item, dict):
+            raise SeparationRunError("run snapshot item is invalid")
+        for view_name in ("spleeter", "htdemucs"):
+            view = item.get(view_name)
+            if not isinstance(view, dict):
+                raise SeparationRunError("derived view evidence is invalid")
+            if view.get("status") == "pending":
+                runtime = view.get("runtime")
+                _set_view_failure(
+                    view,
+                    status="inference_failed",
+                    failure_code="worker_protocol_failed",
+                    runtime=runtime if isinstance(runtime, Mapping) else None,
+                )
+
+
 def _execute_derived_view(
     request: OafSeparationPilotRequest,
     run_path: Path,
@@ -1060,6 +1166,7 @@ def _execute_derived_view(
     backend: object | None,
     descriptor: BackendDescriptor,
     perf_counter: Callable[[], float],
+    stop_disposition: list[str],
 ) -> object | None:
     """Execute one fixed view for one member and checkpoint each boundary."""
     view = item.get(view_name)
@@ -1370,6 +1477,7 @@ def _execute_derived_view(
         if disposition in {"poison", "fatal_preflight"}:
             _close_backend(backend)
             backend = None
+            stop_disposition.append(disposition)
     except (ArtifactPublicationError, PredictionArtifactError):
         _set_view_failure(
             view,
@@ -1478,6 +1586,8 @@ def run_oaf_separation_pilot(
             run_id=run_id,
             rows=rows,
         )
+        if prior_snapshot is not None:
+            _recover_prior_derived_evidence(snapshot, prior_snapshot)
         # Validate the complete local ledger before invoking the public
         # scorer.  A malformed parent evidence row is still fatal preflight;
         # it must not cause even the full-mix control wrapper to run.
@@ -1485,6 +1595,21 @@ def run_oaf_separation_pilot(
         # Resolve all authoritative source identities before either report
         # scoring or an expensive separator/OaF operation.
         sources = _resolve_pilot_sources(request, subset, rows)
+        raw_descriptor = parent.get("backend_descriptor")
+        if not isinstance(raw_descriptor, Mapping):
+            raise SeparationRunError("parent backend descriptor is unavailable")
+        descriptor = BackendDescriptor(
+            payload=dict(raw_descriptor),
+            sha256=parent["backend_descriptor_sha256"],  # type: ignore[arg-type]
+        )
+        _validate_frozen_oaf_binding(parent)
+        bound_backend_factory = _bind_oaf_backend_factory(
+            selected_backend_factory, parent, descriptor
+        )
+        view_configs = {
+            "spleeter": _view_inference_config(parent, SPLEETER_INPUT_VIEW_ID),
+            "htdemucs": _view_inference_config(parent, HTDEMUCS_INPUT_VIEW_ID),
+        }
         write_oaf_separation_run(run_path, snapshot)
 
         # Publish the control only after every fatal identity and source check
@@ -1494,17 +1619,6 @@ def run_oaf_separation_pilot(
         snapshot["overall_status"] = "pending" if control.exit_code == 0 else "partial"
         write_oaf_separation_run(run_path, snapshot)
 
-        raw_descriptor = parent.get("backend_descriptor")
-        if not isinstance(raw_descriptor, Mapping):
-            raise SeparationRunError("parent backend descriptor is unavailable")
-        descriptor = BackendDescriptor(
-            payload=dict(raw_descriptor),
-            sha256=parent["backend_descriptor_sha256"],  # type: ignore[arg-type]
-        )
-        view_configs = {
-            "spleeter": _view_inference_config(parent, SPLEETER_INPUT_VIEW_ID),
-            "htdemucs": _view_inference_config(parent, HTDEMUCS_INPUT_VIEW_ID),
-        }
         prior_items = prior_snapshot.get("items", []) if isinstance(prior_snapshot, Mapping) else []
         prior_by_id = {
             row["simfile_id"]: row
@@ -1512,12 +1626,14 @@ def run_oaf_separation_pilot(
             if isinstance(row, Mapping) and isinstance(row.get("simfile_id"), int)
         }
         backend: object | None = None
+        stop_disposition: list[str] = []
         for item in rows:
             simfile_id = item.get("simfile_id")
             source = sources.get(simfile_id) if isinstance(simfile_id, int) else None
             if source is None:
                 raise SeparationRunError("resolved source is unavailable")
             prior_item = prior_by_id.get(simfile_id)
+            stop_disposition.clear()
             backend = _execute_derived_view(
                 request,
                 run_path,
@@ -1533,11 +1649,15 @@ def run_oaf_separation_pilot(
                 prior_item=prior_item,
                 separator_runner=selected_spleeter_runner,  # type: ignore[arg-type]
                 interpreter=request.spleeter_python,
-                backend_factory=selected_backend_factory,  # type: ignore[arg-type]
+                backend_factory=bound_backend_factory,
                 backend=backend,
                 descriptor=descriptor,
                 perf_counter=selected_perf_counter,  # type: ignore[arg-type]
+                stop_disposition=stop_disposition,
             )
+            if stop_disposition:
+                break
+            stop_disposition.clear()
             backend = _execute_derived_view(
                 request,
                 run_path,
@@ -1553,11 +1673,21 @@ def run_oaf_separation_pilot(
                 prior_item=prior_item,
                 separator_runner=selected_htdemucs_runner,  # type: ignore[arg-type]
                 interpreter=request.demucs_python,
-                backend_factory=selected_backend_factory,  # type: ignore[arg-type]
+                backend_factory=bound_backend_factory,
                 backend=backend,
                 descriptor=descriptor,
                 perf_counter=selected_perf_counter,  # type: ignore[arg-type]
+                stop_disposition=stop_disposition,
             )
+            if stop_disposition:
+                break
+        disposition = stop_disposition[0] if stop_disposition else None
+        if disposition is not None:
+            _mark_outstanding_derived_views(snapshot)
+            snapshot["overall_status"] = "failed" if disposition == "fatal_preflight" else "partial"
+            write_oaf_separation_run(run_path, snapshot)
+            if disposition == "fatal_preflight":
+                return _fatal_outcome()
         _close_backend(backend)
         derived_failed = any(
             isinstance(item.get(view_name), Mapping)
