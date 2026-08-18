@@ -217,6 +217,15 @@ def _path(value: object, field: str) -> str:
     return value
 
 
+def _owner_root(value: object, field: str) -> Path:
+    if not isinstance(value, str) or not value:
+        _fail(f"{field} owner root is invalid")
+    root = Path(value)
+    if not root.is_absolute():
+        _fail(f"{field} owner root is invalid")
+    return root
+
+
 def _positive_duration(value: object, field: str) -> Decimal:
     if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
         _fail(f"{field} is invalid")
@@ -584,22 +593,32 @@ def load_separation_pilot_manifest(path: Path) -> LoadedSeparationPilotManifest:
     )
 
 
-def _recorded_artifact_path(raw_path: object, *, field: str, run_path: Path) -> Path:
+def _recorded_artifact_path(
+    raw_path: object,
+    *,
+    field: str,
+    run_path: Path,
+    owner_root: Path | None = None,
+) -> Path:
     """Resolve one persisted path from its fixed HPA-328 owner root.
 
-    The pilot records stem paths relative to the established sibling ``cache``
-    directory, prediction paths relative to the separation output root, and
-    comparison paths relative to the run directory. Each path therefore has
-    one owner; no directory discovery is permitted at finalization time.
+    Each path has one owner: parent OaF predictions and retained stems carry
+    their exact owner root in the mutable run evidence, derived predictions
+    are relative to the separation output root, and comparisons are relative
+    to the run directory. No directory discovery is permitted at finalization
+    time.
     """
     path = _path(raw_path, field)
     parsed = PurePosixPath(path)
     if field.startswith("comparison_artifacts."):
         root = run_path.parent
+    elif field in {"full_mix.prediction", "spleeter.stem", "htdemucs.stem"}:
+        if owner_root is None:
+            _fail(f"{field} owner root is unavailable")
+            raise AssertionError("unreachable")
+        root = owner_root
     elif field.endswith(".prediction"):
         root = run_path.parents[2]
-    elif field.endswith(".stem"):
-        root = run_path.parents[3] / "cache"
     else:
         _fail(f"{field} has no retained artifact owner")
         raise AssertionError("unreachable")
@@ -613,9 +632,15 @@ def _read_matching_artifact(
     field: str,
     run_path: Path,
     subset_path: Path,
+    owner_root: Path | None = None,
 ) -> tuple[Path, bytes]:
     del subset_path
-    path = _recorded_artifact_path(raw_path, field=field, run_path=run_path)
+    path = _recorded_artifact_path(
+        raw_path,
+        field=field,
+        run_path=run_path,
+        owner_root=owner_root,
+    )
     expected = _hash(expected_sha256, f"{field}.sha256")
     try:
         content = read_regular_file_no_follow(path)
@@ -634,6 +659,7 @@ def _prediction_payload(
     field: str,
     run_path: Path,
     subset_path: Path,
+    owner_root: Path | None,
     input_view_id: str,
     source_audio_id: str,
     source_audio_sha256: str,
@@ -646,6 +672,7 @@ def _prediction_payload(
         field=artifact_field,
         run_path=run_path,
         subset_path=subset_path,
+        owner_root=owner_root,
     )
     del path
     try:
@@ -705,12 +732,14 @@ def _stem_payload(
     separator_lock_sha256: str,
 ) -> dict[str, object]:
     artifact_field = f"{field}.stem"
+    owner_root = _owner_root(raw_stem.get("owner_root"), artifact_field)
     _read_matching_artifact(
         raw_stem.get("path"),
         raw_stem.get("sha256"),
         field=artifact_field,
         run_path=run_path,
         subset_path=subset_path,
+        owner_root=owner_root,
     )
     return {
         "path": _path(raw_stem.get("path"), field),
@@ -727,6 +756,7 @@ def _view_payload(
     item: Mapping[str, object],
     run_path: Path,
     subset_path: Path,
+    parent_prediction_root: Path,
 ) -> dict[str, object]:
     input_view_id = _VIEW_IDS[field]
     source_audio_id = _text(item["source_audio_id"], "source_audio_id")
@@ -762,6 +792,7 @@ def _view_payload(
             field=field,
             run_path=run_path,
             subset_path=subset_path,
+            owner_root=parent_prediction_root if field == "full_mix" else None,
             input_view_id=input_view_id,
             source_audio_id=source_audio_id,
             source_audio_sha256=source_audio_sha256,
@@ -845,7 +876,9 @@ def _parent_snapshot_candidates(run_path: Path, parent_run_id: str) -> tuple[Pat
     return tuple(candidates)
 
 
-def _oaf_parent_identity(snapshot: Mapping[str, object], *, run_path: Path) -> dict[str, str]:
+def _oaf_parent_identity(
+    snapshot: Mapping[str, object], *, run_path: Path
+) -> tuple[dict[str, str], Path]:
     """Load the immutable OaF identity needed by the handoff row.
 
     HPA-328 intentionally stores the parent run ID and hash identities in its
@@ -856,6 +889,7 @@ def _oaf_parent_identity(snapshot: Mapping[str, object], *, run_path: Path) -> d
     """
     parent_run_id = _text(snapshot.get("parent_oaf_run_id"), "parent_oaf_run_id")
     parent: Mapping[str, object] = snapshot
+    parent_path: Path | None = None
     for candidate in _parent_snapshot_candidates(run_path, parent_run_id):
         try:
             content = read_regular_file_no_follow(candidate)
@@ -864,10 +898,16 @@ def _oaf_parent_identity(snapshot: Mapping[str, object], *, run_path: Path) -> d
             continue
         if isinstance(candidate_value, Mapping) and candidate_value.get("run_id") == parent_run_id:
             parent = candidate_value
+            parent_path = candidate
             break
 
-    if parent.get("run_id") != parent_run_id:
+    if parent.get("run_id") != parent_run_id or parent_path is None:
         _fail("parent OaF run identity is unavailable")
+    try:
+        parent_output_root = parent_path.parents[2]
+    except IndexError:
+        _fail("parent OaF output root is unavailable")
+        raise AssertionError("unreachable")
     inference_config = parent.get("inference_config")
     if not isinstance(inference_config, Mapping):
         inference_config = {}
@@ -880,32 +920,37 @@ def _oaf_parent_identity(snapshot: Mapping[str, object], *, run_path: Path) -> d
             result = inference_config.get(config_field)
         return result
 
-    return {
-        "parent_oaf_run_id": parent_run_id,
-        "oaf_model_id": _text(_field_value("model_id"), "oaf_model_id"),
-        "oaf_backend_descriptor_sha256": _hash(
-            _field_value("backend_descriptor_sha256"), "oaf_backend_descriptor_sha256"
-        ),
-        "oaf_model_lock_sha256": _hash(_field_value("model_lock_sha256"), "oaf_model_lock_sha256"),
-        "oaf_checkpoint_archive_sha256": _hash(
-            _field_value("checkpoint_archive_sha256"), "oaf_checkpoint_archive_sha256"
-        ),
-        "oaf_adapter_revision": _text(
-            _field_value("adapter_revision", config_field="adapter_revision"),
-            "oaf_adapter_revision",
-        ),
-        "oaf_canonicalization_revision": _text(
-            _field_value("canonicalization_revision", config_field="canonicalization_revision"),
-            "oaf_canonicalization_revision",
-        ),
-        "oaf_inference_config_sha256": _hash(
-            _field_value("inference_config_sha256"), "oaf_inference_config_sha256"
-        ),
-        "oaf_prediction_map_version": _text(
-            _field_value("prediction_map_version", config_field="prediction_map_version"),
-            "oaf_prediction_map_version",
-        ),
-    }
+    return (
+        {
+            "parent_oaf_run_id": parent_run_id,
+            "oaf_model_id": _text(_field_value("model_id"), "oaf_model_id"),
+            "oaf_backend_descriptor_sha256": _hash(
+                _field_value("backend_descriptor_sha256"), "oaf_backend_descriptor_sha256"
+            ),
+            "oaf_model_lock_sha256": _hash(
+                _field_value("model_lock_sha256"), "oaf_model_lock_sha256"
+            ),
+            "oaf_checkpoint_archive_sha256": _hash(
+                _field_value("checkpoint_archive_sha256"), "oaf_checkpoint_archive_sha256"
+            ),
+            "oaf_adapter_revision": _text(
+                _field_value("adapter_revision", config_field="adapter_revision"),
+                "oaf_adapter_revision",
+            ),
+            "oaf_canonicalization_revision": _text(
+                _field_value("canonicalization_revision", config_field="canonicalization_revision"),
+                "oaf_canonicalization_revision",
+            ),
+            "oaf_inference_config_sha256": _hash(
+                _field_value("inference_config_sha256"), "oaf_inference_config_sha256"
+            ),
+            "oaf_prediction_map_version": _text(
+                _field_value("prediction_map_version", config_field="prediction_map_version"),
+                "oaf_prediction_map_version",
+            ),
+        },
+        parent_output_root,
+    )
 
 
 def _validate_view_oaf_identity(raw_item: Mapping[str, object], parent: Mapping[str, str]) -> None:
@@ -939,6 +984,7 @@ def _build_rows(
     subset_path: Path,
     decision: SeparationDecision,
     rationale: str,
+    artifact_roots: dict[str, Path],
 ) -> tuple[dict[str, object], ...]:
     if snapshot.get("schema") != SEPARATION_RUN_SCHEMA:
         _fail("run snapshot schema is invalid")
@@ -994,7 +1040,8 @@ def _build_rows(
         _hash(snapshot[field], field)
     _text(snapshot["parent_oaf_run_id"], "parent_oaf_run_id")
     _commit(snapshot["crux_commit"])
-    parent_identity = _oaf_parent_identity(snapshot, run_path=run_path)
+    parent_identity, parent_prediction_root = _oaf_parent_identity(snapshot, run_path=run_path)
+    artifact_roots["parent_prediction"] = parent_prediction_root
     run_id = _text(snapshot.get("run_id"), "run_id")
     if _RUN_ID_RE.fullmatch(run_id) is None:
         _fail("run_id is invalid")
@@ -1023,6 +1070,13 @@ def _build_rows(
         source_audio_id = _text(raw_item.get("source_audio_id"), "source_audio_id")
         source_audio_sha256 = _hash(raw_item.get("source_audio_sha256"), "source_audio_sha256")
         _validate_view_oaf_identity(raw_item, parent_identity)
+        for view_name in ("spleeter", "htdemucs"):
+            raw_view = raw_item[view_name]
+            if isinstance(raw_view, Mapping) and isinstance(raw_view.get("stem"), Mapping):
+                cache_root = _owner_root(raw_view["stem"].get("owner_root"), f"{view_name}.stem")
+                previous_cache_root = artifact_roots.setdefault("cache", cache_root)
+                if previous_cache_root != cache_root:
+                    _fail("derived stem owner roots are inconsistent")
         row = {
             "schema_version": SEPARATION_PILOT_SCHEMA,
             "separation_run_id": run_id,
@@ -1055,6 +1109,7 @@ def _build_rows(
                 item=raw_item,
                 run_path=run_path,
                 subset_path=subset_path,
+                parent_prediction_root=parent_prediction_root,
             ),
             "spleeter": _view_payload(
                 raw_item["spleeter"],
@@ -1062,6 +1117,7 @@ def _build_rows(
                 item=raw_item,
                 run_path=run_path,
                 subset_path=subset_path,
+                parent_prediction_root=parent_prediction_root,
             ),
             "htdemucs": _view_payload(
                 raw_item["htdemucs"],
@@ -1069,6 +1125,7 @@ def _build_rows(
                 item=raw_item,
                 run_path=run_path,
                 subset_path=subset_path,
+                parent_prediction_root=parent_prediction_root,
             ),
             "comparison_artifacts": comparison,
             "decision": decision,
@@ -1079,8 +1136,16 @@ def _build_rows(
     return tuple(rows)
 
 
-def _rehash_rows(rows: tuple[dict[str, object], ...], *, run_path: Path, subset_path: Path) -> None:
+def _rehash_rows(
+    rows: tuple[dict[str, object], ...],
+    *,
+    run_path: Path,
+    subset_path: Path,
+    artifact_roots: Mapping[str, Path],
+) -> None:
     """Re-read retained evidence after rendering and immediately before publish."""
+    parent_prediction_root = artifact_roots.get("parent_prediction")
+    cache_root = artifact_roots.get("cache")
     for row in rows:
         for field in ("spleeter", "htdemucs"):
             view = row[field]
@@ -1095,6 +1160,7 @@ def _rehash_rows(rows: tuple[dict[str, object], ...], *, run_path: Path, subset_
                 field=f"{field}.stem",
                 run_path=run_path,
                 subset_path=subset_path,
+                owner_root=cache_root,
             )
             _read_matching_artifact(
                 prediction["path"],
@@ -1113,6 +1179,7 @@ def _rehash_rows(rows: tuple[dict[str, object], ...], *, run_path: Path, subset_
                 field="full_mix.prediction",
                 run_path=run_path,
                 subset_path=subset_path,
+                owner_root=parent_prediction_root,
             )
         comparison = row["comparison_artifacts"]
         assert isinstance(comparison, Mapping)
@@ -1160,6 +1227,7 @@ def finalize_separation_pilot(
             snapshot = parse_oaf_separation_run(run_content)
         except (OSError, TypeError, StrictJsonError, ValueError) as error:
             raise SeparationHandoffError("run snapshot is invalid") from error
+        artifact_roots: dict[str, Path] = {}
         rows = _build_rows(
             snapshot,
             subset,
@@ -1167,11 +1235,17 @@ def finalize_separation_pilot(
             subset_path=request.subset_manifest_path,
             decision=request.decision,
             rationale=request.rationale,
+            artifact_roots=artifact_roots,
         )
         rendered = render_manifest(rows)
         # The second read is intentionally after the manifest bytes are fixed,
         # closing the TOCTOU window before the immutable publication call.
-        _rehash_rows(rows, run_path=request.run_path, subset_path=request.subset_manifest_path)
+        _rehash_rows(
+            rows,
+            run_path=request.run_path,
+            subset_path=request.subset_manifest_path,
+            artifact_roots=artifact_roots,
+        )
         published = publish_manifest(request.output_manifest.parent, rendered)
         _direct_manifest_alias(request.output_manifest, published, rendered.content)
         return FinalizeSeparationPilotOutcome(exit_code=0, manifest=published)

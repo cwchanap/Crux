@@ -37,7 +37,12 @@ def _publish_comparison_fixtures(output_dir: Path) -> None:
         path.write_bytes(f"comparison:{relative}\n".encode("utf-8"))
 
 
-def _successful_pilot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[object, Path, Path]:
+def _successful_pilot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    cache_dir: Path | None = None,
+) -> tuple[object, Path, Path]:
     """Run the existing synthetic pilot seams and retain its immutable evidence."""
     from src.benchmark.separation_pilot import run_oaf_separation_pilot
     from tests.benchmark.reviewed_subset_fixtures import build_reviewed_subset_oaf_fixture
@@ -79,6 +84,18 @@ def _successful_pilot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[
         destination = separation_prediction_root / prediction["path"]
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
+    if cache_dir is not None:
+        # The shared Task 6 seam writes its stems under tmp_path/cache. Move
+        # that exact cache to the caller-supplied owner and update only the
+        # mutable producer snapshot's owner metadata.
+        shutil.move(str(request.cache_dir), str(cache_dir))
+        for item in snapshot["items"]:
+            for view_name in ("spleeter", "htdemucs"):
+                item[view_name]["stem"]["owner_root"] = str(cache_dir.resolve())
+        from src.benchmark.separation_pilot import write_oaf_separation_run
+
+        write_oaf_separation_run(outcome.run_path, snapshot)
+        request = replace(request, cache_dir=cache_dir)
     return request, subset_path, outcome.run_path
 
 
@@ -156,6 +173,82 @@ def test_finalize_rejects_edited_htdemucs_evidence(
     assert outcome.exit_code == 2
     assert outcome.manifest is None
     assert not output_manifest.exists()
+
+
+def test_finalize_rehashes_full_mix_prediction_at_parent_owner_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, subset_path, run_path = _successful_pilot(tmp_path, monkeypatch)
+    snapshot = json.loads(run_path.read_text(encoding="utf-8"))
+    relative = snapshot["items"][0]["full_mix"]["prediction"]["path"]
+    parent_path = tmp_path / "oaf-output" / relative
+    separation_decoy = request.output_dir / relative
+    assert parent_path.exists()
+    separation_decoy.unlink()
+
+    outcome = finalize_separation_pilot(
+        FinalizeSeparationPilotRequest(
+            run_path=run_path,
+            subset_manifest_path=subset_path,
+            output_manifest=tmp_path / "parent-owned-handoff" / "manifest.jsonl",
+            decision="keep_full_mix",
+            rationale="The inherited full-mix prediction remains parent-owned.",
+        )
+    )
+
+    assert outcome.exit_code == 0
+    assert outcome.manifest is not None
+
+
+def test_finalize_rejects_full_mix_decoy_when_parent_prediction_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, subset_path, run_path = _successful_pilot(tmp_path, monkeypatch)
+    snapshot = json.loads(run_path.read_text(encoding="utf-8"))
+    relative = snapshot["items"][0]["full_mix"]["prediction"]["path"]
+    parent_path = tmp_path / "oaf-output" / relative
+    separation_decoy = request.output_dir / relative
+    assert parent_path.exists() and separation_decoy.exists()
+    parent_path.unlink()
+
+    outcome = finalize_separation_pilot(
+        FinalizeSeparationPilotRequest(
+            run_path=run_path,
+            subset_manifest_path=subset_path,
+            output_manifest=tmp_path / "parent-decoy-handoff" / "manifest.jsonl",
+            decision="keep_full_mix",
+            rationale="A separation-root decoy cannot replace parent evidence.",
+        )
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.manifest is None
+
+
+def test_finalize_uses_caller_supplied_cache_owner_for_retained_stems(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, subset_path, run_path = _successful_pilot(
+        tmp_path,
+        monkeypatch,
+        cache_dir=tmp_path / "caller-cache",
+    )
+
+    outcome = finalize_separation_pilot(
+        FinalizeSeparationPilotRequest(
+            run_path=run_path,
+            subset_manifest_path=subset_path,
+            output_manifest=tmp_path / "caller-cache-handoff" / "manifest.jsonl",
+            decision="use_htdemucs",
+            rationale="Retained stems stay under the supplied cache owner.",
+        )
+    )
+
+    assert outcome.exit_code == 0
+    assert outcome.manifest is not None
 
 
 @pytest.mark.parametrize("evidence", ["stem", "prediction"])
