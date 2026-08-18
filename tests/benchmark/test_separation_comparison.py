@@ -5,7 +5,10 @@ from __future__ import annotations
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+
 from src.benchmark.published_comparison import (
+    ComparisonIntegrityError,
     PublishedRunEvidence,
     PublishedRunItem,
     pairable_success_ids,
@@ -62,6 +65,36 @@ def test_paired_event_micro_sums_published_counts_and_uses_authoritative_minutes
     assert row["spleeter"]["f1"] == Decimal("0.8")
     assert row["spleeter"]["fp_per_minute"] == Decimal("0.333333")
     assert row["spleeter"]["fn_per_minute"] == Decimal("0.666667")
+
+
+@pytest.mark.parametrize(
+    "source_durations",
+    (
+        {"1": Decimal("60")},
+        {"1": Decimal("60"), "2": None},
+        {"1": Decimal("60"), "2": Decimal("NaN")},
+        {"1": Decimal("60"), "2": Decimal("0")},
+        {"1": Decimal("60"), "2": Decimal("-1")},
+    ),
+    ids=("missing", "null", "nonfinite", "zero", "negative"),
+)
+def test_paired_event_micro_rejects_pairable_song_without_positive_finite_duration(
+    source_durations: dict[str, object],
+) -> None:
+    reports = SimpleNamespace(
+        songs=(_song("1", tp=1, fp=0, fn=0, f1="1"), _song("2", tp=1, fp=0, fn=0, f1="1")),
+    )
+
+    with pytest.raises(
+        ComparisonIntegrityError,
+        match="positive finite authoritative duration",
+    ):
+        aggregate_paired_event_micro(
+            reports,
+            reports,
+            {"1", "2"},
+            source_durations,
+        )
 
 
 def test_separation_pairing_allows_distinct_derived_input_hashes() -> None:
