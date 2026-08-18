@@ -239,3 +239,24 @@ def _prediction(audio: CanonicalAudio, descriptor: BackendDescriptor) -> NativeP
             ),
         ),
     )
+
+
+class _HealthyBackend:
+    """Minimal backend that returns a deterministic prediction for every call."""
+
+    def __init__(self, descriptor: BackendDescriptor) -> None:
+        self._descriptor = descriptor
+
+    def descriptor(self) -> BackendDescriptor:
+        return self._descriptor
+
+    def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+        return _prediction(audio, self._descriptor)
+
+    def close(self) -> None:
+        return None
+
+
+def _healthy_backend(descriptor: BackendDescriptor) -> _HealthyBackend:
+    """Create a healthy backend instance that returns deterministic predictions."""
+    return _HealthyBackend(descriptor)
