@@ -42,6 +42,7 @@ from src.benchmark.durability import atomic_replace_bytes
 from src.benchmark.oaf_corpus_run import (
     OAF_CORPUS_RUN_SCHEMA,
     OAF_FULL_MIX_INPUT_VIEW_ID,
+    build_run_id,
     inference_config_sha256,
     parse_oaf_corpus_run,
 )
@@ -59,6 +60,7 @@ from src.benchmark.reviewed_subset import (
     LoadedReviewedSubsetManifest,
     ScoreReviewedSubsetOutcome,
     ScoreReviewedSubsetRequest,
+    _source_row_sha256,
     load_reviewed_subset_manifest,
     score_oaf_reviewed_subset,
 )
@@ -218,6 +220,12 @@ def _require_nonempty_string(value: object, field: str) -> str:
     return value
 
 
+def _require_crux_commit(value: object) -> str:
+    if not isinstance(value, str) or _COMMIT_RE.fullmatch(value) is None:
+        raise SeparationRunError("crux_commit must be a lowercase 40-character commit")
+    return value
+
+
 def _normalize_snapshot_value(value: object) -> JsonValue:
     if value is None or isinstance(value, (bool, int, str, Decimal)):
         return value  # type: ignore[return-value]
@@ -308,11 +316,7 @@ def _validate_snapshot(snapshot: dict[str, JsonValue]) -> dict[str, JsonValue]:
         raise SeparationRunError("htdemucs input view identity is invalid")
     if snapshot["scoring_version"] != SCORING_VERSION:
         raise SeparationRunError("scoring_version is invalid")
-    crux_commit = snapshot.get("crux_commit")
-    if crux_commit is not None and (
-        not isinstance(crux_commit, str) or _COMMIT_RE.fullmatch(crux_commit) is None
-    ):
-        raise SeparationRunError("crux_commit is invalid")
+    _require_crux_commit(snapshot.get("crux_commit"))
     started_at = snapshot.get("started_at")
     try:
         parse_manifest_timestamp(started_at)
@@ -521,6 +525,21 @@ def _validate_parent_identity(
             raise SeparationRunError("parent inference config hash is invalid")
     except (StrictJsonError, TypeError, ValueError) as error:
         raise SeparationRunError("parent inference config is invalid") from error
+    try:
+        expected_parent_run_id = build_run_id(
+            reference.manifest_sha256,
+            timing.manifest_sha256,
+            parent["backend_descriptor_sha256"],
+            parent["model_lock_sha256"],
+            parent["checkpoint_archive_sha256"],
+            config_sha,
+            parent.get("include_simfile_ids", ()),
+            parent.get("exclude_simfile_ids", ()),
+        )
+    except (StrictJsonError, TypeError, ValueError) as error:
+        raise SeparationRunError("parent run identity inputs are invalid") from error
+    if parent["run_id"] != expected_parent_run_id:
+        raise SeparationRunError("parent run_id does not match deterministic OaF identity")
     for item in parent.get("items", []):
         if not isinstance(item, Mapping):
             raise SeparationRunError("parent run item is invalid")
@@ -575,6 +594,8 @@ def _validate_subset_population(
         ):
             if loaded.source_row[field] != reference_row[field]:
                 raise SeparationRunError("reviewed subset member reference identity is invalid")
+        if loaded.source_row["source_row_sha256"] != _source_row_sha256(reference_row):
+            raise SeparationRunError("reviewed subset source row identity is invalid")
 
 
 def _subset_parent_rows(
@@ -605,9 +626,14 @@ def _subset_parent_rows(
         if parent_row is None:
             raise SeparationRunError("reviewed subset member is absent from parent run")
         source_id = parent_row.get("source_audio_id", loaded.source_row["source_audio_key"])
-        source_sha = parent_row.get(
-            "source_audio_sha256", loaded.source_row["source_audio_content_hash"]
-        )
+        reviewed_source_sha = loaded.source_row["source_audio_content_hash"]
+        _require_hash(reviewed_source_sha, "reviewed source_audio_content_hash")
+        if "source_audio_sha256" in parent_row:
+            source_sha = parent_row["source_audio_sha256"]
+            if source_sha != reviewed_source_sha:
+                raise SeparationRunError("parent source audio identity does not match subset")
+        else:
+            source_sha = reviewed_source_sha
         if not isinstance(source_id, str) or not source_id:
             raise SeparationRunError("source audio ID is unavailable for subset member")
         _require_hash(source_sha, "source_audio_sha256")
@@ -801,6 +827,7 @@ def run_oaf_separation_pilot(
         raise TypeError("request must be OafSeparationPilotRequest")
     selected_clock = clock or (lambda: datetime.now(timezone.utc))
     try:
+        _require_crux_commit(request.crux_commit)
         _validate_output_paths(request)
         reference = load_reference_set_manifest(request.reference_manifest_path)
         timing = load_reference_timing_manifest(request.timing_manifest_path)
