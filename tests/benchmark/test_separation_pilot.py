@@ -3,11 +3,13 @@
 # Fixtures intentionally import the production seam inside tests so the
 # baseline collection remains free of the optional runtime modules.
 # pylint: disable=import-outside-toplevel,too-many-locals,duplicate-code,too-many-arguments
+# pylint: disable=too-many-lines
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Mapping
 from dataclasses import fields, replace
 from pathlib import Path
@@ -328,6 +330,67 @@ def test_task6_infers_only_the_two_derived_views_after_resolving_membership(
             assert view["inference_config"] == {**full_config, "input_view_id": view_id}
 
 
+def test_task6_default_backend_factory_is_bound_to_parent_frozen_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    import src.benchmark.separation_pilot as pilot
+
+    parent = parse_oaf_corpus_run(fixture.run_path.read_bytes())
+    captured: list[dict[str, object]] = []
+    fake_default_factory = calls["factory"][0]
+
+    def default_factory(**kwargs: object) -> object:
+        captured.append(kwargs)
+        return fake_default_factory(**kwargs)  # type: ignore[operator]
+
+    monkeypatch.setattr(pilot, "create_backend", default_factory)
+
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    outcome = run_oaf_separation_pilot(request)
+
+    assert outcome.exit_code == 0
+    assert captured
+    backend_kwargs = captured[0]
+    checkpoint_root = Path(
+        os.environ.get("CRUX_OAF_CHECKPOINT_CACHE", "artifacts/benchmark/model-cache")
+    )
+    assert backend_kwargs["checkpoint_dir"] == (
+        checkpoint_root / "sha256" / parent["checkpoint_archive_sha256"]
+    )
+    assert (
+        getattr(backend_kwargs["descriptor"], "sha256", None) == parent["backend_descriptor_sha256"]
+    )
+
+
+def test_task6_default_backend_factory_refuses_drifted_parent_model_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    import src.benchmark.separation_pilot as pilot
+
+    drifted_lock = tmp_path / "drifted-model.json"
+    drifted_lock.write_bytes(b"drifted model lock")
+    monkeypatch.setattr(pilot, "_model_lock_path", lambda: drifted_lock, raising=False)
+    monkeypatch.setattr(pilot, "create_backend", calls["factory"][0])
+
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    outcome = run_oaf_separation_pilot(request)
+
+    assert outcome.exit_code == 2
+    assert not calls["transcribe"]
+
+
 def test_task6_resume_exact_stem_and_prediction_skips_separator_and_oaf(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -357,6 +420,66 @@ def test_task6_resume_exact_stem_and_prediction_skips_separator_and_oaf(
     snapshot = json.loads(second.run_path.read_text(encoding="utf-8"))
     assert {item["spleeter"]["status"] for item in snapshot["items"]} == {"resumed"}
     assert {item["htdemucs"]["status"] for item in snapshot["items"]} == {"resumed"}
+
+
+def test_task6_resume_recovers_ledger_after_crash_between_snapshot_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    import src.benchmark.separation_pilot as pilot
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    first = run_oaf_separation_pilot(
+        request,
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+    assert first.exit_code == 0
+    assert first.run_path is not None
+
+    def crash_after_initial_checkpoint(_request: object) -> object:
+        raise RuntimeError("crash between durable boundaries")
+
+    monkeypatch.setattr(pilot, "score_oaf_reviewed_subset", crash_after_initial_checkpoint)
+    crashed = run_oaf_separation_pilot(
+        replace(request, resume=True),
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+    assert crashed.exit_code == 2
+    interrupted = json.loads(first.run_path.read_text(encoding="utf-8"))
+    assert all(item["spleeter"]["prediction"] is not None for item in interrupted["items"])
+    assert all(item["htdemucs"]["prediction"] is not None for item in interrupted["items"])
+
+    def resume_score(score_request: object) -> ScoreReviewedSubsetOutcome:
+        score_request.output_dir.mkdir(parents=True, exist_ok=True)  # type: ignore[attr-defined]
+        return ScoreReviewedSubsetOutcome(
+            exit_code=0,
+            cohort_id="subset-cohort",
+            reports_path=score_request.output_dir,  # type: ignore[attr-defined]
+            success_count=20,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+        )
+
+    monkeypatch.setattr(pilot, "score_oaf_reviewed_subset", resume_score)
+    calls["separate"].clear()
+    calls["transcribe"].clear()
+    resumed = run_oaf_separation_pilot(
+        replace(request, resume=True),
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+
+    assert resumed.exit_code == 0
+    assert not calls["separate"]
+    assert not calls["transcribe"]
+    assert resumed.run_path is not None
+    recovered = json.loads(resumed.run_path.read_text(encoding="utf-8"))
+    assert {item["spleeter"]["status"] for item in recovered["items"]} == {"resumed"}
+    assert {item["htdemucs"]["status"] for item in recovered["items"]} == {"resumed"}
 
 
 def test_task6_resume_valid_stem_without_prediction_reinfers_only_missing_view(
@@ -541,6 +664,68 @@ def test_task6_source_resolution_failure_is_fatal_before_control_or_runtimes(
     assert not calls["score"]
     assert not calls["separate"]
     assert not calls["transcribe"]
+
+
+@pytest.mark.parametrize(
+    ("backend_code", "expected_exit_code"),
+    (("descriptor_invalid", 2), ("worker_error", 1)),
+)
+def test_task6_honors_fatal_and_poison_backend_dispositions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend_code: str,
+    expected_exit_code: int,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    import src.benchmark.separation_pilot as pilot
+    from src.benchmark.backend_identity import BackendDescriptor
+    from src.benchmark.backends.oaf import OafBackendError
+
+    parent = parse_oaf_corpus_run(fixture.run_path.read_bytes())
+    descriptor = BackendDescriptor(
+        payload=parent["backend_descriptor"],  # type: ignore[arg-type]
+        sha256=parent["backend_descriptor_sha256"],  # type: ignore[arg-type]
+    )
+
+    class ErrorBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return descriptor
+
+        def transcribe(self, audio: object) -> object:
+            calls["transcribe"].append(audio.input_view_id)  # type: ignore[attr-defined]
+            raise OafBackendError("injected backend disposition", code=backend_code)
+
+        def close(self) -> None:
+            return None
+
+    def error_factory(**_kwargs: object) -> ErrorBackend:
+        calls["backend"].append(True)
+        return ErrorBackend()
+
+    monkeypatch.setattr(pilot, "create_backend", error_factory)
+
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    outcome = run_oaf_separation_pilot(request)
+
+    assert outcome.exit_code == expected_exit_code
+    assert calls["transcribe"] == [SPLEETER_INPUT_VIEW_ID]
+    assert calls["separate"] == [SPLEETER_INPUT_VIEW_ID]
+    if backend_code == "worker_error":
+        assert outcome.run_path is not None
+        snapshot = json.loads(outcome.run_path.read_text(encoding="utf-8"))
+        for item in snapshot["items"]:
+            for view_name in ("spleeter", "htdemucs"):
+                view = item[view_name]
+                assert view["status"] != "pending"
+                if (
+                    view_name == "htdemucs"
+                    or item["simfile_id"] != snapshot["items"][0]["simfile_id"]
+                ):
+                    assert view["failure_code"] == "worker_protocol_failed"
 
 
 def test_request_exposes_only_the_fixed_pilot_controls() -> None:
