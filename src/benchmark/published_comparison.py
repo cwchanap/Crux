@@ -242,13 +242,25 @@ def paired_class_rows(
     """Join per-class score rows and render deterministic metric deltas."""
     left_label = _label(left_label, "left_label")
     right_label = _label(right_label, "right_label")
+    left_keys = {key for key in left if str(key[0]) in pairable_ids}
+    right_keys = {key for key in right if str(key[0]) in pairable_ids}
+    if left_keys != right_keys:
+
+        def class_key_sort(value: tuple[str, int, str, str]) -> tuple[int, int, int, str]:
+            return int(value[0]), value[1], _MODES[value[2]], value[3]
+
+        missing_right = sorted(left_keys - right_keys, key=class_key_sort)
+        missing_left = sorted(right_keys - left_keys, key=class_key_sort)
+        _fail(
+            "per_class score key grid mismatch"
+            f" (missing from {right_label}: {missing_right},"
+            f" missing from {left_label}: {missing_left})"
+        )
     rows: list[dict[str, str]] = []
     for key in sorted(
-        set(left) & set(right),
+        left_keys,
         key=lambda value: (int(value[0]), value[1], _MODES[value[2]], value[3]),
     ):
-        if str(key[0]) not in pairable_ids:
-            continue
         left_row, right_row = left[key], right[key]
         rows.append(
             {
@@ -470,6 +482,10 @@ def write_markdown(
     assert isinstance(models, Mapping)
     assert isinstance(pairing, Mapping)
     assert isinstance(aggregates, Mapping)
+    show_reason_counts = any(
+        isinstance(models.get(model_name), Mapping) and "reason_counts" in models[model_name]
+        for model_name in (left_label, right_label)
+    )
     lines = [
         f"# {title}",
         "",
@@ -479,18 +495,30 @@ def write_markdown(
         "",
         "## Population",
         "",
-        "| model | total | eligible | success | failed | skipped | quarantined |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        (
+            "| model | total | eligible | success | failed | skipped | quarantined | "
+            "reason_counts |"
+            if show_reason_counts
+            else "| model | total | eligible | success | failed | skipped | quarantined |"
+        ),
+        (
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+            if show_reason_counts
+            else "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"
+        ),
     ]
     for model_name in (left_label, right_label):
         model = models[model_name]
         population_value = model["population"]
-        lines.append(
+        row = (
             f"| {model_name} | {population_value['total_count']} | "
             f"{population_value['eligible_count']} | {population_value['success_count']} | "
             f"{population_value['failed_count']} | {population_value['skipped_count']} | "
             f"{population_value['quarantined_count']} |"
         )
+        if show_reason_counts:
+            row += f" {model.get('reason_counts', {})} |"
+        lines.append(row)
     lines.extend(
         [
             "",

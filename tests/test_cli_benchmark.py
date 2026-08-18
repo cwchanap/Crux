@@ -805,19 +805,43 @@ def test_reviewed_subset_commands_declare_exact_options() -> None:
 
 
 def test_separation_pilot_commands_keep_domain_imports_lazy() -> None:
+    import subprocess
     import sys
 
-    assert "src.benchmark.separation_pilot" not in sys.modules
-    assert "src.benchmark.separation_handoff" not in sys.modules
-    for command in ("run-oaf-separation-pilot", "finalize-oaf-separation-pilot"):
-        result = CliRunner().invoke(main, ["benchmark", command, "--help"])
-        assert result.exit_code == 0
+    probe = """
+import json
+import sys
+
+from click.testing import CliRunner
+
+from src.cli.main import main
+
+for command in ("run-oaf-separation-pilot", "finalize-oaf-separation-pilot"):
+    result = CliRunner().invoke(main, ["benchmark", command, "--help"])
+    if result.exit_code != 0:
+        raise SystemExit(result.output)
+
+print(json.dumps({
+    "pilot_imported": "src.benchmark.separation_pilot" in sys.modules,
+    "handoff_imported": "src.benchmark.separation_handoff" in sys.modules,
+}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert json.loads(result.stdout) == {"pilot_imported": False, "handoff_imported": False}
 
 
 def test_run_oaf_separation_pilot_command_builds_request_and_propagates_partial_exit(
     tmp_path: Path, monkeypatch
 ) -> None:
     import src.benchmark.separation_pilot as pilot_module
+    import src.cli.benchmark as benchmark_module
 
     manifest = tmp_path / "reference.jsonl"
     timing_manifest = tmp_path / "timing.jsonl"
@@ -835,6 +859,7 @@ def test_run_oaf_separation_pilot_command_builds_request_and_propagates_partial_
     output_dir.mkdir()
     captured: list[object] = []
     run_path = output_dir / "runs" / "pilot" / "run.json"
+    monkeypatch.setattr(benchmark_module, "_current_crux_commit", lambda: "a" * 40, raising=False)
 
     def fake_run(request: object) -> pilot_module.OafSeparationPilotOutcome:
         captured.append(request)
@@ -890,6 +915,7 @@ def test_run_oaf_separation_pilot_command_builds_request_and_propagates_partial_
     assert request.spleeter_python == spleeter_python
     assert request.demucs_python == demucs_python
     assert request.resume is True
+    assert request.crux_commit == "a" * 40
     assert json.loads(result.output) == {
         "exit_code": 1,
         "failed_count": 1,
@@ -904,11 +930,26 @@ def test_run_oaf_separation_pilot_command_builds_request_and_propagates_partial_
     }
 
 
+def test_current_crux_commit_accepts_canonical_git_revision(
+    monkeypatch,
+) -> None:
+    import src.cli.benchmark as benchmark_module
+
+    class Result:
+        stdout = "a" * 40 + "\n"
+
+    monkeypatch.setattr(benchmark_module.subprocess, "run", lambda *_args, **_kwargs: Result())
+
+    assert benchmark_module._current_crux_commit() == "a" * 40
+
+
 def test_run_oaf_separation_pilot_command_preserves_complete_and_fatal_exit_codes(
     tmp_path: Path, monkeypatch
 ) -> None:
     import src.benchmark.separation_pilot as pilot_module
+    import src.cli.benchmark as benchmark_module
 
+    monkeypatch.setattr(benchmark_module, "_current_crux_commit", lambda: "a" * 40)
     outcomes = [
         pilot_module.OafSeparationPilotOutcome(
             overall_status="complete",

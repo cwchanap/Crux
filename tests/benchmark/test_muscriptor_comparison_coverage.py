@@ -1016,6 +1016,22 @@ def test_paired_class_rows_skips_non_pairable_ids() -> None:
     assert _paired_class_rows(oaf, muscriptor, pairable_ids=set()) == []
 
 
+def test_paired_class_rows_rejects_asymmetric_pairable_key_grid() -> None:
+    from decimal import Decimal
+
+    key = ("1", 50, "raw", "kick")
+    extra_key = ("1", 50, "raw", "snare")
+    row = _ClassRow("1", 50, "raw", "kick", 2, 1, Decimal("0.5"), Decimal("0.5"), Decimal("0.5"))
+    extra_row = _ClassRow("1", 50, "raw", "snare", 1, 0, Decimal("1"), Decimal("1"), Decimal("1"))
+
+    with pytest.raises(ComparisonIntegrityError, match="per_class score key grid mismatch"):
+        _paired_class_rows(
+            {key: row, extra_key: extra_row},
+            {key: row},
+            pairable_ids={"1"},
+        )
+
+
 def test_compare_rejects_non_comparison_request() -> None:
     with pytest.raises(TypeError, match="request must be ComparisonRequest"):
         compare_oaf_muscriptor({"not": "a request"})  # type: ignore[arg-type]

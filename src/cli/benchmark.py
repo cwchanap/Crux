@@ -3,6 +3,8 @@ from __future__ import annotations
 # Commands keep optional and heavy implementation modules behind their Click boundary.
 # pylint: disable=import-outside-toplevel
 import json
+import re
+import subprocess
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -35,6 +37,27 @@ from src.cli.options import (
     run_name_option,
     song_dir_option,
 )
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
+
+
+def _current_crux_commit() -> str:
+    """Return the canonical commit checked out by this Crux worktree."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=_REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("current Crux commit is unavailable") from error
+    commit = result.stdout.strip()
+    if _COMMIT_RE.fullmatch(commit) is None:
+        raise ValueError("current Crux commit is not canonical")
+    return commit
 
 
 @click.group()
@@ -1342,6 +1365,7 @@ def run_oaf_separation_pilot_command(
     )
 
     try:
+        crux_commit = _current_crux_commit()
         request = OafSeparationPilotRequest(
             reference_manifest_path=reference_manifest_path,
             timing_manifest_path=timing_manifest_path,
@@ -1352,8 +1376,9 @@ def run_oaf_separation_pilot_command(
             spleeter_python=spleeter_python,
             demucs_python=demucs_python,
             resume=resume,
+            crux_commit=crux_commit,
         )
-    except (TypeError, ValueError):
+    except (OSError, TypeError, ValueError, subprocess.SubprocessError):
         outcome = OafSeparationPilotOutcome(
             overall_status="failed",
             exit_code=2,

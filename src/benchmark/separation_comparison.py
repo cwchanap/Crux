@@ -521,6 +521,15 @@ def _pair_summary(
         left_label="full_mix",
         right_label=view_name,
     )
+    models = base["models"]
+    if isinstance(models, Mapping):
+        for label, reports in (
+            ("full_mix", full_mix.reports),
+            (view_name, view.reports),
+        ):
+            model = models.get(label)
+            if isinstance(model, dict):
+                model["reason_counts"] = dict(reports.population.reason_counts)
     event_micro = aggregate_paired_event_micro(
         full_mix.reports,
         view.reports,

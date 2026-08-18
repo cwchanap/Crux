@@ -135,6 +135,7 @@ def _task6_seams(
         "separate": [],
         "materialize": [],
         "backend": [],
+        "close": [],
         "transcribe": [],
         "score": [],
     }
@@ -262,7 +263,7 @@ def _task6_seams(
             )
 
         def close(self) -> None:
-            return None
+            calls["close"].append(True)
 
     def backend_factory(**_kwargs: object) -> FakeBackend:
         calls["backend"].append(True)
@@ -490,7 +491,7 @@ def test_task6_resume_valid_stem_without_prediction_reinfers_only_missing_view(
     subset = _subset_path(tmp_path, fixture)
     request = _request(tmp_path, fixture, subset)
     calls = _task6_seams(tmp_path, fixture, monkeypatch)
-    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot, write_oaf_separation_run
 
     first = run_oaf_separation_pilot(
         request,
@@ -498,7 +499,11 @@ def test_task6_resume_valid_stem_without_prediction_reinfers_only_missing_view(
     )
     assert first.run_path is not None
     snapshot = json.loads(first.run_path.read_text(encoding="utf-8"))
-    target = snapshot["items"][0]["spleeter"]["prediction"]["path"]
+    spleeter_view = snapshot["items"][0]["spleeter"]
+    spleeter_view["runtime"]["separator_wall_time_sec"] = 12.345
+    spleeter_view["runtime"]["separator_rtf"] = 12.345
+    write_oaf_separation_run(first.run_path, snapshot)
+    target = spleeter_view["prediction"]["path"]
     (request.output_dir / target).unlink()
     calls["separate"].clear()
     calls["transcribe"].clear()
@@ -514,7 +519,85 @@ def test_task6_resume_valid_stem_without_prediction_reinfers_only_missing_view(
     assert second.run_path is not None
     resumed = json.loads(second.run_path.read_text(encoding="utf-8"))
     assert resumed["items"][0]["spleeter"]["status"] == "success"
+    assert resumed["items"][0]["spleeter"]["runtime"]["separator_wall_time_sec"] == 12.345
+    assert resumed["items"][0]["spleeter"]["runtime"]["separator_rtf"] == 12.345
     assert all(item["htdemucs"]["status"] == "resumed" for item in resumed["items"])
+
+
+def test_task6_closes_backend_after_scoring_raises_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    events: list[str] = []
+
+    import src.benchmark.separation_pilot as pilot
+
+    def fail_scoring(*_args: object, **_kwargs: object) -> None:
+        events.append("score")
+        raise RuntimeError("scoring failed unexpectedly")
+
+    monkeypatch.setattr(pilot, "_score_derived_cohort", fail_scoring)
+    original_close = calls["close"]
+
+    def record_close() -> None:
+        events.append("close")
+        original_close.append(True)
+
+    # Replace the fixture factory only to observe close ordering without
+    # changing the backend behavior under test.
+    base_factory = calls["factory"][0]
+
+    def backend_factory(**kwargs: object) -> object:
+        backend = base_factory(**kwargs)  # type: ignore[operator]
+        backend.close = record_close  # type: ignore[attr-defined]
+        return backend
+
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    outcome = run_oaf_separation_pilot(request, backend_factory=backend_factory)
+
+    assert outcome.exit_code == 2
+    assert events == ["score", "close"]
+
+
+def test_task6_does_not_retry_backend_close_after_unexpected_close_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    events: list[str] = []
+
+    import src.benchmark.backends.oaf as oaf_backend
+
+    base_factory = calls["factory"][0]
+
+    def backend_factory(**kwargs: object) -> object:
+        backend = base_factory(**kwargs)  # type: ignore[operator]
+
+        def fail_transcribe(_audio: object) -> None:
+            raise oaf_backend.OafBackendError("worker failed", code="worker_error")
+
+        def fail_close() -> None:
+            events.append("close")
+            raise LookupError("unexpected close failure")
+
+        backend.transcribe = fail_transcribe  # type: ignore[attr-defined]
+        backend.close = fail_close  # type: ignore[attr-defined]
+        return backend
+
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    with pytest.raises(LookupError, match="unexpected close failure"):
+        run_oaf_separation_pilot(request, backend_factory=backend_factory)
+
+    assert events == ["close"]
 
 
 @pytest.mark.parametrize(
