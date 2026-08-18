@@ -100,7 +100,54 @@ def test_score_muscriptor_reviewed_subset_command_exits_nonzero_on_fatal_outcome
     )
 
     assert result.exit_code == 2
-    summary = json.loads(result.output)
+    lines = [line for line in result.output.splitlines() if line]
+    assert "score-muscriptor-reviewed-subset: fatal scoring error" in lines[0]
+    summary = json.loads(lines[-1])
+    assert summary["exit_code"] == 2
+    assert summary["cohort_id"] is None
+    assert summary["success_count"] == 0
+
+
+def test_score_muscriptor_reviewed_subset_command_emits_fatal_diagnostic_on_invalid_input(
+    tmp_path: Path,
+) -> None:
+    """Invalid persisted run input triggers a fatal stderr diagnostic and exit 2."""
+    run_path = tmp_path / "run.json"
+    reference_manifest_path = tmp_path / "hpa324.jsonl"
+    timing_manifest_path = tmp_path / "hpa323.jsonl"
+    subset_manifest_path = tmp_path / "subset.jsonl"
+    output_dir = tmp_path / "reports"
+    for path in (
+        run_path,
+        reference_manifest_path,
+        timing_manifest_path,
+        subset_manifest_path,
+    ):
+        path.write_bytes(b"garbage\n")
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "score-muscriptor-reviewed-subset",
+            "--run",
+            str(run_path),
+            "--manifest",
+            str(reference_manifest_path),
+            "--timing-manifest",
+            str(timing_manifest_path),
+            "--subset-manifest",
+            str(subset_manifest_path),
+            "--output-dir",
+            str(output_dir),
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    lines = [line for line in result.output.splitlines() if line]
+    assert "score-muscriptor-reviewed-subset: fatal scoring error" in lines[0]
+    summary = json.loads(lines[-1])
     assert summary["exit_code"] == 2
     assert summary["cohort_id"] is None
     assert summary["success_count"] == 0

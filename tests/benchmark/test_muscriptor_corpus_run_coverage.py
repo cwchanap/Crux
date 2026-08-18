@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -65,6 +66,7 @@ from tests.benchmark.muscriptor_run_fixtures import (
     SHA_A,
     SHA_B,
     SHA_C,
+    _healthy_backend,
     _install_seams,
     _lock,
     _mapping,
@@ -537,11 +539,10 @@ def test_parse_rejects_non_object() -> None:
 
 def test_parse_rejects_non_canonical() -> None:
     valid = render_muscriptor_corpus_run(_valid_snapshot())
-    # Re-serialize with different key order / spacing to break canonicity.
-    import json
-
-    parsed = json.loads(valid)
-    non_canonical = (json.dumps(parsed, separators=(",", ":")) + "\n").encode("utf-8")
+    # Insert a space after the first comma — still valid JSON but no longer
+    # in canonical form (canonical bytes use compact separators with no spaces).
+    non_canonical = valid.replace(b",", b", ", 1)
+    assert json.loads(non_canonical)  # still valid JSON, just non-canonical
     with pytest.raises(StrictJsonError, match="canonical"):
         parse_muscriptor_corpus_run(non_canonical)
 
@@ -800,17 +801,20 @@ def test_remove_temporary_input_ignores_paths_outside_root(tmp_path: Path) -> No
     assert outside.exists()
 
 
-def test_remove_temporary_input_swallows_unlink_errors(tmp_path: Path) -> None:
+def test_remove_temporary_input_swallows_unlink_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     input_root = tmp_path / "input_root"
     input_root.mkdir()
     target = input_root / "file.wav"
     target.write_bytes(b"x")
-    # Make the parent directory read-only so unlink fails, then restore.
-    input_root.chmod(0o555)
-    try:
-        _remove_temporary_input(target, input_root)
-    finally:
-        input_root.chmod(0o755)
+
+    def raise_on_unlink(self, *args, **kwargs):
+        raise OSError("deterministic unlink failure")
+
+    monkeypatch.setattr(Path, "unlink", raise_on_unlink)
+    _remove_temporary_input(target, input_root)
+    assert target.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1195,19 +1199,9 @@ def test_run_fatal_when_existing_run_without_resume(
 ) -> None:
     _, descriptor, _, _ = _install_seams(monkeypatch, tmp_path)
 
-    class HealthyBackend:
-        def descriptor(self) -> BackendDescriptor:
-            return descriptor
-
-        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
-            return _prediction(audio, descriptor)
-
-        def close(self) -> None:
-            return None
-
     first = run_muscriptor_corpus(
         _request(tmp_path),
-        backend_factory=lambda **_: HealthyBackend(),
+        backend_factory=lambda **_: _healthy_backend(descriptor),
         perf_counter=lambda: 0.0,
         clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
     )
@@ -1216,7 +1210,7 @@ def test_run_fatal_when_existing_run_without_resume(
     # Re-run without resume: existing run.json must be fatal.
     second = run_muscriptor_corpus(
         _request(tmp_path),
-        backend_factory=lambda **_: HealthyBackend(),
+        backend_factory=lambda **_: _healthy_backend(descriptor),
         perf_counter=lambda: 0.0,
         clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
     )
@@ -1228,19 +1222,9 @@ def test_run_resume_succeeds_when_evidence_matches(
 ) -> None:
     _, descriptor, _, _ = _install_seams(monkeypatch, tmp_path)
 
-    class HealthyBackend:
-        def descriptor(self) -> BackendDescriptor:
-            return descriptor
-
-        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
-            return _prediction(audio, descriptor)
-
-        def close(self) -> None:
-            return None
-
     first = run_muscriptor_corpus(
         _request(tmp_path),
-        backend_factory=lambda **_: HealthyBackend(),
+        backend_factory=lambda **_: _healthy_backend(descriptor),
         perf_counter=lambda: 0.0,
         clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
     )
@@ -1248,7 +1232,7 @@ def test_run_resume_succeeds_when_evidence_matches(
 
     resumed = run_muscriptor_corpus(
         _request(tmp_path, resume=True),
-        backend_factory=lambda **_: HealthyBackend(),
+        backend_factory=lambda **_: _healthy_backend(descriptor),
         perf_counter=lambda: 0.0,
         clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
     )
@@ -1262,19 +1246,9 @@ def test_run_resume_fatal_when_prior_snapshot_header_mismatch(
 ) -> None:
     _, descriptor, _, _ = _install_seams(monkeypatch, tmp_path)
 
-    class HealthyBackend:
-        def descriptor(self) -> BackendDescriptor:
-            return descriptor
-
-        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
-            return _prediction(audio, descriptor)
-
-        def close(self) -> None:
-            return None
-
     first = run_muscriptor_corpus(
         _request(tmp_path),
-        backend_factory=lambda **_: HealthyBackend(),
+        backend_factory=lambda **_: _healthy_backend(descriptor),
         perf_counter=lambda: 0.0,
         clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
     )
@@ -1285,7 +1259,7 @@ def test_run_resume_fatal_when_prior_snapshot_header_mismatch(
     first.run_path.write_bytes(b"{not valid json}\n")
     resumed = run_muscriptor_corpus(
         _request(tmp_path, resume=True),
-        backend_factory=lambda **_: HealthyBackend(),
+        backend_factory=lambda **_: _healthy_backend(descriptor),
         perf_counter=lambda: 0.0,
         clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
     )
@@ -1315,19 +1289,9 @@ def test_run_source_resolution_failure_marks_item_failed(
         failing_resolve,
     )
 
-    class HealthyBackend:
-        def descriptor(self) -> BackendDescriptor:
-            return descriptor
-
-        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
-            return _prediction(audio, descriptor)
-
-        def close(self) -> None:
-            return None
-
     outcome = run_muscriptor_corpus(
         _request(tmp_path),
-        backend_factory=lambda **_: HealthyBackend(),
+        backend_factory=lambda **_: _healthy_backend(descriptor),
         perf_counter=lambda: 0.0,
         clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
     )
@@ -1343,19 +1307,9 @@ def test_run_resume_rejects_prediction_with_changed_source_identity(
 ) -> None:
     _, descriptor, _, _ = _install_seams(monkeypatch, tmp_path)
 
-    class HealthyBackend:
-        def descriptor(self) -> BackendDescriptor:
-            return descriptor
-
-        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
-            return _prediction(audio, descriptor)
-
-        def close(self) -> None:
-            return None
-
     first = run_muscriptor_corpus(
         _request(tmp_path),
-        backend_factory=lambda **_: HealthyBackend(),
+        backend_factory=lambda **_: _healthy_backend(descriptor),
         perf_counter=lambda: 0.0,
         clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
     )
@@ -1377,7 +1331,7 @@ def test_run_resume_rejects_prediction_with_changed_source_identity(
     monkeypatch.setattr(run_module, "resolve_source_audio", shifting_resolve)
     resumed = run_muscriptor_corpus(
         _request(tmp_path, resume=True),
-        backend_factory=lambda **_: HealthyBackend(),
+        backend_factory=lambda **_: _healthy_backend(descriptor),
         perf_counter=lambda: 0.0,
         clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
     )
@@ -1496,19 +1450,9 @@ def test_run_device_peak_memory_recorded(tmp_path: Path, monkeypatch: pytest.Mon
 def test_run_excludes_and_skips_items(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _, descriptor, _, _ = _install_seams(monkeypatch, tmp_path)
 
-    class HealthyBackend:
-        def descriptor(self) -> BackendDescriptor:
-            return descriptor
-
-        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
-            return _prediction(audio, descriptor)
-
-        def close(self) -> None:
-            return None
-
     outcome = run_muscriptor_corpus(
         replace(_request(tmp_path), exclude_simfile_ids=(20,)),
-        backend_factory=lambda **_: HealthyBackend(),
+        backend_factory=lambda **_: _healthy_backend(descriptor),
         perf_counter=lambda: 0.0,
         clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
     )
@@ -1533,19 +1477,9 @@ def test_run_quarantines_ineligible_items(tmp_path: Path, monkeypatch: pytest.Mo
         lambda *_a, **_k: {10: _mapping(10)},
     )
 
-    class HealthyBackend:
-        def descriptor(self) -> BackendDescriptor:
-            return descriptor
-
-        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
-            return _prediction(audio, descriptor)
-
-        def close(self) -> None:
-            return None
-
     outcome = run_muscriptor_corpus(
         _request(tmp_path),
-        backend_factory=lambda **_: HealthyBackend(),
+        backend_factory=lambda **_: _healthy_backend(descriptor),
         perf_counter=lambda: 0.0,
         clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
     )
@@ -1629,19 +1563,9 @@ def test_run_prediction_output_conflict_marks_failed(
 ) -> None:
     _, descriptor, _, _ = _install_seams(monkeypatch, tmp_path)
 
-    class HealthyBackend:
-        def descriptor(self) -> BackendDescriptor:
-            return descriptor
-
-        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
-            return _prediction(audio, descriptor)
-
-        def close(self) -> None:
-            return None
-
     first = run_muscriptor_corpus(
         _request(tmp_path),
-        backend_factory=lambda **_: HealthyBackend(),
+        backend_factory=lambda **_: _healthy_backend(descriptor),
         perf_counter=lambda: 0.0,
         clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
     )
@@ -1651,7 +1575,7 @@ def test_run_prediction_output_conflict_marks_failed(
 
     second = run_muscriptor_corpus(
         _request(tmp_path),
-        backend_factory=lambda **_: HealthyBackend(),
+        backend_factory=lambda **_: _healthy_backend(descriptor),
         perf_counter=lambda: 0.0,
         clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
     )
@@ -1663,11 +1587,30 @@ def test_run_prediction_output_conflict_marks_failed(
 
 
 def test_runner_failure_mapping_covers_all_reasons() -> None:
-    assert set(RUNNER_FAILURE_TO_COHORT_REASON.values()) <= {
+    allowed_reasons = {
         "reference_quarantined",
         "backend_unavailable",
         "inference_failed",
         "prediction_artifact_invalid",
         "prediction_missing",
         "explicitly_skipped",
+    }
+    # Values are a subset of allowed cohort reasons (not exact equality:
+    # ``reference_quarantined`` is set directly for quarantined items in the
+    # cohort builder, not through this mapping).
+    assert set(RUNNER_FAILURE_TO_COHORT_REASON.values()) <= allowed_reasons
+    # Exact dict equality verifies every runner failure code has a mapping
+    # entry and each maps to the expected cohort reason.
+    assert RUNNER_FAILURE_TO_COHORT_REASON == {
+        "source_audio_unavailable": "inference_failed",
+        "source_audio_decode_failed": "inference_failed",
+        "canonical_input_failed": "inference_failed",
+        "backend_unavailable": "backend_unavailable",
+        "worker_protocol_failed": "backend_unavailable",
+        "inference_failed": "inference_failed",
+        "prediction_artifact_invalid": "prediction_artifact_invalid",
+        "prediction_output_conflict": "prediction_artifact_invalid",
+        "prediction_publish_failed": "prediction_artifact_invalid",
+        "prediction_missing": "prediction_missing",
+        "explicitly_skipped": "explicitly_skipped",
     }

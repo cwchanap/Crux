@@ -1169,6 +1169,8 @@ def score_muscriptor_reviewed_subset_command(
         "skipped_count": outcome.skipped_count,
         "success_count": outcome.success_count,
     }
+    if outcome.exit_code == 2:
+        click.echo("score-muscriptor-reviewed-subset: fatal scoring error", err=True)
     click.echo(canonical_json_bytes(payload).decode("utf-8"))
     if outcome.exit_code:
         raise click.exceptions.Exit(outcome.exit_code)
