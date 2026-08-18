@@ -183,19 +183,21 @@ def aggregate_paired_event_micro(
     right_keys = {key for key in right if key[0] in pairable_ids}
     if left_keys != right_keys:
         raise ComparisonIntegrityError("paired event-micro score key grid mismatch")
+    duration_seconds = Decimal(0)
+    for simfile_id in sorted(pairable_ids, key=int):
+        if simfile_id not in source_durations:
+            raise ComparisonIntegrityError(
+                f"pairable song {simfile_id} lacks a positive finite authoritative duration"
+            )
+        duration = _positive_finite_duration(source_durations[simfile_id])
+        if duration is None:
+            raise ComparisonIntegrityError(
+                f"pairable song {simfile_id} lacks a positive finite authoritative duration"
+            )
+        duration_seconds += duration
     grouped: dict[tuple[int, str], list[tuple[object, object]]] = {}
     for key in sorted(left_keys, key=lambda value: (int(value[0]), value[1], _MODES[value[2]])):
         grouped.setdefault((key[1], key[2]), []).append((left[key], right[key]))
-    duration_seconds = sum(
-        (
-            duration
-            for key, value in source_durations.items()
-            if key in pairable_ids
-            for duration in (_positive_finite_duration(value),)
-            if duration is not None
-        ),
-        Decimal(0),
-    )
     duration = duration_seconds if duration_seconds > 0 else None
     rows: list[dict[str, object]] = []
     for tolerance_mode in sorted(grouped, key=lambda value: (value[0], _MODES[value[1]])):
