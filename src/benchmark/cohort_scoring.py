@@ -11,7 +11,11 @@ from typing import Literal, get_args
 from src.benchmark import scoring
 from src.benchmark.backend_identity import MUSCRIPTOR_BACKEND_ID, OAF_BACKEND_ID, require_sha256
 from src.benchmark.models import BenchmarkEvent, ScoreSummary
-from src.benchmark.prediction_artifact import PredictionArtifact, read_prediction_artifact
+from src.benchmark.prediction_artifact import (
+    PredictionArtifact,
+    read_prediction_artifact,
+    render_prediction_artifact,
+)
 from src.benchmark.reference_set import (
     ReferenceMappingResult,
     project_common_reference_events,
@@ -283,6 +287,71 @@ def cohort_item_from_artifacts(
         artifact_identity=artifact_identity,
         reference_artifact=reference,
         prediction_artifact=prediction,
+    )
+    validate_cohort_items(identity, (item,))
+    return item
+
+
+def cohort_item_from_validated_prediction_artifact(
+    identity: CohortIdentity,
+    simfile_id: str,
+    reference: ReferenceMappingResult,
+    prediction: PredictionArtifact,
+    *,
+    warnings: tuple[str, ...] = (),
+) -> CohortItem:
+    """Adapt a validated persisted artifact for the scorer's item identity."""
+    scorer_artifact = prediction
+    if prediction.prediction.audio.source_audio_id != simfile_id:
+        scorer_audio = replace(prediction.prediction.audio, source_audio_id=simfile_id)
+        scorer_prediction = replace(prediction.prediction, audio=scorer_audio)
+        scorer_artifact = read_prediction_artifact(render_prediction_artifact(scorer_prediction))
+    return cohort_item_from_artifacts(
+        identity,
+        simfile_id,
+        reference,
+        scorer_artifact,
+        warnings=warnings,
+    )
+
+
+def cohort_item_without_prediction(
+    identity: CohortIdentity,
+    simfile_id: str,
+    reference: ReferenceMappingResult | None,
+    *,
+    status: Literal["failed", "skipped", "quarantined"],
+    failure_reason: CohortFailureReason,
+    warnings: tuple[str, ...] = (),
+) -> CohortItem:
+    """Build a non-successful item without prediction artifact evidence."""
+    if reference is None:
+        reference_events = ()
+        coverage = CohortCoverage(
+            reference_native_event_count=0,
+            reference_common_event_count=0,
+            reference_ignored_event_count=0,
+            reference_unmapped_event_count=0,
+            reference_duplicate_collapsed_count=0,
+            prediction_native_event_count=None,
+            prediction_mapped_event_count=None,
+            prediction_unmapped_event_count=None,
+            prediction_native_class_counts=(),
+        )
+    else:
+        reference_events = reference_to_benchmark_events(simfile_id, reference.common_events)
+        coverage = coverage_from_artifacts(reference, None)
+    item = CohortItem(
+        simfile_id=simfile_id,
+        status=status,
+        reference_events=reference_events,
+        prediction_events=None,
+        coverage=coverage,
+        warnings=warnings,
+        failure_reason=failure_reason,
+        artifact_identity=None,
+        reference_artifact=None,
+        prediction_artifact=None,
     )
     validate_cohort_items(identity, (item,))
     return item

@@ -541,6 +541,85 @@ def test_cohort_item_from_artifacts_binds_song_and_descriptor_provenance(
     assert validate_cohort_items(build_identity(), (item,)) is None
 
 
+def test_cohort_item_from_validated_prediction_artifact_normalizes_only_scorer_local_source_id(
+    tmp_path: Path,
+) -> None:
+    reference = build_reference_mapping()
+    persisted = build_prediction_artifact(tmp_path)
+    persisted_content = persisted.content
+    persisted_source_id = persisted.prediction.audio.source_audio_id
+    persisted_source_sha256 = persisted.prediction.audio.source_audio_sha256
+    persisted_input_sha256 = persisted.prediction.audio.input_audio_sha256
+
+    item = cohort_scoring.cohort_item_from_validated_prediction_artifact(
+        build_identity(),
+        "42",
+        reference,
+        persisted,
+    )
+
+    assert persisted.content == persisted_content
+    assert persisted.prediction.audio.source_audio_id == persisted_source_id == "song"
+    assert persisted.prediction.audio.source_audio_sha256 == persisted_source_sha256
+    assert persisted.prediction.audio.input_audio_sha256 == persisted_input_sha256
+    assert item.prediction_artifact is not None
+    assert item.prediction_artifact is not persisted
+    assert item.prediction_artifact.prediction.audio.source_audio_id == "42"
+    assert item.prediction_artifact.prediction.audio.source_audio_sha256 == persisted_source_sha256
+    assert item.prediction_artifact.prediction.audio.input_audio_sha256 == persisted_input_sha256
+    assert item.prediction_artifact.content != persisted_content
+    assert item.prediction_events is not None
+    assert {event.chart_id for event in item.prediction_events} == {"42"}
+
+
+@pytest.mark.parametrize(
+    ("status", "failure_reason"),
+    [
+        ("failed", "backend_unavailable"),
+        ("failed", "inference_failed"),
+        ("failed", "prediction_artifact_invalid"),
+        ("failed", "prediction_missing"),
+        ("skipped", "explicitly_skipped"),
+        ("quarantined", "reference_quarantined"),
+    ],
+)
+def test_cohort_item_without_prediction_preserves_legal_status_reason_pairs(
+    status: str,
+    failure_reason: str,
+) -> None:
+    item = cohort_scoring.cohort_item_without_prediction(
+        build_identity(),
+        "42",
+        build_reference_mapping(),
+        status=status,  # type: ignore[arg-type]
+        failure_reason=failure_reason,  # type: ignore[arg-type]
+        warnings=("eligibility warning",),
+    )
+
+    assert item.simfile_id == "42"
+    assert item.status == status
+    assert item.failure_reason == failure_reason
+    assert item.warnings == ("eligibility warning",)
+    assert item.prediction_events is None
+    assert item.artifact_identity is None
+    assert item.reference_artifact is None
+    assert item.prediction_artifact is None
+    assert validate_cohort_items(build_identity(), (item,)) is None
+
+
+def test_cohort_item_without_prediction_without_reference_has_empty_coverage() -> None:
+    item = cohort_scoring.cohort_item_without_prediction(
+        build_identity(),
+        "42",
+        None,
+        status="failed",
+        failure_reason="prediction_missing",
+    )
+
+    assert item.reference_events == ()
+    assert item.coverage == CohortCoverage(0, 0, 0, 0, 0, None, None, None)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [

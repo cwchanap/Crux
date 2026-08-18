@@ -49,13 +49,11 @@ from src.benchmark.backends.oaf import (
 )
 from src.benchmark.cohort_scoring import (
     COHORT_FAILURE_REASONS,
-    CohortCoverage,
     CohortIdentity,
     CohortItem,
-    cohort_item_from_artifacts,
-    coverage_from_artifacts,
+    cohort_item_from_validated_prediction_artifact,
+    cohort_item_without_prediction,
     score_cohort,
-    validate_cohort_items,
 )
 from src.benchmark.corpus_cache import CacheIndexStore, ResolvedSourceAudio, resolve_source_audio
 from src.benchmark.durability import atomic_replace_bytes
@@ -67,7 +65,6 @@ from src.benchmark.prediction_artifact import (
     prediction_path,
     publish_prediction_artifact,
     read_prediction_artifact,
-    render_prediction_artifact,
 )
 from src.benchmark.reference_set import ReferenceMappingResult
 from src.benchmark.reference_set_manifest import (
@@ -81,7 +78,6 @@ from src.benchmark.reference_timing_manifest import (
     load_reference_timing_manifest,
 )
 from src.benchmark.reports import write_cohort_reports
-from src.benchmark.scorer_input import reference_to_benchmark_events
 from src.benchmark.taxonomy import DTX_LANE_MAP_VERSION, OAF_PREDICTION_MAP_ID, TAXONOMY_VERSION
 
 OAF_CORPUS_RUN_SCHEMA = "crux.oaf-corpus-run/v1"
@@ -855,51 +851,6 @@ def _prediction_artifact_matches_run_row(
     )
 
 
-def _empty_reference_coverage() -> CohortCoverage:
-    return CohortCoverage(
-        reference_native_event_count=0,
-        reference_common_event_count=0,
-        reference_ignored_event_count=0,
-        reference_unmapped_event_count=0,
-        reference_duplicate_collapsed_count=0,
-        prediction_native_event_count=None,
-        prediction_mapped_event_count=None,
-        prediction_unmapped_event_count=None,
-        prediction_native_class_counts=(),
-    )
-
-
-def _cohort_item_without_prediction(
-    identity: CohortIdentity,
-    simfile_id: str,
-    mapping: ReferenceMappingResult | None,
-    *,
-    status: str,
-    failure_reason: str,
-    warnings: tuple[str, ...] = (),
-) -> CohortItem:
-    if mapping is None:
-        reference_events = ()
-        coverage = _empty_reference_coverage()
-    else:
-        reference_events = reference_to_benchmark_events(simfile_id, mapping.common_events)
-        coverage = coverage_from_artifacts(mapping, None)
-    item = CohortItem(
-        simfile_id=simfile_id,
-        status=status,  # type: ignore[arg-type]
-        reference_events=reference_events,
-        prediction_events=None,
-        coverage=coverage,
-        warnings=warnings,
-        failure_reason=failure_reason,  # type: ignore[arg-type]
-        artifact_identity=None,
-        reference_artifact=None,
-        prediction_artifact=None,
-    )
-    validate_cohort_items(identity, (item,))
-    return item
-
-
 def _cohort_item_from_run_row(
     identity: CohortIdentity,
     row: Mapping[str, object],
@@ -932,7 +883,7 @@ def _cohort_item_from_run_row(
     if disposition in {"inferred", "resumed"}:
         prediction_path_value = row.get("prediction_path")
         if not isinstance(prediction_path_value, str) or not prediction_path_value:
-            return _cohort_item_without_prediction(
+            return cohort_item_without_prediction(
                 identity,
                 simfile_id,
                 mapping,
@@ -946,7 +897,7 @@ def _cohort_item_from_run_row(
         try:
             content = read_regular_file_no_follow(prediction_artifact_path)
         except FileNotFoundError:
-            return _cohort_item_without_prediction(
+            return cohort_item_without_prediction(
                 identity,
                 simfile_id,
                 mapping,
@@ -955,7 +906,7 @@ def _cohort_item_from_run_row(
                 warnings=warnings,
             )
         except OSError:
-            return _cohort_item_without_prediction(
+            return cohort_item_without_prediction(
                 identity,
                 simfile_id,
                 mapping,
@@ -964,7 +915,7 @@ def _cohort_item_from_run_row(
                 warnings=warnings,
             )
         if mapping is None:
-            return _cohort_item_without_prediction(
+            return cohort_item_without_prediction(
                 identity,
                 simfile_id,
                 mapping,
@@ -975,7 +926,7 @@ def _cohort_item_from_run_row(
         try:
             prediction = read_prediction_artifact(content)
             if not _prediction_artifact_matches_run_row(prediction, row):
-                return _cohort_item_without_prediction(
+                return cohort_item_without_prediction(
                     identity,
                     simfile_id,
                     mapping,
@@ -983,11 +934,7 @@ def _cohort_item_from_run_row(
                     failure_reason="prediction_artifact_invalid",
                     warnings=warnings,
                 )
-            if prediction.prediction.audio.source_audio_id != simfile_id:
-                scorer_audio = replace(prediction.prediction.audio, source_audio_id=simfile_id)
-                scorer_prediction = replace(prediction.prediction, audio=scorer_audio)
-                prediction = read_prediction_artifact(render_prediction_artifact(scorer_prediction))
-            return cohort_item_from_artifacts(
+            return cohort_item_from_validated_prediction_artifact(
                 identity,
                 simfile_id,
                 mapping,
@@ -995,7 +942,7 @@ def _cohort_item_from_run_row(
                 warnings=warnings,
             )
         except (PredictionArtifactError, StrictJsonError, TypeError, ValueError):
-            return _cohort_item_without_prediction(
+            return cohort_item_without_prediction(
                 identity,
                 simfile_id,
                 mapping,
@@ -1005,7 +952,7 @@ def _cohort_item_from_run_row(
             )
 
     if disposition == "quarantined":
-        return _cohort_item_without_prediction(
+        return cohort_item_without_prediction(
             identity,
             simfile_id,
             mapping,
@@ -1019,7 +966,7 @@ def _cohort_item_from_run_row(
             runner_code if isinstance(runner_code, str) else "explicitly_skipped",
             "explicitly_skipped",
         )
-        return _cohort_item_without_prediction(
+        return cohort_item_without_prediction(
             identity,
             simfile_id,
             mapping,
@@ -1032,7 +979,7 @@ def _cohort_item_from_run_row(
     if not isinstance(runner_code, str) or not runner_code:
         runner_code = "backend_unavailable"
     failure_reason = RUNNER_FAILURE_TO_COHORT_REASON.get(runner_code, "backend_unavailable")
-    return _cohort_item_without_prediction(
+    return cohort_item_without_prediction(
         identity,
         simfile_id,
         mapping,
