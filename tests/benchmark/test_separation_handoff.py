@@ -42,6 +42,7 @@ def _successful_pilot(
     monkeypatch: pytest.MonkeyPatch,
     *,
     cache_dir: Path | None = None,
+    runtime_inputs: tuple[Path, Path, Path, Path] | None = None,
 ) -> tuple[object, Path, Path]:
     """Run the existing synthetic pilot seams and retain its immutable evidence."""
     from src.benchmark.separation_pilot import run_oaf_separation_pilot
@@ -51,6 +52,14 @@ def _successful_pilot(
     fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20, failed_count=0)
     subset_path = _subset_path(tmp_path, fixture)
     request = _request(tmp_path, fixture, subset_path)
+    if runtime_inputs is not None:
+        request = replace(
+            request,
+            spleeter_python=runtime_inputs[0],
+            demucs_python=runtime_inputs[1],
+            spleeter_model_root=runtime_inputs[2],
+            demucs_model_root=runtime_inputs[3],
+        )
     calls = _task6_seams(tmp_path, fixture, monkeypatch)
 
     import src.benchmark.separation_pilot as pilot

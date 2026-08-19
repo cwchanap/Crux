@@ -108,3 +108,65 @@ def test_derived_hpa325_reports_retain_reviewed_population_on_mixed_success(
         assert {row["failure_reason"] for row in rows} == {expected_reason}
 
     assert {item["spleeter"]["failure_code"] for item in snapshot["items"]} == {"separator_timeout"}
+
+
+def test_successful_pilot_artifacts_omit_host_runtime_inputs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from src.benchmark.separation_handoff import (
+        FinalizeSeparationPilotRequest,
+        finalize_separation_pilot,
+    )
+    from tests.benchmark.test_separation_handoff import _successful_pilot
+
+    runtime_inputs = (
+        tmp_path / "runtime" / "spleeter-python",
+        tmp_path / "runtime" / "demucs-python",
+        tmp_path / "runtime" / "spleeter-model-root",
+        tmp_path / "runtime" / "demucs-model-root",
+    )
+    assert len(set(runtime_inputs)) == len(runtime_inputs)
+    request, subset_path, run_path = _successful_pilot(
+        tmp_path,
+        monkeypatch,
+        runtime_inputs=runtime_inputs,
+    )
+    handoff_path = tmp_path / "handoff" / "manifest.jsonl"
+    handoff = finalize_separation_pilot(
+        FinalizeSeparationPilotRequest(
+            run_path=run_path,
+            subset_manifest_path=subset_path,
+            output_manifest=handoff_path,
+            decision="use_htdemucs",
+            rationale="Synthetic portable-output acceptance fixture.",
+        )
+    )
+
+    assert handoff.exit_code == 0
+    assert handoff.manifest is not None
+    snapshot = json.loads(run_path.read_bytes())
+    assert snapshot["schema"] == "crux.oaf-separation-run/v1"
+    assert "failure_code" not in snapshot
+
+    published_paths = [run_path]
+    for view_name in ("spleeter", "htdemucs"):
+        report_paths = sorted(
+            path
+            for path in (run_path.parent / "views" / view_name / "reports").rglob("*")
+            if path.is_file()
+        )
+        assert report_paths
+        published_paths.extend(report_paths)
+
+    comparison_paths = sorted(
+        path for path in (run_path.parent / "comparison").rglob("*") if path.is_file()
+    )
+    assert comparison_paths
+    published_paths.extend(comparison_paths)
+    published_paths.append(handoff.manifest.path)
+
+    forbidden = tuple(str(path).encode("utf-8") for path in runtime_inputs)
+    for path in published_paths:
+        content = path.read_bytes()
+        assert all(value not in content for value in forbidden), path
