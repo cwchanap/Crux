@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import shutil
@@ -26,6 +27,7 @@ from src.benchmark.separators import (
     load_separator_environment_manifest,
     load_separator_lock,
 )
+from tests.benchmark.test_separator_environment_probe import _synthetic_environment
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "separators"
 
@@ -224,26 +226,166 @@ def test_loader_rejects_command_model_mismatch(
         load_separator_lock(path)
 
 
-def test_freeze_script_refuses_v2_lock_until_attestation_flow(
+_ATTESTATION_FAILURE_CODES = frozenset(
+    {
+        "separator_lock_companion_mismatch",
+        "separator_interpreter_mismatch",
+        "separator_environment_mismatch",
+        "separator_model_root_invalid",
+        "separator_environment_probe_failed",
+    }
+)
+
+
+def _freeze_separator_runtime(
+    *,
+    separator_id: str,
+    interpreter: Path,
+    model_root: Path,
+    repository_revision: str,
+    output: Path,
+) -> object:
+    from scripts import freeze_separator_runtime as freezer
+
+    implementation = getattr(freezer, "freeze_separator_runtime", None)
+    assert callable(implementation), "freezer implementation is missing"
+    has_model_root = "model_root" in inspect.signature(implementation).parameters
+    assert has_model_root, "freezer must accept the policy-owned model root"
+    return implementation(
+        separator_id=separator_id,
+        interpreter=interpreter,
+        model_root=model_root,
+        repository_revision=repository_revision,
+        output=output,
+    )
+
+
+def _attest_separator_runtime(
+    lock_path: Path,
+    interpreter: Path,
+    model_root: Path,
+) -> object:
+    implementation = getattr(separators, "attest_separator_runtime", None)
+    assert callable(implementation), "live separator attester is missing"
+    return implementation(lock_path, interpreter, model_root)
+
+
+def _assert_no_attestation_artifacts(tmp_path: Path) -> None:
+    for name in ("cache", "stems", "predictions", "reports"):
+        assert not (tmp_path / name).exists()
+
+
+def test_freeze_and_attest_round_trip_with_synthetic_runtime(tmp_path: Path) -> None:
+    interpreter, _ = _synthetic_environment(tmp_path)
+    model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    lock_path = tmp_path / "frozen" / "model.json"
+
+    lock = _freeze_separator_runtime(
+        separator_id=SPLEETER_SEPARATOR_ID,
+        interpreter=interpreter,
+        model_root=model_root,
+        repository_revision="a" * 40,
+        output=lock_path,
+    )
+    runtime = _attest_separator_runtime(lock_path, interpreter, model_root)
+
+    assert runtime.lock == lock
+    assert runtime.interpreter == interpreter.resolve(strict=True)
+    assert runtime.model_files == lock.model_files
+    assert (lock_path.parent / "environment.json").is_file()
+    assert getattr(separators, "ATTESTATION_FAILURE_CODES", frozenset()) == (
+        _ATTESTATION_FAILURE_CODES
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        ("companion", "separator_lock_companion_mismatch"),
+        ("wrong_interpreter_hash", "separator_interpreter_mismatch"),
+        ("changed_recorded_package_file", "separator_environment_mismatch"),
+        ("changed_model_file", "separator_model_root_invalid"),
+        ("bad_probe_stdout", "separator_environment_probe_failed"),
+    ],
+)
+def test_attest_translates_synthetic_mismatches_to_closed_codes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_code: str,
+) -> None:
+    interpreter, purelib = _synthetic_environment(tmp_path)
+    model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    lock_path = tmp_path / "frozen" / "model.json"
+    _freeze_separator_runtime(
+        separator_id=SPLEETER_SEPARATOR_ID,
+        interpreter=interpreter,
+        model_root=model_root,
+        repository_revision="a" * 40,
+        output=lock_path,
+    )
+
+    environment_path = lock_path.parent / "environment.json"
+    if mutation == "companion":
+        environment_path.write_bytes(b"{}\n")
+    elif mutation == "wrong_interpreter_hash":
+        wrong_hash = "0" * 64
+        environment_payload = json.loads(environment_path.read_text(encoding="utf-8"))
+        environment_payload["interpreter_sha256"] = wrong_hash
+        environment_bytes = canonical_json_bytes(environment_payload, trailing_newline=True)
+        environment_path.write_bytes(environment_bytes)
+        lock_payload = json.loads(lock_path.read_text(encoding="utf-8"))
+        lock_payload["interpreter_sha256"] = wrong_hash
+        lock_payload["environment_manifest_sha256"] = hashlib.sha256(environment_bytes).hexdigest()
+        lock_path.write_bytes(canonical_json_bytes(lock_payload, trailing_newline=True))
+    elif mutation == "changed_recorded_package_file":
+        (purelib / "spleeter" / "__init__.py").write_text("changed\n", encoding="utf-8")
+    elif mutation == "changed_model_file":
+        (model_root / "4stems" / "model.meta").write_bytes(b"changed model bytes")
+    elif mutation == "bad_probe_stdout":
+
+        def fail_probe(_interpreter: Path) -> object:
+            raise SeparatorExecutionError("separator_environment_probe_failed")
+
+        monkeypatch.setattr(separators, "_run_separator_environment_probe", fail_probe)
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
+
+    with pytest.raises(SeparatorExecutionError) as raised:
+        _attest_separator_runtime(lock_path, interpreter, model_root)
+
+    assert raised.value.code == expected_code
+    assert raised.value.code in _ATTESTATION_FAILURE_CODES
+    _assert_no_attestation_artifacts(tmp_path)
+
+
+def test_freezer_cli_requires_model_root_and_rejects_model_file(
     tmp_path: Path,
 ) -> None:
     from scripts import freeze_separator_runtime as freezer
 
-    model_file = tmp_path / "weights.bin"
-    model_bytes = b"synthetic separator model bytes"
-    model_file.write_bytes(model_bytes)
-    output = tmp_path / "separator.json"
+    interpreter, _ = _synthetic_environment(tmp_path)
+    model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    lock_path = tmp_path / "frozen" / "model.json"
+    arguments = [
+        "--separator-id",
+        SPLEETER_SEPARATOR_ID,
+        "--interpreter",
+        str(interpreter),
+        "--model-root",
+        str(model_root),
+        "--repository-revision",
+        "a" * 40,
+        "--output",
+        str(lock_path),
+    ]
 
-    with pytest.raises(freezer.FreezeError, match="Task 4|deferred|v2"):
-        freezer.freeze_separator_runtime(
-            separator_id=SPLEETER_SEPARATOR_ID,
-            interpreter=Path("/isolated/python"),
-            model_files={"weights.bin": model_file},
-            repository_revision="a" * 40,
-            output=output,
-        )
-
-    assert not output.exists()
+    result = freezer.main(arguments)
+    assert result == 0
+    with pytest.raises(SystemExit):
+        freezer._build_parser().parse_args(arguments + ["--model-file", "weights.bin=x"])
+    with pytest.raises(SystemExit):
+        freezer._build_parser().parse_args(arguments + ["--environment", "environment.json"])
 
 
 class _FakePopen:

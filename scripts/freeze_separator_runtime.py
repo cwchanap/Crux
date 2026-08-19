@@ -5,13 +5,22 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Mapping
 from pathlib import Path
 
+from src.benchmark.artifact_io import ArtifactPublicationError, publish_immutable_file
+from src.benchmark.backend_identity import canonical_json_bytes, sha256_hex
 from src.benchmark.separators import (
+    _SEPARATOR_POLICIES,
     HTDEMUCS_SEPARATOR_ID,
+    SEPARATOR_LOCK_SCHEMA,
     SPLEETER_SEPARATOR_ID,
+    SeparatorExecutionError,
     SeparatorLock,
+    _resolve_separator_interpreter,
+    _run_separator_environment_probe,
+    attest_separator_runtime,
+    inventory_separator_model_root,
+    separator_environment_manifest_payload,
 )
 
 
@@ -23,19 +32,70 @@ def freeze_separator_runtime(
     *,
     separator_id: str,
     interpreter: Path,
-    model_files: Mapping[str, Path],
+    model_root: Path,
     repository_revision: str,
     output: Path,
 ) -> SeparatorLock:
-    """Hash explicit model files and publish one lock without running inference."""
-    raise FreezeError("v2 separator lock freezing is deferred until Task 4")
+    """Attest and publish one policy-owned separator runtime as a fixed pair."""
+    if not isinstance(interpreter, Path):
+        raise TypeError("interpreter must be a Path")
+    if not isinstance(model_root, Path):
+        raise TypeError("model_root must be a Path")
+    if not isinstance(output, Path):
+        raise TypeError("output must be a Path")
+    policy = _SEPARATOR_POLICIES.get(separator_id)
+    if policy is None:
+        raise FreezeError("separator_id is unsupported")
 
+    resolved_interpreter, interpreter_sha256 = _resolve_separator_interpreter(interpreter)
+    environment = _run_separator_environment_probe(resolved_interpreter)
+    if (
+        environment.separator_id != separator_id
+        or environment.package_name != policy["package_name"]
+        or environment.interpreter_sha256 != interpreter_sha256
+    ):
+        raise SeparatorExecutionError(
+            "separator_environment_mismatch",
+            "separator environment does not match the selected policy",
+        )
+    model_files = inventory_separator_model_root(separator_id, model_root)
 
-def _parse_model_file(value: str) -> tuple[str, Path]:
-    name, separator, path = value.partition("=")
-    if not separator or not name or not path:
-        raise argparse.ArgumentTypeError("model files must use NAME=PATH")
-    return name, Path(path)
+    environment_bytes = canonical_json_bytes(
+        separator_environment_manifest_payload(environment),
+        trailing_newline=True,
+    )
+    environment_manifest_sha256 = sha256_hex(environment_bytes)
+    lock_payload = {
+        "schema": SEPARATOR_LOCK_SCHEMA,
+        "separator_id": separator_id,
+        "repository_url": policy["repository_url"],
+        "repository_revision": repository_revision,
+        "package_name": environment.package_name,
+        "package_version": environment.package_version,
+        "model_id": policy["model_id"],
+        "model_files": [
+            {"name": model_file.name, "sha256": model_file.sha256} for model_file in model_files
+        ],
+        "code_license": policy["code_license"],
+        "model_license": policy["model_license"],
+        "argv": list(policy["argv"]),
+        "expected_drum_stem_relative_path": policy["expected_drum_stem_relative_path"],
+        "output_container": policy["output_container"],
+        "interpreter_sha256": interpreter_sha256,
+        "environment_manifest_sha256": environment_manifest_sha256,
+        "model_root_kind": policy["model_root_kind"],
+    }
+    lock_bytes = canonical_json_bytes(lock_payload, trailing_newline=True)
+    try:
+        publish_immutable_file(output.parent / "environment.json", environment_bytes)
+        publish_immutable_file(output, lock_bytes)
+    except (ArtifactPublicationError, OSError, TypeError) as error:
+        raise FreezeError("separator lock publication failed") from error
+
+    attested = attest_separator_runtime(output, interpreter, model_root)
+    if attested.lock.separator_id != separator_id:
+        raise FreezeError("published separator lock did not round-trip")
+    return attested.lock
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -46,13 +106,7 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     parser.add_argument("--interpreter", "--python", dest="interpreter", type=Path, required=True)
-    parser.add_argument(
-        "--model-file",
-        action="append",
-        type=_parse_model_file,
-        required=True,
-        metavar="NAME=PATH",
-    )
+    parser.add_argument("--model-root", type=Path, required=True)
     parser.add_argument(
         "--repository-revision",
         "--revision",
@@ -65,17 +119,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    model_files: dict[str, Path] = {}
-    for name, path in args.model_file:
-        if name in model_files:
-            print(f"freeze failed: duplicate model file name {name}", file=sys.stderr)
-            return 1
-        model_files[name] = path
     try:
         lock = freeze_separator_runtime(
             separator_id=args.separator_id,
             interpreter=args.interpreter,
-            model_files=model_files,
+            model_root=args.model_root,
             repository_revision=args.repository_revision,
             output=args.output,
         )
