@@ -745,6 +745,8 @@ def test_reviewed_subset_commands_declare_exact_options() -> None:
             "--output-dir",
             "--spleeter-python",
             "--demucs-python",
+            "--spleeter-model-root",
+            "--demucs-model-root",
             "--resume",
         },
         "finalize-oaf-separation-pilot": {
@@ -851,12 +853,16 @@ def test_run_oaf_separation_pilot_command_builds_request_and_propagates_partial_
     output_dir = tmp_path / "output"
     spleeter_python = tmp_path / "spleeter-python"
     demucs_python = tmp_path / "demucs-python"
+    spleeter_model_root = tmp_path / "spleeter-model-root"
+    demucs_model_root = tmp_path / "demucs-model-root"
     for path in (manifest, timing_manifest, subset_manifest, spleeter_python, demucs_python):
         path.write_bytes(b"fixture")
     oaf_run.parent.mkdir()
     oaf_run.write_bytes(b"fixture")
     cache_dir.mkdir()
     output_dir.mkdir()
+    spleeter_model_root.mkdir()
+    demucs_model_root.mkdir()
     captured: list[object] = []
     run_path = output_dir / "runs" / "pilot" / "run.json"
     monkeypatch.setattr(benchmark_module, "_current_crux_commit", lambda: "a" * 40, raising=False)
@@ -874,6 +880,7 @@ def test_run_oaf_separation_pilot_command_builds_request_and_propagates_partial_
             failed_count=1,
             skipped_count=2,
             quarantined_count=4,
+            failure_code=None,
         )
 
     monkeypatch.setattr(pilot_module, "run_oaf_separation_pilot", fake_run)
@@ -898,6 +905,10 @@ def test_run_oaf_separation_pilot_command_builds_request_and_propagates_partial_
             str(spleeter_python),
             "--demucs-python",
             str(demucs_python),
+            "--spleeter-model-root",
+            str(spleeter_model_root),
+            "--demucs-model-root",
+            str(demucs_model_root),
             "--resume",
         ],
         catch_exceptions=False,
@@ -914,11 +925,14 @@ def test_run_oaf_separation_pilot_command_builds_request_and_propagates_partial_
     assert request.output_dir == output_dir
     assert request.spleeter_python == spleeter_python
     assert request.demucs_python == demucs_python
+    assert request.spleeter_model_root == spleeter_model_root
+    assert request.demucs_model_root == demucs_model_root
     assert request.resume is True
     assert request.crux_commit == "a" * 40
     assert json.loads(result.output) == {
         "exit_code": 1,
         "failed_count": 1,
+        "failure_code": None,
         "full_mix_reports_path": str(run_path.parent / "full-mix-reports"),
         "quarantined_count": 4,
         "reports_path": str(run_path.parent / "reports"),
@@ -962,6 +976,7 @@ def test_run_oaf_separation_pilot_command_preserves_complete_and_fatal_exit_code
             failed_count=0,
             skipped_count=0,
             quarantined_count=0,
+            failure_code=None,
         ),
         pilot_module.OafSeparationPilotOutcome(
             overall_status="failed",
@@ -974,6 +989,7 @@ def test_run_oaf_separation_pilot_command_preserves_complete_and_fatal_exit_code
             failed_count=0,
             skipped_count=0,
             quarantined_count=0,
+            failure_code="separator_environment_mismatch",
         ),
     ]
 
@@ -1000,6 +1016,10 @@ def test_run_oaf_separation_pilot_command_preserves_complete_and_fatal_exit_code
         str(tmp_path / "spleeter-python"),
         "--demucs-python",
         str(tmp_path / "demucs-python"),
+        "--spleeter-model-root",
+        str(tmp_path / "spleeter-model-root"),
+        "--demucs-model-root",
+        str(tmp_path / "demucs-model-root"),
     ]
 
     complete = CliRunner().invoke(main, args, catch_exceptions=False)
@@ -1007,8 +1027,10 @@ def test_run_oaf_separation_pilot_command_preserves_complete_and_fatal_exit_code
 
     assert complete.exit_code == 0
     assert json.loads(complete.output)["exit_code"] == 0
+    assert json.loads(complete.output)["failure_code"] is None
     assert fatal.exit_code == 2
     assert json.loads(fatal.output)["exit_code"] == 2
+    assert json.loads(fatal.output)["failure_code"] == "separator_environment_mismatch"
 
 
 def test_finalize_oaf_separation_pilot_command_publishes_manifest_summary(
