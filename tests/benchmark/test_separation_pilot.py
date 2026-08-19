@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 from collections.abc import Mapping
 from dataclasses import fields, replace
 from pathlib import Path
@@ -1121,6 +1122,47 @@ def test_pilot_attestation_failure_is_fatal_before_any_mutable_artifact(
     assert not calls["score"]
     assert not calls["separate"]
     assert not request.output_dir.exists()
+
+
+def test_pilot_rejects_lock_replacement_between_identity_and_attestation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.benchmark.separation_pilot as pilot
+
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+
+    replacement_directory = tmp_path / "replacement-spleeter-lock"
+    shutil.copytree(FIXTURE_ROOT / "spleeter", replacement_directory)
+    replacement_path = replacement_directory / "model.json"
+    replacement_payload = json.loads(replacement_path.read_text(encoding="utf-8"))
+    replacement_payload["repository_revision"] = "b" * 40
+    replacement_path.write_bytes(canonical_json_bytes(replacement_payload, trailing_newline=True))
+
+    original_load = pilot._load_separator_locks
+
+    def load_then_replace() -> tuple[object, object]:
+        locks = original_load()
+        pilot.SEPARATOR_LOCK_PATHS = {
+            **pilot.SEPARATOR_LOCK_PATHS,
+            SPLEETER_SEPARATOR_ID: replacement_path,
+        }
+        return locks
+
+    monkeypatch.setattr(pilot, "_load_separator_locks", load_then_replace)
+    outcome = pilot.run_oaf_separation_pilot(
+        request,
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.failure_code == "separator_lock_companion_mismatch"
+    assert not request.output_dir.exists()
+    assert calls["separate"] == []
+    assert calls["score"] == []
 
 
 @pytest.mark.parametrize("model_root_field", ("spleeter_model_root", "demucs_model_root"))

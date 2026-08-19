@@ -96,9 +96,12 @@ def freeze_separator_runtime(
         raise FreezeError("separator lock publication failed") from error
 
     attested = attest_separator_runtime(output, interpreter, model_root)
-    if attested.lock.separator_id != separator_id:
-        raise FreezeError("published separator lock did not round-trip")
-    return attested.lock
+    try:
+        if attested.lock.separator_id != separator_id:
+            raise FreezeError("published separator lock did not round-trip")
+        return attested.lock
+    finally:
+        attested.close()
 
 
 def _build_parser() -> argparse.ArgumentParser:

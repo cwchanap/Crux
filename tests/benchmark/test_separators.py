@@ -325,6 +325,25 @@ def test_freeze_and_attest_round_trip_with_synthetic_runtime(tmp_path: Path) -> 
     )
 
 
+def test_attested_runtime_close_releases_model_root_descriptor(
+    tmp_path: Path,
+) -> None:
+    model_root, expected = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    runtime = _attested_runtime(
+        SPLEETER_SEPARATOR_ID,
+        model_root=model_root,
+        model_files=expected,
+    )
+    descriptor = runtime.model_root_fd  # type: ignore[attr-defined]
+    assert isinstance(descriptor, int)
+
+    runtime.close()  # type: ignore[attr-defined]
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+    assert runtime.model_root_fd is None  # type: ignore[attr-defined]
+    runtime.close()  # type: ignore[attr-defined]
+
+
 def test_freezer_rejects_live_package_version_before_publishing(tmp_path: Path) -> None:
     interpreter, _ = _synthetic_environment(tmp_path, package_version="9.9.9")
     model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
@@ -721,7 +740,7 @@ def test_htdemucs_renderer_propagates_the_attested_local_repository(
     )
 
     assert argv[0] == "/isolated/demucs/python"
-    assert argv[argv.index("--repo") + 1] == str(model_root)
+    assert argv[argv.index("--repo") + 1] == str(runtime.model_root_launch_path)
 
 
 def test_spleeter_launch_environment_replaces_inherited_model_path(
@@ -730,6 +749,9 @@ def test_spleeter_launch_environment_replaces_inherited_model_path(
 ) -> None:
     model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
     monkeypatch.setenv("MODEL_PATH", "/ambient/model-cache")
+    monkeypatch.setenv("PYTHONPATH", "/ambient/python-path")
+    monkeypatch.setenv("PYTHONHOME", "/ambient/python-home")
+    monkeypatch.setenv("PYTHONUSERBASE", "/ambient/python-userbase")
 
     environment = separators._build_separator_launch_environment(
         SPLEETER_SEPARATOR_ID,
@@ -737,6 +759,42 @@ def test_spleeter_launch_environment_replaces_inherited_model_path(
     )
 
     assert environment["MODEL_PATH"] == str(model_root)
+    assert all(
+        key not in environment
+        for key in ("PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE", "PYTHONNOUSERSITE")
+    )
+
+
+def test_environment_probe_uses_isolated_interpreter_and_sanitized_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interpreter, _ = _synthetic_environment(tmp_path)
+    for key in ("PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE", "PYTHONNOUSERSITE"):
+        monkeypatch.setenv(key, "/attacker/" + key.lower())
+
+    observed: dict[str, object] = {}
+    original_run = separators.subprocess.run
+
+    def recording_run(argv: object, **kwargs: object) -> object:
+        observed["argv"] = argv
+        observed["env"] = kwargs.get("env")
+        return original_run(argv, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(separators.subprocess, "run", recording_run)
+    manifest = separators._run_separator_environment_probe(interpreter)
+
+    argv = observed["argv"]
+    assert isinstance(argv, list)
+    assert argv[0] == str(interpreter.resolve(strict=True))
+    assert argv[1] == "-I"
+    environment = observed["env"]
+    assert isinstance(environment, dict)
+    assert all(
+        key not in environment
+        for key in ("PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE", "PYTHONNOUSERSITE")
+    )
+    assert manifest.package_name == "spleeter"
 
 
 def test_demucs_launch_environment_removes_model_cache_and_endpoint_keys(
@@ -763,6 +821,8 @@ def test_separator_passes_runtime_launch_environment_to_popen(
 ) -> None:
     source_path = _source_wav(tmp_path)
     model_root, expected = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    for key in ("PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE", "PYTHONNOUSERSITE"):
+        monkeypatch.setenv(key, "/attacker/" + key.lower())
     runtime = _attested_runtime(
         SPLEETER_SEPARATOR_ID,
         model_root=model_root,
@@ -785,7 +845,71 @@ def test_separator_passes_runtime_launch_environment_to_popen(
     )
 
     assert fake.kwargs["env"] == runtime.launch_environment
+    assert fake.argv[1] == "-I"
+    assert fake.kwargs["pass_fds"] == (runtime.model_root_fd,)  # type: ignore[attr-defined]
+    assert all(
+        key not in fake.kwargs["env"]
+        for key in ("PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE", "PYTHONNOUSERSITE")
+    )
     assert str(model_root) not in str(result.path)
+
+
+def test_separator_launch_stays_bound_to_attested_model_root_after_alias_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = _source_wav(tmp_path)
+    model_root, expected = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    runtime = _attested_runtime(
+        SPLEETER_SEPARATOR_ID,
+        model_root=model_root,
+        model_files=expected,
+    )
+    model_root_fd = runtime.model_root_fd  # type: ignore[attr-defined]
+    assert isinstance(model_root_fd, int)
+
+    replacement = tmp_path / "replacement-model-root"
+    shutil.copytree(model_root, replacement)
+    (replacement / "4stems" / "model.meta").write_bytes(b"unverified replacement")
+    verified = tmp_path / "verified-model-root"
+    model_root.rename(verified)
+    replacement.rename(model_root)
+
+    fake = _FakePopen(
+        write_output=lambda workdir: _write_stem(
+            workdir,
+            separator_id=SPLEETER_SEPARATOR_ID,
+            samples=np.full((44100, 1), 0.25, dtype=np.float32),
+        )
+    )
+    _install_fake_popen(monkeypatch, fake)
+    try:
+        _run_separator(
+            SPLEETER_SEPARATOR_ID,
+            source_path,
+            cache_root=tmp_path / "cache",
+            runtime=runtime,
+        )
+        bound_root = Path(fake.kwargs["env"]["MODEL_PATH"])
+        pass_fds = fake.kwargs["pass_fds"]
+        if bound_root == Path("."):
+            original_cwd_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                preexec = fake.kwargs["preexec_fn"]
+                assert callable(preexec)
+                preexec()
+                bound_model_bytes = Path("4stems/model.meta").read_bytes()
+            finally:
+                os.fchdir(original_cwd_fd)
+                os.close(original_cwd_fd)
+        else:
+            bound_model_bytes = (bound_root / "4stems" / "model.meta").read_bytes()
+    finally:
+        runtime.close()  # type: ignore[attr-defined]
+
+    assert bound_root != model_root
+    assert bound_model_bytes == b"meta bytes"
+    assert pass_fds == (model_root_fd,)
 
 
 def _source_wav(tmp_path: Path, *, duration_sec: float = 1.0) -> Path:
