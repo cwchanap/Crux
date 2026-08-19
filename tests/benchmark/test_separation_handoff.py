@@ -42,6 +42,7 @@ def _successful_pilot(
     monkeypatch: pytest.MonkeyPatch,
     *,
     cache_dir: Path | None = None,
+    actual_comparison: bool = False,
     runtime_inputs: tuple[Path, Path, Path, Path] | None = None,
 ) -> tuple[object, Path, Path]:
     """Run the existing synthetic pilot seams and retain its immutable evidence."""
@@ -60,20 +61,43 @@ def _successful_pilot(
             spleeter_model_root=runtime_inputs[2],
             demucs_model_root=runtime_inputs[3],
         )
-    calls = _task6_seams(tmp_path, fixture, monkeypatch)
-
     import src.benchmark.separation_pilot as pilot
 
-    monkeypatch.setattr(pilot, "_comparison_reports_ready", lambda _run_dir: True)
-    monkeypatch.setattr(
-        pilot,
-        "compare_oaf_separation",
-        lambda comparison_request: _publish_comparison_fixtures(comparison_request.output_dir),
-    )
+    real_score_oaf_reviewed_subset = pilot.score_oaf_reviewed_subset
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    backend_factory = calls["factory"][0]
+
+    if actual_comparison:
+        monkeypatch.setattr(pilot, "score_oaf_reviewed_subset", real_score_oaf_reviewed_subset)
+
+        original_backend_factory = backend_factory
+
+        def canonical_comparison_backend_factory(**kwargs: object) -> object:
+            backend = original_backend_factory(**kwargs)  # type: ignore[operator]
+            original_transcribe = backend.transcribe  # type: ignore[attr-defined]
+
+            def transcribe(audio: object) -> object:
+                native = original_transcribe(audio)
+                return replace(
+                    native,
+                    events=tuple(replace(event, time_sec=0.375) for event in native.events),
+                )
+
+            backend.transcribe = transcribe  # type: ignore[attr-defined]
+            return backend
+
+        backend_factory = canonical_comparison_backend_factory
+    else:
+        monkeypatch.setattr(pilot, "_comparison_reports_ready", lambda _run_dir: True)
+        monkeypatch.setattr(
+            pilot,
+            "compare_oaf_separation",
+            lambda comparison_request: _publish_comparison_fixtures(comparison_request.output_dir),
+        )
     ticks = iter(float(index) for index in range(400))
     outcome = run_oaf_separation_pilot(
         request,
-        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+        backend_factory=backend_factory,  # type: ignore[arg-type]
         perf_counter=lambda: next(ticks),
     )
     assert outcome.exit_code == 0

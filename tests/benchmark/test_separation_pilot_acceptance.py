@@ -118,7 +118,7 @@ def test_successful_pilot_artifacts_omit_host_runtime_inputs(
         FinalizeSeparationPilotRequest,
         finalize_separation_pilot,
     )
-    from tests.benchmark.test_separation_handoff import _successful_pilot
+    from tests.benchmark.test_separation_handoff import _COMPARISON_FILES, _successful_pilot
 
     runtime_inputs = (
         tmp_path / "runtime" / "spleeter-python",
@@ -130,6 +130,7 @@ def test_successful_pilot_artifacts_omit_host_runtime_inputs(
     request, subset_path, run_path = _successful_pilot(
         tmp_path,
         monkeypatch,
+        actual_comparison=True,
         runtime_inputs=runtime_inputs,
     )
     handoff_path = tmp_path / "handoff" / "manifest.jsonl"
@@ -159,10 +160,16 @@ def test_successful_pilot_artifacts_omit_host_runtime_inputs(
         assert report_paths
         published_paths.extend(report_paths)
 
-    comparison_paths = sorted(
-        path for path in (run_path.parent / "comparison").rglob("*") if path.is_file()
-    )
+    comparison_root = run_path.parent / "comparison"
+    comparison_paths = sorted(path for path in comparison_root.rglob("*") if path.is_file())
     assert comparison_paths
+    assert {path.relative_to(comparison_root).as_posix() for path in comparison_paths} == set(
+        _COMPARISON_FILES
+    )
+    comparison_summary = json.loads((comparison_root / "summary.json").read_bytes())
+    assert comparison_summary["schema"] == "crux.oaf-separation-comparison/v1"
+    assert (comparison_root / "summary.md").read_text(encoding="utf-8").startswith("# ")
+    assert all(not path.read_bytes().startswith(b"comparison:") for path in comparison_paths)
     published_paths.extend(comparison_paths)
     published_paths.append(handoff.manifest.path)
 
