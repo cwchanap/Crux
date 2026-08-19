@@ -6,8 +6,10 @@ import math
 import os
 import re
 import signal
+import stat
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -92,13 +94,14 @@ _DISTRIBUTION_NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 
 # Commands intentionally contain only interpreter-independent arguments.  The
 # freeze script records the interpreter separately, while the runner supplies
-# the two path placeholders in a private working directory.
+# the private path placeholders in a temporary working directory.
 _SEPARATOR_POLICIES = {
     SPLEETER_SEPARATOR_ID: {
         "repository_url": "https://github.com/deezer/spleeter",
         "package_name": "spleeter",
         "model_id": "spleeter:4stems",
         "model_root_kind": "spleeter-model-path-v1",
+        "environment_discovery_keys": ("MODEL_PATH",),
         "argv": (
             "-m",
             "spleeter",
@@ -117,11 +120,28 @@ _SEPARATOR_POLICIES = {
         "package_name": "demucs",
         "model_id": "htdemucs",
         "model_root_kind": "demucs-local-repo-v1",
+        "environment_discovery_keys": (
+            "DEMUCS_MODEL_PATH",
+            "DEMUCS_REPO",
+            "HF_DATASETS_OFFLINE",
+            "HF_ENDPOINT",
+            "HF_HOME",
+            "HF_HUB_CACHE",
+            "HF_HUB_DISABLE_TELEMETRY",
+            "HF_HUB_ENDPOINT",
+            "HF_HUB_OFFLINE",
+            "HUGGINGFACE_HUB_CACHE",
+            "TORCH_HOME",
+            "TRANSFORMERS_CACHE",
+            "XDG_CACHE_HOME",
+        ),
         "argv": (
             "-m",
             "demucs",
             "-n",
             "htdemucs",
+            "--repo",
+            "{model_root}",
             "-o",
             "{output_dir}",
             "{input_wav}",
@@ -248,6 +268,18 @@ class SeparatorEnvironmentManifest:
 
     def __post_init__(self) -> None:
         _validate_environment_manifest(self)
+
+
+@dataclass(frozen=True)
+class AttestedSeparatorRuntime:
+    """Resolved separator inputs that have passed the fixed runtime attestation."""
+
+    interpreter: Path
+    lock: SeparatorLock
+    model_root: Path
+    model_files: tuple[SeparatorModelFile, ...]
+    environment: SeparatorEnvironmentManifest
+    launch_environment: Mapping[str, str]
 
 
 def load_separator_lock(path: Path) -> SeparatorLock:
@@ -635,13 +667,156 @@ def _require_hash(value: object, field: str) -> None:
         raise SeparatorLockError(f"{field} must be a lowercase SHA-256 hash") from None
 
 
+_SPLEETER_MODEL_ROOT_FILES = (
+    "4stems/.probe",
+    "4stems/checkpoint",
+    "4stems/model.data-00000-of-00001",
+    "4stems/model.index",
+    "4stems/model.meta",
+)
+_HTDEMUCS_MODEL_ROOT_FILES = (
+    "955717e8-8726e21a.th",
+    "htdemucs.yaml",
+)
+
+
+def inventory_separator_model_root(
+    separator_id: str,
+    model_root: Path,
+) -> tuple[SeparatorModelFile, ...]:
+    """Hash the exact policy-owned model-root layout for one separator."""
+    if separator_id not in _SEPARATOR_POLICIES:
+        raise SeparatorExecutionError("separator_id_unsupported", "separator is not supported")
+    if not isinstance(model_root, Path):
+        raise TypeError("model_root must be a Path")
+    expected_files = (
+        _SPLEETER_MODEL_ROOT_FILES
+        if separator_id == SPLEETER_SEPARATOR_ID
+        else _HTDEMUCS_MODEL_ROOT_FILES
+    )
+    try:
+        return _inventory_model_root(model_root, expected_files)
+    except SeparatorExecutionError:
+        raise
+    except (OSError, TypeError, ValueError):
+        raise SeparatorExecutionError(
+            "separator_model_root_invalid",
+            "separator model root does not match the fixed policy",
+        ) from None
+
+
+def revalidate_separator_model_root(runtime: AttestedSeparatorRuntime) -> None:
+    """Re-inventory an attested model root without reading or writing evidence."""
+    if not isinstance(runtime, AttestedSeparatorRuntime):
+        raise TypeError("runtime must be an AttestedSeparatorRuntime")
+    try:
+        inventory = inventory_separator_model_root(runtime.lock.separator_id, runtime.model_root)
+    except SeparatorExecutionError:
+        raise
+    if inventory != runtime.lock.model_files or runtime.model_files != runtime.lock.model_files:
+        raise SeparatorExecutionError(
+            "separator_model_root_invalid",
+            "separator model root does not match the fixed policy",
+        )
+
+
+def _inventory_model_root(
+    model_root: Path,
+    expected_files: tuple[str, ...],
+) -> tuple[SeparatorModelFile, ...]:
+    root_metadata = model_root.lstat()
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise OSError("model root is not an ordinary directory")
+
+    expected_names = set(expected_files)
+    expected_directories = {""}
+    for name in expected_files:
+        expected_directories.update(name.rsplit("/", 1)[:1] if "/" in name else ())
+
+    files: dict[str, bytes] = {}
+    directories: set[str] = {""}
+
+    def walk(directory: Path, relative_directory: str) -> None:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                relative_name = (
+                    f"{relative_directory}/{entry.name}" if relative_directory else entry.name
+                )
+                metadata = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise OSError("model root contains a symlink")
+                if stat.S_ISDIR(metadata.st_mode):
+                    directories.add(relative_name)
+                    walk(Path(entry.path), relative_name)
+                elif stat.S_ISREG(metadata.st_mode):
+                    files[relative_name] = _read_model_file_no_follow(Path(entry.path))
+                else:
+                    raise OSError("model root contains a special file")
+
+    walk(model_root, "")
+    if set(files) != expected_names or directories != expected_directories:
+        raise OSError("model root file layout does not match policy")
+    return tuple(
+        SeparatorModelFile(name=name, sha256=sha256_hex(files[name])) for name in sorted(files)
+    )
+
+
+def _read_model_file_no_follow(path: Path) -> bytes:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(path, os.O_RDONLY | no_follow | close_on_exec)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError("model file is not an ordinary file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise OSError("model file changed while it was read")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _build_separator_launch_environment(
+    separator_id: str,
+    model_root: Path,
+) -> dict[str, str]:
+    """Build a policy overlay that removes ambient model-discovery inputs."""
+    if separator_id not in _SEPARATOR_POLICIES:
+        raise SeparatorExecutionError("separator_id_unsupported", "separator is not supported")
+    if not isinstance(model_root, Path):
+        raise TypeError("model_root must be a Path")
+    policy = _SEPARATOR_POLICIES[separator_id]
+    environment = dict(os.environ)
+    for key in policy["environment_discovery_keys"]:
+        environment.pop(key, None)
+    if separator_id == SPLEETER_SEPARATOR_ID:
+        environment["MODEL_PATH"] = os.fspath(model_root)
+    return environment
+
+
 def run_spleeter_drums(
     source_audio_path: Path,
     *,
     source_audio_sha256: str,
     source_duration_sec: float,
-    interpreter: Path,
-    lock_path: Path,
+    runtime: AttestedSeparatorRuntime,
     cache_root: Path,
 ) -> SeparatedStem:
     """Run the locked Spleeter four-stem runtime and retain its drum WAV."""
@@ -650,8 +825,7 @@ def run_spleeter_drums(
         source_audio_path,
         source_audio_sha256=source_audio_sha256,
         source_duration_sec=source_duration_sec,
-        interpreter=interpreter,
-        lock_path=lock_path,
+        runtime=runtime,
         cache_root=cache_root,
     )
 
@@ -661,8 +835,7 @@ def run_htdemucs_drums(
     *,
     source_audio_sha256: str,
     source_duration_sec: float,
-    interpreter: Path,
-    lock_path: Path,
+    runtime: AttestedSeparatorRuntime,
     cache_root: Path,
 ) -> SeparatedStem:
     """Run the locked standard HTDemucs runtime and retain its drum WAV."""
@@ -671,8 +844,7 @@ def run_htdemucs_drums(
         source_audio_path,
         source_audio_sha256=source_audio_sha256,
         source_duration_sec=source_duration_sec,
-        interpreter=interpreter,
-        lock_path=lock_path,
+        runtime=runtime,
         cache_root=cache_root,
     )
 
@@ -683,8 +855,7 @@ def _run_separator_drums(
     *,
     source_audio_sha256: str,
     source_duration_sec: float,
-    interpreter: Path,
-    lock_path: Path,
+    runtime: AttestedSeparatorRuntime,
     cache_root: Path,
 ) -> SeparatedStem:
     _validate_execution_inputs(
@@ -692,11 +863,10 @@ def _run_separator_drums(
         source_audio_path,
         source_audio_sha256,
         source_duration_sec,
-        interpreter,
-        lock_path,
+        runtime,
         cache_root,
     )
-    lock = load_separator_lock(lock_path)
+    lock = runtime.lock
     if lock.separator_id != separator_id:
         raise SeparatorExecutionError(
             "separator_lock_mismatch",
@@ -741,12 +911,11 @@ def _run_separator_drums(
             input_path.write_bytes(source_bytes)
             output_dir.mkdir()
             argv = _render_separator_argv(
-                lock,
-                interpreter=interpreter,
+                runtime,
                 input_path=input_path,
                 output_dir=output_dir,
             )
-            _run_separator_process(argv, cwd=workdir)
+            _run_separator_process(argv, cwd=workdir, env=runtime.launch_environment)
             output_path = output_dir / lock.expected_drum_stem_relative_path
             try:
                 stem_bytes = read_regular_file_no_follow(output_path)
@@ -795,18 +964,15 @@ def _validate_execution_inputs(
     source_audio_path: Path,
     source_audio_sha256: str,
     source_duration_sec: float,
-    interpreter: Path,
-    lock_path: Path,
+    runtime: AttestedSeparatorRuntime,
     cache_root: Path,
 ) -> None:
     if separator_id not in _SEPARATOR_POLICIES:
         raise SeparatorExecutionError("separator_id_unsupported", "separator is not supported")
     if not isinstance(source_audio_path, Path):
         raise TypeError("source_audio_path must be a Path")
-    if not isinstance(interpreter, Path):
-        raise TypeError("interpreter must be a Path")
-    if not isinstance(lock_path, Path):
-        raise TypeError("lock_path must be a Path")
+    if not isinstance(runtime, AttestedSeparatorRuntime):
+        raise TypeError("runtime must be an AttestedSeparatorRuntime")
     if not isinstance(cache_root, Path):
         raise TypeError("cache_root must be a Path")
     try:
@@ -859,27 +1025,35 @@ def _read_cached_stem(path: Path) -> bytes | None:
 
 
 def _render_separator_argv(
-    lock: SeparatorLock,
+    runtime: AttestedSeparatorRuntime,
     *,
-    interpreter: Path,
     input_path: Path,
     output_dir: Path,
 ) -> list[str]:
+    if not isinstance(runtime, AttestedSeparatorRuntime):
+        raise TypeError("runtime must be an AttestedSeparatorRuntime")
     replacements = {
         "{input_wav}": os.fspath(input_path),
         "{output_dir}": os.fspath(output_dir),
+        "{model_root}": os.fspath(runtime.model_root),
     }
     return [
-        os.fspath(interpreter),
-        *(replacements.get(argument, argument) for argument in lock.argv),
+        os.fspath(runtime.interpreter),
+        *(replacements.get(argument, argument) for argument in runtime.lock.argv),
     ]
 
 
-def _run_separator_process(argv: list[str], *, cwd: Path) -> None:
+def _run_separator_process(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+) -> None:
     try:
         process = subprocess.Popen(
             argv,
             cwd=cwd,
+            env=dict(env),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -993,6 +1167,7 @@ def _qc_stem_bytes(content: bytes, source_duration_sec: float) -> StemQc:
 
 
 __all__ = [
+    "AttestedSeparatorRuntime",
     "HTDEMUCS_SEPARATOR_ID",
     "SEPARATOR_ENVIRONMENT_SCHEMA",
     "SEPARATOR_LOCK_SCHEMA",
@@ -1012,8 +1187,10 @@ __all__ = [
     "SeparatorModelFile",
     "SeparatorExecutionError",
     "StemQc",
+    "inventory_separator_model_root",
     "load_separator_environment_manifest",
     "load_separator_lock",
+    "revalidate_separator_model_root",
     "separator_environment_manifest_payload",
     "run_htdemucs_drums",
     "run_spleeter_drums",
