@@ -674,6 +674,13 @@ def _validate_output_paths(request: OafSeparationPilotRequest) -> None:
     }
     if output in protected:
         raise SeparationRunError("HPA-328 output directory aliases an input or parent run")
+    # Keep this containment check lexical: Task 4 treats model roots as caller-
+    # supplied absolute paths and must not follow symlinks while comparing them.
+    lexical_output = Path(os.path.abspath(os.fspath(request.output_dir)))
+    for model_root in (request.spleeter_model_root, request.demucs_model_root):
+        lexical_model_root = Path(os.path.abspath(os.fspath(model_root)))
+        if lexical_output == lexical_model_root or lexical_model_root in lexical_output.parents:
+            raise SeparationRunError("HPA-328 output directory aliases a separator model root")
 
 
 def _validate_subset_population(
