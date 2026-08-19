@@ -34,6 +34,15 @@ from src.benchmark.backend_identity import (
 
 SEPARATOR_LOCK_SCHEMA = "crux.separator-lock/v2"
 SEPARATOR_ENVIRONMENT_SCHEMA = "crux.separator-environment/v1"
+ATTESTATION_FAILURE_CODES = frozenset(
+    {
+        "separator_lock_companion_mismatch",
+        "separator_interpreter_mismatch",
+        "separator_environment_mismatch",
+        "separator_model_root_invalid",
+        "separator_environment_probe_failed",
+    }
+)
 SPLEETER_SEPARATOR_ID = "spleeter4-drums-v1"
 HTDEMUCS_SEPARATOR_ID = "htdemucs-drums-v1"
 SEPARATOR_TIMEOUT_SECONDS = 1800.0
@@ -104,6 +113,8 @@ _SEPARATOR_POLICIES = {
         "package_name": "spleeter",
         "model_id": "spleeter:4stems",
         "model_root_kind": "spleeter-model-path-v1",
+        "code_license": "MIT",
+        "model_license": "MIT",
         "environment_discovery_keys": ("MODEL_PATH",),
         "argv": (
             "-m",
@@ -123,6 +134,8 @@ _SEPARATOR_POLICIES = {
         "package_name": "demucs",
         "model_id": "htdemucs",
         "model_root_kind": "demucs-local-repo-v1",
+        "code_license": "MIT",
+        "model_license": "MIT",
         "environment_discovery_keys": (
             "DEMUCS_MODEL_PATH",
             "DEMUCS_REPO",
@@ -406,6 +419,46 @@ def separator_environment_manifest_payload(
     }
 
 
+def _parse_separator_environment_manifest(content: bytes) -> SeparatorEnvironmentManifest:
+    """Parse one canonical environment manifest from bytes without filesystem access."""
+    if not isinstance(content, bytes):
+        raise TypeError("environment manifest content must be bytes")
+    if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+        raise SeparatorLockError("separator environment must have one final newline")
+    try:
+        value = strict_json_loads(content[:-1], require_canonical=True)
+    except StrictJsonError as error:
+        raise SeparatorLockError(f"separator environment is invalid: {error}") from None
+    if not isinstance(value, dict) or set(value) != _ENVIRONMENT_KEYS:
+        raise SeparatorLockError("separator environment must contain the exact key set")
+    if value.get("schema") != SEPARATOR_ENVIRONMENT_SCHEMA:
+        raise SeparatorLockError("separator environment schema is invalid")
+
+    try:
+        raw_distributions = value["distributions"]
+        if not isinstance(raw_distributions, list):
+            raise SeparatorLockError("environment distributions must be a list")
+        distributions = tuple(
+            _environment_distribution_from_value(item) for item in raw_distributions
+        )
+        return SeparatorEnvironmentManifest(
+            separator_id=value["separator_id"],
+            package_name=value["package_name"],
+            package_version=value["package_version"],
+            python_implementation=value["python_implementation"],
+            python_version=value["python_version"],
+            python_abi=value["python_abi"],
+            platform=value["platform"],
+            interpreter_sha256=value["interpreter_sha256"],
+            distributions=distributions,
+            sha256=sha256_hex(content),
+        )
+    except SeparatorLockError:
+        raise
+    except (KeyError, TypeError, ValueError):
+        raise SeparatorLockError("separator environment fields are invalid") from None
+
+
 def load_separator_environment_manifest(
     lock_path: Path,
     lock: SeparatorLock,
@@ -423,47 +476,12 @@ def load_separator_environment_manifest(
         raise SeparatorLockError("separator lock companion environment is unavailable") from None
     if sha256_hex(content) != lock.environment_manifest_sha256:
         raise SeparatorLockError("separator lock companion environment hash does not match")
-    if not content.endswith(b"\n") or content.endswith(b"\n\n"):
-        raise SeparatorLockError("separator lock companion environment must have one final newline")
     try:
-        value = strict_json_loads(content[:-1], require_canonical=True)
-    except StrictJsonError as error:
+        manifest = _parse_separator_environment_manifest(content)
+    except SeparatorLockError as error:
         raise SeparatorLockError(
             f"separator lock companion environment is invalid: {error}"
         ) from None
-    if not isinstance(value, dict) or set(value) != _ENVIRONMENT_KEYS:
-        raise SeparatorLockError(
-            "separator lock companion environment must contain the exact key set"
-        )
-    if value.get("schema") != SEPARATOR_ENVIRONMENT_SCHEMA:
-        raise SeparatorLockError("separator lock companion environment schema is invalid")
-
-    try:
-        raw_distributions = value["distributions"]
-        if not isinstance(raw_distributions, list):
-            raise SeparatorLockError("environment distributions must be a list")
-        distributions = tuple(
-            _environment_distribution_from_value(item) for item in raw_distributions
-        )
-        manifest = SeparatorEnvironmentManifest(
-            separator_id=value["separator_id"],
-            package_name=value["package_name"],
-            package_version=value["package_version"],
-            python_implementation=value["python_implementation"],
-            python_version=value["python_version"],
-            python_abi=value["python_abi"],
-            platform=value["platform"],
-            interpreter_sha256=value["interpreter_sha256"],
-            distributions=distributions,
-            sha256=sha256_hex(content),
-        )
-    except SeparatorLockError:
-        raise
-    except (KeyError, TypeError, ValueError):
-        raise SeparatorLockError(
-            "separator lock companion environment fields are invalid"
-        ) from None
-
     if manifest.separator_id != lock.separator_id:
         raise SeparatorLockError("separator lock companion environment separator_id does not match")
     if manifest.package_name != lock.package_name:
@@ -477,6 +495,149 @@ def load_separator_environment_manifest(
             "separator lock companion environment interpreter_sha256 does not match"
         )
     return manifest
+
+
+def _resolve_separator_interpreter(interpreter: Path) -> tuple[Path, str]:
+    """Resolve one regular interpreter and hash the resolved executable bytes."""
+    if not isinstance(interpreter, Path):
+        raise TypeError("interpreter must be a Path")
+    try:
+        resolved = interpreter.resolve(strict=True)
+        digest = sha256_hex(read_regular_file_no_follow(resolved))
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise SeparatorExecutionError(
+            "separator_interpreter_mismatch",
+            "separator interpreter does not match the frozen executable",
+        ) from error
+    return resolved, digest
+
+
+def _run_separator_environment_probe(
+    interpreter: Path,
+) -> SeparatorEnvironmentManifest:
+    """Run and parse the standalone stdlib environment probe."""
+    if not isinstance(interpreter, Path):
+        raise TypeError("interpreter must be a Path")
+    probe_path = Path(__file__).with_name("separator_environment_probe.py")
+    try:
+        result = subprocess.run(
+            [os.fspath(interpreter), os.fspath(probe_path)],
+            check=False,
+            capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise SeparatorExecutionError(
+            "separator_environment_probe_failed",
+            "separator environment probe could not be started",
+        ) from error
+    if result.returncode != 0 or result.stderr:
+        raise SeparatorExecutionError(
+            "separator_environment_probe_failed",
+            "separator environment probe did not complete cleanly",
+        )
+    try:
+        return _parse_separator_environment_manifest(result.stdout)
+    except (SeparatorLockError, TypeError, ValueError) as error:
+        raise SeparatorExecutionError(
+            "separator_environment_probe_failed",
+            "separator environment probe output is not canonical",
+        ) from error
+
+
+def attest_separator_runtime(
+    lock_path: Path,
+    interpreter: Path,
+    model_root: Path,
+) -> AttestedSeparatorRuntime:
+    """Verify all lock-bound separator inputs before constructing a runtime."""
+    if not isinstance(lock_path, Path):
+        raise TypeError("lock_path must be a Path")
+    if not isinstance(interpreter, Path):
+        raise TypeError("interpreter must be a Path")
+    if not isinstance(model_root, Path):
+        raise TypeError("model_root must be a Path")
+
+    try:
+        lock = load_separator_lock(lock_path)
+        environment = load_separator_environment_manifest(lock_path, lock)
+    except (OSError, TypeError, SeparatorLockError) as error:
+        raise SeparatorExecutionError(
+            "separator_lock_companion_mismatch",
+            "separator lock or companion environment is not valid",
+        ) from error
+
+    resolved_interpreter, interpreter_sha256 = _resolve_separator_interpreter(interpreter)
+    if interpreter_sha256 != lock.interpreter_sha256:
+        raise SeparatorExecutionError(
+            "separator_interpreter_mismatch",
+            "separator interpreter does not match the frozen executable",
+        )
+
+    try:
+        probed_environment = _run_separator_environment_probe(resolved_interpreter)
+    except SeparatorExecutionError as error:
+        if error.code == "separator_environment_probe_failed":
+            raise
+        raise SeparatorExecutionError(
+            "separator_environment_probe_failed",
+            "separator environment probe failed",
+        ) from error
+    except (OSError, TypeError, ValueError) as error:
+        raise SeparatorExecutionError(
+            "separator_environment_probe_failed",
+            "separator environment probe failed",
+        ) from error
+    if not isinstance(probed_environment, SeparatorEnvironmentManifest):
+        raise SeparatorExecutionError(
+            "separator_environment_probe_failed",
+            "separator environment probe output is invalid",
+        )
+    if probed_environment != environment:
+        raise SeparatorExecutionError(
+            "separator_environment_mismatch",
+            "separator environment differs from the frozen companion",
+        )
+
+    try:
+        model_files = inventory_separator_model_root(lock.separator_id, model_root)
+    except SeparatorExecutionError as error:
+        if error.code == "separator_model_root_invalid":
+            raise
+        raise SeparatorExecutionError(
+            "separator_model_root_invalid",
+            "separator model root does not match the fixed policy",
+        ) from error
+    except (OSError, TypeError, ValueError) as error:
+        raise SeparatorExecutionError(
+            "separator_model_root_invalid",
+            "separator model root does not match the fixed policy",
+        ) from error
+    if model_files != lock.model_files:
+        raise SeparatorExecutionError(
+            "separator_model_root_invalid",
+            "separator model root does not match the frozen lock",
+        )
+
+    try:
+        return _build_attested_separator_runtime(
+            interpreter=resolved_interpreter,
+            lock=lock,
+            model_root=model_root,
+            model_files=model_files,
+            environment=probed_environment,
+        )
+    except SeparatorExecutionError as error:
+        if error.code in ATTESTATION_FAILURE_CODES:
+            raise
+        raise SeparatorExecutionError(
+            "separator_model_root_invalid",
+            "separator runtime inputs could not be constructed",
+        ) from error
+    except (OSError, TypeError, ValueError) as error:
+        raise SeparatorExecutionError(
+            "separator_model_root_invalid",
+            "separator runtime inputs could not be constructed",
+        ) from error
 
 
 def _model_file_from_value(value: object) -> SeparatorModelFile:
@@ -1333,6 +1494,7 @@ def _qc_stem_bytes(content: bytes, source_duration_sec: float) -> StemQc:
 
 __all__ = [
     "AttestedSeparatorRuntime",
+    "ATTESTATION_FAILURE_CODES",
     "HTDEMUCS_SEPARATOR_ID",
     "SEPARATOR_ENVIRONMENT_SCHEMA",
     "SEPARATOR_LOCK_SCHEMA",
@@ -1352,6 +1514,7 @@ __all__ = [
     "SeparatorModelFile",
     "SeparatorExecutionError",
     "StemQc",
+    "attest_separator_runtime",
     "inventory_separator_model_root",
     "load_separator_environment_manifest",
     "load_separator_lock",
