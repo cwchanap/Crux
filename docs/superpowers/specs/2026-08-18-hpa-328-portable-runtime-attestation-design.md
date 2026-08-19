@@ -2,11 +2,11 @@
 
 ## Status
 
-Revised after implementation review; awaiting confirmation before detailed
-implementation planning. This extends the HPA-328 freeze-time separator lock
-into a portable, live runtime-attestation contract. It does not authorize Task
-11 production locks, separator inference, scoring, or finalization until the
-immutable upstream inputs are available.
+Revised after a second implementation review; awaiting written-spec review
+before detailed implementation planning. This extends the HPA-328 freeze-time
+separator lock into a portable, live runtime-attestation contract. It does not
+authorize Task 11 production locks, separator inference, scoring, or
+finalization until the immutable upstream inputs are available.
 
 ## Goal
 
@@ -20,6 +20,11 @@ pilot run, prove that all of the following match the committed lock:
 The contract must remain portable: committed artifacts contain hashes and
 normalized relative paths, never machine-local absolute paths.
 
+Live attestation occurs once per separator as pilot preflight, outside every
+per-item separator RTF window. A post-pilot model-root recheck detects writes
+made by a separator process without repeating a full environment scan for every
+song.
+
 ## Non-goals
 
 - Do not run real separators, generate Task 11 locks, or alter pilot outputs
@@ -30,6 +35,12 @@ normalized relative paths, never machine-local absolute paths.
 - Do not claim that a pip-installed package proves the lock's Git revision.
   `repository_revision` remains freeze-time provenance metadata; verified code
   identity is the package/environment content hash.
+- Do not treat a hash-pinned requirements file or a distribution name/version
+  list as a live byte-level identity for an arbitrary host interpreter. Those
+  are useful build provenance, not replacements for runtime attestation.
+- Do not claim OS-level network isolation for a native `Popen` separator. The
+  design constrains each separator's model resolver and verifies the model root;
+  it does not turn host subprocess execution into `--network=none`.
 
 ## Persisted artifacts
 
@@ -106,20 +117,24 @@ trees.
 
 ### Policy-owned model-root layouts
 
-`_SEPARATOR_POLICIES` remains the closed separator registry and gains, next to
-the fixed argv, each separator's `model_root_kind`, full model-root inventory
-rule, and process-environment overlay rule. A caller supplies only one model
-root. It cannot select a subset of files or supply model-root metadata.
+`_SEPARATOR_POLICIES` remains a closed, data-only separator registry. It stores
+the fixed argv, `model_root_kind`, and declarative environment keys. Named
+helpers dispatch on `separator_id` to inventory model roots and build launch
+environments; no callable is stored in the registry or compared as lock data.
+A caller supplies only one model root. It cannot select a subset of files or
+supply model-root metadata.
 
 | Separator | Root kind | Policy-owned payload |
 | --- | --- | --- |
 | Spleeter 2.4.2 | `spleeter-model-path-v1` | A dedicated `MODEL_PATH` root with the exact `spleeter:4stems` payload: `4stems/checkpoint`, `4stems/.probe`, `4stems/model.index`, `4stems/model.data-00000-of-00001`, and `4stems/model.meta`. The policy rejects extra regular files or symlinks in the dedicated root. |
-| Demucs 4.1.0 | `demucs-hf-hub-cache-v1` | A dedicated materialized Hugging Face cache with `models--adefossez--HTDemucs/refs/main` and the matching `snapshots/<40-hex-revision>/htdemucs.yaml` and `955717e8.safetensors` payload. The policy derives the snapshot from `refs/main`, inventories the complete permitted cache tree, and rejects extras, symlinks, legacy `--repo`, and cache escapes. |
+| Demucs 4.1.0 | `demucs-local-repo-v1` | A dedicated local repository passed through the fixed `--repo {model_root}` argv. It contains exactly `htdemucs.yaml` and `955717e8-8726e21a.th`, both regular no-follow files whose full hashes are in `model_files`; no other entries or symlinks are permitted. Demucs 4.1.0 selects `LocalRepo` whenever `--repo` is supplied, and `htdemucs.yaml` names `955717e8`, so this avoids the Hugging Face and legacy remote resolver branches. |
 
-The freezer walks this policy tree with no-follow reads and writes
-`model_files` from that walk. Runtime repeats the same policy walk and compares
-the full inventory against the lock. The selected roots are dedicated to the
-fixed separator invocation, so an un-inventoried file cannot influence it.
+The freezer inventories each policy root with descriptor-relative/no-follow
+reads and writes `model_files` from that inventory. Spleeter uses a narrow
+nested-root walk; Demucs uses the existing exact-entry-set verification shape
+from checkpoint acquisition. Runtime repeats the same policy inventory and
+compares it to the lock. The selected roots are dedicated to the fixed
+separator invocation, so an un-inventoried file cannot influence it.
 
 ## Freeze flow
 
@@ -151,8 +166,11 @@ It may launch the isolated standard-library probe, but it creates no cache,
 stem, prediction, or report artifact. It loads the v2 lock and exact sibling,
 resolves/hashes the interpreter, validates the probe result and sibling hash,
 walks and compares the policy-owned model root, and returns the verified launch
-configuration. Freeze uses it for its round trip. Pilot code does not grow a
-second attestation implementation.
+configuration as an `AttestedSeparatorRuntime` value. That value carries the
+resolved interpreter, validated lock, model-root inventory, and launch
+environment; pilot execution passes it to fresh, cache-hit, and retained-stem
+paths rather than reattesting per item. Freeze uses the same verifier for its
+round trip. Pilot code does not grow a second attestation implementation.
 
 New native `SeparatorExecutionError` attestation codes are closed to exactly:
 
@@ -163,48 +181,70 @@ New native `SeparatorExecutionError` attestation codes are closed to exactly:
 - `separator_environment_probe_failed`.
 
 `_separator_failure_status` maps each of those codes to
-`separation_failed`, preserving the code in the native failure histogram. No
-ad-hoc attestation strings enter snapshots, comparisons, or handoff output.
+`separation_failed` if it reaches per-view handling. A preflight failure instead
+terminates the pilot once with exit code 2 and the native code in its structured
+diagnostic; it deliberately does not manufacture one identical row failure per
+song or publish a misleading histogram. No ad-hoc attestation strings enter
+snapshots, comparisons, or handoff output.
 
-## Runtime flow and environment overlay
+## Runtime flow, preflight, and environment overlay
 
 `OafSeparationPilotRequest` gains required Spleeter and Demucs model roots. The
 pilot CLI gains required `--spleeter-model-root` and `--demucs-model-root`
 options while retaining its existing interpreter options.
 
-For every fresh and resumed derived view:
+After authoritative parent/source validation and before full-mix control
+scoring or the derived-view item loop, the pilot calls
+`attest_separator_runtime` once for Spleeter and once for HTDemucs. Each result
+is retained as an `AttestedSeparatorRuntime` for the lifetime of that pilot.
+This preflight sits outside all `separator_wall_time_sec` and
+`separator_rtf` measurement windows. It occurs before constructing or writing
+the initial mutable `run.json` snapshot.
 
-1. `_run_separator_drums` calls `attest_separator_runtime` immediately before
-   `_read_cached_stem`, so a cache hit is never returned before live
-   verification.
-2. The derived-view resume branch calls the same function immediately before
-   `_resolve_retained_stem`, so a persisted valid-looking stem cannot bypass
-   re-attestation.
-3. A cache miss launches the fixed separator argv only with the verified
-   configuration returned by that function.
+If either preflight call fails, the pilot is a run-wide fatal configuration
+failure: it exits 2 with the one native code, does not execute the full-mix
+control or derived item loops, and publishes no mutable pilot run snapshot.
+This prevents one drifted environment from being repeatedly reported as a
+partial per-song separator failure. The existing per-view partial semantics
+remain for failures that occur after successful preflight. The public
+`OafSeparationPilotOutcome` gains `failure_code: str | None`, and the pilot CLI
+includes that closed code in its canonical result JSON. This is the structured
+fatal diagnostic carrier; it contains no host path or exception message.
+
+Fresh, cache-hit, and retained-stem resume paths receive the already-attested
+runtime value. `_run_separator_drums` must not read a cached stem until it has
+that value, and the resume branch must not resolve a retained stem until its
+separator's preflight has succeeded. Thus every item is covered without
+repeating the full interpreter environment scan inside the item loop.
+
+After all derived execution completes but before any derived scoring, view
+report, comparison report, or final snapshot publication, the pilot
+re-inventories each preflighted model root. The same check runs in the cleanup
+path if a separator was launched and the pilot otherwise raises. Derived rows
+are provisional until that check passes: the invocation retains each row's
+pre-mutation view state, and on a changed root restores those preimages (or the
+fresh pending state), clears newly created derived references, and suppresses
+all derived/report publication. A changed root is
+`separator_model_root_invalid`, converts the outcome to fatal with that code,
+and leaves only un-attributed immutable cache stems on disk. Previously valid
+resume evidence is restored rather than deleted; the next pilot preflight also
+prevents unsafe reuse.
 
 The process environment is a closed policy overlay over the parent environment:
 it is not blank, but no ambient separator-discovery input survives. The
 launcher starts with a copy of the parent environment, removes every
 model/cache/endpoint discovery variable named by that separator's policy,
-applies the exact root and offline values, and passes the resulting mapping
-through `subprocess.Popen(..., env=...)`.
+applies the exact root values, and passes the resulting mapping through
+`subprocess.Popen(..., env=...)`.
 
 For Spleeter, the policy removes an inherited `MODEL_PATH` and sets it to the
-attested absolute root. For Demucs, the policy removes conflicting
-Hugging-Face, torch-cache, endpoint, and legacy repository overrides, sets the
-attested `HF_HUB_CACHE`, and applies the exact offline/no-remote controls that
-are demonstrated against the frozen 4.1.0 resolver. The cache prefix and
-controls must be source-proven in an isolated resolver test with network access
-denied; implementation may not substitute guessed environment-variable
-folklore. Any resolver path that would use `--repo`, a non-attested cache root,
-or a remote fetch fails before inference.
-
-An attestation failure occurs before cache access or retained-stem resolution,
-emits one of the native codes above, and retains no newly attributed
-stem/input/prediction. The other fixed derived view may continue under existing
-partial-run semantics. Resume paths attest again even if a valid stem already
-exists.
+attested absolute root. For Demucs, the fixed argv adds `--repo {model_root}`;
+the pinned 4.1.0 source selects its local repository branch whenever that flag
+is present, so model lookup does not use the Hugging Face or legacy remote
+branch. The overlay removes conflicting model-discovery variables as
+defence-in-depth, but it is not the network guarantee. The post-pilot inventory
+detects a changed model root; no claim is made that native `Popen` has a generic
+OS-level network sandbox.
 
 ## Identity and reporting
 
@@ -213,9 +253,33 @@ not appear in run identity, snapshots, cache keys, comparison reports, or
 handoff rows. The v2 lock SHA already binds the verified environment/model
 identity and continues to be the persisted provenance field.
 
+`interpreter_sha256` identifies the resolved executable bytes only; two venvs
+that share a base Python can have the same interpreter hash. The sibling
+environment manifest, rebuilt by that interpreter at preflight, is what binds
+the installed distribution tree to the lock.
+
 `crux.oaf-separation-run/v1`, `crux.oaf-separation-comparison/v1`, and the
 handoff schema remain unchanged. Existing source/input identity, full-mix
 non-rerun, failure histogram, and resource-reporting contracts remain intact.
+`failure_code` is an outcome/CLI diagnostic field only; it is not added to any
+persisted run, comparison, or handoff schema.
+
+## Threat boundary and risks
+
+- A hash-pinned requirements file can make separator environment construction
+  reproducible, but it cannot prove that an arbitrary later host venv remains
+  unchanged. Runtime byte-manifest attestation remains authoritative.
+- Environment scanning is intentionally expensive only at preflight. It is not
+  part of separator wall time or RTF, and is never repeated per source item.
+- The native separator launcher has no host-level network sandbox. Demucs
+  model resolution is constrained by its fixed local `--repo` branch and a
+  post-pilot inventory check, not by environment-variable folklore.
+- A model-root change can be discovered after a separator has written an
+  immutable cache stem. The final pilot restores the invocation's provisional
+  derived rows, treats that as fatal, and does not attribute the stem to a run;
+  a later preflight also prevents its reuse.
+- The Demucs local-repository layout is pinned to package version 4.1.0. Any
+  package upgrade requires a new policy/lock review rather than silent reuse.
 
 ## Verification plan
 
@@ -228,11 +292,19 @@ production separator runtimes. Required coverage includes:
   missing entries, injected extra `.py`/`.pth`/`sitecustomize.py`, bytecode
   exclusion, parent/leaf symlinks, and canonical probe-output failures;
 - policy-owned root walking rather than caller-selected files; Spleeter layout
-  and exact `MODEL_PATH` propagation; and Demucs cache/revision/materialization
-  and resolver-offline/no-remote behavior;
-- attestation before cached stem reads and before retained-stem resume reads;
+  and exact `MODEL_PATH` propagation; and Demucs's exact local `htdemucs.yaml`
+  plus `955717e8-8726e21a.th` repository, `--repo` argv propagation, and
+  rejection of all cache-layout/Hugging-Face assumptions;
+- one preflight per separator outside every RTF measurement window; cache-hit
+  and retained-stem paths that require the preflighted runtime value; fatal
+  preflight behavior with one native outcome/CLI code rather than per-song
+  failures; and no initial mutable snapshot before preflight;
+- post-pilot model-root mutation detection before any scoring/report
+  publication, restoration of prior resume rows or fresh pending rows, and
+  suppression of newly derived evidence on a fatal postflight check;
 - CLI/freezer option wiring, no host roots in persisted artifacts, native-code
-  histogram behavior, partial-run continuation, and missing-root failures; and
+  diagnostic behavior, partial-run continuation after successful preflight, and
+  missing-root failures; and
 - regression coverage for existing HPA-328 schema, comparison, and handoff
   behavior.
 
@@ -243,17 +315,23 @@ production separator runtimes. Required coverage includes:
 2. Add the standalone probe and freezer integration against a synthetic
    isolated environment; prove `RECORD`, extra-file, bytecode, and symlink
    behavior before touching pilot execution.
-3. Add policy-owned model-root walking and the `Popen` environment overlay;
-   prove Spleeter and Demucs layouts plus the Demucs resolver contract.
-4. Add `attest_separator_runtime` at freezer round-trip, pre-cache runner, and
-   pre-resume retained-stem boundaries; wire the two CLI model-root options.
-5. Add histogram, partial-run, missing-root, and no-host-path regressions, then
-   run the HPA-328 focused and whole-branch verification stack.
+3. Add policy-owned model-root inventory and the `Popen` environment overlay;
+   prove the Spleeter layout and Demucs 4.1.0 flat local-repository argv/layout
+   contract without invoking a production separator.
+4. Add one `attest_separator_runtime` preflight per separator, the typed runtime
+   handoff to cache/resume paths, pre-snapshot run-wide fatal configuration
+   handling with the outcome/CLI code carrier, and the two CLI model-root
+   options.
+5. Add timing-isolation, fatal-preflight, partial-after-preflight,
+   provisional-row restoration/post-inventory-before-reports, missing-root, and
+   no-host-path regressions, then run the HPA-328 focused and whole-branch
+   verification stack.
 
 ## Task 11 impact
 
 When the upstream HPA-321/323/324/326/327 inputs become available, Task 11
 will first materialize/verify the dedicated model roots, generate and commit
 each v2 `model.json` plus fixed sibling `environment.json`, and only then run
-the fixed pilot. The later explicit decision/rationale gate for finalization
+the fixed pilot. The HTDemucs root is the reviewed flat local repository, not a
+Hugging Face cache. The later explicit decision/rationale gate for finalization
 remains unchanged.
