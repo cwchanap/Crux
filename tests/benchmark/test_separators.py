@@ -112,7 +112,7 @@ def test_loader_rejects_v1_lock_schema(
     path = tmp_path / "separator.json"
     _write_payload(path, payload)
 
-    with pytest.raises(ValueError, match="schema"):
+    with pytest.raises(SeparatorLockError, match="schema"):
         load_separator_lock(path)
 
 
@@ -221,9 +221,8 @@ def test_loader_rejects_command_model_mismatch(
         load_separator_lock(path)
 
 
-def test_freeze_script_hashes_explicit_files_and_round_trips(
+def test_freeze_script_refuses_v2_lock_until_attestation_flow(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from scripts import freeze_separator_runtime as freezer
 
@@ -231,19 +230,17 @@ def test_freeze_script_hashes_explicit_files_and_round_trips(
     model_bytes = b"synthetic separator model bytes"
     model_file.write_bytes(model_bytes)
     output = tmp_path / "separator.json"
-    monkeypatch.setattr(freezer, "_package_version", lambda interpreter, package: "2.4.2")
 
-    lock = freezer.freeze_separator_runtime(
-        separator_id=SPLEETER_SEPARATOR_ID,
-        interpreter=Path("/isolated/python"),
-        model_files={"weights.bin": model_file},
-        repository_revision="a" * 40,
-        output=output,
-    )
+    with pytest.raises(freezer.FreezeError, match="Task 4|deferred|v2"):
+        freezer.freeze_separator_runtime(
+            separator_id=SPLEETER_SEPARATOR_ID,
+            interpreter=Path("/isolated/python"),
+            model_files={"weights.bin": model_file},
+            repository_revision="a" * 40,
+            output=output,
+        )
 
-    assert lock == load_separator_lock(output)
-    assert lock.package_version == "2.4.2"
-    assert lock.model_files[0].sha256 == hashlib.sha256(model_bytes).hexdigest()
+    assert not output.exists()
 
 
 class _FakePopen:
