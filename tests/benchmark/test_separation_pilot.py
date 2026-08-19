@@ -78,6 +78,8 @@ def _request(tmp_path: Path, fixture: object, subset_path: Path):
         output_dir=tmp_path / "separation-output",
         spleeter_python=Path("/isolated/spleeter/python"),
         demucs_python=Path("/isolated/demucs/python"),
+        spleeter_model_root=tmp_path / "spleeter-model-root",
+        demucs_model_root=tmp_path / "demucs-model-root",
         crux_commit="c" * 40,
     )
 
@@ -89,8 +91,8 @@ def _install_fixture_locks(monkeypatch: pytest.MonkeyPatch) -> None:
         pilot,
         "SEPARATOR_LOCK_PATHS",
         {
-            SPLEETER_SEPARATOR_ID: FIXTURE_ROOT / "spleeter-model.json",
-            HTDEMUCS_SEPARATOR_ID: FIXTURE_ROOT / "htdemucs-model.json",
+            SPLEETER_SEPARATOR_ID: FIXTURE_ROOT / "spleeter" / "model.json",
+            HTDEMUCS_SEPARATOR_ID: FIXTURE_ROOT / "htdemucs" / "model.json",
         },
     )
 
@@ -123,7 +125,13 @@ def _task6_seams(
     from src.benchmark.backend_identity import BackendDescriptor
     from src.benchmark.backends.base import CanonicalAudio, NativeEvent, NativePrediction
     from src.benchmark.corpus_cache import ResolvedSourceAudio
-    from src.benchmark.separators import SeparatedStem, StemQc
+    from src.benchmark.separators import (
+        AttestedSeparatorRuntime,
+        SeparatedStem,
+        StemQc,
+        load_separator_environment_manifest,
+        load_separator_lock,
+    )
 
     parent = parse_oaf_corpus_run(fixture.run_path.read_bytes())
     descriptor = BackendDescriptor(
@@ -138,6 +146,8 @@ def _task6_seams(
         "close": [],
         "transcribe": [],
         "score": [],
+        "attest": [],
+        "events": [],
     }
 
     def resolve(source: object, *_args: object, **kwargs: object) -> ResolvedSourceAudio:
@@ -152,7 +162,7 @@ def _task6_seams(
             duration_sec=1.0,
         )
 
-    def stem(separator_id: str, source_sha: str) -> SeparatedStem:
+    def stem(separator_id: str, source_sha: str, separator_lock_sha256: str) -> SeparatedStem:
         stem_path = (
             tmp_path
             / "cache"
@@ -169,11 +179,7 @@ def _task6_seams(
         return SeparatedStem(
             separator_id=separator_id,
             source_audio_sha256=source_sha,
-            separator_lock_sha256=(
-                "84b478def61f9c78320e76a7a49afeb341a22dc5e02dd1b0c666bb8cc3667a95"
-                if separator_id == SPLEETER_SEPARATOR_ID
-                else "7db5a9bfb64d7ec4b2f55e134ddd720cf6e64b1c97343a50fd7dce1f0b81b5e0"
-            ),
+            separator_lock_sha256=separator_lock_sha256,
             path=stem_path,
             sha256=hashlib.sha256(stem_bytes).hexdigest(),
             qc=StemQc(
@@ -188,17 +194,53 @@ def _task6_seams(
             cache_hit=False,
         )
 
-    def spleeter(source: Path, **kwargs: object) -> SeparatedStem:
+    def fake_attest(
+        lock_path: Path,
+        interpreter: Path,
+        model_root: Path,
+    ) -> AttestedSeparatorRuntime:
+        lock = load_separator_lock(lock_path)
+        environment = load_separator_environment_manifest(lock_path, lock)
+        calls["attest"].append(lock.separator_id)
+        calls["events"].append(f"attest:{lock.separator_id}")
+        return AttestedSeparatorRuntime(
+            interpreter=interpreter,
+            lock=lock,
+            model_root=model_root,
+            model_files=lock.model_files,
+            environment=environment,
+            launch_environment={},
+        )
+
+    def spleeter(
+        source: Path,
+        *,
+        source_audio_sha256: str,
+        source_duration_sec: float,
+        runtime: AttestedSeparatorRuntime,
+        cache_root: Path,
+    ) -> SeparatedStem:
         del source
+        del source_duration_sec, cache_root
         calls["separate"].append(SPLEETER_INPUT_VIEW_ID)
         if spleeter_error is not None:
             raise spleeter_error
-        return stem(SPLEETER_SEPARATOR_ID, kwargs["source_audio_sha256"])  # type: ignore[arg-type]
+        assert runtime.lock.separator_id == SPLEETER_SEPARATOR_ID
+        return stem(SPLEETER_SEPARATOR_ID, source_audio_sha256, runtime.lock.sha256)
 
-    def htdemucs(source: Path, **kwargs: object) -> SeparatedStem:
+    def htdemucs(
+        source: Path,
+        *,
+        source_audio_sha256: str,
+        source_duration_sec: float,
+        runtime: AttestedSeparatorRuntime,
+        cache_root: Path,
+    ) -> SeparatedStem:
         del source
+        del source_duration_sec, cache_root
         calls["separate"].append(HTDEMUCS_INPUT_VIEW_ID)
-        return stem(HTDEMUCS_SEPARATOR_ID, kwargs["source_audio_sha256"])  # type: ignore[arg-type]
+        assert runtime.lock.separator_id == HTDEMUCS_SEPARATOR_ID
+        return stem(HTDEMUCS_SEPARATOR_ID, source_audio_sha256, runtime.lock.sha256)
 
     def materialize(
         source: ResolvedSourceAudio,
@@ -272,14 +314,15 @@ def _task6_seams(
     monkeypatch.setattr(pilot, "resolve_source_audio", resolve, raising=False)
     monkeypatch.setattr(pilot, "run_spleeter_drums", spleeter, raising=False)
     monkeypatch.setattr(pilot, "run_htdemucs_drums", htdemucs, raising=False)
+    monkeypatch.setattr(pilot, "attest_separator_runtime", fake_attest, raising=False)
     monkeypatch.setattr(pilot, "materialize_derived_audio", materialize, raising=False)
     monkeypatch.setattr(pilot, "score_oaf_reviewed_subset", fake_score)
     monkeypatch.setattr(
         pilot,
         "SEPARATOR_LOCK_PATHS",
         {
-            SPLEETER_SEPARATOR_ID: FIXTURE_ROOT / "spleeter-model.json",
-            HTDEMUCS_SEPARATOR_ID: FIXTURE_ROOT / "htdemucs-model.json",
+            SPLEETER_SEPARATOR_ID: FIXTURE_ROOT / "spleeter" / "model.json",
+            HTDEMUCS_SEPARATOR_ID: FIXTURE_ROOT / "htdemucs" / "model.json",
         },
     )
     calls["factory"] = [backend_factory]
@@ -823,9 +866,92 @@ def test_request_exposes_only_the_fixed_pilot_controls() -> None:
         "output_dir",
         "spleeter_python",
         "demucs_python",
+        "spleeter_model_root",
+        "demucs_model_root",
         "resume",
         "crux_commit",
     }
+
+
+def test_pilot_attests_each_separator_once_before_snapshot_or_rtf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.benchmark.separation_pilot as pilot
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    real_writer = pilot.write_oaf_separation_run
+
+    def recording_writer(run_path: Path, snapshot: Mapping[str, object]) -> None:
+        calls["events"].append("write")
+        real_writer(run_path, snapshot)
+
+    monkeypatch.setattr(pilot, "write_oaf_separation_run", recording_writer)
+    ticks = iter(float(index) for index in range(1000))
+
+    def recording_perf_counter() -> float:
+        calls["events"].append("perf")
+        return next(ticks)
+
+    first = run_oaf_separation_pilot(
+        request,
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+        perf_counter=recording_perf_counter,
+    )
+
+    assert first.exit_code == 0
+    assert calls["attest"] == [SPLEETER_SEPARATOR_ID, HTDEMUCS_SEPARATOR_ID]
+    assert calls["events"].index("attest:" + HTDEMUCS_SEPARATOR_ID) < calls["events"].index("write")
+    assert calls["events"].index("attest:" + HTDEMUCS_SEPARATOR_ID) < calls["events"].index("perf")
+
+    second = run_oaf_separation_pilot(
+        replace(request, resume=True),
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+        perf_counter=recording_perf_counter,
+    )
+
+    assert second.exit_code == 0
+    assert calls["attest"] == [
+        SPLEETER_SEPARATOR_ID,
+        HTDEMUCS_SEPARATOR_ID,
+        SPLEETER_SEPARATOR_ID,
+        HTDEMUCS_SEPARATOR_ID,
+    ]
+
+
+def test_pilot_attestation_failure_is_fatal_before_any_mutable_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.benchmark.separation_pilot as pilot
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+    from src.benchmark.separators import SeparatorExecutionError
+
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+
+    def failing_attest(*_args: object, **_kwargs: object) -> object:
+        calls["attest"].append(SPLEETER_SEPARATOR_ID)
+        raise SeparatorExecutionError("separator_environment_mismatch")
+
+    monkeypatch.setattr(pilot, "attest_separator_runtime", failing_attest)
+    outcome = run_oaf_separation_pilot(
+        request,
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.failure_code == "separator_environment_mismatch"
+    assert calls["attest"] == [SPLEETER_SEPARATOR_ID]
+    assert not calls["score"]
+    assert not calls["separate"]
+    assert not request.output_dir.exists()
 
 
 def test_lineage_preflight_fails_before_full_mix_control_or_runtime_touch(

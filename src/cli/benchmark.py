@@ -1343,6 +1343,18 @@ def compare_oaf_muscriptor_command(
     required=True,
     help="Required isolated Demucs interpreter.",
 )
+@click.option(
+    "--spleeter-model-root",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+    help="Required policy-owned Spleeter model root.",
+)
+@click.option(
+    "--demucs-model-root",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+    help="Required policy-owned HTDemucs model root.",
+)
 @click.option("--resume", is_flag=True)
 @click.pass_context
 def run_oaf_separation_pilot_command(
@@ -1355,6 +1367,8 @@ def run_oaf_separation_pilot_command(
     output_dir: Path,
     spleeter_python: Path,
     demucs_python: Path,
+    spleeter_model_root: Path,
+    demucs_model_root: Path,
     resume: bool,
 ) -> None:
     """Run the fixed HPA-328 OaF separation pilot."""
@@ -1375,6 +1389,8 @@ def run_oaf_separation_pilot_command(
             output_dir=output_dir,
             spleeter_python=spleeter_python,
             demucs_python=demucs_python,
+            spleeter_model_root=spleeter_model_root,
+            demucs_model_root=demucs_model_root,
             resume=resume,
             crux_commit=crux_commit,
         )
@@ -1390,6 +1406,7 @@ def run_oaf_separation_pilot_command(
             failed_count=0,
             skipped_count=0,
             quarantined_count=0,
+            failure_code=None,
         )
     else:
         outcome = run_oaf_separation_pilot(request)
@@ -1397,6 +1414,7 @@ def run_oaf_separation_pilot_command(
     payload = {
         "exit_code": outcome.exit_code,
         "failed_count": outcome.failed_count,
+        "failure_code": outcome.failure_code,
         "full_mix_reports_path": (
             None if outcome.full_mix_reports_path is None else str(outcome.full_mix_reports_path)
         ),

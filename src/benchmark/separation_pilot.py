@@ -1,11 +1,10 @@
 """HPA-328 fixed-subset preflight and separation-run ledger.
 
 Task 5 deliberately keeps this boundary concrete.  It validates the four
-already-published input artifacts, binds the two fixed derived views to the
-persisted OaF control, writes the local HPA-328 run identity, and obtains the
-full-mix control through the public reviewed-subset scorer.  Separator and OaF
-execution are added in the following task; this module must not construct
-either runtime during preflight.
+already-published input artifacts, attests the two fixed separator runtimes,
+binds the derived views to the persisted OaF control, writes the local HPA-328
+run identity, and obtains the full-mix control through the public reviewed-
+subset scorer.
 """
 
 # This concrete task boundary intentionally keeps request/ledger state and
@@ -105,11 +104,14 @@ from src.benchmark.separation_comparison import (
     compare_oaf_separation,
 )
 from src.benchmark.separators import (
+    ATTESTATION_FAILURE_CODES,
     HTDEMUCS_SEPARATOR_ID,
     SPLEETER_SEPARATOR_ID,
+    AttestedSeparatorRuntime,
     SeparatedStem,
     SeparatorExecutionError,
     SeparatorLock,
+    attest_separator_runtime,
     load_separator_lock,
     run_htdemucs_drums,
     run_spleeter_drums,
@@ -192,6 +194,8 @@ class OafSeparationPilotRequest:
     output_dir: Path
     spleeter_python: Path
     demucs_python: Path
+    spleeter_model_root: Path
+    demucs_model_root: Path
     resume: bool = False
     crux_commit: str | None = None
 
@@ -205,6 +209,8 @@ class OafSeparationPilotRequest:
             "output_dir",
             "spleeter_python",
             "demucs_python",
+            "spleeter_model_root",
+            "demucs_model_root",
         ):
             if not isinstance(getattr(self, field), Path):
                 raise TypeError(f"{field} must be a Path")
@@ -233,6 +239,7 @@ class OafSeparationPilotOutcome:
     failed_count: int
     skipped_count: int
     quarantined_count: int
+    failure_code: str | None
 
     def __post_init__(self) -> None:
         if self.overall_status not in {"complete", "partial", "failed"}:
@@ -248,13 +255,18 @@ class OafSeparationPilotOutcome:
             value = getattr(self, field)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{field} must be a nonnegative integer")
+        if self.failure_code is not None and (
+            not isinstance(self.failure_code, str)
+            or self.failure_code not in ATTESTATION_FAILURE_CODES
+        ):
+            raise ValueError("failure_code is invalid")
 
 
 class SeparationRunError(ValueError):
     """A malformed or inconsistent HPA-328 run snapshot."""
 
 
-def _fatal_outcome() -> OafSeparationPilotOutcome:
+def _fatal_outcome(failure_code: str | None = None) -> OafSeparationPilotOutcome:
     return OafSeparationPilotOutcome(
         overall_status="failed",
         exit_code=2,
@@ -266,6 +278,7 @@ def _fatal_outcome() -> OafSeparationPilotOutcome:
         failed_count=0,
         skipped_count=0,
         quarantined_count=0,
+        failure_code=failure_code,
     )
 
 
@@ -1392,12 +1405,11 @@ def _execute_derived_view(
     *,
     view_name: str,
     input_view_id: str,
-    separator_lock: SeparatorLock,
+    runtime: AttestedSeparatorRuntime,
     inference_config: Mapping[str, str],
     inference_config_sha: str,
     prior_item: Mapping[str, object] | None,
     separator_runner: Callable[..., object],
-    interpreter: Path,
     backend_factory: Callable[..., object],
     backend: object | None,
     backend_ref: list[object | None],
@@ -1420,7 +1432,7 @@ def _execute_derived_view(
         if isinstance(prior_item, Mapping) and isinstance(prior_item.get(view_name), Mapping)
         else None
     )
-    runtime: dict[str, object] = {}
+    runtime_evidence: dict[str, object] = {}
     stem_path: Path | None = None
 
     separator_started = perf_counter()
@@ -1437,17 +1449,16 @@ def _execute_derived_view(
                 raw_stem,
                 cache_root=request.cache_dir,
                 source=source,
-                lock=separator_lock,
+                lock=runtime.lock,
             )
             view["stem"] = dict(raw_stem)
-            runtime["separator_cache_hit"] = True
+            runtime_evidence["separator_cache_hit"] = True
         else:
             stem = separator_runner(
                 source.path,
                 source_audio_sha256=source.source_audio_sha256,
                 source_duration_sec=source.duration_sec,
-                interpreter=interpreter,
-                lock_path=SEPARATOR_LOCK_PATHS[separator_lock.separator_id],
+                runtime=runtime,
                 cache_root=request.cache_dir,
             )
             if not isinstance(stem, SeparatedStem):
@@ -1458,16 +1469,16 @@ def _execute_derived_view(
                 raise SeparatorExecutionError(
                     "stem_identity_invalid", "separator source identity changed"
                 )
-            if stem.separator_lock_sha256 != separator_lock.sha256:
+            if stem.separator_lock_sha256 != runtime.lock.sha256:
                 raise SeparatorExecutionError(
                     "stem_identity_invalid", "separator lock identity changed"
                 )
             stem_path = stem.path
             view["stem"] = _stem_evidence(stem, request.cache_dir)
-            runtime["separator_cache_hit"] = stem.cache_hit
+            runtime_evidence["separator_cache_hit"] = stem.cache_hit
     except SeparatorExecutionError as error:
         elapsed = max(0.0, perf_counter() - separator_started)
-        runtime.update(
+        runtime_evidence.update(
             {
                 "separator_wall_time_sec": elapsed,
                 "separator_rtf": elapsed / source.duration_sec if source.duration_sec > 0 else None,
@@ -1477,31 +1488,33 @@ def _execute_derived_view(
             view,
             status=_separator_failure_status(error.code),
             failure_code=error.code,
-            runtime=runtime,
+            runtime=runtime_evidence,
         )
         write_oaf_separation_run(run_path, snapshot)
         return backend
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         elapsed = max(0.0, perf_counter() - separator_started)
-        runtime.update({"separator_wall_time_sec": elapsed})
+        runtime_evidence.update({"separator_wall_time_sec": elapsed})
         _set_view_failure(
             view,
             status="separation_failed",
             failure_code=type(error).__name__,
-            runtime=runtime,
+            runtime=runtime_evidence,
         )
         write_oaf_separation_run(run_path, snapshot)
         return backend
 
-    runtime["separator_wall_time_sec"] = max(0.0, perf_counter() - separator_started)
-    runtime["separator_rtf"] = runtime["separator_wall_time_sec"] / source.duration_sec
+    runtime_evidence["separator_wall_time_sec"] = max(0.0, perf_counter() - separator_started)
+    runtime_evidence["separator_rtf"] = (
+        runtime_evidence["separator_wall_time_sec"] / source.duration_sec
+    )
     if isinstance(prior_view, Mapping):
         prior_runtime = prior_view.get("runtime")
         if isinstance(prior_runtime, Mapping):
             for field in ("separator_wall_time_sec", "separator_rtf"):
                 if field in prior_runtime:
-                    runtime[field] = prior_runtime[field]
-    view["runtime"] = runtime
+                    runtime_evidence[field] = prior_runtime[field]
+    view["runtime"] = runtime_evidence
     write_oaf_separation_run(run_path, snapshot)
 
     assert stem_path is not None
@@ -1540,7 +1553,7 @@ def _execute_derived_view(
             view,
             status="inference_failed",
             failure_code="canonical_input_failed",
-            runtime=runtime,
+            runtime=runtime_evidence,
         )
         write_oaf_separation_run(run_path, snapshot)
         canonical_path.unlink(missing_ok=True)
@@ -1563,7 +1576,7 @@ def _execute_derived_view(
             view,
             status="prediction_invalid",
             failure_code="prediction_artifact_invalid",
-            runtime=runtime,
+            runtime=runtime_evidence,
         )
         write_oaf_separation_run(run_path, snapshot)
         canonical_path.unlink(missing_ok=True)
@@ -1575,7 +1588,7 @@ def _execute_derived_view(
                 view,
                 status="prediction_invalid",
                 failure_code="prediction_output_conflict",
-                runtime=runtime,
+                runtime=runtime_evidence,
             )
             write_oaf_separation_run(run_path, snapshot)
             canonical_path.unlink(missing_ok=True)
@@ -1593,7 +1606,7 @@ def _execute_derived_view(
                 view,
                 status="prediction_invalid",
                 failure_code="prediction_output_conflict",
-                runtime=runtime,
+                runtime=runtime_evidence,
             )
             write_oaf_separation_run(run_path, snapshot)
             canonical_path.unlink(missing_ok=True)
@@ -1605,7 +1618,7 @@ def _execute_derived_view(
                 view,
                 status="prediction_invalid",
                 failure_code="prediction_artifact_invalid",
-                runtime=runtime,
+                runtime=runtime_evidence,
             )
             write_oaf_separation_run(run_path, snapshot)
             canonical_path.unlink(missing_ok=True)
@@ -1625,7 +1638,7 @@ def _execute_derived_view(
                 view,
                 status="prediction_invalid",
                 failure_code="prediction_output_conflict",
-                runtime=runtime,
+                runtime=runtime_evidence,
             )
             write_oaf_separation_run(run_path, snapshot)
             canonical_path.unlink(missing_ok=True)
@@ -1642,21 +1655,21 @@ def _execute_derived_view(
                 view,
                 status="prediction_invalid",
                 failure_code="prediction_artifact_invalid",
-                runtime=runtime,
+                runtime=runtime_evidence,
             )
             write_oaf_separation_run(run_path, snapshot)
             canonical_path.unlink(missing_ok=True)
             return backend
         prior_runtime = prior_view.get("runtime") if isinstance(prior_view, Mapping) else None
         if isinstance(prior_runtime, Mapping):
-            runtime.update(dict(prior_runtime))
+            runtime_evidence.update(dict(prior_runtime))
         view["prediction"] = {
             "path": _relative_artifact_path(prediction_target, run_dir.parent.parent),
             "artifact_sha256": artifact.artifact_sha256,
         }
         view["status"] = "resumed"
         view["failure_code"] = None
-        view["runtime"] = runtime
+        view["runtime"] = runtime_evidence
         write_oaf_separation_run(run_path, snapshot)
         canonical_path.unlink(missing_ok=True)
         return backend
@@ -1702,22 +1715,22 @@ def _execute_derived_view(
                 "worker response mapping failed", code="worker_response_invalid"
             ) from error
         published: PublishedArtifact = publish_prediction_artifact(prediction_target, mapped)
-        runtime["wall_time_sec"] = elapsed
-        runtime["rtf"] = elapsed / source.duration_sec if source.duration_sec > 0 else None
+        runtime_evidence["wall_time_sec"] = elapsed
+        runtime_evidence["rtf"] = elapsed / source.duration_sec if source.duration_sec > 0 else None
         view["prediction"] = {
             "path": _relative_artifact_path(prediction_target, run_dir.parent.parent),
             "artifact_sha256": published.sha256,
         }
         view["status"] = "success"
         view["failure_code"] = None
-        view["runtime"] = runtime
+        view["runtime"] = runtime_evidence
     except OafBackendError as error:
         runner_code, disposition = classify_oaf_backend_error(error.code)
         _set_view_failure(
             view,
             status="inference_failed",
             failure_code=runner_code or error.code,
-            runtime=runtime,
+            runtime=runtime_evidence,
         )
         if disposition in {"poison", "fatal_preflight"}:
             backend_to_close = backend
@@ -1730,14 +1743,14 @@ def _execute_derived_view(
             view,
             status="prediction_invalid",
             failure_code="prediction_publish_failed",
-            runtime=runtime,
+            runtime=runtime_evidence,
         )
     except (OSError, RuntimeError, TypeError, ValueError):
         _set_view_failure(
             view,
             status="prediction_invalid",
             failure_code="prediction_artifact_invalid",
-            runtime=runtime,
+            runtime=runtime_evidence,
         )
     finally:
         write_oaf_separation_run(run_path, snapshot)
@@ -1816,6 +1829,39 @@ def run_oaf_separation_pilot(
         if reports_path.resolve() == (request.oaf_run_path.resolve().parent / "reports").resolve():
             raise SeparationRunError("full-mix reports alias parent run reports")
         run_path = run_dir / "run.json"
+
+        # Resolve all authoritative source identities before either report
+        # scoring or an expensive separator/OaF operation.
+        sources = _resolve_pilot_sources(request, subset, rows)
+        raw_descriptor = parent.get("backend_descriptor")
+        if not isinstance(raw_descriptor, Mapping):
+            raise SeparationRunError("parent backend descriptor is unavailable")
+        descriptor = BackendDescriptor(
+            payload=dict(raw_descriptor),
+            sha256=parent["backend_descriptor_sha256"],  # type: ignore[arg-type]
+        )
+        _validate_frozen_oaf_binding(parent)
+        view_configs = {
+            "spleeter": _view_inference_config(parent, SPLEETER_INPUT_VIEW_ID),
+            "htdemucs": _view_inference_config(parent, HTDEMUCS_INPUT_VIEW_ID),
+        }
+        try:
+            runtimes = {
+                SPLEETER_SEPARATOR_ID: attest_separator_runtime(
+                    SEPARATOR_LOCK_PATHS[SPLEETER_SEPARATOR_ID],
+                    request.spleeter_python,
+                    request.spleeter_model_root,
+                ),
+                HTDEMUCS_SEPARATOR_ID: attest_separator_runtime(
+                    SEPARATOR_LOCK_PATHS[HTDEMUCS_SEPARATOR_ID],
+                    request.demucs_python,
+                    request.demucs_model_root,
+                ),
+            }
+        except SeparatorExecutionError as error:
+            failure_code = error.code if error.code in ATTESTATION_FAILURE_CODES else None
+            return _fatal_outcome(failure_code)
+
         prior_snapshot: Mapping[str, object] | None = None
         if run_path.exists():
             if not request.resume:
@@ -1842,24 +1888,9 @@ def run_oaf_separation_pilot(
         # scorer.  A malformed parent evidence row is still fatal preflight;
         # it must not cause even the full-mix control wrapper to run.
         render_oaf_separation_run(snapshot)
-        # Resolve all authoritative source identities before either report
-        # scoring or an expensive separator/OaF operation.
-        sources = _resolve_pilot_sources(request, subset, rows)
-        raw_descriptor = parent.get("backend_descriptor")
-        if not isinstance(raw_descriptor, Mapping):
-            raise SeparationRunError("parent backend descriptor is unavailable")
-        descriptor = BackendDescriptor(
-            payload=dict(raw_descriptor),
-            sha256=parent["backend_descriptor_sha256"],  # type: ignore[arg-type]
-        )
-        _validate_frozen_oaf_binding(parent)
         bound_backend_factory = _bind_oaf_backend_factory(
             selected_backend_factory, parent, descriptor
         )
-        view_configs = {
-            "spleeter": _view_inference_config(parent, SPLEETER_INPUT_VIEW_ID),
-            "htdemucs": _view_inference_config(parent, HTDEMUCS_INPUT_VIEW_ID),
-        }
         write_oaf_separation_run(run_path, snapshot)
 
         # Publish the control only after every fatal identity and source check
@@ -1892,12 +1923,11 @@ def run_oaf_separation_pilot(
                 source,
                 view_name="spleeter",
                 input_view_id=SPLEETER_INPUT_VIEW_ID,
-                separator_lock=spleeter,
+                runtime=runtimes[SPLEETER_SEPARATOR_ID],
                 inference_config=view_configs["spleeter"][0],
                 inference_config_sha=view_configs["spleeter"][1],
                 prior_item=prior_item,
                 separator_runner=selected_spleeter_runner,  # type: ignore[arg-type]
-                interpreter=request.spleeter_python,
                 backend_factory=bound_backend_factory,
                 backend=backend,
                 backend_ref=backend_ref,
@@ -1917,12 +1947,11 @@ def run_oaf_separation_pilot(
                 source,
                 view_name="htdemucs",
                 input_view_id=HTDEMUCS_INPUT_VIEW_ID,
-                separator_lock=htdemucs,
+                runtime=runtimes[HTDEMUCS_SEPARATOR_ID],
                 inference_config=view_configs["htdemucs"][0],
                 inference_config_sha=view_configs["htdemucs"][1],
                 prior_item=prior_item,
                 separator_runner=selected_htdemucs_runner,  # type: ignore[arg-type]
-                interpreter=request.demucs_python,
                 backend_factory=bound_backend_factory,
                 backend=backend,
                 backend_ref=backend_ref,
@@ -1998,6 +2027,7 @@ def run_oaf_separation_pilot(
             failed_count=control.failed_count,
             skipped_count=control.skipped_count,
             quarantined_count=control.quarantined_count,
+            failure_code=None,
         )
     except (OSError, RuntimeError, StrictJsonError, SeparationRunError, TypeError, ValueError):
         return _fatal_outcome()
