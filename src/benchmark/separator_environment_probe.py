@@ -306,7 +306,7 @@ def _hash_absolute_file(path: Path) -> str:
         os.close(file_descriptor)
 
 
-def _parse_record(content: bytes) -> list[tuple[str, str, str]]:
+def _parse_record(content: bytes) -> list[str]:
     try:
         text = content.decode("utf-8", errors="strict")
         rows = list(csv.reader(text.splitlines(), strict=True))
@@ -314,64 +314,19 @@ def _parse_record(content: bytes) -> list[tuple[str, str, str]]:
         raise _ProbeError("distribution RECORD is malformed") from error
     if not rows:
         raise _ProbeError("distribution RECORD is empty")
-    parsed: list[tuple[str, str, str]] = []
+    parsed: list[str] = []
     seen: set[str] = set()
     for row in rows:
         if len(row) != 3:
             raise _ProbeError("distribution RECORD row is malformed")
-        path, digest, byte_length = row
+        path, _, _ = row
         parts = _validate_relative_path(path)
         normalized = _relative_name(parts)
         if normalized in seen:
             raise _ProbeError("distribution RECORD contains duplicate paths")
         seen.add(normalized)
-        parsed.append((normalized, digest, byte_length))
+        parsed.append(normalized)
     return parsed
-
-
-def _urlsafe_base64_without_padding(content: bytes) -> str:
-    alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-    encoded = bytearray()
-    for index in range(0, len(content), 3):
-        chunk = content[index : index + 3]
-        value = int.from_bytes(chunk, "big") << (8 * (3 - len(chunk)))
-        encoded.append(alphabet[(value >> 18) & 63])
-        encoded.append(alphabet[(value >> 12) & 63])
-        if len(chunk) > 1:
-            encoded.append(alphabet[(value >> 6) & 63])
-        if len(chunk) > 2:
-            encoded.append(alphabet[value & 63])
-    return bytes(encoded).decode("ascii")
-
-
-def _validate_record_metadata(
-    digest_specification: str,
-    byte_length_specification: str,
-    byte_length: int,
-    sha256: str,
-) -> None:
-    if byte_length_specification:
-        if (
-            not byte_length_specification.isdecimal()
-            or int(byte_length_specification) != byte_length
-        ):
-            raise _ProbeError("distribution RECORD size does not match")
-    if not digest_specification:
-        return
-    algorithm, separator, encoded = digest_specification.partition("=")
-    if separator != "=" or not algorithm or not encoded:
-        raise _ProbeError("distribution RECORD digest is malformed")
-    try:
-        digest = hashlib.new(algorithm)
-    except (TypeError, ValueError) as error:
-        raise _ProbeError("distribution RECORD digest is unsupported") from error
-    if algorithm == "sha256":
-        actual = _urlsafe_base64_without_padding(bytes.fromhex(sha256))
-    else:
-        del digest
-        raise _ProbeError("distribution RECORD digest is unsupported")
-    if encoded != actual:
-        raise _ProbeError("distribution RECORD digest does not match")
 
 
 def _record_path_for_distribution(
@@ -420,7 +375,7 @@ def _inventory_distribution(
     rows = _parse_record(record_bytes)
     files: dict[tuple[str, str], dict[str, object]] = {}
     expected: set[tuple[str, str]] = set()
-    for relative_name, digest_specification, byte_length_specification in rows:
+    for relative_name in rows:
         parts = _validate_relative_path(relative_name)
         if _is_bytecode(parts):
             continue
@@ -429,12 +384,6 @@ def _inventory_distribution(
         _, byte_length, sha256, _ = _hash_relative_file(
             root_descriptors[root_tag],
             portable_parts,
-        )
-        _validate_record_metadata(
-            digest_specification,
-            byte_length_specification,
-            byte_length,
-            sha256,
         )
         key = (root_tag, portable_path)
         if key in files:
