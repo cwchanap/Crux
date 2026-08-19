@@ -16,6 +16,7 @@ from src.benchmark.separators import (
     SPLEETER_SEPARATOR_ID,
     SeparatorExecutionError,
     SeparatorLock,
+    _require_absolute_model_root,
     _resolve_separator_interpreter,
     _run_separator_environment_probe,
     attest_separator_runtime,
@@ -43,6 +44,7 @@ def freeze_separator_runtime(
         raise TypeError("model_root must be a Path")
     if not isinstance(output, Path):
         raise TypeError("output must be a Path")
+    _require_absolute_model_root(model_root)
     policy = _SEPARATOR_POLICIES.get(separator_id)
     if policy is None:
         raise FreezeError("separator_id is unsupported")
@@ -52,6 +54,7 @@ def freeze_separator_runtime(
     if (
         environment.separator_id != separator_id
         or environment.package_name != policy["package_name"]
+        or environment.package_version != policy["package_version"]
         or environment.interpreter_sha256 != interpreter_sha256
     ):
         raise SeparatorExecutionError(
