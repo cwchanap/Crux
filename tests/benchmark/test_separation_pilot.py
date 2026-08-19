@@ -954,6 +954,37 @@ def test_pilot_attestation_failure_is_fatal_before_any_mutable_artifact(
     assert not request.output_dir.exists()
 
 
+@pytest.mark.parametrize("model_root_field", ("spleeter_model_root", "demucs_model_root"))
+def test_output_nested_under_separator_model_root_fails_before_attestation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model_root_field: str,
+) -> None:
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    model_root = getattr(request, model_root_field)
+    nested_output = model_root / "nested" / ".." / "pilot-output"
+    request = replace(request, output_dir=nested_output)
+
+    outcome = run_oaf_separation_pilot(
+        request,
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+
+    normalized_output = nested_output.absolute()
+    assert outcome.exit_code == 2
+    assert outcome.run_path is None
+    assert calls["attest"] == []
+    assert calls["score"] == []
+    assert calls["separate"] == []
+    assert not normalized_output.exists()
+    assert not (normalized_output / "runs").exists()
+
+
 def test_lineage_preflight_fails_before_full_mix_control_or_runtime_touch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
