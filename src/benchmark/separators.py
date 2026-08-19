@@ -203,25 +203,12 @@ class SeparatorLock:
     argv: tuple[str, ...]
     expected_drum_stem_relative_path: str
     output_container: str
-    interpreter_sha256: str | None = None
-    environment_manifest_sha256: str | None = None
-    model_root_kind: str | None = None
-    sha256: str = ""
+    interpreter_sha256: str
+    environment_manifest_sha256: str
+    model_root_kind: str
+    sha256: str
 
     def __post_init__(self) -> None:
-        # Keep the pre-v2 freezer's constructor source-compatible until its
-        # dedicated Task 4 migration.  It never loads an environment sibling;
-        # all v2 locks loaded from disk carry explicit values for these fields.
-        if (
-            self.interpreter_sha256 is None
-            and self.environment_manifest_sha256 is None
-            and self.model_root_kind is None
-        ):
-            policy = _SEPARATOR_POLICIES.get(self.separator_id)
-            if policy is not None:
-                object.__setattr__(self, "interpreter_sha256", "0" * 64)
-                object.__setattr__(self, "environment_manifest_sha256", "0" * 64)
-                object.__setattr__(self, "model_root_kind", policy["model_root_kind"])
         _validate_lock(self)
 
 
