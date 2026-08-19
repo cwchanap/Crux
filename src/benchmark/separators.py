@@ -27,7 +27,8 @@ from src.benchmark.backend_identity import (
     strict_json_loads,
 )
 
-SEPARATOR_LOCK_SCHEMA = "crux.separator-lock/v1"
+SEPARATOR_LOCK_SCHEMA = "crux.separator-lock/v2"
+SEPARATOR_ENVIRONMENT_SCHEMA = "crux.separator-environment/v1"
 SPLEETER_SEPARATOR_ID = "spleeter4-drums-v1"
 HTDEMUCS_SEPARATOR_ID = "htdemucs-drums-v1"
 SEPARATOR_TIMEOUT_SECONDS = 1800.0
@@ -53,9 +54,41 @@ _LOCK_KEYS = frozenset(
         "argv",
         "expected_drum_stem_relative_path",
         "output_container",
+        "interpreter_sha256",
+        "environment_manifest_sha256",
+        "model_root_kind",
     }
 )
 _MODEL_FILE_KEYS = frozenset({"name", "sha256"})
+_ENVIRONMENT_KEYS = frozenset(
+    {
+        "schema",
+        "separator_id",
+        "package_name",
+        "package_version",
+        "python_implementation",
+        "python_version",
+        "python_abi",
+        "platform",
+        "interpreter_sha256",
+        "distributions",
+    }
+)
+_ENVIRONMENT_DISTRIBUTION_KEYS = frozenset({"name", "version", "files"})
+_ENVIRONMENT_FILE_KEYS = frozenset({"root", "path", "byte_length", "sha256"})
+_ENVIRONMENT_ROOT_TAGS = frozenset(
+    {
+        "stdlib",
+        "platstdlib",
+        "purelib",
+        "platlib",
+        "include",
+        "platinclude",
+        "scripts",
+        "data",
+    }
+)
+_DISTRIBUTION_NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 
 # Commands intentionally contain only interpreter-independent arguments.  The
 # freeze script records the interpreter separately, while the runner supplies
@@ -65,6 +98,7 @@ _SEPARATOR_POLICIES = {
         "repository_url": "https://github.com/deezer/spleeter",
         "package_name": "spleeter",
         "model_id": "spleeter:4stems",
+        "model_root_kind": "spleeter-model-path-v1",
         "argv": (
             "-m",
             "spleeter",
@@ -82,6 +116,7 @@ _SEPARATOR_POLICIES = {
         "repository_url": "https://github.com/facebookresearch/demucs",
         "package_name": "demucs",
         "model_id": "htdemucs",
+        "model_root_kind": "demucs-local-repo-v1",
         "argv": (
             "-m",
             "demucs",
@@ -168,10 +203,64 @@ class SeparatorLock:
     argv: tuple[str, ...]
     expected_drum_stem_relative_path: str
     output_container: str
+    interpreter_sha256: str | None = None
+    environment_manifest_sha256: str | None = None
+    model_root_kind: str | None = None
+    sha256: str = ""
+
+    def __post_init__(self) -> None:
+        # Keep the pre-v2 freezer's constructor source-compatible until its
+        # dedicated Task 4 migration.  It never loads an environment sibling;
+        # all v2 locks loaded from disk carry explicit values for these fields.
+        if (
+            self.interpreter_sha256 is None
+            and self.environment_manifest_sha256 is None
+            and self.model_root_kind is None
+        ):
+            policy = _SEPARATOR_POLICIES.get(self.separator_id)
+            if policy is not None:
+                object.__setattr__(self, "interpreter_sha256", "0" * 64)
+                object.__setattr__(self, "environment_manifest_sha256", "0" * 64)
+                object.__setattr__(self, "model_root_kind", policy["model_root_kind"])
+        _validate_lock(self)
+
+
+@dataclass(frozen=True)
+class SeparatorEnvironmentFile:
+    root: str
+    path: str
+    byte_length: int
     sha256: str
 
     def __post_init__(self) -> None:
-        _validate_lock(self)
+        _validate_environment_file(self)
+
+
+@dataclass(frozen=True)
+class SeparatorEnvironmentDistribution:
+    name: str
+    version: str
+    files: tuple[SeparatorEnvironmentFile, ...]
+
+    def __post_init__(self) -> None:
+        _validate_environment_distribution(self)
+
+
+@dataclass(frozen=True)
+class SeparatorEnvironmentManifest:
+    separator_id: str
+    package_name: str
+    package_version: str
+    python_implementation: str
+    python_version: str
+    python_abi: str
+    platform: str
+    interpreter_sha256: str
+    distributions: tuple[SeparatorEnvironmentDistribution, ...]
+    sha256: str
+
+    def __post_init__(self) -> None:
+        _validate_environment_manifest(self)
 
 
 def load_separator_lock(path: Path) -> SeparatorLock:
@@ -188,10 +277,12 @@ def load_separator_lock(path: Path) -> SeparatorLock:
         value = strict_json_loads(content[:-1], require_canonical=True)
     except StrictJsonError as error:
         raise SeparatorLockError(str(error)) from None
-    if not isinstance(value, dict) or set(value) != _LOCK_KEYS:
+    if not isinstance(value, dict):
         raise SeparatorLockError("separator lock must contain the exact key set")
     if value.get("schema") != SEPARATOR_LOCK_SCHEMA:
         raise SeparatorLockError("separator lock schema is invalid")
+    if set(value) != _LOCK_KEYS:
+        raise SeparatorLockError("separator lock must contain the exact key set")
 
     try:
         raw_model_files = value["model_files"]
@@ -214,6 +305,9 @@ def load_separator_lock(path: Path) -> SeparatorLock:
             argv=tuple(raw_argv),
             expected_drum_stem_relative_path=value["expected_drum_stem_relative_path"],
             output_container=value["output_container"],
+            interpreter_sha256=value["interpreter_sha256"],
+            environment_manifest_sha256=value["environment_manifest_sha256"],
+            model_root_kind=value["model_root_kind"],
             sha256=sha256_hex(content),
         )
     except SeparatorLockError:
@@ -244,7 +338,118 @@ def separator_lock_payload(lock: SeparatorLock) -> dict[str, object]:
         "argv": list(lock.argv),
         "expected_drum_stem_relative_path": lock.expected_drum_stem_relative_path,
         "output_container": lock.output_container,
+        "interpreter_sha256": lock.interpreter_sha256,
+        "environment_manifest_sha256": lock.environment_manifest_sha256,
+        "model_root_kind": lock.model_root_kind,
     }
+
+
+def separator_environment_manifest_payload(
+    manifest: SeparatorEnvironmentManifest,
+) -> dict[str, object]:
+    """Return the canonical JSON payload, excluding the derived file SHA."""
+    if not isinstance(manifest, SeparatorEnvironmentManifest):
+        raise TypeError("manifest must be a SeparatorEnvironmentManifest")
+    return {
+        "schema": SEPARATOR_ENVIRONMENT_SCHEMA,
+        "separator_id": manifest.separator_id,
+        "package_name": manifest.package_name,
+        "package_version": manifest.package_version,
+        "python_implementation": manifest.python_implementation,
+        "python_version": manifest.python_version,
+        "python_abi": manifest.python_abi,
+        "platform": manifest.platform,
+        "interpreter_sha256": manifest.interpreter_sha256,
+        "distributions": [
+            {
+                "name": distribution.name,
+                "version": distribution.version,
+                "files": [
+                    {
+                        "root": environment_file.root,
+                        "path": environment_file.path,
+                        "byte_length": environment_file.byte_length,
+                        "sha256": environment_file.sha256,
+                    }
+                    for environment_file in distribution.files
+                ],
+            }
+            for distribution in manifest.distributions
+        ],
+    }
+
+
+def load_separator_environment_manifest(
+    lock_path: Path,
+    lock: SeparatorLock,
+) -> SeparatorEnvironmentManifest:
+    """Load the exact canonical environment sibling bound by one v2 lock."""
+    if not isinstance(lock_path, Path):
+        raise TypeError("lock_path must be a Path")
+    if not isinstance(lock, SeparatorLock):
+        raise TypeError("lock must be a SeparatorLock")
+
+    sibling_path = lock_path.parent / "environment.json"
+    try:
+        content = read_regular_file_no_follow(sibling_path)
+    except (OSError, TypeError):
+        raise SeparatorLockError("separator lock companion environment is unavailable") from None
+    if sha256_hex(content) != lock.environment_manifest_sha256:
+        raise SeparatorLockError("separator lock companion environment hash does not match")
+    if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+        raise SeparatorLockError("separator lock companion environment must have one final newline")
+    try:
+        value = strict_json_loads(content[:-1], require_canonical=True)
+    except StrictJsonError as error:
+        raise SeparatorLockError(
+            f"separator lock companion environment is invalid: {error}"
+        ) from None
+    if not isinstance(value, dict) or set(value) != _ENVIRONMENT_KEYS:
+        raise SeparatorLockError(
+            "separator lock companion environment must contain the exact key set"
+        )
+    if value.get("schema") != SEPARATOR_ENVIRONMENT_SCHEMA:
+        raise SeparatorLockError("separator lock companion environment schema is invalid")
+
+    try:
+        raw_distributions = value["distributions"]
+        if not isinstance(raw_distributions, list):
+            raise SeparatorLockError("environment distributions must be a list")
+        distributions = tuple(
+            _environment_distribution_from_value(item) for item in raw_distributions
+        )
+        manifest = SeparatorEnvironmentManifest(
+            separator_id=value["separator_id"],
+            package_name=value["package_name"],
+            package_version=value["package_version"],
+            python_implementation=value["python_implementation"],
+            python_version=value["python_version"],
+            python_abi=value["python_abi"],
+            platform=value["platform"],
+            interpreter_sha256=value["interpreter_sha256"],
+            distributions=distributions,
+            sha256=sha256_hex(content),
+        )
+    except SeparatorLockError:
+        raise
+    except (KeyError, TypeError, ValueError):
+        raise SeparatorLockError(
+            "separator lock companion environment fields are invalid"
+        ) from None
+
+    if manifest.separator_id != lock.separator_id:
+        raise SeparatorLockError("separator lock companion environment separator_id does not match")
+    if manifest.package_name != lock.package_name:
+        raise SeparatorLockError("separator lock companion environment package_name does not match")
+    if manifest.package_version != lock.package_version:
+        raise SeparatorLockError(
+            "separator lock companion environment package_version does not match"
+        )
+    if manifest.interpreter_sha256 != lock.interpreter_sha256:
+        raise SeparatorLockError(
+            "separator lock companion environment interpreter_sha256 does not match"
+        )
+    return manifest
 
 
 def _model_file_from_value(value: object) -> SeparatorModelFile:
@@ -267,6 +472,9 @@ def _validate_lock(lock: SeparatorLock) -> None:
         "model_license",
         "expected_drum_stem_relative_path",
         "output_container",
+        "interpreter_sha256",
+        "environment_manifest_sha256",
+        "model_root_kind",
         "sha256",
     ):
         if not isinstance(getattr(lock, field), str) or not getattr(lock, field):
@@ -278,12 +486,16 @@ def _validate_lock(lock: SeparatorLock) -> None:
         raise SeparatorLockError("package_name does not match separator_id")
     if lock.model_id != policy["model_id"]:
         raise SeparatorLockError("model_id does not match separator_id")
+    if lock.model_root_kind != policy["model_root_kind"]:
+        raise SeparatorLockError("model_root_kind does not match separator model")
     if lock.argv != policy["argv"]:
         raise SeparatorLockError("argv does not match separator model")
     if lock.expected_drum_stem_relative_path != policy["expected_drum_stem_relative_path"]:
         raise SeparatorLockError("expected drum stem path does not match separator model")
     if lock.output_container != policy["output_container"]:
         raise SeparatorLockError("output_container does not match separator model")
+    _require_hash(lock.interpreter_sha256, "interpreter_sha256")
+    _require_hash(lock.environment_manifest_sha256, "environment_manifest_sha256")
     _require_hash(lock.sha256, "separator lock sha256")
     if not isinstance(lock.model_files, tuple) or not lock.model_files:
         raise SeparatorLockError("model_files must be a nonempty tuple")
@@ -294,6 +506,117 @@ def _validate_lock(lock: SeparatorLock) -> None:
         raise SeparatorLockError("model file names must be unique")
     if not isinstance(lock.argv, tuple) or any(not isinstance(item, str) for item in lock.argv):
         raise SeparatorLockError("argv must be a tuple of strings")
+
+
+def _environment_file_from_value(value: object) -> SeparatorEnvironmentFile:
+    if not isinstance(value, dict) or set(value) != _ENVIRONMENT_FILE_KEYS:
+        raise SeparatorLockError("environment file must contain the exact key set")
+    return SeparatorEnvironmentFile(
+        root=value["root"],
+        path=value["path"],
+        byte_length=value["byte_length"],
+        sha256=value["sha256"],
+    )
+
+
+def _environment_distribution_from_value(
+    value: object,
+) -> SeparatorEnvironmentDistribution:
+    if not isinstance(value, dict) or set(value) != _ENVIRONMENT_DISTRIBUTION_KEYS:
+        raise SeparatorLockError("environment distribution must contain the exact key set")
+    raw_files = value["files"]
+    if not isinstance(raw_files, list):
+        raise SeparatorLockError("environment distribution files must be a list")
+    return SeparatorEnvironmentDistribution(
+        name=value["name"],
+        version=value["version"],
+        files=tuple(_environment_file_from_value(item) for item in raw_files),
+    )
+
+
+def _validate_environment_file(environment_file: SeparatorEnvironmentFile) -> None:
+    for field in ("root", "path", "sha256"):
+        value = getattr(environment_file, field)
+        if not isinstance(value, str) or not value:
+            raise SeparatorLockError(f"environment file {field} must be a nonempty string")
+    if environment_file.root not in _ENVIRONMENT_ROOT_TAGS:
+        raise SeparatorLockError("environment file root is unsupported")
+    _validate_environment_relative_path(environment_file.path)
+    if (
+        isinstance(environment_file.byte_length, bool)
+        or not isinstance(environment_file.byte_length, int)
+        or environment_file.byte_length < 0
+    ):
+        raise SeparatorLockError("environment file byte_length must be a nonnegative integer")
+    _require_hash(environment_file.sha256, "environment file sha256")
+
+
+def _validate_environment_distribution(
+    distribution: SeparatorEnvironmentDistribution,
+) -> None:
+    for field in ("name", "version"):
+        value = getattr(distribution, field)
+        if not isinstance(value, str) or not value:
+            raise SeparatorLockError(f"environment distribution {field} must be a nonempty string")
+    if _normalize_distribution_name(distribution.name) != distribution.name:
+        raise SeparatorLockError("environment distribution name must be normalized")
+    if not isinstance(distribution.files, tuple) or not distribution.files:
+        raise SeparatorLockError("environment distribution files must be a nonempty tuple")
+    if any(not isinstance(item, SeparatorEnvironmentFile) for item in distribution.files):
+        raise SeparatorLockError("environment distribution contains an invalid file")
+    file_keys = [(item.root, item.path) for item in distribution.files]
+    if file_keys != sorted(file_keys) or len(file_keys) != len(set(file_keys)):
+        raise SeparatorLockError("environment file tuples must be sorted and unique")
+
+
+def _validate_environment_manifest(manifest: SeparatorEnvironmentManifest) -> None:
+    for field in (
+        "separator_id",
+        "package_name",
+        "package_version",
+        "python_implementation",
+        "python_version",
+        "python_abi",
+        "platform",
+        "interpreter_sha256",
+        "sha256",
+    ):
+        value = getattr(manifest, field)
+        if not isinstance(value, str) or not value:
+            raise SeparatorLockError(f"environment manifest {field} must be a nonempty string")
+    _require_hash(manifest.interpreter_sha256, "interpreter_sha256")
+    _require_hash(manifest.sha256, "environment manifest sha256")
+    if not isinstance(manifest.distributions, tuple) or not manifest.distributions:
+        raise SeparatorLockError("environment distributions must be a nonempty tuple")
+    if any(
+        not isinstance(item, SeparatorEnvironmentDistribution) for item in manifest.distributions
+    ):
+        raise SeparatorLockError("environment manifest contains an invalid distribution")
+    names = [distribution.name for distribution in manifest.distributions]
+    if names != sorted(names) or len(names) != len(set(names)):
+        raise SeparatorLockError("environment distributions must be sorted and unique")
+
+
+def _normalize_distribution_name(value: str) -> str:
+    normalized = re.sub(r"[-_.]+", "-", value).lower()
+    if _DISTRIBUTION_NAME_RE.fullmatch(normalized) is None:
+        raise SeparatorLockError("environment distribution name is invalid")
+    return normalized
+
+
+def _validate_environment_relative_path(value: object) -> None:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise SeparatorLockError("environment file path is invalid")
+    if (
+        value.startswith(("/", "\\"))
+        or PurePosixPath(value).is_absolute()
+        or PureWindowsPath(value).is_absolute()
+        or PureWindowsPath(value).drive
+        or "\\" in value
+    ):
+        raise SeparatorLockError("environment file path must be relative")
+    if any(part in ("", ".", "..") for part in value.split("/")):
+        raise SeparatorLockError("environment file path must be normalized")
 
 
 def _validate_model_file_name(value: object) -> None:
@@ -684,6 +1007,7 @@ def _qc_stem_bytes(content: bytes, source_duration_sec: float) -> StemQc:
 
 __all__ = [
     "HTDEMUCS_SEPARATOR_ID",
+    "SEPARATOR_ENVIRONMENT_SCHEMA",
     "SEPARATOR_LOCK_SCHEMA",
     "SEPARATOR_TERMINATE_GRACE_SECONDS",
     "SEPARATOR_TIMEOUT_SECONDS",
@@ -693,12 +1017,17 @@ __all__ = [
     "STEM_MAX_DURATION_DELTA_SECONDS",
     "STEM_NEAR_SILENT_DBFS",
     "SeparatedStem",
+    "SeparatorEnvironmentDistribution",
+    "SeparatorEnvironmentFile",
+    "SeparatorEnvironmentManifest",
     "SeparatorLock",
     "SeparatorLockError",
     "SeparatorModelFile",
     "SeparatorExecutionError",
     "StemQc",
+    "load_separator_environment_manifest",
     "load_separator_lock",
+    "separator_environment_manifest_payload",
     "run_htdemucs_drums",
     "run_spleeter_drums",
     "separator_lock_payload",

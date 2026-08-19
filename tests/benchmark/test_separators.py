@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 from pathlib import Path
@@ -18,6 +19,8 @@ from src.benchmark.separators import (
     SEPARATOR_LOCK_SCHEMA,
     SPLEETER_SEPARATOR_ID,
     SeparatorLock,
+    SeparatorLockError,
+    load_separator_environment_manifest,
     load_separator_lock,
 )
 
@@ -25,10 +28,8 @@ FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "separators"
 
 
 def _fixture_path(separator_id: str) -> Path:
-    filename = (
-        "spleeter-model.json" if separator_id == SPLEETER_SEPARATOR_ID else "htdemucs-model.json"
-    )
-    return FIXTURE_ROOT / filename
+    directory = "spleeter" if separator_id == SPLEETER_SEPARATOR_ID else "htdemucs"
+    return FIXTURE_ROOT / directory / "model.json"
 
 
 def _fixture_payload(separator_id: str) -> dict[str, object]:
@@ -69,8 +70,50 @@ def test_loads_fixture_lock_and_hashes_exact_canonical_bytes(
         "argv",
         "expected_drum_stem_relative_path",
         "output_container",
+        "interpreter_sha256",
+        "environment_manifest_sha256",
+        "model_root_kind",
     }
     assert _fixture_payload(separator_id)["schema"] == SEPARATOR_LOCK_SCHEMA
+
+
+def test_v2_lock_requires_its_fixed_canonical_environment_sibling(
+    tmp_path: Path,
+) -> None:
+    fixture_directory = _fixture_path(SPLEETER_SEPARATOR_ID).parent
+    copied_directory = tmp_path / "fixture-pair"
+    shutil.copytree(fixture_directory, copied_directory)
+    lock_path = copied_directory / "model.json"
+    lock = load_separator_lock(lock_path)
+    manifest = load_separator_environment_manifest(lock_path, lock)
+
+    assert manifest.separator_id == lock.separator_id
+    assert manifest.package_name == lock.package_name
+    assert manifest.package_version == lock.package_version
+    assert manifest.interpreter_sha256 == lock.interpreter_sha256
+    assert manifest.sha256 == lock.environment_manifest_sha256
+
+    sibling = lock_path.parent / "environment.json"
+    sibling.write_bytes(b"{}\n")
+    with pytest.raises(SeparatorLockError, match="companion|environment"):
+        load_separator_environment_manifest(lock_path, lock)
+
+
+@pytest.mark.parametrize("separator_id", [SPLEETER_SEPARATOR_ID, HTDEMUCS_SEPARATOR_ID])
+def test_loader_rejects_v1_lock_schema(
+    tmp_path: Path,
+    separator_id: str,
+) -> None:
+    payload = _fixture_payload(separator_id)
+    payload["schema"] = "crux.separator-lock/v1"
+    payload.pop("interpreter_sha256")
+    payload.pop("environment_manifest_sha256")
+    payload.pop("model_root_kind")
+    path = tmp_path / "separator.json"
+    _write_payload(path, payload)
+
+    with pytest.raises(ValueError, match="schema"):
+        load_separator_lock(path)
 
 
 @pytest.mark.parametrize("separator_id", [SPLEETER_SEPARATOR_ID, HTDEMUCS_SEPARATOR_ID])
