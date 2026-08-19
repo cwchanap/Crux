@@ -111,6 +111,7 @@ _SEPARATOR_POLICIES = {
     SPLEETER_SEPARATOR_ID: {
         "repository_url": "https://github.com/deezer/spleeter",
         "package_name": "spleeter",
+        "package_version": "2.4.2",
         "model_id": "spleeter:4stems",
         "model_root_kind": "spleeter-model-path-v1",
         "code_license": "MIT",
@@ -132,6 +133,7 @@ _SEPARATOR_POLICIES = {
     HTDEMUCS_SEPARATOR_ID: {
         "repository_url": "https://github.com/facebookresearch/demucs",
         "package_name": "demucs",
+        "package_version": "4.1.0",
         "model_id": "htdemucs",
         "model_root_kind": "demucs-local-repo-v1",
         "code_license": "MIT",
@@ -544,6 +546,18 @@ def _run_separator_environment_probe(
         ) from error
 
 
+def _require_absolute_model_root(model_root: Path) -> Path:
+    """Require and return the caller's lexical absolute model-root path."""
+    if not isinstance(model_root, Path):
+        raise TypeError("model_root must be a Path")
+    if not model_root.is_absolute():
+        raise SeparatorExecutionError(
+            "separator_model_root_invalid",
+            "separator model root must be an absolute path",
+        )
+    return model_root
+
+
 def attest_separator_runtime(
     lock_path: Path,
     interpreter: Path,
@@ -554,8 +568,7 @@ def attest_separator_runtime(
         raise TypeError("lock_path must be a Path")
     if not isinstance(interpreter, Path):
         raise TypeError("interpreter must be a Path")
-    if not isinstance(model_root, Path):
-        raise TypeError("model_root must be a Path")
+    _require_absolute_model_root(model_root)
 
     try:
         lock = load_separator_lock(lock_path)
@@ -672,6 +685,8 @@ def _validate_lock(lock: SeparatorLock) -> None:
     _require_revision(lock.repository_revision)
     if lock.package_name != policy["package_name"]:
         raise SeparatorLockError("package_name does not match separator_id")
+    if lock.package_version != policy["package_version"]:
+        raise SeparatorLockError("package_version does not match separator_id")
     if lock.model_id != policy["model_id"]:
         raise SeparatorLockError("model_id does not match separator_id")
     if lock.model_root_kind != policy["model_root_kind"]:
@@ -856,8 +871,7 @@ def inventory_separator_model_root(
     """Hash the exact policy-owned model-root layout for one separator."""
     if separator_id not in _SEPARATOR_POLICIES:
         raise SeparatorExecutionError("separator_id_unsupported", "separator is not supported")
-    if not isinstance(model_root, Path):
-        raise TypeError("model_root must be a Path")
+    _require_absolute_model_root(model_root)
     expected_files = (
         _SPLEETER_MODEL_ROOT_FILES
         if separator_id == SPLEETER_SEPARATOR_ID

@@ -45,6 +45,33 @@ def _write_payload(path: Path, payload: dict[str, object]) -> None:
     path.write_bytes(canonical_json_bytes(payload, trailing_newline=True))
 
 
+@pytest.mark.parametrize(
+    ("separator_id", "package_version"),
+    [
+        (SPLEETER_SEPARATOR_ID, "2.4.2"),
+        (HTDEMUCS_SEPARATOR_ID, "4.1.0"),
+    ],
+)
+def test_separator_policy_pins_package_version(
+    separator_id: str,
+    package_version: str,
+) -> None:
+    policy = separators._SEPARATOR_POLICIES[separator_id]
+
+    assert policy.get("package_version") == package_version
+    assert load_separator_lock(_fixture_path(separator_id)).package_version == package_version
+
+
+def test_loader_rejects_package_version_outside_policy(tmp_path: Path) -> None:
+    payload = _fixture_payload(SPLEETER_SEPARATOR_ID)
+    payload["package_version"] = "9.9.9"
+    path = tmp_path / "separator.json"
+    _write_payload(path, payload)
+
+    with pytest.raises(SeparatorLockError, match="package_version"):
+        load_separator_lock(path)
+
+
 @pytest.mark.parametrize("separator_id", [SPLEETER_SEPARATOR_ID, HTDEMUCS_SEPARATOR_ID])
 def test_loads_fixture_lock_and_hashes_exact_canonical_bytes(
     separator_id: str,
@@ -296,6 +323,55 @@ def test_freeze_and_attest_round_trip_with_synthetic_runtime(tmp_path: Path) -> 
     assert getattr(separators, "ATTESTATION_FAILURE_CODES", frozenset()) == (
         _ATTESTATION_FAILURE_CODES
     )
+
+
+def test_freezer_rejects_live_package_version_before_publishing(tmp_path: Path) -> None:
+    interpreter, _ = _synthetic_environment(tmp_path, package_version="9.9.9")
+    model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    lock_path = tmp_path / "frozen" / "model.json"
+
+    with pytest.raises(SeparatorExecutionError) as raised:
+        _freeze_separator_runtime(
+            separator_id=SPLEETER_SEPARATOR_ID,
+            interpreter=interpreter,
+            model_root=model_root,
+            repository_revision="a" * 40,
+            output=lock_path,
+        )
+
+    assert raised.value.code == "separator_environment_mismatch"
+    assert not lock_path.exists()
+    assert not (lock_path.parent / "environment.json").exists()
+
+
+def test_freezer_rejects_relative_model_root_before_probe_or_publishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import freeze_separator_runtime as freezer
+
+    interpreter, _ = _synthetic_environment(tmp_path)
+    model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    relative_model_root = Path(os.path.relpath(model_root, Path.cwd()))
+    lock_path = tmp_path / "frozen" / "model.json"
+
+    def unexpected_probe(_interpreter: Path) -> object:
+        raise AssertionError("relative model roots must be rejected before probing")
+
+    monkeypatch.setattr(freezer, "_run_separator_environment_probe", unexpected_probe)
+
+    with pytest.raises(SeparatorExecutionError) as raised:
+        _freeze_separator_runtime(
+            separator_id=SPLEETER_SEPARATOR_ID,
+            interpreter=interpreter,
+            model_root=relative_model_root,
+            repository_revision="a" * 40,
+            output=lock_path,
+        )
+
+    assert raised.value.code == "separator_model_root_invalid"
+    assert not lock_path.exists()
+    assert not (lock_path.parent / "environment.json").exists()
 
 
 @pytest.mark.parametrize(
