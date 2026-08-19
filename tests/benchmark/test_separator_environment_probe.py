@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import csv
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -122,6 +123,15 @@ def _run_probe(interpreter: Path) -> subprocess.CompletedProcess[bytes]:
         check=False,
         capture_output=True,
     )
+
+
+def _load_probe_module():
+    spec = importlib.util.spec_from_file_location("separator_environment_probe_test", PROBE_PATH)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _iter_strings(value: object) -> list[str]:
@@ -322,3 +332,107 @@ def test_probe_hashes_resolved_interpreter_target(tmp_path: Path) -> None:
     assert isinstance(payload, dict)
     final_target = interpreter.resolve(strict=True)
     assert payload["interpreter_sha256"] == hashlib.sha256(final_target.read_bytes()).hexdigest()
+
+
+def _synthetic_root_configuration(tmp_path: Path) -> dict[str, str]:
+    tags = (
+        "stdlib",
+        "platstdlib",
+        "purelib",
+        "platlib",
+        "include",
+        "platinclude",
+        "scripts",
+        "data",
+    )
+    paths = {tag: tmp_path / tag for tag in tags}
+    for path in paths.values():
+        path.mkdir(parents=True)
+    configuration = {tag: str(path) for tag, path in paths.items()}
+    configuration["platstdlib"] = configuration["stdlib"]
+    configuration["platlib"] = configuration["purelib"]
+    configuration["platinclude"] = configuration["include"]
+    return configuration
+
+
+def test_root_aliases_are_primary_by_role_and_cross_role_collisions_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _load_probe_module()
+    configuration = _synthetic_root_configuration(tmp_path)
+    monkeypatch.setattr(probe, "_configured_paths", lambda _: configuration)
+
+    roots = probe._canonical_root_paths(Path("/synthetic/python"))
+
+    assert tuple(roots) == ("stdlib", "purelib", "include", "scripts", "data")
+
+    ambiguous = dict(configuration)
+    ambiguous["platlib"] = ambiguous["stdlib"]
+    monkeypatch.setattr(probe, "_configured_paths", lambda _: ambiguous)
+    with pytest.raises(probe._ProbeError):
+        probe._canonical_root_paths(Path("/synthetic/python"))
+
+
+def test_configured_symlink_root_and_missing_no_follow_support_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _load_probe_module()
+    configuration = _synthetic_root_configuration(tmp_path / "configured")
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    configuration["purelib"] = str(link)
+    monkeypatch.setattr(probe, "_configured_paths", lambda _: configuration)
+
+    with pytest.raises(probe._ProbeError):
+        probe._canonical_root_paths(Path("/synthetic/python"))
+
+    monkeypatch.setattr(probe, "_NOFOLLOW", 0)
+    with pytest.raises(probe._ProbeError):
+        probe._canonical_root_paths(Path("/synthetic/python"))
+
+
+def test_inventory_carries_first_hash_identity_to_tree_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interpreter, purelib = _synthetic_environment(tmp_path)
+    probe = _load_probe_module()
+    roots = probe._canonical_root_paths(interpreter)
+    descriptors = {}
+    identities = {}
+    try:
+        for tag, path in roots.items():
+            descriptor, identity = probe._open_root(path)
+            descriptors[tag] = descriptor
+            identities[tag] = identity
+        distributions = list(probe.importlib.metadata.distributions(path=[str(purelib)]))
+        distribution = next(item for item in distributions if item.metadata["Name"] == "spleeter")
+        original_hash = probe._hash_relative_file
+        mutated = False
+
+        def racing_hash(root_descriptor, parts, *, capture=False):
+            nonlocal mutated
+            result = original_hash(root_descriptor, parts, capture=capture)
+            if not capture and parts == ("spleeter", "__init__.py") and not mutated:
+                (purelib / "spleeter" / "__init__.py").write_text("raced\n", encoding="utf-8")
+                mutated = True
+            return result
+
+        monkeypatch.setattr(probe, "_hash_relative_file", racing_hash)
+        item, expected, expected_identities = probe._inventory_distribution(
+            distribution, roots, descriptors
+        )
+        assert item["name"] == "spleeter"
+        assert expected_identities
+        with pytest.raises(probe._ProbeError):
+            probe._walk_tree(
+                descriptors["purelib"],
+                identities["purelib"],
+                "purelib",
+                expected,
+                expected_identities,
+            )
+    finally:
+        for descriptor in descriptors.values():
+            os.close(descriptor)

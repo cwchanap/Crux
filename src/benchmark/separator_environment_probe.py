@@ -33,13 +33,25 @@ _ROOT_TAG_PRIORITY = (
     "platlib",
     "platinclude",
 )
+# Ordinary venvs alias these same-role tags. The primary tag appears first in
+# _ROOT_TAG_PRIORITY, making serialized root tags deterministic.
+_ROOT_ALIAS_PRIMARY = {
+    "stdlib": "stdlib",
+    "platstdlib": "stdlib",
+    "purelib": "purelib",
+    "platlib": "purelib",
+    "include": "include",
+    "platinclude": "include",
+    "scripts": "scripts",
+    "data": "data",
+}
 _SEPARATOR_TARGETS = {
     "spleeter": ("spleeter4-drums-v1", "spleeter"),
     "demucs": ("htdemucs-drums-v1", "demucs"),
 }
 _READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
 _DIRECTORY_FLAGS = _READ_FLAGS | getattr(os, "O_DIRECTORY", 0)
-_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", None)
 _CHUNK_SIZE = 1024 * 1024
 
 
@@ -82,6 +94,11 @@ def _require_directory(metadata: os.stat_result) -> None:
         raise _ProbeError("expected a directory")
 
 
+def _require_no_follow_support() -> None:
+    if _NOFOLLOW is None or not _NOFOLLOW or os.open not in getattr(os, "supports_dir_fd", ()):
+        raise _ProbeError("descriptor no-follow support is unavailable")
+
+
 def _read_hash_fd(
     file_descriptor: int, *, capture: bool = False
 ) -> tuple[bytes, int, str, tuple[int, ...]]:
@@ -105,20 +122,24 @@ def _read_hash_fd(
 
 
 def _open_root(path: Path) -> tuple[int, tuple[int, ...]]:
+    _require_no_follow_support()
+    file_descriptor: int | None = None
     try:
         file_descriptor = os.open(os.fspath(path), _DIRECTORY_FLAGS | _NOFOLLOW)
         metadata = os.fstat(file_descriptor)
         _require_directory(metadata)
     except (OSError, _ProbeError) as error:
-        try:
-            os.close(file_descriptor)
-        except (UnboundLocalError, OSError):
-            pass
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
         raise _ProbeError("installation root is unavailable") from error
     return file_descriptor, _identity(metadata)
 
 
 def _open_relative(root_descriptor: int, parts: tuple[str, ...]) -> int:
+    _require_no_follow_support()
     if not parts:
         raise _ProbeError("relative file path is empty")
     current = os.dup(root_descriptor)
@@ -231,29 +252,43 @@ def _configured_paths(interpreter: Path) -> dict[str, str]:
 
 
 def _canonical_root_paths(interpreter: Path) -> dict[str, Path]:
+    _require_no_follow_support()
     configured = _configured_paths(interpreter)
+    for tag in _ROOT_TAGS:
+        if tag not in configured:
+            raise _ProbeError("installation root tag is missing")
+
     roots: dict[str, Path] = {}
-    seen_paths: set[str] = set()
+    seen_paths: dict[str, str] = {}
+    seen_identities: dict[tuple[int, int], str] = {}
     for tag in _ROOT_TAG_PRIORITY:
         value = configured.get(tag)
         if not isinstance(value, str) or not value:
             raise _ProbeError("installation root is missing")
         try:
-            path = Path(value).resolve(strict=True)
+            path = Path(value)
         except (OSError, RuntimeError, ValueError) as error:
             raise _ProbeError("installation root is unavailable") from error
         if not path.is_absolute():
             raise _ProbeError("installation root is not absolute")
+        path = Path(os.path.normpath(os.fspath(path)))
         path_key = os.path.normcase(os.fspath(path))
-        if path_key in seen_paths:
+        descriptor, identity = _open_root(path)
+        try:
+            identity_key = (identity[0], identity[1])
+        finally:
+            os.close(descriptor)
+
+        previous_tag = seen_paths.get(path_key) or seen_identities.get(identity_key)
+        if previous_tag is not None:
+            if _ROOT_ALIAS_PRIMARY[previous_tag] != _ROOT_ALIAS_PRIMARY[tag]:
+                raise _ProbeError("installation roots have an ambiguous role collision")
             continue
-        seen_paths.add(path_key)
+        seen_paths[path_key] = tag
+        seen_identities[identity_key] = tag
         roots[tag] = path
     if not roots:
         raise _ProbeError("installation roots are empty")
-    for tag in _ROOT_TAGS:
-        if tag not in configured:
-            raise _ProbeError("installation root tag is missing")
     return roots
 
 
@@ -293,6 +328,7 @@ def _hash_relative_file(
 
 
 def _hash_absolute_file(path: Path) -> str:
+    _require_no_follow_support()
     try:
         file_descriptor = os.open(os.fspath(path), _READ_FLAGS | _NOFOLLOW)
     except OSError as error:
@@ -356,7 +392,11 @@ def _inventory_distribution(
     distribution: importlib.metadata.Distribution,
     roots: dict[str, Path],
     root_descriptors: dict[str, int],
-) -> tuple[dict[str, object], set[tuple[str, str]]]:
+) -> tuple[
+    dict[str, object],
+    set[tuple[str, str]],
+    dict[tuple[str, str], tuple[int, ...]],
+]:
     try:
         name = _normalize_distribution_name(distribution.metadata.get("Name", distribution.name))
         version = distribution.version
@@ -375,17 +415,21 @@ def _inventory_distribution(
     rows = _parse_record(record_bytes)
     files: dict[tuple[str, str], dict[str, object]] = {}
     expected: set[tuple[str, str]] = set()
+    expected_identities: dict[tuple[str, str], tuple[int, ...]] = {}
     for relative_name in rows:
         parts = _validate_relative_path(relative_name)
         if _is_bytecode(parts):
             continue
         file_path = distribution_root.joinpath(*parts)
         root_tag, portable_path, portable_parts = _root_for_path(file_path, roots)
-        _, byte_length, sha256, _ = _hash_relative_file(
-            root_descriptors[root_tag],
-            portable_parts,
-        )
         key = (root_tag, portable_path)
+        if key == (record_tag, record_name):
+            byte_length, sha256, identity = record_length, record_sha256, record_identity
+        else:
+            _, byte_length, sha256, identity = _hash_relative_file(
+                root_descriptors[root_tag],
+                portable_parts,
+            )
         if key in files:
             raise _ProbeError("distribution contains duplicate files")
         files[key] = {
@@ -395,6 +439,7 @@ def _inventory_distribution(
             "sha256": sha256,
         }
         expected.add(key)
+        expected_identities[key] = identity
 
     record_key = (record_tag, record_name)
     if record_key not in files:
@@ -405,12 +450,12 @@ def _inventory_distribution(
             "sha256": record_sha256,
         }
         expected.add(record_key)
+        expected_identities[record_key] = record_identity
     elif (
         files[record_key]["sha256"] != record_sha256
         or files[record_key]["byte_length"] != record_length
     ):
         raise _ProbeError("distribution RECORD changed while reading")
-    del record_identity
 
     return (
         {
@@ -419,6 +464,7 @@ def _inventory_distribution(
             "files": [files[key] for key in sorted(files)],
         },
         expected,
+        expected_identities,
     )
 
 
@@ -533,6 +579,7 @@ def _distribution_search_paths(interpreter: Path, roots: dict[str, Path]) -> lis
 
 
 def build_environment_manifest() -> dict[str, object]:
+    _require_no_follow_support()
     interpreter = Path(sys.executable).resolve(strict=True)
     interpreter_sha256 = _hash_absolute_file(interpreter)
     roots = _canonical_root_paths(interpreter)
@@ -551,8 +598,11 @@ def build_environment_manifest() -> dict[str, object]:
             distributions = list(importlib.metadata.distributions(path=search_paths))
         inventory: list[tuple[str, dict[str, object]]] = []
         expected_by_root: dict[str, set[tuple[str, str]]] = {}
+        expected_identities: dict[tuple[str, str], tuple[int, ...]] = {}
         for distribution in distributions:
-            item, expected = _inventory_distribution(distribution, roots, root_descriptors)
+            item, expected, identities = _inventory_distribution(
+                distribution, roots, root_descriptors
+            )
             name = item["name"]
             if not isinstance(name, str):
                 raise _ProbeError("distribution name is malformed")
@@ -561,6 +611,11 @@ def build_environment_manifest() -> dict[str, object]:
             inventory.append((name, item))
             for key in expected:
                 expected_by_root.setdefault(key[0], set()).add(key)
+            for key, identity in identities.items():
+                previous_identity = expected_identities.get(key)
+                if previous_identity is not None and previous_identity != identity:
+                    raise _ProbeError("distribution file changed while inventorying")
+                expected_identities[key] = identity
 
         if not inventory:
             raise _ProbeError("no installed separator distribution")
@@ -574,22 +629,7 @@ def build_environment_manifest() -> dict[str, object]:
         if not isinstance(package_version, str) or not package_version:
             raise _ProbeError("separator package version is malformed")
 
-        expected_identities: dict[tuple[str, str], tuple[int, ...]] = {}
-        for item in inventory:
-            for file in item[1]["files"]:
-                if not isinstance(file, dict):
-                    raise _ProbeError("distribution inventory is malformed")
-                key = (file["root"], file["path"])
-                expected_identities[key] = expected_identities.get(key, ())
         for tag, expected in expected_by_root.items():
-            for key in expected:
-                root_tag, portable_path = key
-                parts = _validate_relative_path(portable_path)
-                _, _, _, identity = _hash_relative_file(
-                    root_descriptors[root_tag],
-                    parts,
-                )
-                expected_identities[(root_tag, portable_path)] = identity
             observed = _walk_tree(
                 root_descriptors[tag],
                 root_identities[tag],
