@@ -329,22 +329,20 @@ def _attested_runtime(
     interpreter: Path = Path("/isolated/python"),
     model_root: Path = Path("/isolated/model-root"),
     model_files: tuple[SeparatorModelFile, ...] | None = None,
-    launch_environment: dict[str, str] | None = None,
 ) -> object:
     lock_path = _lock_path(separator_id)
     lock = load_separator_lock(lock_path)
     if model_files is not None:
         lock = replace(lock, model_files=model_files)
     environment = load_separator_environment_manifest(lock_path, load_separator_lock(lock_path))
-    runtime_type = getattr(separators, "AttestedSeparatorRuntime", None)
-    assert runtime_type is not None, "Task 3 typed separator runtime API is missing"
-    return runtime_type(
+    factory = getattr(separators, "_build_attested_separator_runtime", None)
+    assert callable(factory), "Task 3 internal runtime construction gate is missing"
+    return factory(
         interpreter=interpreter,
         lock=lock,
         model_root=model_root,
         model_files=lock.model_files,
         environment=environment,
-        launch_environment=launch_environment or {"PATH": os.environ.get("PATH", "")},
     )
 
 
@@ -402,6 +400,71 @@ def test_inventory_separator_model_root_rejects_parent_symlink(tmp_path: Path) -
     with pytest.raises(SeparatorExecutionError, match="separator_model_root_invalid") as raised:
         separators.inventory_separator_model_root(SPLEETER_SEPARATOR_ID, model_root)
     assert raised.value.detail_code == "separator_model_root_invalid"
+
+
+def test_inventory_separator_model_root_rejects_child_directory_identity_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    original_directory = model_root / "4stems"
+    replacement_directory = tmp_path / "replacement-4stems"
+    shutil.copytree(original_directory, replacement_directory)
+    moved_original = tmp_path / "original-4stems"
+    original_open = separators.os.open
+    swapped = False
+
+    def swap_directory_before_open(
+        path: object,
+        flags: int,
+        *args: object,
+        **kwargs: object,
+    ) -> int:
+        nonlocal swapped
+        if path == "4stems" and kwargs.get("dir_fd") is not None and not swapped:
+            original_directory.rename(moved_original)
+            replacement_directory.rename(original_directory)
+            swapped = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(separators.os, "open", swap_directory_before_open)
+    monkeypatch.setattr(
+        separators.os,
+        "supports_dir_fd",
+        set(separators.os.supports_dir_fd) | {swap_directory_before_open},
+    )
+
+    with pytest.raises(SeparatorExecutionError, match="separator_model_root_invalid") as raised:
+        separators.inventory_separator_model_root(SPLEETER_SEPARATOR_ID, model_root)
+    assert raised.value.detail_code == "separator_model_root_invalid"
+    assert swapped is True
+
+
+def test_runner_rejects_direct_unattested_runtime_instance(
+    tmp_path: Path,
+) -> None:
+    source_path = _source_wav(tmp_path)
+    model_root, expected = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    lock_path = _lock_path(SPLEETER_SEPARATOR_ID)
+    lock = replace(load_separator_lock(lock_path), model_files=expected)
+    environment = load_separator_environment_manifest(lock_path, load_separator_lock(lock_path))
+    runtime = separators.AttestedSeparatorRuntime(
+        interpreter=Path("/isolated/python"),
+        lock=lock,
+        model_root=model_root,
+        model_files=expected,
+        environment=environment,
+        launch_environment={"PATH": "/isolated/bin", "MODEL_PATH": str(model_root)},
+    )
+
+    with pytest.raises(SeparatorExecutionError, match="separator_runtime_unattested") as raised:
+        _run_separator(
+            SPLEETER_SEPARATOR_ID,
+            source_path,
+            cache_root=tmp_path / "cache",
+            runtime=runtime,
+        )
+    assert raised.value.detail_code == "separator_runtime_unattested"
 
 
 def test_revalidate_separator_model_root_compares_the_attested_inventory(
@@ -486,7 +549,6 @@ def test_separator_passes_runtime_launch_environment_to_popen(
         SPLEETER_SEPARATOR_ID,
         model_root=model_root,
         model_files=expected,
-        launch_environment={"PATH": "/isolated/bin", "MODEL_PATH": str(model_root)},
     )
     fake = _FakePopen(
         write_output=lambda workdir: _write_stem(
@@ -534,7 +596,12 @@ def _run_separator(
     )
     assert callable(implementation), "Task 4 separator execution API is missing"
     if runtime is None:
-        runtime = _attested_runtime(separator_id)
+        model_root, model_files = _synthetic_model_root(cache_root, separator_id)
+        runtime = _attested_runtime(
+            separator_id,
+            model_root=model_root,
+            model_files=model_files,
+        )
     return implementation(
         source_path,
         source_audio_sha256="a" * 64,

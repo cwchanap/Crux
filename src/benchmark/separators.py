@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import re
@@ -9,10 +10,12 @@ import signal
 import stat
 import subprocess
 import tempfile
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from types import MappingProxyType
 
 import numpy as np
 import soundfile
@@ -280,6 +283,11 @@ class AttestedSeparatorRuntime:
     model_files: tuple[SeparatorModelFile, ...]
     environment: SeparatorEnvironmentManifest
     launch_environment: Mapping[str, str]
+
+
+_ATTESTED_RUNTIME_REGISTRY: weakref.WeakValueDictionary[int, AttestedSeparatorRuntime] = (
+    weakref.WeakValueDictionary()
+)
 
 
 def load_separator_lock(path: Path) -> SeparatorLock:
@@ -707,8 +715,7 @@ def inventory_separator_model_root(
 
 def revalidate_separator_model_root(runtime: AttestedSeparatorRuntime) -> None:
     """Re-inventory an attested model root without reading or writing evidence."""
-    if not isinstance(runtime, AttestedSeparatorRuntime):
-        raise TypeError("runtime must be an AttestedSeparatorRuntime")
+    _require_attested_runtime(runtime)
     try:
         inventory = inventory_separator_model_root(runtime.lock.separator_id, runtime.model_root)
     except SeparatorExecutionError:
@@ -724,73 +731,170 @@ def _inventory_model_root(
     model_root: Path,
     expected_files: tuple[str, ...],
 ) -> tuple[SeparatorModelFile, ...]:
-    root_metadata = model_root.lstat()
-    if not stat.S_ISDIR(root_metadata.st_mode):
-        raise OSError("model root is not an ordinary directory")
-
+    no_follow, directory_flag, close_on_exec = _model_root_descriptor_flags()
     expected_names = set(expected_files)
     expected_directories = {""}
     for name in expected_files:
         expected_directories.update(name.rsplit("/", 1)[:1] if "/" in name else ())
 
-    files: dict[str, bytes] = {}
-    directories: set[str] = {""}
+    root_metadata = os.stat(model_root, follow_symlinks=False)
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise OSError("model root is not an ordinary directory")
+    root_fd = os.open(
+        model_root,
+        os.O_RDONLY | directory_flag | no_follow | close_on_exec,
+    )
+    try:
+        opened_root_metadata = os.fstat(root_fd)
+        _require_same_model_identity(root_metadata, opened_root_metadata)
+        files: dict[str, str] = {}
+        directories: set[str] = {""}
 
-    def walk(directory: Path, relative_directory: str) -> None:
-        with os.scandir(directory) as entries:
-            for entry in entries:
+        def walk(directory_fd: int, relative_directory: str) -> None:
+            for entry_name in sorted(os.listdir(directory_fd)):
+                if not isinstance(entry_name, str) or not entry_name:
+                    raise OSError("model root entry name is invalid")
                 relative_name = (
-                    f"{relative_directory}/{entry.name}" if relative_directory else entry.name
+                    f"{relative_directory}/{entry_name}" if relative_directory else entry_name
                 )
-                metadata = entry.stat(follow_symlinks=False)
-                if stat.S_ISLNK(metadata.st_mode):
+                entry_metadata = os.stat(
+                    entry_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISLNK(entry_metadata.st_mode):
                     raise OSError("model root contains a symlink")
-                if stat.S_ISDIR(metadata.st_mode):
-                    directories.add(relative_name)
-                    walk(Path(entry.path), relative_name)
-                elif stat.S_ISREG(metadata.st_mode):
-                    files[relative_name] = _read_model_file_no_follow(Path(entry.path))
+                if stat.S_ISDIR(entry_metadata.st_mode):
+                    child_fd = os.open(
+                        entry_name,
+                        os.O_RDONLY | directory_flag | no_follow | close_on_exec,
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        opened_child_metadata = os.fstat(child_fd)
+                        _require_same_model_identity(entry_metadata, opened_child_metadata)
+                        directories.add(relative_name)
+                        walk(child_fd, relative_name)
+                        _require_same_model_state(
+                            opened_child_metadata,
+                            os.fstat(child_fd),
+                        )
+                        _require_same_model_identity(
+                            opened_child_metadata,
+                            os.stat(
+                                entry_name,
+                                dir_fd=directory_fd,
+                                follow_symlinks=False,
+                            ),
+                        )
+                    finally:
+                        os.close(child_fd)
+                elif stat.S_ISREG(entry_metadata.st_mode):
+                    file_fd = os.open(
+                        entry_name,
+                        os.O_RDONLY | no_follow | close_on_exec,
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        opened_file_metadata = os.fstat(file_fd)
+                        _require_same_model_identity(entry_metadata, opened_file_metadata)
+                        _, digest = _hash_model_file_descriptor(file_fd, opened_file_metadata)
+                        _require_same_model_identity(
+                            opened_file_metadata,
+                            os.stat(
+                                entry_name,
+                                dir_fd=directory_fd,
+                                follow_symlinks=False,
+                            ),
+                        )
+                        files[relative_name] = digest
+                    finally:
+                        os.close(file_fd)
                 else:
                     raise OSError("model root contains a special file")
 
-    walk(model_root, "")
+        walk(root_fd, "")
+        _require_same_model_state(opened_root_metadata, os.fstat(root_fd))
+        _require_same_model_identity(
+            opened_root_metadata,
+            os.stat(model_root, follow_symlinks=False),
+        )
+    finally:
+        os.close(root_fd)
+
     if set(files) != expected_names or directories != expected_directories:
         raise OSError("model root file layout does not match policy")
-    return tuple(
-        SeparatorModelFile(name=name, sha256=sha256_hex(files[name])) for name in sorted(files)
+    return tuple(SeparatorModelFile(name=name, sha256=files[name]) for name in sorted(files))
+
+
+def _model_root_descriptor_flags() -> tuple[int, int, int]:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if (
+        not isinstance(no_follow, int)
+        or no_follow == 0
+        or not isinstance(directory_flag, int)
+        or directory_flag == 0
+    ):
+        raise OSError("descriptor no-follow model inventory is unavailable")
+    supports_dir_fd = getattr(os, "supports_dir_fd", ())
+    supports_follow_symlinks = getattr(os, "supports_follow_symlinks", ())
+    supports_fd = getattr(os, "supports_fd", ())
+    if os.open not in supports_dir_fd or os.stat not in supports_dir_fd:
+        raise OSError("descriptor-relative model inventory is unavailable")
+    if os.stat not in supports_follow_symlinks or os.listdir not in supports_fd:
+        raise OSError("descriptor no-follow model inventory is unavailable")
+    return no_follow, directory_flag, getattr(os, "O_CLOEXEC", 0)
+
+
+def _model_identity(metadata: os.stat_result) -> tuple[int, int, int]:
+    return metadata.st_dev, metadata.st_ino, metadata.st_mode
+
+
+def _model_state(metadata: os.stat_result) -> tuple[tuple[int, int, int], int, int, int]:
+    return (
+        _model_identity(metadata),
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
     )
 
 
-def _read_model_file_no_follow(path: Path) -> bytes:
-    no_follow = getattr(os, "O_NOFOLLOW", 0)
-    close_on_exec = getattr(os, "O_CLOEXEC", 0)
-    descriptor = os.open(path, os.O_RDONLY | no_follow | close_on_exec)
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise OSError("model file is not an ordinary file")
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        after = os.fstat(descriptor)
-        if (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-        ) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-        ):
-            raise OSError("model file changed while it was read")
-        return b"".join(chunks)
-    finally:
-        os.close(descriptor)
+def _require_same_model_identity(
+    expected: os.stat_result,
+    observed: os.stat_result,
+) -> None:
+    if _model_identity(expected) != _model_identity(observed):
+        raise OSError("model root entry changed during inventory")
+
+
+def _require_same_model_state(
+    expected: os.stat_result,
+    observed: os.stat_result,
+) -> None:
+    if _model_state(expected) != _model_state(observed):
+        raise OSError("model root entry changed during inventory")
+
+
+def _hash_model_file_descriptor(
+    descriptor: int,
+    opened_metadata: os.stat_result,
+) -> tuple[int, str]:
+    if not stat.S_ISREG(opened_metadata.st_mode):
+        raise OSError("model file is not an ordinary file")
+    digest = hashlib.sha256()
+    byte_length = 0
+    while True:
+        content = os.read(descriptor, 1024 * 1024)
+        if not content:
+            break
+        digest.update(content)
+        byte_length += len(content)
+    after_metadata = os.fstat(descriptor)
+    _require_same_model_state(opened_metadata, after_metadata)
+    if byte_length != after_metadata.st_size:
+        raise OSError("model file changed while it was read")
+    return byte_length, digest.hexdigest()
 
 
 def _build_separator_launch_environment(
@@ -809,6 +913,69 @@ def _build_separator_launch_environment(
     if separator_id == SPLEETER_SEPARATOR_ID:
         environment["MODEL_PATH"] = os.fspath(model_root)
     return environment
+
+
+def _build_attested_separator_runtime(
+    *,
+    interpreter: Path,
+    lock: SeparatorLock,
+    model_root: Path,
+    model_files: tuple[SeparatorModelFile, ...],
+    environment: SeparatorEnvironmentManifest,
+) -> AttestedSeparatorRuntime:
+    """Construct a runtime only after its lock-bound inputs pass local checks."""
+    if not isinstance(interpreter, Path):
+        raise TypeError("interpreter must be a Path")
+    if not isinstance(lock, SeparatorLock):
+        raise TypeError("lock must be a SeparatorLock")
+    if not isinstance(model_root, Path):
+        raise TypeError("model_root must be a Path")
+    if not isinstance(model_files, tuple) or any(
+        not isinstance(item, SeparatorModelFile) for item in model_files
+    ):
+        raise TypeError("model_files must be a tuple of SeparatorModelFile")
+    if not isinstance(environment, SeparatorEnvironmentManifest):
+        raise TypeError("environment must be a SeparatorEnvironmentManifest")
+    if (
+        model_files != lock.model_files
+        or environment.sha256 != lock.environment_manifest_sha256
+        or environment.separator_id != lock.separator_id
+        or environment.package_name != lock.package_name
+        or environment.package_version != lock.package_version
+        or environment.interpreter_sha256 != lock.interpreter_sha256
+    ):
+        raise SeparatorExecutionError(
+            "separator_runtime_unattested",
+            "separator runtime inputs do not match the v2 lock",
+        )
+    inventory = inventory_separator_model_root(lock.separator_id, model_root)
+    if inventory != lock.model_files:
+        raise SeparatorExecutionError(
+            "separator_runtime_unattested",
+            "separator model root does not match the v2 lock",
+        )
+    runtime = AttestedSeparatorRuntime(
+        interpreter=interpreter,
+        lock=lock,
+        model_root=model_root,
+        model_files=inventory,
+        environment=environment,
+        launch_environment=MappingProxyType(
+            _build_separator_launch_environment(lock.separator_id, model_root)
+        ),
+    )
+    _ATTESTED_RUNTIME_REGISTRY[id(runtime)] = runtime
+    return runtime
+
+
+def _require_attested_runtime(runtime: AttestedSeparatorRuntime) -> None:
+    if not isinstance(runtime, AttestedSeparatorRuntime):
+        raise TypeError("runtime must be an AttestedSeparatorRuntime")
+    if _ATTESTED_RUNTIME_REGISTRY.get(id(runtime)) is not runtime:
+        raise SeparatorExecutionError(
+            "separator_runtime_unattested",
+            "separator runtime was not constructed by the attestation gate",
+        )
 
 
 def run_spleeter_drums(
@@ -971,8 +1138,7 @@ def _validate_execution_inputs(
         raise SeparatorExecutionError("separator_id_unsupported", "separator is not supported")
     if not isinstance(source_audio_path, Path):
         raise TypeError("source_audio_path must be a Path")
-    if not isinstance(runtime, AttestedSeparatorRuntime):
-        raise TypeError("runtime must be an AttestedSeparatorRuntime")
+    _require_attested_runtime(runtime)
     if not isinstance(cache_root, Path):
         raise TypeError("cache_root must be a Path")
     try:
@@ -1030,8 +1196,7 @@ def _render_separator_argv(
     input_path: Path,
     output_dir: Path,
 ) -> list[str]:
-    if not isinstance(runtime, AttestedSeparatorRuntime):
-        raise TypeError("runtime must be an AttestedSeparatorRuntime")
+    _require_attested_runtime(runtime)
     replacements = {
         "{input_wav}": os.fspath(input_path),
         "{output_dir}": os.fspath(output_dir),
