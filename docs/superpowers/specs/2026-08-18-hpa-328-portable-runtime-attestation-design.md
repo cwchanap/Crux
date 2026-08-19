@@ -2,11 +2,11 @@
 
 ## Status
 
-Approved for detailed implementation planning after a second implementation
-review. This extends the HPA-328 freeze-time separator lock into a portable,
-live runtime-attestation contract. It does not authorize Task 11 production
-locks, separator inference, scoring, or finalization until the immutable
-upstream inputs are available.
+Code implementation is complete after Task 7's focused and static
+verification in Step 4 passes. This extends the HPA-328 freeze-time separator
+lock into a portable, live runtime-attestation contract. It does not authorize
+Task 11 production locks, separator inference, scoring, or finalization until
+the immutable upstream inputs are available.
 
 ## Goal
 

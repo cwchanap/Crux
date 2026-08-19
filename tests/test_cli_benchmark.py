@@ -1029,8 +1029,27 @@ def test_run_oaf_separation_pilot_command_preserves_complete_and_fatal_exit_code
     assert json.loads(complete.output)["exit_code"] == 0
     assert json.loads(complete.output)["failure_code"] is None
     assert fatal.exit_code == 2
-    assert json.loads(fatal.output)["exit_code"] == 2
-    assert json.loads(fatal.output)["failure_code"] == "separator_environment_mismatch"
+    fatal_payload = json.loads(fatal.output)
+    assert fatal_payload == {
+        "exit_code": 2,
+        "failed_count": 0,
+        "failure_code": "separator_environment_mismatch",
+        "full_mix_reports_path": None,
+        "quarantined_count": 0,
+        "reports_path": None,
+        "run_id": None,
+        "run_path": None,
+        "skipped_count": 0,
+        "status": "failed",
+        "success_count": 0,
+    }
+    assert fatal_payload["failure_code"] in {
+        "separator_lock_companion_mismatch",
+        "separator_interpreter_mismatch",
+        "separator_environment_mismatch",
+        "separator_model_root_invalid",
+        "separator_environment_probe_failed",
+    }
 
 
 def test_finalize_oaf_separation_pilot_command_publishes_manifest_summary(
