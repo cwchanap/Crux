@@ -186,6 +186,60 @@ def test_probe_emits_canonical_manifest_with_synthetic_distribution(tmp_path: Pa
         }
 
 
+def test_probe_ignores_stale_record_digest_and_size(tmp_path: Path) -> None:
+    interpreter, purelib = _synthetic_environment(tmp_path)
+    record_path = purelib / "spleeter-2.4.2.dist-info" / "RECORD"
+    rows = list(csv.reader(record_path.read_text(encoding="utf-8").splitlines()))
+    assert rows[0][0] == "spleeter/__init__.py"
+    rows[0][1] = "sha256=stale"
+    rows[0][2] = "0"
+    with record_path.open("w", encoding="utf-8", newline="") as stream:
+        csv.writer(stream, lineterminator="\n").writerows(rows)
+
+    result = _run_probe(interpreter)
+
+    assert result.returncode == 0, result.stderr.decode()
+    payload = strict_json_loads(result.stdout[:-1], require_canonical=True)
+    assert isinstance(payload, dict)
+    distribution = next(item for item in payload["distributions"] if item["name"] == "spleeter")
+    file = next(item for item in distribution["files"] if item["path"] == "spleeter/__init__.py")
+    actual_bytes = (purelib / "spleeter" / "__init__.py").read_bytes()
+    assert file["byte_length"] == len(actual_bytes)
+    assert file["sha256"] == hashlib.sha256(actual_bytes).hexdigest()
+    assert canonical_json_bytes(payload, trailing_newline=True) == result.stdout
+
+
+def test_probe_reports_changed_declared_member_bytes(tmp_path: Path) -> None:
+    interpreter, purelib = _synthetic_environment(tmp_path)
+    baseline_result = _run_probe(interpreter)
+    assert baseline_result.returncode == 0, baseline_result.stderr.decode()
+    baseline = strict_json_loads(baseline_result.stdout[:-1], require_canonical=True)
+    assert isinstance(baseline, dict)
+
+    _mutate_distribution_tree(purelib, "record_content_changed")
+    result = _run_probe(interpreter)
+
+    assert result.returncode == 0, result.stderr.decode()
+    payload = strict_json_loads(result.stdout[:-1], require_canonical=True)
+    assert isinstance(payload, dict)
+    assert canonical_json_bytes(payload, trailing_newline=True) == result.stdout
+    baseline_distribution = next(
+        item for item in baseline["distributions"] if item["name"] == "spleeter"
+    )
+    distribution = next(item for item in payload["distributions"] if item["name"] == "spleeter")
+    baseline_file = next(
+        item for item in baseline_distribution["files"] if item["path"] == "spleeter/__init__.py"
+    )
+    file = next(item for item in distribution["files"] if item["path"] == "spleeter/__init__.py")
+    actual_bytes = (purelib / "spleeter" / "__init__.py").read_bytes()
+    assert file["byte_length"] == len(actual_bytes)
+    assert file["sha256"] == hashlib.sha256(actual_bytes).hexdigest()
+    assert (file["byte_length"], file["sha256"]) != (
+        baseline_file["byte_length"],
+        baseline_file["sha256"],
+    )
+
+
 def _mutate_distribution_tree(purelib: Path, mutation: str) -> None:
     mutations = {
         "missing_record_member": lambda: (purelib / "spleeter" / "__init__.py").unlink(),
@@ -223,7 +277,6 @@ def _mutate_distribution_tree(purelib: Path, mutation: str) -> None:
     "mutation",
     (
         "missing_record_member",
-        "record_content_changed",
         "record_self_changed",
         "extra_python",
         "extra_pth",
