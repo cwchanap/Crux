@@ -147,6 +147,7 @@ def _task6_seams(
         "transcribe": [],
         "score": [],
         "attest": [],
+        "revalidate": [],
         "events": [],
     }
 
@@ -211,6 +212,9 @@ def _task6_seams(
             environment=environment,
             launch_environment={},
         )
+
+    def fake_revalidate(runtime: AttestedSeparatorRuntime) -> None:
+        calls["revalidate"].append(runtime.lock.separator_id)
 
     def spleeter(
         source: Path,
@@ -315,6 +319,7 @@ def _task6_seams(
     monkeypatch.setattr(pilot, "run_spleeter_drums", spleeter, raising=False)
     monkeypatch.setattr(pilot, "run_htdemucs_drums", htdemucs, raising=False)
     monkeypatch.setattr(pilot, "attest_separator_runtime", fake_attest, raising=False)
+    monkeypatch.setattr(pilot, "revalidate_separator_model_root", fake_revalidate, raising=False)
     monkeypatch.setattr(pilot, "materialize_derived_audio", materialize, raising=False)
     monkeypatch.setattr(pilot, "score_oaf_reviewed_subset", fake_score)
     monkeypatch.setattr(
@@ -372,6 +377,170 @@ def test_task6_infers_only_the_two_derived_views_after_resolving_membership(
             assert view["input"]["input_view_id"] == view_id
             assert view["input"]["input_audio_sha256"] in {"c" * 64, "d" * 64}
             assert view["inference_config"] == {**full_config, "input_view_id": view_id}
+
+
+def test_task6_postflight_root_drift_restores_pending_views_without_reports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    import src.benchmark.separation_pilot as pilot
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+    from src.benchmark.separators import SeparatorExecutionError
+
+    original_spleeter = pilot.run_spleeter_drums
+
+    def dirty_spleeter(*args: object, **kwargs: object) -> object:
+        runtime = kwargs["runtime"]
+        result = original_spleeter(*args, **kwargs)
+        runtime.model_root.mkdir(parents=True, exist_ok=True)  # type: ignore[attr-defined]
+        (runtime.model_root / "extra.bin").write_bytes(b"postflight drift")  # type: ignore[attr-defined]
+        return result
+
+    def revalidate(runtime: object) -> None:
+        calls["revalidate"].append(runtime.lock.separator_id)  # type: ignore[attr-defined]
+        if (runtime.model_root / "extra.bin").is_file():  # type: ignore[attr-defined]
+            raise SeparatorExecutionError("separator_model_root_invalid")
+
+    derived_score_calls: list[object] = []
+    comparison_calls: list[object] = []
+    monkeypatch.setattr(pilot, "run_spleeter_drums", dirty_spleeter)
+    monkeypatch.setattr(pilot, "revalidate_separator_model_root", revalidate)
+    monkeypatch.setattr(
+        pilot,
+        "_score_derived_cohort",
+        lambda *args: derived_score_calls.append(args),
+    )
+    monkeypatch.setattr(pilot, "_comparison_reports_ready", lambda _run_dir: True)
+    monkeypatch.setattr(
+        pilot, "compare_oaf_separation", lambda request: comparison_calls.append(request)
+    )
+
+    outcome = run_oaf_separation_pilot(
+        request,
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+
+    assert outcome.exit_code == 2
+    assert outcome.failure_code == "separator_model_root_invalid"
+    assert not derived_score_calls
+    assert not comparison_calls
+    run_paths = list((request.output_dir / "runs").glob("*/run.json"))
+    assert len(run_paths) == 1
+    snapshot = json.loads(run_paths[0].read_text(encoding="utf-8"))
+    assert snapshot["overall_status"] == "failed"
+    for item in snapshot["items"]:
+        for view_name in ("spleeter", "htdemucs"):
+            view = item[view_name]
+            assert view["status"] == "pending"
+            assert view["failure_code"] is None
+            assert view["stem"] is None
+            assert view["input"] is None
+            assert view["prediction"] is None
+            assert view["runtime"] is None
+            assert "inference_config" not in view
+            assert "inference_config_sha256" not in view
+
+
+def test_task6_postflight_root_drift_restores_resume_preimages_byte_for_byte(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    import src.benchmark.separation_pilot as pilot
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+    from src.benchmark.separators import SeparatorExecutionError
+
+    original_spleeter = pilot.run_spleeter_drums
+
+    def dirty_spleeter(*args: object, **kwargs: object) -> object:
+        runtime = kwargs["runtime"]
+        result = original_spleeter(*args, **kwargs)
+        runtime.model_root.mkdir(parents=True, exist_ok=True)  # type: ignore[attr-defined]
+        (runtime.model_root / "extra.bin").write_bytes(b"postflight drift")  # type: ignore[attr-defined]
+        return result
+
+    monkeypatch.setattr(pilot, "run_spleeter_drums", dirty_spleeter)
+
+    first = run_oaf_separation_pilot(
+        request,
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+    assert first.exit_code == 0
+    assert first.run_path is not None
+    prior_snapshot = json.loads(first.run_path.read_text(encoding="utf-8"))
+    removed_prediction = prior_snapshot["items"][0]["spleeter"]["prediction"]["path"]
+    (request.output_dir / removed_prediction).unlink()
+    calls["separate"].clear()
+    calls["transcribe"].clear()
+
+    def revalidate(runtime: object) -> None:
+        calls["revalidate"].append(runtime.lock.separator_id)  # type: ignore[attr-defined]
+        if (runtime.model_root / "extra.bin").is_file():  # type: ignore[attr-defined]
+            raise SeparatorExecutionError("separator_model_root_invalid")
+
+    derived_score_calls: list[object] = []
+    comparison_calls: list[object] = []
+    monkeypatch.setattr(pilot, "revalidate_separator_model_root", revalidate)
+    monkeypatch.setattr(
+        pilot,
+        "_score_derived_cohort",
+        lambda *args: derived_score_calls.append(args),
+    )
+    monkeypatch.setattr(pilot, "_comparison_reports_ready", lambda _run_dir: True)
+    monkeypatch.setattr(
+        pilot, "compare_oaf_separation", lambda request: comparison_calls.append(request)
+    )
+
+    resumed = run_oaf_separation_pilot(
+        replace(request, resume=True),
+        backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+    )
+
+    assert resumed.exit_code == 2
+    assert resumed.failure_code == "separator_model_root_invalid"
+    assert not derived_score_calls
+    assert not comparison_calls
+    assert resumed.run_path is None
+    recovered = json.loads(first.run_path.read_text(encoding="utf-8"))
+    assert recovered["overall_status"] == "failed"
+    for prior_item, recovered_item in zip(prior_snapshot["items"], recovered["items"], strict=True):
+        assert recovered_item["spleeter"] == prior_item["spleeter"]
+        assert recovered_item["htdemucs"] == prior_item["htdemucs"]
+    assert not calls["separate"]
+    assert calls["transcribe"] == [SPLEETER_INPUT_VIEW_ID]
+
+
+def test_task6_cleanup_revalidates_after_started_separator_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    import src.benchmark.separation_pilot as pilot
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    def interrupting_spleeter(*_args: object, **_kwargs: object) -> object:
+        calls["separate"].append(SPLEETER_INPUT_VIEW_ID)
+        raise KeyboardInterrupt("separator interrupted")
+
+    monkeypatch.setattr(pilot, "run_spleeter_drums", interrupting_spleeter)
+
+    with pytest.raises(KeyboardInterrupt, match="separator interrupted"):
+        run_oaf_separation_pilot(
+            request,
+            backend_factory=calls["factory"][0],  # type: ignore[arg-type]
+        )
+
+    assert calls["revalidate"] == [SPLEETER_SEPARATOR_ID, HTDEMUCS_SEPARATOR_ID]
 
 
 def test_task6_default_backend_factory_is_bound_to_parent_frozen_identity(
