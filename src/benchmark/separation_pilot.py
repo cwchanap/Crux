@@ -22,6 +22,7 @@ import os
 import re
 import time
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -113,6 +114,7 @@ from src.benchmark.separators import (
     SeparatorLock,
     attest_separator_runtime,
     load_separator_lock,
+    revalidate_separator_model_root,
     run_htdemucs_drums,
     run_spleeter_drums,
 )
@@ -929,6 +931,83 @@ def _recover_prior_derived_evidence(
             item[view_name] = recovered_view
 
 
+def _capture_derived_view_preimages(
+    snapshot: Mapping[str, object],
+) -> dict[tuple[int, str], dict[str, object]]:
+    """Deep-copy each mutable derived view before this invocation can change it."""
+    raw_items = snapshot.get("items")
+    if not isinstance(raw_items, list):
+        raise SeparationRunError("run snapshot items are unavailable")
+    preimages: dict[tuple[int, str], dict[str, object]] = {}
+    for raw_item in raw_items:
+        if not isinstance(raw_item, Mapping):
+            raise SeparationRunError("run snapshot item is invalid")
+        simfile_id = raw_item.get("simfile_id")
+        if isinstance(simfile_id, bool) or not isinstance(simfile_id, int):
+            raise SeparationRunError("run snapshot item simfile_id is invalid")
+        for view_name in ("spleeter", "htdemucs"):
+            raw_view = raw_item.get(view_name)
+            if not isinstance(raw_view, Mapping):
+                raise SeparationRunError("derived view evidence is invalid")
+            preimages[(simfile_id, view_name)] = deepcopy(dict(raw_view))
+    return preimages
+
+
+def _restore_derived_view_preimages(
+    snapshot: dict[str, object],
+    preimages: Mapping[tuple[int, str], Mapping[str, object]],
+) -> None:
+    """Restore only derived views, preserving all immutable artifacts and rows."""
+    raw_items = snapshot.get("items")
+    if not isinstance(raw_items, list):
+        raise SeparationRunError("run snapshot items are unavailable")
+    items_by_id: dict[int, dict[str, object]] = {}
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            raise SeparationRunError("run snapshot item is invalid")
+        simfile_id = raw_item.get("simfile_id")
+        if isinstance(simfile_id, bool) or not isinstance(simfile_id, int):
+            raise SeparationRunError("run snapshot item simfile_id is invalid")
+        items_by_id[simfile_id] = raw_item
+    for (simfile_id, view_name), preimage in preimages.items():
+        if isinstance(simfile_id, bool) or not isinstance(simfile_id, int):
+            raise SeparationRunError("derived view preimage simfile_id is invalid")
+        if view_name not in {"spleeter", "htdemucs"}:
+            raise SeparationRunError("derived view preimage name is invalid")
+        if not isinstance(preimage, Mapping):
+            raise SeparationRunError("derived view preimage is invalid")
+        item = items_by_id.get(simfile_id)
+        if item is None:
+            raise SeparationRunError("derived view preimage item is unavailable")
+        item[view_name] = deepcopy(dict(preimage))
+
+
+def _revalidate_separator_runtimes(
+    runtimes: Mapping[str, AttestedSeparatorRuntime],
+) -> None:
+    """Revalidate every successful-preflight separator runtime."""
+    first_error: SeparatorExecutionError | None = None
+    for runtime in runtimes.values():
+        try:
+            revalidate_separator_model_root(runtime)
+        except SeparatorExecutionError as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        raise first_error
+
+
+def _persist_restored_failed_snapshot(
+    run_path: Path,
+    snapshot: dict[str, object],
+    preimages: Mapping[tuple[int, str], Mapping[str, object]],
+) -> None:
+    """Persist a model-root-drift snapshot without newly attributed evidence."""
+    _restore_derived_view_preimages(snapshot, preimages)
+    snapshot["overall_status"] = "failed"
+    write_oaf_separation_run(run_path, snapshot)
+
+
 def _score_full_mix_control(
     request: OafSeparationPilotRequest,
     run_dir: Path,
@@ -1423,6 +1502,7 @@ def _execute_derived_view(
     descriptor: BackendDescriptor,
     perf_counter: Callable[[], float],
     stop_disposition: list[str],
+    separator_invocation_attempted: list[bool],
 ) -> object | None:
     """Execute one fixed view for one member and checkpoint each boundary."""
     backend_ref[0] = backend
@@ -1461,6 +1541,7 @@ def _execute_derived_view(
             view["stem"] = dict(raw_stem)
             runtime_evidence["separator_cache_hit"] = True
         else:
+            separator_invocation_attempted[0] = True
             stem = separator_runner(
                 source.path,
                 source_audio_sha256=source.source_audio_sha256,
@@ -1795,6 +1876,12 @@ def run_oaf_separation_pilot(
         raise TypeError("execution seams must be callable")
     backend: object | None = None
     backend_ref: list[object | None] = [None]
+    runtimes: dict[str, AttestedSeparatorRuntime] = {}
+    run_path: Path | None = None
+    snapshot: dict[str, object] | None = None
+    derived_view_preimages: dict[tuple[int, str], dict[str, object]] = {}
+    separator_invocation_attempted = [False]
+    postflight_finished = False
     try:
         _require_crux_commit(request.crux_commit)
         _validate_output_paths(request)
@@ -1891,6 +1978,7 @@ def run_oaf_separation_pilot(
         )
         if prior_snapshot is not None:
             _recover_prior_derived_evidence(snapshot, prior_snapshot)
+        derived_view_preimages = _capture_derived_view_preimages(snapshot)
         # Validate the complete local ledger before invoking the public
         # scorer.  A malformed parent evidence row is still fatal preflight;
         # it must not cause even the full-mix control wrapper to run.
@@ -1941,6 +2029,7 @@ def run_oaf_separation_pilot(
                 descriptor=descriptor,
                 perf_counter=selected_perf_counter,  # type: ignore[arg-type]
                 stop_disposition=stop_disposition,
+                separator_invocation_attempted=separator_invocation_attempted,
             )
             if stop_disposition:
                 break
@@ -1965,6 +2054,7 @@ def run_oaf_separation_pilot(
                 descriptor=descriptor,
                 perf_counter=selected_perf_counter,  # type: ignore[arg-type]
                 stop_disposition=stop_disposition,
+                separator_invocation_attempted=separator_invocation_attempted,
             )
             if stop_disposition:
                 break
@@ -1973,8 +2063,17 @@ def run_oaf_separation_pilot(
             _mark_outstanding_derived_views(snapshot)
             snapshot["overall_status"] = "failed" if disposition == "fatal_preflight" else "partial"
             write_oaf_separation_run(run_path, snapshot)
-            if disposition == "fatal_preflight":
-                return _fatal_outcome()
+        try:
+            _revalidate_separator_runtimes(runtimes)
+        except SeparatorExecutionError as error:
+            postflight_finished = True
+            if error.code == "separator_model_root_invalid":
+                _persist_restored_failed_snapshot(run_path, snapshot, derived_view_preimages)
+                return _fatal_outcome("separator_model_root_invalid")
+            raise
+        postflight_finished = True
+        if disposition == "fatal_preflight":
+            return _fatal_outcome()
         _score_derived_cohort(
             request,
             run_dir,
@@ -2037,7 +2136,41 @@ def run_oaf_separation_pilot(
             failure_code=None,
         )
     except (OSError, RuntimeError, StrictJsonError, SeparationRunError, TypeError, ValueError):
+        if separator_invocation_attempted[0] and not postflight_finished:
+            cleanup_failure_code: str | None = None
+            try:
+                _revalidate_separator_runtimes(runtimes)
+            except SeparatorExecutionError as error:
+                if error.code == "separator_model_root_invalid":
+                    try:
+                        if snapshot is not None and run_path is not None:
+                            _persist_restored_failed_snapshot(
+                                run_path, snapshot, derived_view_preimages
+                            )
+                            cleanup_failure_code = "separator_model_root_invalid"
+                    except BaseException:  # preserve the original fatal path
+                        pass
+            except BaseException:  # preserve the original fatal path
+                pass
+            if cleanup_failure_code is not None:
+                return _fatal_outcome(cleanup_failure_code)
         return _fatal_outcome()
+    except BaseException:
+        if separator_invocation_attempted[0] and not postflight_finished:
+            try:
+                _revalidate_separator_runtimes(runtimes)
+            except SeparatorExecutionError as error:
+                if error.code == "separator_model_root_invalid":
+                    try:
+                        if snapshot is not None and run_path is not None:
+                            _persist_restored_failed_snapshot(
+                                run_path, snapshot, derived_view_preimages
+                            )
+                    except BaseException:  # preserve the original exception
+                        pass
+            except BaseException:  # preserve the original exception
+                pass
+        raise
     finally:
         _close_backend(backend_ref[0])
 
