@@ -6,6 +6,7 @@ import os
 import shutil
 import signal
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -18,8 +19,10 @@ from src.benchmark.separators import (
     HTDEMUCS_SEPARATOR_ID,
     SEPARATOR_LOCK_SCHEMA,
     SPLEETER_SEPARATOR_ID,
+    SeparatorExecutionError,
     SeparatorLock,
     SeparatorLockError,
+    SeparatorModelFile,
     load_separator_environment_manifest,
     load_separator_lock,
 )
@@ -287,6 +290,224 @@ class _FakePopen:
         self.kill_calls += 1
 
 
+def _synthetic_model_root(
+    tmp_path: Path,
+    separator_id: str,
+) -> tuple[Path, tuple[SeparatorModelFile, ...]]:
+    expected_files = (
+        {
+            "4stems/checkpoint": b"checkpoint bytes",
+            "4stems/.probe": b"probe bytes",
+            "4stems/model.index": b"index bytes",
+            "4stems/model.data-00000-of-00001": b"data bytes",
+            "4stems/model.meta": b"meta bytes",
+        }
+        if separator_id == SPLEETER_SEPARATOR_ID
+        else {
+            "htdemucs.yaml": b"yaml bytes",
+            "955717e8-8726e21a.th": b"weights bytes",
+        }
+    )
+    root = tmp_path / separator_id
+    for relative_path, content in expected_files.items():
+        destination = root / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+    model_files = tuple(
+        SeparatorModelFile(
+            name=relative_path,
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+        for relative_path, content in sorted(expected_files.items())
+    )
+    return root, model_files
+
+
+def _attested_runtime(
+    separator_id: str,
+    *,
+    interpreter: Path = Path("/isolated/python"),
+    model_root: Path = Path("/isolated/model-root"),
+    model_files: tuple[SeparatorModelFile, ...] | None = None,
+    launch_environment: dict[str, str] | None = None,
+) -> object:
+    lock_path = _lock_path(separator_id)
+    lock = load_separator_lock(lock_path)
+    if model_files is not None:
+        lock = replace(lock, model_files=model_files)
+    environment = load_separator_environment_manifest(lock_path, load_separator_lock(lock_path))
+    runtime_type = getattr(separators, "AttestedSeparatorRuntime", None)
+    assert runtime_type is not None, "Task 3 typed separator runtime API is missing"
+    return runtime_type(
+        interpreter=interpreter,
+        lock=lock,
+        model_root=model_root,
+        model_files=lock.model_files,
+        environment=environment,
+        launch_environment=launch_environment or {"PATH": os.environ.get("PATH", "")},
+    )
+
+
+@pytest.mark.parametrize("separator_id", [SPLEETER_SEPARATOR_ID, HTDEMUCS_SEPARATOR_ID])
+def test_inventory_separator_model_root_returns_exact_policy_files(
+    tmp_path: Path,
+    separator_id: str,
+) -> None:
+    model_root, expected = _synthetic_model_root(tmp_path, separator_id)
+
+    assert separators.inventory_separator_model_root(separator_id, model_root) == expected
+
+
+@pytest.mark.parametrize("separator_id", [SPLEETER_SEPARATOR_ID, HTDEMUCS_SEPARATOR_ID])
+def test_inventory_separator_model_root_rejects_extra_regular_file(
+    tmp_path: Path,
+    separator_id: str,
+) -> None:
+    model_root, _ = _synthetic_model_root(tmp_path, separator_id)
+    (model_root / "extra.bin").write_bytes(b"unexpected")
+
+    with pytest.raises(SeparatorExecutionError, match="separator_model_root_invalid") as raised:
+        separators.inventory_separator_model_root(separator_id, model_root)
+    assert raised.value.detail_code == "separator_model_root_invalid"
+
+
+@pytest.mark.parametrize("separator_id", [SPLEETER_SEPARATOR_ID, HTDEMUCS_SEPARATOR_ID])
+def test_inventory_separator_model_root_rejects_symlink(
+    tmp_path: Path,
+    separator_id: str,
+) -> None:
+    model_root, _ = _synthetic_model_root(tmp_path, separator_id)
+    relative_path = (
+        "4stems/model.index" if separator_id == SPLEETER_SEPARATOR_ID else "htdemucs.yaml"
+    )
+    destination = model_root / relative_path
+    destination.unlink()
+    destination.symlink_to(
+        model_root
+        / ("4stems/checkpoint" if separator_id == SPLEETER_SEPARATOR_ID else "955717e8-8726e21a.th")
+    )
+
+    with pytest.raises(SeparatorExecutionError, match="separator_model_root_invalid") as raised:
+        separators.inventory_separator_model_root(separator_id, model_root)
+    assert raised.value.detail_code == "separator_model_root_invalid"
+
+
+def test_inventory_separator_model_root_rejects_parent_symlink(tmp_path: Path) -> None:
+    model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    nested_root = model_root / "4stems"
+    replacement = tmp_path / "real-4stems"
+    nested_root.rename(replacement)
+    nested_root.symlink_to(replacement, target_is_directory=True)
+
+    with pytest.raises(SeparatorExecutionError, match="separator_model_root_invalid") as raised:
+        separators.inventory_separator_model_root(SPLEETER_SEPARATOR_ID, model_root)
+    assert raised.value.detail_code == "separator_model_root_invalid"
+
+
+def test_revalidate_separator_model_root_compares_the_attested_inventory(
+    tmp_path: Path,
+) -> None:
+    model_root, expected = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    runtime = _attested_runtime(
+        SPLEETER_SEPARATOR_ID,
+        model_root=model_root,
+        model_files=expected,
+    )
+
+    separators.revalidate_separator_model_root(runtime)
+
+    (model_root / "4stems" / "model.meta").write_bytes(b"changed")
+    with pytest.raises(SeparatorExecutionError, match="separator_model_root_invalid") as raised:
+        separators.revalidate_separator_model_root(runtime)
+    assert raised.value.detail_code == "separator_model_root_invalid"
+
+
+def test_htdemucs_renderer_propagates_the_attested_local_repository(
+    tmp_path: Path,
+) -> None:
+    model_root, expected = _synthetic_model_root(tmp_path, HTDEMUCS_SEPARATOR_ID)
+    runtime = _attested_runtime(
+        HTDEMUCS_SEPARATOR_ID,
+        interpreter=Path("/isolated/demucs/python"),
+        model_root=model_root,
+        model_files=expected,
+    )
+
+    argv = separators._render_separator_argv(
+        runtime,
+        input_path=tmp_path / "input.wav",
+        output_dir=tmp_path / "output",
+    )
+
+    assert argv[0] == "/isolated/demucs/python"
+    assert argv[argv.index("--repo") + 1] == str(model_root)
+
+
+def test_spleeter_launch_environment_replaces_inherited_model_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    monkeypatch.setenv("MODEL_PATH", "/ambient/model-cache")
+
+    environment = separators._build_separator_launch_environment(
+        SPLEETER_SEPARATOR_ID,
+        model_root,
+    )
+
+    assert environment["MODEL_PATH"] == str(model_root)
+
+
+def test_demucs_launch_environment_removes_model_cache_and_endpoint_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_root, _ = _synthetic_model_root(tmp_path, HTDEMUCS_SEPARATOR_ID)
+    policy = separators._SEPARATOR_POLICIES[HTDEMUCS_SEPARATOR_ID]
+    discovery_keys = tuple(policy["environment_discovery_keys"])
+    for key in discovery_keys:
+        monkeypatch.setenv(key, "/ambient/" + key.lower())
+
+    environment = separators._build_separator_launch_environment(
+        HTDEMUCS_SEPARATOR_ID,
+        model_root,
+    )
+
+    assert all(key not in environment for key in discovery_keys)
+
+
+def test_separator_passes_runtime_launch_environment_to_popen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = _source_wav(tmp_path)
+    model_root, expected = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    runtime = _attested_runtime(
+        SPLEETER_SEPARATOR_ID,
+        model_root=model_root,
+        model_files=expected,
+        launch_environment={"PATH": "/isolated/bin", "MODEL_PATH": str(model_root)},
+    )
+    fake = _FakePopen(
+        write_output=lambda workdir: _write_stem(
+            workdir,
+            separator_id=SPLEETER_SEPARATOR_ID,
+            samples=np.full((44100, 1), 0.25, dtype=np.float32),
+        )
+    )
+    _install_fake_popen(monkeypatch, fake)
+
+    result = _run_separator(
+        SPLEETER_SEPARATOR_ID,
+        source_path,
+        cache_root=tmp_path / "cache",
+        runtime=runtime,
+    )
+
+    assert fake.kwargs["env"] == runtime.launch_environment
+    assert str(model_root) not in str(result.path)
+
+
 def _source_wav(tmp_path: Path, *, duration_sec: float = 1.0) -> Path:
     path = tmp_path / "source.wav"
     frame_count = int(duration_sec * 44100)
@@ -303,6 +524,7 @@ def _run_separator(
     source_path: Path,
     *,
     cache_root: Path,
+    runtime: object | None = None,
     **kwargs: object,
 ) -> object:
     implementation = (
@@ -311,12 +533,13 @@ def _run_separator(
         else getattr(separators, "run_htdemucs_drums", None)
     )
     assert callable(implementation), "Task 4 separator execution API is missing"
+    if runtime is None:
+        runtime = _attested_runtime(separator_id)
     return implementation(
         source_path,
         source_audio_sha256="a" * 64,
         source_duration_sec=1.0,
-        interpreter=Path("/isolated/python"),
-        lock_path=_lock_path(separator_id),
+        runtime=runtime,
         cache_root=cache_root,
         **kwargs,
     )
