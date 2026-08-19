@@ -9,10 +9,12 @@ import re
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from io import BytesIO
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
@@ -103,6 +105,17 @@ _ENVIRONMENT_ROOT_TAGS = frozenset(
     }
 )
 _DISTRIBUTION_NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+_PYTHON_IMPORT_DISCOVERY_ENVIRONMENT_KEYS = frozenset(
+    {
+        "PYTHONCASEOK",
+        "PYTHONHOME",
+        "PYTHONNOUSERSITE",
+        "PYTHONPATH",
+        "PYTHONPLATLIBDIR",
+        "PYTHONSAFEPATH",
+        "PYTHONUSERBASE",
+    }
+)
 
 # Commands intentionally contain only interpreter-independent arguments.  The
 # freeze script records the interpreter separately, while the runner supplies
@@ -298,6 +311,28 @@ class AttestedSeparatorRuntime:
     model_files: tuple[SeparatorModelFile, ...]
     environment: SeparatorEnvironmentManifest
     launch_environment: Mapping[str, str]
+    model_root_fd: int | None = dataclass_field(default=None, init=False, repr=False, compare=False)
+    model_root_launch_path: Path | None = dataclass_field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _model_root_finalizer: weakref.finalize | None = dataclass_field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    def close(self) -> None:
+        """Release the descriptor held to bind this runtime's model root."""
+        finalizer = self._model_root_finalizer
+        if finalizer is not None and finalizer.alive:
+            finalizer()
+        object.__setattr__(self, "model_root_fd", None)
+        object.__setattr__(self, "model_root_launch_path", None)
+        object.__setattr__(self, "_model_root_finalizer", None)
 
 
 _ATTESTED_RUNTIME_REGISTRY: weakref.WeakValueDictionary[int, AttestedSeparatorRuntime] = (
@@ -523,9 +558,10 @@ def _run_separator_environment_probe(
     probe_path = Path(__file__).with_name("separator_environment_probe.py")
     try:
         result = subprocess.run(
-            [os.fspath(interpreter), os.fspath(probe_path)],
+            [os.fspath(interpreter), "-I", os.fspath(probe_path)],
             check=False,
             capture_output=True,
+            env=_isolated_python_environment(),
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise SeparatorExecutionError(
@@ -544,6 +580,14 @@ def _run_separator_environment_probe(
             "separator_environment_probe_failed",
             "separator environment probe output is not canonical",
         ) from error
+
+
+def _isolated_python_environment() -> dict[str, str]:
+    """Remove parent variables that can alter Python import discovery."""
+    environment = dict(os.environ)
+    for key in _PYTHON_IMPORT_DISCOVERY_ENVIRONMENT_KEYS:
+        environment.pop(key, None)
+    return environment
 
 
 def _require_absolute_model_root(model_root: Path) -> Path:
@@ -612,7 +656,12 @@ def attest_separator_runtime(
         )
 
     try:
-        model_files = inventory_separator_model_root(lock.separator_id, model_root)
+        expected_files = (
+            _SPLEETER_MODEL_ROOT_FILES
+            if lock.separator_id == SPLEETER_SEPARATOR_ID
+            else _HTDEMUCS_MODEL_ROOT_FILES
+        )
+        model_files, model_root_fd = _inventory_model_root_bound(model_root, expected_files)
     except SeparatorExecutionError as error:
         if error.code == "separator_model_root_invalid":
             raise
@@ -626,6 +675,7 @@ def attest_separator_runtime(
             "separator model root does not match the fixed policy",
         ) from error
     if model_files != lock.model_files:
+        _close_model_root_fd(model_root_fd)
         raise SeparatorExecutionError(
             "separator_model_root_invalid",
             "separator model root does not match the frozen lock",
@@ -638,6 +688,7 @@ def attest_separator_runtime(
             model_root=model_root,
             model_files=model_files,
             environment=probed_environment,
+            model_root_fd=model_root_fd,
         )
     except SeparatorExecutionError as error:
         if error.code in ATTESTATION_FAILURE_CODES:
@@ -891,10 +942,29 @@ def inventory_separator_model_root(
 def revalidate_separator_model_root(runtime: AttestedSeparatorRuntime) -> None:
     """Re-inventory an attested model root without reading or writing evidence."""
     _require_attested_runtime(runtime)
+    if not isinstance(runtime.model_root_fd, int):
+        raise SeparatorExecutionError(
+            "separator_model_root_invalid",
+            "separator model root descriptor is unavailable",
+        )
     try:
-        inventory = inventory_separator_model_root(runtime.lock.separator_id, runtime.model_root)
+        expected_files = (
+            _SPLEETER_MODEL_ROOT_FILES
+            if runtime.lock.separator_id == SPLEETER_SEPARATOR_ID
+            else _HTDEMUCS_MODEL_ROOT_FILES
+        )
+        inventory, _ = _inventory_model_root_bound(
+            runtime.model_root,
+            expected_files,
+            root_fd=runtime.model_root_fd,
+        )
     except SeparatorExecutionError:
         raise
+    except (OSError, TypeError, ValueError) as error:
+        raise SeparatorExecutionError(
+            "separator_model_root_invalid",
+            "separator model root does not match the fixed policy",
+        ) from error
     if inventory != runtime.lock.model_files or runtime.model_files != runtime.lock.model_files:
         raise SeparatorExecutionError(
             "separator_model_root_invalid",
@@ -906,22 +976,37 @@ def _inventory_model_root(
     model_root: Path,
     expected_files: tuple[str, ...],
 ) -> tuple[SeparatorModelFile, ...]:
+    inventory, descriptor = _inventory_model_root_bound(model_root, expected_files)
+    _close_model_root_fd(descriptor)
+    return inventory
+
+
+def _inventory_model_root_bound(
+    model_root: Path,
+    expected_files: tuple[str, ...],
+    *,
+    root_fd: int | None = None,
+) -> tuple[tuple[SeparatorModelFile, ...], int]:
+    """Inventory a root while optionally retaining its bound directory fd."""
     no_follow, directory_flag, close_on_exec = _model_root_descriptor_flags()
     expected_names = set(expected_files)
     expected_directories = {""}
     for name in expected_files:
         expected_directories.update(name.rsplit("/", 1)[:1] if "/" in name else ())
-
-    root_metadata = os.stat(model_root, follow_symlinks=False)
-    if not stat.S_ISDIR(root_metadata.st_mode):
-        raise OSError("model root is not an ordinary directory")
-    root_fd = os.open(
-        model_root,
-        os.O_RDONLY | directory_flag | no_follow | close_on_exec,
-    )
+    owns_descriptor = root_fd is None
     try:
+        if root_fd is None:
+            root_fd = _open_model_root_path(
+                model_root,
+                directory_flag=directory_flag,
+                no_follow=no_follow,
+                close_on_exec=close_on_exec,
+            )
+        if not isinstance(root_fd, int):
+            raise OSError("model root descriptor is unavailable")
         opened_root_metadata = os.fstat(root_fd)
-        _require_same_model_identity(root_metadata, opened_root_metadata)
+        if not stat.S_ISDIR(opened_root_metadata.st_mode):
+            raise OSError("model root is not an ordinary directory")
         files: dict[str, str] = {}
         directories: set[str] = {""}
 
@@ -990,16 +1075,44 @@ def _inventory_model_root(
 
         walk(root_fd, "")
         _require_same_model_state(opened_root_metadata, os.fstat(root_fd))
-        _require_same_model_identity(
-            opened_root_metadata,
-            os.stat(model_root, follow_symlinks=False),
+        if set(files) != expected_names or directories != expected_directories:
+            raise OSError("model root file layout does not match policy")
+        return (
+            tuple(SeparatorModelFile(name=name, sha256=files[name]) for name in sorted(files)),
+            root_fd,
         )
-    finally:
-        os.close(root_fd)
+    except BaseException:
+        if owns_descriptor and isinstance(root_fd, int):
+            _close_model_root_fd(root_fd)
+        raise
 
-    if set(files) != expected_names or directories != expected_directories:
-        raise OSError("model root file layout does not match policy")
-    return tuple(SeparatorModelFile(name=name, sha256=files[name]) for name in sorted(files))
+
+def _open_model_root_path(
+    model_root: Path,
+    *,
+    directory_flag: int,
+    no_follow: int,
+    close_on_exec: int,
+) -> int:
+    """Open every absolute model-root path component without following aliases."""
+    if not isinstance(model_root, Path) or not model_root.is_absolute():
+        raise OSError("model root must be absolute")
+    parts = model_root.parts
+    if os.name == "nt" or not parts or parts[0] != os.path.sep:
+        raise OSError("descriptor-relative model paths are unavailable")
+    flags = os.O_RDONLY | directory_flag | no_follow | close_on_exec
+    descriptor = os.open(os.path.sep, flags)
+    try:
+        for part in parts[1:]:
+            if not part or part in {".", "..", os.path.sep}:
+                raise OSError("model root path is not normalized")
+            child_descriptor = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child_descriptor
+        return descriptor
+    except BaseException:
+        _close_model_root_fd(descriptor)
+        raise
 
 
 def _model_root_descriptor_flags() -> tuple[int, int, int]:
@@ -1020,6 +1133,28 @@ def _model_root_descriptor_flags() -> tuple[int, int, int]:
     if os.stat not in supports_follow_symlinks or os.listdir not in supports_fd:
         raise OSError("descriptor no-follow model inventory is unavailable")
     return no_follow, directory_flag, getattr(os, "O_CLOEXEC", 0)
+
+
+def _close_model_root_fd(descriptor: int) -> None:
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _model_root_launch_path(descriptor: int) -> Path:
+    """Return a child-visible path that resolves through a held directory fd."""
+    if os.name != "posix":
+        raise OSError("descriptor-backed model-root paths are unavailable")
+    if sys.platform == "darwin":
+        # macOS exposes directory descriptors through /dev/fd, but does not
+        # permit path traversal below that symlink.  The launcher therefore
+        # fchdirs to the held descriptor in the child and uses '.'.
+        return Path(".")
+    for prefix in (Path("/proc/self/fd"), Path("/dev/fd")):
+        if prefix.is_dir():
+            return prefix / str(descriptor)
+    raise OSError("descriptor-backed model-root paths are unavailable")
 
 
 def _model_identity(metadata: os.stat_result) -> tuple[int, int, int]:
@@ -1083,6 +1218,8 @@ def _build_separator_launch_environment(
         raise TypeError("model_root must be a Path")
     policy = _SEPARATOR_POLICIES[separator_id]
     environment = dict(os.environ)
+    for key in _PYTHON_IMPORT_DISCOVERY_ENVIRONMENT_KEYS:
+        environment.pop(key, None)
     for key in policy["environment_discovery_keys"]:
         environment.pop(key, None)
     if separator_id == SPLEETER_SEPARATOR_ID:
@@ -1097,50 +1234,77 @@ def _build_attested_separator_runtime(
     model_root: Path,
     model_files: tuple[SeparatorModelFile, ...],
     environment: SeparatorEnvironmentManifest,
+    model_root_fd: int | None = None,
 ) -> AttestedSeparatorRuntime:
     """Construct a runtime only after its lock-bound inputs pass local checks."""
-    if not isinstance(interpreter, Path):
-        raise TypeError("interpreter must be a Path")
-    if not isinstance(lock, SeparatorLock):
-        raise TypeError("lock must be a SeparatorLock")
-    if not isinstance(model_root, Path):
-        raise TypeError("model_root must be a Path")
-    if not isinstance(model_files, tuple) or any(
-        not isinstance(item, SeparatorModelFile) for item in model_files
-    ):
-        raise TypeError("model_files must be a tuple of SeparatorModelFile")
-    if not isinstance(environment, SeparatorEnvironmentManifest):
-        raise TypeError("environment must be a SeparatorEnvironmentManifest")
-    if (
-        model_files != lock.model_files
-        or environment.sha256 != lock.environment_manifest_sha256
-        or environment.separator_id != lock.separator_id
-        or environment.package_name != lock.package_name
-        or environment.package_version != lock.package_version
-        or environment.interpreter_sha256 != lock.interpreter_sha256
-    ):
-        raise SeparatorExecutionError(
-            "separator_runtime_unattested",
-            "separator runtime inputs do not match the v2 lock",
+    runtime_descriptor = model_root_fd
+    try:
+        if not isinstance(interpreter, Path):
+            raise TypeError("interpreter must be a Path")
+        if not isinstance(lock, SeparatorLock):
+            raise TypeError("lock must be a SeparatorLock")
+        if not isinstance(model_root, Path):
+            raise TypeError("model_root must be a Path")
+        if not isinstance(model_files, tuple) or any(
+            not isinstance(item, SeparatorModelFile) for item in model_files
+        ):
+            raise TypeError("model_files must be a tuple of SeparatorModelFile")
+        if not isinstance(environment, SeparatorEnvironmentManifest):
+            raise TypeError("environment must be a SeparatorEnvironmentManifest")
+        if (
+            model_files != lock.model_files
+            or environment.sha256 != lock.environment_manifest_sha256
+            or environment.separator_id != lock.separator_id
+            or environment.package_name != lock.package_name
+            or environment.package_version != lock.package_version
+            or environment.interpreter_sha256 != lock.interpreter_sha256
+        ):
+            raise SeparatorExecutionError(
+                "separator_runtime_unattested",
+                "separator runtime inputs do not match the v2 lock",
+            )
+        if runtime_descriptor is None:
+            inventory, runtime_descriptor = _inventory_model_root_bound(
+                model_root,
+                (
+                    _SPLEETER_MODEL_ROOT_FILES
+                    if lock.separator_id == SPLEETER_SEPARATOR_ID
+                    else _HTDEMUCS_MODEL_ROOT_FILES
+                ),
+            )
+        else:
+            inventory = model_files
+        if not isinstance(runtime_descriptor, int):
+            raise OSError("separator model root descriptor is unavailable")
+        if inventory != lock.model_files:
+            raise SeparatorExecutionError(
+                "separator_runtime_unattested",
+                "separator model root does not match the v2 lock",
+            )
+        launch_path = _model_root_launch_path(runtime_descriptor)
+        runtime = AttestedSeparatorRuntime(
+            interpreter=interpreter,
+            lock=lock,
+            model_root=model_root,
+            model_files=inventory,
+            environment=environment,
+            launch_environment=MappingProxyType(
+                _build_separator_launch_environment(lock.separator_id, launch_path)
+            ),
         )
-    inventory = inventory_separator_model_root(lock.separator_id, model_root)
-    if inventory != lock.model_files:
-        raise SeparatorExecutionError(
-            "separator_runtime_unattested",
-            "separator model root does not match the v2 lock",
+        object.__setattr__(runtime, "model_root_fd", runtime_descriptor)
+        object.__setattr__(runtime, "model_root_launch_path", launch_path)
+        object.__setattr__(
+            runtime,
+            "_model_root_finalizer",
+            weakref.finalize(runtime, _close_model_root_fd, runtime_descriptor),
         )
-    runtime = AttestedSeparatorRuntime(
-        interpreter=interpreter,
-        lock=lock,
-        model_root=model_root,
-        model_files=inventory,
-        environment=environment,
-        launch_environment=MappingProxyType(
-            _build_separator_launch_environment(lock.separator_id, model_root)
-        ),
-    )
-    _ATTESTED_RUNTIME_REGISTRY[id(runtime)] = runtime
-    return runtime
+        _ATTESTED_RUNTIME_REGISTRY[id(runtime)] = runtime
+        return runtime
+    except BaseException:
+        if isinstance(runtime_descriptor, int):
+            _close_model_root_fd(runtime_descriptor)
+        raise
 
 
 def _require_attested_runtime(runtime: AttestedSeparatorRuntime) -> None:
@@ -1150,6 +1314,15 @@ def _require_attested_runtime(runtime: AttestedSeparatorRuntime) -> None:
         raise SeparatorExecutionError(
             "separator_runtime_unattested",
             "separator runtime was not constructed by the attestation gate",
+        )
+    if (
+        not isinstance(runtime.model_root_fd, int)
+        or runtime._model_root_finalizer is None
+        or not runtime._model_root_finalizer.alive
+    ):
+        raise SeparatorExecutionError(
+            "separator_runtime_unattested",
+            "separator runtime model root descriptor is closed",
         )
 
 
@@ -1257,7 +1430,16 @@ def _run_separator_drums(
                 input_path=input_path,
                 output_dir=output_dir,
             )
-            _run_separator_process(argv, cwd=workdir, env=runtime.launch_environment)
+            pass_fds = (runtime.model_root_fd,) if isinstance(runtime.model_root_fd, int) else ()
+            _run_separator_process(
+                argv,
+                cwd=workdir,
+                env=runtime.launch_environment,
+                pass_fds=pass_fds,
+                model_root_cwd_fd=(
+                    runtime.model_root_fd if runtime.model_root_launch_path == Path(".") else None
+                ),
+            )
             output_path = output_dir / lock.expected_drum_stem_relative_path
             try:
                 stem_bytes = read_regular_file_no_follow(output_path)
@@ -1372,13 +1554,15 @@ def _render_separator_argv(
     output_dir: Path,
 ) -> list[str]:
     _require_attested_runtime(runtime)
+    model_root = runtime.model_root_launch_path or runtime.model_root
     replacements = {
         "{input_wav}": os.fspath(input_path),
         "{output_dir}": os.fspath(output_dir),
-        "{model_root}": os.fspath(runtime.model_root),
+        "{model_root}": os.fspath(model_root),
     }
     return [
         os.fspath(runtime.interpreter),
+        "-I",
         *(replacements.get(argument, argument) for argument in runtime.lock.argv),
     ]
 
@@ -1388,18 +1572,23 @@ def _run_separator_process(
     *,
     cwd: Path,
     env: Mapping[str, str],
+    pass_fds: tuple[int, ...] = (),
+    model_root_cwd_fd: int | None = None,
 ) -> None:
+    popen_options: dict[str, object] = {
+        "cwd": cwd,
+        "env": dict(env),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "shell": False,
+        "start_new_session": True,
+        "pass_fds": pass_fds,
+    }
+    if model_root_cwd_fd is not None:
+        popen_options["preexec_fn"] = lambda: os.fchdir(model_root_cwd_fd)
     try:
-        process = subprocess.Popen(
-            argv,
-            cwd=cwd,
-            env=dict(env),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            start_new_session=True,
-        )
+        process = subprocess.Popen(argv, **popen_options)
     except OSError as error:
         raise SeparatorExecutionError(
             "separator_start_failed",

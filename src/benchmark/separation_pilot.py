@@ -1916,13 +1916,6 @@ def run_oaf_separation_pilot(
             spleeter_lock_sha256=spleeter.sha256,
             htdemucs_lock_sha256=htdemucs.sha256,
         )
-        identity = _identity_payload(request, reference, timing, subset, parent, spleeter, htdemucs)
-        run_id = "oaf-separation-" + sha256(canonical_json_bytes(identity)).hexdigest()[:16]
-        run_dir = request.output_dir / "runs" / run_id
-        reports_path = run_dir / "views" / "full_mix" / "reports"
-        if reports_path.resolve() == (request.oaf_run_path.resolve().parent / "reports").resolve():
-            raise SeparationRunError("full-mix reports alias parent run reports")
-        run_path = run_dir / "run.json"
 
         # Resolve all authoritative source identities before either report
         # scoring or an expensive separator/OaF operation.
@@ -1940,21 +1933,62 @@ def run_oaf_separation_pilot(
             "htdemucs": _view_inference_config(parent, HTDEMUCS_INPUT_VIEW_ID),
         }
         try:
-            runtimes = {
-                SPLEETER_SEPARATOR_ID: attest_separator_runtime(
-                    SEPARATOR_LOCK_PATHS[SPLEETER_SEPARATOR_ID],
+            for separator_id, loaded_lock, interpreter, model_root in (
+                (
+                    SPLEETER_SEPARATOR_ID,
+                    spleeter,
                     request.spleeter_python,
                     request.spleeter_model_root,
                 ),
-                HTDEMUCS_SEPARATOR_ID: attest_separator_runtime(
-                    SEPARATOR_LOCK_PATHS[HTDEMUCS_SEPARATOR_ID],
+                (
+                    HTDEMUCS_SEPARATOR_ID,
+                    htdemucs,
                     request.demucs_python,
                     request.demucs_model_root,
                 ),
-            }
+            ):
+                runtime = attest_separator_runtime(
+                    SEPARATOR_LOCK_PATHS[separator_id],
+                    interpreter,
+                    model_root,
+                )
+                if runtime.lock.sha256 != loaded_lock.sha256:
+                    runtime.close()
+                    raise SeparatorExecutionError(
+                        "separator_lock_companion_mismatch",
+                        "separator lock changed during runtime attestation",
+                    )
+                runtimes[separator_id] = runtime
         except SeparatorExecutionError as error:
             failure_code = error.code if error.code in ATTESTATION_FAILURE_CODES else None
             return _fatal_outcome(failure_code)
+
+        # The lock objects used for row identity and the snapshot must be the
+        # exact lock objects carried by the runtimes that will execute.
+        spleeter = runtimes[SPLEETER_SEPARATOR_ID].lock
+        htdemucs = runtimes[HTDEMUCS_SEPARATOR_ID].lock
+        rows = _subset_parent_rows(
+            subset,
+            parent,
+            spleeter_lock_sha256=spleeter.sha256,
+            htdemucs_lock_sha256=htdemucs.sha256,
+        )
+        for row in rows:
+            simfile_id = row.get("simfile_id")
+            source = sources.get(simfile_id) if isinstance(simfile_id, int) else None
+            if source is None:
+                raise SeparationRunError("resolved source is unavailable")
+            row["source_audio_id"] = source.source_audio_id
+            row["source_audio_sha256"] = source.source_audio_sha256
+            row["source_duration_sec"] = source.duration_sec
+
+        identity = _identity_payload(request, reference, timing, subset, parent, spleeter, htdemucs)
+        run_id = "oaf-separation-" + sha256(canonical_json_bytes(identity)).hexdigest()[:16]
+        run_dir = request.output_dir / "runs" / run_id
+        reports_path = run_dir / "views" / "full_mix" / "reports"
+        if reports_path.resolve() == (request.oaf_run_path.resolve().parent / "reports").resolve():
+            raise SeparationRunError("full-mix reports alias parent run reports")
+        run_path = run_dir / "run.json"
 
         prior_snapshot: Mapping[str, object] | None = None
         if run_path.exists():
@@ -2173,6 +2207,8 @@ def run_oaf_separation_pilot(
         raise
     finally:
         _close_backend(backend_ref[0])
+        for runtime in runtimes.values():
+            runtime.close()
 
 
 __all__ = [
