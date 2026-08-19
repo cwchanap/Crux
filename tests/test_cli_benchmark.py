@@ -1052,6 +1052,76 @@ def test_run_oaf_separation_pilot_command_preserves_complete_and_fatal_exit_code
     }
 
 
+def test_run_oaf_separation_pilot_command_sanitizes_native_fatal_detail(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import src.benchmark.separation_pilot as pilot_module
+    import src.cli.benchmark as benchmark_module
+    from src.benchmark.separators import SeparatorExecutionError
+    from tests.benchmark.reviewed_subset_fixtures import build_reviewed_subset_oaf_fixture
+    from tests.benchmark.test_separation_pilot import _subset_path, _task6_seams
+
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20, failed_count=0)
+    subset_manifest = _subset_path(tmp_path, fixture)
+    calls = _task6_seams(tmp_path, fixture, monkeypatch)
+    del calls
+
+    private_runtime_path = (tmp_path / "private-runtime" / "spleeter" / "python").resolve()
+
+    def failing_attest(*_args: object, **_kwargs: object) -> object:
+        raise SeparatorExecutionError(
+            "separator_environment_mismatch",
+            f"private runtime detail: {private_runtime_path}",
+        )
+
+    monkeypatch.setattr(pilot_module, "attest_separator_runtime", failing_attest)
+    monkeypatch.setattr(benchmark_module, "_current_crux_commit", lambda: "a" * 40)
+    args = [
+        "benchmark",
+        "run-oaf-separation-pilot",
+        "--manifest",
+        str(fixture.reference_manifest_path),
+        "--timing-manifest",
+        str(fixture.timing_manifest_path),
+        "--subset-manifest",
+        str(subset_manifest),
+        "--oaf-run",
+        str(fixture.run_path),
+        "--cache-dir",
+        str(tmp_path / "cache"),
+        "--output-dir",
+        str(tmp_path / "separation-output"),
+        "--spleeter-python",
+        str(private_runtime_path),
+        "--demucs-python",
+        str(tmp_path / "private-runtime" / "demucs" / "python"),
+        "--spleeter-model-root",
+        str(tmp_path / "private-runtime" / "spleeter-model-root"),
+        "--demucs-model-root",
+        str(tmp_path / "private-runtime" / "demucs-model-root"),
+    ]
+
+    result = CliRunner().invoke(main, args, catch_exceptions=False)
+
+    assert result.exit_code == 2
+    assert json.loads(result.output) == {
+        "exit_code": 2,
+        "failed_count": 0,
+        "failure_code": "separator_environment_mismatch",
+        "full_mix_reports_path": None,
+        "quarantined_count": 0,
+        "reports_path": None,
+        "run_id": None,
+        "run_path": None,
+        "skipped_count": 0,
+        "status": "failed",
+        "success_count": 0,
+    }
+    assert str(private_runtime_path) not in result.output
+    assert "private runtime detail" not in result.output
+
+
 def test_finalize_oaf_separation_pilot_command_publishes_manifest_summary(
     tmp_path: Path, monkeypatch
 ) -> None:
