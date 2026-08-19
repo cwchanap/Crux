@@ -342,7 +342,20 @@
             "sitecustomize": lambda purelib: (purelib / "sitecustomize.py").write_text("pass\\n"),
         }
 
-    Implement the two symlink cases separately with Path.symlink_to() so leaf_symlink replaces package/__init__.py and parent_symlink replaces the package directory. For every case, mutate only the synthetic venv after _write_distribution(), rerun the child, and assert nonzero return code with empty stdout. Add a separate bytecode case that creates package/__pycache__/module.cpython-313.pyc and asserts the canonical manifest bytes are unchanged. Add a resolved-interpreter test using a symlink to the venv interpreter and assert the child manifest hash equals the final target's hash.
+    Implement the two symlink cases separately with Path.symlink_to() so
+    leaf_symlink replaces package/__init__.py and parent_symlink replaces the
+    package directory. For `missing_record_member`, malformed
+    `record_self_changed`, extra-file, and symlink cases, mutate only the
+    synthetic venv after _write_distribution(), rerun the child, and assert a
+    nonzero return code with empty stdout. For `record_content_changed`, capture
+    the baseline canonical manifest, mutate the non-RECORD member, rerun the
+    child, and assert successful canonical output whose observed member hash/size
+    and overall manifest differ from the baseline. The later frozen-vs-live
+    attester, rather than quoted RECORD metadata, rejects that live drift. Add a
+    separate bytecode case that creates package/__pycache__/module.cpython-313.pyc
+    and asserts the canonical manifest bytes are unchanged. Add a
+    resolved-interpreter test using a symlink to the venv interpreter and assert
+    the child manifest hash equals the final target's hash.
 
 - [ ] **Step 5: Run the probe suite**
 
