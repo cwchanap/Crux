@@ -15,7 +15,10 @@ from src.benchmark.backends import CanonicalAudio, NativeEvent
 from src.benchmark.prediction_artifact import (
     MappedPrediction,
     MappedPredictionEvent,
+    PredictionArtifact,
     PredictionArtifactError,
+    prediction_artifact_matches_audio,
+    prediction_artifact_matches_run_row,
     prediction_path,
     read_prediction_artifact,
     render_prediction_artifact,
@@ -151,3 +154,168 @@ def test_prediction_path_rejects_non_positive_simfile_id() -> None:
             backend_descriptor_sha256=SHA_B,
             inference_config_sha256=SHA_C,
         )
+
+
+def _oaf_artifact() -> PredictionArtifact:
+    return read_prediction_artifact(render_prediction_artifact(_oaf_prediction()))
+
+
+def test_prediction_artifact_matches_audio_returns_true_for_matching_input() -> None:
+    artifact = _oaf_artifact()
+    prediction = artifact.prediction
+    assert (
+        prediction_artifact_matches_audio(
+            artifact,
+            source_audio_id=prediction.audio.source_audio_id,
+            source_audio_sha256=prediction.audio.source_audio_sha256,
+            audio=prediction.audio,
+            descriptor=prediction.descriptor,
+            prediction_map_version=OAF_PREDICTION_MAP_ID,
+        )
+        is True
+    )
+
+
+def test_prediction_artifact_matches_audio_rejects_non_artifact() -> None:
+    assert (
+        prediction_artifact_matches_audio(
+            "not-an-artifact",  # type: ignore[arg-type]
+            source_audio_id="song",
+            source_audio_sha256=SHA_A,
+            audio=_oaf_prediction().audio,
+            descriptor=_oaf_descriptor(),
+            prediction_map_version=OAF_PREDICTION_MAP_ID,
+        )
+        is False
+    )
+
+
+def test_prediction_artifact_matches_audio_rejects_non_canonical_audio() -> None:
+    artifact = _oaf_artifact()
+    prediction = artifact.prediction
+    assert (
+        prediction_artifact_matches_audio(
+            artifact,
+            source_audio_id=prediction.audio.source_audio_id,
+            source_audio_sha256=prediction.audio.source_audio_sha256,
+            audio="not-audio",  # type: ignore[arg-type]
+            descriptor=prediction.descriptor,
+            prediction_map_version=OAF_PREDICTION_MAP_ID,
+        )
+        is False
+    )
+
+
+def test_prediction_artifact_matches_audio_rejects_empty_string_args() -> None:
+    artifact = _oaf_artifact()
+    prediction = artifact.prediction
+    assert (
+        prediction_artifact_matches_audio(
+            artifact,
+            source_audio_id="",
+            source_audio_sha256=prediction.audio.source_audio_sha256,
+            audio=prediction.audio,
+            descriptor=prediction.descriptor,
+            prediction_map_version=OAF_PREDICTION_MAP_ID,
+        )
+        is False
+    )
+
+
+def test_prediction_artifact_matches_run_row_returns_true_for_matching_row() -> None:
+    artifact = _oaf_artifact()
+    prediction = artifact.prediction
+    row = {
+        "prediction_artifact_sha256": artifact.artifact_sha256,
+        "source_audio_id": prediction.audio.source_audio_id,
+        "source_audio_sha256": prediction.audio.source_audio_sha256,
+        "input_audio_sha256": prediction.audio.input_audio_sha256,
+        "input_view_id": prediction.audio.input_view_id,
+    }
+    assert (
+        prediction_artifact_matches_run_row(
+            artifact,
+            row,
+            expected_input_view_id=prediction.audio.input_view_id,
+        )
+        is True
+    )
+
+
+def test_prediction_artifact_matches_run_row_rejects_non_artifact() -> None:
+    assert (
+        prediction_artifact_matches_run_row(
+            "not-an-artifact",  # type: ignore[arg-type]
+            {"prediction_artifact_sha256": SHA_A},
+            expected_input_view_id="full-mix-v1",
+        )
+        is False
+    )
+
+
+def test_prediction_artifact_matches_run_row_rejects_non_mapping_row() -> None:
+    artifact = _oaf_artifact()
+    assert (
+        prediction_artifact_matches_run_row(
+            artifact,
+            "not-a-mapping",  # type: ignore[arg-type]
+            expected_input_view_id="full-mix-v1",
+        )
+        is False
+    )
+
+
+def test_prediction_artifact_matches_run_row_rejects_empty_expected_view_id() -> None:
+    artifact = _oaf_artifact()
+    row = {
+        "prediction_artifact_sha256": artifact.artifact_sha256,
+        "source_audio_id": "song",
+        "source_audio_sha256": SHA_A,
+        "input_audio_sha256": SHA_B,
+    }
+    assert (
+        prediction_artifact_matches_run_row(
+            artifact,
+            row,
+            expected_input_view_id="",
+        )
+        is False
+    )
+
+
+def test_prediction_artifact_matches_run_row_rejects_missing_string_values() -> None:
+    artifact = _oaf_artifact()
+    row = {
+        "prediction_artifact_sha256": artifact.artifact_sha256,
+        "source_audio_id": "song",
+        "source_audio_sha256": "",
+        "input_audio_sha256": SHA_B,
+    }
+    assert (
+        prediction_artifact_matches_run_row(
+            artifact,
+            row,
+            expected_input_view_id="full-mix-v1",
+        )
+        is False
+    )
+
+
+def test_prediction_artifact_matches_run_row_rejects_mismatched_view_id() -> None:
+    artifact = _oaf_artifact()
+    prediction = artifact.prediction
+    row = {
+        "prediction_artifact_sha256": artifact.artifact_sha256,
+        "source_audio_id": prediction.audio.source_audio_id,
+        "source_audio_sha256": prediction.audio.source_audio_sha256,
+        "input_audio_sha256": prediction.audio.input_audio_sha256,
+        "input_view_id": "other-view-v1",
+    }
+    assert (
+        prediction_artifact_matches_run_row(
+            artifact,
+            row,
+            expected_input_view_id=prediction.audio.input_view_id,
+        )
+        is False
+    )

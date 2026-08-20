@@ -641,3 +641,418 @@ def test_read_cohort_reports_rejects_inconsistent_per_song_class_set(
 
     with pytest.raises(ReportIntegrityError, match="inconsistent"):
         read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def _read_valid_reports(tmp_path: Path):
+    write_cohort_reports(_result(), tmp_path)
+    return read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def _load_summary(tmp_path: Path) -> dict:
+    return strict_json_loads((tmp_path / "summary.json").read_bytes(), require_canonical=True)
+
+
+def _save_summary(tmp_path: Path, summary: dict) -> None:
+    (tmp_path / "summary.json").write_bytes(canonical_json_bytes(summary))
+
+
+def test_published_metric_aliases(tmp_path: Path) -> None:
+    from src.benchmark.reports import PublishedMetric
+
+    metric = PublishedMetric(1, 2, 3, None, None, None)
+    assert metric.tp == 1
+    assert metric.fp == 2
+    assert metric.fn == 3
+
+
+def test_published_aggregate_class_summary_alias(tmp_path: Path) -> None:
+    from src.benchmark.reports import PublishedAggregateClass, PublishedMetric
+
+    metric = PublishedMetric(1, 2, 3, None, None, None)
+    row = PublishedAggregateClass("kick", metric, 5, 6)
+    assert row.summary is metric
+
+
+def test_published_song_row_aliases(tmp_path: Path) -> None:
+    reports = _read_valid_reports(tmp_path)
+    row = reports.songs[0]
+    assert row.tp == row.true_positives
+    assert row.fp == row.false_positives
+    assert row.fn == row.false_negatives
+
+
+def test_published_class_row_aliases(tmp_path: Path) -> None:
+    reports = _read_valid_reports(tmp_path)
+    row = reports.classes[0]
+    assert row.tp == row.true_positives
+    assert row.fp == row.false_positives
+    assert row.fn == row.false_negatives
+
+
+def test_read_cohort_reports_rejects_non_path_report_dir() -> None:
+    with pytest.raises(TypeError, match="report_dir must be a Path"):
+        read_cohort_reports("not a path", expected_identity=_identity())  # type: ignore[arg-type]
+
+
+def test_read_cohort_reports_rejects_non_cohort_identity(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="expected_identity must be CohortIdentity"):
+        read_cohort_reports(tmp_path, expected_identity="not identity")  # type: ignore[arg-type]
+
+
+def test_read_cohort_reports_rejects_invalid_summary_schema(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["schema"] = "crux.wrong/v1"
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="summary schema is invalid"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_summary_with_invalid_keys(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["extra"] = "bad"
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="invalid schema"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_non_object_summary(tmp_path: Path) -> None:
+    (tmp_path / "summary.json").write_bytes(canonical_json_bytes([1, 2, 3]))
+    with pytest.raises(ReportIntegrityError, match="must contain an object"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_empty_tolerances(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["tolerances_ms"] = []
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="tolerances_ms must be a nonempty array"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_unsorted_tolerances(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["tolerances_ms"] = [50, 50]
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="sorted and unique"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_aggregate_tolerance_mismatch(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["tolerances_ms"] = [99]
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="aggregate tolerances do not match"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_unbalanced_population(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["population"]["total_count"] = 99
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="population counts do not balance"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_reason_counts_not_object(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["population"]["reason_counts"] = "not an object"
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="reason_counts must be an object"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_invalid_failure_reason_in_population(
+    tmp_path: Path,
+) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["population"]["reason_counts"] = {"not_a_real_reason": 1}
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="invalid reason"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_reason_counts_mismatch_with_items(
+    tmp_path: Path,
+) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["population"]["reason_counts"] = {"prediction_missing": 99}
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="reason_counts does not match"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_aggregates_not_array(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["aggregates"] = "not an array"
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="aggregates must be an array"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_invalid_aggregate_mode(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["aggregates"][0]["mode"] = "sideways"
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="mode is invalid"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_duplicate_aggregate_key(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["aggregates"][1]["mode"] = "raw"
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="duplicate score key"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_per_class_not_array(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["aggregates"][0]["per_class"] = "not an array"
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="per_class must be an array"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_duplicate_aggregate_class(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    kick = summary["aggregates"][0]["per_class"][0]
+    summary["aggregates"][0]["per_class"] = [kick, kick]
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="duplicate common_class"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_metric_out_of_range(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["aggregates"][0]["event_micro"]["precision"] = 2
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="out of range"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_non_finite_metric(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["aggregates"][0]["event_micro"]["precision"] = "Infinity"
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="malformed"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_boolean_metric(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["aggregates"][0]["event_micro"]["tp"] = True
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="malformed"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_zero_tolerance(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["aggregates"][0]["tolerance_ms"] = 0
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="malformed"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_malformed_summary_identity(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["identity"]["scoring_version"] = "crux.wrong/v1"
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="summary identity is malformed"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_summary_identity_mismatch(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    summary = _load_summary(tmp_path)
+    summary["identity"]["cohort_id"] = "other-cohort"
+    _save_summary(tmp_path, summary)
+    with pytest.raises(ReportIntegrityError, match="summary identity mismatch"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_invalid_failure_reason_in_items(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "items.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    failed_row = next(line for line in lines[1:] if ",failed," in line)
+    failed_row = failed_row.replace("prediction_missing", "not_a_real_reason")
+    path.write_text("\n".join([lines[0], failed_row, *lines[2:]]) + "\n", encoding="utf-8")
+    with pytest.raises(ReportIntegrityError, match="invalid failure_reason"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_success_item_with_failure_reason(
+    tmp_path: Path,
+) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "items.csv"
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames
+        rows = list(reader)
+    for row in rows:
+        if row["status"] == "success":
+            row["failure_reason"] = "prediction_missing"
+            break
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    with pytest.raises(ReportIntegrityError, match="failure_reason"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_success_item_missing_prediction_coverage(
+    tmp_path: Path,
+) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "items.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    success_row = next(line for line in lines[1:] if ",success," in line)
+    # Blank out the prediction counts for a success row.
+    parts = success_row.split(",")
+    # prediction_native_event_count is index 10 in _ITEM_FIELDNAMES.
+    parts[10] = ""
+    path.write_text("\n".join([lines[0], ",".join(parts), *lines[2:]]) + "\n", encoding="utf-8")
+    with pytest.raises(ReportIntegrityError, match="missing prediction coverage"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_failed_item_with_invalid_reason(
+    tmp_path: Path,
+) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "items.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    failed_row = next(line for line in lines[1:] if ",failed," in line)
+    failed_row = failed_row.replace("prediction_missing", "explicitly_skipped")
+    path.write_text("\n".join([lines[0], failed_row, *lines[2:]]) + "\n", encoding="utf-8")
+    with pytest.raises(ReportIntegrityError, match="invalid failure_reason"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_failed_item_with_prediction_coverage(
+    tmp_path: Path,
+) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "items.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    failed_row = next(line for line in lines[1:] if ",failed," in line)
+    parts = failed_row.split(",")
+    # prediction_native_event_count is index 10; set a non-empty value.
+    parts[10] = "1"
+    path.write_text("\n".join([lines[0], ",".join(parts), *lines[2:]]) + "\n", encoding="utf-8")
+    with pytest.raises(ReportIntegrityError, match="contains prediction coverage"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_noncanonical_csv_int(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "per_song.csv"
+    content = path.read_text(encoding="utf-8")
+    assert ",50,raw," in content
+    path.write_text(content.replace(",50,raw,", ",050,raw,", 1), encoding="utf-8")
+    with pytest.raises(ReportIntegrityError, match="not canonical"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_negative_prediction_ratio(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "per_song.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    parts = lines[1].split(",")
+    # prediction_to_reference_ratio is field index 15 in _PER_SONG_FIELDNAMES.
+    parts[15] = "-1"
+    path.write_text("\n".join([lines[0], ",".join(parts), *lines[2:]]) + "\n", encoding="utf-8")
+    with pytest.raises(ReportIntegrityError, match="out of range"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_malformed_warnings(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "per_song.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    parts = lines[1].split(",")
+    # warnings is the last field in _PER_SONG_FIELDNAMES.
+    parts[-1] = "a||b"
+    path.write_text("\n".join([lines[0], ",".join(parts), *lines[2:]]) + "\n", encoding="utf-8")
+    with pytest.raises(ReportIntegrityError, match="malformed"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_malformed_simfile_id(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "per_song.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    parts = lines[1].split(",")
+    # simfile_id is field index 6 in _PER_SONG_FIELDNAMES.
+    parts[6] = "abc"
+    path.write_text("\n".join([lines[0], ",".join(parts), *lines[2:]]) + "\n", encoding="utf-8")
+    with pytest.raises(ReportIntegrityError, match="malformed"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_non_canonical_simfile_id(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "per_song.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    parts = lines[1].split(",")
+    parts[6] = "01"
+    path.write_text("\n".join([lines[0], ",".join(parts), *lines[2:]]) + "\n", encoding="utf-8")
+    with pytest.raises(ReportIntegrityError, match="malformed"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_invalid_status_in_items(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "items.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    success_row = next(line for line in lines[1:] if ",success," in line)
+    success_row = success_row.replace(",success,", ",bogus,", 1)
+    path.write_text("\n".join([lines[0], success_row, *lines[2:]]) + "\n", encoding="utf-8")
+    with pytest.raises(ReportIntegrityError, match="invalid status"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_nonascii_csv_int(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "per_song.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    parts = lines[1].split(",")
+    # tp is field index 9 in _PER_SONG_FIELDNAMES; inject whitespace padding.
+    parts[9] = " 5 "
+    path.write_text("\n".join([lines[0], ",".join(parts), *lines[2:]]) + "\n", encoding="utf-8")
+    with pytest.raises(ReportIntegrityError, match="malformed"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_empty_csv_int(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    path = tmp_path / "per_class.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    parts = lines[1].split(",")
+    # tp is field index 10 in _PER_CLASS_FIELDNAMES; blank it out.
+    parts[10] = ""
+    path.write_text("\n".join([lines[0], ",".join(parts), *lines[2:]]) + "\n", encoding="utf-8")
+    with pytest.raises(ReportIntegrityError, match="malformed"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
