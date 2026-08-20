@@ -960,6 +960,7 @@ def freeze_separator_runtime(
     policy = _SEPARATOR_POLICIES.get(separator_id)
     if policy is None:
         raise ValueError("separator_id is unsupported")
+    _require_revision(repository_revision)
 
     resolved_interpreter, interpreter_sha256 = _resolve_separator_interpreter(interpreter)
     environment = _run_separator_environment_probe(resolved_interpreter)
@@ -1002,14 +1003,20 @@ def freeze_separator_runtime(
     }
     lock_bytes = canonical_json_bytes(lock_payload, trailing_newline=True)
     environment_path = output.parent / "environment.json"
+    environment_preexisting = environment_path.exists()
     try:
         publish_immutable_file(environment_path, environment_bytes)
         publish_immutable_file(output, lock_bytes)
     except (ArtifactPublicationError, OSError, TypeError) as error:
-        try:
-            environment_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        # Only clean up environment.json when this invocation created it.
+        # publish_immutable_file treats identical existing bytes as reuse, so
+        # a pre-existing manifest must never be deleted when the lock publish
+        # conflicts — that would corrupt a previously valid runtime directory.
+        if not environment_preexisting:
+            try:
+                environment_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         raise SeparatorExecutionError(
             "separator_lock_publication_failed",
             "separator lock publication failed",

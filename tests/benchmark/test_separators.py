@@ -389,6 +389,80 @@ def test_freezer_rejects_relative_model_root_before_probe_or_publishing(
     assert not (lock_path.parent / "environment.json").exists()
 
 
+def test_freezer_rejects_invalid_repository_revision_before_probe_or_publishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interpreter, _ = _synthetic_environment(tmp_path)
+    model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    lock_path = tmp_path / "frozen" / "model.json"
+
+    def unexpected_probe(_interpreter: Path) -> object:
+        raise AssertionError("invalid revision must be rejected before probing")
+
+    monkeypatch.setattr(separators, "_run_separator_environment_probe", unexpected_probe)
+
+    with pytest.raises(SeparatorLockError, match="repository_revision"):
+        _freeze_separator_runtime(
+            separator_id=SPLEETER_SEPARATOR_ID,
+            interpreter=interpreter,
+            model_root=model_root,
+            repository_revision="not-a-sha",
+            output=lock_path,
+        )
+
+    assert not lock_path.exists()
+    assert not (lock_path.parent / "environment.json").exists()
+
+
+def test_freezer_preserves_preexisting_environment_on_lock_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interpreter, _ = _synthetic_environment(tmp_path)
+    model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    lock_path = tmp_path / "frozen" / "model.json"
+    environment_path = lock_path.parent / "environment.json"
+
+    # First freeze succeeds and publishes both files.
+    _freeze_separator_runtime(
+        separator_id=SPLEETER_SEPARATOR_ID,
+        interpreter=interpreter,
+        model_root=model_root,
+        repository_revision="a" * 40,
+        output=lock_path,
+    )
+    environment_bytes_before = environment_path.read_bytes()
+    lock_bytes_before = lock_path.read_bytes()
+
+    # Second freeze with a different revision reuses environment.json (identical
+    # bytes) but must conflict on model.json (different lock payload).  The
+    # pre-existing environment.json must survive the conflict.
+    real_publish = separators.publish_immutable_file
+
+    def conflict_on_lock(path: Path, content: bytes) -> object:
+        if path == lock_path and content != lock_bytes_before:
+            from src.benchmark.artifact_io import ArtifactPublicationError
+
+            raise ArtifactPublicationError("artifact already exists with different bytes")
+        return real_publish(path, content)
+
+    monkeypatch.setattr(separators, "publish_immutable_file", conflict_on_lock)
+
+    with pytest.raises(SeparatorExecutionError, match="separator_lock_publication_failed"):
+        _freeze_separator_runtime(
+            separator_id=SPLEETER_SEPARATOR_ID,
+            interpreter=interpreter,
+            model_root=model_root,
+            repository_revision="b" * 40,
+            output=lock_path,
+        )
+
+    assert environment_path.exists()
+    assert environment_path.read_bytes() == environment_bytes_before
+    assert lock_path.read_bytes() == lock_bytes_before
+
+
 @pytest.mark.parametrize(
     ("mutation", "expected_code"),
     [

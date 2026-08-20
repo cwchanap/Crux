@@ -49,6 +49,12 @@ _SEPARATOR_TARGETS = {
     "spleeter": ("spleeter4-drums-v1", "spleeter"),
     "demucs": ("htdemucs-drums-v1", "demucs"),
 }
+# Roots that are exclusively distribution-owned: every file in the tree must
+# appear in some distribution's RECORD.  All other roots (scripts, data,
+# stdlib, include, ...) may contain non-distribution files (venv-owned
+# activation scripts, the interpreter itself, standard-library modules) and
+# are verified by checking only the distribution-owned members.
+_EXCLUSIVE_ROOT_TAGS = frozenset({"purelib", "platlib"})
 _READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
 _DIRECTORY_FLAGS = _READ_FLAGS | getattr(os, "O_DIRECTORY", 0)
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", None)
@@ -185,6 +191,33 @@ def _validate_relative_path(value: object) -> tuple[str, ...]:
     if any(not part or part in (".", "..") for part in parts):
         raise _ProbeError("record path is not normalized")
     return parts
+
+
+def _validate_record_path(value: object) -> str:
+    """Validate one RECORD path, allowing installer cross-root references.
+
+    PyPA's RECORD specification permits paths relative to the directory
+    containing ``.dist-info``.  Installer-generated console-entry-point
+    wrappers are installed into the scheme's scripts directory, so their
+    RECORD paths legitimately contain ``..`` components to escape the
+    distribution root before landing in another installation root.  The
+    resolved location is validated against the installation roots in
+    ``_inventory_distribution``.
+    """
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise _ProbeError("record path is invalid")
+    if (
+        value.startswith(("/", "\\"))
+        or PurePosixPath(value).is_absolute()
+        or PureWindowsPath(value).is_absolute()
+        or PureWindowsPath(value).drive
+        or "\\" in value
+    ):
+        raise _ProbeError("record path is not relative")
+    parts = tuple(value.split("/"))
+    if any(not part or part == "." for part in parts):
+        raise _ProbeError("record path is not normalized")
+    return value
 
 
 def _relative_name(parts: tuple[str, ...]) -> str:
@@ -362,8 +395,7 @@ def _parse_record(content: bytes) -> list[str]:
         if len(row) != 3:
             raise _ProbeError("distribution RECORD row is malformed")
         path, _, _ = row
-        parts = _validate_relative_path(path)
-        normalized = _relative_name(parts)
+        normalized = _validate_record_path(path)
         if normalized in seen:
             raise _ProbeError("distribution RECORD contains duplicate paths")
         seen.add(normalized)
@@ -423,10 +455,15 @@ def _inventory_distribution(
     expected: set[tuple[str, str]] = set()
     expected_identities: dict[tuple[str, str], tuple[int, ...]] = {}
     for relative_name in rows:
-        parts = _validate_relative_path(relative_name)
-        if _is_bytecode(parts):
+        # RECORD paths may contain ".." to reference files outside the
+        # distribution root (e.g. console scripts in the scripts directory).
+        # Resolve the path against the distribution root without following
+        # symlinks, then validate the normalized result falls under one of
+        # the installation roots via _root_for_path.
+        record_parts = tuple(relative_name.split("/"))
+        if _is_bytecode(record_parts):
             continue
-        file_path = distribution_root.joinpath(*parts)
+        file_path = Path(os.path.normpath(os.fspath(distribution_root / relative_name)))
         root_tag, portable_path, portable_parts = _root_for_path(file_path, roots)
         key = (root_tag, portable_path)
         if key == (record_tag, record_name):
@@ -553,6 +590,54 @@ def _walk_tree(
         raise _ProbeError("installation tree is unavailable") from error
 
 
+def _verify_expected_files_in_shared_root(
+    root_descriptor: int,
+    root_identity: tuple[int, ...],
+    root_tag: str,
+    expected: set[tuple[str, str]],
+    expected_identities: dict[tuple[str, str], tuple[int, ...]],
+) -> set[tuple[str, str]]:
+    """Verify distribution-owned files in a shared root without walking it.
+
+    Shared roots (scripts, data, stdlib, ...) contain non-distribution files
+    (venv activation scripts, the interpreter, standard-library modules) that
+    must not be rejected.  Instead of walking the entire tree, verify only the
+    distribution-owned members: open each expected file relative to the root
+    descriptor, confirm it is regular, and check its identity matches the
+    inventory snapshot.
+    """
+    try:
+        before = os.fstat(root_descriptor)
+        _require_directory(before)
+        if _identity(before) != root_identity:
+            raise _ProbeError("installation tree directory changed")
+        observed: set[tuple[str, str]] = set()
+        for key in expected:
+            _, portable_path = key
+            parts = _validate_relative_path(portable_path)
+            file_descriptor = _open_relative(root_descriptor, parts)
+            try:
+                metadata = os.fstat(file_descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise _ProbeError("installation tree file is not regular")
+                if key in expected_identities and not _same_expected_identity(
+                    metadata,
+                    expected_identities[key],
+                ):
+                    raise _ProbeError("installation tree file changed")
+                observed.add(key)
+            finally:
+                os.close(file_descriptor)
+        after = os.fstat(root_descriptor)
+        if _identity(before) != _identity(after):
+            raise _ProbeError("installation tree changed while walking")
+        return observed
+    except (OSError, _ProbeError) as error:
+        if isinstance(error, _ProbeError):
+            raise
+        raise _ProbeError("installation tree is unavailable") from error
+
+
 def _python_version() -> str:
     version = sys.version_info
     return f"{version.major}.{version.minor}.{version.micro}"
@@ -636,13 +721,22 @@ def build_environment_manifest() -> dict[str, object]:
             raise _ProbeError("separator package version is malformed")
 
         for tag, expected in expected_by_root.items():
-            observed = _walk_tree(
-                root_descriptors[tag],
-                root_identities[tag],
-                tag,
-                expected,
-                expected_identities,
-            )
+            if tag in _EXCLUSIVE_ROOT_TAGS:
+                observed = _walk_tree(
+                    root_descriptors[tag],
+                    root_identities[tag],
+                    tag,
+                    expected,
+                    expected_identities,
+                )
+            else:
+                observed = _verify_expected_files_in_shared_root(
+                    root_descriptors[tag],
+                    root_identities[tag],
+                    tag,
+                    expected,
+                    expected_identities,
+                )
             if observed != expected:
                 raise _ProbeError("installation tree membership changed")
 
