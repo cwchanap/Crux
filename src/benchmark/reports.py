@@ -1316,6 +1316,14 @@ def read_cohort_reports(
     class_combo_keys = {(row.simfile_id, row.tolerance_ms, row.mode) for row in classes}
     if not class_combo_keys <= expected_song_keys:
         _report_error("per_class report contains an unexpected score combination")
+    # Every successful song has a complete per_song grid and non-empty
+    # reference events, so each expected (simfile_id, tolerance_ms, mode)
+    # combination must emit at least one per_class row.  A truncated CSV that
+    # drops every row for one combination would otherwise pass the subset
+    # check above and the per-song consistency check below, since the missing
+    # combination simply disappears from both groupings.
+    if not expected_song_keys <= class_combo_keys:
+        _report_error("per_class report is missing a score combination")
     per_combo_classes: dict[tuple[str, int, str], set[str]] = {}
     for row in classes:
         per_combo_classes.setdefault((row.simfile_id, row.tolerance_ms, row.mode), set()).add(
