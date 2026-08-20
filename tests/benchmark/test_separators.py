@@ -7,6 +7,7 @@ import os
 import shutil
 import signal
 import subprocess
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -461,6 +462,95 @@ def test_freezer_preserves_preexisting_environment_on_lock_conflict(
     assert environment_path.exists()
     assert environment_path.read_bytes() == environment_bytes_before
     assert lock_path.read_bytes() == lock_bytes_before
+
+
+def test_concurrent_freezes_same_env_different_revision_retain_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two concurrent freezes with the same env but different revisions must not
+    orphan the winning lock's companion manifest.
+
+    Without per-runtime publication serialization, both freezes observe
+    ``environment_preexisting == False``; the loser reuses the winner's
+    environment.json, conflicts on model.json, and then deletes the manifest it
+    does not own.  The coordinated publisher below forces that interleaving so
+    the regression is deterministic.
+    """
+    interpreter, _ = _synthetic_environment(tmp_path)
+    model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    lock_path = tmp_path / "frozen" / "model.json"
+    environment_path = lock_path.parent / "environment.json"
+
+    real_publish = separators.publish_immutable_file
+    env_first_done = threading.Event()
+    lock_first_done = threading.Event()
+    counter_lock = threading.Lock()
+    counters = {"environment": 0, "lock": 0}
+
+    def coordinated_publish(path: Path, content: bytes) -> object:
+        if path == environment_path:
+            with counter_lock:
+                counters["environment"] += 1
+                rank = counters["environment"]
+            if rank == 1:
+                result = real_publish(path, content)
+                env_first_done.set()
+                return result
+            env_first_done.wait(timeout=10)
+            return real_publish(path, content)
+        if path == lock_path:
+            with counter_lock:
+                counters["lock"] += 1
+                rank = counters["lock"]
+            if rank == 1:
+                result = real_publish(path, content)
+                lock_first_done.set()
+                return result
+            lock_first_done.wait(timeout=10)
+            return real_publish(path, content)
+        return real_publish(path, content)
+
+    monkeypatch.setattr(separators, "publish_immutable_file", coordinated_publish)
+
+    outcomes: dict[str, str] = {}
+
+    def freeze(revision: str) -> None:
+        try:
+            separators.freeze_separator_runtime(
+                separator_id=SPLEETER_SEPARATOR_ID,
+                interpreter=interpreter,
+                model_root=model_root,
+                repository_revision=revision,
+                output=lock_path,
+            )
+            outcomes[revision] = "success"
+        except Exception as error:  # noqa: BLE001
+            outcomes[revision] = type(error).__name__
+
+    revision_a = "a" * 40
+    revision_b = "b" * 40
+    thread_a = threading.Thread(target=freeze, args=(revision_a,), name="freeze-a")
+    thread_b = threading.Thread(target=freeze, args=(revision_b,), name="freeze-b")
+    thread_a.start()
+    thread_b.start()
+    thread_a.join(timeout=30)
+    thread_b.join(timeout=30)
+
+    # Exactly one freeze wins; the other conflicts on the lock payload.
+    winners = [rev for rev, outcome in outcomes.items() if outcome == "success"]
+    losers = [rev for rev, outcome in outcomes.items() if outcome != "success"]
+    assert len(winners) == 1, outcomes
+    assert len(losers) == 1, outcomes
+    assert outcomes[losers[0]] == "SeparatorExecutionError", outcomes
+
+    # The winning lock must retain its companion manifest.
+    assert lock_path.is_file(), "winning lock was not published"
+    assert environment_path.is_file(), "winning lock's companion manifest was deleted"
+    lock = separators.load_separator_lock(lock_path)
+    manifest = separators.load_separator_environment_manifest(lock_path, lock)
+    assert lock.repository_revision == winners[0]
+    assert manifest.sha256 == lock.environment_manifest_sha256
 
 
 @pytest.mark.parametrize(
