@@ -272,9 +272,7 @@ def _freeze_separator_runtime(
     repository_revision: str,
     output: Path,
 ) -> object:
-    from scripts import freeze_separator_runtime as freezer
-
-    implementation = getattr(freezer, "freeze_separator_runtime", None)
+    implementation = getattr(separators, "freeze_separator_runtime", None)
     assert callable(implementation), "freezer implementation is missing"
     has_model_root = "model_root" in inspect.signature(implementation).parameters
     assert has_model_root, "freezer must accept the policy-owned model root"
@@ -367,8 +365,6 @@ def test_freezer_rejects_relative_model_root_before_probe_or_publishing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from scripts import freeze_separator_runtime as freezer
-
     interpreter, _ = _synthetic_environment(tmp_path)
     model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
     relative_model_root = Path(os.path.relpath(model_root, Path.cwd()))
@@ -377,7 +373,7 @@ def test_freezer_rejects_relative_model_root_before_probe_or_publishing(
     def unexpected_probe(_interpreter: Path) -> object:
         raise AssertionError("relative model roots must be rejected before probing")
 
-    monkeypatch.setattr(freezer, "_run_separator_environment_probe", unexpected_probe)
+    monkeypatch.setattr(separators, "_run_separator_environment_probe", unexpected_probe)
 
     with pytest.raises(SeparatorExecutionError) as raised:
         _freeze_separator_runtime(
@@ -457,7 +453,7 @@ def test_attest_translates_synthetic_mismatches_to_closed_codes(
 def test_freezer_cli_requires_model_root_and_rejects_model_file(
     tmp_path: Path,
 ) -> None:
-    from scripts import freeze_separator_runtime as freezer
+    from src.cli import freeze_separator_runtime as cli
 
     interpreter, _ = _synthetic_environment(tmp_path)
     model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
@@ -475,12 +471,12 @@ def test_freezer_cli_requires_model_root_and_rejects_model_file(
         str(lock_path),
     ]
 
-    result = freezer.main(arguments)
+    result = cli.main(arguments)
     assert result == 0
     with pytest.raises(SystemExit):
-        freezer._build_parser().parse_args(arguments + ["--model-file", "weights.bin=x"])
+        cli._build_parser().parse_args(arguments + ["--model-file", "weights.bin=x"])
     with pytest.raises(SystemExit):
-        freezer._build_parser().parse_args(arguments + ["--environment", "environment.json"])
+        cli._build_parser().parse_args(arguments + ["--environment", "environment.json"])
 
 
 class _FakePopen:

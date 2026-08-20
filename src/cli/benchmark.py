@@ -1478,8 +1478,10 @@ def finalize_oaf_separation_pilot_command(
             decision=decision,
             rationale=rationale,
         )
-    except (TypeError, ValueError):
-        outcome = FinalizeSeparationPilotOutcome(exit_code=2, manifest=None)
+    except (TypeError, ValueError) as error:
+        outcome = FinalizeSeparationPilotOutcome(
+            exit_code=2, manifest=None, failure_reason=str(error)
+        )
     else:
         outcome = finalize_separation_pilot(request)
 
@@ -1491,6 +1493,7 @@ def finalize_oaf_separation_pilot_command(
         "exit_code": exit_code,
         "manifest_path": None if manifest is None else str(manifest.path),
         "manifest_sha256": None if manifest is None else manifest.manifest_sha256,
+        "failure_reason": outcome.failure_reason,
     }
     click.echo(canonical_json_bytes(payload).decode("utf-8"))
     if exit_code:

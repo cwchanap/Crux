@@ -679,7 +679,9 @@ def test_load_evidence_rejects_population_mismatch(tmp_path: Path) -> None:
     )
     _reports(run.parent, _COHORT, _MODEL, _MODEL_LOCK, _MAP, precision="0.5", item_ids=(1, 2))
     _write_items(run.parent / "reports", [_items_row(simfile_id="1")])
-    with pytest.raises(ComparisonIntegrityError, match="population does not match"):
+    with pytest.raises(
+        ComparisonIntegrityError, match="summary population does not match items report"
+    ):
         _load_evidence(run)
 
 

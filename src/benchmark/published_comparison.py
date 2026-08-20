@@ -168,7 +168,9 @@ def csv_decimal(value: Decimal | None) -> str:
         return ""
     if value.is_zero():
         return "0"
-    rendered = format(value, "f").rstrip("0").rstrip(".")
+    rendered = format(value, "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
     return rendered or "0"
 
 
@@ -360,21 +362,41 @@ def runtime(snapshot: Mapping[str, object]) -> dict[str, object]:
     return {field_name: snapshot[field_name] for field_name in fields if field_name in snapshot}
 
 
+_MISSING = object()
+
+
+def _manifest_attr(manifest: object, field_name: str) -> object:
+    value = getattr(manifest, field_name, _MISSING)
+    if value is _MISSING:
+        _fail(f"manifest is missing required field {field_name!r}")
+    return value
+
+
+def _identity_attr(identity: object, field_name: str) -> object:
+    value = getattr(identity, field_name, _MISSING)
+    if value is _MISSING:
+        _fail(f"identity is missing required field {field_name!r}")
+    return value
+
+
 def _identity_values(identity: object) -> dict[str, object]:
     report_values = getattr(identity, "report_values", None)
     if callable(report_values):
         return dict(report_values())
-    return {
-        field_name: getattr(identity, field_name)
-        for field_name in (
-            "cohort_id",
-            "model_id",
-            "model_lock_sha256",
-            "prediction_map_version",
-            "input_view_id",
-            "scoring_version",
-        )
-    }
+    values: dict[str, object] = {}
+    for field_name in (
+        "cohort_id",
+        "model_id",
+        "model_lock_sha256",
+        "prediction_map_version",
+        "input_view_id",
+        "scoring_version",
+    ):
+        try:
+            values[field_name] = getattr(identity, field_name)
+        except AttributeError:
+            _fail(f"identity is missing required field {field_name!r}")
+    return values
 
 
 def comparison_summary(
@@ -399,11 +421,11 @@ def comparison_summary(
     right_label = _label(right_label, "right_label")
     if identity is None:
         summary_identity: Mapping[str, object] = {
-            "reference_manifest_sha256": getattr(reference_manifest, "manifest_sha256"),
-            "reference_manifest_version": getattr(reference_manifest, "corpus_version"),
-            "reference_timing_manifest_sha256": getattr(timing_manifest, "manifest_sha256"),
-            "reference_timing_version": getattr(timing_manifest, "corpus_version"),
-            "input_view_id": getattr(left.identity, "input_view_id"),
+            "reference_manifest_sha256": _manifest_attr(reference_manifest, "manifest_sha256"),
+            "reference_manifest_version": _manifest_attr(reference_manifest, "corpus_version"),
+            "reference_timing_manifest_sha256": _manifest_attr(timing_manifest, "manifest_sha256"),
+            "reference_timing_version": _manifest_attr(timing_manifest, "corpus_version"),
+            "input_view_id": _identity_attr(left.identity, "input_view_id"),
         }
     elif isinstance(identity, Mapping):
         summary_identity = dict(identity)
@@ -417,10 +439,10 @@ def comparison_summary(
             if subset_path is None
             else {
                 "path": str(subset_path),
-                "manifest_sha256": getattr(subset_manifest, "manifest_sha256"),
-                "corpus_version": getattr(subset_manifest, "corpus_version"),
-                "review_policy_version": getattr(subset_manifest, "review_policy_version"),
-                "review_ledger_sha256": getattr(subset_manifest, "review_ledger_sha256"),
+                "manifest_sha256": _manifest_attr(subset_manifest, "manifest_sha256"),
+                "corpus_version": _manifest_attr(subset_manifest, "corpus_version"),
+                "review_policy_version": _manifest_attr(subset_manifest, "review_policy_version"),
+                "review_ledger_sha256": _manifest_attr(subset_manifest, "review_ledger_sha256"),
             }
         ),
         "models": {
@@ -467,28 +489,35 @@ def write_markdown(
     path: Path,
     summary: Mapping[str, object],
     *,
-    title: str = COMPARISON_TITLE,
+    title: str | None = COMPARISON_TITLE,
     left_label: str = "oaf",
     right_label: str = "muscriptor",
 ) -> None:
-    title = _label(title, "title")
     left_label = _label(left_label, "left_label")
     right_label = _label(right_label, "right_label")
+    if title is not None:
+        title = _label(title, "title")
     identity = summary["identity"]
     models = summary["models"]
     pairing = summary["pairing"]
     aggregates = summary["aggregates"]
-    assert isinstance(identity, Mapping)
-    assert isinstance(models, Mapping)
-    assert isinstance(pairing, Mapping)
-    assert isinstance(aggregates, Mapping)
+    if not isinstance(identity, Mapping):
+        _fail("comparison summary identity must be a mapping")
+    if not isinstance(models, Mapping):
+        _fail("comparison summary models must be a mapping")
+    if not isinstance(pairing, Mapping):
+        _fail("comparison summary pairing must be a mapping")
+    if not isinstance(aggregates, Mapping):
+        _fail("comparison summary aggregates must be a mapping")
     show_reason_counts = any(
         isinstance(models.get(model_name), Mapping) and "reason_counts" in models[model_name]
         for model_name in (left_label, right_label)
     )
+    header: list[str] = []
+    if title is not None:
+        header = [f"# {title}", ""]
     lines = [
-        f"# {title}",
-        "",
+        *header,
         "## Identity",
         "",
         *[f"- {field_name}: `{identity[field_name]}`" for field_name in identity],

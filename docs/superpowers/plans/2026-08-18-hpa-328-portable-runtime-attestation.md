@@ -37,7 +37,8 @@
 | --- | --- |
 | src/benchmark/separators.py | v2 lock and sibling-manifest types/loaders, policy-owned model inventory, environment-probe bridge, typed runtime, attestation, launch environment, and separator process invocation. |
 | src/benchmark/separator_environment_probe.py | Standalone stdlib-only child program that inventories the interpreter environment and prints canonical manifest JSON. |
-| scripts/freeze_separator_runtime.py | Freezes one supplied model root/interpreter into environment.json plus model.json, then round-trips through the shared attester. |
+| scripts/freeze_separator_runtime.py | Thin wrapper that delegates to `src/cli/freeze_separator_runtime.py` for backward-compatible direct invocation. |
+| src/cli/freeze_separator_runtime.py | CLI parser and error reporting for the freeze entry point; delegates to `src.benchmark.separators.freeze_separator_runtime`. |
 | src/benchmark/separation_pilot.py | Required model-root request fields, one-per-separator preflight, typed runtime handoff, fatal diagnostic carrier, and postflight restoration. |
 | src/cli/benchmark.py | Required model-root options and canonical outcome failure_code output. |
 | tests/benchmark/test_separators.py | Lock/companion/model-root/launch/freezer/attestation unit coverage using synthetic files and fake Popen. |

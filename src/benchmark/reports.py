@@ -836,7 +836,9 @@ def _csv_int(value: object, field: str, *, positive: bool = False) -> int:
 def _canonical_csv_decimal(value: Decimal) -> str:
     if value.is_zero():
         return "0"
-    rendered = format(value, "f").rstrip("0").rstrip(".")
+    rendered = format(value, "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
     return rendered or "0"
 
 
@@ -1088,6 +1090,9 @@ def _parse_item_rows(
             )
         )
         native_class_counts = _parse_native_class_counts(row["prediction_native_class_counts"])
+        prediction_mapping_coverage = _bounded_csv_metric(
+            row["prediction_mapping_coverage"], "prediction_mapping_coverage"
+        )
         if status == "success":
             if failure_reason:
                 _report_error("successful item contains a failure_reason")
@@ -1106,7 +1111,11 @@ def _parse_item_rows(
             }[status]
             if failure_reason not in expected_reason:
                 _report_error(f"{status} item has an invalid failure_reason")
-            if any(value is not None for value in prediction_counts) or native_class_counts:
+            if (
+                any(value is not None for value in prediction_counts)
+                or native_class_counts
+                or prediction_mapping_coverage is not None
+            ):
                 _report_error(f"{status} item contains prediction coverage")
         parsed.append(
             PublishedItemRow(
@@ -1123,9 +1132,7 @@ def _parse_item_rows(
                 prediction_native_event_count=prediction_counts[0],
                 prediction_mapped_event_count=prediction_counts[1],
                 prediction_unmapped_event_count=prediction_counts[2],
-                prediction_mapping_coverage=_bounded_csv_metric(
-                    row["prediction_mapping_coverage"], "prediction_mapping_coverage"
-                ),
+                prediction_mapping_coverage=prediction_mapping_coverage,
                 prediction_native_class_counts=native_class_counts,
             )
         )
@@ -1296,6 +1303,19 @@ def read_cohort_reports(
     actual_song_keys = {(row.simfile_id, row.tolerance_ms, row.mode) for row in songs}
     if actual_song_keys != expected_song_keys:
         _report_error("per_song score grid is incomplete")
+    common_classes = {cls.common_class for aggregate in aggregates for cls in aggregate.per_class}
+    expected_class_keys = {
+        (simfile_id, tolerance_ms, mode, common_class)
+        for simfile_id in successful_ids
+        for tolerance_ms in parsed_tolerances
+        for mode in _MODES
+        for common_class in common_classes
+    }
+    actual_class_keys = {
+        (row.simfile_id, row.tolerance_ms, row.mode, row.common_class) for row in classes
+    }
+    if actual_class_keys != expected_class_keys:
+        _report_error("per_class score grid is incomplete")
     return PublishedCohortReports(
         identity=identity,
         population=population,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -263,7 +264,7 @@ def _expected_cohort_id(
         run_id = snapshot.get("run_id")
         if not isinstance(run_id, str) or not run_id:
             raise ComparisonIntegrityError("separation run identity is unavailable")
-        payload = {"parent_oaf_run_id": run_id, "input_view_id": _VIEW_IDS[view_name]}
+        payload = {"separation_run_id": run_id, "input_view_id": _VIEW_IDS[view_name]}
     return sha256(canonical_json_bytes(payload)).hexdigest()
 
 
@@ -382,9 +383,9 @@ def _finite_seconds(value: object) -> Decimal:
     return parsed
 
 
-def _resolve_artifact(value: object, *, roots: tuple[Path, ...]) -> Path | None:
+def _resolve_artifact(value: object, *, roots: tuple[Path, ...]) -> Path:
     if not isinstance(value, str) or not value:
-        return None
+        raise ComparisonIntegrityError("retained artifact path is unavailable")
     raw = Path(value)
     if raw.is_absolute():
         return raw
@@ -392,16 +393,17 @@ def _resolve_artifact(value: object, *, roots: tuple[Path, ...]) -> Path | None:
         candidate = root / raw
         if candidate.exists():
             return candidate
-    return None
+    raise ComparisonIntegrityError(f"retained artifact is unresolved: {value}")
 
 
-def _artifact_bytes(path: Path | None) -> int:
-    if path is None:
-        return 0
+def _artifact_bytes(path: Path) -> int:
     try:
-        return len(read_regular_file_no_follow(path))
-    except (OSError, TypeError) as error:
+        metadata = os.stat(path, follow_symlinks=False)
+    except (OSError, ValueError) as error:
         raise ComparisonIntegrityError(f"retained artifact is unreadable: {path}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ComparisonIntegrityError(f"retained artifact is not a regular file: {path}")
+    return metadata.st_size
 
 
 def _report_bytes(report_dir: Path) -> int:
@@ -643,12 +645,12 @@ def _write_outputs(
             write_markdown(
                 pair_markdown,
                 pair["base"],  # type: ignore[arg-type]
-                title=f"Full Mix vs {view_name.title()} Published Comparison",
+                title=None,
                 left_label="full_mix",
                 right_label=view_name,
             )
             generated = pair_markdown.read_text(encoding="utf-8").splitlines()
-            lines.extend(["", f"## Full Mix vs {view_name.title()}", "", *generated[2:]])
+            lines.extend(["", f"## Full Mix vs {view_name.title()}", "", *generated])
             _markdown_evidence(
                 lines,
                 view_name,
