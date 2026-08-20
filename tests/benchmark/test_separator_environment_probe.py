@@ -6,8 +6,10 @@ import hashlib
 import importlib.util
 import json
 import os
+import runpy
 import shutil
 import subprocess
+import sys
 import venv
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -586,3 +588,1017 @@ def test_inventory_carries_first_hash_identity_to_tree_walk(
     finally:
         for descriptor in descriptors.values():
             os.close(descriptor)
+
+
+class _FakeImplementation:
+    """Stand-in for ``sys.implementation`` with controllable attributes."""
+
+    def __init__(self, name: str, cache_tag: str | None = None) -> None:
+        self.name = name
+        self.cache_tag = cache_tag
+
+
+class _FakeDistribution:
+    """Minimal stand-in for ``importlib.metadata.Distribution``."""
+
+    def __init__(
+        self,
+        *,
+        dist_path: Path | None,
+        files: object,
+        locate_file: object,
+        metadata: dict[str, str] | None = None,
+        version: str = "2.4.2",
+        name: str = "spleeter",
+    ) -> None:
+        self._path = dist_path
+        self.files = files
+        self._locate_file = locate_file
+        self._metadata = metadata if metadata is not None else {"Name": name}
+        self._version = version
+        self._name = name
+
+    @property
+    def metadata(self) -> dict[str, str]:
+        return self._metadata
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def version(self) -> str:
+        return self._version
+
+    def locate_file(self, record: object) -> object:
+        return self._locate_file(record)
+
+
+def _open_roots(probe, roots: dict[str, Path]) -> tuple[dict[str, int], dict[str, tuple[int, ...]]]:
+    descriptors: dict[str, int] = {}
+    identities: dict[str, tuple[int, ...]] = {}
+    for tag, path in roots.items():
+        descriptor, identity = probe._open_root(path)
+        descriptors[tag] = descriptor
+        identities[tag] = identity
+    return descriptors, identities
+
+
+def test_canonical_json_bytes_appends_trailing_newline() -> None:
+    probe = _load_probe_module()
+    assert probe.canonical_json_bytes({"a": 1}, trailing_newline=True) == b'{"a":1}\n'
+
+
+def test_canonical_json_bytes_rejects_non_serializable() -> None:
+    probe = _load_probe_module()
+    with pytest.raises(probe._ProbeError):
+        probe.canonical_json_bytes({object()})
+
+
+def test_require_regular_rejects_directory(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    with pytest.raises(probe._ProbeError):
+        probe._require_regular(os.stat(tmp_path))
+
+
+def test_require_directory_rejects_regular_file(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    file_path = tmp_path / "file"
+    file_path.write_text("x", encoding="utf-8")
+    with pytest.raises(probe._ProbeError):
+        probe._require_directory(os.stat(file_path))
+
+
+def test_require_dir_fd_support_rejects_unsupported(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe = _load_probe_module()
+    monkeypatch.setattr(probe.os, "supports_dir_fd", set())
+    with pytest.raises(probe._ProbeError):
+        probe._require_dir_fd_support()
+
+
+def test_read_hash_fd_rejects_changed_file_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _load_probe_module()
+    file_path = tmp_path / "data.bin"
+    file_path.write_bytes(b"payload")
+    file_descriptor = os.open(file_path, os.O_RDONLY)
+    real_identity = probe._identity
+    calls = 0
+
+    def shifting_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        nonlocal calls
+        calls += 1
+        base = real_identity(metadata)
+        return (calls, *base[1:])
+
+    monkeypatch.setattr(probe, "_identity", shifting_identity)
+    try:
+        with pytest.raises(probe._ProbeError):
+            probe._read_hash_fd(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+
+
+def test_open_root_closes_descriptor_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _load_probe_module()
+    target = tmp_path / "realdir"
+    target.mkdir()
+    real_close = os.close
+
+    def failing_fstat(fd: int) -> os.stat_result:
+        raise OSError("boom")
+
+    def failing_close(fd: int) -> None:
+        monkeypatch.setattr(probe.os, "close", real_close)
+        raise OSError("close boom")
+
+    monkeypatch.setattr(probe.os, "fstat", failing_fstat)
+    monkeypatch.setattr(probe.os, "close", failing_close)
+    with pytest.raises(probe._ProbeError):
+        probe._open_root(target)
+
+
+def test_open_relative_rejects_empty_parts(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "root"
+    root.mkdir()
+    file_descriptor = os.open(root, os.O_RDONLY)
+    try:
+        with pytest.raises(probe._ProbeError):
+            probe._open_relative(file_descriptor, ())
+    finally:
+        os.close(file_descriptor)
+
+
+def test_open_relative_wraps_missing_file_error(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "root"
+    root.mkdir()
+    file_descriptor = os.open(root, os.O_RDONLY)
+    try:
+        with pytest.raises(probe._ProbeError):
+            probe._open_relative(file_descriptor, ("missing",))
+    finally:
+        os.close(file_descriptor)
+
+
+def test_open_relative_closes_descriptor_when_intermediate_not_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "root"
+    (root / "subdir").mkdir(parents=True)
+    file_descriptor = os.open(root, os.O_RDONLY)
+    monkeypatch.setattr(
+        probe,
+        "_require_directory",
+        lambda metadata: (_ for _ in ()).throw(probe._ProbeError("not a dir")),
+    )
+    try:
+        with pytest.raises(probe._ProbeError):
+            probe._open_relative(file_descriptor, ("subdir", "file"))
+    finally:
+        os.close(file_descriptor)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ("", 123, "a\x00b", "/abs", "\\win", "a/../b", "a/./b", "a//b"),
+)
+def test_validate_relative_path_rejects_invalid(value: object) -> None:
+    probe = _load_probe_module()
+    with pytest.raises(probe._ProbeError):
+        probe._validate_relative_path(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ("", 123, "a\x00b", "/abs", "\\win", "a/./b", "a//b"),
+)
+def test_validate_record_path_rejects_invalid(value: object) -> None:
+    probe = _load_probe_module()
+    with pytest.raises(probe._ProbeError):
+        probe._validate_record_path(value)
+
+
+def test_validate_record_path_allows_parent_references() -> None:
+    probe = _load_probe_module()
+    assert probe._validate_record_path("a/../b") == "a/../b"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ("", 123, "!bad", "-abc", "abc-", "a!b", "A-B.C_D", "ABC"),
+)
+def test_normalize_distribution_name_branches(value: object) -> None:
+    probe = _load_probe_module()
+    if value in ("", 123, "!bad", "-abc", "abc-", "a!b"):
+        with pytest.raises(probe._ProbeError):
+            probe._normalize_distribution_name(value)
+    else:
+        result = probe._normalize_distribution_name(value)
+        assert isinstance(result, str) and result
+
+
+def test_normalize_distribution_name_lowercases_and_normalizes_separators() -> None:
+    probe = _load_probe_module()
+    assert probe._normalize_distribution_name("A-B.C_D") == "a-b-c-d"
+    assert probe._normalize_distribution_name("ABC") == "abc"
+
+
+def test_resolved_virtual_environment_returns_none_without_pyvenv_cfg(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    interpreter = tmp_path / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    assert probe._resolved_virtual_environment(interpreter) is None
+
+
+def test_resolved_virtual_environment_returns_none_for_non_regular_cfg(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    environment = tmp_path / "venv"
+    (environment / "bin").mkdir(parents=True)
+    (environment / "pyvenv.cfg").mkdir()
+    interpreter = environment / "bin" / "python"
+    assert probe._resolved_virtual_environment(interpreter) is None
+
+
+def test_configured_paths_wraps_sysconfig_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe = _load_probe_module()
+
+    def boom() -> dict[str, str]:
+        raise KeyError("nope")
+
+    monkeypatch.setattr(probe.sysconfig, "get_paths", boom)
+    with pytest.raises(probe._ProbeError):
+        probe._configured_paths(Path("/x/python"))
+
+
+def test_configured_paths_overrides_windows_venv_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interpreter, _ = _synthetic_environment(tmp_path)
+    probe = _load_probe_module()
+    monkeypatch.setattr(probe.os, "name", "nt")
+    configured = probe._configured_paths(interpreter)
+    environment = interpreter.parent.parent
+    assert configured["platstdlib"] == os.fspath(environment / "Lib")
+    assert configured["scripts"] == os.fspath(environment / "Scripts")
+
+
+def test_canonical_root_paths_rejects_missing_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _load_probe_module()
+    configuration = _synthetic_root_configuration(tmp_path)
+    del configuration["scripts"]
+    monkeypatch.setattr(probe, "_configured_paths", lambda _: configuration)
+    with pytest.raises(probe._ProbeError):
+        probe._canonical_root_paths(Path("/synthetic/python"))
+
+
+def test_canonical_root_paths_rejects_empty_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _load_probe_module()
+    configuration = _synthetic_root_configuration(tmp_path)
+    configuration["scripts"] = ""
+    monkeypatch.setattr(probe, "_configured_paths", lambda _: configuration)
+    with pytest.raises(probe._ProbeError):
+        probe._canonical_root_paths(Path("/synthetic/python"))
+
+
+def test_canonical_root_paths_rejects_relative_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _load_probe_module()
+    configuration = _synthetic_root_configuration(tmp_path)
+    configuration["scripts"] = "relative/path"
+    monkeypatch.setattr(probe, "_configured_paths", lambda _: configuration)
+    with pytest.raises(probe._ProbeError):
+        probe._canonical_root_paths(Path("/synthetic/python"))
+
+
+def test_root_for_path_rejects_outside_roots(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with pytest.raises(probe._ProbeError):
+        probe._root_for_path(outside, {"purelib": root})
+
+
+def test_root_for_path_rejects_ambiguous_root(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "root"
+    (root / "sub").mkdir(parents=True)
+    with pytest.raises(probe._ProbeError):
+        probe._root_for_path(root / "sub", {"a": root, "b": root})
+
+
+def test_hash_relative_file_wraps_open_error(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "root"
+    root.mkdir()
+    file_descriptor = os.open(root, os.O_RDONLY)
+    try:
+        with pytest.raises(probe._ProbeError):
+            probe._hash_relative_file(file_descriptor, ("missing",))
+    finally:
+        os.close(file_descriptor)
+
+
+def test_hash_absolute_file_returns_digest(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    file_path = tmp_path / "interp"
+    file_path.write_bytes(b"binary")
+    assert probe._hash_absolute_file(file_path) == hashlib.sha256(b"binary").hexdigest()
+
+
+def test_hash_absolute_file_wraps_open_error(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    with pytest.raises(probe._ProbeError):
+        probe._hash_absolute_file(tmp_path / "missing")
+
+
+def test_hash_absolute_file_wraps_read_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _load_probe_module()
+    file_path = tmp_path / "interp"
+    file_path.write_bytes(b"binary")
+
+    def boom(fd: int, *, capture: bool = False) -> tuple[bytes, int, str, tuple[int, ...]]:
+        raise probe._ProbeError("read boom")
+
+    monkeypatch.setattr(probe, "_read_hash_fd", boom)
+    with pytest.raises(probe._ProbeError):
+        probe._hash_absolute_file(file_path)
+
+
+def test_parse_record_rejects_malformed_encoding() -> None:
+    probe = _load_probe_module()
+    with pytest.raises(probe._ProbeError):
+        probe._parse_record(b"\xff\xfe invalid utf8")
+
+
+def test_parse_record_rejects_empty() -> None:
+    probe = _load_probe_module()
+    with pytest.raises(probe._ProbeError):
+        probe._parse_record(b"")
+
+
+def test_parse_record_rejects_malformed_row() -> None:
+    probe = _load_probe_module()
+    with pytest.raises(probe._ProbeError):
+        probe._parse_record(b"a,b\n")
+
+
+def test_parse_record_rejects_duplicate_paths() -> None:
+    probe = _load_probe_module()
+    with pytest.raises(probe._ProbeError):
+        probe._parse_record(b"a,b,c\na,b,c\n")
+
+
+def test_record_path_for_distribution_uses_files_candidates(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    dist_info = tmp_path / "pkg-1.0.dist-info"
+    dist_info.mkdir()
+    record = dist_info / "RECORD"
+    record.write_text("", encoding="utf-8")
+    distribution = _FakeDistribution(
+        dist_path=None,
+        files=[PurePosixPath("pkg-1.0.dist-info/RECORD")],
+        locate_file=lambda r: record,
+    )
+    record_path, root = probe._record_path_for_distribution(distribution)
+    assert record_path == record
+    assert root == dist_info.parent
+
+
+def test_record_path_for_distribution_rejects_ambiguous_candidates(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    distribution = _FakeDistribution(
+        dist_path=None,
+        files=[
+            PurePosixPath("a.dist-info/RECORD"),
+            PurePosixPath("b.dist-info/RECORD"),
+        ],
+        locate_file=lambda r: tmp_path / "RECORD",
+    )
+    with pytest.raises(probe._ProbeError):
+        probe._record_path_for_distribution(distribution)
+
+
+def test_record_path_for_distribution_wraps_locate_file_error(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    distribution = _FakeDistribution(
+        dist_path=None,
+        files=[PurePosixPath("pkg-1.0.dist-info/RECORD")],
+        locate_file=lambda r: (_ for _ in ()).throw(TypeError("boom")),
+    )
+    with pytest.raises(probe._ProbeError):
+        probe._record_path_for_distribution(distribution)
+
+
+def test_record_path_for_distribution_rejects_non_dist_info_parent(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    other = tmp_path / "not-dist"
+    other.mkdir()
+    distribution = _FakeDistribution(dist_path=other, files=None, locate_file=None)
+    with pytest.raises(probe._ProbeError):
+        probe._record_path_for_distribution(distribution)
+
+
+def test_inventory_distribution_rejects_malformed_name(tmp_path: Path) -> None:
+    interpreter, purelib = _synthetic_environment(tmp_path)
+    probe = _load_probe_module()
+    roots = probe._canonical_root_paths(interpreter)
+    descriptors, _ = _open_roots(probe, roots)
+    try:
+        dist_info = purelib / "spleeter-2.4.2.dist-info"
+        distribution = _FakeDistribution(
+            dist_path=dist_info,
+            files=None,
+            locate_file=None,
+            metadata={"Name": "!invalid!"},
+        )
+        with pytest.raises(probe._ProbeError):
+            probe._inventory_distribution(distribution, roots, descriptors)
+    finally:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+
+
+def test_inventory_distribution_rejects_malformed_version(tmp_path: Path) -> None:
+    interpreter, purelib = _synthetic_environment(tmp_path)
+    probe = _load_probe_module()
+    roots = probe._canonical_root_paths(interpreter)
+    descriptors, _ = _open_roots(probe, roots)
+    try:
+        dist_info = purelib / "spleeter-2.4.2.dist-info"
+        distribution = _FakeDistribution(
+            dist_path=dist_info,
+            files=None,
+            locate_file=None,
+            version="",
+        )
+        with pytest.raises(probe._ProbeError):
+            probe._inventory_distribution(distribution, roots, descriptors)
+    finally:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+
+
+def test_inventory_distribution_skips_bytecode_records(tmp_path: Path) -> None:
+    interpreter, purelib = _synthetic_environment(tmp_path)
+    probe = _load_probe_module()
+    roots = probe._canonical_root_paths(interpreter)
+    descriptors, _ = _open_roots(probe, roots)
+    try:
+        (purelib / "spleeter" / "module.pyc").write_bytes(b"bytecode")
+        record_path = purelib / "spleeter-2.4.2.dist-info" / "RECORD"
+        rows = list(csv.reader(record_path.read_text(encoding="utf-8").splitlines()))
+        rows.insert(1, ["spleeter/module.pyc", "", ""])
+        with record_path.open("w", encoding="utf-8", newline="") as stream:
+            csv.writer(stream, lineterminator="\n").writerows(rows)
+        distributions = list(probe.importlib.metadata.distributions(path=[str(purelib)]))
+        distribution = next(d for d in distributions if d.metadata["Name"] == "spleeter")
+        item, _, _ = probe._inventory_distribution(distribution, roots, descriptors)
+        paths = {file["path"] for file in item["files"]}
+        assert "spleeter/module.pyc" not in paths
+    finally:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+
+
+def test_inventory_distribution_rejects_duplicate_resolved_files(tmp_path: Path) -> None:
+    interpreter, purelib = _synthetic_environment(tmp_path)
+    probe = _load_probe_module()
+    roots = probe._canonical_root_paths(interpreter)
+    descriptors, _ = _open_roots(probe, roots)
+    try:
+        record_path = purelib / "spleeter-2.4.2.dist-info" / "RECORD"
+        rows = list(csv.reader(record_path.read_text(encoding="utf-8").splitlines()))
+        rows.insert(1, ["spleeter/sub/../__init__.py", "", ""])
+        with record_path.open("w", encoding="utf-8", newline="") as stream:
+            csv.writer(stream, lineterminator="\n").writerows(rows)
+        distributions = list(probe.importlib.metadata.distributions(path=[str(purelib)]))
+        distribution = next(d for d in distributions if d.metadata["Name"] == "spleeter")
+        with pytest.raises(probe._ProbeError):
+            probe._inventory_distribution(distribution, roots, descriptors)
+    finally:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+
+
+def test_inventory_distribution_adds_record_when_missing_from_rows(tmp_path: Path) -> None:
+    interpreter, purelib = _synthetic_environment(tmp_path)
+    probe = _load_probe_module()
+    roots = probe._canonical_root_paths(interpreter)
+    descriptors, _ = _open_roots(probe, roots)
+    try:
+        record_path = purelib / "spleeter-2.4.2.dist-info" / "RECORD"
+        rows = [
+            row
+            for row in csv.reader(record_path.read_text(encoding="utf-8").splitlines())
+            if row[0] != "spleeter-2.4.2.dist-info/RECORD"
+        ]
+        with record_path.open("w", encoding="utf-8", newline="") as stream:
+            csv.writer(stream, lineterminator="\n").writerows(rows)
+        distributions = list(probe.importlib.metadata.distributions(path=[str(purelib)]))
+        distribution = next(d for d in distributions if d.metadata["Name"] == "spleeter")
+        item, _, _ = probe._inventory_distribution(distribution, roots, descriptors)
+        paths = {file["path"] for file in item["files"]}
+        assert "spleeter-2.4.2.dist-info/RECORD" in paths
+    finally:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+
+
+def test_walk_tree_rejects_changed_root_identity(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "root"
+    root.mkdir()
+    file_descriptor = os.open(root, os.O_RDONLY)
+    try:
+        with pytest.raises(probe._ProbeError):
+            probe._walk_tree(file_descriptor, (999, 999, 0, 0, 0, 0), "purelib", set(), {})
+    finally:
+        os.close(file_descriptor)
+
+
+def test_walk_tree_rejects_symlink(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "root"
+    root.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    (root / "link").symlink_to(target)
+    file_descriptor = os.open(root, os.O_RDONLY)
+    try:
+        identity = probe._identity(os.fstat(file_descriptor))
+        with pytest.raises(probe._ProbeError):
+            probe._walk_tree(file_descriptor, identity, "purelib", set(), {})
+    finally:
+        os.close(file_descriptor)
+
+
+def test_walk_tree_skips_pycache_directory(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "__pycache__").mkdir()
+    (root / "real.py").write_text("x = 1\n", encoding="utf-8")
+    file_descriptor = os.open(root, os.O_RDONLY)
+    try:
+        identity = probe._identity(os.fstat(file_descriptor))
+        key = ("purelib", "real.py")
+        observed = probe._walk_tree(
+            file_descriptor,
+            identity,
+            "purelib",
+            {key},
+            {key: probe._identity(os.stat(root / "real.py"))},
+        )
+        assert observed == {key}
+    finally:
+        os.close(file_descriptor)
+
+
+def test_walk_tree_skips_pyc_file(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "module.pyc").write_bytes(b"bytecode")
+    file_descriptor = os.open(root, os.O_RDONLY)
+    try:
+        identity = probe._identity(os.fstat(file_descriptor))
+        assert probe._walk_tree(file_descriptor, identity, "purelib", set(), {}) == set()
+    finally:
+        os.close(file_descriptor)
+
+
+def test_walk_tree_rejects_unexpected_file(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "extra.py").write_text("x = 1\n", encoding="utf-8")
+    file_descriptor = os.open(root, os.O_RDONLY)
+    try:
+        identity = probe._identity(os.fstat(file_descriptor))
+        with pytest.raises(probe._ProbeError):
+            probe._walk_tree(file_descriptor, identity, "purelib", set(), {})
+    finally:
+        os.close(file_descriptor)
+
+
+def test_walk_tree_rejects_changed_file_identity(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "real.py").write_text("x = 1\n", encoding="utf-8")
+    file_descriptor = os.open(root, os.O_RDONLY)
+    try:
+        identity = probe._identity(os.fstat(file_descriptor))
+        key = ("purelib", "real.py")
+        with pytest.raises(probe._ProbeError):
+            probe._walk_tree(file_descriptor, identity, "purelib", {key}, {key: (0, 0, 0, 0, 0, 0)})
+    finally:
+        os.close(file_descriptor)
+
+
+def test_walk_tree_rejects_special_file(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "root"
+    root.mkdir()
+    os.mkfifo(root / "fifo")
+    file_descriptor = os.open(root, os.O_RDONLY)
+    try:
+        identity = probe._identity(os.fstat(file_descriptor))
+        with pytest.raises(probe._ProbeError):
+            probe._walk_tree(file_descriptor, identity, "purelib", set(), {})
+    finally:
+        os.close(file_descriptor)
+
+
+def test_walk_tree_rejects_root_changed_while_walking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "root"
+    root.mkdir()
+    file_descriptor = os.open(root, os.O_RDONLY)
+    real_identity = probe._identity
+    calls = 0
+
+    def shifting_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        nonlocal calls
+        calls += 1
+        base = real_identity(metadata)
+        return (calls, *base[1:])
+
+    monkeypatch.setattr(probe, "_identity", shifting_identity)
+    try:
+        real = real_identity(os.fstat(file_descriptor))
+        root_identity = (1, *real[1:])
+        with pytest.raises(probe._ProbeError):
+            probe._walk_tree(file_descriptor, root_identity, "purelib", set(), {})
+    finally:
+        os.close(file_descriptor)
+
+
+def test_walk_tree_wraps_scandir_oserror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "root"
+    root.mkdir()
+    file_descriptor = os.open(root, os.O_RDONLY)
+
+    def boom(*args: object, **kwargs: object) -> object:
+        raise OSError("boom")
+
+    monkeypatch.setattr(probe.os, "scandir", boom)
+    try:
+        identity = probe._identity(os.fstat(file_descriptor))
+        with pytest.raises(probe._ProbeError):
+            probe._walk_tree(file_descriptor, identity, "purelib", set(), {})
+    finally:
+        os.close(file_descriptor)
+
+
+def test_verify_expected_files_in_shared_root_confirms_members(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "scripts"
+    root.mkdir()
+    (root / "spleeter").write_text("script\n", encoding="utf-8")
+    file_descriptor = os.open(root, os.O_RDONLY)
+    try:
+        identity = probe._identity(os.fstat(file_descriptor))
+        key = ("scripts", "spleeter")
+        observed = probe._verify_expected_files_in_shared_root(
+            file_descriptor,
+            identity,
+            "scripts",
+            {key},
+            {key: probe._identity(os.stat(root / "spleeter"))},
+        )
+        assert observed == {key}
+    finally:
+        os.close(file_descriptor)
+
+
+def test_verify_expected_files_in_shared_root_rejects_non_regular(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "scripts"
+    root.mkdir()
+    (root / "subdir").mkdir()
+    file_descriptor = os.open(root, os.O_RDONLY)
+    try:
+        identity = probe._identity(os.fstat(file_descriptor))
+        with pytest.raises(probe._ProbeError):
+            probe._verify_expected_files_in_shared_root(
+                file_descriptor, identity, "scripts", {("scripts", "subdir")}, {}
+            )
+    finally:
+        os.close(file_descriptor)
+
+
+def test_verify_expected_files_in_shared_root_rejects_changed_identity(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "scripts"
+    root.mkdir()
+    (root / "spleeter").write_text("script\n", encoding="utf-8")
+    file_descriptor = os.open(root, os.O_RDONLY)
+    try:
+        identity = probe._identity(os.fstat(file_descriptor))
+        key = ("scripts", "spleeter")
+        with pytest.raises(probe._ProbeError):
+            probe._verify_expected_files_in_shared_root(
+                file_descriptor, identity, "scripts", {key}, {key: (0, 0, 0, 0, 0, 0)}
+            )
+    finally:
+        os.close(file_descriptor)
+
+
+def test_verify_expected_files_in_shared_root_rejects_root_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "scripts"
+    root.mkdir()
+    file_descriptor = os.open(root, os.O_RDONLY)
+    real_identity = probe._identity
+    calls = 0
+
+    def shifting_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        nonlocal calls
+        calls += 1
+        base = real_identity(metadata)
+        return (calls, *base[1:])
+
+    monkeypatch.setattr(probe, "_identity", shifting_identity)
+    try:
+        real = real_identity(os.fstat(file_descriptor))
+        root_identity = (1, *real[1:])
+        with pytest.raises(probe._ProbeError):
+            probe._verify_expected_files_in_shared_root(
+                file_descriptor, root_identity, "scripts", set(), {}
+            )
+    finally:
+        os.close(file_descriptor)
+
+
+def test_verify_expected_files_in_shared_root_wraps_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "scripts"
+    root.mkdir()
+    file_descriptor = os.open(root, os.O_RDONLY)
+
+    def boom(fd: int) -> os.stat_result:
+        raise OSError("boom")
+
+    monkeypatch.setattr(probe.os, "fstat", boom)
+    try:
+        with pytest.raises(probe._ProbeError):
+            probe._verify_expected_files_in_shared_root(
+                file_descriptor, (0, 0, 0, 0, 0, 0), "scripts", set(), {}
+            )
+    finally:
+        os.close(file_descriptor)
+
+
+def test_verify_expected_files_in_shared_root_rejects_changed_root_identity(
+    tmp_path: Path,
+) -> None:
+    probe = _load_probe_module()
+    root = tmp_path / "scripts"
+    root.mkdir()
+    (root / "spleeter").write_text("script\n", encoding="utf-8")
+    file_descriptor = os.open(root, os.O_RDONLY)
+    try:
+        with pytest.raises(probe._ProbeError):
+            probe._verify_expected_files_in_shared_root(
+                file_descriptor, (999, 999, 0, 0, 0, 0), "scripts", set(), {}
+            )
+    finally:
+        os.close(file_descriptor)
+
+
+def test_python_version_returns_dotted_version() -> None:
+    probe = _load_probe_module()
+    version = probe._python_version()
+    assert version.count(".") == 2
+
+
+def test_python_implementation_returns_cpython() -> None:
+    probe = _load_probe_module()
+    if probe.sys.implementation.name == "cpython":
+        assert probe._python_implementation() == "CPython"
+
+
+def test_python_implementation_maps_pypy(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe = _load_probe_module()
+    monkeypatch.setattr(probe.sys, "implementation", _FakeImplementation("pypy"))
+    assert probe._python_implementation() == "PyPy"
+
+
+def test_python_implementation_returns_other_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe = _load_probe_module()
+    monkeypatch.setattr(probe.sys, "implementation", _FakeImplementation("graalpy"))
+    assert probe._python_implementation() == "graalpy"
+
+
+def test_python_implementation_rejects_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe = _load_probe_module()
+    monkeypatch.setattr(probe.sys, "implementation", _FakeImplementation(""))
+    with pytest.raises(probe._ProbeError):
+        probe._python_implementation()
+
+
+def test_python_abi_returns_value() -> None:
+    probe = _load_probe_module()
+    assert probe._python_abi()
+
+
+def test_python_abi_falls_back_to_cache_tag(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe = _load_probe_module()
+    monkeypatch.setattr(probe.sysconfig, "get_config_var", lambda name: None)
+    monkeypatch.setattr(probe.sys, "implementation", _FakeImplementation("cpython", "cpython-312"))
+    assert probe._python_abi() == "cpython-312"
+
+
+def test_python_abi_rejects_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe = _load_probe_module()
+    monkeypatch.setattr(probe.sysconfig, "get_config_var", lambda name: None)
+    monkeypatch.setattr(probe.sys, "implementation", _FakeImplementation("cpython", None))
+    with pytest.raises(probe._ProbeError):
+        probe._python_abi()
+
+
+def test_distribution_search_paths_returns_none_outside_venv(tmp_path: Path) -> None:
+    probe = _load_probe_module()
+    interpreter = tmp_path / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    assert probe._distribution_search_paths(interpreter, {}) is None
+
+
+def test_distribution_search_paths_returns_purelib_paths(tmp_path: Path) -> None:
+    interpreter, _ = _synthetic_environment(tmp_path)
+    probe = _load_probe_module()
+    roots = probe._canonical_root_paths(interpreter)
+    paths = probe._distribution_search_paths(interpreter, roots)
+    assert paths is not None
+    assert os.fspath(roots["purelib"]) in paths
+
+
+def test_build_environment_manifest_in_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interpreter, _ = _synthetic_environment(tmp_path)
+    probe = _load_probe_module()
+    monkeypatch.setattr(probe.sys, "executable", str(interpreter))
+    manifest = probe.build_environment_manifest()
+    assert manifest["schema"] == "crux.separator-environment/v1"
+    assert manifest["separator_id"] == "spleeter4-drums-v1"
+    assert manifest["package_name"] == "spleeter"
+    assert manifest["package_version"] == "2.4.2"
+    assert isinstance(manifest["interpreter_sha256"], str)
+    assert any(distribution["name"] == "spleeter" for distribution in manifest["distributions"])
+
+
+def test_build_environment_manifest_uses_global_distributions_when_not_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interpreter, purelib = _synthetic_environment(tmp_path)
+    probe = _load_probe_module()
+    monkeypatch.setattr(probe.sys, "executable", str(interpreter))
+    monkeypatch.setattr(probe, "_distribution_search_paths", lambda *_: None)
+    distributions = list(probe.importlib.metadata.distributions(path=[str(purelib)]))
+    monkeypatch.setattr(
+        probe.importlib.metadata, "distributions", lambda *args, **kwargs: distributions
+    )
+    manifest = probe.build_environment_manifest()
+    assert manifest["separator_id"] == "spleeter4-drums-v1"
+
+
+def test_build_environment_manifest_rejects_no_separator_distribution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interpreter, purelib = _synthetic_environment(tmp_path)
+    shutil.rmtree(purelib / "spleeter-2.4.2.dist-info")
+    shutil.rmtree(purelib / "spleeter")
+    probe = _load_probe_module()
+    monkeypatch.setattr(probe.sys, "executable", str(interpreter))
+    with pytest.raises(probe._ProbeError):
+        probe.build_environment_manifest()
+
+
+def test_build_environment_manifest_rejects_ambiguous_separator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interpreter, purelib = _synthetic_environment(tmp_path)
+    _write_distribution(purelib, "demucs", "4.0.0")
+    probe = _load_probe_module()
+    monkeypatch.setattr(probe.sys, "executable", str(interpreter))
+    with pytest.raises(probe._ProbeError):
+        probe.build_environment_manifest()
+
+
+def test_build_environment_manifest_rejects_duplicate_distribution_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interpreter, purelib = _synthetic_environment(tmp_path)
+    package_dir = purelib / "spleeter_dup"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("__version__ = '9.9.9'\n", encoding="utf-8")
+    distribution_dir = purelib / "spleeter_dup-9.9.9.dist-info"
+    distribution_dir.mkdir()
+    (distribution_dir / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: spleeter\nVersion: 9.9.9\n", encoding="utf-8"
+    )
+    record_path = distribution_dir / "RECORD"
+    init_path = package_dir / "__init__.py"
+    rows = [
+        [
+            init_path.relative_to(purelib).as_posix(),
+            f"sha256={_distribution_file_digest(init_path.read_bytes())}",
+            str(len(init_path.read_bytes())),
+        ],
+        [record_path.relative_to(purelib).as_posix(), "", ""],
+    ]
+    with record_path.open("w", encoding="utf-8", newline="") as stream:
+        csv.writer(stream, lineterminator="\n").writerows(rows)
+    probe = _load_probe_module()
+    monkeypatch.setattr(probe.sys, "executable", str(interpreter))
+    with pytest.raises(probe._ProbeError):
+        probe.build_environment_manifest()
+
+
+def test_main_writes_canonical_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsysbinary: pytest.CaptureFixture[bytes]
+) -> None:
+    interpreter, _ = _synthetic_environment(tmp_path)
+    probe = _load_probe_module()
+    monkeypatch.setattr(probe.sys, "executable", str(interpreter))
+    return_code = probe.main()
+    assert return_code == 0
+    captured = capsysbinary.readouterr()
+    assert captured.out.endswith(b"\n")
+    payload = strict_json_loads(captured.out[:-1], require_canonical=True)
+    assert payload["separator_id"] == "spleeter4-drums-v1"
+
+
+def test_main_reports_probe_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    probe = _load_probe_module()
+    monkeypatch.setattr(
+        probe,
+        "build_environment_manifest",
+        lambda: (_ for _ in ()).throw(probe._ProbeError("boom")),
+    )
+    return_code = probe.main()
+    assert return_code == 1
+    assert capsys.readouterr().out == ""
+
+
+def test_main_reports_unexpected_exception(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    probe = _load_probe_module()
+    monkeypatch.setattr(
+        probe,
+        "build_environment_manifest",
+        lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    return_code = probe.main()
+    assert return_code == 1
+    assert "separator_environment_probe_failed" in capsys.readouterr().err
+
+
+def test_build_environment_manifest_verifies_shared_root_members(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interpreter, purelib, console_script = _synthetic_environment_with_console_script(tmp_path)
+    probe = _load_probe_module()
+    monkeypatch.setattr(probe.sys, "executable", str(interpreter))
+    manifest = probe.build_environment_manifest()
+    distribution = next(d for d in manifest["distributions"] if d["name"] == "spleeter")
+    files = {file["path"]: file for file in distribution["files"]}
+    assert console_script.name in files
+    assert files[console_script.name]["root"] == "scripts"
+
+
+def test_module_entry_point_raises_systemexit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interpreter, _ = _synthetic_environment(tmp_path)
+    monkeypatch.setattr(sys, "executable", str(interpreter))
+    with pytest.raises(SystemExit) as excinfo:
+        runpy.run_path(str(PROBE_PATH), run_name="__main__")
+    assert excinfo.value.code == 0

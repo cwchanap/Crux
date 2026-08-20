@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
+import pytest
 from click.testing import CliRunner
 
+import src.cli.benchmark as benchmark_module
 from src.benchmark.reviewed_subset import ScoreReviewedSubsetOutcome
 from src.cli.main import main
 
@@ -193,3 +197,100 @@ def test_compare_oaf_muscriptor_command_emits_error_payload_and_exits_2(
     assert summary["paired_class_count"] == 0
     assert summary["paired_song_count"] == 0
     assert summary["pairable_success_count"] == 0
+
+
+def test_current_crux_commit_raises_on_subprocess_error() -> None:
+    """_current_crux_commit wraps CalledProcessError as ValueError."""
+    with patch.object(
+        subprocess,
+        "run",
+        side_effect=subprocess.CalledProcessError(1, ["git"]),
+    ):
+        with pytest.raises(ValueError, match="current Crux commit is unavailable"):
+            benchmark_module._current_crux_commit()
+
+
+def test_current_crux_commit_rejects_non_canonical_commit() -> None:
+    """_current_crux_commit rejects a short or non-hex commit."""
+    fake_result = subprocess.CompletedProcess(
+        args=["git", "rev-parse", "--verify", "HEAD"],
+        returncode=0,
+        stdout="short\n",
+    )
+    with patch.object(subprocess, "run", return_value=fake_result):
+        with pytest.raises(ValueError, match="not canonical"):
+            benchmark_module._current_crux_commit()
+
+
+def test_run_oaf_separation_pilot_command_emits_failed_outcome_on_commit_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """When _current_crux_commit raises ValueError the CLI emits a failed outcome."""
+    monkeypatch.setattr(
+        benchmark_module,
+        "_current_crux_commit",
+        lambda: (_ for _ in ()).throw(ValueError("no commit")),
+    )
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "run-oaf-separation-pilot",
+            "--manifest",
+            str(tmp_path / "m.json"),
+            "--timing-manifest",
+            str(tmp_path / "t.json"),
+            "--subset-manifest",
+            str(tmp_path / "s.json"),
+            "--oaf-run",
+            str(tmp_path / "run.json"),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--spleeter-python",
+            str(tmp_path / "sp"),
+            "--demucs-python",
+            str(tmp_path / "dm"),
+            "--spleeter-model-root",
+            str(tmp_path / "smr"),
+            "--demucs-model-root",
+            str(tmp_path / "dmr"),
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 2
+    summary = json.loads(result.output)
+    assert summary["status"] == "failed"
+    assert summary["exit_code"] == 2
+    assert summary["success_count"] == 0
+
+
+def test_finalize_oaf_separation_pilot_command_emits_failed_outcome_on_invalid_decision(
+    tmp_path,
+) -> None:
+    """An invalid decision value triggers ValueError in request construction."""
+    result = CliRunner().invoke(
+        main,
+        [
+            "benchmark",
+            "finalize-oaf-separation-pilot",
+            "--run",
+            str(tmp_path / "run.json"),
+            "--subset-manifest",
+            str(tmp_path / "subset.json"),
+            "--output-manifest",
+            str(tmp_path / "out.json"),
+            "--decision",
+            "bogus_decision",
+            "--rationale",
+            "test rationale",
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 2
+    summary = json.loads(result.output)
+    assert summary["exit_code"] == 2
+    assert summary["manifest_path"] is None
+    assert "decision is invalid" in summary["failure_reason"]

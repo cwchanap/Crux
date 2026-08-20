@@ -1495,3 +1495,965 @@ def test_missing_crux_commit_is_fatal_before_identity(
         ).exit_code
         == 2  # type: ignore[attr-defined]
     )
+
+
+# ---------------------------------------------------------------------------
+# Direct unit coverage for the pure helper / validation functions.
+# ---------------------------------------------------------------------------
+
+
+def _fake_source():
+    from src.benchmark.corpus_cache import ResolvedSourceAudio
+
+    return ResolvedSourceAudio(
+        path=Path("/fake/source.wav"),
+        source_audio_id="100/bgm.wav",
+        source_audio_sha256="a" * 64,
+        duration_sec=1.0,
+    )
+
+
+def _fake_lock():
+    from src.benchmark.separators import load_separator_lock
+
+    return load_separator_lock(FIXTURE_ROOT / "spleeter" / "model.json")
+
+
+def test_request_post_init_rejects_non_path_field(tmp_path: Path) -> None:
+    from src.benchmark.separation_pilot import OafSeparationPilotRequest
+
+    with pytest.raises(TypeError, match="cache_dir must be a Path"):
+        OafSeparationPilotRequest(
+            reference_manifest_path=tmp_path / "ref.jsonl",
+            timing_manifest_path=tmp_path / "timing.jsonl",
+            subset_manifest_path=tmp_path / "subset.jsonl",
+            oaf_run_path=tmp_path / "run.json",
+            cache_dir=str(tmp_path / "cache"),
+            output_dir=tmp_path / "out",
+            spleeter_python=Path("/p"),
+            demucs_python=Path("/p"),
+            spleeter_model_root=tmp_path / "s",
+            demucs_model_root=tmp_path / "d",
+            crux_commit="c" * 40,
+        )
+
+
+def test_request_post_init_rejects_non_bool_resume(tmp_path: Path) -> None:
+    from src.benchmark.separation_pilot import OafSeparationPilotRequest
+
+    with pytest.raises(TypeError, match="resume must be a bool"):
+        OafSeparationPilotRequest(
+            reference_manifest_path=tmp_path / "ref.jsonl",
+            timing_manifest_path=tmp_path / "timing.jsonl",
+            subset_manifest_path=tmp_path / "subset.jsonl",
+            oaf_run_path=tmp_path / "run.json",
+            cache_dir=tmp_path / "cache",
+            output_dir=tmp_path / "out",
+            spleeter_python=Path("/p"),
+            demucs_python=Path("/p"),
+            spleeter_model_root=tmp_path / "s",
+            demucs_model_root=tmp_path / "d",
+            resume="yes",  # type: ignore[arg-type]
+            crux_commit="c" * 40,
+        )
+
+
+def test_request_post_init_rejects_malformed_crux_commit(tmp_path: Path) -> None:
+    from src.benchmark.separation_pilot import OafSeparationPilotRequest
+
+    with pytest.raises(ValueError, match="crux_commit must be a lowercase 40-character commit"):
+        OafSeparationPilotRequest(
+            reference_manifest_path=tmp_path / "ref.jsonl",
+            timing_manifest_path=tmp_path / "timing.jsonl",
+            subset_manifest_path=tmp_path / "subset.jsonl",
+            oaf_run_path=tmp_path / "run.json",
+            cache_dir=tmp_path / "cache",
+            output_dir=tmp_path / "out",
+            spleeter_python=Path("/p"),
+            demucs_python=Path("/p"),
+            spleeter_model_root=tmp_path / "s",
+            demucs_model_root=tmp_path / "d",
+            crux_commit="not-a-commit",
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"overall_status": "bogus"}, "overall_status is invalid"),
+        ({"exit_code": 5}, "exit_code is invalid"),
+        ({"run_id": 123}, "run_id must be a string or None"),
+        ({"run_path": "not-a-path"}, "run_path must be a Path or None"),
+        ({"success_count": -1}, "success_count must be a nonnegative integer"),
+        ({"success_count": True}, "success_count must be a nonnegative integer"),
+        ({"failure_code": "not_a_code"}, "failure_code is invalid"),
+        ({"failure_code": 123}, "failure_code is invalid"),
+    ],
+)
+def test_outcome_post_init_rejects_invalid_fields(overrides: dict[str, object], match: str) -> None:
+    from src.benchmark.separation_pilot import OafSeparationPilotOutcome
+
+    base: dict[str, object] = {
+        "overall_status": "complete",
+        "exit_code": 0,
+        "run_id": "oaf-separation-abcdef0123456789",
+        "run_path": None,
+        "reports_path": None,
+        "full_mix_reports_path": None,
+        "success_count": 0,
+        "failed_count": 0,
+        "skipped_count": 0,
+        "quarantined_count": 0,
+        "failure_code": None,
+    }
+    base.update(overrides)
+    with pytest.raises((ValueError, TypeError), match=match):
+        OafSeparationPilotOutcome(**base)  # type: ignore[arg-type]
+
+
+def test_require_hash_rejects_non_string() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _require_hash
+
+    with pytest.raises(SeparationRunError, match="must be a lowercase SHA-256"):
+        _require_hash(123, "field")
+
+
+def test_require_hash_rejects_invalid_hex() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _require_hash
+
+    with pytest.raises(SeparationRunError, match="must be a lowercase SHA-256"):
+        _require_hash("nothex", "field")
+
+
+def test_require_nonempty_string_rejects_non_string() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _require_nonempty_string
+
+    with pytest.raises(SeparationRunError, match="must be a nonempty string"):
+        _require_nonempty_string(123, "field")
+
+
+def test_require_nonempty_string_rejects_empty() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _require_nonempty_string
+
+    with pytest.raises(SeparationRunError, match="must be a nonempty string"):
+        _require_nonempty_string("", "field")
+
+
+def test_require_absolute_path_rejects_non_string() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _require_absolute_path
+
+    with pytest.raises(SeparationRunError, match="must be an absolute path"):
+        _require_absolute_path(123, "field")
+
+
+def test_require_absolute_path_rejects_empty() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _require_absolute_path
+
+    with pytest.raises(SeparationRunError, match="must be an absolute path"):
+        _require_absolute_path("", "field")
+
+
+def test_require_absolute_path_rejects_relative(tmp_path: Path) -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _require_absolute_path
+
+    with pytest.raises(SeparationRunError, match="must be an absolute path"):
+        _require_absolute_path("relative/path", "field")
+
+
+def test_require_crux_commit_rejects_invalid() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _require_crux_commit
+
+    with pytest.raises(SeparationRunError, match="crux_commit"):
+        _require_crux_commit("short")
+
+
+def test_normalize_snapshot_value_rejects_non_string_key() -> None:
+    from src.benchmark.backend_identity import StrictJsonError
+    from src.benchmark.separation_pilot import _normalize_snapshot_value
+
+    with pytest.raises(StrictJsonError, match="object keys must be strings"):
+        _normalize_snapshot_value({1: "value"})
+
+
+def test_normalize_snapshot_value_rejects_unsupported_type() -> None:
+    from src.benchmark.backend_identity import StrictJsonError
+    from src.benchmark.separation_pilot import _normalize_snapshot_value
+
+    with pytest.raises(StrictJsonError, match="unsupported separation snapshot value"):
+        _normalize_snapshot_value(object())
+
+
+def test_normalize_snapshot_value_quantizes_float() -> None:
+    from decimal import Decimal
+
+    from src.benchmark.separation_pilot import _normalize_snapshot_value
+
+    result = _normalize_snapshot_value(1.0000001)
+    # Floats are quantized to a fixed six-place Decimal, not a string.
+    assert isinstance(result, Decimal)
+
+
+def test_validate_evidence_rejects_non_mapping() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _validate_evidence
+
+    with pytest.raises(SeparationRunError, match="evidence must be an object or null"):
+        _validate_evidence("not-a-mapping", "field")
+
+
+def test_validate_view_row_rejects_non_mapping() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _validate_view_row
+
+    with pytest.raises(SeparationRunError, match="view evidence must be an object"):
+        _validate_view_row("not-a-mapping", field="spleeter", derived=True)
+
+
+def test_validate_view_row_rejects_invalid_status() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _validate_view_row
+
+    with pytest.raises(SeparationRunError, match="view status is invalid"):
+        _validate_view_row({"status": "bogus"}, field="spleeter", derived=True)
+
+
+def test_validate_view_row_rejects_invalid_failure_code() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _validate_view_row
+
+    with pytest.raises(SeparationRunError, match="failure_code is invalid"):
+        _validate_view_row(
+            {"status": "success", "failure_code": 123},
+            field="spleeter",
+            derived=True,
+        )
+
+
+def test_validate_view_row_rejects_invalid_evidence() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _validate_view_row
+
+    with pytest.raises(SeparationRunError, match="stem evidence must be an object or null"):
+        _validate_view_row(
+            {"status": "success", "stem": "not-a-mapping"},
+            field="spleeter",
+            derived=True,
+        )
+
+
+def test_validate_view_row_derived_rejects_missing_separator_lock() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _validate_view_row
+
+    with pytest.raises(SeparationRunError, match="separator_lock_sha256"):
+        _validate_view_row({"status": "pending"}, field="spleeter", derived=True)
+
+
+def test_validate_view_row_derived_rejects_wrong_input_view_id() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _validate_view_row
+
+    with pytest.raises(SeparationRunError, match="input view identity is invalid"):
+        _validate_view_row(
+            {
+                "status": "pending",
+                "separator_lock_sha256": "a" * 64,
+                "input_view_id": "wrong-view",
+            },
+            field="spleeter",
+            derived=True,
+        )
+
+
+def test_validate_view_row_parent_rejects_wrong_full_mix_input_view_id() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _validate_view_row
+
+    with pytest.raises(SeparationRunError, match="full_mix input view identity is invalid"):
+        _validate_view_row(
+            {"status": "inferred", "input_view_id": "wrong-view"},
+            field="full_mix",
+            derived=False,
+        )
+
+
+def test_validate_view_row_rejects_input_evidence_view_mismatch() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _validate_view_row
+
+    with pytest.raises(SeparationRunError, match="input evidence view identity is invalid"):
+        _validate_view_row(
+            {
+                "status": "pending",
+                "separator_lock_sha256": "a" * 64,
+                "input_view_id": SPLEETER_INPUT_VIEW_ID,
+                "input": {"input_view_id": "wrong"},
+            },
+            field="spleeter",
+            derived=True,
+        )
+
+
+def test_validate_view_row_rejects_invalid_input_audio_sha() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _validate_view_row
+
+    with pytest.raises(SeparationRunError, match="input_audio_sha256"):
+        _validate_view_row(
+            {
+                "status": "pending",
+                "separator_lock_sha256": "a" * 64,
+                "input_view_id": SPLEETER_INPUT_VIEW_ID,
+                "input": {
+                    "input_view_id": SPLEETER_INPUT_VIEW_ID,
+                    "input_audio_sha256": "nothex",
+                },
+            },
+            field="spleeter",
+            derived=True,
+        )
+
+
+def test_validate_view_row_rejects_empty_prediction_path() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _validate_view_row
+
+    with pytest.raises(SeparationRunError, match="prediction path is invalid"):
+        _validate_view_row(
+            {
+                "status": "pending",
+                "separator_lock_sha256": "a" * 64,
+                "input_view_id": SPLEETER_INPUT_VIEW_ID,
+                "prediction": {"path": ""},
+            },
+            field="spleeter",
+            derived=True,
+        )
+
+
+def test_validate_view_row_rejects_invalid_prediction_sha() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _validate_view_row
+
+    with pytest.raises(SeparationRunError, match="prediction.artifact_sha256"):
+        _validate_view_row(
+            {
+                "status": "pending",
+                "separator_lock_sha256": "a" * 64,
+                "input_view_id": SPLEETER_INPUT_VIEW_ID,
+                "prediction": {"path": "rel/path", "artifact_sha256": "nothex"},
+            },
+            field="spleeter",
+            derived=True,
+        )
+
+
+def test_render_oaf_separation_run_rejects_non_mapping() -> None:
+    from src.benchmark.separation_pilot import render_oaf_separation_run
+
+    with pytest.raises(TypeError, match="run snapshot must be a mapping"):
+        render_oaf_separation_run("not-a-mapping")  # type: ignore[arg-type]
+
+
+def test_parse_oaf_separation_run_rejects_non_canonical() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, parse_oaf_separation_run
+
+    with pytest.raises((SeparationRunError, ValueError)):
+        parse_oaf_separation_run(b'{"schema":"wrong"}')
+
+
+def test_write_oaf_separation_run_rejects_non_path() -> None:
+    from src.benchmark.separation_pilot import write_oaf_separation_run
+
+    with pytest.raises(TypeError, match="run_path must be a Path"):
+        write_oaf_separation_run("not-a-path", {})  # type: ignore[arg-type]
+
+
+def test_load_separator_locks_rejects_missing_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.benchmark.separation_pilot as pilot
+    from src.benchmark.separation_pilot import SeparationRunError
+
+    monkeypatch.setattr(
+        pilot,
+        "SEPARATOR_LOCK_PATHS",
+        {
+            SPLEETER_SEPARATOR_ID: tmp_path / "missing-spleeter.json",
+            HTDEMUCS_SEPARATOR_ID: FIXTURE_ROOT / "htdemucs" / "model.json",
+        },
+    )
+    with pytest.raises(SeparationRunError, match="separator lock is invalid"):
+        pilot._load_separator_locks()
+
+
+def test_load_separator_locks_rejects_wrong_separator_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.benchmark.separation_pilot as pilot
+    from src.benchmark.separation_pilot import SeparationRunError
+
+    swapped = tmp_path / "swapped"
+    shutil.copytree(FIXTURE_ROOT / "spleeter", swapped / "spleeter")
+    shutil.copytree(FIXTURE_ROOT / "htdemucs", swapped / "htdemucs")
+    monkeypatch.setattr(
+        pilot,
+        "SEPARATOR_LOCK_PATHS",
+        {
+            SPLEETER_SEPARATOR_ID: swapped / "htdemucs" / "model.json",
+            HTDEMUCS_SEPARATOR_ID: swapped / "spleeter" / "model.json",
+        },
+    )
+    with pytest.raises(SeparationRunError, match="Spleeter separator lock identity is invalid"):
+        pilot._load_separator_locks()
+
+
+def test_load_separator_locks_rejects_identical_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.benchmark.separation_pilot as pilot
+    from src.benchmark.separation_pilot import SeparationRunError
+    from src.benchmark.separators import SeparatorLock, load_separator_lock
+
+    spleeter_lock = load_separator_lock(FIXTURE_ROOT / "spleeter" / "model.json")
+    htdemucs_lock = load_separator_lock(FIXTURE_ROOT / "htdemucs" / "model.json")
+    # Force identical sha256 while preserving each lock's correct separator_id.
+    forged_htdemucs = replace(htdemucs_lock, sha256=spleeter_lock.sha256)
+    forged_spleeter = replace(spleeter_lock, sha256=spleeter_lock.sha256)
+
+    def fake_load(path: Path) -> SeparatorLock:
+        if path == FIXTURE_ROOT / "spleeter" / "model.json":
+            return forged_spleeter
+        return forged_htdemucs
+
+    monkeypatch.setattr(pilot, "load_separator_lock", fake_load)
+    monkeypatch.setattr(
+        pilot,
+        "SEPARATOR_LOCK_PATHS",
+        {
+            SPLEETER_SEPARATOR_ID: FIXTURE_ROOT / "spleeter" / "model.json",
+            HTDEMUCS_SEPARATOR_ID: FIXTURE_ROOT / "htdemucs" / "model.json",
+        },
+    )
+    with pytest.raises(SeparationRunError, match="separator locks must be distinct"):
+        pilot._load_separator_locks()
+
+
+def test_read_parent_run_rejects_invalid_file(tmp_path: Path) -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _read_parent_run
+
+    bad = tmp_path / "bad-run.json"
+    bad.write_bytes(b"not json at all")
+    with pytest.raises(SeparationRunError, match="parent OaF run snapshot is invalid"):
+        _read_parent_run(bad)
+
+
+def test_separator_failure_status_maps_stem_codes() -> None:
+    from src.benchmark.separation_pilot import _separator_failure_status
+
+    assert _separator_failure_status("stem_decode_failed") == "stem_invalid"
+    assert _separator_failure_status("stem_channel_count") == "stem_invalid"
+    assert _separator_failure_status("stem_nonfinite") == "stem_invalid"
+    assert _separator_failure_status("stem_duration_invalid") == "stem_invalid"
+    assert _separator_failure_status("stem_duration_mismatch") == "stem_invalid"
+    assert _separator_failure_status("stem_near_silent") == "stem_invalid"
+    assert _separator_failure_status("stem_identity_invalid") == "stem_invalid"
+    assert _separator_failure_status("separator_timeout") == "separation_failed"
+    assert _separator_failure_status("unknown_code") == "separation_failed"
+
+
+def test_derived_failure_reason_returns_code_reason() -> None:
+    from src.benchmark.separation_pilot import _derived_failure_reason
+
+    assert _derived_failure_reason("separation_failed", "stem_invalid") == "inference_failed"
+    assert _derived_failure_reason("prediction_invalid", "prediction_publish_failed") == (
+        "prediction_artifact_invalid"
+    )
+
+
+def test_derived_failure_reason_falls_back_to_status() -> None:
+    from src.benchmark.separation_pilot import _derived_failure_reason
+
+    assert _derived_failure_reason("pending", None) == "inference_failed"
+    assert _derived_failure_reason("separation_failed", None) == "inference_failed"
+    assert _derived_failure_reason("stem_invalid", None) == "inference_failed"
+    assert _derived_failure_reason("inference_failed", None) == "inference_failed"
+    assert _derived_failure_reason("prediction_invalid", None) == "prediction_artifact_invalid"
+
+
+def test_derived_failure_reason_rejects_unsupported() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _derived_failure_reason
+
+    with pytest.raises(SeparationRunError, match="no supported HPA-325 failure reason"):
+        _derived_failure_reason("unknown_status", "unknown_code")
+
+
+def test_close_backend_handles_none() -> None:
+    from src.benchmark.separation_pilot import _close_backend
+
+    _close_backend(None)
+
+
+def test_close_backend_swallows_errors() -> None:
+    from src.benchmark.separation_pilot import _close_backend
+
+    class BadBackend:
+        def close(self) -> None:
+            raise OSError("boom")
+
+    _close_backend(BadBackend())
+
+
+def test_close_backend_closes_clean_backend() -> None:
+    from src.benchmark.separation_pilot import _close_backend
+
+    closed: list[bool] = []
+
+    class GoodBackend:
+        def close(self) -> None:
+            closed.append(True)
+
+    _close_backend(GoodBackend())
+    assert closed == [True]
+
+
+def test_relative_artifact_path_returns_relative(tmp_path: Path) -> None:
+    from src.benchmark.separation_pilot import _relative_artifact_path
+
+    root = tmp_path / "root"
+    child = root / "child" / "file.wav"
+    child.parent.mkdir(parents=True)
+    child.write_bytes(b"x")
+    assert _relative_artifact_path(child, root) == "child/file.wav"
+
+
+def test_relative_artifact_path_falls_back_to_absolute(tmp_path: Path) -> None:
+    from src.benchmark.separation_pilot import _relative_artifact_path
+
+    root = tmp_path / "root"
+    other = tmp_path / "other" / "file.wav"
+    other.parent.mkdir(parents=True)
+    other.write_bytes(b"x")
+    result = _relative_artifact_path(other, root)
+    assert result == str(other)
+
+
+def test_view_inference_config_rejects_missing_config() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _view_inference_config
+
+    with pytest.raises(SeparationRunError, match="parent inference config is unavailable"):
+        _view_inference_config({}, SPLEETER_INPUT_VIEW_ID)
+
+
+def _full_mix_inference_config() -> dict[str, str]:
+    return {
+        "schema": "crux.oaf-inference-config/v1",
+        "backend_descriptor_sha256": "a" * 64,
+        "model_lock_sha256": "b" * 64,
+        "checkpoint_archive_sha256": "c" * 64,
+        "adapter_revision": "0.0.0",
+        "prediction_map_version": "1",
+        "input_view_id": OAF_FULL_MIX_INPUT_VIEW_ID,
+        "canonicalization_revision": "0.0.0",
+    }
+
+
+def test_view_inference_config_rejects_empty_view_id() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _view_inference_config
+
+    parent = {"inference_config": _full_mix_inference_config()}
+    with pytest.raises(SeparationRunError, match="derived input view identity is invalid"):
+        _view_inference_config(parent, "")
+
+
+def test_view_inference_config_swaps_view_id() -> None:
+    from src.benchmark.separation_pilot import _view_inference_config
+
+    parent = {"inference_config": _full_mix_inference_config()}
+    config, sha = _view_inference_config(parent, SPLEETER_INPUT_VIEW_ID)
+    assert config["input_view_id"] == SPLEETER_INPUT_VIEW_ID
+    assert isinstance(sha, str)
+
+
+def test_resolve_retained_stem_rejects_missing_path(tmp_path: Path) -> None:
+    from src.benchmark.separation_pilot import _resolve_retained_stem
+    from src.benchmark.separators import SeparatorExecutionError
+
+    with pytest.raises(SeparatorExecutionError, match="retained stem path is missing"):
+        _resolve_retained_stem(
+            {},
+            cache_root=tmp_path,
+            source=_fake_source(),
+            lock=_fake_lock(),
+        )
+
+
+def test_resolve_retained_stem_rejects_missing_hash(tmp_path: Path) -> None:
+    from src.benchmark.separation_pilot import _resolve_retained_stem
+    from src.benchmark.separators import SeparatorExecutionError
+
+    with pytest.raises(SeparatorExecutionError, match="retained stem hash is missing"):
+        _resolve_retained_stem(
+            {"path": str(tmp_path / "stem.wav")},
+            cache_root=tmp_path,
+            source=_fake_source(),
+            lock=_fake_lock(),
+        )
+
+
+def test_resolve_retained_stem_rejects_outside_cache(tmp_path: Path) -> None:
+    from src.benchmark.separation_pilot import _resolve_retained_stem
+    from src.benchmark.separators import SeparatorExecutionError
+
+    outside = tmp_path / "outside.wav"
+    outside.write_bytes(b"x")
+    with pytest.raises(SeparatorExecutionError, match="outside the native cache"):
+        _resolve_retained_stem(
+            {"path": str(outside), "sha256": hashlib.sha256(b"x").hexdigest()},
+            cache_root=tmp_path / "cache",
+            source=_fake_source(),
+            lock=_fake_lock(),
+        )
+
+
+def test_resolve_retained_stem_rejects_hash_mismatch(tmp_path: Path) -> None:
+    from src.benchmark.separation_pilot import _resolve_retained_stem
+    from src.benchmark.separators import SeparatorExecutionError
+
+    cache_root = tmp_path / "cache"
+    stem_path = cache_root / "stems" / "drums.wav"
+    stem_path.parent.mkdir(parents=True)
+    stem_path.write_bytes(b"real-bytes")
+    with pytest.raises(SeparatorExecutionError, match="bytes do not match"):
+        _resolve_retained_stem(
+            {"path": str(stem_path), "sha256": "e" * 64},
+            cache_root=cache_root,
+            source=_fake_source(),
+            lock=_fake_lock(),
+        )
+
+
+def test_resolve_retained_stem_rejects_source_mismatch(tmp_path: Path) -> None:
+    from src.benchmark.separation_pilot import _resolve_retained_stem
+    from src.benchmark.separators import SeparatorExecutionError
+
+    cache_root = tmp_path / "cache"
+    stem_path = cache_root / "stems" / "drums.wav"
+    stem_path.parent.mkdir(parents=True)
+    content = b"real-bytes"
+    stem_path.write_bytes(content)
+    with pytest.raises(SeparatorExecutionError, match="source identity does not match"):
+        _resolve_retained_stem(
+            {
+                "path": str(stem_path),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "source_audio_sha256": "wrong",
+            },
+            cache_root=cache_root,
+            source=_fake_source(),
+            lock=_fake_lock(),
+        )
+
+
+def test_resolve_retained_stem_rejects_lock_mismatch(tmp_path: Path) -> None:
+    from src.benchmark.separation_pilot import _resolve_retained_stem
+    from src.benchmark.separators import SeparatorExecutionError
+
+    cache_root = tmp_path / "cache"
+    stem_path = cache_root / "stems" / "drums.wav"
+    stem_path.parent.mkdir(parents=True)
+    content = b"real-bytes"
+    stem_path.write_bytes(content)
+    source = _fake_source()
+    with pytest.raises(SeparatorExecutionError, match="separator identity does not match"):
+        _resolve_retained_stem(
+            {
+                "path": str(stem_path),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "source_audio_sha256": source.source_audio_sha256,
+                "separator_lock_sha256": "wrong-lock",
+            },
+            cache_root=cache_root,
+            source=source,
+            lock=_fake_lock(),
+        )
+
+
+def test_resolve_retained_stem_succeeds_for_valid_stem(tmp_path: Path) -> None:
+    from src.benchmark.separation_pilot import _resolve_retained_stem
+
+    cache_root = tmp_path / "cache"
+    stem_path = cache_root / "stems" / "drums.wav"
+    stem_path.parent.mkdir(parents=True)
+    content = b"real-bytes"
+    stem_path.write_bytes(content)
+    source = _fake_source()
+    lock = _fake_lock()
+    resolved = _resolve_retained_stem(
+        {
+            "path": str(stem_path),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "source_audio_sha256": source.source_audio_sha256,
+            "separator_lock_sha256": lock.sha256,
+        },
+        cache_root=cache_root,
+        source=source,
+        lock=lock,
+    )
+    assert resolved == stem_path.resolve()
+
+
+def test_stem_evidence_rejects_non_stem() -> None:
+    from src.benchmark.separation_pilot import SeparationRunError, _stem_evidence
+
+    with pytest.raises(SeparationRunError, match="separator returned an invalid stem"):
+        _stem_evidence("not-a-stem", Path("/cache"))  # type: ignore[arg-type]
+
+
+def test_mark_outstanding_derived_views_marks_pending(tmp_path: Path) -> None:
+    from src.benchmark.separation_pilot import _mark_outstanding_derived_views
+
+    snapshot: dict[str, object] = {
+        "items": [
+            {
+                "simfile_id": 1,
+                "spleeter": {"status": "pending", "runtime": None},
+                "htdemucs": {"status": "success"},
+            },
+        ]
+    }
+    _mark_outstanding_derived_views(snapshot)
+    view = snapshot["items"][0]["spleeter"]  # type: ignore[index]
+    assert view["status"] == "inference_failed"
+    assert view["failure_code"] == "worker_protocol_failed"
+    assert snapshot["items"][0]["htdemucs"]["status"] == "success"  # type: ignore[index]
+
+
+def test_mark_outstanding_derived_views_rejects_non_list() -> None:
+    from src.benchmark.separation_pilot import (
+        SeparationRunError,
+        _mark_outstanding_derived_views,
+    )
+
+    with pytest.raises(SeparationRunError, match="items are unavailable"):
+        _mark_outstanding_derived_views({"items": "not-a-list"})
+
+
+def test_capture_derived_view_preimages_rejects_non_list() -> None:
+    from src.benchmark.separation_pilot import (
+        SeparationRunError,
+        _capture_derived_view_preimages,
+    )
+
+    with pytest.raises(SeparationRunError, match="items are unavailable"):
+        _capture_derived_view_preimages({"items": "not-a-list"})
+
+
+def test_capture_derived_view_preimages_rejects_invalid_item() -> None:
+    from src.benchmark.separation_pilot import (
+        SeparationRunError,
+        _capture_derived_view_preimages,
+    )
+
+    with pytest.raises(SeparationRunError, match="run snapshot item is invalid"):
+        _capture_derived_view_preimages({"items": ["not-a-mapping"]})
+
+
+def test_capture_derived_view_preimages_rejects_invalid_simfile_id() -> None:
+    from src.benchmark.separation_pilot import (
+        SeparationRunError,
+        _capture_derived_view_preimages,
+    )
+
+    with pytest.raises(SeparationRunError, match="simfile_id is invalid"):
+        _capture_derived_view_preimages(
+            {"items": [{"simfile_id": "not-int", "spleeter": {}, "htdemucs": {}}]}
+        )
+
+
+def test_capture_derived_view_preimages_rejects_invalid_view() -> None:
+    from src.benchmark.separation_pilot import (
+        SeparationRunError,
+        _capture_derived_view_preimages,
+    )
+
+    with pytest.raises(SeparationRunError, match="derived view evidence is invalid"):
+        _capture_derived_view_preimages(
+            {"items": [{"simfile_id": 1, "spleeter": "not-a-mapping", "htdemucs": {}}]}
+        )
+
+
+def test_restore_derived_view_preimages_rejects_non_list() -> None:
+    from src.benchmark.separation_pilot import (
+        SeparationRunError,
+        _restore_derived_view_preimages,
+    )
+
+    with pytest.raises(SeparationRunError, match="items are unavailable"):
+        _restore_derived_view_preimages({"items": "not-a-list"}, {})
+
+
+def test_restore_derived_view_preimages_rejects_invalid_preimage_name() -> None:
+    from src.benchmark.separation_pilot import (
+        SeparationRunError,
+        _restore_derived_view_preimages,
+    )
+
+    snapshot: dict[str, object] = {"items": [{"simfile_id": 1}]}
+    with pytest.raises(SeparationRunError, match="preimage name is invalid"):
+        _restore_derived_view_preimages(snapshot, {(1, "bogus"): {}})
+
+
+def test_recover_prior_derived_evidence_rejects_non_list_items() -> None:
+    from src.benchmark.separation_pilot import (
+        SeparationRunError,
+        _recover_prior_derived_evidence,
+    )
+
+    with pytest.raises(SeparationRunError, match="items are unavailable"):
+        _recover_prior_derived_evidence({"items": "not-a-list"}, {"items": []})
+
+
+def test_recover_prior_derived_evidence_rejects_invalid_prior_item() -> None:
+    from src.benchmark.separation_pilot import (
+        SeparationRunError,
+        _recover_prior_derived_evidence,
+    )
+
+    with pytest.raises(SeparationRunError, match="prior run snapshot item is invalid"):
+        _recover_prior_derived_evidence(
+            {"items": [{"simfile_id": 1}]},
+            {"items": [{"simfile_id": "not-int"}]},
+        )
+
+
+def test_recover_prior_derived_evidence_rejects_missing_membership() -> None:
+    from src.benchmark.separation_pilot import (
+        SeparationRunError,
+        _recover_prior_derived_evidence,
+    )
+
+    with pytest.raises(SeparationRunError, match="membership is incomplete"):
+        _recover_prior_derived_evidence(
+            {"items": [{"simfile_id": 1}]},
+            {"items": [{"simfile_id": 2}]},
+        )
+
+
+def test_recover_prior_derived_evidence_rejects_source_mismatch() -> None:
+    from src.benchmark.separation_pilot import (
+        SeparationRunError,
+        _recover_prior_derived_evidence,
+    )
+
+    with pytest.raises(SeparationRunError, match="source identity does not match"):
+        _recover_prior_derived_evidence(
+            {"items": [{"simfile_id": 1, "source_row_sha256": "a" * 64}]},
+            {"items": [{"simfile_id": 1, "source_row_sha256": "b" * 64}]},
+        )
+
+
+def test_recover_prior_derived_evidence_rejects_invalid_prior_view() -> None:
+    from src.benchmark.separation_pilot import (
+        SeparationRunError,
+        _recover_prior_derived_evidence,
+    )
+
+    row = {
+        "simfile_id": 1,
+        "source_row_sha256": "a" * 64,
+        "source_audio_id": "id",
+        "source_audio_sha256": "b" * 64,
+    }
+    with pytest.raises(SeparationRunError, match="prior derived view evidence is invalid"):
+        _recover_prior_derived_evidence(
+            {"items": [dict(row)]},
+            {"items": [dict(row, spleeter="not-a-mapping")]},
+        )
+
+
+def test_revalidate_separator_runtimes_raises_first_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.benchmark.separation_pilot import _revalidate_separator_runtimes
+    from src.benchmark.separators import SeparatorExecutionError
+
+    def fail(_runtime: object) -> None:
+        raise SeparatorExecutionError("separator_model_root_invalid")
+
+    monkeypatch.setattr("src.benchmark.separation_pilot.revalidate_separator_model_root", fail)
+
+    class _StubRuntime:
+        class lock:
+            separator_id = "stub"
+
+    with pytest.raises(SeparatorExecutionError, match="separator_model_root_invalid"):
+        _revalidate_separator_runtimes({"stub": _StubRuntime()})
+
+
+def test_validate_frozen_oaf_binding_rejects_missing_identity() -> None:
+    from src.benchmark.backends.oaf import OafBackendError
+    from src.benchmark.separation_pilot import _validate_frozen_oaf_binding
+
+    with pytest.raises(OafBackendError, match="parent OaF model identity is unavailable"):
+        _validate_frozen_oaf_binding({})
+
+
+def test_validate_frozen_oaf_binding_rejects_drifted_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.benchmark.separation_pilot as pilot
+    from src.benchmark.backends.oaf import OafBackendError
+
+    drifted = tmp_path / "drifted-model.json"
+    drifted.write_bytes(b"drifted")
+    monkeypatch.setattr(pilot, "_model_lock_path", lambda: drifted, raising=False)
+    with pytest.raises(OafBackendError, match="model lock cannot be verified"):
+        pilot._validate_frozen_oaf_binding(
+            {"model_lock_sha256": "a" * 64, "checkpoint_archive_sha256": "b" * 64}
+        )
+
+
+def test_comparison_reports_ready_returns_false_for_missing(tmp_path: Path) -> None:
+    from src.benchmark.separation_pilot import _comparison_reports_ready
+
+    assert _comparison_reports_ready(tmp_path) is False
+
+
+def test_comparison_reports_ready_returns_true_when_complete(tmp_path: Path) -> None:
+    from src.benchmark.separation_pilot import _COMPARISON_REPORT_NAMES, _comparison_reports_ready
+
+    for view_name in ("full_mix", "spleeter", "htdemucs"):
+        report_dir = tmp_path / "views" / view_name / "reports"
+        report_dir.mkdir(parents=True)
+        for report_name in _COMPARISON_REPORT_NAMES:
+            (report_dir / report_name).write_bytes(b"x")
+    assert _comparison_reports_ready(tmp_path) is True
+
+
+def test_fatal_outcome_defaults_to_no_failure_code() -> None:
+    from src.benchmark.separation_pilot import _fatal_outcome
+
+    outcome = _fatal_outcome()
+    assert outcome.overall_status == "failed"
+    assert outcome.exit_code == 2
+    assert outcome.failure_code is None
+
+
+def test_fatal_outcome_carries_failure_code() -> None:
+    from src.benchmark.separation_pilot import _fatal_outcome
+
+    outcome = _fatal_outcome("separator_model_root_invalid")
+    assert outcome.failure_code == "separator_model_root_invalid"
+
+
+def test_pilot_rejects_non_callable_seam(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    subset = _subset_path(tmp_path, fixture)
+    request = _request(tmp_path, fixture, subset)
+    with pytest.raises(TypeError, match="execution seams must be callable"):
+        run_oaf_separation_pilot(request, perf_counter="not-callable")  # type: ignore[arg-type]
+
+
+def test_pilot_rejects_non_request_type() -> None:
+    from src.benchmark.separation_pilot import run_oaf_separation_pilot
+
+    with pytest.raises(TypeError, match="request must be OafSeparationPilotRequest"):
+        run_oaf_separation_pilot("not-a-request")  # type: ignore[arg-type]

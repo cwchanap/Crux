@@ -35,6 +35,7 @@ from src.benchmark.muscriptor_comparison import (
     _parse_simfile_id,
     _parse_song_rows,
     _read_csv,
+    _report_identity_from_snapshot,
     _Reports,
     _RunEvidence,
     _RunIdentity,
@@ -1078,3 +1079,38 @@ def test_compare_wraps_os_error_as_integrity_error(tmp_path: Path, manifest_load
     )
     with pytest.raises(ComparisonIntegrityError):
         compare_oaf_muscriptor(request)
+
+
+def test_parse_metric_returns_parsed_value_for_non_bounded_field() -> None:
+    """_parse_metric returns the parsed Decimal for fields without range bounds."""
+    assert _parse_metric("0", "offset_ms") == Decimal("0")
+
+
+def test_parse_song_rows_succeeds_for_valid_csv(tmp_path: Path) -> None:
+    """_parse_song_rows returns a dict of score-keyed rows for a well-formed report."""
+    path = _write_songs(tmp_path, [_song_row()])
+    rows = _parse_song_rows(path, _identity(), {"1"})
+    key = ("1", 50, "raw")
+    assert key in rows
+    assert rows[key].precision == Decimal("0.5")
+
+
+def test_parse_class_rows_succeeds_for_valid_csv(tmp_path: Path) -> None:
+    """_parse_class_rows returns a dict of score-keyed rows for a well-formed report."""
+    path = _write_classes(tmp_path, [_class_row()])
+    rows = _parse_class_rows(path, _identity(), {"1"})
+    key = ("1", 50, "raw", "kick")
+    assert key in rows
+    assert rows[key].precision == Decimal("0.5")
+
+
+def test_report_identity_from_snapshot_rejects_unsupported_schema() -> None:
+    """An unknown schema triggers ComparisonIntegrityError."""
+    with pytest.raises(ComparisonIntegrityError, match="schema is unsupported"):
+        _report_identity_from_snapshot({"schema": "crux.unknown/v1"})
+
+
+def test_report_identity_from_snapshot_wraps_invalid_identity_as_integrity_error() -> None:
+    """A valid schema with missing identity fields is wrapped as ComparisonIntegrityError."""
+    with pytest.raises(ComparisonIntegrityError, match="cohort identity is invalid"):
+        _report_identity_from_snapshot({"schema": "crux.oaf-corpus-run/v1"})
