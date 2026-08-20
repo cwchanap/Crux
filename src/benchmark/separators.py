@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import math
 import os
@@ -12,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import weakref
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from io import BytesIO
@@ -941,6 +942,66 @@ def inventory_separator_model_root(
         ) from None
 
 
+_RUNTIME_PUBLICATION_LOCK_NAME = ".separator-publish.lock"
+
+
+@contextlib.contextmanager
+def _runtime_publication_lock(output: Path) -> Iterator[None]:
+    """Serialize multi-file runtime publication under one exclusive lock.
+
+    The lock+manifest pair must be published atomically so that a concurrent
+    freeze with the same environment but a different revision cannot observe a
+    stale ``environment_preexisting`` value and delete a manifest that belongs
+    to the winning freeze.
+    """
+    try:
+        import fcntl  # noqa: PLC0415 — lazy stdlib import; Unix-only
+    except ImportError as error:  # pragma: no cover — non-Unix platform
+        raise SeparatorExecutionError(
+            "separator_lock_publication_failed",
+            "separator publication locks are unsupported on this platform",
+        ) from error
+    lock_path = output.parent / _RUNTIME_PUBLICATION_LOCK_NAME
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
+    descriptor = -1
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | no_follow | close_on_exec,
+            0o600,
+        )
+        descriptor_metadata = os.fstat(descriptor)
+        path_metadata = lock_path.lstat()
+        if (
+            not stat.S_ISREG(descriptor_metadata.st_mode)
+            or not stat.S_ISREG(path_metadata.st_mode)
+            or descriptor_metadata.st_dev != path_metadata.st_dev
+            or descriptor_metadata.st_ino != path_metadata.st_ino
+        ):
+            raise OSError("publication lock is unavailable")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except OSError as error:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise SeparatorExecutionError(
+            "separator_lock_publication_failed",
+            "separator publication lock could not be acquired",
+        ) from error
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(descriptor)
+
+
 def freeze_separator_runtime(
     *,
     separator_id: str,
@@ -1003,24 +1064,30 @@ def freeze_separator_runtime(
     }
     lock_bytes = canonical_json_bytes(lock_payload, trailing_newline=True)
     environment_path = output.parent / "environment.json"
-    environment_preexisting = environment_path.exists()
-    try:
-        publish_immutable_file(environment_path, environment_bytes)
-        publish_immutable_file(output, lock_bytes)
-    except (ArtifactPublicationError, OSError, TypeError) as error:
-        # Only clean up environment.json when this invocation created it.
-        # publish_immutable_file treats identical existing bytes as reuse, so
-        # a pre-existing manifest must never be deleted when the lock publish
-        # conflicts — that would corrupt a previously valid runtime directory.
-        if not environment_preexisting:
-            try:
-                environment_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        raise SeparatorExecutionError(
-            "separator_lock_publication_failed",
-            "separator lock publication failed",
-        ) from error
+    # The exists-check and both publishes are serialized under one per-runtime
+    # lock so that the lock+manifest pair is the atomic publication unit.  A
+    # concurrent freeze with the same environment but a different revision
+    # cannot observe a stale environment_preexisting value and delete a manifest
+    # that belongs to the winning freeze.
+    with _runtime_publication_lock(output):
+        environment_preexisting = environment_path.exists()
+        try:
+            publish_immutable_file(environment_path, environment_bytes)
+            publish_immutable_file(output, lock_bytes)
+        except (ArtifactPublicationError, OSError, TypeError) as error:
+            # Only clean up environment.json when this invocation created it.
+            # publish_immutable_file treats identical existing bytes as reuse, so
+            # a pre-existing manifest must never be deleted when the lock publish
+            # conflicts — that would corrupt a previously valid runtime directory.
+            if not environment_preexisting:
+                try:
+                    environment_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise SeparatorExecutionError(
+                "separator_lock_publication_failed",
+                "separator lock publication failed",
+            ) from error
 
     attested = attest_separator_runtime(output, interpreter, model_root)
     try:
