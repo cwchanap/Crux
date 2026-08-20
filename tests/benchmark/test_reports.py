@@ -591,6 +591,37 @@ def test_read_cohort_reports_rejects_per_class_for_unexpected_combination(
         read_cohort_reports(tmp_path, expected_identity=_identity())
 
 
+def test_read_cohort_reports_rejects_per_class_missing_combination(
+    tmp_path: Path,
+) -> None:
+    write_cohort_reports(_result(), tmp_path)
+
+    # Drop every per_class row for one valid (simfile_id, tolerance, mode)
+    # combination.  The remaining rows still reference valid combinations,
+    # and song "1" keeps a consistent class set across its remaining combo,
+    # so the subset check and the per-song consistency check alone would not
+    # catch the truncation.
+    path = tmp_path / "per_class.csv"
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames
+        rows = list(reader)
+    kept = [
+        row
+        for row in rows
+        if not (
+            row["simfile_id"] == "1" and row["tolerance_ms"] == "50" and row["mode"] == "aligned"
+        )
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(kept)
+
+    with pytest.raises(ReportIntegrityError, match="missing a score combination"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
 def test_read_cohort_reports_rejects_inconsistent_per_song_class_set(
     tmp_path: Path,
 ) -> None:
