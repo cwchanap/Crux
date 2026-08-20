@@ -44,6 +44,7 @@ muscriptor = ["muscriptor==0.3.0"]
 [project.scripts]
 convert-checkpoint = "src.cli.convert:main"
 crux = "src.cli.main:main"
+freeze-separator-runtime = "src.cli.freeze_separator_runtime:main"
 
 [build-system]
 requires = ["hatchling"]

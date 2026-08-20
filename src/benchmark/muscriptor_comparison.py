@@ -662,17 +662,6 @@ def _selected_rows[T](rows: Mapping[T, object], selected_ids: set[str] | None) -
 
 
 # The model-neutral comparison implementation lives in published_comparison.py.
-_metric_delta = _metric_delta
-_csv_decimal = _csv_decimal
-_paired_song_rows = _paired_song_rows
-_paired_class_rows = _paired_class_rows
-_aggregate_rows = _aggregate_rows
-_population = _population
-_runtime = _runtime
-_summary = _summary
-_write_csv = _write_csv
-_markdown_metric = _markdown_metric
-_write_markdown = _write_markdown
 
 
 def compare_oaf_muscriptor(request: ComparisonRequest) -> ComparisonOutcome:
@@ -689,16 +678,6 @@ def compare_oaf_muscriptor(request: ComparisonRequest) -> ComparisonOutcome:
         )
         muscriptor = _load_evidence(
             request.muscriptor_run_path,
-            expected_backend_id=MUSCRIPTOR_BACKEND_ID,
-            argument="--muscriptor-run",
-        )
-        _validate_backend_family(
-            oaf.identity,
-            expected_backend_id=OAF_BACKEND_ID,
-            argument="--oaf-run",
-        )
-        _validate_backend_family(
-            muscriptor.identity,
             expected_backend_id=MUSCRIPTOR_BACKEND_ID,
             argument="--muscriptor-run",
         )
@@ -761,4 +740,10 @@ __all__ = [
     "ComparisonOutcome",
     "ComparisonRequest",
     "compare_oaf_muscriptor",
+    "_aggregate_rows",
+    "_csv_decimal",
+    "_markdown_metric",
+    "_metric_delta",
+    "_population",
+    "_runtime",
 ]

@@ -1276,7 +1276,7 @@ def test_other_fatal_preflight_cases_never_call_public_control(
         "src.benchmark.separation_pilot.SEPARATOR_LOCK_PATHS",
         {
             SPLEETER_SEPARATOR_ID: tmp_path / "missing-spleeter-lock.json",
-            HTDEMUCS_SEPARATOR_ID: FIXTURE_ROOT / "htdemucs-model.json",
+            HTDEMUCS_SEPARATOR_ID: FIXTURE_ROOT / "htdemucs" / "model.json",
         },
     )
     outcome = _run_with_runtime_sentinels(run_oaf_separation_pilot, request)

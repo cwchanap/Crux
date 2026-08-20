@@ -865,7 +865,7 @@ def test_run_oaf_separation_pilot_command_builds_request_and_propagates_partial_
     demucs_model_root.mkdir()
     captured: list[object] = []
     run_path = output_dir / "runs" / "pilot" / "run.json"
-    monkeypatch.setattr(benchmark_module, "_current_crux_commit", lambda: "a" * 40, raising=False)
+    monkeypatch.setattr(benchmark_module, "_current_crux_commit", lambda: "a" * 40)
 
     def fake_run(request: object) -> pilot_module.OafSeparationPilotOutcome:
         captured.append(request)
@@ -1176,6 +1176,7 @@ def test_finalize_oaf_separation_pilot_command_publishes_manifest_summary(
         "exit_code": 0,
         "manifest_path": str(published_path),
         "manifest_sha256": "a" * 64,
+        "failure_reason": None,
     }
 
 
@@ -1214,11 +1215,11 @@ def test_finalize_oaf_separation_pilot_command_rejects_unpublished_success(
     )
 
     assert result.exit_code == 2
-    assert json.loads(result.output) == {
-        "exit_code": 2,
-        "manifest_path": None,
-        "manifest_sha256": None,
-    }
+    payload = json.loads(result.output)
+    assert payload["exit_code"] == 2
+    assert payload["manifest_path"] is None
+    assert payload["manifest_sha256"] is None
+    assert payload["failure_reason"] is None
 
 
 def test_prepare_reviewed_subset_command_builds_request_and_emits_canonical_summary(

@@ -158,6 +158,29 @@ def test_prediction_matchers_accept_a_non_full_mix_view_and_explicit_row_policy(
     )
 
 
+def test_prediction_artifact_matches_run_row_when_input_view_id_missing_from_row() -> None:
+    prediction = _muscriptor_prediction()
+    derived_audio = replace(
+        prediction.audio,
+        input_view_id="crux.oaf-spleeter4-drums-mono44k1-pcm16/v1",
+        input_audio_sha256="c" * 64,
+    )
+    artifact = read_prediction_artifact(
+        render_prediction_artifact(replace(prediction, audio=derived_audio))
+    )
+    row = {
+        "prediction_artifact_sha256": artifact.artifact_sha256,
+        "source_audio_id": "song",
+        "source_audio_sha256": "f" * 64,
+        "input_audio_sha256": "c" * 64,
+    }
+    assert prediction_artifact_matches_run_row(
+        artifact,
+        row,
+        expected_input_view_id="crux.oaf-spleeter4-drums-mono44k1-pcm16/v1",
+    )
+
+
 @pytest.mark.parametrize(
     "change",
     [

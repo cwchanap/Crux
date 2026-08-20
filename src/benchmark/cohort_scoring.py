@@ -301,6 +301,8 @@ def cohort_item_from_validated_prediction_artifact(
     warnings: tuple[str, ...] = (),
 ) -> CohortItem:
     """Adapt a validated persisted artifact for the scorer's item identity."""
+    if not isinstance(prediction, PredictionArtifact):
+        raise TypeError("prediction must be PredictionArtifact")
     scorer_artifact = prediction
     if prediction.prediction.audio.source_audio_id != simfile_id:
         scorer_audio = replace(prediction.prediction.audio, source_audio_id=simfile_id)
@@ -1118,6 +1120,8 @@ __all__ = [
     "CohortItem",
     "coverage_from_artifacts",
     "cohort_item_from_artifacts",
+    "cohort_item_from_validated_prediction_artifact",
+    "cohort_item_without_prediction",
     "validate_cohort_items",
     "score_cohort",
     "_score_success_items",

@@ -264,6 +264,15 @@ class OafSeparationPilotOutcome:
             raise ValueError("failure_code is invalid")
 
 
+@dataclass(frozen=True)
+class DerivedViewResult:
+    """Result of one derived view execution: backend state, stop signal, invocation flag."""
+
+    backend: object | None
+    stop_disposition: str | None
+    separator_invocation_attempted: bool
+
+
 class SeparationRunError(ValueError):
     """A malformed or inconsistent HPA-328 run snapshot."""
 
@@ -1052,7 +1061,7 @@ def _derived_cohort_identity(
     cohort_id = sha256(
         canonical_json_bytes(
             {
-                "parent_oaf_run_id": run_id,
+                "separation_run_id": run_id,
                 "input_view_id": input_view_id,
             }
         )
@@ -1498,14 +1507,13 @@ def _execute_derived_view(
     separator_runner: Callable[..., object],
     backend_factory: Callable[..., object],
     backend: object | None,
-    backend_ref: list[object | None],
     descriptor: BackendDescriptor,
     perf_counter: Callable[[], float],
-    stop_disposition: list[str],
     separator_invocation_attempted: list[bool],
-) -> object | None:
+) -> DerivedViewResult:
     """Execute one fixed view for one member and checkpoint each boundary."""
-    backend_ref[0] = backend
+    stop_disposition_value: str | None = None
+    invocation_attempted = False
     view = item.get(view_name)
     if not isinstance(view, dict):
         raise SeparationRunError("derived view row is invalid")
@@ -1541,6 +1549,7 @@ def _execute_derived_view(
             view["stem"] = dict(raw_stem)
             runtime_evidence["separator_cache_hit"] = True
         else:
+            invocation_attempted = True
             separator_invocation_attempted[0] = True
             stem = separator_runner(
                 source.path,
@@ -1579,7 +1588,11 @@ def _execute_derived_view(
             runtime=runtime_evidence,
         )
         write_oaf_separation_run(run_path, snapshot)
-        return backend
+        return DerivedViewResult(
+            backend=backend,
+            stop_disposition=stop_disposition_value,
+            separator_invocation_attempted=invocation_attempted,
+        )
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         elapsed = max(0.0, perf_counter() - separator_started)
         runtime_evidence.update({"separator_wall_time_sec": elapsed})
@@ -1590,11 +1603,17 @@ def _execute_derived_view(
             runtime=runtime_evidence,
         )
         write_oaf_separation_run(run_path, snapshot)
-        return backend
+        return DerivedViewResult(
+            backend=backend,
+            stop_disposition=stop_disposition_value,
+            separator_invocation_attempted=invocation_attempted,
+        )
 
     runtime_evidence["separator_wall_time_sec"] = max(0.0, perf_counter() - separator_started)
     runtime_evidence["separator_rtf"] = (
         runtime_evidence["separator_wall_time_sec"] / source.duration_sec
+        if source.duration_sec > 0
+        else None
     )
     if isinstance(prior_view, Mapping):
         prior_runtime = prior_view.get("runtime")
@@ -1645,7 +1664,11 @@ def _execute_derived_view(
         )
         write_oaf_separation_run(run_path, snapshot)
         canonical_path.unlink(missing_ok=True)
-        return backend
+        return DerivedViewResult(
+            backend=backend,
+            stop_disposition=stop_disposition_value,
+            separator_invocation_attempted=invocation_attempted,
+        )
 
     prediction_target = prediction_path(
         run_dir.parent.parent,
@@ -1668,7 +1691,11 @@ def _execute_derived_view(
         )
         write_oaf_separation_run(run_path, snapshot)
         canonical_path.unlink(missing_ok=True)
-        return backend
+        return DerivedViewResult(
+            backend=backend,
+            stop_disposition=stop_disposition_value,
+            separator_invocation_attempted=invocation_attempted,
+        )
 
     if existing_content is not None:
         if not request.resume:
@@ -1680,7 +1707,11 @@ def _execute_derived_view(
             )
             write_oaf_separation_run(run_path, snapshot)
             canonical_path.unlink(missing_ok=True)
-            return backend
+            return DerivedViewResult(
+                backend=backend,
+                stop_disposition=stop_disposition_value,
+                separator_invocation_attempted=invocation_attempted,
+            )
         prior_prediction = prior_view.get("prediction") if isinstance(prior_view, Mapping) else None
         prior_artifact_sha = (
             prior_prediction.get("artifact_sha256")
@@ -1698,7 +1729,11 @@ def _execute_derived_view(
             )
             write_oaf_separation_run(run_path, snapshot)
             canonical_path.unlink(missing_ok=True)
-            return backend
+            return DerivedViewResult(
+                backend=backend,
+                stop_disposition=stop_disposition_value,
+                separator_invocation_attempted=invocation_attempted,
+            )
         try:
             artifact = read_prediction_artifact(existing_content)
         except (PredictionArtifactError, StrictJsonError, TypeError, ValueError):
@@ -1710,7 +1745,11 @@ def _execute_derived_view(
             )
             write_oaf_separation_run(run_path, snapshot)
             canonical_path.unlink(missing_ok=True)
-            return backend
+            return DerivedViewResult(
+                backend=backend,
+                stop_disposition=stop_disposition_value,
+                separator_invocation_attempted=invocation_attempted,
+            )
         prior_row = (
             _prediction_row_from_view(prior_item, prior_view)
             if isinstance(prior_item, Mapping) and isinstance(prior_view, Mapping)
@@ -1730,7 +1769,11 @@ def _execute_derived_view(
             )
             write_oaf_separation_run(run_path, snapshot)
             canonical_path.unlink(missing_ok=True)
-            return backend
+            return DerivedViewResult(
+                backend=backend,
+                stop_disposition=stop_disposition_value,
+                separator_invocation_attempted=invocation_attempted,
+            )
         if not prediction_artifact_matches_audio(
             artifact,
             source_audio_id=source.source_audio_id,
@@ -1747,7 +1790,11 @@ def _execute_derived_view(
             )
             write_oaf_separation_run(run_path, snapshot)
             canonical_path.unlink(missing_ok=True)
-            return backend
+            return DerivedViewResult(
+                backend=backend,
+                stop_disposition=stop_disposition_value,
+                separator_invocation_attempted=invocation_attempted,
+            )
         prior_runtime = prior_view.get("runtime") if isinstance(prior_view, Mapping) else None
         if isinstance(prior_runtime, Mapping):
             runtime_evidence.update(dict(prior_runtime))
@@ -1760,7 +1807,11 @@ def _execute_derived_view(
         view["runtime"] = runtime_evidence
         write_oaf_separation_run(run_path, snapshot)
         canonical_path.unlink(missing_ok=True)
-        return backend
+        return DerivedViewResult(
+            backend=backend,
+            stop_disposition=stop_disposition_value,
+            separator_invocation_attempted=invocation_attempted,
+        )
 
     try:
         if backend is None:
@@ -1770,7 +1821,6 @@ def _execute_derived_view(
                     timeout_seconds=OAF_CORPUS_REQUEST_TIMEOUT_SECONDS,
                     close_timeout_seconds=OAF_WORKER_CLOSE_TIMEOUT_SECONDS,
                 )
-                backend_ref[0] = backend
                 actual_descriptor = backend.descriptor()  # type: ignore[attr-defined]
                 if not isinstance(actual_descriptor, BackendDescriptor) or (
                     actual_descriptor.sha256 != descriptor.sha256
@@ -1823,9 +1873,8 @@ def _execute_derived_view(
         if disposition in {"poison", "fatal_preflight"}:
             backend_to_close = backend
             backend = None
-            backend_ref[0] = None
             _close_backend(backend_to_close)
-            stop_disposition.append(disposition)
+            stop_disposition_value = disposition
     except (ArtifactPublicationError, PredictionArtifactError):
         _set_view_failure(
             view,
@@ -1843,17 +1892,20 @@ def _execute_derived_view(
     finally:
         write_oaf_separation_run(run_path, snapshot)
         canonical_path.unlink(missing_ok=True)
-    backend_ref[0] = backend
-    return backend
+    return DerivedViewResult(
+        backend=backend,
+        stop_disposition=stop_disposition_value,
+        separator_invocation_attempted=invocation_attempted,
+    )
 
 
 def run_oaf_separation_pilot(
     request: OafSeparationPilotRequest,
     *,
-    backend_factory: object | None = None,
-    spleeter_runner: object | None = None,
-    htdemucs_runner: object | None = None,
-    perf_counter: object | None = None,
+    backend_factory: Callable[..., object] | None = None,
+    spleeter_runner: Callable[..., object] | None = None,
+    htdemucs_runner: Callable[..., object] | None = None,
+    perf_counter: Callable[[], float] | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> OafSeparationPilotOutcome:
     """Run the frozen full-mix control plus both fixed derived OaF views."""
@@ -1875,7 +1927,6 @@ def run_oaf_separation_pilot(
     ):
         raise TypeError("execution seams must be callable")
     backend: object | None = None
-    backend_ref: list[object | None] = [None]
     runtimes: dict[str, AttestedSeparatorRuntime] = {}
     run_path: Path | None = None
     snapshot: dict[str, object] | None = None
@@ -2035,15 +2086,14 @@ def run_oaf_separation_pilot(
             for row in prior_items
             if isinstance(row, Mapping) and isinstance(row.get("simfile_id"), int)
         }
-        stop_disposition: list[str] = []
+        disposition: str | None = None
         for item in rows:
             simfile_id = item.get("simfile_id")
             source = sources.get(simfile_id) if isinstance(simfile_id, int) else None
             if source is None:
                 raise SeparationRunError("resolved source is unavailable")
             prior_item = prior_by_id.get(simfile_id)
-            stop_disposition.clear()
-            backend = _execute_derived_view(
+            result = _execute_derived_view(
                 request,
                 run_path,
                 run_dir,
@@ -2056,19 +2106,18 @@ def run_oaf_separation_pilot(
                 inference_config=view_configs["spleeter"][0],
                 inference_config_sha=view_configs["spleeter"][1],
                 prior_item=prior_item,
-                separator_runner=selected_spleeter_runner,  # type: ignore[arg-type]
+                separator_runner=selected_spleeter_runner,
                 backend_factory=bound_backend_factory,
                 backend=backend,
-                backend_ref=backend_ref,
                 descriptor=descriptor,
-                perf_counter=selected_perf_counter,  # type: ignore[arg-type]
-                stop_disposition=stop_disposition,
+                perf_counter=selected_perf_counter,
                 separator_invocation_attempted=separator_invocation_attempted,
             )
-            if stop_disposition:
+            backend = result.backend
+            if result.stop_disposition is not None:
+                disposition = result.stop_disposition
                 break
-            stop_disposition.clear()
-            backend = _execute_derived_view(
+            result = _execute_derived_view(
                 request,
                 run_path,
                 run_dir,
@@ -2081,18 +2130,17 @@ def run_oaf_separation_pilot(
                 inference_config=view_configs["htdemucs"][0],
                 inference_config_sha=view_configs["htdemucs"][1],
                 prior_item=prior_item,
-                separator_runner=selected_htdemucs_runner,  # type: ignore[arg-type]
+                separator_runner=selected_htdemucs_runner,
                 backend_factory=bound_backend_factory,
                 backend=backend,
-                backend_ref=backend_ref,
                 descriptor=descriptor,
-                perf_counter=selected_perf_counter,  # type: ignore[arg-type]
-                stop_disposition=stop_disposition,
+                perf_counter=selected_perf_counter,
                 separator_invocation_attempted=separator_invocation_attempted,
             )
-            if stop_disposition:
+            backend = result.backend
+            if result.stop_disposition is not None:
+                disposition = result.stop_disposition
                 break
-        disposition = stop_disposition[0] if stop_disposition else None
         if disposition is not None:
             _mark_outstanding_derived_views(snapshot)
             snapshot["overall_status"] = "failed" if disposition == "fatal_preflight" else "partial"
@@ -2206,7 +2254,7 @@ def run_oaf_separation_pilot(
                 pass
         raise
     finally:
-        _close_backend(backend_ref[0])
+        _close_backend(backend)
         for runtime in runtimes.values():
             runtime.close()
 

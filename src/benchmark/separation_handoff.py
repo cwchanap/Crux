@@ -167,6 +167,7 @@ class FinalizeSeparationPilotRequest:
 class FinalizeSeparationPilotOutcome:
     exit_code: Literal[0, 2]
     manifest: object | None
+    failure_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -618,6 +619,9 @@ def _recorded_artifact_path(
             raise AssertionError("unreachable")
         root = owner_root
     elif field.endswith(".prediction"):
+        if len(run_path.parents) < 3:
+            _fail(f"{field} retained prediction owner root is unavailable")
+            raise AssertionError("unreachable")
         root = run_path.parents[2]
     else:
         _fail(f"{field} has no retained artifact owner")
@@ -821,14 +825,14 @@ def _view_payload(
     }
     # Run-level statuses are checked again on the self-contained row.  This
     # keeps the finalizer from publishing a row that was merely pending.
+    if field in _DERIVED_VIEW_NAMES and status == "pending":
+        _fail(f"{field} remains pending")
     _validate_view(
         view,
         field=field,
         source_audio_id=source_audio_id,
         source_audio_sha256=source_audio_sha256,
     )
-    if field in _DERIVED_VIEW_NAMES and status == "pending":
-        _fail(f"{field} remains pending")
     if successful and prediction_payload is None:
         _fail(f"successful {field} prediction evidence is missing")
     return view
@@ -953,7 +957,7 @@ def _build_rows(
         _fail("run snapshot schema is invalid")
     if snapshot.get("overall_status") not in {"complete", "partial"}:
         _fail("run snapshot is not closed")
-    if not isinstance(subset, object) or not hasattr(subset, "rows"):
+    if not hasattr(subset, "rows"):
         _fail("reviewed subset manifest is invalid")
     subset_rows = getattr(subset, "rows")
     subset_by_id: dict[int, Mapping[str, object]] = {}
@@ -1220,8 +1224,8 @@ def finalize_separation_pilot(
         StrictJsonError,
         TypeError,
         ValueError,
-    ):
-        return FinalizeSeparationPilotOutcome(exit_code=2, manifest=None)
+    ) as error:
+        return FinalizeSeparationPilotOutcome(exit_code=2, manifest=None, failure_reason=str(error))
 
 
 __all__ = [

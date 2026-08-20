@@ -83,9 +83,13 @@ The manifest contains no absolute paths and records:
 
 `src/benchmark/separator_environment_probe.py` is the sole implementation of
 environment discovery. It is a standalone standard-library-only program with
-no `src` imports, invoked by the resolved isolated interpreter and returning
-canonical JSON on stdout. Both freezing and live attestation use that same
-probe; neither reimplements distribution discovery.
+no `src` imports, invoked by the resolved isolated interpreter with `-I`
+(ignore user site, isolated mode) and returning canonical JSON on stdout. The
+probe subprocess is launched with `timeout=SEPARATOR_TIMEOUT_SECONDS`; a
+timeout or non-zero exit code is a probe failure, but diagnostic output on
+stderr alone does not reject an otherwise successful probe. Both freezing and
+live attestation use that same probe; neither reimplements distribution
+discovery.
 
 The probe treats a distribution's `RECORD` as membership/path metadata only:
 
@@ -105,8 +109,12 @@ The probe treats a distribution's `RECORD` as membership/path metadata only:
 
 The probe uses no-follow descriptor-relative reads and fails on malformed
 metadata, traversal, missing files, any parent or leaf symlink, unstable file
-identity, or nondeterministic output. Host-side model-root traversal follows
-the existing descriptor-bound/no-follow pattern in `input_view.py` rather than
+identity, or nondeterministic output. `O_NOFOLLOW` and directory-fd support are
+validated independently: `_require_no_follow_support` checks only `O_NOFOLLOW`
+and is used by `_open_root` and `_hash_absolute_file`; `_require_dir_fd_support`
+checks `os.open` in `os.supports_dir_fd` and is used only by `_open_relative`.
+Host-side model-root traversal follows the existing descriptor-bound/no-follow
+pattern in `input_view.py` rather than
 using `Path.rglob`; a narrow helper may be extracted beside that pattern if
 needed, but no second generic tree framework is introduced.
 
@@ -138,7 +146,10 @@ separator invocation, so an un-inventoried file cannot influence it.
 
 ## Freeze flow
 
-`scripts/freeze_separator_runtime.py` evolves to require:
+`src/benchmark/separators.py` exposes `freeze_separator_runtime` as the public
+freeze entry point. `src/cli/freeze_separator_runtime.py` owns the CLI parser
+and error reporting; `scripts/freeze_separator_runtime.py` remains as a thin
+wrapper for direct invocation. The freeze entry point requires:
 
 - an isolated interpreter;
 - an explicit `--model-root`;
@@ -153,6 +164,15 @@ It resolves and hashes the interpreter, invokes the standalone probe, validates
 the complete policy-owned model root, writes the immutable sibling manifest and
 v2 lock, then round-trips them through `attest_separator_runtime`. The freezer
 never installs packages, downloads models, or runs inference.
+
+### Atomic lock and companion publication
+
+The sibling `environment.json` and the v2 `model.json` lock are published as a
+pair. If the lock publication fails after the companion manifest has been
+written, the freezer removes the orphaned `environment.json` before raising
+`SeparatorExecutionError` with code `separator_lock_publication_failed`. This
+prevents a downstream attester from observing a companion manifest without its
+matching lock.
 
 ## Single live attestation authority
 

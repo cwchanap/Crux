@@ -95,8 +95,13 @@ def _require_directory(metadata: os.stat_result) -> None:
 
 
 def _require_no_follow_support() -> None:
-    if _NOFOLLOW is None or not _NOFOLLOW or os.open not in getattr(os, "supports_dir_fd", ()):
+    if _NOFOLLOW is None or not _NOFOLLOW:
         raise _ProbeError("descriptor no-follow support is unavailable")
+
+
+def _require_dir_fd_support() -> None:
+    if os.open not in getattr(os, "supports_dir_fd", ()):
+        raise _ProbeError("descriptor directory-fd support is unavailable")
 
 
 def _read_hash_fd(
@@ -140,6 +145,7 @@ def _open_root(path: Path) -> tuple[int, tuple[int, ...]]:
 
 def _open_relative(root_descriptor: int, parts: tuple[str, ...]) -> int:
     _require_no_follow_support()
+    _require_dir_fd_support()
     if not parts:
         raise _ProbeError("relative file path is empty")
     current = os.dup(root_descriptor)
@@ -665,6 +671,9 @@ def main() -> int:
         payload = build_environment_manifest()
         sys.stdout.buffer.write(canonical_json_bytes(payload, trailing_newline=True))
         return 0
+    except _ProbeError as error:
+        sys.stderr.write(f"{error}\n")
+        return 1
     except Exception:
         sys.stderr.write("separator_environment_probe_failed\n")
         return 1
