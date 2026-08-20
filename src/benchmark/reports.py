@@ -1304,18 +1304,28 @@ def read_cohort_reports(
     if actual_song_keys != expected_song_keys:
         _report_error("per_song score grid is incomplete")
     common_classes = {cls.common_class for aggregate in aggregates for cls in aggregate.per_class}
-    expected_class_keys = {
-        (simfile_id, tolerance_ms, mode, common_class)
-        for simfile_id in successful_ids
-        for tolerance_ms in parsed_tolerances
-        for mode in _MODES
-        for common_class in common_classes
-    }
-    actual_class_keys = {
-        (row.simfile_id, row.tolerance_ms, row.mode, row.common_class) for row in classes
-    }
-    if actual_class_keys != expected_class_keys:
-        _report_error("per_class score grid is incomplete")
+    # Per-class rows are song-scoped: the scorer emits one row per class
+    # present in each individual ScoreResult, so heterogeneous cohorts
+    # legitimately omit classes that a given song does not contain.  Validate
+    # that each row references a valid score combination and a known aggregate
+    # class, and that each song's class set is consistent across its
+    # tolerances and modes — but do not cross-product every song with the
+    # cohort-wide class union.
+    if any(row.common_class not in common_classes for row in classes):
+        _report_error("per_class report contains a class absent from aggregates")
+    class_combo_keys = {(row.simfile_id, row.tolerance_ms, row.mode) for row in classes}
+    if not class_combo_keys <= expected_song_keys:
+        _report_error("per_class report contains an unexpected score combination")
+    per_combo_classes: dict[tuple[str, int, str], set[str]] = {}
+    for row in classes:
+        per_combo_classes.setdefault((row.simfile_id, row.tolerance_ms, row.mode), set()).add(
+            row.common_class
+        )
+    per_song_class_sets: dict[str, set[frozenset[str]]] = {}
+    for (simfile_id, _tolerance, _mode), class_set in per_combo_classes.items():
+        per_song_class_sets.setdefault(simfile_id, set()).add(frozenset(class_set))
+    if any(len(class_sets) != 1 for class_sets in per_song_class_sets.values()):
+        _report_error("per_class class set is inconsistent across tolerances or modes")
     return PublishedCohortReports(
         identity=identity,
         population=population,

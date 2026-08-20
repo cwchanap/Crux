@@ -499,3 +499,114 @@ def test_read_cohort_reports_rejects_noncanonical_csv_numbers(
 
     with pytest.raises(ReportIntegrityError, match="canonical"):
         read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def _add_snare_to_aggregate_per_class(artifacts_dir: Path) -> None:
+    """Add a snare class to the aggregate per_class in summary.json."""
+    summary = strict_json_loads(
+        (artifacts_dir / "summary.json").read_bytes(), require_canonical=True
+    )
+    for aggregate in summary["aggregates"]:
+        aggregate["per_class"] = sorted(
+            [*aggregate["per_class"], _snare_aggregate_class()],
+            key=lambda entry: entry["common_class"],
+        )
+    (artifacts_dir / "summary.json").write_bytes(canonical_json_bytes(summary))
+
+
+def _snare_aggregate_class() -> dict[str, object]:
+    return {
+        "common_class": "snare",
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "precision": None,
+        "recall": None,
+        "f1": None,
+        "reference_support": 0,
+        "prediction_support": 0,
+    }
+
+
+def _per_class_row(simfile_id: str, common_class: str) -> str:
+    identity = _identity()
+    return (
+        f"{identity.cohort_id},{identity.model_id},{identity.model_lock_sha256},"
+        f"{identity.prediction_map_version},{identity.input_view_id},"
+        f"{identity.scoring_version},{simfile_id},50,raw,{common_class},"
+        "0,0,0,0,0,,,"
+    )
+
+
+def test_read_cohort_reports_accepts_heterogeneous_per_class(tmp_path: Path) -> None:
+    """A song may omit classes that another song in the cohort contains."""
+    write_cohort_reports(_result(), tmp_path)
+    _add_snare_to_aggregate_per_class(tmp_path)
+
+    # Add snare rows for song "1" under both modes; songs "2" and "4" remain
+    # kick-only.  The class set for song "1" is {kick, snare} across both
+    # tolerances/modes, while songs "2" and "4" have {kick} — a valid
+    # heterogeneous cohort.
+    path = tmp_path / "per_class.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    snare_raw = _per_class_row("1", "snare")
+    snare_aligned = _per_class_row("1", "snare").replace(",50,raw,", ",50,aligned,")
+    path.write_text(
+        "\n".join([lines[0], lines[1], snare_raw, snare_aligned, *lines[2:]]) + "\n",
+        encoding="utf-8",
+    )
+
+    reports = read_cohort_reports(tmp_path, expected_identity=_identity())
+
+    assert {row.common_class for row in reports.classes} == {"kick", "snare"}
+    assert {row.simfile_id for row in reports.classes if row.common_class == "snare"} == {"1"}
+
+
+def test_read_cohort_reports_rejects_per_class_absent_from_aggregates(
+    tmp_path: Path,
+) -> None:
+    write_cohort_reports(_result(), tmp_path)
+
+    path = tmp_path / "per_class.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    extra = _per_class_row("1", "snare")
+    path.write_text("\n".join([lines[0], lines[1], extra, *lines[2:]]) + "\n", encoding="utf-8")
+
+    with pytest.raises(ReportIntegrityError, match="absent from aggregates"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_per_class_for_unexpected_combination(
+    tmp_path: Path,
+) -> None:
+    write_cohort_reports(_result(), tmp_path)
+
+    path = tmp_path / "per_class.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    # Tolerance 999 is not in the published tolerances.
+    bad_row = _per_class_row("1", "kick").replace(",50,raw,", ",999,raw,")
+    path.write_text("\n".join([lines[0], lines[1], bad_row, *lines[2:]]) + "\n", encoding="utf-8")
+
+    with pytest.raises(ReportIntegrityError, match="unexpected score combination"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_read_cohort_reports_rejects_inconsistent_per_song_class_set(
+    tmp_path: Path,
+) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    _add_snare_to_aggregate_per_class(tmp_path)
+
+    # The fixture already has both raw and aligned modes.  Add snare for
+    # song "1" under raw only — the class set for song "1" becomes
+    # {kick, snare} for raw but {kick} for aligned, which is inconsistent.
+    path = tmp_path / "per_class.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    snare_raw = _per_class_row("1", "snare")
+    path.write_text(
+        "\n".join([lines[0], lines[1], snare_raw, *lines[2:]]) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReportIntegrityError, match="inconsistent"):
+        read_cohort_reports(tmp_path, expected_identity=_identity())

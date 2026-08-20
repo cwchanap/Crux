@@ -117,6 +117,105 @@ def _synthetic_environment(
     return interpreter, purelib
 
 
+def _venv_scripts(interpreter: Path) -> Path:
+    return Path(
+        subprocess.check_output(
+            [
+                str(interpreter),
+                "-c",
+                "import sysconfig; print(sysconfig.get_paths()['scripts'])",
+            ],
+            text=True,
+        ).strip()
+    )
+
+
+def _write_console_script(
+    purelib: Path,
+    scripts: Path,
+    package_name: str,
+    package_version: str,
+) -> Path:
+    """Write a distribution whose RECORD references a console script in scripts.
+
+    Mirrors the layout that ``pip install`` produces: the console-entry-point
+    wrapper is installed into the scheme's scripts directory, and its RECORD
+    entry uses a relative path with ``..`` components to escape the
+    distribution root (``purelib``) before landing in ``scripts``.
+    """
+    package_dir = purelib / package_name
+    package_dir.mkdir()
+    init_path = package_dir / "__init__.py"
+    init_path.write_text("__version__ = '2.4.2'\n", encoding="utf-8")
+
+    distribution_dir = purelib / f"{package_name}-{package_version}.dist-info"
+    distribution_dir.mkdir()
+    metadata_path = distribution_dir / "METADATA"
+    metadata_path.write_text(
+        f"Metadata-Version: 2.1\nName: {package_name}\nVersion: {package_version}\n",
+        encoding="utf-8",
+    )
+
+    scripts.mkdir(parents=True, exist_ok=True)
+    console_script_path = scripts / package_name
+    console_script_path.write_text(
+        f"#!/usr/bin/env python\nimport {package_name}\n{package_name}.main()\n",
+        encoding="utf-8",
+    )
+
+    record_path = distribution_dir / "RECORD"
+    rows: list[list[str]] = []
+    for file_path in (init_path, metadata_path):
+        relative_path = file_path.relative_to(purelib).as_posix()
+        content = file_path.read_bytes()
+        rows.append(
+            [
+                relative_path,
+                f"sha256={_distribution_file_digest(content)}",
+                str(len(content)),
+            ]
+        )
+    # Console script: path relative to purelib (the directory containing
+    # .dist-info) uses ".." to reach the scripts directory.
+    script_relative = os.path.relpath(console_script_path, purelib).replace(os.sep, "/")
+    script_content = console_script_path.read_bytes()
+    rows.append(
+        [
+            script_relative,
+            f"sha256={_distribution_file_digest(script_content)}",
+            str(len(script_content)),
+        ]
+    )
+    rows.append([record_path.relative_to(purelib).as_posix(), "", ""])
+    with record_path.open("w", encoding="utf-8", newline="") as stream:
+        csv.writer(stream, lineterminator="\n").writerows(rows)
+    return console_script_path
+
+
+def _synthetic_environment_with_console_script(
+    tmp_path: Path,
+    *,
+    package_name: str = "spleeter",
+    package_version: str = "2.4.2",
+) -> tuple[Path, Path, Path]:
+    environment = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=False, symlinks=False).create(environment)
+    interpreter = _venv_interpreter(environment)
+    purelib = Path(
+        subprocess.check_output(
+            [
+                str(interpreter),
+                "-c",
+                "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+            ],
+            text=True,
+        ).strip()
+    )
+    scripts = _venv_scripts(interpreter)
+    console_script = _write_console_script(purelib, scripts, package_name, package_version)
+    return interpreter, purelib, console_script
+
+
 def _run_probe(interpreter: Path) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         [str(interpreter), str(PROBE_PATH)],
@@ -182,6 +281,57 @@ def test_probe_emits_canonical_manifest_with_synthetic_distribution(tmp_path: Pa
     synthetic = next(item for item in distributions if item["name"] == "spleeter")
     assert synthetic["version"] == "2.4.2"
     files = {item["path"]: item for item in synthetic["files"]}
+    for relative_path in (
+        "spleeter/__init__.py",
+        "spleeter-2.4.2.dist-info/METADATA",
+        "spleeter-2.4.2.dist-info/RECORD",
+    ):
+        content = (purelib / relative_path).read_bytes()
+        assert files[relative_path] == {
+            "root": "purelib",
+            "path": relative_path,
+            "byte_length": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+
+
+def test_probe_inventories_console_script_in_scripts_root(tmp_path: Path) -> None:
+    """A console script referenced via a cross-root RECORD path is inventoried.
+
+    Installer-generated RECORD files reference console-entry-point wrappers
+    in the scripts directory using relative paths with ``..`` components that
+    escape the distribution root.  The probe must normalize these paths,
+    classify them under the ``scripts`` root, and verify them without
+    rejecting the venv-owned files (activate, python, ...) that share that
+    root.
+    """
+    interpreter, purelib, console_script = _synthetic_environment_with_console_script(tmp_path)
+
+    result = _run_probe(interpreter)
+
+    assert result.returncode == 0, result.stderr.decode()
+    assert result.stdout.endswith(b"\n")
+    payload = strict_json_loads(result.stdout[:-1], require_canonical=True)
+    assert isinstance(payload, dict)
+    assert canonical_json_bytes(payload, trailing_newline=True) == result.stdout
+    _assert_no_absolute_paths(payload)
+
+    distributions = payload["distributions"]
+    assert isinstance(distributions, list)
+    synthetic = next(item for item in distributions if item["name"] == "spleeter")
+    files = {item["path"]: item for item in synthetic["files"]}
+
+    # The console script is classified under the scripts root with a portable
+    # path relative to that root (just the script name).
+    script_name = console_script.name
+    assert script_name in files
+    script_entry = files[script_name]
+    assert script_entry["root"] == "scripts"
+    assert script_entry["path"] == script_name
+    assert script_entry["sha256"] == hashlib.sha256(console_script.read_bytes()).hexdigest()
+    assert script_entry["byte_length"] == console_script.stat().st_size
+
+    # The purelib members are still present and correct.
     for relative_path in (
         "spleeter/__init__.py",
         "spleeter-2.4.2.dist-info/METADATA",
