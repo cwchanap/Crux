@@ -253,6 +253,14 @@ def _run_first_synthetic(tmp_path: Path, monkeypatch):
     return runner, loaded_handoff, request, calls, outcome
 
 
+def _write_handoff_variant(path: Path, handoff: LoadedSeparationPilotManifest) -> None:
+    rows = tuple(
+        {key: value for key, value in row.items() if key != "corpus_version"}
+        for row in handoff.rows
+    )
+    write_actual_handoff(path, replace(handoff, rows=rows))
+
+
 def test_synthetic_immutable_handoff_runs_both_complete_populations_and_resumes(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -363,8 +371,11 @@ def test_changed_identity_does_not_resume_shared_prediction_artifacts(
     calls.clear()
 
     if identity == "handoff":
-        changed_handoff = replace(handoff, manifest_sha256="2" * 64)
-        monkeypatch.setattr(runner, "load_separation_pilot_manifest", lambda _: changed_handoff)
+        changed_handoff = replace(
+            handoff,
+            rows=tuple({**row, "rationale": "changed handoff identity"} for row in handoff.rows),
+        )
+        _write_handoff_variant(request.separation_handoff_path, changed_handoff)
         changed = replace(request, resume=True)
     elif identity == "reference":
         changed_handoff = replace(
@@ -375,7 +386,7 @@ def test_changed_identity_does_not_resume_shared_prediction_artifacts(
             runner.load_reference_set_manifest(request.reference_manifest_path),
             manifest_sha256="2" * 64,
         )
-        monkeypatch.setattr(runner, "load_separation_pilot_manifest", lambda _: changed_handoff)
+        _write_handoff_variant(request.separation_handoff_path, changed_handoff)
         monkeypatch.setattr(runner, "load_reference_set_manifest", lambda _: changed_reference)
         changed = replace(request, resume=True)
     elif identity == "timing":
@@ -389,7 +400,7 @@ def test_changed_identity_does_not_resume_shared_prediction_artifacts(
             runner.load_reference_timing_manifest(request.timing_manifest_path),
             manifest_sha256="2" * 64,
         )
-        monkeypatch.setattr(runner, "load_separation_pilot_manifest", lambda _: changed_handoff)
+        _write_handoff_variant(request.separation_handoff_path, changed_handoff)
         monkeypatch.setattr(runner, "load_reference_timing_manifest", lambda _: changed_timing)
         changed = replace(request, resume=True)
     else:
@@ -410,6 +421,97 @@ def test_changed_identity_does_not_resume_shared_prediction_artifacts(
     assert rows[20]["native_failure_code"] == "prediction_output_conflict"
     assert rows[20]["execution_disposition"] == "failed"
     assert resumed.run_id != first.run_id
+
+
+def test_resume_clears_transient_failure_fields_after_successful_retry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    handoff, reference, timing, mappings = _synthetic_handoff(tmp_path)
+    request = _request(tmp_path)
+    write_actual_handoff(request.separation_handoff_path, handoff)
+    runner = _install_synthetic_seams(monkeypatch, reference, timing, mappings)
+    descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
+
+    def prediction(audio):
+        return NativePrediction(
+            audio,
+            descriptor,
+            (
+                NativeEvent(
+                    0.25,
+                    "KD",
+                    4,
+                    None,
+                    {"frame_index": "43", "native_velocity": "1"},
+                    0.9,
+                    64,
+                ),
+            ),
+        )
+
+    first_calls: list[int] = []
+
+    class FirstBackend:
+        def descriptor(self):
+            return descriptor
+
+        def transcribe(self, audio):
+            simfile_id = int(audio.source_audio_id.split("/")[0])
+            first_calls.append(simfile_id)
+            if simfile_id == 20:
+                raise IdmBackendError("temporary inference failure", code="inference_failed")
+            return prediction(audio)
+
+        def close(self):
+            return None
+
+    first = run_idm_pilot(
+        request, backend_factory=lambda **_: FirstBackend(), perf_counter=lambda: 1.0
+    )
+
+    assert first.success_count == 17
+    assert first.failed_count == 3
+    assert first.run_path is not None
+    first_rows = {
+        row["simfile_id"]: row for row in parse_idm_pilot_run(first.run_path.read_bytes())["items"]
+    }
+    assert first_rows[20]["native_failure_code"] == "inference_failed"
+    assert first_calls == list(range(20, 38))
+
+    retry_calls: list[int] = []
+
+    class RetryBackend:
+        def descriptor(self):
+            return descriptor
+
+        def transcribe(self, audio):
+            retry_calls.append(int(audio.source_audio_id.split("/")[0]))
+            return prediction(audio)
+
+        def close(self):
+            return None
+
+    retried = run_idm_pilot(
+        replace(request, resume=True),
+        backend_factory=lambda **_: RetryBackend(),
+        perf_counter=lambda: 1.0,
+    )
+
+    assert retried.success_count == 18
+    assert retried.failed_count == 2
+    assert retry_calls == [20]
+    assert "inference_failed" not in dict(retried.native_failure_counts)
+    assert retried.run_path is not None
+    retried_rows = {
+        row["simfile_id"]: row
+        for row in parse_idm_pilot_run(retried.run_path.read_bytes())["items"]
+    }
+    row = retried_rows[20]
+    assert row["execution_disposition"] == "inferred"
+    assert all(
+        field not in row
+        for field in ("native_failure_code", "cohort_failure_reason", "failure_detail")
+    )
 
 
 def test_resume_rejects_changed_retained_wav_without_rerunning_upstream(
