@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import venv
+from collections.abc import Iterator
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
@@ -100,7 +101,7 @@ def _write_distribution(
 _SYNTHETIC_VENV_BASE: tuple[Path, Path, Path] | None = None
 
 
-def _synthetic_venv_base() -> tuple[Path, Path, Path]:
+def _initialize_synthetic_venv_base() -> tuple[Path, Path, Path]:
     """Build the shared bare venv once per session (eagerly via the fixture)."""
     global _SYNTHETIC_VENV_BASE
     if _SYNTHETIC_VENV_BASE is None:
@@ -122,13 +123,19 @@ def _synthetic_venv_base() -> tuple[Path, Path, Path]:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _synthetic_venv_base_fixture() -> None:
-    _synthetic_venv_base()
+def _initialize_synthetic_venv_base_fixture() -> Iterator[None]:
+    global _SYNTHETIC_VENV_BASE
+    _initialize_synthetic_venv_base()
+    yield
+    if _SYNTHETIC_VENV_BASE is not None:
+        environment, _, _ = _SYNTHETIC_VENV_BASE  # pylint: disable=unpacking-non-sequence
+        shutil.rmtree(environment.parent, ignore_errors=True)
+        _SYNTHETIC_VENV_BASE = None
 
 
 def _copy_synthetic_venv(tmp_path: Path) -> tuple[Path, Path, Path]:
     """Copy the session venv into tmp_path and remap its scheme locations."""
-    base_environment, base_purelib, base_scripts = _synthetic_venv_base()
+    base_environment, base_purelib, base_scripts = _initialize_synthetic_venv_base()
     environment = tmp_path / "venv"
     shutil.copytree(base_environment, environment)
 
