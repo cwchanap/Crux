@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build and attest a local wheel for the pinned upstream IDM checkout.
 
-The upstream repository intentionally remains untouched.  A temporary copy of its tracked
-files receives only the pinned Poetry PEP 517 build-system declaration; the resulting wheel is
-then checked against the source commit before it is copied into this runtime directory.
+The upstream repository intentionally remains untouched.  A temporary copy of files read from
+the pinned commit receives only the pinned Poetry PEP 517 build-system declaration; the resulting
+wheel is then checked against the source commit before it is copied into this runtime directory.
 """
 
 from __future__ import annotations
@@ -50,42 +50,56 @@ def _git(source: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _tracked_files(source: Path) -> tuple[PurePosixPath, ...]:
+def _commit_files(source: Path, commit: str) -> tuple[PurePosixPath, ...]:
     result = subprocess.run(
-        ["git", "-C", str(source), "ls-files", "-z"],
+        ["git", "-C", str(source), "ls-tree", "-r", "--name-only", commit],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return tuple(PurePosixPath(path) for path in result.stdout.splitlines() if path)
+
+
+def _commit_blob(source: Path, commit: str, relative: PurePosixPath) -> bytes:
+    result = subprocess.run(
+        ["git", "-C", str(source), "show", f"{commit}:{relative.as_posix()}"],
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    return tuple(PurePosixPath(path) for path in result.stdout.decode("utf-8").split("\0") if path)
+    return result.stdout
 
 
-def _copy_tracked_tree(source: Path, destination: Path) -> tuple[PurePosixPath, ...]:
-    tracked = _tracked_files(source)
+def _copy_commit_tree(source: Path, commit: str, destination: Path) -> tuple[PurePosixPath, ...]:
+    tracked = _commit_files(source, commit)
     for relative in tracked:
-        source_path = source.joinpath(*relative.parts)
         destination_path = destination.joinpath(*relative.parts)
-        if not source_path.is_file():
-            raise RuntimeError(f"tracked source is not a regular file: {relative}")
         destination_path.parent.mkdir(parents=True, exist_ok=True)
-        destination_path.write_bytes(source_path.read_bytes())
+        destination_path.write_bytes(_commit_blob(source, commit, relative))
     return tracked
 
 
-def _source_manifest(source: Path, tracked: tuple[PurePosixPath, ...]) -> list[dict[str, Any]]:
-    return [
-        {
-            "path": relative.as_posix(),
-            "sha256": _sha256_file(source.joinpath(*relative.parts)),
-            "byte_length": source.joinpath(*relative.parts).stat().st_size,
-        }
-        for relative in tracked
-    ]
+def _source_manifest(
+    source: Path, commit: str, tracked: tuple[PurePosixPath, ...]
+) -> list[dict[str, Any]]:
+    manifest: list[dict[str, Any]] = []
+    for relative in tracked:
+        content = _commit_blob(source, commit, relative)
+        manifest.append(
+            {
+                "path": relative.as_posix(),
+                "sha256": _sha256_bytes(content),
+                "byte_length": len(content),
+            }
+        )
+    return manifest
 
 
 def _verify_wheel_sources(
     wheel_path: Path,
     source: Path,
+    commit: str,
     tracked: tuple[PurePosixPath, ...],
 ) -> list[dict[str, Any]]:
     expected = {relative for relative in tracked if relative.parts[0] == "idm"}
@@ -99,7 +113,7 @@ def _verify_wheel_sources(
 
         verified: list[dict[str, Any]] = []
         for relative in sorted(expected):
-            source_bytes = source.joinpath(*relative.parts).read_bytes()
+            source_bytes = _commit_blob(source, commit, relative)
             wheel_bytes = wheel.read(relative.as_posix())
             if wheel_bytes != source_bytes:
                 raise RuntimeError(f"wheel source bytes differ from pinned checkout: {relative}")
@@ -113,7 +127,7 @@ def _verify_wheel_sources(
     return verified
 
 
-def _build_wheel(source: Path, wheel_output: Path) -> tuple[Path, str]:
+def _build_wheel(source: Path, commit: str, wheel_output: Path) -> tuple[Path, str]:
     uv = shutil.which("uv")
     if uv is None:
         raise RuntimeError("uv is required to build the pinned wheel")
@@ -124,7 +138,7 @@ def _build_wheel(source: Path, wheel_output: Path) -> tuple[Path, str]:
         build_output = temporary_path / "dist"
         build_source.mkdir()
         build_output.mkdir()
-        _copy_tracked_tree(source, build_source)
+        _copy_commit_tree(source, commit, build_source)
 
         original_pyproject = (build_source / "pyproject.toml").read_bytes()
         if b"[build-system]" in original_pyproject:
@@ -178,14 +192,14 @@ def build(source: Path, wheel_output: Path, provenance_output: Path) -> None:
             f"source commit mismatch: expected {UPSTREAM_COMMIT}, got {actual_commit}"
         )
 
-    original_pyproject = (source / "pyproject.toml").read_bytes()
+    original_pyproject = _commit_blob(source, actual_commit, PurePosixPath("pyproject.toml"))
     if b"[build-system]" in original_pyproject:
         raise RuntimeError("pinned upstream pyproject unexpectedly already has build-system")
-    tracked = _tracked_files(source)
-    source_manifest = _source_manifest(source, tracked)
+    tracked = _commit_files(source, actual_commit)
+    source_manifest = _source_manifest(source, actual_commit, tracked)
 
-    built_wheel, wheel_sha256 = _build_wheel(source, wheel_output)
-    packaged_idm_files = _verify_wheel_sources(built_wheel, source, tracked)
+    built_wheel, wheel_sha256 = _build_wheel(source, actual_commit, wheel_output)
+    packaged_idm_files = _verify_wheel_sources(built_wheel, source, actual_commit, tracked)
 
     provenance = {
         "schema": "crux.idm-wheel-provenance/v1",
