@@ -834,6 +834,15 @@ def _set_failed(item: dict[str, object], code: str, detail: BaseException | str)
     item["failure_detail"] = _bounded_error(detail)
 
 
+def _native_failure_counts(items: Iterable[Mapping[str, object]]) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for item in items:
+        code = item.get("native_failure_code")
+        if isinstance(code, str):
+            counts[code] += 1
+    return counts
+
+
 def _set_quarantined(item: dict[str, object], detail: str = "reference is quarantined") -> None:
     item["execution_disposition"] = "quarantined"
     item["cohort_failure_reason"] = "reference_quarantined"
@@ -1353,8 +1362,20 @@ def run_idm_pilot(
                 for item in raw_prior_items
                 if isinstance(item, Mapping) and type(item.get("simfile_id")) is int
             }
-        items = [_initial_item(row) for row in handoff.rows]
-        _write_checkpoint(run_path, header, items)
+        items: list[dict[str, object]] = []
+        for row in handoff.rows:
+            item = _initial_item(row)
+            prior = prior_items.get(int(row["simfile_id"]))
+            if prior is not None:
+                item.update(dict(prior))
+            items.append(item)
+        native_failure_counts = _native_failure_counts(items)
+        _write_checkpoint(
+            run_path,
+            header,
+            items,
+            native_failure_counts=native_failure_counts,
+        )
     except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError):
         return _fatal_outcome()
 
@@ -1362,7 +1383,7 @@ def run_idm_pilot(
     backend_poisoned = False
     fatal_run_error = False
     close_error: dict[str, str] | None = None
-    native_failure_counts: Counter[str] = Counter()
+    native_failure_counts: Counter[str] = _native_failure_counts(items)
     try:
         for index, row in enumerate(handoff.rows):
             item = items[index]
@@ -1545,6 +1566,7 @@ def run_idm_pilot(
                 native_failure_counts["retained_input_invalid"] += 1
             finally:
                 try:
+                    native_failure_counts = _native_failure_counts(items)
                     _write_checkpoint(
                         run_path,
                         header,
@@ -1574,6 +1596,7 @@ def run_idm_pilot(
             )
             native_failure_counts["worker_protocol_failed"] += 1
 
+    native_failure_counts = _native_failure_counts(items)
     counts = _snapshot_counts(items)
     all_done = all(item.get("execution_disposition") in _DISPOSITIONS for item in items)
     if fatal_run_error:
