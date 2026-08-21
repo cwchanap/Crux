@@ -50,6 +50,7 @@ from src.benchmark.cohort_scoring import (
     cohort_item_without_prediction,
     score_cohort,
 )
+from src.benchmark.corpus_cache import CacheIndexStore, ResolvedSourceAudio, resolve_source_audio
 from src.benchmark.durability import atomic_replace_bytes
 from src.benchmark.idm_model import (
     IDM_REQUEST_TIMEOUT_SECONDS,
@@ -57,7 +58,7 @@ from src.benchmark.idm_model import (
     idm_inference_config,
     load_idm_model_lock,
 )
-from src.benchmark.input_view import parse_canonical_wav
+from src.benchmark.input_view import materialize_full_mix_audio, parse_canonical_wav
 from src.benchmark.mapping import map_idm_prediction
 from src.benchmark.prediction_artifact import (
     PredictionArtifact,
@@ -90,6 +91,19 @@ from src.benchmark.taxonomy import (
 
 IDM_PILOT_RUN_SCHEMA = "crux.idm-stem-pilot-run/v1"
 IDM_STEM_INPUT_VIEW_ID = "crux.oaf-htdemucs-drums-mono44k1-pcm16/v1"
+IDM_FULL_MIX_INPUT_VIEW_ID = "crux.oaf-full-mix-mono44k1-pcm16/v1"
+IDM_SMOKE_SCHEMA = "crux.idm-smoke/v1"
+IDM_FULL_MIX_SMOKE_RUN_SCHEMA = "crux.idm-full-mix-smoke-run/v1"
+IDM_FULL_MIX_SMOKE_DIRNAME = "full-mix-smoke"
+IDM_FULL_MIX_SMOKE_REPORT_DIRNAME = "reports"
+IDM_SMOKE_CASE_ORDER = (
+    "short",
+    "long",
+    "sparse",
+    "dense",
+    "median_duration",
+)
+_IDM_SMOKE_CASE_REASONS = frozenset(IDM_SMOKE_CASE_ORDER)
 
 IDM_FAILURE_TO_COHORT_REASON = {
     "worker_start_failed": "backend_unavailable",
@@ -120,6 +134,118 @@ class IdmPilotRunError(ValueError):
     def __init__(self, message: str, *, code: str = "inference_failed") -> None:
         self.code = code
         super().__init__(message)
+
+
+class IdmSmokeManifestError(ValueError):
+    """Raised when the offline/production five-song smoke contract is invalid."""
+
+    def __init__(self, message: str, *, code: str = "preflight_invalid") -> None:
+        self.code = code
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class IdmSmokeCase:
+    """One reason-labelled member of the fixed full-mix smoke population."""
+
+    reason: str
+    simfile_id: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reason, str) or self.reason not in _IDM_SMOKE_CASE_REASONS:
+            raise IdmSmokeManifestError("smoke case reason is invalid")
+        if type(self.simfile_id) is not int or self.simfile_id <= 0:
+            raise IdmSmokeManifestError("smoke case simfile_id must be a positive integer")
+
+
+@dataclass(frozen=True)
+class IdmSmokeManifest:
+    """Canonical, ordered five-song smoke membership."""
+
+    schema: str
+    cases: tuple[IdmSmokeCase, ...]
+
+    def __post_init__(self) -> None:
+        if self.schema != IDM_SMOKE_SCHEMA:
+            raise IdmSmokeManifestError("smoke manifest schema is invalid")
+        if not isinstance(self.cases, tuple):
+            raise TypeError("smoke manifest cases must be a tuple")
+        if len(self.cases) != len(IDM_SMOKE_CASE_ORDER):
+            raise IdmSmokeManifestError("smoke manifest must contain exactly five cases")
+        if any(not isinstance(case, IdmSmokeCase) for case in self.cases):
+            raise TypeError("smoke manifest cases must be IdmSmokeCase values")
+        reasons = tuple(case.reason for case in self.cases)
+        if reasons != IDM_SMOKE_CASE_ORDER:
+            raise IdmSmokeManifestError("smoke case reasons must use the canonical order")
+        ids = tuple(case.simfile_id for case in self.cases)
+        if len(set(ids)) != len(ids):
+            raise IdmSmokeManifestError("smoke case simfile IDs must be unique")
+
+
+@dataclass(frozen=True)
+class IdmFullMixSmokeRequest:
+    """Inputs for the separate five-song full-mix IDM diagnostic."""
+
+    separation_handoff_path: Path
+    reference_manifest_path: Path
+    timing_manifest_path: Path
+    smoke_manifest_path: Path
+    source_cache_dir: Path
+    output_dir: Path
+    model_lock_path: Path
+    model_root: Path
+    runtime_python: Path
+    crux_commit: str | None = None
+
+    def __post_init__(self) -> None:
+        for field in (
+            "separation_handoff_path",
+            "reference_manifest_path",
+            "timing_manifest_path",
+            "smoke_manifest_path",
+            "source_cache_dir",
+            "output_dir",
+            "model_lock_path",
+            "model_root",
+            "runtime_python",
+        ):
+            if not isinstance(getattr(self, field), Path):
+                raise TypeError(f"{field} must be a Path")
+        if self.crux_commit is not None and (
+            not isinstance(self.crux_commit, str) or _COMMIT_RE.fullmatch(self.crux_commit) is None
+        ):
+            raise ValueError("crux_commit must be a lowercase 40-character commit")
+
+
+@dataclass(frozen=True)
+class IdmFullMixSmokeOutcome:
+    """Stable result for one offline or production full-mix smoke run."""
+
+    overall_status: Literal["complete", "partial", "failed"]
+    exit_code: Literal[0, 1, 2]
+    run_id: str | None
+    run_path: Path | None
+    reports_path: Path | None
+    success_count: int
+    failed_count: int
+    skipped_count: int
+    quarantined_count: int
+
+    def __post_init__(self) -> None:
+        if self.overall_status not in {"complete", "partial", "failed"}:
+            raise ValueError("overall_status is invalid")
+        if self.exit_code not in {0, 1, 2}:
+            raise ValueError("exit_code is invalid")
+        if self.run_id is not None and (not isinstance(self.run_id, str) or not self.run_id):
+            raise ValueError("run_id must be a nonempty string or None")
+        for field in ("run_path", "reports_path"):
+            value = getattr(self, field)
+            if value is not None and not isinstance(value, Path):
+                raise TypeError(f"{field} must be a Path or None")
+        for field in ("success_count", "failed_count", "skipped_count", "quarantined_count"):
+            value = getattr(self, field)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{field} must be a nonnegative integer")
 
 
 @dataclass(frozen=True)
@@ -261,6 +387,274 @@ def _commit(value: object, field: str = "crux_commit") -> str:
             f"{field} must be a lowercase 40-character commit", code="preflight_invalid"
         )
     return value
+
+
+def _smoke_handoff_rows(
+    handoff: LoadedSeparationPilotManifest | Iterable[Mapping[str, object]],
+) -> tuple[Mapping[str, object], ...]:
+    if isinstance(handoff, LoadedSeparationPilotManifest):
+        return tuple(handoff.rows)
+    if isinstance(handoff, Mapping):
+        raw_rows = handoff.get("rows")
+        if not isinstance(raw_rows, Iterable) or isinstance(raw_rows, (str, bytes)):
+            raise IdmSmokeManifestError("handoff rows are unavailable")
+        rows = tuple(raw_rows)
+    else:
+        try:
+            rows = tuple(handoff)
+        except TypeError as error:
+            raise IdmSmokeManifestError("handoff rows are unavailable") from error
+    if any(not isinstance(row, Mapping) for row in rows):
+        raise IdmSmokeManifestError("handoff row is invalid")
+    return rows  # type: ignore[return-value]
+
+
+def _coerce_smoke_case(value: object) -> IdmSmokeCase:
+    if isinstance(value, IdmSmokeCase):
+        return value
+    if not isinstance(value, Mapping) or set(value) != {"reason", "simfile_id"}:
+        raise IdmSmokeManifestError("smoke case must contain reason and simfile_id")
+    return IdmSmokeCase(
+        reason=value["reason"],  # type: ignore[arg-type]
+        simfile_id=value["simfile_id"],  # type: ignore[arg-type]
+    )
+
+
+def _coerce_smoke_manifest(value: object) -> IdmSmokeManifest:
+    if isinstance(value, IdmSmokeManifest):
+        return value
+    if not isinstance(value, Mapping) or set(value) != {"cases", "schema"}:
+        raise IdmSmokeManifestError("smoke manifest must contain the exact schema/cases keys")
+    raw_cases = value.get("cases")
+    if not isinstance(raw_cases, list):
+        raise IdmSmokeManifestError("smoke manifest cases must be an array")
+    try:
+        cases = tuple(_coerce_smoke_case(case) for case in raw_cases)
+        return IdmSmokeManifest(schema=value.get("schema"), cases=cases)  # type: ignore[arg-type]
+    except IdmSmokeManifestError:
+        raise
+    except (TypeError, ValueError) as error:
+        raise IdmSmokeManifestError("smoke manifest is invalid") from error
+
+
+def validate_idm_smoke_manifest(
+    manifest: IdmSmokeManifest | Mapping[str, object],
+    *,
+    handoff: LoadedSeparationPilotManifest | Iterable[Mapping[str, object]] | None = None,
+) -> IdmSmokeManifest:
+    """Validate exact five-case shape and, when supplied, handoff membership."""
+    normalized = _coerce_smoke_manifest(manifest)
+    if handoff is not None:
+        handoff_ids: set[int] = set()
+        for row in _smoke_handoff_rows(handoff):
+            simfile_id = row.get("simfile_id")
+            if type(simfile_id) is int and simfile_id > 0:
+                handoff_ids.add(simfile_id)
+        missing = [
+            case.simfile_id for case in normalized.cases if case.simfile_id not in handoff_ids
+        ]
+        if missing:
+            raise IdmSmokeManifestError(
+                "smoke case simfile IDs are not all present in the loaded handoff"
+            )
+    return normalized
+
+
+def render_idm_smoke_manifest(
+    cases: IdmSmokeManifest | Iterable[IdmSmokeCase | Mapping[str, object]],
+) -> bytes:
+    """Render canonical smoke JSON without inventing production membership."""
+    if isinstance(cases, IdmSmokeManifest):
+        manifest = cases
+    else:
+        try:
+            manifest = IdmSmokeManifest(
+                schema=IDM_SMOKE_SCHEMA,
+                cases=tuple(_coerce_smoke_case(case) for case in cases),
+            )
+        except TypeError as error:
+            raise TypeError("cases must be iterable") from error
+    payload = {
+        "cases": [
+            {"reason": case.reason, "simfile_id": case.simfile_id} for case in manifest.cases
+        ],
+        "schema": manifest.schema,
+    }
+    return canonical_json_bytes(payload, trailing_newline=True)
+
+
+def parse_idm_smoke_manifest(
+    content: bytes,
+    *,
+    handoff: LoadedSeparationPilotManifest | Iterable[Mapping[str, object]] | None = None,
+) -> IdmSmokeManifest:
+    """Parse a canonical smoke manifest and optionally bind it to handoff IDs."""
+    if not isinstance(content, bytes):
+        raise TypeError("smoke manifest content must be bytes")
+    if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+        raise IdmSmokeManifestError("smoke manifest must have one final newline")
+    try:
+        value = strict_json_loads(content[:-1], require_canonical=True)
+    except StrictJsonError as error:
+        raise IdmSmokeManifestError(str(error)) from None
+    try:
+        manifest = validate_idm_smoke_manifest(value, handoff=handoff)  # type: ignore[arg-type]
+    except IdmSmokeManifestError:
+        raise
+    if render_idm_smoke_manifest(manifest) != content:
+        raise IdmSmokeManifestError("smoke manifest is not semantically canonical")
+    return manifest
+
+
+def load_idm_smoke_manifest(
+    path: Path,
+    *,
+    handoff: LoadedSeparationPilotManifest | Iterable[Mapping[str, object]] | None = None,
+) -> IdmSmokeManifest:
+    if not isinstance(path, Path):
+        raise TypeError("smoke manifest path must be a Path")
+    try:
+        content = read_regular_file_no_follow(path)
+    except (OSError, TypeError) as error:
+        raise IdmSmokeManifestError("smoke manifest is unavailable") from error
+    return parse_idm_smoke_manifest(content, handoff=handoff)
+
+
+def write_idm_smoke_manifest(
+    path: Path,
+    manifest: IdmSmokeManifest | Mapping[str, object],
+    *,
+    handoff: LoadedSeparationPilotManifest | Iterable[Mapping[str, object]] | None = None,
+) -> None:
+    if not isinstance(path, Path):
+        raise TypeError("smoke manifest path must be a Path")
+    normalized = validate_idm_smoke_manifest(manifest, handoff=handoff)
+    atomic_replace_bytes(path, render_idm_smoke_manifest(normalized))
+
+
+def _smoke_mapping_event_count(mapping: object, simfile_id: int) -> int:
+    if mapping is None:
+        raise IdmSmokeManifestError("reference mapping is unavailable")
+    common_events = (
+        mapping.get("common_events")
+        if isinstance(mapping, Mapping)
+        else getattr(mapping, "common_events", None)
+    )
+    if not isinstance(common_events, (tuple, list)):
+        raise IdmSmokeManifestError(f"reference mapping for {simfile_id} is invalid")
+    return len(common_events)
+
+
+def _smoke_duration(value: object, simfile_id: int) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        raise IdmSmokeManifestError(f"source duration for {simfile_id} is invalid")
+    try:
+        duration = Decimal(str(value))
+    except (ArithmeticError, ValueError) as error:
+        raise IdmSmokeManifestError(f"source duration for {simfile_id} is invalid") from error
+    if not duration.is_finite() or duration <= 0:
+        raise IdmSmokeManifestError(f"source duration for {simfile_id} is invalid")
+    return duration
+
+
+def _smoke_median(values: Iterable[Decimal]) -> Decimal:
+    ordered = sorted(values)
+    if not ordered:
+        raise IdmSmokeManifestError("smoke candidates are unavailable")
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / Decimal(2)
+
+
+def select_idm_smoke_cases(
+    handoff: LoadedSeparationPilotManifest | Iterable[Mapping[str, object]],
+    reference_mappings: Mapping[int, object],
+) -> tuple[IdmSmokeCase, ...]:
+    """Select five pre-IDM cases from loaded HPA-328 evidence only."""
+    if not isinstance(reference_mappings, Mapping):
+        raise TypeError("reference_mappings must be a Mapping")
+    rows = _smoke_handoff_rows(handoff)
+    seen_ids: set[int] = set()
+    candidates: list[tuple[int, Decimal, int]] = []
+    for row in rows:
+        simfile_id = row.get("simfile_id")
+        if type(simfile_id) is not int or simfile_id <= 0:
+            raise IdmSmokeManifestError("handoff simfile IDs are invalid")
+        if simfile_id in seen_ids:
+            raise IdmSmokeManifestError("handoff membership contains duplicate IDs")
+        seen_ids.add(simfile_id)
+        view = row.get("htdemucs")
+        if not isinstance(view, Mapping) or view.get("status") not in _SUCCESSFUL_HANDOFF_STATUSES:
+            continue
+        mapping = reference_mappings.get(simfile_id)
+        if mapping is None:
+            continue
+        duration = _smoke_duration(row.get("source_duration_sec"), simfile_id)
+        event_count = _smoke_mapping_event_count(mapping, simfile_id)
+        candidates.append((simfile_id, duration, event_count))
+
+    if len(candidates) < len(IDM_SMOKE_CASE_ORDER):
+        raise IdmSmokeManifestError("fewer than five eligible smoke candidates remain")
+
+    remaining = list(candidates)
+    all_durations = [duration for _simfile_id, duration, _event_count in candidates]
+
+    def take(key: Callable[[tuple[int, Decimal, int]], object], *, reverse: bool = False):
+        if reverse:
+            best_value = max(key(candidate) for candidate in remaining)
+            eligible = [candidate for candidate in remaining if key(candidate) == best_value]
+            chosen = min(eligible, key=lambda candidate: candidate[0])
+        else:
+            best_value = min(key(candidate) for candidate in remaining)
+            eligible = [candidate for candidate in remaining if key(candidate) == best_value]
+            chosen = min(eligible, key=lambda candidate: candidate[0])
+        remaining.remove(chosen)
+        return chosen
+
+    selected: list[IdmSmokeCase] = []
+    short = take(lambda candidate: candidate[1])
+    selected.append(IdmSmokeCase("short", short[0]))
+    long = take(lambda candidate: candidate[1], reverse=True)
+    selected.append(IdmSmokeCase("long", long[0]))
+    sparse = take(lambda candidate: candidate[2])
+    selected.append(IdmSmokeCase("sparse", sparse[0]))
+    dense = take(lambda candidate: candidate[2], reverse=True)
+    selected.append(IdmSmokeCase("dense", dense[0]))
+    median_duration = _smoke_median(all_durations)
+    median_case = take(lambda candidate: abs(candidate[1] - median_duration))
+    selected.append(IdmSmokeCase("median_duration", median_case[0]))
+    return tuple(selected)
+
+
+def materialize_idm_full_mix_audio(
+    source_audio: ResolvedSourceAudio,
+    output_path: Path,
+    *,
+    input_root: Path,
+) -> CanonicalAudio:
+    """Use the historical OaF full-mix canonicalization for smoke inputs."""
+    if not isinstance(source_audio, ResolvedSourceAudio):
+        raise TypeError("source_audio must be ResolvedSourceAudio")
+    audio = materialize_full_mix_audio(
+        source_audio,
+        output_path,
+        input_root=input_root,
+        input_view_id=IDM_FULL_MIX_INPUT_VIEW_ID,
+        max_input_audio_frames=None,
+    )
+    if not isinstance(audio, CanonicalAudio):
+        raise ValueError("full-mix materializer returned invalid audio")
+    if audio.input_view_id != IDM_FULL_MIX_INPUT_VIEW_ID:
+        raise ValueError("full-mix materializer returned the wrong input view")
+    if audio.path.resolve() != output_path.resolve():
+        raise ValueError("full-mix materializer returned the wrong path")
+    if (
+        audio.source_audio_id != source_audio.source_audio_id
+        or audio.source_audio_sha256 != source_audio.source_audio_sha256
+    ):
+        raise ValueError("full-mix materializer changed source identity")
+    return audio
 
 
 def build_run_id(
@@ -1675,13 +2069,480 @@ def run_idm_pilot(
     return outcome
 
 
+def _fatal_full_mix_smoke() -> IdmFullMixSmokeOutcome:
+    return IdmFullMixSmokeOutcome(
+        overall_status="failed",
+        exit_code=2,
+        run_id=None,
+        run_path=None,
+        reports_path=None,
+        success_count=0,
+        failed_count=0,
+        skipped_count=0,
+        quarantined_count=0,
+    )
+
+
+def _validate_full_mix_smoke_roots(request: IdmFullMixSmokeRequest) -> None:
+    if request.output_dir.is_symlink():
+        raise IdmSmokeManifestError("output_dir must not be a symlink")
+    output = request.output_dir.resolve()
+    for field in ("source_cache_dir", "model_root"):
+        root = getattr(request, field).resolve()
+        if output == root or output.is_relative_to(root) or root.is_relative_to(output):
+            raise IdmSmokeManifestError("full-mix smoke output aliases an input root")
+
+
+def _smoke_run_id(
+    *,
+    handoff: LoadedSeparationPilotManifest,
+    reference: LoadedReferenceSetManifest,
+    timing: LoadedReferenceTimingManifest,
+    smoke_manifest_sha256: str,
+    descriptor_sha256: str,
+    model_lock_sha256: str,
+    inference_config_sha256_value: str,
+    crux_commit: str | None,
+) -> str:
+    values = {
+        "schema": IDM_FULL_MIX_SMOKE_RUN_SCHEMA,
+        "handoff_manifest_sha256": handoff.manifest_sha256,
+        "handoff_manifest_version": handoff.corpus_version,
+        "reference_manifest_sha256": reference.manifest_sha256,
+        "reference_manifest_version": reference.corpus_version,
+        "timing_manifest_sha256": timing.manifest_sha256,
+        "timing_manifest_version": timing.corpus_version,
+        "smoke_manifest_sha256": smoke_manifest_sha256,
+        "backend_descriptor_sha256": descriptor_sha256,
+        "model_lock_sha256": model_lock_sha256,
+        "inference_config_sha256": inference_config_sha256_value,
+        "input_view_id": IDM_FULL_MIX_INPUT_VIEW_ID,
+        "crux_commit": crux_commit,
+    }
+    return "idm-full-mix-" + sha256_hex(canonical_json_bytes(values))[:16]
+
+
+def _write_full_mix_smoke_snapshot(path: Path, snapshot: Mapping[str, object]) -> None:
+    if not isinstance(path, Path):
+        raise TypeError("run path must be a Path")
+    normalized = _normalize_snapshot_value(snapshot)
+    atomic_replace_bytes(path, canonical_json_bytes(normalized, trailing_newline=True))
+
+
+def _smoke_source_kwargs(source_row: Mapping[str, object]) -> dict[str, str | None]:
+    return {
+        "source_audio_key": (
+            source_row.get("source_audio_key")
+            if isinstance(source_row.get("source_audio_key"), str)
+            else None
+        ),
+        "source_audio_content_hash": (
+            source_row.get("source_audio_content_hash")
+            if isinstance(source_row.get("source_audio_content_hash"), str)
+            else None
+        ),
+        "source_endpoint_sha256": (
+            source_row.get("source_endpoint_sha256")
+            if isinstance(source_row.get("source_endpoint_sha256"), str)
+            else None
+        ),
+        "source_bucket": (
+            source_row.get("source_bucket")
+            if isinstance(source_row.get("source_bucket"), str)
+            else None
+        ),
+    }
+
+
+def _set_full_mix_smoke_failed(
+    item: dict[str, object], code: str, detail: BaseException | str
+) -> None:
+    if code not in IDM_FAILURE_TO_COHORT_REASON:
+        code = "inference_failed"
+    item.update(
+        {
+            "execution_disposition": "failed",
+            "native_failure_code": code,
+            "cohort_failure_reason": IDM_FAILURE_TO_COHORT_REASON[code],
+            "failure_detail": _bounded_error(detail),
+        }
+    )
+
+
+def run_idm_full_mix_smoke(
+    request: IdmFullMixSmokeRequest,
+    *,
+    backend_factory: Callable[..., Any] | None = None,
+    clock: Callable[[], datetime] = _utc_now,
+    perf_counter: Callable[[], float] = time.perf_counter,
+) -> IdmFullMixSmokeOutcome:
+    """Run exactly the validated five-song smoke through the frozen IDM backend.
+
+    This path intentionally owns its cache, input-view/config identity, run
+    directory, and report directory.  It never calls the stem runner or the
+    headline comparison module.
+    """
+    if not isinstance(request, IdmFullMixSmokeRequest):
+        raise TypeError("request must be IdmFullMixSmokeRequest")
+    try:
+        _validate_full_mix_smoke_roots(request)
+        handoff = load_separation_pilot_manifest(request.separation_handoff_path)
+        reference = load_reference_set_manifest(request.reference_manifest_path)
+        timing = load_reference_timing_manifest(request.timing_manifest_path)
+        _validate_lineage(handoff, reference, timing)
+        smoke_content = read_regular_file_no_follow(request.smoke_manifest_path)
+        smoke_manifest = parse_idm_smoke_manifest(smoke_content, handoff=handoff)
+        mappings = preflight_reference_mappings(
+            reference,
+            timing,
+            timing_output_root=request.timing_manifest_path.parent.parent,
+        )
+        lock = load_idm_model_lock(request.model_lock_path)
+        model_lock_sha256 = compute_model_lock_sha256(request.model_lock_path)
+        descriptor = descriptor_for_lock(lock)
+        inference_config = build_idm_inference_config(
+            model_lock_sha256,
+            descriptor.sha256,
+            input_view_id=IDM_FULL_MIX_INPUT_VIEW_ID,
+            timeout_seconds=IDM_REQUEST_TIMEOUT_SECONDS,
+        )
+        inference_config_sha = idm_inference_config_sha256(inference_config)
+        run_id = _smoke_run_id(
+            handoff=handoff,
+            reference=reference,
+            timing=timing,
+            smoke_manifest_sha256=sha256_hex(smoke_content),
+            descriptor_sha256=descriptor.sha256,
+            model_lock_sha256=model_lock_sha256,
+            inference_config_sha256_value=inference_config_sha,
+            crux_commit=request.crux_commit,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError, IdmSmokeManifestError):
+        return _fatal_full_mix_smoke()
+
+    run_dir = request.output_dir / IDM_FULL_MIX_SMOKE_DIRNAME / "runs" / run_id
+    run_path = run_dir / "run.json"
+    reports_path = run_dir / IDM_FULL_MIX_SMOKE_REPORT_DIRNAME
+    input_root = run_dir / "inputs"
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        input_root.mkdir(parents=True, exist_ok=True)
+        header: dict[str, object] = {
+            "schema": IDM_FULL_MIX_SMOKE_RUN_SCHEMA,
+            "run_id": run_id,
+            "handoff_manifest_sha256": handoff.manifest_sha256,
+            "handoff_manifest_version": handoff.corpus_version,
+            "reference_manifest_sha256": reference.manifest_sha256,
+            "reference_manifest_version": reference.corpus_version,
+            "reference_timing_manifest_sha256": timing.manifest_sha256,
+            "reference_timing_version": timing.corpus_version,
+            "smoke_manifest_sha256": sha256_hex(smoke_content),
+            "smoke_manifest": {
+                "schema": smoke_manifest.schema,
+                "cases": [
+                    {"reason": case.reason, "simfile_id": case.simfile_id}
+                    for case in smoke_manifest.cases
+                ],
+            },
+            "backend_descriptor_sha256": descriptor.sha256,
+            "backend_descriptor": dict(descriptor.payload),
+            "model_id": lock.model_id,
+            "model_lock_sha256": model_lock_sha256,
+            "inference_config": dict(inference_config),
+            "inference_config_sha256": inference_config_sha,
+            "input_view_id": IDM_FULL_MIX_INPUT_VIEW_ID,
+            "request_timeout_seconds": inference_config.get("request_timeout_seconds"),
+            "worker_close_timeout_seconds": int(IDM_WORKER_CLOSE_TIMEOUT_SECONDS),
+            "crux_commit": request.crux_commit,
+            "started_at": _timestamp(clock()),
+        }
+        _write_full_mix_smoke_snapshot(
+            run_path,
+            {**header, "items": [], "overall_status": "partial"},
+        )
+    except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError):
+        return _fatal_full_mix_smoke()
+
+    handoff_by_id = {int(row["simfile_id"]): row for row in handoff.rows}
+    reference_rows = {row.view.simfile_id: row.source_row for row in reference.rows}
+    cache_index: CacheIndexStore
+    try:
+        cache_index = CacheIndexStore.load(request.source_cache_dir)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return _fatal_full_mix_smoke()
+
+    items: list[dict[str, object]] = [
+        {
+            "simfile_id": case.simfile_id,
+            "reason": case.reason,
+            "execution_disposition": None,
+        }
+        for case in smoke_manifest.cases
+    ]
+    audio_by_id: dict[int, CanonicalAudio] = {}
+    backend: Any | None = None
+    backend_poisoned = False
+    close_error: str | None = None
+
+    try:
+        for item in items:
+            simfile_id = int(item["simfile_id"])
+            row = handoff_by_id.get(simfile_id)
+            mapping = mappings.get(simfile_id)
+            if row is None or mapping is None:
+                item["execution_disposition"] = "quarantined"
+                item["cohort_failure_reason"] = "reference_quarantined"
+                item["failure_detail"] = "smoke member has no loaded handoff/reference row"
+                continue
+            source_row = reference_rows.get(simfile_id)
+            if source_row is None:
+                _set_full_mix_smoke_failed(
+                    item,
+                    "retained_input_invalid",
+                    "smoke member has no authoritative source row",
+                )
+                continue
+            try:
+                source = resolve_source_audio(
+                    source_row,
+                    request.source_cache_dir,
+                    cache_index,
+                    **_smoke_source_kwargs(source_row),
+                    load_body=True,
+                )
+                if source.source_audio_id != row.get(
+                    "source_audio_id"
+                ) or source.source_audio_sha256 != row.get("source_audio_sha256"):
+                    raise IdmSmokeManifestError("resolved source identity differs from handoff")
+                canonical_path = input_root / str(simfile_id) / "full-mix.wav"
+                audio = materialize_idm_full_mix_audio(
+                    source,
+                    canonical_path,
+                    input_root=input_root,
+                )
+                item.update(
+                    {
+                        "source_audio_id": source.source_audio_id,
+                        "source_audio_sha256": source.source_audio_sha256,
+                        "source_duration_sec": source.duration_sec,
+                        "input_view_id": audio.input_view_id,
+                        "input_audio_sha256": audio.input_audio_sha256,
+                    }
+                )
+                audio_by_id[simfile_id] = audio
+            except (OSError, RuntimeError, TypeError, ValueError, IdmSmokeManifestError) as error:
+                _set_full_mix_smoke_failed(item, "retained_input_invalid", error)
+                continue
+
+            target = prediction_path(
+                run_dir,
+                simfile_id=simfile_id,
+                source_audio_sha256=audio.source_audio_sha256,
+                backend_descriptor_sha256=descriptor.sha256,
+                inference_config_sha256=inference_config_sha,
+            )
+            if target.exists():
+                _set_full_mix_smoke_failed(
+                    item,
+                    "prediction_output_conflict",
+                    "full-mix smoke prediction already exists",
+                )
+                continue
+            if backend_poisoned:
+                _set_full_mix_smoke_failed(
+                    item,
+                    "worker_protocol_failed",
+                    "inference was not attempted after a poison failure",
+                )
+                continue
+            if backend is None:
+                factory = backend_factory or IdmBackend
+                try:
+                    backend = factory(
+                        runtime_python=request.runtime_python,
+                        model_lock_path=request.model_lock_path,
+                        model_root=request.model_root,
+                        input_root=input_root,
+                        timeout_seconds=IDM_REQUEST_TIMEOUT_SECONDS,
+                        close_timeout_seconds=IDM_WORKER_CLOSE_TIMEOUT_SECONDS,
+                    )
+                    backend_descriptor = backend.descriptor()
+                    if (
+                        not isinstance(backend_descriptor, BackendDescriptor)
+                        or backend_descriptor != descriptor
+                    ):
+                        raise IdmBackendError(
+                            "backend descriptor identity changed", code="worker_start_failed"
+                        )
+                except BaseException as error:  # pylint: disable=broad-exception-caught
+                    code, disposition = classify_idm_backend_error(
+                        getattr(error, "code", "worker_start_failed")
+                    )
+                    _set_full_mix_smoke_failed(item, code, error)
+                    if disposition == "poison":
+                        backend_poisoned = True
+                    continue
+            try:
+                started = perf_counter()
+                native = backend.transcribe(audio)
+                elapsed = max(0.0, perf_counter() - started)
+                if (
+                    not isinstance(native, NativePrediction)
+                    or native.audio != audio
+                    or native.descriptor != descriptor
+                ):
+                    raise IdmBackendError(
+                        "IDM backend returned an invalid prediction", code="native_event_invalid"
+                    )
+                mapped, _diagnostics = map_idm_prediction(native)
+                published = publish_prediction_artifact(target, mapped)
+                item.update(
+                    {
+                        "execution_disposition": "inferred",
+                        "prediction_path": target.relative_to(run_dir).as_posix(),
+                        "prediction_artifact_sha256": published.sha256,
+                        "wall_time_sec": elapsed,
+                    }
+                )
+            except BaseException as error:  # pylint: disable=broad-exception-caught
+                code, disposition = classify_idm_backend_error(_backend_failure_code(error))
+                if isinstance(error, ArtifactPublicationError):
+                    code = "prediction_publish_failed"
+                elif isinstance(error, (PredictionArtifactError, OSError, TypeError, ValueError)):
+                    code = "prediction_artifact_invalid"
+                _set_full_mix_smoke_failed(item, code, error)
+                if disposition == "poison":
+                    backend_poisoned = True
+    finally:
+        if backend is not None:
+            try:
+                backend.close()
+            except BaseException as error:  # pylint: disable=broad-exception-caught
+                close_error = _bounded_error(error)
+
+    identity = CohortIdentity(
+        cohort_id=f"{run_id}:full-mix-smoke",
+        reference_manifest_sha256=reference.manifest_sha256,
+        reference_timing_version=timing.corpus_version,
+        taxonomy_version=TAXONOMY_VERSION,
+        lane_map_version=DTX_LANE_MAP_VERSION,
+        backend_id=IDM_BACKEND_ID,
+        model_id=lock.model_id,
+        model_lock_sha256=model_lock_sha256,
+        backend_descriptor_sha256=descriptor.sha256,
+        prediction_map_version=IDM_PREDICTION_MAP_ID,
+        input_view_id=IDM_FULL_MIX_INPUT_VIEW_ID,
+    )
+    cohort_items: list[CohortItem] = []
+    try:
+        for item in items:
+            simfile_id = int(item["simfile_id"])
+            reference_mapping = mappings.get(simfile_id)
+            if item.get("execution_disposition") == "inferred":
+                prediction_path_value = item.get("prediction_path")
+                audio = audio_by_id.get(simfile_id)
+                if not isinstance(prediction_path_value, str) or audio is None:
+                    raise ValueError("full-mix smoke success item is incomplete")
+                artifact_path = _owned_path(
+                    run_dir, prediction_path_value, "full-mix smoke prediction"
+                )
+                content = read_regular_file_no_follow(artifact_path)
+                artifact = read_prediction_artifact(content)
+                if not prediction_artifact_matches_audio(
+                    artifact,
+                    source_audio_id=audio.source_audio_id,
+                    source_audio_sha256=audio.source_audio_sha256,
+                    audio=audio,
+                    descriptor=descriptor,
+                    prediction_map_version=IDM_PREDICTION_MAP_ID,
+                ):
+                    raise ValueError("full-mix smoke prediction identity mismatch")
+                cohort_items.append(
+                    cohort_item_from_validated_prediction_artifact(
+                        identity,
+                        str(simfile_id),
+                        reference_mapping,
+                        artifact,
+                    )
+                )
+            elif item.get("execution_disposition") == "quarantined":
+                cohort_items.append(
+                    cohort_item_without_prediction(
+                        identity,
+                        str(simfile_id),
+                        None,
+                        status="quarantined",
+                        failure_reason="reference_quarantined",
+                    )
+                )
+            else:
+                reason = item.get("cohort_failure_reason", "inference_failed")
+                if not isinstance(reason, str) or reason not in COHORT_FAILURE_REASONS:
+                    reason = "inference_failed"
+                cohort_items.append(
+                    cohort_item_without_prediction(
+                        identity,
+                        str(simfile_id),
+                        reference_mapping,
+                        status="failed",
+                        failure_reason=reason,  # type: ignore[arg-type]
+                    )
+                )
+        score = score_cohort(identity, tuple(cohort_items), diagnostics_for=())
+        write_cohort_reports(score, reports_path)
+        counts = score.population
+        status = (
+            "complete" if counts.failed_count == 0 and counts.quarantined_count == 0 else "partial"
+        )
+        if close_error is not None and status == "complete":
+            status = "partial"
+        snapshot = {
+            **header,
+            "items": sorted(items, key=lambda item: int(item["simfile_id"])),
+            "success_count": counts.success_count,
+            "failed_count": counts.failed_count,
+            "skipped_count": counts.skipped_count,
+            "quarantined_count": counts.quarantined_count,
+            "overall_status": status,
+            "completed_at": _timestamp(clock()) if status == "complete" else None,
+        }
+        if close_error is not None:
+            snapshot["close_error"] = close_error
+        snapshot = {key: value for key, value in snapshot.items() if value is not None}
+        _write_full_mix_smoke_snapshot(run_path, snapshot)
+    except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError, PredictionArtifactError):
+        return _fatal_full_mix_smoke()
+    return IdmFullMixSmokeOutcome(
+        overall_status=status,  # type: ignore[arg-type]
+        exit_code=0 if status == "complete" else 1,
+        run_id=run_id,
+        run_path=run_path,
+        reports_path=reports_path,
+        success_count=counts.success_count,
+        failed_count=counts.failed_count,
+        skipped_count=counts.skipped_count,
+        quarantined_count=counts.quarantined_count,
+    )
+
+
 __all__ = [
     "IDM_FAILURE_TO_COHORT_REASON",
+    "IDM_FULL_MIX_INPUT_VIEW_ID",
+    "IDM_FULL_MIX_SMOKE_DIRNAME",
+    "IDM_FULL_MIX_SMOKE_REPORT_DIRNAME",
+    "IDM_FULL_MIX_SMOKE_RUN_SCHEMA",
     "IDM_PILOT_RUN_SCHEMA",
+    "IDM_SMOKE_CASE_ORDER",
+    "IDM_SMOKE_SCHEMA",
     "IDM_STEM_INPUT_VIEW_ID",
+    "IdmFullMixSmokeOutcome",
+    "IdmFullMixSmokeRequest",
     "IdmPilotRunError",
     "IdmPilotRunOutcome",
     "IdmPilotRunRequest",
+    "IdmSmokeCase",
+    "IdmSmokeManifest",
+    "IdmSmokeManifestError",
     "build_idm_cohort_from_snapshot",
     "build_idm_inference_config",
     "build_oaf_cohort_from_handoff",
@@ -1689,8 +2550,16 @@ __all__ = [
     "classify_idm_backend_error",
     "compute_model_lock_sha256",
     "idm_inference_config_sha256",
+    "load_idm_smoke_manifest",
+    "materialize_idm_full_mix_audio",
     "parse_idm_pilot_run",
+    "parse_idm_smoke_manifest",
     "render_idm_pilot_run",
+    "render_idm_smoke_manifest",
+    "run_idm_full_mix_smoke",
     "run_idm_pilot",
+    "select_idm_smoke_cases",
+    "validate_idm_smoke_manifest",
+    "write_idm_smoke_manifest",
     "write_idm_pilot_run",
 ]
