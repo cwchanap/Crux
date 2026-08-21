@@ -81,3 +81,41 @@ and the production smoke manifest are available.
 - `tests/test_cli_benchmark.py`
 - `tests/test_cli_benchmark_coverage.py`
 - `.superpowers/sdd/2026-08-20-hpa-396-idm-stem-pilot/task-7-report.md`
+
+## Fix Round 1
+
+### RED
+
+Added a regression before changing the command:
+
+```text
+uv run pytest tests/test_cli_benchmark.py::test_run_idm_pilot_skips_smoke_when_comparison_fails -q
+1 failed
+```
+
+The failure showed that a nonfatal primary run still invoked the optional
+full-mix smoke after `compare_oaf_idm` raised, allowing the smoke call to mask
+the comparison failure.
+
+### GREEN
+
+The smoke branch now requires `comparison_error is None`, preserving the
+canonical fatal comparison payload and exit code 2 while making zero smoke
+calls after comparison failure.
+
+```text
+uv run pytest tests/test_cli_benchmark.py tests/test_cli_benchmark_coverage.py -q
+38 passed
+
+uv run pytest \
+  tests/benchmark/test_idm_model.py \
+  tests/benchmark/test_idm_backend.py \
+  tests/benchmark/test_idm_pilot_run.py \
+  tests/benchmark/test_idm_pilot_run_acceptance.py \
+  tests/benchmark/test_idm_comparison.py \
+  tests/test_cli_benchmark.py \
+  tests/test_cli_benchmark_coverage.py -q
+155 passed
+```
+
+Ruff, Black, Pylint (`src/cli`), and `git diff --check` also passed.
