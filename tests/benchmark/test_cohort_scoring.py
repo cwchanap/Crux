@@ -50,6 +50,9 @@ from src.benchmark.taxonomy import (
     ClassMapping,
 )
 
+IDM_BACKEND_ID = "idm-44-train-kits-v1"
+IDM_PREDICTION_MAP_ID = "crux.prediction-map/idm-44-train-kits-v1"
+
 
 def build_identity() -> CohortIdentity:
     return CohortIdentity(
@@ -1872,6 +1875,55 @@ def build_empty_muscriptor_artifact_for_song(tmp_path: Path, simfile_id: str) ->
         events=(),
     )
     return read_prediction_artifact(render_prediction_artifact(prediction))
+
+
+def build_empty_idm_artifact_for_song(tmp_path: Path, simfile_id: str) -> PredictionArtifact:
+    payload = {
+        "architecture_id": "inverse-drum-machine-v0.1.0",
+        "backend_id": IDM_BACKEND_ID,
+        "descriptor_schema": OAF_DESCRIPTOR_SCHEMA,
+        "model_id": "idm-44-train-kits-0123456789ab-fedcba987654",
+        "native_metadata_schema_id": "idm-peak-event-metadata-v1",
+        "native_output_space_id": "idm-44-train-kits-9class-v1",
+        "prediction_schema": "crux.drum-prediction-events/v2",
+        "training_data_map_id": "idm-training-contract-44-train-kits-v1",
+        "upstream_source_commit": "456656868538205ef756912c7cf5b0fd936de8af",
+    }
+    descriptor = build_descriptor(payload, frozenset(payload), OAF_DESCRIPTOR_SCHEMA)
+    artifact = _artifact_for_song(tmp_path, simfile_id)
+    prediction = dataclasses.replace(
+        artifact.prediction,
+        descriptor=descriptor,
+        events=(),
+    )
+    return read_prediction_artifact(render_prediction_artifact(prediction))
+
+
+def test_empty_idm_artifact_uses_its_closed_zero_hit_map_identity(
+    tmp_path: Path,
+) -> None:
+    artifact = build_empty_idm_artifact_for_song(tmp_path, "42")
+    identity = dataclasses.replace(
+        build_identity(),
+        cohort_id="idm-v1",
+        backend_id=IDM_BACKEND_ID,
+        model_id="idm-44-train-kits-0123456789ab-fedcba987654",
+        backend_descriptor_sha256=artifact.prediction.descriptor.sha256,
+        prediction_map_version=IDM_PREDICTION_MAP_ID,
+    )
+
+    item = cohort_scoring.cohort_item_from_validated_prediction_artifact(
+        identity,
+        "42",
+        build_reference_mapping(),
+        artifact,
+    )
+
+    assert item.prediction_events == ()
+    assert item.artifact_identity is not None
+    assert item.artifact_identity.prediction_map_version == IDM_PREDICTION_MAP_ID
+    assert cohort_scoring.ZERO_HIT_PREDICTION_MAPS[IDM_BACKEND_ID] == IDM_PREDICTION_MAP_ID
+    assert validate_cohort_items(identity, (item,)) is None
 
 
 def test_empty_muscriptor_artifact_uses_only_its_closed_zero_hit_map_identity(

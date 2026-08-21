@@ -25,6 +25,9 @@ from src.benchmark.prediction_artifact import (
 )
 
 OAF_PREDICTION_MAP_ID = "crux.prediction-map/oaf-drums-v1"
+IDM_BACKEND_ID = "idm-44-train-kits-v1"
+IDM_DESCRIPTOR_SCHEMA = "crux.transcription-backend-descriptor/v2"
+IDM_PREDICTION_MAP_ID = "crux.prediction-map/idm-44-train-kits-v1"
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
@@ -85,12 +88,66 @@ def _oaf_prediction(native: NativeEvent | None = None) -> MappedPrediction:
     )
 
 
+def _idm_prediction(native: NativeEvent | None = None) -> MappedPrediction:
+    payload = {
+        "architecture_id": "inverse-drum-machine-v0.1.0",
+        "backend_id": IDM_BACKEND_ID,
+        "descriptor_schema": IDM_DESCRIPTOR_SCHEMA,
+        "model_id": "idm-44-train-kits-0123456789ab-fedcba987654",
+        "native_metadata_schema_id": "idm-peak-event-metadata-v1",
+        "native_output_space_id": "idm-44-train-kits-9class-v1",
+        "prediction_schema": "crux.drum-prediction-events/v2",
+        "training_data_map_id": "idm-training-contract-44-train-kits-v1",
+        "upstream_source_commit": "456656868538205ef756912c7cf5b0fd936de8af",
+    }
+    descriptor = build_descriptor(payload, frozenset(payload), IDM_DESCRIPTOR_SCHEMA)
+    return MappedPrediction(
+        audio=_oaf_prediction().audio,
+        descriptor=descriptor,
+        events=(
+            MappedPredictionEvent(
+                native=(
+                    NativeEvent(
+                        time_sec=1.25,
+                        native_class_id="KD",
+                        model_output_bin=4,
+                        native_midi_note=None,
+                        native_metadata={
+                            "frame_index": "215",
+                            "native_velocity": "1.337421",
+                        },
+                        confidence=0.83,
+                        velocity_midi=85,
+                    )
+                    if native is None
+                    else native
+                ),
+                canonical_class="kick",
+                common_class="kick",
+                mapping_status="mapped",
+                prediction_map_version=IDM_PREDICTION_MAP_ID,
+            ),
+        ),
+    )
+
+
 def test_oaf_prediction_round_trip_is_byte_identical() -> None:
     content = render_prediction_artifact(_oaf_prediction())
 
     round_tripped = read_prediction_artifact(content)
 
     assert render_prediction_artifact(round_tripped.prediction) == content
+
+
+def test_idm_prediction_round_trip_preserves_native_peak_metadata() -> None:
+    content = render_prediction_artifact(_idm_prediction())
+
+    round_tripped = read_prediction_artifact(content)
+
+    assert round_tripped.prediction.events[0].native.native_metadata == {
+        "frame_index": "215",
+        "native_velocity": "1.337421",
+    }
 
 
 @pytest.mark.parametrize(
