@@ -1550,6 +1550,9 @@ def _execute_derived_view(
             runtime_evidence["separator_cache_hit"] = True
         else:
             invocation_attempted = True
+            # Marked before the separator runs: an escaping exception (e.g.
+            # KeyboardInterrupt) must still trigger the caller's model-root
+            # revalidation cleanup, which no returned result can carry.
             separator_invocation_attempted[0] = True
             stem = separator_runner(
                 source.path,

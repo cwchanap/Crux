@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import src.benchmark.separation_handoff as separation_handoff
 from src.benchmark.backend_identity import strict_json_loads
 from src.benchmark.corpus_manifest import canonical_json_line, render_manifest
 from src.benchmark.oaf_corpus_run import OAF_FULL_MIX_INPUT_VIEW_ID
@@ -158,6 +160,36 @@ def _successful_pilot(
 
 def test_oaf_separation_pilot_schema_golden_round_trips() -> None:
     validate_schema_golden(SEPARATION_PILOT_SCHEMA, _GOLDEN.read_bytes())
+
+
+def test_finalize_failure_reason_hides_filesystem_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    request, subset_path, run_path = _successful_pilot(tmp_path, monkeypatch)
+
+    def failing_publish(*args: object, **kwargs: object) -> object:
+        raise OSError(f"cannot publish under {tmp_path}")
+
+    monkeypatch.setattr(separation_handoff, "publish_manifest", failing_publish)
+
+    with caplog.at_level(logging.ERROR, logger="src.benchmark.separation_handoff"):
+        outcome = finalize_separation_pilot(
+            FinalizeSeparationPilotRequest(
+                run_path=run_path,
+                subset_manifest_path=subset_path,
+                output_manifest=tmp_path / "unwritable-handoff" / "manifest.jsonl",
+                decision="keep_full_mix",
+                rationale="A raw publication error must not leak paths.",
+            )
+        )
+
+    assert outcome.exit_code == 2
+    assert outcome.manifest is None
+    assert outcome.failure_reason == "separation handoff finalization failed"
+    assert str(tmp_path) not in outcome.failure_reason
+    assert str(tmp_path) in caplog.text
 
 
 def test_finalize_publishes_stable_htdemucs_evidence_without_run_state(

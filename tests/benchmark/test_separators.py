@@ -416,6 +416,28 @@ def test_freezer_rejects_invalid_repository_revision_before_probe_or_publishing(
     assert not (lock_path.parent / "environment.json").exists()
 
 
+def test_freezer_rejects_output_inside_model_root_before_publishing(
+    tmp_path: Path,
+) -> None:
+    interpreter, _ = _synthetic_environment(tmp_path)
+    model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    lock_path = model_root / "frozen" / "model.json"
+
+    with pytest.raises(SeparatorExecutionError) as raised:
+        _freeze_separator_runtime(
+            separator_id=SPLEETER_SEPARATOR_ID,
+            interpreter=interpreter,
+            model_root=model_root,
+            repository_revision="a" * 40,
+            output=lock_path,
+        )
+
+    assert raised.value.code == "separator_output_inside_model_root"
+    assert not lock_path.exists()
+    assert not (model_root / "environment.json").exists()
+    assert not (model_root / "frozen" / ".separator-publish.lock").exists()
+
+
 def test_freezer_preserves_preexisting_environment_on_lock_conflict(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
