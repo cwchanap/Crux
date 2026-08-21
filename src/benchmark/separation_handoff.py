@@ -10,6 +10,7 @@ longer available.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from collections.abc import Mapping
@@ -39,6 +40,8 @@ from src.benchmark.separation_pilot import (
     SPLEETER_INPUT_VIEW_ID,
     parse_oaf_separation_run,
 )
+
+_logger = logging.getLogger(__name__)
 
 SEPARATION_PILOT_SCHEMA = "crux.oaf-separation-pilot/v1"
 SeparationDecision = Literal[
@@ -1225,7 +1228,17 @@ def finalize_separation_pilot(
         TypeError,
         ValueError,
     ) as error:
-        return FinalizeSeparationPilotOutcome(exit_code=2, manifest=None, failure_reason=str(error))
+        # Only handoff-owned reasons (fixed SeparationHandoffError messages) are
+        # safe for machine-readable output; raw exception text (notably OSError
+        # details carrying filesystem paths) stays in the log.
+        if isinstance(error, SeparationHandoffError):
+            failure_reason = str(error)
+        else:
+            _logger.exception("separation handoff finalization failed")
+            failure_reason = "separation handoff finalization failed"
+        return FinalizeSeparationPilotOutcome(
+            exit_code=2, manifest=None, failure_reason=failure_reason
+        )
 
 
 __all__ = [

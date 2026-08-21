@@ -10,6 +10,7 @@ import runpy
 import shutil
 import subprocess
 import sys
+import tempfile
 import venv
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -96,25 +97,54 @@ def _write_distribution(
         csv.writer(stream, lineterminator="\n").writerows(rows)
 
 
+_SYNTHETIC_VENV_BASE: tuple[Path, Path, Path] | None = None
+
+
+def _synthetic_venv_base() -> tuple[Path, Path, Path]:
+    """Build the shared bare venv once per session (eagerly via the fixture)."""
+    global _SYNTHETIC_VENV_BASE
+    if _SYNTHETIC_VENV_BASE is None:
+        environment = (Path(tempfile.mkdtemp(prefix="crux-synthetic-venv-")) / "venv").resolve()
+        venv.EnvBuilder(with_pip=False, symlinks=False).create(environment)
+        interpreter = _venv_interpreter(environment)
+        purelib = Path(
+            subprocess.check_output(
+                [
+                    str(interpreter),
+                    "-c",
+                    "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+                ],
+                text=True,
+            ).strip()
+        )
+        _SYNTHETIC_VENV_BASE = (environment, purelib, _venv_scripts(interpreter))
+    return _SYNTHETIC_VENV_BASE
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _synthetic_venv_base_fixture() -> None:
+    _synthetic_venv_base()
+
+
+def _copy_synthetic_venv(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Copy the session venv into tmp_path and remap its scheme locations."""
+    base_environment, base_purelib, base_scripts = _synthetic_venv_base()
+    environment = tmp_path / "venv"
+    shutil.copytree(base_environment, environment)
+
+    def _remap(base_path: Path) -> Path:
+        return environment / base_path.relative_to(base_environment)
+
+    return _venv_interpreter(environment), _remap(base_purelib), _remap(base_scripts)
+
+
 def _synthetic_environment(
     tmp_path: Path,
     *,
     package_name: str = "spleeter",
     package_version: str = "2.4.2",
 ) -> tuple[Path, Path]:
-    environment = tmp_path / "venv"
-    venv.EnvBuilder(with_pip=False, symlinks=False).create(environment)
-    interpreter = _venv_interpreter(environment)
-    purelib = Path(
-        subprocess.check_output(
-            [
-                str(interpreter),
-                "-c",
-                "import sysconfig; print(sysconfig.get_paths()['purelib'])",
-            ],
-            text=True,
-        ).strip()
-    )
+    interpreter, purelib, _scripts = _copy_synthetic_venv(tmp_path)
     _write_distribution(purelib, package_name, package_version)
     return interpreter, purelib
 
@@ -200,20 +230,7 @@ def _synthetic_environment_with_console_script(
     package_name: str = "spleeter",
     package_version: str = "2.4.2",
 ) -> tuple[Path, Path, Path]:
-    environment = tmp_path / "venv"
-    venv.EnvBuilder(with_pip=False, symlinks=False).create(environment)
-    interpreter = _venv_interpreter(environment)
-    purelib = Path(
-        subprocess.check_output(
-            [
-                str(interpreter),
-                "-c",
-                "import sysconfig; print(sysconfig.get_paths()['purelib'])",
-            ],
-            text=True,
-        ).strip()
-    )
-    scripts = _venv_scripts(interpreter)
+    interpreter, purelib, scripts = _copy_synthetic_venv(tmp_path)
     console_script = _write_console_script(purelib, scripts, package_name, package_version)
     return interpreter, purelib, console_script
 

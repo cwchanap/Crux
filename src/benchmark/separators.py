@@ -946,14 +946,23 @@ _RUNTIME_PUBLICATION_LOCK_NAME = ".separator-publish.lock"
 
 
 @contextlib.contextmanager
-def _runtime_publication_lock(output: Path) -> Iterator[None]:
+def _runtime_publication_lock(output: Path, model_root: Path) -> Iterator[None]:
     """Serialize multi-file runtime publication under one exclusive lock.
 
     The lock+manifest pair must be published atomically so that a concurrent
     freeze with the same environment but a different revision cannot observe a
     stale ``environment_preexisting`` value and delete a manifest that belongs
     to the winning freeze.
+
+    The output must live outside the attested model root: publishing there
+    would mutate the very tree the lock attests, so it is rejected before the
+    lock file or any artifact is created.
     """
+    if output.resolve().is_relative_to(model_root.resolve()):
+        raise SeparatorExecutionError(
+            "separator_output_inside_model_root",
+            "separator lock output must not be written inside the model root",
+        )
     try:
         import fcntl  # noqa: PLC0415 — lazy stdlib import; Unix-only
     except ImportError as error:  # pragma: no cover — non-Unix platform
@@ -1069,7 +1078,7 @@ def freeze_separator_runtime(
     # concurrent freeze with the same environment but a different revision
     # cannot observe a stale environment_preexisting value and delete a manifest
     # that belongs to the winning freeze.
-    with _runtime_publication_lock(output):
+    with _runtime_publication_lock(output, model_root):
         environment_preexisting = environment_path.exists()
         try:
             publish_immutable_file(environment_path, environment_bytes)

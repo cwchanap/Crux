@@ -720,6 +720,10 @@ def build_environment_manifest() -> dict[str, object]:
         if not isinstance(package_version, str) or not package_version:
             raise _ProbeError("separator package version is malformed")
 
+        # Exclusive roots (purelib/platlib) are walked in full, so every
+        # undeclared non-bytecode file fails attestation.  Shared roots are
+        # validated per expected member only (type and identity); undeclared
+        # membership in a shared root is neither enumerated nor rejected.
         for tag, expected in expected_by_root.items():
             if tag in _EXCLUSIVE_ROOT_TAGS:
                 observed = _walk_tree(
