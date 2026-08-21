@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import io
 import json
 import math
 import os
@@ -52,19 +53,34 @@ def _request_id(payload: object) -> str | None:
     return request_id if isinstance(request_id, str) and request_id else None
 
 
-def _valid_request(payload: object) -> tuple[str, str]:
-    if not isinstance(payload, dict) or set(payload) != {"id", "audio_path"}:
+def _valid_request(payload: object) -> tuple[str, str, int, str]:
+    if not isinstance(payload, dict) or set(payload) != {
+        "id",
+        "audio_path",
+        "audio_byte_length",
+        "audio_sha256",
+    }:
         raise ValueError("request is invalid")
     request_id = payload["id"]
     audio_path = payload["audio_path"]
+    audio_byte_length = payload["audio_byte_length"]
+    audio_sha256 = payload["audio_sha256"]
     if not isinstance(request_id, str) or not request_id:
         raise ValueError("request id is invalid")
     if not isinstance(audio_path, str) or not audio_path or "\x00" in audio_path:
         raise ValueError("audio path is invalid")
     path = Path(audio_path)
-    if any(part in {"", ".", ".."} for part in path.parts):
+    if not path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         raise ValueError("audio path is invalid")
-    return request_id, audio_path
+    if type(audio_byte_length) is not int or audio_byte_length < 0:
+        raise ValueError("audio byte length is invalid")
+    if (
+        not isinstance(audio_sha256, str)
+        or len(audio_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in audio_sha256)
+    ):
+        raise ValueError("audio digest is invalid")
+    return request_id, audio_path, audio_byte_length, audio_sha256
 
 
 def _load_model(
@@ -249,11 +265,87 @@ def _configure_isolated_imports(site_packages: Path, wheel_project: Path) -> Non
     sys.path.insert(1, os.fspath(site_packages))
 
 
-def _load_audio(path: str, torch: Any, device: Any) -> Any:
+def _open_audio_leaf(path: Path) -> tuple[int, list[int]]:
+    """Open every path component without following a replacement ancestor."""
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory is None:
+        raise ValueError("audio no-follow reads are unavailable")
+    if not path.is_absolute() or len(path.parts) < 2:
+        raise ValueError("audio path is invalid")
+    common_flags = os.O_RDONLY | no_follow | directory | getattr(os, "O_CLOEXEC", 0)
+    descriptors: list[int] = []
+    try:
+        parent = os.open(path.anchor, common_flags)
+        descriptors.append(parent)
+        for component in path.parts[1:-1]:
+            parent = os.open(component, common_flags, dir_fd=parent)
+            descriptors.append(parent)
+        leaf = os.open(
+            path.parts[-1],
+            os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent,
+        )
+        return leaf, descriptors
+    except Exception:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+
+
+def _read_audio_bytes(path: Path, expected_byte_length: int, expected_sha256: str) -> bytes:
+    descriptor, parents = _open_audio_leaf(path)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("audio input is not regular")
+        initial_size = metadata.st_size
+        chunks: list[bytes] = []
+        digest = hashlib.sha256()
+        byte_length = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            digest.update(chunk)
+            byte_length += len(chunk)
+        final_size = os.fstat(descriptor).st_size
+        content = b"".join(chunks)
+        if (
+            initial_size != final_size
+            or byte_length != expected_byte_length
+            or digest.hexdigest() != expected_sha256
+        ):
+            raise ValueError("audio bytes do not match verified identity")
+        return content
+    finally:
+        os.close(descriptor)
+        for parent in reversed(parents):
+            os.close(parent)
+
+
+def _load_audio(
+    path: str,
+    expected_byte_length: int,
+    expected_sha256: str,
+    torch: Any,
+    device: Any,
+) -> Any:
     import soundfile
 
     try:
-        info = soundfile.info(path)
+        if (
+            type(expected_byte_length) is not int
+            or expected_byte_length < 0
+            or not isinstance(expected_sha256, str)
+            or len(expected_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in expected_sha256)
+        ):
+            raise ValueError("audio identity is invalid")
+        content = _read_audio_bytes(Path(path), expected_byte_length, expected_sha256)
+        stream = io.BytesIO(content)
+        info = soundfile.info(stream)
         if (
             info.format != "WAV"
             or info.subtype != "PCM_16"
@@ -261,9 +353,10 @@ def _load_audio(path: str, torch: Any, device: Any) -> Any:
             or info.channels != 1
         ):
             raise ValueError("audio format is invalid")
-        samples, sample_rate = soundfile.read(path, dtype="float32", always_2d=True)
+        stream.seek(0)
+        samples, sample_rate = soundfile.read(stream, dtype="float32", always_2d=True)
     except Exception as error:
-        raise ValueError("audio format is invalid") from error
+        raise ValueError("audio input or format is invalid") from error
     if sample_rate != SAMPLE_RATE_HZ or samples.shape[1] != 1:
         raise ValueError("audio format is invalid")
     return torch.from_numpy(samples[:, 0]).to(device).unsqueeze(0)
@@ -407,7 +500,7 @@ def serve_requests(
         try:
             payload = json.loads(raw_line)
             request_id = _request_id(payload)
-            request_id, audio_path = _valid_request(payload)
+            request_id, audio_path, audio_byte_length, audio_sha256 = _valid_request(payload)
         except (TypeError, ValueError, json.JSONDecodeError):
             error: dict[str, Any] = {
                 "error": {"code": "invalid_request", "message": "invalid request"}
@@ -418,7 +511,7 @@ def serve_requests(
             continue
 
         try:
-            audio = _load_audio(audio_path, torch, device)
+            audio = _load_audio(audio_path, audio_byte_length, audio_sha256, torch, device)
             events = _events(model, audio, torch)
         except ValueError:
             _write(

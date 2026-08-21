@@ -435,6 +435,112 @@ def test_primary_output_namespace_rejects_preseeded_symlinks_without_outside_wri
     assert sentinel.read_bytes() == b"must remain untouched"
 
 
+def _swap_held_directory(path: Path, outside: Path) -> Path:
+    outside.mkdir(parents=True, exist_ok=True)
+    moved = outside / path.name
+    path.rename(moved)
+    path.symlink_to(moved, target_is_directory=True)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"must remain untouched")
+    return sentinel
+
+
+def test_primary_run_checkpoint_uses_held_run_directory_after_swap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    handoff, reference, timing, mappings = _synthetic_handoff(tmp_path)
+    request = _request(tmp_path)
+    write_actual_handoff(request.separation_handoff_path, handoff)
+    runner = _install_synthetic_seams(monkeypatch, reference, timing, mappings)
+    original_open = runner._open_primary_namespace
+    swapped = False
+
+    def open_then_swap(*args, **kwargs):
+        nonlocal swapped
+        handles = original_open(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            _swap_held_directory(
+                request.output_dir / "runs" / handles.run_id,
+                tmp_path / "outside-run",
+            )
+        return handles
+
+    monkeypatch.setattr(runner, "_open_primary_namespace", open_then_swap)
+    descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
+    outcome = run_idm_pilot(
+        request,
+        backend_factory=_healthy_backend_factory(descriptor, []),
+        perf_counter=lambda: 1.0,
+    )
+
+    assert swapped
+    assert outcome.overall_status in {"complete", "partial"}
+    assert (tmp_path / "outside-run" / "sentinel").read_bytes() == b"must remain untouched"
+
+
+def test_primary_prediction_publication_uses_held_dynamic_parent_after_swap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    handoff, reference, timing, mappings = _synthetic_handoff(tmp_path)
+    request = _request(tmp_path)
+    write_actual_handoff(request.separation_handoff_path, handoff)
+    runner = _install_synthetic_seams(monkeypatch, reference, timing, mappings)
+    original_open = runner._open_primary_prediction_parent
+    swapped = False
+
+    def open_then_swap(*args, **kwargs):
+        nonlocal swapped
+        parent_fd = original_open(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            _swap_held_directory(args[0].parent, tmp_path / "outside-prediction")
+        return parent_fd
+
+    monkeypatch.setattr(runner, "_open_primary_prediction_parent", open_then_swap)
+    descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
+    outcome = run_idm_pilot(
+        request,
+        backend_factory=_healthy_backend_factory(descriptor, []),
+        perf_counter=lambda: 1.0,
+    )
+
+    assert swapped
+    assert outcome.overall_status in {"complete", "partial"}
+    assert (tmp_path / "outside-prediction" / "sentinel").read_bytes() == b"must remain untouched"
+
+
+def test_primary_reports_publication_uses_held_report_directories_after_swap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    handoff, reference, timing, mappings = _synthetic_handoff(tmp_path)
+    request = _request(tmp_path)
+    write_actual_handoff(request.separation_handoff_path, handoff)
+    runner = _install_synthetic_seams(monkeypatch, reference, timing, mappings)
+    original_open = runner._open_primary_report_directories
+    swapped = False
+
+    def open_then_swap(*args, **kwargs):
+        nonlocal swapped
+        report_fds = original_open(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            _swap_held_directory(args[0], tmp_path / "outside-reports")
+        return report_fds
+
+    monkeypatch.setattr(runner, "_open_primary_report_directories", open_then_swap)
+    descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
+    outcome = run_idm_pilot(
+        request,
+        backend_factory=_healthy_backend_factory(descriptor, []),
+        perf_counter=lambda: 1.0,
+    )
+
+    assert swapped
+    assert outcome.overall_status in {"complete", "partial"}
+    assert (tmp_path / "outside-reports" / "sentinel").read_bytes() == b"must remain untouched"
+
+
 def test_interrupted_resume_preserves_unvisited_exact_ledger_items(
     tmp_path: Path, monkeypatch
 ) -> None:

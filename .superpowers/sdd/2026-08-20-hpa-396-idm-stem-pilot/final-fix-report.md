@@ -147,3 +147,105 @@ WAV only; the checkout still has no production HPA-328 immutable handoff and
 no `runtime/idm/smoke.json`. Therefore production five-song membership,
 full-corpus stem inference, scored comparison, and operational smoke remain
 blocked until that upstream handoff and attested production evidence exist.
+
+## Fix Round 2 — final re-review integrity fixes
+
+This round closes the two remaining Important findings from the final
+re-review without changing the full-mix path or the progress ledger.
+
+### TDD RED
+
+The new publication-seam tests were run before their descriptor-bound helpers
+existed. The initial focused run observed three failures for the missing
+primary namespace/prediction/report descriptor seams. The worker identity
+regressions were likewise added at the request boundary before the worker and
+backend changes were completed; they exercised the old pathname-based audio
+decode and missing request identity fields.
+
+### GREEN and verification
+
+The focused IDM backend, worker-process, and primary acceptance suites passed:
+
+```text
+.venv/bin/pytest -q tests/benchmark/test_idm_backend.py \
+  tests/benchmark/test_worker_process.py \
+  tests/benchmark/test_idm_pilot_run_acceptance.py
+80 passed in 19.75s
+
+.venv/bin/pytest -q tests/benchmark/test_idm_pilot_run_acceptance.py
+23 passed in 17.14s
+```
+
+The complete HPA-396 matrix, including the new audio identity and publication
+race cases, passed `367` tests in `21.93s`. The full repository suite passed
+`3142` tests in `292.03s (0:04:52)`:
+
+```text
+.venv/bin/pytest -q <HPA-396 test matrix>
+367 passed in 21.93s
+
+.venv/bin/pytest -q
+3142 passed in 292.03s (0:04:52)
+```
+
+Static verification also passed:
+
+```text
+.venv/bin/ruff check .
+All checks passed!
+
+.venv/bin/ruff format --check src tests
+170 files already formatted
+
+.venv/bin/pylint --errors-only --disable=E1120,E0401 --jobs=1 src
+exit 0; no output
+
+git diff --check
+exit 0; no output
+```
+
+The pinned real IDM runtime/WAV probe still passed after the descriptor
+changes, with `python_version=3.11.12`, the locked model/classes,
+`sample_rate_hz=44100`, `activation_rate_hz=172.265625`, `device=cpu`,
+`dtype=float32`, and `events=78`.
+
+### Files changed
+
+- `runtime/idm/worker.py`
+- `src/benchmark/backends/idm.py`
+- `src/benchmark/idm_pilot_run.py`
+- `src/benchmark/worker_process.py`
+- `tests/benchmark/test_idm_backend.py`
+- `tests/benchmark/test_idm_pilot_run_acceptance.py`
+- this report
+
+### Self-review
+
+The IDM request now carries the retained CanonicalAudio byte length and
+SHA-256. The isolated worker opens the staged leaf once through held
+`O_NOFOLLOW` ancestor descriptors, requires a regular file, reads and hashes
+the bytes from that descriptor, and decodes the verified bytes from memory;
+it never reopens or decodes the pathname. Leaf, ancestor, symlink,
+non-regular, length, digest, and protocol mismatch cases fail closed before a
+prediction can be labeled with the retained identity.
+
+The primary stem runner holds no-follow descriptors for the output root,
+`runs`, exact run, input, predictions, dynamic prediction parent, reports, and
+owned report roots. Checkpoints, retained-input materialization, prediction
+publication, and final report leaves use those held descriptors with private
+temporary files, no-follow opens, atomic replacement, and fsync. Report bytes
+are still produced by the existing scoring/report helpers. Resume identity and
+immutable prediction conflict behavior remain intact. The publication-seam
+tests swap the run, dynamic prediction, and report directories after
+validation and assert that no outside sentinel is changed.
+
+No generic filesystem framework, dependency, full-mix redesign, or speculative
+scope was introduced.
+
+### Remaining production operational block
+
+The checkout still has no production HPA-328 immutable handoff and no
+`runtime/idm/smoke.json`. The pinned demo probe is therefore the available
+production-like evidence; production five-song membership, full-corpus stem
+inference, scored comparison, and the operational smoke remain blocked until
+that upstream handoff and attested production evidence exist.

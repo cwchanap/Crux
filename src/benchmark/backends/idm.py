@@ -142,7 +142,11 @@ class IdmBackend:
         frame_limit = _activation_frame_limit(audio, self._lock)
         process = self._ensure_process()
         try:
-            response = process.request(request_path)
+            response = process.request(
+                request_path,
+                audio_byte_length=audio.byte_length,
+                audio_sha256=audio.input_audio_sha256,
+            )
         except WorkerProcessError as error:
             self._poison()
             raise IdmBackendError(str(error), code="worker_protocol_failed") from error

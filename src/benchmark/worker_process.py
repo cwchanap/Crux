@@ -123,7 +123,12 @@ class WorkerProcess:
         return self._closed
 
     def request(
-        self, audio_path: Path | str, *, request_id: str | None = None
+        self,
+        audio_path: Path | str,
+        *,
+        audio_byte_length: int | None = None,
+        audio_sha256: str | None = None,
+        request_id: str | None = None,
     ) -> Mapping[str, Any]:
         if self._closed:
             raise WorkerProcessError("worker process is closed")
@@ -139,6 +144,21 @@ class WorkerProcess:
             if not isinstance(identifier, str) or not identifier:
                 raise WorkerProcessError("worker request id is invalid")
             payload = {"id": identifier, "audio_path": os.fspath(audio_path)}
+            if audio_byte_length is not None or audio_sha256 is not None:
+                if (
+                    type(audio_byte_length) is not int
+                    or audio_byte_length < 0
+                    or not isinstance(audio_sha256, str)
+                    or len(audio_sha256) != 64
+                    or any(character not in "0123456789abcdef" for character in audio_sha256)
+                ):
+                    raise WorkerProcessError("worker audio identity is invalid")
+                payload.update(
+                    {
+                        "audio_byte_length": audio_byte_length,
+                        "audio_sha256": audio_sha256,
+                    }
+                )
             stream = self._process.stdin
             if stream is None:
                 raise WorkerProcessError("worker stdin is unavailable")
