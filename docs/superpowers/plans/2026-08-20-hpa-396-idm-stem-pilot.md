@@ -2,118 +2,177 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Freeze one official Inverse Drum Machine runtime/model contract, run its native transcription head over the exact HPA-328 HTDemucs canonical input population, score IDM and retained OaF predictions through the unchanged HPA-325 scorer, and publish exact-input paired OaF→IDM evidence plus a separate five-song full-mix compatibility smoke.
+**Goal:** Freeze one official Inverse Drum Machine runtime/model/extraction contract, run its native transcription head over the exact HPA-328 HTDemucs canonical input population, score IDM and retained OaF predictions through the unchanged HPA-325 scorer, and publish exact-input paired OaF→IDM evidence plus a separate fixed five-song full-mix compatibility diagnostic.
 
-**Architecture:** Keep IDM comparator-only. Run the exact upstream package in one isolated `uv` environment behind the existing persistent `WorkerProcess`. Extend the closed backend descriptor/prediction-v2/taxonomy unions for one third family. Consume the immutable HPA-328 handoff rather than rerunning separators/OaF, keep every fixed row in the population, and build one concrete HPA-396 runner plus one small comparison driver around existing scoring/comparison primitives.
+**Architecture:** Keep IDM comparator-only. Run the exact upstream package in one isolated Python 3.11 `uv` environment behind the existing persistent `WorkerProcess`. Extend the closed backend descriptor/prediction-v2/taxonomy/zero-hit tables for one third family. Consume the immutable HPA-328 handoff rather than rerunning separators/OaF, keep every fixed row in population accounting, and implement one concrete `idm_pilot_run.py` plus one concrete `idm_comparison.py` around existing HPA-325/public comparison rails.
 
-**Tech Stack:** Main Crux Python 3.12, isolated IDM Python selected/frozen during Task 0 (prefer 3.11 if required by upstream dependencies), `uv`, PyTorch/torchaudio, official `inverse-drum-machine` commit `456656868538205ef756912c7cf5b0fd936de8af`, Click, pytest, Crux canonical JSON/JSONL helpers, HPA-324 taxonomy, HPA-325 scorer/reports, HPA-327 subset, HPA-328 separation handoff.
+**Tech Stack:** Main Crux Python 3.12; isolated IDM Python 3.11; `uv`; PyTorch/torchaudio through the pinned upstream package; `soundfile` for exact 44.1 kHz mono PCM16 decode; official `inverse-drum-machine` commit `456656868538205ef756912c7cf5b0fd936de8af`; Click; pytest; Crux canonical JSON/JSONL helpers; HPA-324 taxonomy; HPA-325 scorer/reports; HPA-327 references; HPA-328 immutable separation handoff.
 
-## PR constraint
+**Spec:** `docs/superpowers/specs/2026-08-20-hpa-396-idm-stem-pilot-design.md`
 
-This draft planning PR is the **single HPA-396 PR**. After planning review, implementation commits must continue on this same branch/PR. Do not open a second implementation PR for HPA-396.
+## Global Constraints
 
-## Global constraints
-
-- Official upstream repository only: `https://github.com/bernardo-torres/inverse-drum-machine`.
-- Freeze source commit `456656868538205ef756912c7cf5b0fd936de8af` unless Task 0 proves that exact revision cannot load its committed checkpoint. Do not silently move to a newer commit.
+- This is the **single HPA-396 PR**. Continue implementation on this branch/PR after planning review; do not open a second implementation PR.
+- Official upstream only: `https://github.com/bernardo-torres/inverse-drum-machine` at `456656868538205ef756912c7cf5b0fd936de8af`.
 - Primary model is exactly `idm-44-train-kits`.
-- Primary population is exactly the finalized HPA-328 handoff population. No seed/count/include/exclude controls.
-- Primary input bytes are the retained HPA-328 `htdemucs.input` canonical WAV bytes; do not rerun HTDemucs or re-canonicalize successful rows.
-- Retained HPA-328 OaF predictions are the comparator. Do not rerun OaF.
-- Use the existing `crux.oaf-htdemucs-drums-mono44k1-pcm16/v1` input-view ID because it identifies the frozen bytes, not the consumer model.
-- Use the existing HPA-325 tolerance/alignment/scoring implementation unchanged.
-- Keep `crux.drum-prediction-events/v2`; add IDM as the third closed family without weakening OaF/MuScriptor invariants.
-- Persist the post-sigmoid onset activation as `confidence`; do not add a Crux confidence threshold.
-- Project native IDM velocity `(0, 2]` to the existing `velocity_midi` field with one frozen `round(clamp(v/2, 0, 1) * 127)` transform. Velocity is diagnostic only and never part of onset F1.
-- Use IDM's own evaluation sigmoid + `PeakPicking` semantics. No manual onset override and no hand-edited events.
-- Do not require IDM synthesized/reconstructed stems. No Wiener masking path is needed for the scored transcription pilot.
-- Full-mix work is exactly five predeclared smoke songs and stays separate from the headline stem results.
-- No production registry/API integration.
-- No full-corpus IDM runner, generic runner/base class, model runtime framework, mapping DSL, experiment framework, database, queue, second scorer, tuning loop, training, or fine-tuning.
-- CI remains offline and does not install/download the isolated IDM runtime/model.
+- Isolated runtime is Python `3.11.*`; if the pinned dependency set cannot resolve/run there without patching upstream, stop and report the blocker rather than broadening runtime policy.
+- Primary population is exactly the production HPA-328 handoff population. No seed/count/include/exclude controls.
+- The merged HPA-328 PR currently records that production Task 11 was not run. Real HPA-396 corpus/smoke inference remains blocked until the immutable production handoff exists.
+- Primary input bytes are the retained HPA-328 `htdemucs.input` canonical WAV bytes. Do not rerun HTDemucs or recanonicalize successful rows.
+- Retained HPA-328 OaF-on-HTDemucs predictions are the comparator. Do not rerun OaF.
+- Preserve `crux.oaf-htdemucs-drums-mono44k1-pcm16/v1` as the primary input-view ID.
+- Worker WAV decode is `soundfile-preserve-wav/v1`: WAV, 44.1 kHz, mono, PCM16; no librosa load, resample, mixdown, normalization, or rewrite.
+- Freeze `IDM_REQUEST_TIMEOUT_SECONDS = 1800.0`; include it in `crux.idm-inference-config/v1` run identity. Freeze `IDM_WORKER_CLOSE_TIMEOUT_SECONDS = 30.0` as lifecycle policy.
+- Launch `WorkerProcess.start()` with a `Sequence[str]` beginning with the isolated `runtime_python`; never pass a lone worker `Path`/string.
+- Keep `crux.drum-prediction-events/v2`; add IDM as the third closed family without weakening OaF/MuScriptor.
+- Add `ZERO_HIT_PREDICTION_MAPS[IDM_BACKEND_ID] = IDM_PREDICTION_MAP_ID` in the same schema-family task. This is mandatory.
+- Persist IDM `native_metadata` with exactly `frame_index` and pre-MIDI `native_velocity` as canonical strings. Keep `confidence` and `velocity_midi` diagnostic-only.
+- `map_idm_prediction()` keys on `native_class_id`.
+- `TT_LMT` maps to `ClassMapping(None, "tom")`.
+- Use unchanged `score_cohort()` and `write_cohort_reports()`.
+- Paired stem comparison must call `pairable_success_ids(..., require_identical_input_hash=True)`.
+- Keep HPA-396 native failure codes in the run snapshot/histogram; map them to the existing HPA-325 failure enum using the fixed table in the spec. Do not extend the scorer enum.
+- `upstream_stem_unavailable` maps to HPA-325 `inference_failed`, matching existing source-unavailable runner semantics; it does not map to `prediction_missing`.
+- No manual onset override, score-driven tuning, required IDM reconstructed stems, Wiener masking, full-corpus path, production registry entry, generic runner/comparison framework, database, queue, training, or fine-tuning.
+- `source_cache_dir` belongs only to the separate full-mix smoke request, never the primary stem request.
+- Per-task commits stay on this PR. Keep Task 0/runtime lock separate from later scoring commits.
+
+## Risks / Hard Gates
+
+- **Production HPA-328 handoff absent:** do not fabricate smoke/pilot membership from tests. Offline implementation may proceed; real Task 6/8 execution cannot.
+- **Weight license:** missing or contradictory checkpoint-license evidence stops scored work.
+- **PeakPicking compatibility:** Task 0 must execute the exact pinned decoder sigmoid + `peak_picking_val` path. Do not replace it with a locally tuned picker if it fails.
+- **librosa resampling:** any path that calls default `librosa.load(path)` is a contract violation. The worker uses `soundfile` and rejects noncanonical WAV.
+- **Timeout-dependent population:** request timeout changes success/pairable population. The fixed `1800`-second value is hashed into inference identity before scores.
+- **Zero-hit artifacts:** valid silence/no-peak output must score through the IDM zero-hit map entry.
+- **Metadata recovery cost:** `frame_index` and pre-MIDI native velocity must be persisted before real inference; do not plan a later rerun merely to recover them.
 
 ---
 
-### Task 0: Prove the exact upstream runtime/model path before building Crux integration
-
-**Purpose:** HPA-396 is experimental integration work. Prove the scientific target is runnable first so implementation does not accumulate around a false upstream assumption.
+### Task 0: Prove the exact upstream runtime, demo, WAV tensor path, and PeakPicking contract
 
 **Files:**
 - Create: `runtime/idm/pyproject.toml`
 - Create: `runtime/idm/uv.lock`
-- Temporary/local only: isolated `.venv` and downloaded model cache
+- Temporary/local only: `runtime/idm/.venv/`
+- Verify upstream: `demo/mix.wav`
 - Verify upstream: `pretrained/idm-44-train-kits/checkpoints/model.yaml`
 - Verify upstream: `pretrained/idm-44-train-kits/checkpoints/val-epoch=518-global_step=0.ckpt`
 
-- [ ] **Step 1: Create the smallest isolated runtime project**
-
-Use one exact git dependency:
+**Interfaces:**
 
 ```toml
 [project]
 name = "crux-idm-runtime"
 version = "0.0.0"
-requires-python = "==<selected-minor>.*"
+requires-python = "==3.11.*"
 dependencies = [
   "inverse-drum-machine @ git+https://github.com/bernardo-torres/inverse-drum-machine.git@456656868538205ef756912c7cf5b0fd936de8af",
 ]
 ```
 
-Start with Python 3.11 because upstream's dependency set was authored around Python 3.10/3.11-era PyTorch/librosa. If `uv lock` proves 3.11 invalid but another upstream-supported minor works, select that minor once and document the evidence. Do not change Crux's main Python requirement.
+- [ ] **Step 1: Create the isolated runtime project**
 
-- [ ] **Step 2: Resolve and freeze the isolated environment**
+Write `runtime/idm/pyproject.toml` exactly with Python 3.11 and the pinned Git dependency above. Do not touch root `pyproject.toml` or root `uv.lock`.
+
+- [ ] **Step 2: Resolve the runtime**
+
+Run:
 
 ```bash
 uv lock --project runtime/idm
 uv sync --project runtime/idm --frozen
 ```
 
-Expected: exact git revision appears in `runtime/idm/uv.lock` and the isolated environment imports `idm`.
+Expected: both commands exit 0; `runtime/idm/uv.lock` resolves the exact upstream commit. If not, stop HPA-396 rather than patching/upgrading upstream.
 
-If dependency resolution cannot produce an upstream-compatible environment without patching the package, stop and record HPA-396 blocked rather than modifying upstream semantics.
+- [ ] **Step 3: Verify source/model/license facts before integration**
 
-- [ ] **Step 3: Verify source/model/license evidence at the pinned revision**
-
-Confirm:
+Using the pinned checkout/runtime, assert:
 
 ```text
-package version: 0.1.0
-root code license: Apache-2.0
-model config path exists
-checkpoint path exists
-train_classes are exactly the frozen nine classes
-model config sample rate/hop/activation facts match the design
+package version = 0.1.0
+root license = Apache-2.0
+model.yaml exists
+val-epoch=518-global_step=0.ckpt exists
+train_classes = CY_CR,CY_RD,HH_CHH,HH_OHH,KD,SD,TT_HFT,TT_HMT,TT_LMT
+sample rate = 44100
+mel n_fft = 1024
+mel hop = 256
+mel bins = 128
 ```
 
-Check for a checkpoint-specific license/notice. If the weight-license basis is ambiguous or contradicts the repository license, stop before scored inference and record the blocker.
+Inspect the pinned repository for checkpoint-specific license/notice text. If the checkpoint licensing basis cannot be established, stop before scored execution.
 
-- [ ] **Step 4: Run one real official model load outside Crux integration**
+- [ ] **Step 4: Reproduce the official demo model load**
 
-Using the isolated environment and local copy of the two official model files, execute the upstream load path and inspect:
+Use upstream `demo/mix.wav` and the isolated Python:
 
 ```python
-model, name = load_model("idm-44-train-kits", device, log_dir=<local-pretrained-root>)
+from pathlib import Path
+import torch
+from idm.inference import load_model
+
+model, name = load_model(
+    "idm-44-train-kits",
+    torch.device("cpu"),
+    log_dir=Path("pretrained"),
+)
 assert name == "idm-44-train-kits"
+assert tuple(model.train_classes) == (
+    "CY_CR", "CY_RD", "HH_CHH", "HH_OHH", "KD", "SD", "TT_HFT", "TT_HMT", "TT_LMT"
+)
 assert model.encoder.sampling_rate == 44100
 assert model.encoder.frame_rate == 44100 / 256
 ```
 
-Run one known-good WAV through `model.encoder()` and assert:
+Use the pinned upstream checkout as working directory so `pretrained/` resolves exactly.
 
-```text
-activations["onset"] shape == (1, 9, frames)
-activations["velocity"] shape == (1, 9, frames)
-all values finite
-activation_rate == 44100 / 256
+- [ ] **Step 5: Prove the no-resample soundfile tensor path**
+
+Run a small script in the isolated runtime:
+
+```python
+import soundfile as sf
+import torch
+
+info = sf.info("demo/mix.wav")
+assert info.format == "WAV"
+assert info.subtype == "PCM_16"
+assert info.samplerate == 44100
+assert info.channels == 1
+samples, sr = sf.read("demo/mix.wav", dtype="float32", always_2d=True)
+assert sr == 44100
+assert samples.shape[1] == 1
+audio = torch.from_numpy(samples[:, 0]).unsqueeze(0)
+outputs = model.encoder(audio)
+assert outputs["activations"]["onset"].shape[1] == 9
+assert outputs["activations"]["velocity"].shape == outputs["activations"]["onset"].shape
+assert outputs["activation_rate"] == 44100 / 256
+assert torch.isfinite(outputs["activations"]["onset"]).all()
+assert torch.isfinite(outputs["activations"]["velocity"]).all()
 ```
 
-Then execute the decoder evaluation peak-picking path without manual override and prove at least the protocol shape is usable.
+Do not use `librosa.load()` in this probe.
 
-- [ ] **Step 5: Record the feasibility result in the PR before continuing**
+- [ ] **Step 6: Prove the exact evaluation PeakPicking path**
 
-If the exact official path works, continue. If not, update HPA-396/this PR with the concrete blocker; do not substitute another model based on convenience or F1.
+Continue the same probe:
 
-- [ ] **Step 6: Commit the isolated runtime lock only after it is proven**
+```python
+onset_logits = outputs["activations"]["onset"]
+onset_scores = model.decoder.activation(onset_logits)
+onsets = model.decoder.peak_picking_val(
+    onset_scores,
+    activation_rate=outputs["activation_rate"],
+)
+assert onsets.shape == onset_scores.shape
+assert torch.isfinite(onset_scores).all()
+```
+
+If this pinned API/path is unusable, stop. Do not substitute custom thresholds or a second picker.
+
+- [ ] **Step 7: Commit the proven isolated runtime lock**
 
 ```bash
 git add runtime/idm/pyproject.toml runtime/idm/uv.lock
@@ -122,7 +181,7 @@ git commit -m "build: freeze IDM benchmark runtime"
 
 ---
 
-### Task 1: Freeze the IDM model/extraction identity and local model cache
+### Task 1: Freeze the model, loader, extraction, and thin inference-config identity
 
 **Files:**
 - Create: `src/benchmark/idm_model.py`
@@ -135,19 +194,14 @@ git commit -m "build: freeze IDM benchmark runtime"
 ```python
 IDM_MODEL_SCHEMA = "crux.idm-model/v1"
 IDM_RELEASE_COMMIT = "456656868538205ef756912c7cf5b0fd936de8af"
-IDM_MODEL_ID_RE = re.compile(
-    r"idm-44-train-kits-[0-9a-f]{12}-[0-9a-f]{12}\Z"
-)
+IDM_MODEL_ID_RE = re.compile(r"idm-44-train-kits-[0-9a-f]{12}-[0-9a-f]{12}\Z")
+IDM_REQUEST_TIMEOUT_SECONDS = 1800.0
+IDM_WORKER_CLOSE_TIMEOUT_SECONDS = 30.0
+IDM_AUDIO_LOADER_REVISION = "soundfile-preserve-wav/v1"
+IDM_VELOCITY_TO_MIDI_REVISION = "clamp-half-round-midi127/v1"
+IDM_NATIVE_VELOCITY_PERSISTENCE_REVISION = "quantize-six-canonical-string/v1"
 IDM_TRAIN_CLASSES = (
-    "CY_CR",
-    "CY_RD",
-    "HH_CHH",
-    "HH_OHH",
-    "KD",
-    "SD",
-    "TT_HFT",
-    "TT_HMT",
-    "TT_LMT",
+    "CY_CR", "CY_RD", "HH_CHH", "HH_OHH", "KD", "SD", "TT_HFT", "TT_HMT", "TT_LMT"
 )
 
 @dataclass(frozen=True)
@@ -171,6 +225,12 @@ class IdmModelLock:
     device: str
     dtype: str
     sample_rate_hz: int
+    input_channel_count: int
+    input_container: str
+    input_subtype: str
+    audio_loader_revision: str
+    resampling: str
+    mixdown: str
     mel_n_fft: int
     mel_hop_length: int
     mel_n_mels: int
@@ -185,6 +245,7 @@ class IdmModelLock:
     velocity_activation: str
     velocity_max_value: float
     velocity_to_midi_revision: str
+    native_velocity_persistence_revision: str
     manual_onset_override: bool
     reconstructed_stems: bool
     masking: str
@@ -197,36 +258,56 @@ class IdmModelLock:
 def load_idm_model_lock(path: Path) -> IdmModelLock: ...
 def derive_idm_model_id(lock: IdmModelLock) -> str: ...
 def verify_idm_model_files(lock: IdmModelLock, model_root: Path) -> tuple[Path, Path]: ...
+def idm_inference_config(lock_sha256: str, descriptor_sha256: str, input_view_id: str) -> dict[str, object]: ...
+def idm_inference_config_sha256(config: Mapping[str, object]) -> str: ...
 ```
 
-- [ ] **Step 1: Write strict model-lock tests first**
+`crux.idm-inference-config/v1` contains only:
 
-Cover exact keys/schema and frozen facts:
+```text
+schema
+backend_descriptor_sha256
+model_lock_sha256
+adapter_revision
+prediction_map_version
+input_view_id
+request_timeout_seconds
+```
+
+- [ ] **Step 1: Write model-lock/inference-config tests first**
+
+Tests must require:
 
 ```python
 assert lock.repository_revision == IDM_RELEASE_COMMIT
-assert lock.package_name == "inverse-drum-machine"
-assert lock.package_version == "0.1.0"
+assert lock.python_version.startswith("3.11.")
 assert lock.model_name == "idm-44-train-kits"
 assert lock.sample_rate_hz == 44100
-assert lock.mel_n_fft == 1024
-assert lock.mel_hop_length == 256
-assert lock.mel_n_mels == 128
-assert lock.activation_rate_hz == 44100 / 256
+assert lock.input_channel_count == 1
+assert lock.input_container == "WAV"
+assert lock.input_subtype == "PCM_16"
+assert lock.audio_loader_revision == IDM_AUDIO_LOADER_REVISION
+assert lock.resampling == "forbidden"
+assert lock.mixdown == "forbidden"
 assert lock.train_classes == IDM_TRAIN_CLASSES
 assert lock.peak_pick_div_max == 20
 assert lock.peak_pick_div_avg == 10
 assert lock.peak_pick_div_wait == 16
 assert lock.peak_pick_div_threshold == 5
 assert lock.peak_pick_normalize is False
+assert lock.velocity_to_midi_revision == IDM_VELOCITY_TO_MIDI_REVISION
+assert lock.native_velocity_persistence_revision == IDM_NATIVE_VELOCITY_PERSISTENCE_REVISION
 assert lock.manual_onset_override is False
 assert lock.reconstructed_stems is False
 assert lock.masking == "none"
 assert lock.chunking_mode == "none"
 assert lock.model_id == derive_idm_model_id(lock)
+
+config = idm_inference_config(lock_sha, descriptor_sha, "crux.oaf-htdemucs-drums-mono44k1-pcm16/v1")
+assert config["request_timeout_seconds"] == 1800
 ```
 
-Also reject edited/missing runtime lock, model config, checkpoint, licenses, revision, class order, extraction settings, device/dtype, digest fragments, sizes, and non-canonical JSON.
+Also reject edited/missing runtime lock/model/config bytes, invalid licenses, wrong loader facts, reordered classes, changed peak settings, invalid device/dtype, invalid timeout, and noncanonical JSON.
 
 - [ ] **Step 2: Verify red**
 
@@ -234,38 +315,17 @@ Also reject edited/missing runtime lock, model config, checkpoint, licenses, rev
 uv run pytest tests/benchmark/test_idm_model.py -q
 ```
 
-Expected: FAIL because `idm_model.py` does not exist.
+Expected: FAIL because the module does not exist.
 
-- [ ] **Step 3: Implement the strict lock/parser/verifier**
+- [ ] **Step 3: Implement strict lock/config parsing**
 
-Reuse:
+Reuse `strict_json_loads()`, `canonical_json_bytes()`, `require_sha256()`, and `read_regular_file_no_follow()`. Keep the module free of IDM/PyTorch imports.
 
-```text
-strict_json_loads()
-canonical_json_bytes()
-require_sha256()
-read_regular_file_no_follow()
-```
+- [ ] **Step 4: Implement the freeze script**
 
-Do not import IDM/PyTorch here. This module is pure Crux identity verification and remains testable in the main environment.
+The script must hash the proven `runtime/idm/uv.lock`, fetch/copy only the exact upstream `model.yaml` and checkpoint from the pinned revision, verify fixed YAML facts, establish code/weight license evidence, choose device/dtype once for feasibility, derive `model_id`, write `runtime/idm/model.json`, and round-trip through the strict loader/verifier.
 
-The verifier checks only the two model files named by the closed lock beneath the caller-supplied model root; no directory discovery or generic model-cache framework.
-
-- [ ] **Step 4: Implement the one-time freeze script**
-
-The freeze script must:
-
-1. require the proven `runtime/idm/uv.lock` and hash its canonical bytes;
-2. acquire/read the two exact model files from the pinned public upstream revision into a caller-selected cache;
-3. hash/size both;
-4. verify model YAML facts and exact ordered `train_classes`;
-5. establish code/weight license evidence;
-6. resolve `--device auto` once to an exact supported device and freeze `dtype`;
-7. derive `model_id`;
-8. write canonical `runtime/idm/model.json`;
-9. round-trip it through `load_idm_model_lock()` and `verify_idm_model_files()`.
-
-The freeze script does not run HPA-325 scoring and does not choose a model/config from F1.
+Do not put request timeout or duplicate peak settings into a second model structure; timeout lives in the thin inference config while peak/loader semantics live in the model lock.
 
 - [ ] **Step 5: Run focused tests**
 
@@ -273,22 +333,11 @@ The freeze script does not run HPA-325 scoring and does not choose a model/confi
 uv run pytest tests/benchmark/test_idm_model.py -q
 ```
 
-Expected: PASS offline with synthetic fixture files.
+Expected: PASS with synthetic lock/model fixtures.
 
-- [ ] **Step 6: Perform the real freeze**
+- [ ] **Step 6: Perform the real model freeze after Task 0 passes**
 
-Use an explicit model cache/output, for example:
-
-```bash
-uv run python scripts/freeze_idm_model.py \
-  --runtime-lock runtime/idm/uv.lock \
-  --model-root artifacts/idm/pretrained \
-  --device auto \
-  --dtype float32 \
-  --output runtime/idm/model.json
-```
-
-Then rerun the model-lock tests against the committed lock/local cache.
+Run `scripts/freeze_idm_model.py` against the pinned public model bytes and commit only `runtime/idm/model.json`; checkpoint/config bytes stay under ignored local artifacts.
 
 - [ ] **Step 7: Commit**
 
@@ -299,19 +348,19 @@ git commit -m "feat: freeze IDM benchmark identity"
 
 ---
 
-### Task 2: Add IDM as the third closed descriptor/prediction/taxonomy family
+### Task 2: Add IDM to every required closed identity table, including zero-hit and peak metadata
 
 **Files:**
 - Modify: `src/benchmark/backend_identity.py`
 - Modify: `src/benchmark/prediction_artifact.py`
 - Modify: `src/benchmark/taxonomy.py`
 - Modify: `src/benchmark/mapping.py`
-- Modify: `src/benchmark/cohort_scoring.py` only if its zero-hit closed map table still needs the third family
+- Modify: `src/benchmark/cohort_scoring.py`
 - Modify: `tests/benchmark/test_backend_identity.py`
 - Modify: `tests/benchmark/test_prediction_artifact.py`
 - Modify: `tests/benchmark/test_prediction_artifact_coverage.py`
 - Modify: `tests/benchmark/test_mapping.py`
-- Modify existing taxonomy tests or create `tests/benchmark/test_taxonomy.py` only if that file already fits repository conventions
+- Modify: `tests/benchmark/test_cohort_scoring.py`
 
 **Interfaces:**
 
@@ -319,32 +368,33 @@ git commit -m "feat: freeze IDM benchmark identity"
 IDM_BACKEND_ID = "idm-44-train-kits-v1"
 IDM_DESCRIPTOR_SCHEMA = "crux.transcription-backend-descriptor/v2"
 IDM_PREDICTION_MAP_ID = "crux.prediction-map/idm-44-train-kits-v1"
+IDM_NATIVE_METADATA_SCHEMA_ID = "idm-peak-event-metadata-v1"
 
 IDM_PREDICTION_MAP = PredictionMap(
     map_id=IDM_PREDICTION_MAP_ID,
     backend_id=IDM_BACKEND_ID,
     native_output_space_id="idm-44-train-kits-9class-v1",
-    classes=...,
+    classes=MappingProxyType({
+        "KD": ClassMapping("kick", "kick"),
+        "SD": ClassMapping("snare", "snare"),
+        "HH_CHH": ClassMapping("closed_hihat", "hihat"),
+        "HH_OHH": ClassMapping("open_hihat", "hihat"),
+        "CY_CR": ClassMapping("crash", "crash"),
+        "CY_RD": ClassMapping("ride", "ride"),
+        "TT_HMT": ClassMapping("high_tom", "tom"),
+        "TT_LMT": ClassMapping(None, "tom"),
+        "TT_HFT": ClassMapping("low_or_floor_tom", "tom"),
+    }),
 )
-
-
-def map_idm_prediction(
-    prediction: NativePrediction,
-    prediction_map: PredictionMap = IDM_PREDICTION_MAP,
-) -> tuple[MappedPrediction, MappingDiagnostics]: ...
 ```
 
-- [ ] **Step 1: Write descriptor and prediction-v2 red tests**
+- [ ] **Step 1: Write red tests for the third descriptor family**
 
-Add one valid IDM descriptor shape and failures for:
+Require fixed IDM identities, patterned model ID only, exact upstream commit, and unknown-family rejection. Keep existing OaF/MuScriptor tests unchanged.
 
-- wrong fixed identities;
-- invalid source commit;
-- invalid model ID grammar;
-- wrong native output/metadata schema;
-- unknown backend still rejected.
+- [ ] **Step 2: Write red prediction-v2 tests with preserved peak metadata**
 
-Add canonical IDM prediction round-trip tests with:
+Use:
 
 ```python
 NativeEvent(
@@ -352,9 +402,9 @@ NativeEvent(
     native_class_id="KD",
     model_output_bin=4,
     native_midi_note=None,
-    native_metadata={},
+    native_metadata={"frame_index": "215", "native_velocity": "1.337421"},
     confidence=0.83,
-    velocity_midi=97,
+    velocity_midi=85,
 )
 ```
 
@@ -363,76 +413,67 @@ Reject:
 - bin outside `0..8`;
 - bin/class mismatch;
 - MIDI note present;
-- null/out-of-range confidence;
-- null/out-of-range velocity;
-- nonempty metadata;
-- malformed native class;
-- changed OaF/MuScriptor behavior.
+- null/out-of-range confidence or velocity;
+- missing/extra metadata keys;
+- noncanonical/negative `frame_index` string;
+- noncanonical, nonfinite, `<=0`, or `>2` `native_velocity` string;
+- changed OaF/MuScriptor semantics.
 
-- [ ] **Step 2: Verify red**
+- [ ] **Step 3: Write zero-hit red test**
+
+Create a valid empty IDM prediction artifact and pass it through `cohort_item_from_validated_prediction_artifact()`. Expected after implementation: success with `prediction_map_version == IDM_PREDICTION_MAP_ID` and zero prediction events.
+
+- [ ] **Step 4: Write mapping red tests**
+
+Assert `map_idm_prediction()` uses `native_class_id` and maps all nine fixed classes exactly, including:
+
+```python
+assert IDM_PREDICTION_MAP.classes["TT_LMT"] == ClassMapping(None, "tom")
+```
+
+- [ ] **Step 5: Verify red**
 
 ```bash
 uv run pytest \
   tests/benchmark/test_backend_identity.py \
   tests/benchmark/test_prediction_artifact.py \
   tests/benchmark/test_mapping.py \
+  tests/benchmark/test_cohort_scoring.py \
   -q
 ```
 
 Expected: new IDM cases FAIL.
 
-- [ ] **Step 3: Extend the descriptor policy table only**
+- [ ] **Step 6: Extend only the closed policy tables/branches**
 
-Add the IDM family to the existing `_DESCRIPTOR_POLICIES`. Do not replace the closed table with a plugin/registry abstraction.
+Add the IDM descriptor family to `_DESCRIPTOR_POLICIES`. Add exact IDM metadata key/value-format validation without introducing a generic metadata plugin. Extend native-event validation with an IDM branch while leaving OaF/MuScriptor invariants unchanged.
 
-`model_id` follows:
+- [ ] **Step 7: Add the mandatory zero-hit table entry**
 
-```text
-idm-44-train-kits-<revision12>-<checkpoint12>
-```
-
-The backend later checks exact lock equality.
-
-- [ ] **Step 4: Extend prediction-v2 native event dispatch**
-
-Add:
+In `cohort_scoring.py`:
 
 ```python
-IDM_METADATA_SCHEMA = "idm-peak-event-metadata-v1"
-NATIVE_METADATA_SCHEMAS[IDM_METADATA_SCHEMA] = {}
+ZERO_HIT_PREDICTION_MAPS = {
+    OAF_BACKEND_ID: OAF_PREDICTION_MAP_ID,
+    MUSCRIPTOR_BACKEND_ID: MUSCRIPTOR_PREDICTION_MAP_ID,
+    IDM_BACKEND_ID: IDM_PREDICTION_MAP_ID,
+}
 ```
 
-Dispatch IDM event invariants after descriptor normalization. Keep OaF/MuScriptor branches unchanged.
+No conditional/"only if required" wording remains.
 
-Keep the existing prediction-v2 golden unchanged. Add focused IDM render/read/render coverage rather than changing the golden's backend family.
+- [ ] **Step 8: Implement the native-class mapping**
 
-- [ ] **Step 5: Freeze the IDM mapping table**
+`map_idm_prediction()` uses:
 
-Use:
-
-```text
-KD       -> kick / kick
-SD       -> snare / snare
-HH_CHH   -> closed_hihat / hihat
-HH_OHH   -> open_hihat / hihat
-CY_CR    -> crash / crash
-CY_RD    -> ride / ride
-TT_HMT   -> high_tom / tom
-TT_LMT   -> null / tom
-TT_HFT   -> low_or_floor_tom / tom
+```python
+key = native.native_class_id
+class_mapping = prediction_map.classes.get(key)
 ```
 
-The `TT_LMT` detailed class stays null because Crux has no mid-tom detailed category. Do not distort it into high/low merely to fill a field.
+Persist unmapped unexpected classes as evidence.
 
-- [ ] **Step 6: Add `map_idm_prediction()`**
-
-Mirror the small existing OaF/MuScriptor mapping functions. Persist all native events and count unexpected classes as unmapped.
-
-- [ ] **Step 7: Extend zero-hit prediction map identity only if required**
-
-If `cohort_scoring.py` still uses a closed backend→map table for empty artifacts, add IDM there. Do not derive the expected map from cohort identity.
-
-- [ ] **Step 8: Run regression tests**
+- [ ] **Step 9: Run focused regressions**
 
 ```bash
 uv run pytest \
@@ -444,25 +485,24 @@ uv run pytest \
   -q
 ```
 
-Expected: PASS with OaF/MuScriptor behavior unchanged.
+Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
-git add src/benchmark/backend_identity.py src/benchmark/prediction_artifact.py src/benchmark/taxonomy.py src/benchmark/mapping.py src/benchmark/cohort_scoring.py tests/benchmark
-git commit -m "feat: add frozen IDM prediction family"
+git add src/benchmark/backend_identity.py src/benchmark/prediction_artifact.py src/benchmark/taxonomy.py src/benchmark/mapping.py src/benchmark/cohort_scoring.py tests/benchmark/test_backend_identity.py tests/benchmark/test_prediction_artifact.py tests/benchmark/test_prediction_artifact_coverage.py tests/benchmark/test_mapping.py tests/benchmark/test_cohort_scoring.py
+git commit -m "feat: add IDM prediction contract"
 ```
 
 ---
 
-### Task 3: Implement the persistent IDM worker and host backend adapter
+### Task 3: Add the isolated persistent worker backend with frozen decode/timeout semantics
 
 **Files:**
 - Create: `runtime/idm/worker.py`
 - Create: `src/benchmark/backends/idm.py`
-- Modify narrowly: `src/benchmark/worker_process.py` only to neutralize OaF-specific wording if necessary; do not change the protocol
 - Create: `tests/benchmark/test_idm_backend.py`
-- Modify: `tests/benchmark/test_worker_process.py` only if second-caller characterization is needed
+- Reuse unchanged: `src/benchmark/worker_process.py`
 
 **Interfaces:**
 
@@ -475,13 +515,14 @@ class IdmBackendError(RuntimeError):
 class IdmBackend:
     def __init__(
         self,
-        model_lock_path: Path | IdmModelLock,
-        model_root: Path,
         runtime_python: Path,
+        model_lock_path: Path,
+        model_root: Path,
+        input_root: Path,
         *,
         process_factory=WorkerProcess.start,
-        timeout_seconds: float = ...,
-        close_timeout_seconds: float = ...,
+        timeout_seconds: float = IDM_REQUEST_TIMEOUT_SECONDS,
+        close_timeout_seconds: float = IDM_WORKER_CLOSE_TIMEOUT_SECONDS,
         descriptor: BackendDescriptor | None = None,
     ) -> None: ...
 
@@ -490,121 +531,133 @@ class IdmBackend:
     def close(self) -> None: ...
 ```
 
-- [ ] **Step 1: Write host-adapter tests with a fake process**
+- [ ] **Step 1: Write host-backend lifecycle red tests**
 
-Cover:
+Using fake `process_factory`, cover:
 
-- exact command construction with isolated Python + worker + verified model root;
-- ready payload must match model ID, source revision, sample rate, activation rate, and exact ordered classes;
-- one model process reused across multiple `transcribe()` calls;
-- source audio must be `CanonicalAudio` at 44.1 kHz mono PCM16;
-- worker error mapping;
-- process poisoning/close behavior;
-- descriptor equality with the model lock;
-- raw event validation;
-- velocity conversion boundaries `0 -> 0`, `1 -> ~64`, `2 -> 127`, clamping only at the frozen projection boundary;
-- non-finite time/onset/velocity rejection;
-- bin/native-class mismatch rejection.
+- exact argv sequence begins with `runtime_python`;
+- exact timeout values forwarded;
+- valid ready payload accepted;
+- wrong model/classes/sample rate/frame rate rejected before requests;
+- request ID/event decoding;
+- worker protocol error -> `worker_protocol_failed` and poisoned process;
+- worker start error -> `worker_start_failed`;
+- malformed raw event -> `native_event_invalid`;
+- close called once; close failure remains run-level finalization evidence.
 
-- [ ] **Step 2: Verify red**
+- [ ] **Step 2: Write raw-event conversion tests**
+
+Given:
+
+```python
+{
+  "class_index": 4,
+  "native_class_id": "KD",
+  "frame_index": 215,
+  "time_sec": 1.248526,
+  "onset_score": 0.83,
+  "native_velocity": 1.337421,
+}
+```
+
+Require:
+
+```python
+event.native_class_id == "KD"
+event.model_output_bin == 4
+event.native_midi_note is None
+event.native_metadata == {"frame_index": "215", "native_velocity": "1.337421"}
+event.confidence == 0.83
+event.velocity_midi == round((1.337421 / 2.0) * 127)
+```
+
+Reject inconsistent class index/name, negative/out-of-range frame, nonfinite values, onset score outside `0..1`, velocity outside `(0,2]`, and time inconsistent with the selected frame beyond the frozen activation-rate tolerance.
+
+- [ ] **Step 3: Verify red**
 
 ```bash
 uv run pytest tests/benchmark/test_idm_backend.py -q
 ```
 
-Expected: FAIL because the backend does not exist.
+Expected: FAIL because backend does not exist.
 
-- [ ] **Step 3: Implement `runtime/idm/worker.py`**
+- [ ] **Step 4: Implement the standalone worker WAV loader**
 
-The worker has no Crux imports. On startup:
+`runtime/idm/worker.py` contains no Crux imports. For each request:
 
 ```python
-model, name = load_model("idm-44-train-kits", device, log_dir=model_root)
-model.eval()
+info = soundfile.info(path)
+if info.format != "WAV" or info.subtype != "PCM_16" or info.samplerate != 44100 or info.channels != 1:
+    return error("invalid_request")
+samples, sr = soundfile.read(path, dtype="float32", always_2d=True)
+if sr != 44100 or samples.shape[1] != 1:
+    return error("invalid_request")
+audio = torch.from_numpy(samples[:, 0]).to(device).unsqueeze(0)
 ```
 
-Validate observed model facts and emit one ready record.
+No librosa call is allowed.
 
-For each request:
+- [ ] **Step 5: Implement transcription-only inference**
 
-1. read the canonical WAV;
-2. require 44.1 kHz mono finite audio;
-3. run `model.encoder()`;
-4. require `onset`/`velocity` tensors with `(1, 9, frames)` and finite values;
-5. compute `onset_scores = model.decoder.activation(onset_logits)`;
-6. compute sparse peaks with `model.decoder.peak_picking_val(..., activation_rate=...)`;
-7. return raw event dictionaries containing bin/class/frame/time/onset score/native velocity.
+Load the model once. Run encoder → decoder sigmoid → decoder `peak_picking_val`; extract class index/name, exact picked frame index, time, score, and native velocity. Do not synthesize stems or use manual override.
 
-Do not call `separate()` because it always continues into synthesis/masking work. Do not call or expose manual onset override.
+- [ ] **Step 6: Implement `IdmBackend` by mirroring OaF host lifecycle**
 
-- [ ] **Step 4: Implement `IdmBackend`**
+Use process-factory injection, ready validation, exact isolated-python argv sequence, request decoding, poison semantics, and bounded close. Do not introduce a second process abstraction.
 
-Host responsibilities:
-
-- load/verify model lock/model files;
-- build/validate exact descriptor;
-- launch worker using the isolated interpreter;
-- verify ready payload;
-- validate every raw event;
-- map `onset_score -> NativeEvent.confidence`;
-- map native velocity to frozen `velocity_midi`;
-- leave native MIDI null;
-- close the persistent process.
-
-No model/PyTorch import enters the main Crux environment.
-
-- [ ] **Step 5: Run focused tests**
+- [ ] **Step 7: Run focused tests**
 
 ```bash
-uv run pytest \
-  tests/benchmark/test_idm_backend.py \
-  tests/benchmark/test_worker_process.py \
-  -q
+uv run pytest tests/benchmark/test_idm_backend.py tests/benchmark/test_worker_process.py -q
 ```
 
-Expected: PASS offline with fake process responses.
+Expected: PASS.
 
-- [ ] **Step 6: Run one real worker smoke before runner work**
+- [ ] **Step 8: Run one real worker smoke in the isolated runtime**
 
-Use the frozen local model root and one known-good canonical WAV. Verify:
+After `runtime/idm/model.json` exists, invoke the worker through `IdmBackend` on upstream `demo/mix.wav` converted/verified as the frozen canonical WAV contract. Confirm ready identity and at least a structurally valid prediction response; do not score/tune it.
 
-```text
-ready succeeds
-at least protocol-valid response returns
-all event bins/classes match frozen order
-confidence is in 0..1
-velocity projection is valid
-worker is reused for a second request
-```
-
-This is a runtime contract check, not a score gate.
-
-- [ ] **Step 7: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add runtime/idm/worker.py src/benchmark/backends/idm.py src/benchmark/worker_process.py tests/benchmark/test_idm_backend.py tests/benchmark/test_worker_process.py
-git commit -m "feat: add IDM benchmark backend"
+git add runtime/idm/worker.py src/benchmark/backends/idm.py tests/benchmark/test_idm_backend.py
+git commit -m "feat: add persistent IDM benchmark backend"
 ```
 
 ---
 
-### Task 4: Build the fixed HPA-328 handoff consumer and resumable IDM stem runner
+### Task 4: Build the concrete HPA-328 handoff consumer, fixed failure mapping, resume ledger, and HPA-325 reports
 
 **Files:**
 - Create: `src/benchmark/idm_pilot_run.py`
-- Create: `tests/benchmark/idm_pilot_fixtures.py` only if fixtures cannot stay local to the test module
+- Create: `tests/benchmark/idm_pilot_fixtures.py`
 - Create: `tests/benchmark/test_idm_pilot_run.py`
-- Create: `tests/benchmark/test_idm_pilot_run_coverage.py` only if branch coverage convention requires it
-- Reuse unchanged: `src/benchmark/separation_handoff.py`
-- Reuse unchanged: `src/benchmark/prediction_artifact.py`
-- Reuse unchanged: `src/benchmark/artifact_io.py`
+- Create: `tests/benchmark/test_idm_pilot_run_acceptance.py`
+- Reuse: `src/benchmark/separation_handoff.py`
+- Reuse: `src/benchmark/reference_set_manifest.py`
+- Reuse: `src/benchmark/reference_timing_manifest.py`
+- Reuse: `src/benchmark/cohort_scoring.py`
+- Reuse: `src/benchmark/reports.py`
+- Reuse: `src/benchmark/prediction_artifact.py`
 
 **Interfaces:**
 
 ```python
 IDM_PILOT_RUN_SCHEMA = "crux.idm-stem-pilot-run/v1"
 IDM_STEM_INPUT_VIEW_ID = "crux.oaf-htdemucs-drums-mono44k1-pcm16/v1"
-IDM_INFERENCE_CONFIG_SCHEMA = "crux.idm-inference-config/v1"
+
+IDM_FAILURE_TO_COHORT_REASON = {
+    "worker_start_failed": "backend_unavailable",
+    "worker_protocol_failed": "backend_unavailable",
+    "inference_failed": "inference_failed",
+    "native_event_invalid": "inference_failed",
+    "upstream_stem_unavailable": "inference_failed",
+    "retained_input_invalid": "prediction_artifact_invalid",
+    "retained_oaf_prediction_invalid": "prediction_artifact_invalid",
+    "prediction_artifact_invalid": "prediction_artifact_invalid",
+    "prediction_output_conflict": "prediction_artifact_invalid",
+    "prediction_publish_failed": "prediction_artifact_invalid",
+}
 
 @dataclass(frozen=True)
 class IdmPilotRunRequest:
@@ -617,405 +670,296 @@ class IdmPilotRunRequest:
     model_lock_path: Path
     model_root: Path
     runtime_python: Path
-    source_cache_dir: Path | None = None  # only needed by Task 6 full-mix smoke
     resume: bool = False
     crux_commit: str | None = None
-
-@dataclass(frozen=True)
-class IdmPilotRunOutcome:
-    overall_status: Literal["complete", "partial", "failed"]
-    exit_code: Literal[0, 1, 2]
-    run_id: str | None
-    run_path: Path | None
-    reports_path: Path | None
-    success_count: int
-    failed_count: int
-    upstream_unavailable_count: int
-    aggregate_rtf: float | None
-    worker_startup_wall_time_sec: float | None
-    fatal_reason: str | None = None
-
-
-def run_idm_pilot(request: IdmPilotRunRequest) -> IdmPilotRunOutcome: ...
-def parse_idm_pilot_run(content: bytes) -> dict[str, JsonValue]: ...
-def render_idm_pilot_run(snapshot: Mapping[str, object]) -> bytes: ...
 ```
 
-- [ ] **Step 1: Write strict run-identity/population tests first**
+- [ ] **Step 1: Write failure-table and request-shape tests first**
 
-Build synthetic finalized HPA-328 handoff rows and cover:
+Assert every mapping value is in `COHORT_FAILURE_REASONS`, `upstream_stem_unavailable == "inference_failed"`, and no `source_cache_dir` field exists on `IdmPilotRunRequest`.
 
-- `load_separation_pilot_manifest()` is the only membership source;
-- exactly the handoff's 20–30 sorted unique rows appear in the IDM snapshot;
-- no include/exclude/sample controls exist;
-- run ID changes with handoff/model/runtime/inference/scoring/Crux identity;
-- run snapshot rejects mixed source/reference/timing/input/model identity;
-- output roots may not alias protected inputs;
-- runtime/model preflight failure produces fatal exit 2 before mutable run publication.
+- [ ] **Step 2: Write handoff/lineage red tests**
 
-- [ ] **Step 2: Write retained-artifact binding tests**
+Use synthetic immutable handoff fixtures to require:
 
-For successful HTDemucs rows require and verify:
+- exact 20–30 membership;
+- reference/timing file SHA/version match handoff run-level identity;
+- only explicit `separation_artifact_root` / `stem_cache_root` resolve retained paths;
+- path stays under owner root and is read no-follow;
+- retained HTDemucs input bytes hash matches handoff;
+- retained OaF prediction bytes/header/source/input identities match handoff;
+- no directory scan or fallback repair.
+
+- [ ] **Step 3: Write run identity/resume red tests**
+
+Run identity includes:
 
 ```text
-htdemucs.stem path/hash/source/separator-lock identity
-htdemucs.input path/input_view/input SHA/source identity
-htdemucs.prediction path/artifact SHA/source/input identity
+schema
+handoff manifest SHA/version
+reference manifest SHA/version
+timing manifest SHA/version
+IDM backend descriptor SHA
+IDM model lock SHA
+IDM inference config SHA
+input view ID
+Crux commit
 ```
 
-Resolution rules:
+Changing timeout changes inference-config SHA/run ID. Exact identity resume reuses valid IDM prediction artifacts; changed/missing retained upstream evidence becomes explicit failure and never triggers HTDemucs/OaF rerun.
 
-- only explicit `separation_artifact_root` / `stem_cache_root` are owners;
-- paths must remain beneath their owner root;
-- no directory scan or fallback discovery;
-- use no-follow regular-file reads;
-- hash bytes before use.
+- [ ] **Step 4: Write complete-population scoring red tests**
 
-The IDM audio passed to the backend is the exact retained `htdemucs.input` file. Do not rematerialize it.
+For successful HTDemucs rows, create/persist IDM predictions and reconstruct both OaF and IDM `CohortItem`s against the same reference mapping. For non-success rows, preserve the row in population accounting and map failure through the fixed table.
 
-- [ ] **Step 3: Write upstream-failure preservation tests**
+Require `score_cohort()`/`write_cohort_reports()` as the only scorer/writer.
 
-Rows with non-successful HTDemucs evidence remain in the fixed HPA-396 population with native failure `upstream_stem_unavailable` and a mapped HPA-325 failure reason. They are not handed to IDM and are not dropped.
-
-- [ ] **Step 4: Verify red**
+- [ ] **Step 5: Verify red**
 
 ```bash
-uv run pytest tests/benchmark/test_idm_pilot_run.py -q
+uv run pytest tests/benchmark/test_idm_pilot_run.py tests/benchmark/test_idm_pilot_run_acceptance.py -q
 ```
 
-Expected: FAIL because the runner does not exist.
+Expected: FAIL because runner does not exist.
 
-- [ ] **Step 5: Implement preflight and immutable run identity**
+- [ ] **Step 6: Implement strict preflight and snapshot parsing**
 
-Preflight:
+Load `load_separation_pilot_manifest()`, `load_reference_set_manifest()`, and `load_reference_timing_manifest()`. Bind exact hashes/versions. Load model lock/descriptor/inference config before constructing worker. Validate output roots do not alias inputs.
 
-1. load reference/timing manifests;
-2. load finalized HPA-328 handoff;
-3. verify cross-lineage equality;
-4. load/verify IDM model + runtime lock;
-5. build exact descriptor/inference config;
-6. validate artifact owner roots;
-7. start backend once and verify ready payload;
-8. only then create mutable HPA-396 run state.
+- [ ] **Step 7: Implement sequential persisted execution**
 
-No full-mix smoke or scored execution occurs before identity is frozen.
+For each fixed row:
 
-- [ ] **Step 6: Implement sequential primary execution**
+1. resolve/re-read retained HTDemucs canonical input;
+2. verify bytes/hash/format;
+3. if exact valid IDM prediction already exists on resume, reuse it;
+4. otherwise call one persistent `IdmBackend`;
+5. map with `map_idm_prediction()`;
+6. publish immutable prediction-v2;
+7. checkpoint mutable HPA-396 snapshot after each row;
+8. retain native failure code on failure.
 
-For each fixed row in sorted order:
+Stop/poison behavior follows the backend disposition; do not auto-restart a poisoned worker in this ticket.
 
-- preserve upstream-unavailable rows as failure;
-- validate retained HTDemucs input + OaF prediction;
-- construct `CanonicalAudio` from the exact retained input metadata/bytes;
-- transcribe with the persistent IDM backend;
-- `map_idm_prediction()`;
-- publish through `prediction_path()` + `publish_prediction_artifact()`;
-- checkpoint the run snapshot after each terminal item;
-- record item wall time/RTF only around IDM request/inference, excluding worker startup;
-- on item-local failure, persist one stable failure code and continue.
+- [ ] **Step 8: Rebuild OaF + IDM HPA-325 reports**
 
-- [ ] **Step 7: Implement resume/conflict semantics**
+Re-read retained OaF prediction artifacts and new IDM artifacts. Build both cohorts over the same fixed population and write separate report directories with unchanged HPA-325 scoring.
 
-On resume:
-
-- parse exact existing run identity;
-- revalidate retained HPA-328 input/OaF evidence;
-- read existing IDM prediction bytes;
-- require artifact/audio/descriptor/map identity match;
-- reuse only exact matches;
-- immutable output conflict is failure, not overwrite.
-
-Do not add a generic run-snapshot helper merely because OaF/MuScriptor/HPA-328 have their own snapshots.
-
-- [ ] **Step 8: Run focused runner tests**
+- [ ] **Step 9: Run focused tests**
 
 ```bash
 uv run pytest \
   tests/benchmark/test_idm_pilot_run.py \
-  tests/benchmark/test_idm_pilot_run_coverage.py \
+  tests/benchmark/test_idm_pilot_run_acceptance.py \
+  tests/benchmark/test_cohort_scoring.py \
+  tests/benchmark/test_reports.py \
   -q
 ```
 
-Omit the coverage file command if no separate file was needed.
+Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
-git add src/benchmark/idm_pilot_run.py tests/benchmark/test_idm_pilot_run.py tests/benchmark/test_idm_pilot_run_coverage.py tests/benchmark/idm_pilot_fixtures.py
+git add src/benchmark/idm_pilot_run.py tests/benchmark/idm_pilot_fixtures.py tests/benchmark/test_idm_pilot_run.py tests/benchmark/test_idm_pilot_run_acceptance.py
 git commit -m "feat: run fixed IDM stem pilot"
 ```
 
-Only add paths that actually exist.
-
 ---
 
-### Task 5: Rebuild HPA-325 OaF/IDM cohorts and publish exact-input paired deltas
+### Task 5: Publish strict OaF↔IDM paired comparison from public report helpers
 
 **Files:**
-- Modify: `src/benchmark/idm_pilot_run.py`
 - Create: `src/benchmark/idm_comparison.py`
 - Create: `tests/benchmark/test_idm_comparison.py`
-- Create: `tests/benchmark/test_idm_comparison_coverage.py` only if needed
-- Modify: `tests/benchmark/test_idm_pilot_run.py`
-- Reuse unchanged: `src/benchmark/cohort_scoring.py`
-- Reuse unchanged: `src/benchmark/reports.py`
-- Reuse primitives: `src/benchmark/published_comparison.py`
+- Reuse unchanged: `src/benchmark/published_comparison.py`
+- Reuse: `src/benchmark/reports.py`
 
 **Interfaces:**
 
 ```python
-IDM_COMPARISON_SCHEMA = "crux.oaf-idm-comparison/v1"
-
 @dataclass(frozen=True)
 class IdmComparisonRequest:
-    oaf_evidence: PublishedRunEvidence
-    idm_evidence: PublishedRunEvidence
+    run_path: Path
     output_dir: Path
 
 
-def compare_oaf_idm(request: IdmComparisonRequest) -> None: ...
+def compare_oaf_idm(request: IdmComparisonRequest) -> Path: ...
 ```
 
-- [ ] **Step 1: Write cohort reconstruction tests**
+- [ ] **Step 1: Write paired-identity red tests**
 
-For every HPA-396 row:
-
-- build one OaF cohort item from the retained HPA-328 OaF prediction artifact when valid;
-- build one IDM cohort item from the HPA-396 artifact when valid;
-- use the same preflighted reference mapping object;
-- represent every failure with `cohort_item_without_prediction()`;
-- preserve exact input-view/source/input hash identity.
-
-Assert that no OaF inference function is called.
-
-- [ ] **Step 2: Write exact pairable-set tests**
-
-Call:
+Require:
 
 ```python
-pairable_success_ids(
+pairable_ids, exclusions = pairable_success_ids(
     oaf,
     idm,
-    selected_ids=None,
+    selected_ids,
     require_identical_input_hash=True,
     left_label="oaf",
     right_label="idm",
 )
 ```
 
-Cover:
+Reject source hash, input hash, reference/timing/taxonomy/scoring identity mismatch. Report full eligible/success/failure populations before the intersection.
 
-- source mismatch excludes pair;
-- input mismatch is an integrity error;
-- OaF-only/IDM-only success counts are visible;
-- failed upstream stem rows remain in population counts but not paired rows;
-- per-song/per-class score grids must match exactly.
+- [ ] **Step 2: Write output red tests**
+
+Require deterministic:
+
+```text
+summary.json
+summary.md
+paired_per_song.csv
+paired_per_class.csv
+```
+
+Summary includes intersection/exclusion counts, HPA-396 native failure histogram, IDM mapped/unmapped/native-class coverage, runtime/RTF/peak memory when present, and velocity availability/distribution as diagnostics only.
 
 - [ ] **Step 3: Verify red**
 
 ```bash
-uv run pytest \
-  tests/benchmark/test_idm_pilot_run.py \
-  tests/benchmark/test_idm_comparison.py \
-  -q
+uv run pytest tests/benchmark/test_idm_comparison.py -q
 ```
 
-Expected: new scoring/comparison cases FAIL.
+Expected: FAIL because module does not exist.
 
-- [ ] **Step 4: Publish HPA-325 reports for both retained OaF and IDM**
+- [ ] **Step 4: Implement the concrete driver**
 
-Use exactly:
+Mirror `muscriptor_comparison.py`'s driver shape but call only public `published_comparison.py` helpers. Do not import private MuScriptor helpers and do not create a generic comparison registry.
 
-```python
-score_cohort(...)
-write_cohort_reports(...)
-```
-
-for the same fixed HTDemucs population. Do not copy cells from HPA-328 comparison CSVs; rebuild from the retained prediction artifacts so OaF↔IDM pairing is independent of HPA-328 full-mix success.
-
-Suggested layout:
-
-```text
-<run>/views/htdemucs/oaf/reports/
-<run>/views/htdemucs/idm/reports/
-```
-
-- [ ] **Step 5: Implement the small IDM comparison driver**
-
-Reuse model-neutral helpers from `published_comparison.py` for paired song/class rows, deltas, aggregate deltas, population, and runtime fields. Keep only schema/title/summary assembly IDM-specific.
-
-Publish:
-
-```text
-<run>/comparison/summary.json
-<run>/comparison/summary.md
-<run>/comparison/paired_per_song.csv
-<run>/comparison/paired_per_class.csv
-```
-
-- [ ] **Step 6: Add diagnostics without changing scorer semantics**
-
-Include:
-
-- mapped/unmapped native class counts;
-- confidence/onset activation distribution summaries;
-- MIDI-projected velocity distribution summaries;
-- failure-code histogram;
-- worker startup wall time;
-- per-item/aggregate RTF;
-- peak memory only if already available cheaply from process/runtime evidence.
-
-Do not add confidence/velocity weighting to HPA-325.
-
-- [ ] **Step 7: Add representative error rows mechanically**
-
-Derive a small displayed list from the complete paired CSV, e.g. largest F1 regressions/improvements under one frozen tolerance/mode used only for presentation. Do not make a hidden hand-curated subset and do not change aggregate calculations.
-
-- [ ] **Step 8: Run focused tests**
+- [ ] **Step 5: Run focused tests**
 
 ```bash
-uv run pytest \
-  tests/benchmark/test_idm_pilot_run.py \
-  tests/benchmark/test_idm_comparison.py \
-  tests/benchmark/test_idm_comparison_coverage.py \
-  -q
+uv run pytest tests/benchmark/test_idm_comparison.py tests/benchmark/test_published_comparison.py -q
 ```
 
-Omit nonexistent coverage file.
+Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/benchmark/idm_pilot_run.py src/benchmark/idm_comparison.py tests/benchmark/test_idm_pilot_run.py tests/benchmark/test_idm_comparison.py tests/benchmark/test_idm_comparison_coverage.py
-git commit -m "feat: compare IDM with OaF on fixed stems"
+git add src/benchmark/idm_comparison.py tests/benchmark/test_idm_comparison.py
+git commit -m "feat: compare OaF and IDM stem reports"
 ```
 
 ---
 
-### Task 6: Add the fixed five-song full-mix compatibility smoke without contaminating the primary result
+### Task 6: Freeze real five-song smoke membership, then add the separate full-mix diagnostic
+
+**Operational prerequisite:** A production HPA-328 handoff must exist. PR #26 did not produce one. If it is still absent, stop this task without inventing IDs.
 
 **Files:**
-- Create before first score inspection: `runtime/idm/smoke.json`
+- Create after production handoff exists and before any IDM HPA-328/full-mix inference: `runtime/idm/smoke.json`
 - Modify: `src/benchmark/idm_pilot_run.py`
 - Modify: `tests/benchmark/test_idm_pilot_run.py`
 - Reuse: `src/benchmark/corpus_cache.py`
 - Reuse: `src/benchmark/input_view.py`
 
-**Smoke contract:**
+**Interface:**
 
-```text
-exactly 5 unique positive HPA-327 simfile IDs
-one pre-model reason per ID
-membership frozen before IDM score inspection
+```python
+@dataclass(frozen=True)
+class IdmFullMixSmokeRequest:
+    separation_handoff_path: Path
+    reference_manifest_path: Path
+    timing_manifest_path: Path
+    smoke_manifest_path: Path
+    source_cache_dir: Path
+    output_dir: Path
+    model_lock_path: Path
+    model_root: Path
+    runtime_python: Path
+    crux_commit: str | None = None
 ```
 
-Suggested reason vocabulary:
+- [ ] **Step 1: Freeze membership from the real handoff before inference**
+
+Use only real handoff membership and pre-IDM evidence. Do not copy MuScriptor IDs `1..5`.
+
+Select five unique HPA-328 members before any IDM corpus/full-mix request, using duration/reference-event evidence and no model scores. Record the exact IDs in:
+
+```json
+{"cases":[{"reason":"short","simfile_id":0},{"reason":"long","simfile_id":0},{"reason":"dense","simfile_id":0},{"reason":"sparse","simfile_id":0},{"reason":"median_duration","simfile_id":0}],"schema":"crux.idm-smoke/v1"}
+```
+
+The zero values above document file shape only; the file must never be committed with zero or fixture IDs. The committed file must contain the five actual production handoff IDs.
+
+A deterministic selection order is preferred when ties occur: lowest `simfile_id` wins after the primary duration/event-count sort. No F1 or model output participates.
+
+- [ ] **Step 2: Write/execute smoke-manifest validation before any IDM corpus inference**
+
+Tests require exactly five unique positive IDs, all present in the loaded production handoff, and exactly one reason from:
 
 ```text
 short
 long
 dense
 sparse
-non_drum_heavy
+median_duration
 ```
 
-- [ ] **Step 1: Select/freeze smoke membership from existing reference/source evidence**
+Commit `runtime/idm/smoke.json` immediately after these tests pass and before invoking IDM on HPA-328 stem/full-mix inputs.
 
-Selection may use durations/reference hit counts and source listening needed to classify the reason. It must not use IDM/OaF F1 to select songs.
+- [ ] **Step 3: Keep smoke roots out of the primary request**
 
-Write and commit `runtime/idm/smoke.json` before running the five scores.
+Assert `IdmPilotRunRequest` still has no `source_cache_dir`. Full-mix source resolution exists only through `IdmFullMixSmokeRequest`.
 
-- [ ] **Step 2: Write smoke isolation tests**
+- [ ] **Step 4: Add separate full-mix materialization/inference**
 
-Assert:
+Resolve authoritative full mix for exactly the five smoke IDs with existing cache/source rails, materialize using the historical OaF full-mix canonicalization, and run the same frozen IDM backend. Use a separate full-mix input-view/config identity.
 
-- exactly five IDs;
-- every ID belongs to the HPA-328 handoff population;
-- no duplicate reasons/IDs if the chosen contract requires one each;
-- smoke results do not enter primary HTDemucs cohort rows;
-- smoke results do not alter primary inference config/model identity;
-- no F1 pass/fail threshold exists.
+Do not change stem-pilot membership/config and do not feed smoke results into parameter selection.
 
-- [ ] **Step 3: Materialize/reuse exact canonical full mix**
+- [ ] **Step 5: Score/report smoke separately**
 
-Use retained full-mix canonical input if the handoff retains a usable path. Otherwise use the authoritative source hash from the handoff/reference row and the existing:
+Write a separate five-song report directory. Keep it out of `idm_comparison.py` headline stem files.
 
-```python
-resolve_source_audio(...)
-materialize_full_mix_audio(...)
-```
-
-with historical input view:
-
-```text
-crux.oaf-full-mix-mono44k1-pcm16/v1
-```
-
-Do not invent an IDM-specific full-mix canonicalization.
-
-- [ ] **Step 4: Run IDM through the same frozen backend/config**
-
-Persist smoke prediction artifacts separately, score/report separately, and include a `full_mix_smoke` section in `summary.json`/`summary.md`.
-
-If one or more smoke songs fail, report failures. Primary stem execution remains valid if the frozen IDM runtime itself works on the required HTDemucs input path.
-
-- [ ] **Step 5: Run focused tests**
+- [ ] **Step 6: Run focused tests**
 
 ```bash
 uv run pytest tests/benchmark/test_idm_pilot_run.py -q
 ```
 
-- [ ] **Step 6: Commit**
+Expected: PASS.
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git add runtime/idm/smoke.json src/benchmark/idm_pilot_run.py tests/benchmark/test_idm_pilot_run.py
-git commit -m "feat: add IDM full-mix smoke diagnostic"
+git commit -m "feat: add frozen IDM full-mix smoke"
 ```
 
 ---
 
-### Task 7: Expose one HPA-396 CLI path and freeze the command contract
+### Task 7: Wire one CLI command and verify offline acceptance
 
 **Files:**
 - Modify: `src/cli/benchmark.py`
 - Modify: `tests/test_cli_benchmark.py`
 - Modify: `tests/test_cli_benchmark_coverage.py`
 
-**Command:**
+**Interface:**
 
 ```text
 crux benchmark run-idm-pilot
 ```
 
-No generic `--model`, `--separator`, `--sample-count`, threshold, masking, manual-onset, tuning, or policy flags.
-
-Required paths should expose only the fixed external evidence/runtime roots needed by `IdmPilotRunRequest`, for example:
-
-```text
---separation-handoff
---reference-manifest
---timing-manifest
---separation-artifact-root
---stem-cache-root
---output-dir
---idm-model-lock
---idm-model-root
---idm-python
---source-cache-dir   # only for full-mix smoke fallback
---resume
-```
+Primary required inputs mirror `IdmPilotRunRequest`. Full-mix smoke inputs are optional only through explicit smoke options after `runtime/idm/smoke.json` exists; they do not become primary stem-run identity.
 
 - [ ] **Step 1: Write CLI red tests**
 
 Cover:
 
-- exact required options;
-- `--resume` only behavioral flag;
-- typed path conversion;
-- request construction;
-- exit 0 complete / exit 1 partial / exit 2 fatal;
-- canonical result JSON includes run/report paths/counts/RTF/startup time/fatal reason only as intended;
-- no forbidden sampling/tuning/manual-onset flags.
+- required production handoff/reference/timing/artifact roots;
+- runtime Python/model lock/model root;
+- resume;
+- no include/exclude/count/seed/tuning flags;
+- canonical JSON outcome;
+- 0 complete / 1 partial / 2 fatal convention;
+- smoke options rejected unless the smoke manifest/source cache are supplied together;
+- no implicit main-environment IDM import.
 
 - [ ] **Step 2: Verify red**
 
@@ -1023,146 +967,84 @@ Cover:
 uv run pytest tests/test_cli_benchmark.py tests/test_cli_benchmark_coverage.py -q
 ```
 
-- [ ] **Step 3: Implement the thin Click wrapper**
+Expected: new IDM CLI cases FAIL.
 
-CLI owns parsing/result presentation only. `run_idm_pilot()` owns validation/execution/reporting.
+- [ ] **Step 3: Implement thin CLI wiring**
 
-Do not create a second CLI module unless `benchmark.py` structure forces it.
+Parse paths/options, construct request values, call the concrete runner/comparison/smoke functions, print canonical outcome JSON, and propagate exit code. No business logic in Click callbacks.
 
-- [ ] **Step 4: Run focused CLI + runner tests**
+- [ ] **Step 4: Run focused CLI + full HPA-396 tests**
 
 ```bash
 uv run pytest \
+  tests/benchmark/test_idm_model.py \
+  tests/benchmark/test_idm_backend.py \
+  tests/benchmark/test_idm_pilot_run.py \
+  tests/benchmark/test_idm_pilot_run_acceptance.py \
+  tests/benchmark/test_idm_comparison.py \
   tests/test_cli_benchmark.py \
   tests/test_cli_benchmark_coverage.py \
-  tests/benchmark/test_idm_pilot_run.py \
-  tests/benchmark/test_idm_comparison.py \
   -q
 ```
+
+Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/cli/benchmark.py tests/test_cli_benchmark.py tests/test_cli_benchmark_coverage.py
-git commit -m "feat: expose fixed IDM pilot command"
+git commit -m "feat: expose fixed IDM benchmark pilot"
 ```
 
 ---
 
-### Task 8: Run the real frozen smoke + 20–30-song pilot and close HPA-396 without post-score tuning
+### Task 8: Execute the real frozen pilot when HPA-328 Task 11 evidence exists, then run repository gates
+
+**Operational prerequisite:** production HPA-328 immutable handoff + retained HTDemucs inputs/OaF predictions + reference/timing manifests are available. If not, leave HPA-396 In Progress and record that operational block; do not manufacture a synthetic acceptance run.
 
 **Files:**
-- No required production changes unless a test-first defect is found
-- Real local artifacts under caller-selected artifact directories
-- Update this PR description / HPA-396 evidence with command outcomes
+- Generated local/published benchmark outputs only; do not commit audio/model weights.
+- Commit only small canonical runtime/smoke locks when produced by earlier tasks.
 
-- [ ] **Step 1: Verify the committed runtime/model locks against the real local cache**
+- [ ] **Step 1: Re-run Task 0/1 runtime/model verification against the exact committed locks**
 
 ```bash
 uv sync --project runtime/idm --frozen
-uv run pytest tests/benchmark/test_idm_model.py -q
+uv run pytest tests/benchmark/test_idm_model.py tests/benchmark/test_idm_backend.py -q
 ```
 
-Run the model verifier against the real model root as part of the CLI preflight.
+Expected: PASS.
 
-- [ ] **Step 2: Re-run one real worker smoke after final code changes**
+- [ ] **Step 2: Verify the production handoff and smoke membership before inference**
 
-Confirm the ready payload and one real retained HTDemucs input still match the committed lock/adapter assumptions.
+Load `load_separation_pilot_manifest()` against the production handoff and verify `runtime/idm/smoke.json` IDs are all members. If the file does not yet contain real production IDs, complete Task 6 Step 1 and commit them first.
 
-- [ ] **Step 3: Execute the fixed five-song full-mix smoke**
+- [ ] **Step 3: Run the fixed stem pilot with no score-driven changes**
 
-Do not change model/threshold/map membership based on the scores. Record compatibility/failure/runtime evidence.
+Execute `crux benchmark run-idm-pilot` using the exact production HPA-328/reference/timing/artifact paths. Do not change model, peak settings, mapping, timeout, device/dtype, or smoke membership after inspecting the first scores.
 
-- [ ] **Step 4: Execute the exact HPA-328 handoff population**
+Expected: every fixed population row has either a validated IDM prediction artifact or an explicit native failure code.
 
-Example shape:
+- [ ] **Step 4: Publish OaF↔IDM comparison and five-song smoke**
+
+Require identical source/input SHA for every headline pair. Keep full-mix smoke under its separate view/report path.
+
+- [ ] **Step 5: Run full repository verification**
 
 ```bash
-uv run crux benchmark run-idm-pilot \
-  --separation-handoff <hpa328-final-manifest.jsonl> \
-  --reference-manifest <reference-manifest.jsonl> \
-  --timing-manifest <timing-manifest.jsonl> \
-  --separation-artifact-root <hpa328-artifact-root> \
-  --stem-cache-root <hpa328-stem-cache-root> \
-  --output-dir <idm-pilot-output> \
-  --idm-model-lock runtime/idm/model.json \
-  --idm-model-root <local-idm-pretrained-root> \
-  --idm-python runtime/idm/.venv/bin/python \
-  --source-cache-dir <source-cache>
-```
-
-Expected: complete or explicit partial outcome over the entire fixed population; never an implicitly smaller cohort.
-
-- [ ] **Step 5: Inspect the published evidence, not hidden scratch calculations**
-
-Verify:
-
-```text
-OaF + IDM HPA-325 report grids exist
-paired per-song/per-class CSVs use exact source+input hashes
-all HPA-328 rows appear in population counts
-failure histogram reconciles with run items
-IDM native class coverage reconciles with prediction artifacts
-velocity/confidence diagnostics reconcile with prediction artifacts
-full-mix smoke is separate
-runtime/RTF counts reconcile with executed rows
-```
-
-- [ ] **Step 6: Do not tune after inspection**
-
-Unexpected scientific performance is a result, not an implementation bug. Only fix a concrete contract/implementation defect with a failing test. Do not change peak-picking thresholds, map policy, selected model, device/dtype, smoke membership, or primary population because F1 is disappointing.
-
-- [ ] **Step 7: Run full repository verification**
-
-Use the repository's current documented gates. At minimum:
-
-```bash
-uv run pytest -q
+uv run pytest
 uv run ruff check .
 uv run ruff format --check src tests
-uv run pylint --errors-only --disable=E1120,E0401 src
+uv run pylint --errors-only --disable=E1120,E0401 --jobs=1 src
 git diff --check main...HEAD
 ```
 
-If the current `CLAUDE.md` documents different authoritative commands at implementation time, follow those commands instead of stale plan text.
+Expected: all commands exit 0.
 
-- [ ] **Step 8: Final diff review**
+- [ ] **Step 6: Review final scope**
 
-Confirm:
+Confirm no production registry entry, generic runner/comparison framework, prediction v3, scorer change, full-corpus path, required IDM synthesis output, manual override, tuning, training, or fine-tuning was added.
 
-```text
-one HPA-396 PR only
-no production registry/API IDM integration
-no generic runtime/runner framework
-no full-corpus IDM path
-no required synthesized IDM stems
-no HPA-325 semantic changes
-no HPA-327/HPA-328 membership changes
-no score-driven tuning
-```
+- [ ] **Step 7: Commit only final documentation/evidence updates if needed**
 
-- [ ] **Step 9: Update the same draft PR with implementation evidence and mark ready only when verified**
-
-Do not create a second HPA-396 implementation PR.
-
-## Final acceptance checklist
-
-- [ ] Exact official IDM source commit frozen.
-- [ ] Exact runtime lock, model config, checkpoint, and license evidence frozen.
-- [ ] Exact observed sample/frame/class/extraction contract validated.
-- [ ] Persistent isolated worker reuses one model load.
-- [ ] No manual onset override or required synthesis/masking path.
-- [ ] Prediction-v2 supports IDM while preserving OaF/MuScriptor behavior.
-- [ ] IDM native mapping is frozen, including `TT_LMT -> common tom / detailed null`.
-- [ ] Exact HPA-328 handoff population is preserved.
-- [ ] Primary IDM inference consumes byte-identical HPA-328 HTDemucs canonical inputs.
-- [ ] Retained HPA-328 OaF predictions are validated and not rerun.
-- [ ] OaF and IDM use the unchanged HPA-325 scorer.
-- [ ] Paired deltas require identical source and input SHA-256.
-- [ ] Failure population is explicit; no silent row dropping.
-- [ ] Onset activation + velocity diagnostics are persisted without entering F1.
-- [ ] Five-song full-mix smoke is frozen before score inspection and reported separately.
-- [ ] Runtime/RTF/failure/class evidence reconciles with run rows.
-- [ ] No tuning/training/full-corpus/production/generic-framework scope creep.
-- [ ] Full repository verification passes.
-- [ ] HPA-396 implementation remains in this single PR.
+Keep generated weights/audio/prediction outputs out of Git unless an existing benchmark-manifest rail explicitly requires a small identity artifact.
