@@ -6,14 +6,20 @@ from pathlib import Path
 
 import pytest
 
-from src.benchmark.backend_identity import canonical_json_bytes
+from src.benchmark.backend_identity import build_descriptor, canonical_json_bytes, sha256_hex
+from src.benchmark.backends import CanonicalAudio, NativeEvent
 from src.benchmark.cohort_scoring import SCORING_VERSION
 from src.benchmark.idm_comparison import (
     ComparisonIntegrityError,
     IdmComparisonRequest,
     compare_oaf_idm,
 )
-from src.benchmark.idm_pilot_run import render_idm_pilot_run
+from src.benchmark.idm_pilot_run import build_run_id, render_idm_pilot_run
+from src.benchmark.prediction_artifact import (
+    MappedPrediction,
+    MappedPredictionEvent,
+    render_prediction_artifact,
+)
 from src.benchmark.taxonomy import DTX_LANE_MAP_VERSION, TAXONOMY_VERSION
 
 _REPORT_IDENTITY = (
@@ -74,18 +80,45 @@ _CLASS_FIELDS = (
     "f1",
 )
 
+_HANDOFF_SHA = "5" * 64
+_HANDOFF_VERSION = "sha256:" + "6" * 64
+_REFERENCE_SHA = "a" * 64
+_REFERENCE_VERSION = "sha256:" + "7" * 64
+_TIMING_SHA = "b" * 64
+_TIMING_VERSION = "sha256:" + "8" * 64
+_DESCRIPTOR_SHA = "1" * 64
+_MODEL_LOCK_SHA = "2" * 64
+_INFERENCE_CONFIG_SHA = "9" * 64
+_BASE_RUN_ID = build_run_id(
+    _HANDOFF_SHA,
+    _HANDOFF_VERSION,
+    _REFERENCE_SHA,
+    _REFERENCE_VERSION,
+    _TIMING_SHA,
+    _TIMING_VERSION,
+    _DESCRIPTOR_SHA,
+    _MODEL_LOCK_SHA,
+    _INFERENCE_CONFIG_SHA,
+    "crux.oaf-htdemucs-drums-mono44k1-pcm16/v1",
+)
+
 
 def _snapshot(
     *,
+    source_audio_sha256: str | None = "d" * 64,
     input_audio_sha256: str = "c" * 64,
     input_view_id: str = "crux.oaf-htdemucs-drums-mono44k1-pcm16/v1",
     oaf_input_audio_sha256: str | None = None,
+    reference_manifest_sha256: str = _REFERENCE_SHA,
+    reference_timing_manifest_sha256: str = _TIMING_SHA,
+    run_id: str = _BASE_RUN_ID,
+    native_failure_counts: dict[str, int] | None = None,
 ) -> bytes:
     items = [
         {
             "simfile_id": 1,
             "source_audio_id": "song-1",
-            "source_audio_sha256": "d" * 64,
+            "source_audio_sha256": source_audio_sha256,
             "input_audio_sha256": input_audio_sha256,
             "input_view_id": input_view_id,
             "execution_disposition": "inferred",
@@ -111,22 +144,29 @@ def _snapshot(
     return render_idm_pilot_run(
         {
             "schema": "crux.idm-stem-pilot-run/v1",
-            "run_id": "idm-test-run",
-            "reference_manifest_sha256": "a" * 64,
-            "reference_manifest_version": "hpa324-v1",
-            "reference_timing_manifest_sha256": "b" * 64,
-            "reference_timing_version": "hpa323-v1",
-            "backend_descriptor_sha256": "1" * 64,
+            "run_id": run_id,
+            "handoff_manifest_sha256": _HANDOFF_SHA,
+            "handoff_manifest_version": _HANDOFF_VERSION,
+            "reference_manifest_sha256": reference_manifest_sha256,
+            "reference_manifest_version": _REFERENCE_VERSION,
+            "reference_timing_manifest_sha256": reference_timing_manifest_sha256,
+            "reference_timing_version": _TIMING_VERSION,
+            "backend_descriptor_sha256": _DESCRIPTOR_SHA,
             "backend_descriptor": {"backend_id": "idm-44-train-kits-v1"},
             "model_id": "idm-44-train-kits-model",
-            "model_lock_sha256": "2" * 64,
+            "model_lock_sha256": _MODEL_LOCK_SHA,
+            "inference_config_sha256": _INFERENCE_CONFIG_SHA,
             "prediction_map_version": "crux.prediction-map/idm-44-train-kits-v1",
             "input_view_id": input_view_id,
             "oaf_model_id": "oaf-model",
             "oaf_model_lock_sha256": "3" * 64,
             "oaf_backend_descriptor_sha256": "4" * 64,
             "oaf_prediction_map_version": "crux.prediction-map/oaf-v1",
-            "native_failure_counts": {"worker_protocol_failed": 1},
+            "native_failure_counts": (
+                {"worker_protocol_failed": 1}
+                if native_failure_counts is None
+                else native_failure_counts
+            ),
             "aggregate_rtf": 0.125,
             "peak_process_rss_bytes": 1234,
             "items": items,
@@ -147,8 +187,10 @@ def _write_csv(path: Path, fields: tuple[str, ...], rows: list[dict[str, str]]) 
         writer.writerows(rows)
 
 
-def _write_reports(root: Path, *, label: str, failed: bool = True) -> None:
-    cohort_id = f"idm-test-run:{label}"
+def _write_reports(
+    root: Path, *, label: str, failed: bool = True, run_id: str = _BASE_RUN_ID
+) -> None:
+    cohort_id = f"{run_id}:{label}"
     model_id = "oaf-model" if label == "oaf" else "idm-44-train-kits-model"
     model_lock = "3" * 64 if label == "oaf" else "2" * 64
     prediction_map = (
@@ -263,8 +305,8 @@ def _write_reports(root: Path, *, label: str, failed: bool = True) -> None:
     summary = {
         "schema": "crux.single-cohort-report/v1",
         "identity": {
-            "reference_manifest_sha256": "a" * 64,
-            "reference_timing_version": "hpa323-v1",
+            "reference_manifest_sha256": _REFERENCE_SHA,
+            "reference_timing_version": _TIMING_VERSION,
             "taxonomy_version": TAXONOMY_VERSION,
             "lane_map_version": DTX_LANE_MAP_VERSION,
             "backend_id": (
@@ -287,9 +329,69 @@ def _write_reports(root: Path, *, label: str, failed: bool = True) -> None:
     (root / "summary.json").write_bytes(canonical_json_bytes(summary))
 
 
+def _idm_prediction_bytes(
+    *,
+    source_audio_id: str = "song-1",
+    source_audio_sha256: str = "d" * 64,
+    input_audio_sha256: str = "c" * 64,
+    native_velocity: str = "1.337421",
+) -> bytes:
+    descriptor_payload = {
+        "architecture_id": "inverse-drum-machine-v0.1.0",
+        "backend_id": "idm-44-train-kits-v1",
+        "descriptor_schema": "crux.transcription-backend-descriptor/v2",
+        "model_id": "idm-44-train-kits-0123456789ab-fedcba987654",
+        "native_metadata_schema_id": "idm-peak-event-metadata-v1",
+        "native_output_space_id": "idm-44-train-kits-9class-v1",
+        "prediction_schema": "crux.drum-prediction-events/v2",
+        "training_data_map_id": "idm-training-contract-44-train-kits-v1",
+        "upstream_source_commit": "456656868538205ef756912c7cf5b0fd936de8af",
+    }
+    prediction = MappedPrediction(
+        audio=CanonicalAudio(
+            path=Path(),
+            source_audio_id=source_audio_id,
+            source_audio_sha256=source_audio_sha256,
+            input_view_id="crux.oaf-htdemucs-drums-mono44k1-pcm16/v1",
+            input_audio_sha256=input_audio_sha256,
+            byte_length=46,
+            sample_rate=44100,
+            channel_count=1,
+            sample_width_bytes=2,
+            audio_frame_count=1,
+        ),
+        descriptor=build_descriptor(
+            descriptor_payload,
+            frozenset(descriptor_payload),
+            "crux.transcription-backend-descriptor/v2",
+        ),
+        events=(
+            MappedPredictionEvent(
+                native=NativeEvent(
+                    time_sec=1.25,
+                    native_class_id="KD",
+                    model_output_bin=4,
+                    native_midi_note=None,
+                    native_metadata={
+                        "frame_index": "215",
+                        "native_velocity": native_velocity,
+                    },
+                    confidence=0.83,
+                    velocity_midi=85,
+                ),
+                canonical_class="kick",
+                common_class="kick",
+                mapping_status="mapped",
+                prediction_map_version="crux.prediction-map/idm-44-train-kits-v1",
+            ),
+        ),
+    )
+    return render_prediction_artifact(prediction)
+
+
 @pytest.fixture
 def idm_run(tmp_path: Path) -> Path:
-    run_path = tmp_path / "run" / "run.json"
+    run_path = tmp_path / "output" / "runs" / _BASE_RUN_ID / "run.json"
     run_path.parent.mkdir(parents=True)
     run_path.write_bytes(_snapshot())
     _write_reports(run_path.parent / "reports" / "oaf", label="oaf")
@@ -349,3 +451,116 @@ def test_compare_oaf_idm_rejects_identical_input_hash_mismatch(
 
     with pytest.raises(ComparisonIntegrityError, match="canonical-input.*input_audio_sha256"):
         compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "comparison"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("source_audio_sha256", None),
+        ("source_audio_sha256", "not-a-sha"),
+        ("input_audio_sha256", None),
+        ("input_audio_sha256", "not-a-sha"),
+    ),
+)
+def test_compare_oaf_idm_rejects_missing_or_malformed_success_hash(
+    idm_run: Path, tmp_path: Path, field: str, value: object
+) -> None:
+    idm_run.write_bytes(_snapshot(**{field: value}))
+
+    with pytest.raises(
+        ComparisonIntegrityError,
+        match=f"successful .*{field}",
+    ):
+        compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "comparison"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("reference_manifest_sha256", "0" * 64),
+        ("reference_timing_manifest_sha256", "0" * 64),
+    ),
+)
+def test_compare_oaf_idm_rejects_mutated_lineage_with_stale_run_id(
+    idm_run: Path, tmp_path: Path, field: str, value: str
+) -> None:
+    idm_run.write_bytes(_snapshot(run_id=_BASE_RUN_ID, **{field: value}))
+
+    with pytest.raises(ComparisonIntegrityError, match="run_id identity"):
+        compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "comparison"))
+
+
+def test_compare_oaf_idm_rejects_inconsistent_native_failure_histogram(
+    idm_run: Path, tmp_path: Path
+) -> None:
+    idm_run.write_bytes(_snapshot(native_failure_counts={"worker_protocol_failed": 2}))
+
+    with pytest.raises(ComparisonIntegrityError, match="native_failure_counts.*failed"):
+        compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "comparison"))
+
+
+def test_compare_oaf_idm_derives_native_failure_histogram_when_unstored(
+    idm_run: Path, tmp_path: Path
+) -> None:
+    snapshot = json.loads(_snapshot().decode("utf-8"))
+    del snapshot["native_failure_counts"]
+    idm_run.write_bytes(render_idm_pilot_run(snapshot))
+
+    compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "comparison"))
+
+    summary = json.loads((tmp_path / "comparison" / "summary.json").read_text(encoding="utf-8"))
+    assert summary["models"]["idm"]["native_failure_histogram"] == {"worker_protocol_failed": 1}
+
+
+def _set_prediction_artifact_sha(run_path: Path, artifact: bytes, *, source_audio_id: str) -> None:
+    snapshot = json.loads(run_path.read_text(encoding="utf-8"))
+    row = snapshot["items"][0]
+    row["source_audio_id"] = source_audio_id
+    row["prediction_artifact_sha256"] = sha256_hex(artifact)
+    run_path.write_bytes(render_idm_pilot_run(snapshot))
+
+
+def test_compare_oaf_idm_reports_velocity_from_task4_output_root(
+    idm_run: Path, tmp_path: Path
+) -> None:
+    artifact = _idm_prediction_bytes()
+    _set_prediction_artifact_sha(idm_run, artifact, source_audio_id="song-1")
+    target = idm_run.parents[2] / "predictions" / "1.jsonl"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(artifact)
+
+    compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "comparison"))
+
+    summary = json.loads((tmp_path / "comparison" / "summary.json").read_text(encoding="utf-8"))
+    velocity = summary["models"]["idm"]["velocity"]
+    assert velocity["available_event_count"] == 1
+    assert velocity["native_velocity_distribution"]["median"] == 1.337421
+
+
+def test_compare_oaf_idm_ignores_prediction_shadow_under_run_directory(
+    idm_run: Path, tmp_path: Path
+) -> None:
+    artifact = _idm_prediction_bytes()
+    _set_prediction_artifact_sha(idm_run, artifact, source_audio_id="song-1")
+    target = idm_run.parent / "predictions" / "1.jsonl"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(artifact)
+
+    compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "comparison"))
+
+    summary = json.loads((tmp_path / "comparison" / "summary.json").read_text(encoding="utf-8"))
+    assert summary["models"]["idm"]["velocity"]["available_event_count"] == 0
+
+
+def test_compare_oaf_idm_rejects_prediction_artifact_wrong_for_run_row(
+    idm_run: Path, tmp_path: Path
+) -> None:
+    artifact = _idm_prediction_bytes(source_audio_id="different-song")
+    target = idm_run.parents[2] / "predictions" / "1.jsonl"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(artifact)
+
+    compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "comparison"))
+
+    summary = json.loads((tmp_path / "comparison" / "summary.json").read_text(encoding="utf-8"))
+    assert summary["models"]["idm"]["velocity"]["available_event_count"] == 0
