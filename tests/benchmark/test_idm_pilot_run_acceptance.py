@@ -10,14 +10,16 @@ from src.benchmark.backends.base import CanonicalAudio, NativeEvent, NativePredi
 from src.benchmark.backends.idm import IdmBackendError
 from src.benchmark.idm_model import load_idm_model_lock
 from src.benchmark.idm_pilot_run import (
-    IdmPilotRunError,
     IdmPilotRunRequest,
-    _prepare_handoff_row,
     parse_idm_pilot_run,
     run_idm_pilot,
 )
 from src.benchmark.reference_set_manifest import LoadedReferenceSetManifest
-from src.benchmark.separation_handoff import LoadedSeparationPilotManifest
+from src.benchmark.separation_handoff import (
+    LoadedSeparationPilotManifest,
+    SeparationHandoffError,
+    load_separation_pilot_manifest,
+)
 from src.benchmark.taxonomy import OAF_PREDICTION_MAP_ID
 from tests.benchmark.idm_pilot_fixtures import (
     CRUX_COMMIT,
@@ -174,13 +176,9 @@ def _synthetic_handoff(
     return handoff, reference, timing, mappings
 
 
-def _install_synthetic_seams(
-    monkeypatch, handoff, reference, timing, mappings, *, patch_handoff: bool = True
-):
+def _install_synthetic_seams(monkeypatch, reference, timing, mappings):
     import src.benchmark.idm_pilot_run as runner
 
-    if patch_handoff:
-        monkeypatch.setattr(runner, "load_separation_pilot_manifest", lambda _: handoff)
     monkeypatch.setattr(runner, "load_reference_set_manifest", lambda _: reference)
     monkeypatch.setattr(runner, "load_reference_timing_manifest", lambda _: timing)
     monkeypatch.setattr(runner, "preflight_reference_mappings", lambda *_args, **_kwargs: mappings)
@@ -239,10 +237,12 @@ def _healthy_backend_factory(descriptor, calls: list[int]):
 
 def _run_first_synthetic(tmp_path: Path, monkeypatch):
     handoff, reference, timing, mappings = _synthetic_handoff(tmp_path)
-    runner = _install_synthetic_seams(monkeypatch, handoff, reference, timing, mappings)
+    request = _request(tmp_path)
+    write_actual_handoff(request.separation_handoff_path, handoff)
+    runner = _install_synthetic_seams(monkeypatch, reference, timing, mappings)
+    loaded_handoff = runner.load_separation_pilot_manifest(request.separation_handoff_path)
     descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
     calls: list[int] = []
-    request = _request(tmp_path)
     outcome = run_idm_pilot(
         request,
         backend_factory=_healthy_backend_factory(descriptor, calls),
@@ -250,7 +250,7 @@ def _run_first_synthetic(tmp_path: Path, monkeypatch):
     )
     assert outcome.success_count == 18
     assert len(calls) == 18
-    return runner, handoff, request, calls, outcome
+    return runner, loaded_handoff, request, calls, outcome
 
 
 def test_synthetic_immutable_handoff_runs_both_complete_populations_and_resumes(
@@ -259,9 +259,7 @@ def test_synthetic_immutable_handoff_runs_both_complete_populations_and_resumes(
     handoff, reference, timing, mappings = _synthetic_handoff(tmp_path)
     request = _request(tmp_path)
     write_actual_handoff(request.separation_handoff_path, handoff)
-    runner = _install_synthetic_seams(
-        monkeypatch, handoff, reference, timing, mappings, patch_handoff=False
-    )
+    runner = _install_synthetic_seams(monkeypatch, reference, timing, mappings)
     lock = load_idm_model_lock(Path("runtime/idm/model.json"))
     descriptor = runner.descriptor_for_lock(lock)
     calls: list[int] = []
@@ -309,6 +307,48 @@ def test_synthetic_immutable_handoff_runs_both_complete_populations_and_resumes(
         backend_factory=lambda **_: FakeBackend(),
         perf_counter=lambda: 1.0,
     )
+    assert resumed.success_count == 18
+    assert resumed.failed_count == 2
+    assert calls == []
+
+
+def test_interrupted_resume_preserves_unvisited_exact_ledger_items(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runner, _handoff, request, calls, first = _run_first_synthetic(tmp_path, monkeypatch)
+    assert first.run_path is not None
+    calls.clear()
+    original_checkpoint = runner._write_checkpoint
+    checkpoint_calls = 0
+
+    def interrupt_after_first_row(*args, **kwargs):
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        original_checkpoint(*args, **kwargs)
+        if checkpoint_calls == 2:
+            raise KeyboardInterrupt("deterministic row-checkpoint interruption")
+
+    monkeypatch.setattr(runner, "_write_checkpoint", interrupt_after_first_row)
+    with pytest.raises(KeyboardInterrupt, match="deterministic row-checkpoint interruption"):
+        run_idm_pilot(
+            replace(request, resume=True),
+            backend_factory=lambda **_: pytest.fail("valid artifacts must not invoke IDM"),
+            perf_counter=lambda: 1.0,
+        )
+
+    interrupted = parse_idm_pilot_run(first.run_path.read_bytes())
+    interrupted_rows = {row["simfile_id"]: row for row in interrupted["items"]}
+    assert interrupted_rows[20]["execution_disposition"] == "resumed"
+    assert interrupted_rows[21]["execution_disposition"] == "inferred"
+    assert interrupted_rows[21]["prediction_artifact_sha256"]
+
+    monkeypatch.setattr(runner, "_write_checkpoint", original_checkpoint)
+    resumed = run_idm_pilot(
+        replace(request, resume=True),
+        backend_factory=lambda **_: pytest.fail("preserved artifacts must not invoke IDM"),
+        perf_counter=lambda: 1.0,
+    )
+
     assert resumed.success_count == 18
     assert resumed.failed_count == 2
     assert calls == []
@@ -468,39 +508,59 @@ def test_resume_rejects_idm_artifact_hash_mismatch_without_rerun(
     assert rows[20]["native_failure_code"] == "prediction_artifact_invalid"
 
 
-def test_retained_path_escape_and_symlink_are_rejected_without_fallback_scan(
-    tmp_path: Path,
-) -> None:
+def test_retained_path_escape_is_rejected_by_real_handoff_loader(tmp_path: Path) -> None:
     handoff, _reference, _timing, _mappings = _synthetic_handoff(tmp_path)
+    request = _request(tmp_path)
     escaped = deepcopy(handoff.rows[0])
-    escaped["htdemucs"]["input"]["path"] = "../outside.wav"
-    with pytest.raises(IdmPilotRunError, match="path is invalid"):
-        _prepare_handoff_row(
-            escaped,
-            separation_artifact_root=tmp_path / "separation",
-            stem_cache_root=tmp_path / "stems",
-        )
+    escaped_view = deepcopy(escaped["htdemucs"])
+    escaped_input = deepcopy(escaped_view["input"])
+    escaped_input["path"] = "../outside.wav"
+    escaped_view["input"] = escaped_input
+    escaped["htdemucs"] = escaped_view
+    escaped_handoff = replace(handoff, rows=(escaped, *handoff.rows[1:]))
+    write_actual_handoff(request.separation_handoff_path, escaped_handoff)
 
+    with pytest.raises(SeparationHandoffError, match="path is invalid"):
+        load_separation_pilot_manifest(request.separation_handoff_path)
+
+
+def test_retained_symlink_is_rejected_through_real_handoff_loader(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _runner, _handoff, request, calls, _first = _run_first_synthetic(tmp_path, monkeypatch)
+    calls.clear()
     input_path = tmp_path / "separation" / "inputs" / "20" / "htdemucs.wav"
     outside = tmp_path / "outside.wav"
     outside.write_bytes(canonical_wav())
     input_path.unlink()
     input_path.symlink_to(outside)
-    with pytest.raises(IdmPilotRunError, match="symlinks"):
-        _prepare_handoff_row(
-            handoff.rows[0],
-            separation_artifact_root=tmp_path / "separation",
-            stem_cache_root=tmp_path / "stems",
-        )
+
+    resumed = run_idm_pilot(
+        replace(request, resume=True),
+        backend_factory=lambda **_: pytest.fail("symlink evidence must not rerun IDM"),
+        perf_counter=lambda: 1.0,
+    )
+
+    assert resumed.success_count == 17
+    assert resumed.failed_count == 3
+    assert calls == []
+    assert resumed.run_path is not None
+    rows = {
+        row["simfile_id"]: row
+        for row in parse_idm_pilot_run(resumed.run_path.read_bytes())["items"]
+    }
+    assert rows[20]["native_failure_code"] == "retained_input_invalid"
 
 
 def test_poisoned_backend_is_not_restarted_and_remaining_rows_are_protocol_failed(
     tmp_path: Path, monkeypatch
 ) -> None:
     handoff, reference, timing, mappings = _synthetic_handoff(tmp_path)
+    request = _request(tmp_path)
+    write_actual_handoff(request.separation_handoff_path, handoff)
     import src.benchmark.idm_pilot_run as runner
 
-    _install_synthetic_seams(monkeypatch, handoff, reference, timing, mappings)
+    _install_synthetic_seams(monkeypatch, reference, timing, mappings)
     descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
     transcribe_calls: list[int] = []
     factory_calls: list[int] = []
