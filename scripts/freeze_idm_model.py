@@ -202,18 +202,34 @@ def _verify_model_config(content: bytes) -> None:
         transform = encoder["transform"]
         head = encoder["transcription_head"]
         decoder = config["decoder"]
-        assert config["sampling_rate"] == 44100
-        assert encoder["sampling_rate"] == 44100
-        assert decoder["sampling_rate"] == 44100
-        assert transform["sample_rate"] == 44100
-        assert transform["n_fft"] == 1024
-        assert transform["hop_length"] == 256
-        assert transform["n_mels"] == 128
-        assert head["onset_activation"] == "none"
-        assert head["velocity_activation"] == "exp_sigmoid"
-        assert config["train_classes"] == list(IDM_TRAIN_CLASSES)
-    except (AssertionError, KeyError, TypeError):
+        actual_facts = (
+            config["sampling_rate"],
+            encoder["sampling_rate"],
+            decoder["sampling_rate"],
+            transform["sample_rate"],
+            transform["n_fft"],
+            transform["hop_length"],
+            transform["n_mels"],
+            head["onset_activation"],
+            head["velocity_activation"],
+            config["train_classes"],
+        )
+    except (KeyError, TypeError):
         raise FreezeError("model config facts differ from the frozen IDM contract") from None
+    expected_facts = (
+        44100,
+        44100,
+        44100,
+        44100,
+        1024,
+        256,
+        128,
+        "none",
+        "exp_sigmoid",
+        list(IDM_TRAIN_CLASSES),
+    )
+    if actual_facts != expected_facts:
+        raise FreezeError("model config facts differ from the frozen IDM contract")
 
 
 def _verify_license_evidence(license_bytes: bytes, provenance_path: Path) -> None:
