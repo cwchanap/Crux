@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
 import os
@@ -72,9 +73,13 @@ def _ready(lock_path: Path = MODEL_LOCK_PATH, **overrides: object) -> dict[str, 
         "type": "ready",
         "backend_id": IDM_BACKEND_ID,
         "model_id": lock.model_id,
+        "model_name": lock.model_name,
         "train_classes": list(IDM_TRAIN_CLASSES),
+        "python_version": lock.python_version,
         "sample_rate_hz": 44100,
         "activation_rate_hz": 172.265625,
+        "device": lock.device,
+        "dtype": lock.dtype,
     }
     ready.update(overrides)
     return ready
@@ -266,9 +271,13 @@ def test_idm_backend_decodes_events_and_reuses_worker(tmp_path: Path) -> None:
     "override",
     [
         {"model_id": "wrong"},
+        {"model_name": "wrong"},
         {"train_classes": ["KD"]},
+        {"python_version": "3.11.11"},
         {"sample_rate_hz": 48000},
         {"activation_rate_hz": 100.0},
+        {"device": "mps"},
+        {"dtype": "float16"},
     ],
 )
 def test_idm_backend_rejects_wrong_ready_identity_before_request(
@@ -283,6 +292,74 @@ def test_idm_backend_rejects_wrong_ready_identity_before_request(
     assert raised.value.code == "worker_identity_invalid"
     assert worker.requests == []
     assert worker.close_count == 1
+
+
+@pytest.mark.parametrize(("field", "value"), [("device", "mps"), ("dtype", "float16")])
+def test_idm_backend_rejects_non_kiss_runtime_lock_before_worker_start(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    artifact_root, model_root = _copy_attested_runtime(tmp_path)
+    lock_path = artifact_root / "model.json"
+    payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    payload["activation_rate_hz"] = Decimal("172.265625")
+    payload["velocity_max_value"] = Decimal("2.0")
+    payload[field] = value
+    lock_path.write_bytes(canonical_json_bytes(payload, trailing_newline=True))
+
+    worker = _FakeWorker(_ready(), {"id": "request", "events": []})
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    with pytest.raises(IdmBackendError) as raised:
+        _backend(
+            tmp_path,
+            worker,
+            calls,
+            artifact_root=artifact_root,
+            model_root=model_root,
+        )
+
+    assert raised.value.code == "descriptor_invalid"
+    assert calls == []
+
+
+def test_idm_worker_ready_reports_effective_runtime_model_and_tensor_facts(
+    tmp_path: Path,
+) -> None:
+    from runtime.idm import worker
+
+    class Parameter:
+        device = "cpu"
+        dtype = "float32"
+
+    class Encoder:
+        sampling_rate = 44100
+        frame_rate = 172.265625
+
+    class Model:
+        model_name = "idm-44-train-kits"
+        train_classes = list(IDM_TRAIN_CLASSES)
+        encoder = Encoder()
+
+        def parameters(self):
+            return iter((Parameter(),))
+
+    output = io.StringIO()
+    result = worker.serve_requests(
+        io.StringIO(),
+        output,
+        model_root=tmp_path,
+        model_loader=lambda _root: (Model(), object(), "cpu"),
+    )
+
+    assert result == 0
+    ready = json.loads(output.getvalue())
+    assert ready["model_name"] == "idm-44-train-kits"
+    assert ready["train_classes"] == list(IDM_TRAIN_CLASSES)
+    expected_python_version = ".".join(str(part) for part in sys.version_info[:3])
+    assert ready["python_version"] == expected_python_version
+    assert ready["sample_rate_hz"] == 44100
+    assert ready["activation_rate_hz"] == 172.265625
+    assert ready["device"] == "cpu"
+    assert ready["dtype"] == "float32"
 
 
 def test_idm_backend_maps_worker_protocol_failure_and_poison(tmp_path: Path) -> None:

@@ -79,7 +79,7 @@ def _load_model(
     checkpoint_path: Path | None = None,
     checkpoint_sha256: str | None = None,
     checkpoint_byte_length: int | None = None,
-) -> tuple[Any, Any, Any]:
+) -> tuple[Any, Any, Any, str]:
     global _WHEEL_PROJECT
     if sys.flags.isolated != 1 or sys.flags.no_site != 1:
         raise ValueError("IDM worker requires isolated no-site interpreter startup")
@@ -126,9 +126,14 @@ def _load_model(
     from idm.inference import load_model
 
     with contextlib.redirect_stdout(sys.stderr):
-        model, _ = load_model("idm-44-train-kits", torch.device("cpu"), log_dir=Path("pretrained"))
+        model, model_name = load_model(
+            "idm-44-train-kits", torch.device("cpu"), log_dir=Path("pretrained")
+        )
+    if model_name != "idm-44-train-kits":
+        raise ValueError("loaded IDM model name does not match the frozen model")
     model.eval()
-    return model, torch, torch.device("cpu")
+    _ready_payload(model, model_name, torch.device("cpu"))
+    return model, torch, torch.device("cpu"), model_name
 
 
 def _read_regular_file_no_follow(
@@ -264,6 +269,66 @@ def _load_audio(path: str, torch: Any, device: Any) -> Any:
     return torch.from_numpy(samples[:, 0]).to(device).unsqueeze(0)
 
 
+def _python_version() -> str:
+    version = sys.version_info
+    return f"{version.major}.{version.minor}.{version.micro}"
+
+
+def _ready_payload(model: Any, model_name: object, device: Any) -> dict[str, Any]:
+    """Build readiness from the loaded model and effective tensor runtime."""
+    if model_name != "idm-44-train-kits":
+        raise ValueError("loaded IDM model name does not match the frozen model")
+    classes = getattr(model, "train_classes", None)
+    if not isinstance(classes, (list, tuple)) or tuple(classes) != TRAIN_CLASSES:
+        raise ValueError("loaded IDM model classes do not match the frozen ordering")
+    encoder = getattr(model, "encoder", None)
+    sample_rate = getattr(encoder, "sampling_rate", None)
+    frame_rate = getattr(encoder, "frame_rate", None)
+    if type(sample_rate) is not int or sample_rate != SAMPLE_RATE_HZ:
+        raise ValueError("loaded IDM encoder sample rate is invalid")
+    if type(frame_rate) not in {int, float} or not math.isfinite(float(frame_rate)):
+        raise ValueError("loaded IDM encoder frame rate is invalid")
+    if float(frame_rate) != ACTIVATION_RATE_HZ:
+        raise ValueError("loaded IDM encoder frame rate is invalid")
+
+    try:
+        parameters = iter(model.parameters())
+        first_parameter = next(parameters)
+    except (AttributeError, StopIteration, TypeError) as error:
+        raise ValueError("loaded IDM model parameters are unavailable") from error
+    parameter_device = getattr(first_parameter, "device", None)
+    parameter_dtype = getattr(first_parameter, "dtype", None)
+    if parameter_device is None or parameter_dtype is None:
+        raise ValueError("loaded IDM model tensor facts are unavailable")
+    effective_device = str(parameter_device)
+    effective_dtype = str(parameter_dtype).removeprefix("torch.")
+    if effective_device != str(device):
+        raise ValueError("loaded IDM model device does not match the runtime device")
+    for parameter in parameters:
+        parameter_device = getattr(parameter, "device", None)
+        parameter_dtype = getattr(parameter, "dtype", None)
+        if parameter_device is None or parameter_dtype is None:
+            raise ValueError("loaded IDM model tensor facts are unavailable")
+        if str(parameter_device) != effective_device:
+            raise ValueError("loaded IDM model uses mixed devices")
+        if str(parameter_dtype).removeprefix("torch.") != effective_dtype:
+            raise ValueError("loaded IDM model uses mixed dtypes")
+    if effective_device != "cpu" or effective_dtype != "float32":
+        raise ValueError("IDM KISS runtime supports only CPU float32")
+    return {
+        "type": "ready",
+        "backend_id": BACKEND_ID,
+        "model_id": MODEL_ID,
+        "model_name": model_name,
+        "train_classes": list(classes),
+        "python_version": _python_version(),
+        "sample_rate_hz": sample_rate,
+        "activation_rate_hz": float(frame_rate),
+        "device": effective_device,
+        "dtype": effective_dtype,
+    }
+
+
 def _events(model: Any, audio: Any, torch: Any) -> list[dict[str, Any]]:
     with torch.inference_mode():
         encoder_outputs = model.encoder(audio)
@@ -315,10 +380,10 @@ def serve_requests(
     checkpoint_path: Path | None = None,
     checkpoint_sha256: str | None = None,
     checkpoint_byte_length: int | None = None,
-    model_loader: Callable[..., tuple[Any, Any, Any]] = _load_model,
+    model_loader: Callable[..., tuple[Any, ...]] = _load_model,
 ) -> int:
     if model_loader is _load_model:
-        model, torch, device = model_loader(
+        loaded = model_loader(
             model_root,
             wheel_path=wheel_path,
             wheel_sha256=wheel_sha256,
@@ -331,18 +396,12 @@ def serve_requests(
             checkpoint_byte_length=checkpoint_byte_length,
         )
     else:
-        model, torch, device = model_loader(model_root)
-    _write(
-        stdout,
-        {
-            "type": "ready",
-            "backend_id": BACKEND_ID,
-            "model_id": MODEL_ID,
-            "train_classes": list(TRAIN_CLASSES),
-            "sample_rate_hz": SAMPLE_RATE_HZ,
-            "activation_rate_hz": ACTIVATION_RATE_HZ,
-        },
-    )
+        loaded = model_loader(model_root)
+    if not isinstance(loaded, tuple) or len(loaded) not in {3, 4}:
+        raise ValueError("IDM model loader returned an invalid result")
+    model, torch, device = loaded[:3]
+    model_name = loaded[3] if len(loaded) == 4 else getattr(model, "model_name", None)
+    _write(stdout, _ready_payload(model, model_name, device))
     for raw_line in stdin:
         request_id = None
         try:

@@ -9,11 +9,13 @@ recreate either upstream artifact.
 from __future__ import annotations
 
 import math
+import os
 import re
+import stat
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
@@ -21,6 +23,7 @@ from typing import Any, Literal
 
 from src.benchmark.artifact_io import (
     ArtifactPublicationError,
+    publish_immutable_file_at,
     read_regular_file_no_follow,
 )
 from src.benchmark.backend_identity import (
@@ -51,7 +54,7 @@ from src.benchmark.cohort_scoring import (
     score_cohort,
 )
 from src.benchmark.corpus_cache import CacheIndexStore, ResolvedSourceAudio, resolve_source_audio
-from src.benchmark.durability import atomic_replace_bytes
+from src.benchmark.durability import atomic_replace_bytes, ensure_durable_directory
 from src.benchmark.idm_model import (
     IDM_REQUEST_TIMEOUT_SECONDS,
     IdmModelLock,
@@ -329,6 +332,7 @@ class _PreparedHandoffRow:
     row: Mapping[str, object]
     audio: CanonicalAudio | None
     oaf_artifact: PredictionArtifact | None
+    input_content: bytes | None = None
     native_failure_code: str | None = None
     upstream_failure_code: str | None = None
 
@@ -902,6 +906,246 @@ def _validate_output_roots(request: IdmPilotRunRequest) -> None:
             )
 
 
+_PRIMARY_REPORT_FILENAMES = (
+    "summary.json",
+    "items.csv",
+    "per_song.csv",
+    "per_class.csv",
+    "event_diagnostics.jsonl",
+    "summary.md",
+)
+
+
+def _validate_primary_namespace_path(
+    path: Path,
+    output_dir: Path,
+    output_root: Path,
+    field: str,
+    *,
+    leaf_kind: Literal["directory", "file"],
+) -> None:
+    """Validate one primary output path without following preseeded components."""
+    if not isinstance(path, Path) or not isinstance(output_dir, Path):
+        raise TypeError("primary namespace paths must be Paths")
+    try:
+        relative = path.relative_to(output_dir)
+    except ValueError as error:
+        raise IdmPilotRunError(f"{field} escapes output_dir", code="preflight_invalid") from error
+
+    cursor = output_dir
+    components = (cursor, *relative.parts)
+    for index, part in enumerate(components):
+        if index:
+            cursor = cursor / part
+        try:
+            metadata = cursor.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise IdmPilotRunError(f"{field} is unavailable", code="preflight_invalid") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise IdmPilotRunError(f"{field} must not use symlinks", code="preflight_invalid")
+        is_leaf = index == len(components) - 1
+        if not is_leaf and not stat.S_ISDIR(metadata.st_mode):
+            raise IdmPilotRunError(f"{field} parent is not a directory", code="preflight_invalid")
+        if is_leaf:
+            if leaf_kind == "directory" and not stat.S_ISDIR(metadata.st_mode):
+                raise IdmPilotRunError(f"{field} is not a directory", code="preflight_invalid")
+            if leaf_kind == "file" and not stat.S_ISREG(metadata.st_mode):
+                raise IdmPilotRunError(f"{field} is not a regular file", code="preflight_invalid")
+
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError as error:
+        raise IdmPilotRunError(f"{field} is unavailable", code="preflight_invalid") from error
+    if not resolved.is_relative_to(output_root):
+        raise IdmPilotRunError(f"{field} escapes output_dir", code="preflight_invalid")
+
+
+def _validate_primary_namespace(
+    request: IdmPilotRunRequest,
+    *,
+    run_id: str,
+    allow_existing_run: bool = False,
+) -> tuple[Path, Path, Path, Path]:
+    """Validate the primary run-owned namespace before any mutable writes."""
+    output_dir = request.output_dir
+    output_root = _root_resolved(output_dir, "output_dir")
+    _validate_primary_namespace_path(
+        output_dir,
+        output_dir,
+        output_root,
+        "output_dir",
+        leaf_kind="directory",
+    )
+    runs_root = output_dir / "runs"
+    predictions_root = output_dir / "predictions"
+    run_dir = runs_root / run_id
+    run_path = run_dir / "run.json"
+    input_root = run_dir / "inputs"
+    reports_path = run_dir / "reports"
+    derived_directories = (
+        (runs_root, "runs"),
+        (predictions_root, "predictions"),
+        (run_dir, "IDM run directory"),
+        (input_root, "IDM input root"),
+        (reports_path, "IDM reports root"),
+        (reports_path / "oaf", "OaF reports root"),
+        (reports_path / "idm", "IDM reports root"),
+    )
+    for path, field in derived_directories:
+        _validate_primary_namespace_path(
+            path,
+            output_dir,
+            output_root,
+            field,
+            leaf_kind="directory",
+        )
+
+    _validate_primary_namespace_path(
+        run_path,
+        output_dir,
+        output_root,
+        "IDM run snapshot",
+        leaf_kind="file",
+    )
+    run_exists = False
+    try:
+        run_exists = stat.S_ISDIR(run_dir.lstat().st_mode)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise IdmPilotRunError(
+            "IDM run directory is unavailable", code="preflight_invalid"
+        ) from error
+    if run_exists and not request.resume and not allow_existing_run:
+        raise IdmPilotRunError("IDM run directory already exists", code="preflight_invalid")
+    if request.resume:
+        try:
+            metadata = run_path.lstat()
+        except FileNotFoundError:
+            metadata = None
+        if metadata is not None and not stat.S_ISREG(metadata.st_mode):
+            raise IdmPilotRunError(
+                "resume run snapshot is not a regular file", code="preflight_invalid"
+            )
+
+    for cohort in ("oaf", "idm"):
+        report_root = reports_path / cohort
+        for filename in _PRIMARY_REPORT_FILENAMES:
+            _validate_primary_namespace_path(
+                report_root / filename,
+                output_dir,
+                output_root,
+                f"{cohort} report {filename}",
+                leaf_kind="file",
+            )
+    return run_dir, run_path, reports_path, input_root
+
+
+def _validate_primary_prediction_target(
+    target: Path,
+    *,
+    output_dir: Path,
+) -> None:
+    output_root = _root_resolved(output_dir, "output_dir")
+    _validate_primary_namespace_path(
+        target,
+        output_dir,
+        output_root,
+        "IDM prediction path",
+        leaf_kind="file",
+    )
+
+
+def _validate_primary_reports_namespace(reports_path: Path, output_dir: Path) -> None:
+    output_root = _root_resolved(output_dir, "output_dir")
+    for cohort in ("oaf", "idm"):
+        report_root = reports_path / cohort
+        _validate_primary_namespace_path(
+            report_root,
+            output_dir,
+            output_root,
+            f"{cohort} reports root",
+            leaf_kind="directory",
+        )
+        for filename in _PRIMARY_REPORT_FILENAMES:
+            _validate_primary_namespace_path(
+                report_root / filename,
+                output_dir,
+                output_root,
+                f"{cohort} report {filename}",
+                leaf_kind="file",
+            )
+
+
+def _stage_primary_verified_input(
+    run_dir: Path,
+    output_dir: Path,
+    simfile_id: int,
+    content: bytes,
+) -> Path:
+    """Persist verified handoff bytes in a private, run-owned regular file."""
+    if type(simfile_id) is not int or simfile_id <= 0:
+        raise IdmPilotRunError("simfile_id is invalid", code="retained_input_invalid")
+    if not isinstance(content, bytes):
+        raise TypeError("verified input content must be bytes")
+    output_root = _root_resolved(output_dir, "output_dir")
+    input_root = run_dir / "inputs"
+    song_root = input_root / str(simfile_id)
+    staged_path = song_root / "verified.wav"
+    for path, field in (
+        (input_root, "IDM input root"),
+        (song_root, "IDM song input root"),
+        (staged_path, "IDM verified input"),
+    ):
+        _validate_primary_namespace_path(
+            path,
+            output_dir,
+            output_root,
+            field,
+            leaf_kind="file" if path == staged_path else "directory",
+        )
+    try:
+        ensure_durable_directory(song_root)
+        directory_fd = os.open(
+            song_root,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as error:
+        raise IdmPilotRunError(
+            "verified IDM input directory is unavailable", code="retained_input_invalid"
+        ) from error
+    try:
+        try:
+            publish_immutable_file_at(directory_fd, staged_path.name, content)
+        except (ArtifactPublicationError, OSError) as error:
+            raise IdmPilotRunError(
+                "verified IDM input could not be staged", code="retained_input_invalid"
+            ) from error
+    finally:
+        os.close(directory_fd)
+    try:
+        persisted = read_regular_file_no_follow(staged_path)
+        metadata = staged_path.lstat()
+    except OSError as error:
+        raise IdmPilotRunError(
+            "verified IDM input could not be re-read", code="retained_input_invalid"
+        ) from error
+    if (
+        persisted != content
+        or not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise IdmPilotRunError(
+            "verified IDM input bytes or permissions changed", code="retained_input_invalid"
+        )
+    return staged_path
+
+
 def _owned_path(root: Path, raw_path: object, field: str) -> Path:
     if not isinstance(raw_path, str) or not raw_path:
         raise IdmPilotRunError(f"{field} path is invalid", code="retained_input_invalid")
@@ -1149,6 +1393,7 @@ def _prepare_handoff_row(
                 audio_frame_count=wav.audio_frame_count,
             ),
             oaf_artifact=oaf_artifact,
+            input_content=input_content,
         )
     except IdmPilotRunError:
         raise
@@ -1727,14 +1972,22 @@ def run_idm_pilot(
     except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError, IdmPilotRunError):
         return _fatal_outcome()
 
-    run_dir = request.output_dir / "runs" / run_id
-    run_path = run_dir / "run.json"
-    reports_path = run_dir / "reports"
-    if run_path.exists() and not request.resume:
+    try:
+        run_dir, run_path, reports_path, input_root = _validate_primary_namespace(
+            request,
+            run_id=run_id,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError, IdmPilotRunError):
         return _fatal_outcome()
     try:
         started_at = _timestamp(clock())
-        run_dir.mkdir(parents=True, exist_ok=True)
+        ensure_durable_directory(request.output_dir / "runs")
+        ensure_durable_directory(run_dir)
+        _validate_primary_namespace(
+            request,
+            run_id=run_id,
+            allow_existing_run=True,
+        )
         header = _build_header(
             request,
             handoff=handoff,
@@ -1815,6 +2068,29 @@ def run_idm_pilot(
                     backend_descriptor_sha256=descriptor.sha256,
                     inference_config_sha256=inference_config_sha,
                 )
+                try:
+                    _validate_primary_prediction_target(target, output_dir=request.output_dir)
+                except (OSError, RuntimeError, TypeError, ValueError, IdmPilotRunError) as error:
+                    _set_failed(item, "prediction_artifact_invalid", error)
+                    native_failure_counts["prediction_artifact_invalid"] += 1
+                    continue
+                try:
+                    if prepared.input_content is None:
+                        raise IdmPilotRunError(
+                            "verified IDM input bytes are unavailable",
+                            code="retained_input_invalid",
+                        )
+                    staged_path = _stage_primary_verified_input(
+                        run_dir,
+                        request.output_dir,
+                        int(row["simfile_id"]),
+                        prepared.input_content,
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError, IdmPilotRunError) as error:
+                    _set_failed(item, "retained_input_invalid", error)
+                    native_failure_counts["retained_input_invalid"] += 1
+                    continue
+                audio = replace(audio, path=staged_path)
                 existing = _read_output_prediction(target, request.output_dir)
                 prior = prior_items.get(int(row["simfile_id"]))
                 if existing is not None:
@@ -1874,7 +2150,7 @@ def run_idm_pilot(
                             runtime_python=request.runtime_python,
                             model_lock_path=request.model_lock_path,
                             model_root=request.model_root,
-                            input_root=request.separation_artifact_root,
+                            input_root=input_root,
                             timeout_seconds=IDM_REQUEST_TIMEOUT_SECONDS,
                             close_timeout_seconds=IDM_WORKER_CLOSE_TIMEOUT_SECONDS,
                         )
@@ -1939,6 +2215,9 @@ def run_idm_pilot(
                     backend_poisoned = True
                     continue
                 try:
+                    _validate_primary_prediction_target(target, output_dir=request.output_dir)
+                    ensure_durable_directory(target.parent)
+                    _validate_primary_prediction_target(target, output_dir=request.output_dir)
                     published = publish_prediction_artifact(target, mapped)
                 except ArtifactPublicationError as error:
                     _set_failed(item, "prediction_publish_failed", error)
@@ -2047,6 +2326,9 @@ def run_idm_pilot(
         idm_score = score_cohort(idm_identity, idm_items, diagnostics_for=())
         oaf_reports = reports_path / "oaf"
         idm_reports = reports_path / "idm"
+        ensure_durable_directory(oaf_reports)
+        ensure_durable_directory(idm_reports)
+        _validate_primary_reports_namespace(reports_path, request.output_dir)
         write_cohort_reports(oaf_score, oaf_reports)
         write_cohort_reports(idm_score, idm_reports)
     except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError, PredictionArtifactError):
