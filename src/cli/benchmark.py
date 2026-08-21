@@ -1019,7 +1019,12 @@ def _execute_idm_pilot(
             comparison_error = type(error).__name__
 
     smoke_outcome: object | None = None
-    if smoke_manifest is not None and source_cache_dir is not None and outcome.exit_code != 2:
+    if (
+        smoke_manifest is not None
+        and source_cache_dir is not None
+        and outcome.exit_code != 2
+        and comparison_error is None
+    ):
         try:
             smoke_outcome = run_idm_full_mix_smoke(
                 IdmFullMixSmokeRequest(
