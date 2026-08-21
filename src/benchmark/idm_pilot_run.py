@@ -834,6 +834,11 @@ def _set_failed(item: dict[str, object], code: str, detail: BaseException | str)
     item["failure_detail"] = _bounded_error(detail)
 
 
+def _clear_failure_fields(item: dict[str, object]) -> None:
+    for field in ("native_failure_code", "cohort_failure_reason", "failure_detail"):
+        item.pop(field, None)
+
+
 def _native_failure_counts(items: Iterable[Mapping[str, object]]) -> Counter[str]:
     counts: Counter[str] = Counter()
     for item in items:
@@ -1446,6 +1451,7 @@ def run_idm_pilot(
                         _set_failed(item, error.code, error)
                         native_failure_counts[item["native_failure_code"]] += 1  # type: ignore[index]
                         continue
+                    _clear_failure_fields(item)
                     item.update(
                         {
                             "execution_disposition": "resumed",
@@ -1548,6 +1554,7 @@ def run_idm_pilot(
                     _set_failed(item, "prediction_artifact_invalid", error)
                     native_failure_counts["prediction_artifact_invalid"] += 1
                     continue
+                _clear_failure_fields(item)
                 item.update(
                     {
                         "execution_disposition": "inferred",
