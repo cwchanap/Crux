@@ -7,11 +7,14 @@ import io
 import json
 import struct
 import wave
+from copy import deepcopy
 from pathlib import Path
 
 from src.benchmark.backend_identity import canonical_json_bytes
 from src.benchmark.backends.base import CanonicalAudio, NativeEvent, NativePrediction
+from src.benchmark.corpus_manifest import render_manifest
 from src.benchmark.mapping import map_oaf_prediction
+from src.benchmark.oaf_corpus_run import OAF_FULL_MIX_INPUT_VIEW_ID
 from src.benchmark.prediction_artifact import render_prediction_artifact
 from src.benchmark.reference_set import map_reference_events
 from src.benchmark.reference_set_manifest import (
@@ -21,6 +24,8 @@ from src.benchmark.reference_set_manifest import (
 )
 from src.benchmark.reference_timing import NativeReferenceEvent
 from src.benchmark.reference_timing_manifest import LoadedReferenceTimingManifest
+from src.benchmark.separation_handoff import LoadedSeparationPilotManifest
+from src.benchmark.separation_pilot import SPLEETER_INPUT_VIEW_ID
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
@@ -186,3 +191,52 @@ def loaded_reference_manifests(
         rows=(),
     )
     return reference, timing, {simfile_id: reference_mapping(simfile_id) for simfile_id in ids}
+
+
+def write_actual_handoff(path: Path, handoff: LoadedSeparationPilotManifest) -> bytes:
+    """Render a synthetic handoff through the production immutable loader."""
+    rows: list[dict[str, object]] = []
+    comparison_names = (
+        "summary.json",
+        "summary.md",
+        "spleeter/paired_per_song.csv",
+        "spleeter/paired_per_class.csv",
+        "htdemucs/paired_per_song.csv",
+        "htdemucs/paired_per_class.csv",
+    )
+    for source in handoff.rows:
+        row = deepcopy(dict(source))
+        row.update(
+            {
+                "reviewed_subset_manifest_sha256": SHA_A,
+                "reviewed_subset_manifest_version": "sha256:" + SHA_B,
+                "parent_oaf_run_id": "oaf-parent-run",
+                "full_mix": {
+                    "status": "failed",
+                    "failure_code": "source_audio_unavailable",
+                    "separator_lock_sha256": None,
+                    "input_view_id": OAF_FULL_MIX_INPUT_VIEW_ID,
+                    "stem": None,
+                    "input": None,
+                    "prediction": None,
+                },
+                "spleeter": {
+                    "status": "separation_failed",
+                    "failure_code": "separation_failed",
+                    "separator_lock_sha256": SHA_D,
+                    "input_view_id": SPLEETER_INPUT_VIEW_ID,
+                    "stem": None,
+                    "input": None,
+                    "prediction": None,
+                },
+                "comparison_artifacts": {
+                    name: {"path": f"comparison/{name}", "sha256": SHA_A}
+                    for name in comparison_names
+                },
+            }
+        )
+        rows.append(row)
+    rendered = render_manifest(tuple(rows))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(rendered.content)
+    return rendered.content
