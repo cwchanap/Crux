@@ -369,3 +369,174 @@ WAV probe remains the available production-like evidence; production
 five-song membership, full-corpus stem inference, scored comparison, and
 operational smoke remain blocked until that upstream handoff and attested
 production evidence exist.
+
+## Fix Round 4 — prediction error preservation and transactional reports
+
+This round addresses the two localized final re-review findings without
+changing the worker/audio handoff, report formats, scorer, full-mix path, or
+progress ledger.
+
+### TDD RED
+
+The new prediction-guard and report-rollback seams were run before the
+production changes:
+
+```text
+.venv/bin/pytest -q tests/benchmark/test_idm_pilot_run_acceptance.py \
+  -k 'prediction_guard_failure_preserves_integrity_code_and_stops_backend or \
+      reports_publication_rolls_back_all_completed_leaves_after_swap'
+2 failed, 25 deselected
+```
+
+The prediction seam observed the guard error being wrapped as a generic
+artifact failure, allowing a partial run. The report seam observed the first
+published leaf retaining the replacement mode after the later guard swap.
+
+### GREEN and verification
+
+The focused regression seams passed, followed by the complete IDM
+acceptance/backend/worker suites:
+
+```text
+.venv/bin/pytest -q tests/benchmark/test_idm_pilot_run_acceptance.py \
+  -k 'prediction_guard_failure_preserves_integrity_code_and_stops_backend or \
+      reports_publication_rolls_back_all_completed_leaves_after_swap'
+2 passed in 3.21s
+
+.venv/bin/pytest -q tests/benchmark/test_idm_pilot_run_acceptance.py \
+  tests/benchmark/test_idm_backend.py tests/benchmark/test_worker_process.py
+87 passed in 21.43s
+```
+
+The HPA-396 matrix and full repository suite passed:
+
+```text
+.venv/bin/pytest -q <HPA-396 test matrix>
+371 passed in 23.92s
+
+.venv/bin/pytest -q
+3146 passed in 290.83s (0:04:50)
+```
+
+Static verification passed:
+
+```text
+.venv/bin/ruff check .
+All checks passed!
+
+.venv/bin/ruff format --check src tests
+170 files already formatted
+
+.venv/bin/pylint --errors-only --disable=E1120,E0401 --jobs=1 src
+exit 0; no output
+
+git diff --check
+exit 0; no output
+```
+
+### Files changed in Round 4
+
+- `src/benchmark/idm_pilot_run.py`
+- `tests/benchmark/test_idm_pilot_run_acceptance.py`
+- this report
+
+### Self-review
+
+`_publish_primary_prediction_at()` now re-raises `IdmPilotRunError` before
+the broad artifact/value conversion. A guard swap therefore retains
+`output_integrity_failed`, records that exact row code, marks the run fatal,
+and stops before the next backend invocation. The seam swaps the dynamic
+prediction parent from inside the guard and verifies the moved and attacker
+directories receive no new leaves.
+
+Report publication snapshots every fixed destination leaf's bytes and mode
+before rendering/publication, tracks touched leaves, and restores all touched
+leaves through the held original descriptor on any write, guard, or
+post-publication failure. Missing leaves are removed, existing leaves are
+atomically restored and chmod/fsynced to their original mode, and the
+original failure is propagated. The report seam swaps the authorized
+directory after the first leaf, checks both moved and attacker targets, and
+verifies all pre-existing report bytes and modes remain unchanged.
+
+The transaction is intentionally a narrow fixed-report-set helper; report
+formats and scoring remain unchanged. The previously documented filesystem
+trust boundary and production operational block remain unchanged.
+
+## Fix Round 5 — transactional report seam proof correction
+
+This final allowed round corrects the transactional report regression seam
+without changing production code or the prediction error-preservation fix.
+
+### Test-first result
+
+The adjusted test is proof-only: it moves the swap from the first-leaf
+completion seam to the start of the third report leaf, after two complete
+leaf publications. It records every report guard invocation and completed
+publication, then asserts that the observed sequence—not an assumed constant—
+has eight guard calls and two completed leaves before the swap at call nine.
+Because the Round 4 transaction already satisfied this stronger seam, the
+adjusted test was green immediately; no production RED or implementation
+change was required in Round 5.
+
+### GREEN and verification
+
+The corrected transactional seam passed with an exact
+`output_integrity_failed` guard exception, fatal status, no backend call, the
+pre-existing marker bytes/mode restored, the initially absent second leaf
+removed, and an empty attacker target:
+
+```text
+.venv/bin/pytest -q tests/benchmark/test_idm_pilot_run_acceptance.py \
+  -k 'reports_publication_rolls_back_all_completed_leaves_after_swap'
+1 passed in 3.16s
+```
+
+The focused IDM suites and HPA-396 matrix remained green:
+
+```text
+.venv/bin/pytest -q tests/benchmark/test_idm_pilot_run_acceptance.py \
+  tests/benchmark/test_idm_backend.py tests/benchmark/test_worker_process.py
+87 passed in 22.86s
+
+.venv/bin/pytest -q <HPA-396 test matrix>
+371 passed in 25.11s
+```
+
+The first final full-suite run reproduced the previously observed intermittent
+wheel-builder failure with 3145 other tests passing. The isolated test passed,
+and the required full suite was rerun cleanly:
+
+```text
+.venv/bin/pytest -q tests/runtime/test_idm_wheel_builder.py::\
+  test_commit_blobs_ignore_staged_and_unstaged_source_edits -vv
+1 passed in 1.26s
+
+.venv/bin/pytest -q
+3146 passed in 372.72s (0:06:12)
+```
+
+Ruff, format, Pylint errors-only, and diff checks passed after the corrected
+test:
+
+```text
+.venv/bin/ruff check .
+All checks passed!
+
+.venv/bin/ruff format --check src tests
+170 files already formatted
+
+.venv/bin/pylint --errors-only --disable=E1120,E0401 --jobs=1 src
+exit 0; no output
+
+git diff --check
+exit 0; no output
+```
+
+### Files changed in Round 5
+
+- `tests/benchmark/test_idm_pilot_run_acceptance.py`
+- this report
+
+The production prediction and transactional report implementations from Round
+4 are unchanged. The remaining production operational block and documented
+filesystem trust boundary are unchanged as well.
