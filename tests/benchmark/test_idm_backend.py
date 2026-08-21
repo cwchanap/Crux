@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import math
+import shutil
 import struct
 from pathlib import Path
 
@@ -20,10 +23,23 @@ from src.benchmark.idm_model import (
 )
 from src.benchmark.worker_process import WorkerProcessError
 
-MODEL_LOCK_PATH = Path(__file__).parents[2] / "runtime" / "idm" / "model.json"
+REPOSITORY_ROOT = Path(__file__).parents[2]
+RUNTIME_ROOT = REPOSITORY_ROOT / "runtime" / "idm"
+MODEL_LOCK_PATH = RUNTIME_ROOT / "model.json"
+MODEL_ROOT_SOURCE = Path("/Users/chanwaichan/.cache/uv/git-v0/checkouts/6b3af2406ab45d55/4566568")
+WHEEL_NAME = "inverse_drum_machine-0.1.0-py3-none-any.whl"
+MODEL_RELATIVE_PATHS = (
+    "pretrained/idm-44-train-kits/checkpoints/model.yaml",
+    "pretrained/idm-44-train-kits/checkpoints/val-epoch=518-global_step=0.ckpt",
+)
 
 
-def _audio(input_root: Path, name: str = "song.wav") -> CanonicalAudio:
+def _audio(
+    input_root: Path,
+    name: str = "song.wav",
+    *,
+    frame_count: int = 440744,
+) -> CanonicalAudio:
     content = (
         struct.pack("<4sI4s", b"RIFF", 40, b"WAVE")
         + struct.pack("<4sIHHIIHH", b"fmt ", 16, 1, 1, 44100, 88200, 2, 16)
@@ -34,7 +50,9 @@ def _audio(input_root: Path, name: str = "song.wav") -> CanonicalAudio:
     path = input_root / name
     path.write_bytes(content)
     digest = sha256_hex(content)
-    return CanonicalAudio(path, "song", digest, "view", digest, len(content), 44100, 1, 2, 2)
+    return CanonicalAudio(
+        path, "song", digest, "view", digest, len(content), 44100, 1, 2, frame_count
+    )
 
 
 def _ready(**overrides: object) -> dict[str, object]:
@@ -68,28 +86,52 @@ class _FakeWorker:
         self.close_count += 1
 
 
-def _event() -> dict[str, object]:
+def _event(*, frame_index: int = 215) -> dict[str, object]:
     return {
         "class_index": 4,
         "native_class_id": "KD",
-        "frame_index": 215,
-        "time_sec": 1.248526,
+        "frame_index": frame_index,
+        "time_sec": frame_index / 172.265625,
         "onset_score": 0.83,
         "native_velocity": 1.337421,
     }
+
+
+def _copy_attested_runtime(tmp_path: Path) -> tuple[Path, Path]:
+    artifact_root = tmp_path / "runtime"
+    wheel_root = artifact_root / "wheels"
+    wheel_root.mkdir(parents=True)
+    for name in ("model.json", "uv.lock", "idm-wheel-provenance.json"):
+        shutil.copyfile(RUNTIME_ROOT / name, artifact_root / name)
+    shutil.copyfile(RUNTIME_ROOT / "wheels" / WHEEL_NAME, wheel_root / WHEEL_NAME)
+
+    model_root = tmp_path / "model-root"
+    for relative in MODEL_RELATIVE_PATHS:
+        destination = model_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(MODEL_ROOT_SOURCE / relative, destination)
+    return artifact_root, model_root
 
 
 def _backend(
     tmp_path: Path,
     worker: _FakeWorker,
     calls: list[tuple[list[str], dict[str, object]]] | None = None,
+    *,
+    artifact_root: Path | None = None,
+    model_root: Path | None = None,
     **kwargs: object,
 ) -> IdmBackend:
     runtime_python = tmp_path / "runtime-python"
-    model_root = tmp_path / "model-root"
     input_root = tmp_path / "input"
-    model_root.mkdir()
-    input_root.mkdir()
+    if artifact_root is None:
+        model_lock_path = MODEL_LOCK_PATH
+        model_root = MODEL_ROOT_SOURCE if model_root is None else model_root
+    else:
+        model_lock_path = artifact_root / "model.json"
+        model_root = artifact_root.parent / "model-root" if model_root is None else model_root
+    model_root.mkdir(parents=True, exist_ok=True)
+    input_root.mkdir(exist_ok=True)
 
     def factory(command: list[str], **factory_kwargs: object) -> _FakeWorker:
         if calls is not None:
@@ -98,7 +140,7 @@ def _backend(
 
     return IdmBackend(
         runtime_python,
-        MODEL_LOCK_PATH,
+        model_lock_path,
         model_root,
         input_root,
         process_factory=factory,
@@ -121,9 +163,13 @@ def test_idm_backend_launches_isolated_python_and_forwards_frozen_timeouts(
         (
             [
                 str(tmp_path / "runtime-python"),
-                str(Path(__file__).parents[2] / "runtime" / "idm" / "worker.py"),
+                str(RUNTIME_ROOT / "worker.py"),
                 "--model-root",
-                str(tmp_path / "model-root"),
+                str(MODEL_ROOT_SOURCE),
+                "--wheel-path",
+                str(RUNTIME_ROOT / "wheels" / WHEEL_NAME),
+                "--wheel-sha256",
+                "b4e8dc567e3d013cddecec5e8ba16b9424951af18e28dcd1d94854d6bcbe7ab5",
             ],
             {
                 "timeout_seconds": IDM_REQUEST_TIMEOUT_SECONDS,
@@ -192,6 +238,7 @@ def test_idm_backend_maps_worker_protocol_failure_and_poison(tmp_path: Path) -> 
 
 
 def test_idm_backend_maps_worker_start_failure(tmp_path: Path) -> None:
+    artifact_root, model_root = _copy_attested_runtime(tmp_path)
     root = tmp_path / "input"
     root.mkdir()
 
@@ -200,8 +247,8 @@ def test_idm_backend_maps_worker_start_failure(tmp_path: Path) -> None:
 
     backend = IdmBackend(
         tmp_path / "python",
-        MODEL_LOCK_PATH,
-        tmp_path / "model",
+        artifact_root / "model.json",
+        model_root,
         root,
         process_factory=factory,
     )
@@ -280,3 +327,81 @@ def test_idm_backend_rejects_input_outside_root(tmp_path: Path) -> None:
 
 def test_idm_adapter_revision_is_frozen() -> None:
     assert IDM_ADAPTER_REVISION == "crux.idm-adapter/v1"
+
+
+@pytest.mark.parametrize("artifact", ["wheel", "provenance", "runtime", "model"])
+def test_idm_backend_rejects_tampered_attested_artifacts_before_worker_start(
+    tmp_path: Path, artifact: str
+) -> None:
+    artifact_root, model_root = _copy_attested_runtime(tmp_path)
+    if artifact == "wheel":
+        (artifact_root / "wheels" / WHEEL_NAME).write_bytes(b"tampered wheel")
+    elif artifact == "provenance":
+        provenance_path = artifact_root / "idm-wheel-provenance.json"
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        provenance["source_commit"] = "0" * 40
+        provenance_path.write_text(
+            json.dumps(provenance, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    elif artifact == "runtime":
+        (artifact_root / "uv.lock").write_bytes((artifact_root / "uv.lock").read_bytes() + b"\n")
+    else:
+        checkpoint = model_root / MODEL_RELATIVE_PATHS[1]
+        checkpoint.write_bytes(checkpoint.read_bytes() + b"tampered")
+
+    worker = _FakeWorker(_ready(), {"id": "request", "events": []})
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    backend = _backend(tmp_path, worker, calls, artifact_root=artifact_root, model_root=model_root)
+
+    with pytest.raises(IdmBackendError) as raised:
+        backend.transcribe(_audio(tmp_path / "input"))
+
+    assert raised.value.code == "runtime_artifact_invalid"
+    assert calls == []
+    assert worker.requests == []
+
+
+def test_idm_backend_binds_worker_import_to_attested_wheel_path(tmp_path: Path) -> None:
+    artifact_root, model_root = _copy_attested_runtime(tmp_path)
+    worker = _FakeWorker(_ready(), {"id": "request", "events": []})
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    backend = _backend(tmp_path, worker, calls, artifact_root=artifact_root, model_root=model_root)
+    try:
+        backend.transcribe(_audio(tmp_path / "input"))
+    finally:
+        backend.close()
+
+    command = calls[0][0]
+    assert command[command.index("--wheel-path") + 1] == str(artifact_root / "wheels" / WHEEL_NAME)
+    assert str(MODEL_ROOT_SOURCE / "idm") not in command
+
+
+def test_idm_backend_accepts_exact_activation_frame_boundary(tmp_path: Path) -> None:
+    artifact_root, model_root = _copy_attested_runtime(tmp_path)
+    audio = _audio(tmp_path / "input", frame_count=440744)
+    frame_limit = math.ceil(audio.audio_frame_count / 256) + 13
+    worker = _FakeWorker(
+        _ready(), {"id": "request", "events": [_event(frame_index=frame_limit - 1)]}
+    )
+    backend = _backend(tmp_path, worker, artifact_root=artifact_root, model_root=model_root)
+
+    try:
+        prediction = backend.transcribe(audio)
+    finally:
+        backend.close()
+
+    assert prediction.events[0].native_metadata["frame_index"] == str(frame_limit - 1)
+
+
+def test_idm_backend_rejects_one_past_activation_frame_boundary(tmp_path: Path) -> None:
+    artifact_root, model_root = _copy_attested_runtime(tmp_path)
+    audio = _audio(tmp_path / "input", frame_count=440744)
+    frame_limit = math.ceil(audio.audio_frame_count / 256) + 13
+    worker = _FakeWorker(_ready(), {"id": "request", "events": [_event(frame_index=frame_limit)]})
+    backend = _backend(tmp_path, worker, artifact_root=artifact_root, model_root=model_root)
+
+    with pytest.raises(IdmBackendError) as raised:
+        backend.transcribe(audio)
+
+    assert raised.value.code == "native_event_invalid"

@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import math
 import os
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
@@ -29,6 +32,11 @@ TRAIN_CLASSES = (
 )
 SAMPLE_RATE_HZ = 44100
 ACTIVATION_RATE_HZ = 44100 / 256
+MODEL_CONFIG_RELATIVE_PATH = Path("pretrained/idm-44-train-kits/checkpoints/model.yaml")
+CHECKPOINT_RELATIVE_PATH = Path(
+    "pretrained/idm-44-train-kits/checkpoints/val-epoch=518-global_step=0.ckpt"
+)
+_WHEEL_PROJECT: Any | None = None
 
 
 def _write(output: TextIO, payload: dict[str, Any]) -> None:
@@ -58,11 +66,36 @@ def _valid_request(payload: object) -> tuple[str, str]:
     return request_id, audio_path
 
 
-def _load_model(model_root: Path) -> tuple[Any, Any, Any]:
+def _load_model(
+    model_root: Path,
+    *,
+    wheel_path: Path | None = None,
+    wheel_sha256: str | None = None,
+) -> tuple[Any, Any, Any]:
     import torch
 
-    os.chdir(model_root)
-    sys.path.insert(0, os.fspath(model_root))
+    global _WHEEL_PROJECT
+    if wheel_path is None or wheel_sha256 is None or wheel_path.is_symlink():
+        raise ValueError("attested IDM wheel is required")
+    wheel_bytes = wheel_path.read_bytes()
+    if hashlib.sha256(wheel_bytes).hexdigest() != wheel_sha256:
+        raise ValueError("attested IDM wheel digest does not match")
+
+    if _WHEEL_PROJECT is not None:
+        _WHEEL_PROJECT.cleanup()
+    _WHEEL_PROJECT = tempfile.TemporaryDirectory(prefix="crux-idm-wheel-")
+    project_root = Path(_WHEEL_PROJECT.name)
+    with zipfile.ZipFile(_bytes_as_file(wheel_bytes)) as wheel:
+        wheel.extractall(project_root)
+    (project_root / ".project-root").touch()
+    model_data_root = project_root / MODEL_CONFIG_RELATIVE_PATH.parent
+    model_data_root.mkdir(parents=True)
+    for relative_path in (MODEL_CONFIG_RELATIVE_PATH, CHECKPOINT_RELATIVE_PATH):
+        (model_data_root / relative_path.name).symlink_to(
+            (model_root / relative_path).resolve(strict=True)
+        )
+    os.chdir(project_root)
+    sys.path.insert(0, os.fspath(project_root))
     from idm.inference import load_model
 
     with contextlib.redirect_stdout(sys.stderr):
@@ -133,9 +166,18 @@ def serve_requests(
     stdout: TextIO = sys.stdout,
     *,
     model_root: Path,
-    model_loader: Callable[[Path], tuple[Any, Any, Any]] = _load_model,
+    wheel_path: Path | None = None,
+    wheel_sha256: str | None = None,
+    model_loader: Callable[..., tuple[Any, Any, Any]] = _load_model,
 ) -> int:
-    model, torch, device = model_loader(model_root)
+    if model_loader is _load_model:
+        model, torch, device = model_loader(
+            model_root,
+            wheel_path=wheel_path,
+            wheel_sha256=wheel_sha256,
+        )
+    else:
+        model, torch, device = model_loader(model_root)
     _write(
         stdout,
         {
@@ -189,8 +231,20 @@ def serve_requests(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the isolated IDM model worker")
     parser.add_argument("--model-root", type=Path, required=True)
+    parser.add_argument("--wheel-path", type=Path, required=True)
+    parser.add_argument("--wheel-sha256", required=True)
     args = parser.parse_args(argv)
-    return serve_requests(model_root=args.model_root)
+    return serve_requests(
+        model_root=args.model_root,
+        wheel_path=args.wheel_path,
+        wheel_sha256=args.wheel_sha256,
+    )
+
+
+def _bytes_as_file(content: bytes) -> Any:
+    from io import BytesIO
+
+    return BytesIO(content)
 
 
 if __name__ == "__main__":

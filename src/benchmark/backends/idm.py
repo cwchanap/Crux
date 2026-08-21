@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 import math
 import os
+import tomllib
+import zipfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from src.benchmark.artifact_io import read_regular_file_no_follow
 from src.benchmark.backend_identity import (
     IDM_BACKEND_ID,
     IDM_DESCRIPTOR_IDENTITIES,
@@ -28,12 +33,20 @@ from src.benchmark.idm_model import (
     IdmModelLock,
     IdmModelLockError,
     load_idm_model_lock,
+    verify_idm_model_files,
+    verify_idm_runtime_lock,
 )
 from src.benchmark.worker_process import WorkerProcess, WorkerProcessError
 
 IDM_ADAPTER_REVISION = "crux.idm-adapter/v1"
 IDM_WORKER_PATH = Path(__file__).resolve().parents[3] / "runtime" / "idm" / "worker.py"
+IDM_RUNTIME_LOCK_NAME = "uv.lock"
+IDM_WHEEL_NAME = "inverse_drum_machine-0.1.0-py3-none-any.whl"
+IDM_PROVENANCE_NAME = "idm-wheel-provenance.json"
 IDM_TIME_TOLERANCE_FRAMES = 0.5
+# The locked transform pads to a hop multiple, centered mel adds one frame, and
+# the pinned temporal backbone adds twelve frames (three padded convolutions).
+IDM_ACTIVATION_FRAME_PADDING = 13
 
 
 class IdmBackendError(RuntimeError):
@@ -111,6 +124,7 @@ class IdmBackend:
             raise TypeError("audio must be CanonicalAudio")
 
         request_path = self._input_path(audio.path)
+        frame_limit = _activation_frame_limit(audio, self._lock)
         process = self._ensure_process()
         try:
             response = process.request(request_path)
@@ -138,7 +152,9 @@ class IdmBackend:
             self._poison()
             raise IdmBackendError("worker response is invalid", code="worker_protocol_failed")
         try:
-            events = tuple(_decode_native_event(value, self._lock) for value in raw_events)
+            events = tuple(
+                _decode_native_event(value, self._lock, frame_limit) for value in raw_events
+            )
         except IdmBackendError as error:
             if error.code == "native_event_invalid":
                 self._poison()
@@ -162,9 +178,16 @@ class IdmBackend:
         if self._poisoned:
             raise IdmBackendError("worker is poisoned", code="worker_protocol_failed")
 
+        wheel_path, wheel_sha256 = _attest_runtime_artifacts(
+            self._lock,
+            self._model_lock_path,
+            self._model_root,
+        )
         command = build_worker_command(
             self._runtime_python,
             self._model_root,
+            wheel_path=wheel_path,
+            wheel_sha256=wheel_sha256,
         )
         try:
             factory_params = inspect.signature(self._process_factory).parameters
@@ -223,16 +246,37 @@ class IdmBackend:
                 pass
 
 
-def build_worker_command(runtime_python: Path, model_root: Path) -> list[str]:
+def build_worker_command(
+    runtime_python: Path,
+    model_root: Path,
+    *,
+    wheel_path: Path | None = None,
+    wheel_sha256: str | None = None,
+) -> list[str]:
     """Build the exact command that keeps IDM in its isolated Python runtime."""
     if not isinstance(runtime_python, Path) or not isinstance(model_root, Path):
         raise TypeError("runtime_python and model_root must be Paths")
-    return [
+    if wheel_path is None:
+        wheel_path = IDM_WORKER_PATH.parent / IDM_WHEEL_NAME
+    if not isinstance(wheel_path, Path):
+        raise TypeError("wheel_path must be a Path")
+    command = [
         os.fspath(runtime_python),
         os.fspath(IDM_WORKER_PATH),
         "--model-root",
         os.fspath(model_root),
+        "--wheel-path",
+        os.fspath(wheel_path),
     ]
+    if wheel_sha256 is not None:
+        if (
+            not isinstance(wheel_sha256, str)
+            or len(wheel_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in wheel_sha256)
+        ):
+            raise ValueError("wheel_sha256 must be lowercase SHA-256")
+        command.extend(("--wheel-sha256", wheel_sha256))
+    return command
 
 
 def descriptor_for_lock(lock: IdmModelLock) -> BackendDescriptor:
@@ -298,7 +342,7 @@ def _validate_ready(value: Mapping[str, object], lock: IdmModelLock) -> None:
         raise IdmBackendError("worker frame rate is invalid", code="worker_identity_invalid")
 
 
-def _decode_native_event(value: object, lock: IdmModelLock) -> NativeEvent:
+def _decode_native_event(value: object, lock: IdmModelLock, frame_limit: int) -> NativeEvent:
     if not isinstance(value, Mapping):
         raise IdmBackendError("worker event is invalid", code="native_event_invalid")
     required = {
@@ -320,7 +364,7 @@ def _decode_native_event(value: object, lock: IdmModelLock) -> NativeEvent:
         raise IdmBackendError("worker event class identity is invalid", code="native_event_invalid")
 
     frame_index = value["frame_index"]
-    if type(frame_index) is not int or frame_index < 0:
+    if type(frame_index) is not int or not 0 <= frame_index < frame_limit:
         raise IdmBackendError("worker event frame index is invalid", code="native_event_invalid")
     time_sec = value["time_sec"]
     if type(time_sec) is not float or not math.isfinite(time_sec) or time_sec < 0:
@@ -372,6 +416,160 @@ def _raise_worker_error(value: object) -> None:
         if isinstance(code, str) and isinstance(message, str):
             raise IdmBackendError(message, code=code)
     raise IdmBackendError("worker response is invalid", code="worker_protocol_failed")
+
+
+def _activation_frame_limit(audio: CanonicalAudio, lock: IdmModelLock) -> int:
+    frame_count = audio.audio_frame_count
+    if type(frame_count) is not int or frame_count < 0:
+        raise IdmBackendError("canonical audio frame count is invalid", code="input_audio_invalid")
+    return (
+        frame_count + lock.mel_hop_length - 1
+    ) // lock.mel_hop_length + IDM_ACTIVATION_FRAME_PADDING
+
+
+def _attest_runtime_artifacts(
+    lock: IdmModelLock,
+    model_lock_path: Path,
+    model_root: Path,
+) -> tuple[Path, str]:
+    runtime_root = model_lock_path.parent
+    runtime_lock_path = runtime_root / IDM_RUNTIME_LOCK_NAME
+    wheel_path = runtime_root / "wheels" / IDM_WHEEL_NAME
+    provenance_path = runtime_root / IDM_PROVENANCE_NAME
+    try:
+        verify_idm_model_files(lock, model_root)
+        verify_idm_runtime_lock(lock, runtime_lock_path)
+        runtime_lock_bytes = read_regular_file_no_follow(runtime_lock_path)
+        wheel_sha256 = _wheel_sha256_from_runtime_lock(runtime_lock_bytes, lock)
+        wheel_bytes = read_regular_file_no_follow(wheel_path)
+        actual_sha256 = hashlib.sha256(wheel_bytes).hexdigest()
+        if actual_sha256 != wheel_sha256:
+            raise ValueError("IDM runtime wheel digest does not match uv.lock")
+        provenance_bytes = read_regular_file_no_follow(provenance_path)
+        _validate_wheel_provenance(
+            provenance_bytes,
+            wheel_path.name,
+            wheel_bytes,
+            wheel_sha256,
+            lock,
+        )
+        return wheel_path.absolute(), wheel_sha256
+    except (OSError, TypeError, ValueError, KeyError, IndexError, zipfile.BadZipFile) as error:
+        raise IdmBackendError(
+            "IDM runtime or model artifacts are not attested", code="runtime_artifact_invalid"
+        ) from error
+
+
+def _wheel_sha256_from_runtime_lock(runtime_lock_bytes: bytes, lock: IdmModelLock) -> str:
+    try:
+        payload = tomllib.loads(runtime_lock_bytes.decode("utf-8"))
+        packages = payload["package"]
+        matches = [
+            package
+            for package in packages
+            if package.get("name") == lock.package_name
+            and package.get("version") == lock.package_version
+        ]
+        if len(matches) != 1:
+            raise ValueError("runtime lock does not identify exactly one IDM package")
+        package = matches[0]
+        source = package["source"]
+        if source.get("path") != f"wheels/{IDM_WHEEL_NAME}":
+            raise ValueError("runtime lock IDM source path is invalid")
+        wheels = package["wheels"]
+        if len(wheels) != 1 or wheels[0].get("filename") != IDM_WHEEL_NAME:
+            raise ValueError("runtime lock IDM wheel identity is invalid")
+        wheel_hash = wheels[0].get("hash")
+    except (
+        AttributeError,
+        KeyError,
+        TypeError,
+        UnicodeDecodeError,
+        tomllib.TOMLDecodeError,
+    ) as error:
+        raise ValueError("runtime lock IDM wheel identity is invalid") from error
+    if (
+        not isinstance(wheel_hash, str)
+        or not wheel_hash.startswith("sha256:")
+        or len(wheel_hash) != len("sha256:") + 64
+    ):
+        raise ValueError("runtime lock IDM wheel digest is invalid")
+    return wheel_hash.removeprefix("sha256:")
+
+
+def _validate_wheel_provenance(
+    content: bytes,
+    wheel_name: str,
+    wheel_bytes: bytes,
+    wheel_sha256: str,
+    lock: IdmModelLock,
+) -> None:
+    if not content.endswith(b"\n") or content.endswith(b"\n\n"):
+        raise ValueError("IDM wheel provenance newline is invalid")
+    try:
+        provenance = json.loads(content[:-1].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("IDM wheel provenance is invalid") from error
+    if not isinstance(provenance, dict):
+        raise ValueError("IDM wheel provenance is invalid")
+    if (
+        provenance.get("schema") != "crux.idm-wheel-provenance/v1"
+        or provenance.get("source_commit") != lock.repository_revision
+        or provenance.get("package_name") != lock.package_name
+        or provenance.get("package_version") != lock.package_version
+    ):
+        raise ValueError("IDM wheel provenance identity is invalid")
+    wheel = provenance.get("wheel")
+    if not isinstance(wheel, dict):
+        raise ValueError("IDM wheel provenance wheel record is invalid")
+    if (
+        wheel.get("path") != wheel_name
+        or wheel.get("sha256") != wheel_sha256
+        or wheel.get("byte_length") != len(wheel_bytes)
+        or wheel.get("tag") != "py3-none-any"
+    ):
+        raise ValueError("IDM wheel provenance wheel record is invalid")
+    packaged_files = provenance.get("packaged_idm_files")
+    if not isinstance(packaged_files, list) or not packaged_files:
+        raise ValueError("IDM wheel provenance package inventory is invalid")
+    expected_files: dict[str, tuple[str, int]] = {}
+    for record in packaged_files:
+        if not isinstance(record, dict):
+            raise ValueError("IDM wheel provenance package inventory is invalid")
+        path = record.get("path")
+        digest = record.get("sha256")
+        byte_length = record.get("byte_length")
+        if (
+            not isinstance(path, str)
+            or not path.startswith("idm/")
+            or path.endswith("/")
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or type(byte_length) is not int
+            or byte_length < 0
+            or path in expected_files
+        ):
+            raise ValueError("IDM wheel provenance package inventory is invalid")
+        expected_files[path] = (digest, byte_length)
+    with zipfile.ZipFile(_bytes_as_file(wheel_bytes)) as wheel_archive:
+        packaged_names = {
+            name
+            for name in wheel_archive.namelist()
+            if name.startswith("idm/") and not name.endswith("/")
+        }
+        if packaged_names != set(expected_files):
+            raise ValueError("IDM wheel package inventory does not match wheel")
+        for path, (digest, byte_length) in expected_files.items():
+            source = wheel_archive.read(path)
+            if len(source) != byte_length or hashlib.sha256(source).hexdigest() != digest:
+                raise ValueError("IDM wheel package inventory does not match wheel")
+
+
+def _bytes_as_file(content: bytes) -> Any:
+    from io import BytesIO
+
+    return BytesIO(content)
 
 
 __all__ = [
