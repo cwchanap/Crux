@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 import stat
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,15 +28,7 @@ def read_regular_file_no_follow(path: Path) -> bytes:
     close_on_exec = getattr(os, "O_CLOEXEC", 0)
     descriptor = os.open(path, os.O_RDONLY | no_follow | close_on_exec)
     try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise OSError("artifact is not a regular file")
-        chunks: list[bytes] = []
-        while True:
-            content = os.read(descriptor, 1024 * 1024)
-            if not content:
-                return b"".join(chunks)
-            chunks.append(content)
+        return _read_regular_file_descriptor(descriptor)
     finally:
         os.close(descriptor)
 
@@ -45,15 +37,70 @@ def publish_immutable_file(path: Path, content: bytes) -> PublishedArtifact:
     """Create one file without replacement, or reuse matching immutable bytes."""
     if not isinstance(path, Path) or not isinstance(content, bytes):
         raise TypeError("path must be a Path and content must be bytes")
-    digest = hashlib.sha256(content).hexdigest()
     parent = path.parent
     try:
         parent.mkdir(parents=True, exist_ok=True)
+        directory_fd = os.open(
+            parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
     except OSError as error:
         raise ArtifactPublicationError("artifact publication failed") from error
+    try:
+        digest = _publish_immutable_file_into(directory_fd, path.name, content)
+    finally:
+        os.close(directory_fd)
+    return PublishedArtifact(path=path, sha256=digest)
+
+
+def publish_immutable_file_at(directory_fd: int, name: str, content: bytes) -> str:
+    """Publish one immutable file relative to a held directory descriptor.
+
+    ``name`` must be a single path component.  Every read, temporary file, and
+    link is performed relative to ``directory_fd``, so the publication cannot
+    be redirected by renaming or swapping the directory after the descriptor
+    was validated.  Returns the SHA-256 digest of the published bytes.
+    """
+    if (
+        not isinstance(directory_fd, int)
+        or not isinstance(name, str)
+        or not isinstance(content, bytes)
+    ):
+        raise TypeError("directory_fd must be an int, name a str, and content bytes")
+    return _publish_immutable_file_into(directory_fd, name, content)
+
+
+def _read_regular_file_descriptor(descriptor: int) -> bytes:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OSError("artifact is not a regular file")
+    chunks: list[bytes] = []
+    while True:
+        content = os.read(descriptor, 1024 * 1024)
+        if not content:
+            return b"".join(chunks)
+        chunks.append(content)
+
+
+def _read_regular_file_at(directory_fd: int, name: str) -> bytes:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=directory_fd,
+    )
+    try:
+        return _read_regular_file_descriptor(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _publish_immutable_file_into(directory_fd: int, name: str, content: bytes) -> str:
+    if not name or "/" in name or name in {".", ".."}:
+        raise ArtifactPublicationError("artifact publication failed")
+    digest = hashlib.sha256(content).hexdigest()
 
     try:
-        existing = read_regular_file_no_follow(path)
+        existing = _read_regular_file_at(directory_fd, name)
     except FileNotFoundError:
         existing = None
     except OSError as error:
@@ -61,45 +108,66 @@ def publish_immutable_file(path: Path, content: bytes) -> PublishedArtifact:
     if existing is not None:
         if existing != content:
             raise ArtifactPublicationError("artifact already exists with different bytes")
-        return PublishedArtifact(path=path, sha256=digest)
+        return digest
 
-    temporary_path: Path | None = None
-    descriptor: int | None = None
+    temporary_name = _create_temporary_file_at(directory_fd, name, content)
     try:
-        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=parent)
-        temporary_path = Path(temporary_name)
-        _write_all(descriptor, content)
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
         try:
-            os.link(temporary_path, path, follow_symlinks=False)
+            os.link(
+                temporary_name,
+                name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
         except FileExistsError:
             try:
-                existing = read_regular_file_no_follow(path)
+                existing = _read_regular_file_at(directory_fd, name)
             except OSError as error:
                 raise ArtifactPublicationError("artifact publication failed") from error
             if existing != content:
                 raise ArtifactPublicationError("artifact already exists with different bytes")
         else:
-            _fsync_directory(parent)
-        return PublishedArtifact(path=path, sha256=digest)
+            os.fsync(directory_fd)
+        return digest
     except ArtifactPublicationError:
         raise
     except OSError as error:
         raise ArtifactPublicationError("artifact publication failed") from error
     finally:
-        if descriptor is not None:
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except OSError:
+            # The publication itself has already either succeeded or failed;
+            # do not hide its stable result behind cleanup noise.
+            pass
+
+
+def _create_temporary_file_at(directory_fd: int, name: str, content: bytes) -> str:
+    """Create one exclusive temporary file beside ``name`` and fill it."""
+    prefix = f".{name}."
+    for _ in range(100):
+        temporary_name = f"{prefix}{secrets.token_hex(6)}"
+        try:
+            descriptor = os.open(
+                temporary_name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+        except FileExistsError:
+            continue
+        try:
+            _write_all(descriptor, content)
+            os.fsync(descriptor)
+        finally:
             os.close(descriptor)
-        if temporary_path is not None:
-            try:
-                temporary_path.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                # The publication itself has already either succeeded or failed;
-                # do not hide its stable result behind cleanup noise.
-                pass
+        return temporary_name
+    raise ArtifactPublicationError("artifact publication failed")
 
 
 def _write_all(descriptor: int, content: bytes) -> None:
@@ -109,11 +177,3 @@ def _write_all(descriptor: int, content: bytes) -> None:
         if written <= 0:
             raise OSError("short artifact write")
         view = view[written:]
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)

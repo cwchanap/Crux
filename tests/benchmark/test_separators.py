@@ -438,6 +438,66 @@ def test_freezer_rejects_output_inside_model_root_before_publishing(
     assert not (model_root / "frozen" / ".separator-publish.lock").exists()
 
 
+def test_freezer_rejects_output_written_directly_into_model_root(tmp_path: Path) -> None:
+    interpreter, _ = _synthetic_environment(tmp_path)
+    model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+
+    with pytest.raises(SeparatorExecutionError) as raised:
+        _freeze_separator_runtime(
+            separator_id=SPLEETER_SEPARATOR_ID,
+            interpreter=interpreter,
+            model_root=model_root,
+            repository_revision="a" * 40,
+            output=model_root / "model.json",
+        )
+
+    assert raised.value.code == "separator_output_inside_model_root"
+    assert not (model_root / "model.json").exists()
+    assert not (model_root / ".separator-publish.lock").exists()
+
+
+def test_freezer_rejects_symlinked_output_parent_component(tmp_path: Path) -> None:
+    interpreter, _ = _synthetic_environment(tmp_path)
+    model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    real_directory = tmp_path / "real-frozen"
+    real_directory.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_directory)
+    lock_path = alias / "model.json"
+
+    with pytest.raises(SeparatorExecutionError) as raised:
+        _freeze_separator_runtime(
+            separator_id=SPLEETER_SEPARATOR_ID,
+            interpreter=interpreter,
+            model_root=model_root,
+            repository_revision="a" * 40,
+            output=lock_path,
+        )
+
+    # The no-follow component walk must reject the alias before anything is
+    # published through it, even though the alias target is outside the model
+    # root.
+    assert raised.value.code == "separator_lock_publication_failed"
+    assert not (real_directory / "model.json").exists()
+    assert not (real_directory / ".separator-publish.lock").exists()
+
+
+def test_freezer_rejects_relative_output_before_publishing(tmp_path: Path) -> None:
+    interpreter, _ = _synthetic_environment(tmp_path)
+    model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+
+    with pytest.raises(SeparatorExecutionError) as raised:
+        _freeze_separator_runtime(
+            separator_id=SPLEETER_SEPARATOR_ID,
+            interpreter=interpreter,
+            model_root=model_root,
+            repository_revision="a" * 40,
+            output=Path("relative/model.json"),
+        )
+
+    assert raised.value.code == "separator_lock_publication_failed"
+
+
 def test_freezer_preserves_preexisting_environment_on_lock_conflict(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -461,16 +521,16 @@ def test_freezer_preserves_preexisting_environment_on_lock_conflict(
     # Second freeze with a different revision reuses environment.json (identical
     # bytes) but must conflict on model.json (different lock payload).  The
     # pre-existing environment.json must survive the conflict.
-    real_publish = separators.publish_immutable_file
+    real_publish = separators.publish_immutable_file_at
 
-    def conflict_on_lock(path: Path, content: bytes) -> object:
-        if path == lock_path and content != lock_bytes_before:
+    def conflict_on_lock(directory_fd: int, name: str, content: bytes) -> object:
+        if name == lock_path.name and content != lock_bytes_before:
             from src.benchmark.artifact_io import ArtifactPublicationError
 
             raise ArtifactPublicationError("artifact already exists with different bytes")
-        return real_publish(path, content)
+        return real_publish(directory_fd, name, content)
 
-    monkeypatch.setattr(separators, "publish_immutable_file", conflict_on_lock)
+    monkeypatch.setattr(separators, "publish_immutable_file_at", conflict_on_lock)
 
     with pytest.raises(SeparatorExecutionError, match="separator_lock_publication_failed"):
         _freeze_separator_runtime(
@@ -504,36 +564,36 @@ def test_concurrent_freezes_same_env_different_revision_retain_manifest(
     lock_path = tmp_path / "frozen" / "model.json"
     environment_path = lock_path.parent / "environment.json"
 
-    real_publish = separators.publish_immutable_file
+    real_publish = separators.publish_immutable_file_at
     env_first_done = threading.Event()
     lock_first_done = threading.Event()
     counter_lock = threading.Lock()
     counters = {"environment": 0, "lock": 0}
 
-    def coordinated_publish(path: Path, content: bytes) -> object:
-        if path == environment_path:
+    def coordinated_publish(directory_fd: int, name: str, content: bytes) -> object:
+        if name == environment_path.name:
             with counter_lock:
                 counters["environment"] += 1
                 rank = counters["environment"]
             if rank == 1:
-                result = real_publish(path, content)
+                result = real_publish(directory_fd, name, content)
                 env_first_done.set()
                 return result
             env_first_done.wait(timeout=10)
-            return real_publish(path, content)
-        if path == lock_path:
+            return real_publish(directory_fd, name, content)
+        if name == lock_path.name:
             with counter_lock:
                 counters["lock"] += 1
                 rank = counters["lock"]
             if rank == 1:
-                result = real_publish(path, content)
+                result = real_publish(directory_fd, name, content)
                 lock_first_done.set()
                 return result
             lock_first_done.wait(timeout=10)
-            return real_publish(path, content)
-        return real_publish(path, content)
+            return real_publish(directory_fd, name, content)
+        return real_publish(directory_fd, name, content)
 
-    monkeypatch.setattr(separators, "publish_immutable_file", coordinated_publish)
+    monkeypatch.setattr(separators, "publish_immutable_file_at", coordinated_publish)
 
     outcomes: dict[str, str] = {}
 
@@ -2346,16 +2406,16 @@ def test_freeze_cleans_up_environment_on_publication_failure(
     lock_path = tmp_path / "frozen" / "model.json"
     environment_path = lock_path.parent / "environment.json"
 
-    def fail_publish(path: Path, content: bytes) -> object:
+    def fail_publish(directory_fd: int, name: str, content: bytes) -> object:
         from src.benchmark.artifact_io import ArtifactPublicationError
 
-        if path == lock_path:
+        if name == lock_path.name:
             raise ArtifactPublicationError("conflict")
-        from src.benchmark.artifact_io import publish_immutable_file
+        from src.benchmark.artifact_io import publish_immutable_file_at
 
-        return publish_immutable_file(path, content)
+        return publish_immutable_file_at(directory_fd, name, content)
 
-    monkeypatch.setattr(separators, "publish_immutable_file", fail_publish)
+    monkeypatch.setattr(separators, "publish_immutable_file_at", fail_publish)
     with pytest.raises(SeparatorExecutionError, match="separator_lock_publication_failed"):
         separators.freeze_separator_runtime(
             separator_id=SPLEETER_SEPARATOR_ID,
@@ -3063,24 +3123,24 @@ def test_freeze_cleans_up_environment_on_os_error_during_cleanup(
     model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
     lock_path = tmp_path / "frozen" / "model.json"
 
-    def fail_publish(path: Path, content: bytes) -> object:
+    def fail_publish(directory_fd: int, name: str, content: bytes) -> object:
         from src.benchmark.artifact_io import ArtifactPublicationError
 
-        if path == lock_path:
+        if name == lock_path.name:
             raise ArtifactPublicationError("conflict")
-        from src.benchmark.artifact_io import publish_immutable_file
+        from src.benchmark.artifact_io import publish_immutable_file_at
 
-        return publish_immutable_file(path, content)
+        return publish_immutable_file_at(directory_fd, name, content)
 
-    monkeypatch.setattr(separators, "publish_immutable_file", fail_publish)
-    original_unlink = Path.unlink
+    monkeypatch.setattr(separators, "publish_immutable_file_at", fail_publish)
+    original_unlink = os.unlink
 
-    def fail_unlink(self: Path, *args: object, **kwargs: object) -> object:
-        if self.name == "environment.json":
+    def fail_unlink(path: object, *args: object, **kwargs: object) -> object:
+        if path == "environment.json":
             raise OSError("cannot unlink")
-        return original_unlink(self, *args, **kwargs)  # type: ignore[call-arg]
+        return original_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    monkeypatch.setattr(os, "unlink", fail_unlink)
     with pytest.raises(SeparatorExecutionError, match="separator_lock_publication_failed"):
         separators.freeze_separator_runtime(
             separator_id=SPLEETER_SEPARATOR_ID,

@@ -26,6 +26,7 @@ import soundfile
 from src.benchmark.artifact_io import (
     ArtifactPublicationError,
     publish_immutable_file,
+    publish_immutable_file_at,
     read_regular_file_no_follow,
 )
 from src.benchmark.backend_identity import (
@@ -943,10 +944,11 @@ def inventory_separator_model_root(
 
 
 _RUNTIME_PUBLICATION_LOCK_NAME = ".separator-publish.lock"
+_RUNTIME_ENVIRONMENT_MANIFEST_NAME = "environment.json"
 
 
 @contextlib.contextmanager
-def _runtime_publication_lock(output: Path, model_root: Path) -> Iterator[None]:
+def _acquire_runtime_publication_lock(output: Path, model_root: Path) -> Iterator[int]:
     """Serialize multi-file runtime publication under one exclusive lock.
 
     The lock+manifest pair must be published atomically so that a concurrent
@@ -956,12 +958,17 @@ def _runtime_publication_lock(output: Path, model_root: Path) -> Iterator[None]:
 
     The output must live outside the attested model root: publishing there
     would mutate the very tree the lock attests, so it is rejected before the
-    lock file or any artifact is created.
+    lock file or any artifact is created.  The output directory is opened with
+    a no-follow descriptor walk from the filesystem root and validated against
+    the model root by identity; directory creation, the lock file, and every
+    published artifact are then created relative to the held descriptor, so
+    parent-directory renames or symlink swaps after validation cannot redirect
+    writes into the model root.  Yields the held directory descriptor.
     """
-    if output.resolve().is_relative_to(model_root.resolve()):
+    if not output.is_absolute():
         raise SeparatorExecutionError(
-            "separator_output_inside_model_root",
-            "separator lock output must not be written inside the model root",
+            "separator_lock_publication_failed",
+            "separator lock output must be an absolute path",
         )
     try:
         import fcntl  # noqa: PLC0415 — lazy stdlib import; Unix-only
@@ -970,45 +977,171 @@ def _runtime_publication_lock(output: Path, model_root: Path) -> Iterator[None]:
             "separator_lock_publication_failed",
             "separator publication locks are unsupported on this platform",
         ) from error
-    lock_path = output.parent / _RUNTIME_PUBLICATION_LOCK_NAME
-    no_follow = getattr(os, "O_NOFOLLOW", 0)
-    close_on_exec = getattr(os, "O_CLOEXEC", 0)
-    descriptor = -1
+    no_follow, directory_flag, close_on_exec = _model_root_descriptor_flags()
+    directory_flags = os.O_RDONLY | directory_flag | no_follow | close_on_exec
+    lock_fd = -1
+    directory_fd = -1
     try:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(
-            lock_path,
-            os.O_RDWR | os.O_CREAT | no_follow | close_on_exec,
-            0o600,
-        )
-        descriptor_metadata = os.fstat(descriptor)
-        path_metadata = lock_path.lstat()
-        if (
-            not stat.S_ISREG(descriptor_metadata.st_mode)
-            or not stat.S_ISREG(path_metadata.st_mode)
-            or descriptor_metadata.st_dev != path_metadata.st_dev
-            or descriptor_metadata.st_ino != path_metadata.st_ino
-        ):
-            raise OSError("publication lock is unavailable")
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-    except OSError as error:
-        if descriptor >= 0:
+        try:
+            model_root_fd = _open_model_root_path(
+                model_root,
+                directory_flag=directory_flag,
+                no_follow=no_follow,
+                close_on_exec=close_on_exec,
+            )
             try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        raise SeparatorExecutionError(
-            "separator_lock_publication_failed",
-            "separator publication lock could not be acquired",
-        ) from error
+                directory_fd = _open_output_directory(
+                    output.parent,
+                    model_root_fd,
+                    directory_flags=directory_flags,
+                )
+            finally:
+                _close_model_root_fd(model_root_fd)
+            lock_fd = os.open(
+                _RUNTIME_PUBLICATION_LOCK_NAME,
+                os.O_RDWR | os.O_CREAT | no_follow | close_on_exec,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            descriptor_metadata = os.fstat(lock_fd)
+            path_metadata = os.stat(
+                _RUNTIME_PUBLICATION_LOCK_NAME,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(descriptor_metadata.st_mode)
+                or not stat.S_ISREG(path_metadata.st_mode)
+                or descriptor_metadata.st_dev != path_metadata.st_dev
+                or descriptor_metadata.st_ino != path_metadata.st_ino
+            ):
+                raise OSError("publication lock is unavailable")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except OSError as error:
+            raise SeparatorExecutionError(
+                "separator_lock_publication_failed",
+                "separator publication lock could not be acquired",
+            ) from error
+    except BaseException:
+        if lock_fd >= 0:
+            _close_model_root_fd(lock_fd)
+        if directory_fd >= 0:
+            _close_model_root_fd(directory_fd)
+        raise
     try:
-        yield
+        yield directory_fd
     finally:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
         except OSError:
             pass
-        os.close(descriptor)
+        _close_model_root_fd(lock_fd)
+        _close_model_root_fd(directory_fd)
+
+
+def _open_output_directory(
+    directory: Path,
+    model_root_fd: int,
+    *,
+    directory_flags: int,
+) -> int:
+    """Open the publication directory without following path aliases.
+
+    Missing components are created only after the deepest existing ancestor is
+    proven outside the model root by identity, so a rejected output path never
+    mutates the model root, and every component is opened with ``O_NOFOLLOW``
+    with its opened identity checked against the stat that observed it.
+    """
+    parts = directory.parts
+    if os.name == "nt" or not parts or parts[0] != os.path.sep:
+        raise OSError("descriptor-relative publication is unavailable")
+    for part in parts[1:]:
+        if not part or part in {".", "..", os.path.sep}:
+            raise OSError("separator output path is not normalized")
+    model_root_metadata = os.fstat(model_root_fd)
+    descriptor = os.open(os.path.sep, directory_flags)
+    try:
+        for index, part in enumerate(parts[1:]):
+            try:
+                child_descriptor = os.open(part, directory_flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                # The remaining components do not exist yet.  The deepest
+                # existing ancestor is proven outside the model root first, and
+                # the components created below it are brand-new directories, so
+                # the final directory cannot be inside the model root either.
+                _require_directory_outside_model_root(
+                    descriptor,
+                    model_root_metadata,
+                    directory_flags=directory_flags,
+                )
+                for remaining in parts[1 + index :]:
+                    try:
+                        os.mkdir(remaining, 0o777, dir_fd=descriptor)
+                    except FileExistsError:
+                        pass
+                    child_descriptor = os.open(remaining, directory_flags, dir_fd=descriptor)
+                    _require_same_model_identity(
+                        os.stat(remaining, dir_fd=descriptor, follow_symlinks=False),
+                        os.fstat(child_descriptor),
+                    )
+                    os.close(descriptor)
+                    descriptor = child_descriptor
+                return descriptor
+            _require_same_model_identity(
+                os.stat(part, dir_fd=descriptor, follow_symlinks=False),
+                os.fstat(child_descriptor),
+            )
+            os.close(descriptor)
+            descriptor = child_descriptor
+        _require_directory_outside_model_root(
+            descriptor,
+            model_root_metadata,
+            directory_flags=directory_flags,
+        )
+        return descriptor
+    except BaseException:
+        _close_model_root_fd(descriptor)
+        raise
+
+
+def _require_directory_outside_model_root(
+    descriptor: int,
+    model_root_metadata: os.stat_result,
+    *,
+    directory_flags: int,
+) -> None:
+    """Reject a publication directory at or below the model root by identity.
+
+    The ancestor chain is walked from the held descriptor with parent opens
+    and identity comparisons, so symlinked or renamed paths cannot mask
+    containment the way a textual path-prefix check could.
+    """
+    opened: list[int] = []
+    try:
+        current = descriptor
+        while True:
+            current_metadata = os.fstat(current)
+            if _model_identity(current_metadata) == _model_identity(model_root_metadata):
+                raise SeparatorExecutionError(
+                    "separator_output_inside_model_root",
+                    "separator lock output must not be written inside the model root",
+                )
+            parent = os.open("..", directory_flags, dir_fd=current)
+            opened.append(parent)
+            if _model_identity(os.fstat(parent)) == _model_identity(current_metadata):
+                return  # reached the filesystem root
+            current = parent
+    finally:
+        for opened_fd in opened:
+            _close_model_root_fd(opened_fd)
+
+
+def _publication_name_exists(descriptor: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def freeze_separator_runtime(
@@ -1072,25 +1205,30 @@ def freeze_separator_runtime(
         "model_root_kind": policy["model_root_kind"],
     }
     lock_bytes = canonical_json_bytes(lock_payload, trailing_newline=True)
-    environment_path = output.parent / "environment.json"
-    # The exists-check and both publishes are serialized under one per-runtime
-    # lock so that the lock+manifest pair is the atomic publication unit.  A
-    # concurrent freeze with the same environment but a different revision
-    # cannot observe a stale environment_preexisting value and delete a manifest
-    # that belongs to the winning freeze.
-    with _runtime_publication_lock(output, model_root):
-        environment_preexisting = environment_path.exists()
+    # Both names are published relative to the descriptor held by the
+    # publication lock, and the exists-check plus both publishes are serialized
+    # under one per-runtime lock so that the lock+manifest pair is the atomic
+    # publication unit.  A concurrent freeze with the same environment but a
+    # different revision cannot observe a stale environment_preexisting value
+    # and delete a manifest that belongs to the winning freeze.
+    with _acquire_runtime_publication_lock(output, model_root) as publication_fd:
+        environment_preexisting = _publication_name_exists(
+            publication_fd, _RUNTIME_ENVIRONMENT_MANIFEST_NAME
+        )
         try:
-            publish_immutable_file(environment_path, environment_bytes)
-            publish_immutable_file(output, lock_bytes)
+            publish_immutable_file_at(
+                publication_fd, _RUNTIME_ENVIRONMENT_MANIFEST_NAME, environment_bytes
+            )
+            publish_immutable_file_at(publication_fd, output.name, lock_bytes)
         except (ArtifactPublicationError, OSError, TypeError) as error:
             # Only clean up environment.json when this invocation created it.
-            # publish_immutable_file treats identical existing bytes as reuse, so
-            # a pre-existing manifest must never be deleted when the lock publish
-            # conflicts — that would corrupt a previously valid runtime directory.
+            # publish_immutable_file_at treats identical existing bytes as
+            # reuse, so a pre-existing manifest must never be deleted when the
+            # lock publish conflicts — that would corrupt a previously valid
+            # runtime directory.
             if not environment_preexisting:
                 try:
-                    environment_path.unlink(missing_ok=True)
+                    os.unlink(_RUNTIME_ENVIRONMENT_MANIFEST_NAME, dir_fd=publication_fd)
                 except OSError:
                     pass
             raise SeparatorExecutionError(
