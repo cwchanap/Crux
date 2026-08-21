@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 
@@ -118,4 +119,39 @@ def test_publish_immutable_file_at_cleans_temporary_file_on_fill_failure(
         os.close(directory_fd)
 
     # No partial temporary file leaks behind the failed publication.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_publish_immutable_file_at_wraps_temporary_open_failure(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A failure creating the exclusive temporary file itself must surface as
+    ArtifactPublicationError, not a raw OSError.
+
+    ``_create_temporary_file_at`` is called before the caller's unlink finally
+    and OSError-to-ArtifactPublicationError wrapper are in scope.  Only
+    FileExistsError is a collision retry; other OSError failures from the
+    exclusive ``os.open`` (ENOSPC, EACCES, EMFILE, ...) would otherwise escape
+    unwrapped, breaking the helper's contract (OaF maps
+    ArtifactPublicationError to prediction_publish_failed but a raw OSError to
+    prediction_artifact_invalid, so the distinction is observable).
+    """
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        real_open = os.open
+
+        def fail_exclusive_open(path, flags, *args, **kwargs):
+            if os.fspath(path).startswith(".artifact.json."):
+                raise OSError(errno.ENOSPC, "simulated temporary open failure")
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", fail_exclusive_open)
+
+        with pytest.raises(ArtifactPublicationError):
+            publish_immutable_file_at(directory_fd, "artifact.json", b"payload")
+    finally:
+        os.close(directory_fd)
+
+    # No temporary file leaks behind the failed publication.
     assert list(tmp_path.iterdir()) == []
