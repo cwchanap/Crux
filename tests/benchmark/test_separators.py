@@ -482,6 +482,59 @@ def test_freezer_rejects_symlinked_output_parent_component(tmp_path: Path) -> No
     assert not (real_directory / ".separator-publish.lock").exists()
 
 
+def test_freezer_rejects_missing_component_raced_into_model_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing output component that loses its mkdir race to a directory
+    carrying the model-root identity must still be rejected before publishing.
+
+    The missing-component path in ``_open_output_directory`` proves only the
+    deepest existing ancestor is outside the model root, then creates the
+    remaining components with ``mkdir``.  ``_require_same_model_identity`` only
+    proves the opened object is the named object; it does not prove the named
+    object is outside the attested model root.  Another process can win the
+    mkdir race by moving the attested model root into the missing output
+    location between ``mkdir`` and ``open``, so the final descriptor must be
+    re-checked against the model root by identity.  The regression forces that
+    interleaving deterministically.
+    """
+    interpreter, _ = _synthetic_environment(tmp_path)
+    model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    output_parent = tmp_path / "out"
+    output_parent.mkdir()
+    # "nested" is the missing component that triggers the missing-component
+    # branch in _open_output_directory.
+    raced_name = "nested"
+    lock_path = output_parent / raced_name / "model.json"
+
+    real_mkdir = os.mkdir
+
+    def racing_mkdir(path, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None and os.fspath(path) == raced_name:
+            # Another process wins the mkdir race by moving the attested model
+            # root into the missing output location first; the real mkdir then
+            # collides with FileExistsError, which the publication code tolerates.
+            os.rename(model_root, output_parent / raced_name)
+        return real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "mkdir", racing_mkdir)
+
+    with pytest.raises(SeparatorExecutionError) as raised:
+        _freeze_separator_runtime(
+            separator_id=SPLEETER_SEPARATOR_ID,
+            interpreter=interpreter,
+            model_root=model_root,
+            repository_revision="a" * 40,
+            output=lock_path,
+        )
+
+    assert raised.value.code == "separator_output_inside_model_root"
+    # Nothing was published into the model root (now at output_parent / raced_name).
+    assert not (output_parent / raced_name / "model.json").exists()
+    assert not (output_parent / raced_name / ".separator-publish.lock").exists()
+
+
 def test_freezer_rejects_relative_output_before_publishing(tmp_path: Path) -> None:
     interpreter, _ = _synthetic_environment(tmp_path)
     model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)

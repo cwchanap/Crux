@@ -5,6 +5,7 @@ import os
 
 import pytest
 
+from src.benchmark import artifact_io
 from src.benchmark.artifact_io import (
     ArtifactPublicationError,
     publish_immutable_file,
@@ -79,3 +80,42 @@ def test_publish_immutable_file_at_rejects_non_component_name(tmp_path):
         os.close(directory_fd)
 
     assert not (tmp_path / "nested").exists()
+
+
+@pytest.mark.parametrize("failure", ["write", "fsync"])
+def test_publish_immutable_file_at_cleans_temporary_file_on_fill_failure(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+):
+    """A write/fsync failure while filling the temporary file must not leak it
+    and must surface as ArtifactPublicationError, not a raw OSError.
+
+    ``_create_temporary_file_at`` runs before the caller's unlink finally is in
+    scope, so without an internal cleanup a partial ``.<name>.<random>`` file
+    would remain behind and the failure would escape as a raw OSError, breaking
+    the helper's ArtifactPublicationError contract (OaF maps that to
+    ``prediction_publish_failed`` rather than ``prediction_artifact_invalid``).
+    """
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        if failure == "write":
+
+            def fail_write(_descriptor: int, _content: bytes) -> None:
+                raise OSError("simulated write failure")
+
+            monkeypatch.setattr(artifact_io, "_write_all", fail_write)
+        else:
+
+            def fail_fsync(_fd: int) -> None:
+                raise OSError("simulated fsync failure")
+
+            monkeypatch.setattr(os, "fsync", fail_fsync)
+
+        with pytest.raises(ArtifactPublicationError):
+            publish_immutable_file_at(directory_fd, "artifact.json", b"payload")
+    finally:
+        os.close(directory_fd)
+
+    # No partial temporary file leaks behind the failed publication.
+    assert list(tmp_path.iterdir()) == []

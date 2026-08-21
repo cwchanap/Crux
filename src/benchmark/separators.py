@@ -1086,6 +1086,19 @@ def _open_output_directory(
                     )
                     os.close(descriptor)
                     descriptor = child_descriptor
+                # The identity check above only proves the opened object is the
+                # named object; it does not prove the named object is outside the
+                # attested model root.  Another process can win the mkdir race by
+                # moving the model root (or a descendant sharing its identity)
+                # into the missing output location between mkdir and open, so the
+                # final descriptor must be re-checked against the model root by
+                # identity before it is handed back, mirroring the all-existing
+                # path below.
+                _require_directory_outside_model_root(
+                    descriptor,
+                    model_root_metadata,
+                    directory_flags=directory_flags,
+                )
                 return descriptor
             _require_same_model_identity(
                 os.stat(part, dir_fd=descriptor, follow_symlinks=False),
