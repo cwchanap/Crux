@@ -566,6 +566,51 @@ def test_primary_prediction_publication_uses_held_dynamic_parent_after_swap(
     _assert_no_new_primary_leaves(outside / "attacker-target", outside)
 
 
+def test_primary_prediction_guard_failure_preserves_integrity_code_and_stops_backend(
+    tmp_path: Path, monkeypatch
+) -> None:
+    handoff, reference, timing, mappings = _synthetic_handoff(tmp_path)
+    request = _request(tmp_path)
+    write_actual_handoff(request.separation_handoff_path, handoff)
+    runner = _install_synthetic_seams(monkeypatch, reference, timing, mappings)
+    original_guard = runner._primary_verify_prediction_parent
+    verify_calls = 0
+    swapped = False
+    calls: list[int] = []
+
+    def guard_then_swap(namespace, target):
+        nonlocal swapped, verify_calls
+        verify_calls += 1
+        if verify_calls == 2:
+            _swap_held_directory(target.parent, tmp_path / "outside-prediction-guard")
+            swapped = True
+        return original_guard(namespace, target)
+
+    monkeypatch.setattr(runner, "_primary_verify_prediction_parent", guard_then_swap)
+    descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
+    outcome = run_idm_pilot(
+        request,
+        backend_factory=_healthy_backend_factory(descriptor, calls),
+        perf_counter=lambda: 1.0,
+    )
+
+    assert swapped
+    assert outcome.overall_status == "failed"
+    assert outcome.exit_code == 2
+    assert calls == [20]
+    run_paths = list((request.output_dir / "runs").glob("*/run.json"))
+    assert len(run_paths) == 1
+    snapshot = parse_idm_pilot_run(run_paths[0].read_bytes())
+    assert snapshot["overall_status"] == "failed"
+    first_item = snapshot["items"][0]
+    assert first_item["simfile_id"] == 20
+    assert first_item["native_failure_code"] == "output_integrity_failed"
+    outside = tmp_path / "outside-prediction-guard"
+    assert (outside / "moved-sentinel").read_bytes() == b"must remain untouched"
+    assert (outside / "attacker-sentinel").read_bytes() == b"must remain untouched"
+    _assert_no_new_primary_leaves(outside / "attacker-target", outside)
+
+
 def test_primary_staged_input_rejects_held_song_directory_after_swap(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -636,6 +681,85 @@ def test_primary_reports_publication_uses_held_report_directories_after_swap(
     assert (outside / "moved-sentinel").read_bytes() == b"must remain untouched"
     assert (outside / "attacker-sentinel").read_bytes() == b"must remain untouched"
     _assert_no_new_primary_leaves(outside / "attacker-target", outside)
+
+
+def test_primary_reports_publication_rolls_back_all_completed_leaves_after_swap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runner, _handoff, request, calls, first = _run_first_synthetic(tmp_path, monkeypatch)
+    assert first.run_id is not None
+    calls.clear()
+    report_dir = request.output_dir / "runs" / first.run_id / "reports" / "oaf"
+    preexisting_name = runner._PRIMARY_REPORT_FILENAMES[0]
+    initially_absent_name = runner._PRIMARY_REPORT_FILENAMES[1]
+    marker = b"preexisting-report-bytes"
+    (report_dir / preexisting_name).write_bytes(marker)
+    (report_dir / preexisting_name).chmod(0o640)
+    (report_dir / initially_absent_name).unlink()
+    assert (report_dir / initially_absent_name).exists() is False
+    report_states = {
+        filename: (report_dir / filename).read_bytes()
+        for filename in runner._PRIMARY_REPORT_FILENAMES
+        if (report_dir / filename).exists()
+    }
+    report_modes = {
+        filename: (report_dir / filename).stat().st_mode & 0o777 for filename in report_states
+    }
+
+    original_replace = runner._primary_replace_with_identity_guard
+    completed_report_leaves: list[str] = []
+
+    def replace_then_record(directory_fd, name, content, verify):
+        original_replace(directory_fd, name, content, verify)
+        if name in runner._PRIMARY_REPORT_FILENAMES:
+            completed_report_leaves.append(name)
+
+    monkeypatch.setattr(runner, "_primary_replace_with_identity_guard", replace_then_record)
+    original_guard = runner._primary_report_directory_identities
+    guard_calls: list[str] = []
+    integrity_codes: list[str] = []
+    completed_at_swap: list[tuple[str, ...]] = []
+    swapped = False
+
+    def guard_then_swap(namespace, cohort, directory_fd):
+        nonlocal swapped
+        guard_calls.append(cohort)
+        if cohort == "oaf" and len(guard_calls) == 9:
+            completed_at_swap.append(tuple(completed_report_leaves))
+            _swap_held_directory(report_dir, tmp_path / "outside-reports-transaction")
+            swapped = True
+        try:
+            return original_guard(namespace, cohort, directory_fd)
+        except runner.IdmPilotRunError as error:
+            integrity_codes.append(error.code)
+            raise
+
+    monkeypatch.setattr(runner, "_primary_report_directory_identities", guard_then_swap)
+    resumed = run_idm_pilot(
+        replace(request, resume=True),
+        backend_factory=lambda **_: pytest.fail("report rollback must not invoke IDM"),
+        perf_counter=lambda: 1.0,
+    )
+
+    assert swapped
+    assert resumed.overall_status == "failed"
+    assert resumed.exit_code == 2
+    assert calls == []
+    assert len(guard_calls) == 9
+    assert guard_calls == ["oaf"] * 9
+    assert completed_at_swap == [(preexisting_name, initially_absent_name)]
+    assert completed_report_leaves == [preexisting_name, initially_absent_name]
+    assert integrity_codes == ["output_integrity_failed"]
+    outside = tmp_path / "outside-reports-transaction"
+    moved = outside / "oaf"
+    assert (outside / "moved-sentinel").read_bytes() == b"must remain untouched"
+    assert (outside / "attacker-sentinel").read_bytes() == b"must remain untouched"
+    assert {path.name for path in moved.iterdir() if path.is_file()} == set(report_states)
+    for filename, content in report_states.items():
+        assert (moved / filename).read_bytes() == content
+        assert (moved / filename).stat().st_mode & 0o777 == report_modes[filename]
+    assert not (moved / initially_absent_name).exists()
+    assert not any((outside / "attacker-target").rglob("*"))
 
 
 def test_interrupted_resume_preserves_unvisited_exact_ledger_items(

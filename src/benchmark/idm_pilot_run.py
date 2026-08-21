@@ -1260,6 +1260,64 @@ def _primary_existing_leaf(directory_fd: int, name: str) -> bytes | None:
         return None
 
 
+@dataclass(frozen=True)
+class _PrimaryLeafSnapshot:
+    content: bytes | None
+    mode: int | None
+
+
+def _primary_snapshot_leaf(directory_fd: int, name: str) -> _PrimaryLeafSnapshot:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise OSError("primary file no-follow support is unavailable")
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
+        )
+    except FileNotFoundError:
+        return _PrimaryLeafSnapshot(content=None, mode=None)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("primary output is not a regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                return _PrimaryLeafSnapshot(
+                    content=b"".join(chunks),
+                    mode=stat.S_IMODE(metadata.st_mode),
+                )
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+
+
+def _primary_restore_leaf(directory_fd: int, name: str, snapshot: _PrimaryLeafSnapshot) -> None:
+    if snapshot.content is None:
+        _primary_remove_leaf(directory_fd, name)
+        return
+    if snapshot.mode is None:
+        raise ValueError("primary leaf snapshot mode is missing")
+    _primary_atomic_replace_at(directory_fd, name, snapshot.content)
+    descriptor = os.open(
+        name,
+        os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=directory_fd,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("primary output is not a regular file")
+        os.fchmod(descriptor, snapshot.mode)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.fsync(directory_fd)
+
+
 def _primary_remove_leaf(directory_fd: int, name: str) -> None:
     try:
         os.unlink(name, dir_fd=directory_fd)
@@ -1440,6 +1498,8 @@ def _publish_primary_prediction_at(
             )
         persisted = _read_primary_file_at(directory_fd, target.name)
         artifact = read_prediction_artifact(persisted)
+    except IdmPilotRunError:
+        raise
     except (
         ArtifactPublicationError,
         OSError,
@@ -2511,27 +2571,41 @@ def _publish_primary_cohort_reports(
     cohort: str | None = None,
 ) -> None:
     """Render reports privately, then publish their fixed leaves by descriptor."""
-    with tempfile.TemporaryDirectory(prefix=".idm-primary-report-stage-") as stage_name:
-        staged_dir = Path(stage_name)
-        write_cohort_reports(result, staged_dir)  # type: ignore[arg-type]
-        for filename in _PRIMARY_REPORT_FILENAMES:
-            content = read_regular_file_no_follow(staged_dir / filename)
-            if namespace is None:
-                _primary_atomic_replace_at(reports_fd, filename, content)
-            else:
+    snapshots = {
+        filename: _primary_snapshot_leaf(reports_fd, filename)
+        for filename in _PRIMARY_REPORT_FILENAMES
+    }
+    touched: list[str] = []
+    try:
+        with tempfile.TemporaryDirectory(prefix=".idm-primary-report-stage-") as stage_name:
+            staged_dir = Path(stage_name)
+            write_cohort_reports(result, staged_dir)  # type: ignore[arg-type]
+            for filename in _PRIMARY_REPORT_FILENAMES:
+                content = read_regular_file_no_follow(staged_dir / filename)
+                touched.append(filename)
+                if namespace is None:
+                    _primary_atomic_replace_at(reports_fd, filename, content)
+                else:
+                    if cohort is None:
+                        raise ValueError("primary report cohort is required")
+                    _primary_replace_with_identity_guard(
+                        reports_fd,
+                        filename,
+                        content,
+                        lambda: _primary_report_directory_identities(namespace, cohort, reports_fd),
+                    )
+                    _primary_report_directory_identities(namespace, cohort, reports_fd)
+            if namespace is not None:
                 if cohort is None:
                     raise ValueError("primary report cohort is required")
-                _primary_replace_with_identity_guard(
-                    reports_fd,
-                    filename,
-                    content,
-                    lambda: _primary_report_directory_identities(namespace, cohort, reports_fd),
-                )
                 _primary_report_directory_identities(namespace, cohort, reports_fd)
-        if namespace is not None:
-            if cohort is None:
-                raise ValueError("primary report cohort is required")
-            _primary_report_directory_identities(namespace, cohort, reports_fd)
+    except BaseException:
+        for filename in reversed(touched):
+            try:
+                _primary_restore_leaf(reports_fd, filename, snapshots[filename])
+            except OSError:
+                pass
+        raise
 
 
 def _outcome_from_scores(
