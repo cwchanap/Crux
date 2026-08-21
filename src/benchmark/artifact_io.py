@@ -132,7 +132,10 @@ def _publish_immutable_file_into(directory_fd: int, name: str, content: bytes) -
         return digest
     except ArtifactPublicationError:
         raise
-    except OSError as error:
+    except (OSError, NotImplementedError) as error:
+        # NotImplementedError is not an OSError (platforms without os.link
+        # follow_symlinks/dir_fd support raise it), yet it must still surface as
+        # a publication failure, not escape unwrapped.
         raise ArtifactPublicationError("artifact publication failed") from error
     finally:
         try:
