@@ -21,9 +21,14 @@ from src.benchmark.cohort_scoring import SCORING_VERSION, CohortIdentity
 from src.benchmark.idm_pilot_run import (
     IDM_PILOT_RUN_SCHEMA,
     IDM_STEM_INPUT_VIEW_ID,
+    build_run_id,
     parse_idm_pilot_run,
 )
-from src.benchmark.prediction_artifact import PredictionArtifactError, read_prediction_artifact
+from src.benchmark.prediction_artifact import (
+    PredictionArtifactError,
+    prediction_artifact_matches_run_row,
+    read_prediction_artifact,
+)
 from src.benchmark.published_comparison import (
     ComparisonIntegrityError,
     PublishedRunEvidence,
@@ -122,6 +127,27 @@ def _validate_snapshot_identity(snapshot: Mapping[str, object]) -> None:
                 _fail(f"run snapshot inference_config {field} identity mismatch")
 
 
+def _validate_run_identity(snapshot: Mapping[str, object]) -> None:
+    try:
+        expected_run_id = build_run_id(
+            snapshot.get("handoff_manifest_sha256"),  # type: ignore[arg-type]
+            snapshot.get("handoff_manifest_version"),  # type: ignore[arg-type]
+            snapshot.get("reference_manifest_sha256"),  # type: ignore[arg-type]
+            snapshot.get("reference_manifest_version"),  # type: ignore[arg-type]
+            snapshot.get("reference_timing_manifest_sha256"),  # type: ignore[arg-type]
+            snapshot.get("reference_timing_version"),  # type: ignore[arg-type]
+            snapshot.get("backend_descriptor_sha256"),  # type: ignore[arg-type]
+            snapshot.get("model_lock_sha256"),  # type: ignore[arg-type]
+            snapshot.get("inference_config_sha256"),  # type: ignore[arg-type]
+            snapshot.get("input_view_id"),  # type: ignore[arg-type]
+            snapshot.get("crux_commit"),  # type: ignore[arg-type]
+        )
+    except (StrictJsonError, TypeError, ValueError) as error:
+        _fail(f"run identity inputs are invalid: {error}")
+    if snapshot.get("run_id") != expected_run_id:
+        _fail("run_id identity mismatch")
+
+
 def _identity(snapshot: Mapping[str, object], *, label: str) -> CohortIdentity:
     run_id = _text(snapshot.get("run_id"), "run_id")
     if label == "oaf":
@@ -209,10 +235,14 @@ def _run_items(
         raw = snapshot_items[simfile_id]
         source_hash = raw.get(f"{label}_source_audio_sha256", raw.get("source_audio_sha256"))
         input_hash = raw.get(f"{label}_input_audio_sha256", raw.get("input_audio_sha256"))
-        if source_hash is not None and not isinstance(source_hash, str):
-            _fail("source_audio_sha256 is malformed")
-        if input_hash is not None and not isinstance(input_hash, str):
-            _fail("input_audio_sha256 is malformed")
+        if row.status == "success":
+            source_hash = _hash(source_hash, f"successful {label} source_audio_sha256")
+            input_hash = _hash(input_hash, f"successful {label} input_audio_sha256")
+        else:
+            if source_hash is not None:
+                source_hash = _hash(source_hash, f"{label} source_audio_sha256")
+            if input_hash is not None:
+                input_hash = _hash(input_hash, f"{label} input_audio_sha256")
         if validate_snapshot_status:
             disposition = raw.get("execution_disposition")
             expected_status = {
@@ -275,19 +305,36 @@ def _coverage(reports: PublishedCohortReports) -> dict[str, object]:
 
 
 def _native_failure_histogram(snapshot: Mapping[str, object]) -> dict[str, int]:
-    raw = snapshot.get("native_failure_counts", {})
+    derived: Counter[str] = Counter()
+    raw_items = snapshot.get("items", [])
+    if not isinstance(raw_items, list):
+        _fail("run snapshot items must be an array")
+    for raw_item in raw_items:
+        if not isinstance(raw_item, Mapping):
+            _fail("run snapshot item is malformed")
+        if raw_item.get("execution_disposition") != "failed":
+            continue
+        code = raw_item.get("native_failure_code")
+        if not isinstance(code, str) or not code:
+            _fail("failed run snapshot item has no native_failure_code")
+        derived[code] += 1
+
+    raw = snapshot.get("native_failure_counts")
     if raw is None:
-        return {}
+        return dict(sorted(derived.items()))
     if not isinstance(raw, Mapping):
         _fail("native_failure_counts must be an object")
-    result: dict[str, int] = {}
+    stored: dict[str, int] = {}
     for code, count in raw.items():
         if not isinstance(code, str) or not code:
             _fail("native_failure_counts contains an invalid code")
         if isinstance(count, bool) or not isinstance(count, int) or count < 0:
             _fail("native_failure_counts contains an invalid count")
-        result[code] = count
-    return dict(sorted(result.items()))
+        stored[code] = count
+    expected = dict(sorted(derived.items()))
+    if stored != expected:
+        _fail("native_failure_counts does not match failed item rows")
+    return stored
 
 
 def _runtime_diagnostics(snapshot: Mapping[str, object]) -> dict[str, object]:
@@ -340,7 +387,7 @@ def _owned_prediction_path(root: Path, value: object) -> Path | None:
 def _velocity_diagnostics(
     snapshot: Mapping[str, object],
     *,
-    run_roots: tuple[Path, ...],
+    output_root: Path,
     total_event_count: int,
 ) -> dict[str, object]:
     values: list[Decimal] = []
@@ -352,17 +399,18 @@ def _velocity_diagnostics(
                 "resumed",
             }:
                 continue
-            artifact = None
-            for run_root in run_roots:
-                path = _owned_prediction_path(run_root, raw.get("prediction_path"))
-                if path is None:
-                    continue
-                try:
-                    artifact = read_prediction_artifact(read_regular_file_no_follow(path))
-                except (OSError, PredictionArtifactError, StrictJsonError, TypeError, ValueError):
-                    continue
-                break
-            if artifact is None:
+            path = _owned_prediction_path(output_root, raw.get("prediction_path"))
+            if path is None:
+                continue
+            try:
+                artifact = read_prediction_artifact(read_regular_file_no_follow(path))
+            except (OSError, PredictionArtifactError, StrictJsonError, TypeError, ValueError):
+                continue
+            if not prediction_artifact_matches_run_row(
+                artifact,
+                raw,
+                expected_input_view_id=IDM_STEM_INPUT_VIEW_ID,
+            ):
                 continue
             for event in artifact.prediction.events:
                 velocity = event.native.native_metadata.get("native_velocity")
@@ -427,6 +475,7 @@ def compare_oaf_idm(request: IdmComparisonRequest) -> Path:
     try:
         snapshot = _load_snapshot(request.run_path)
         _validate_snapshot_identity(snapshot)
+        _validate_run_identity(snapshot)
         raw_items = snapshot.get("items")
         if not isinstance(raw_items, list):
             _fail("run snapshot items must be an array")
@@ -555,11 +604,7 @@ def compare_oaf_idm(request: IdmComparisonRequest) -> Path:
         idm_model["runtime"] = _runtime_diagnostics(snapshot)
         idm_model["velocity"] = _velocity_diagnostics(
             snapshot,
-            run_roots=(
-                request.run_path.parent,
-                request.run_path.parent.parent,
-                request.run_path.parent.parent.parent,
-            ),
+            output_root=request.run_path.parents[2],
             total_event_count=int(coverage["prediction_native_event_count"]),
         )
         write_comparison_artifacts(
