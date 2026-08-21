@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -318,6 +319,120 @@ def test_synthetic_immutable_handoff_runs_both_complete_populations_and_resumes(
     assert resumed.success_count == 18
     assert resumed.failed_count == 2
     assert calls == []
+
+
+def test_primary_worker_consumes_private_verified_input_after_retained_path_swap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    handoff, reference, timing, mappings = _synthetic_handoff(tmp_path)
+    request = _request(tmp_path)
+    write_actual_handoff(request.separation_handoff_path, handoff)
+    runner = _install_synthetic_seams(monkeypatch, reference, timing, mappings)
+    lock = load_idm_model_lock(Path("runtime/idm/model.json"))
+    descriptor = runner.descriptor_for_lock(lock)
+    canonical = canonical_wav()
+    retained_path = request.separation_artifact_root / "inputs" / "20" / "htdemucs.wav"
+    observed: list[tuple[Path, bytes]] = []
+
+    class SwappingBackend:
+        def descriptor(self):
+            return descriptor
+
+        def transcribe(self, audio):
+            if not observed:
+                retained_path.write_bytes(canonical_wav(sample=1))
+            observed.append((audio.path, audio.path.read_bytes()))
+            if len(observed) == 1:
+                retained_path.write_bytes(canonical)
+            return NativePrediction(
+                audio,
+                descriptor,
+                (
+                    NativeEvent(
+                        0.25,
+                        "KD",
+                        4,
+                        None,
+                        {"frame_index": "43", "native_velocity": "1"},
+                        0.9,
+                        64,
+                    ),
+                ),
+            )
+
+        def close(self):
+            return None
+
+    outcome = run_idm_pilot(
+        request,
+        backend_factory=lambda **_: SwappingBackend(),
+        perf_counter=lambda: 1.0,
+    )
+
+    assert outcome.success_count == 18
+    assert observed
+    staged_path, staged_bytes = observed[0]
+    assert staged_bytes == canonical
+    assert staged_path != retained_path
+    assert outcome.run_path is not None
+    assert staged_path.is_relative_to(outcome.run_path.parent / "inputs")
+    assert staged_path.stat().st_mode & 0o077 == 0
+
+
+@pytest.mark.parametrize("component", ("runs", "run-dir", "predictions", "reports"))
+def test_primary_output_namespace_rejects_preseeded_symlinks_without_outside_writes(
+    tmp_path: Path, monkeypatch, component: str
+) -> None:
+    handoff, reference, timing, mappings = _synthetic_handoff(tmp_path)
+    request = _request(tmp_path)
+    write_actual_handoff(request.separation_handoff_path, handoff)
+    runner = _install_synthetic_seams(monkeypatch, reference, timing, mappings)
+    lock = load_idm_model_lock(Path("runtime/idm/model.json"))
+    descriptor = runner.descriptor_for_lock(lock)
+    first = run_idm_pilot(
+        request,
+        backend_factory=_healthy_backend_factory(descriptor, []),
+        perf_counter=lambda: 1.0,
+    )
+    assert first.run_id is not None
+    assert first.run_path is not None
+
+    outside = tmp_path / "outside" / component
+    outside.mkdir(parents=True)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"must remain untouched")
+    output_dir = request.output_dir
+    run_dir = output_dir / "runs" / first.run_id
+    if component == "runs":
+        source = outside / "runs"
+        shutil.copytree(output_dir / "runs", source)
+        shutil.rmtree(output_dir / "runs")
+        (output_dir / "runs").symlink_to(source, target_is_directory=True)
+    elif component == "run-dir":
+        source = outside / "run-dir"
+        shutil.copytree(run_dir, source)
+        shutil.rmtree(run_dir)
+        run_dir.symlink_to(source, target_is_directory=True)
+    elif component == "predictions":
+        source = outside / "predictions"
+        shutil.copytree(output_dir / "predictions", source)
+        shutil.rmtree(output_dir / "predictions")
+        (output_dir / "predictions").symlink_to(source, target_is_directory=True)
+    else:
+        source = outside / "reports"
+        shutil.copytree(run_dir / "reports", source)
+        shutil.rmtree(run_dir / "reports")
+        (run_dir / "reports").symlink_to(source, target_is_directory=True)
+
+    resumed = run_idm_pilot(
+        replace(request, resume=True),
+        backend_factory=lambda **_: pytest.fail("symlinked output must fail before IDM"),
+        perf_counter=lambda: 1.0,
+    )
+
+    assert resumed.overall_status == "failed"
+    assert resumed.exit_code == 2
+    assert sentinel.read_bytes() == b"must remain untouched"
 
 
 def test_interrupted_resume_preserves_unvisited_exact_ledger_items(

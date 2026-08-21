@@ -106,6 +106,7 @@ class IdmBackend:
             lock = load_idm_model_lock(model_lock_path)
         except (IdmModelLockError, OSError, TypeError, ValueError) as error:
             raise IdmBackendError("IDM model lock is invalid", code="descriptor_invalid") from error
+        _validate_supported_runtime(lock)
 
         expected_descriptor = descriptor_for_lock(lock)
         if descriptor is None:
@@ -410,15 +411,26 @@ def _validate_descriptor(value: BackendDescriptor, expected: BackendDescriptor) 
         raise IdmBackendError("backend descriptor is invalid", code="descriptor_invalid") from error
 
 
+def _validate_supported_runtime(lock: IdmModelLock) -> None:
+    if lock.device != "cpu" or lock.dtype != "float32":
+        raise IdmBackendError(
+            "IDM KISS runtime supports only CPU float32", code="descriptor_invalid"
+        )
+
+
 def _validate_ready(value: Mapping[str, object], lock: IdmModelLock) -> None:
     if not isinstance(value, Mapping) or value.get("type") != "ready":
         raise IdmBackendError("worker ready response is invalid", code="worker_ready_invalid")
     required = {
         "backend_id",
         "model_id",
+        "model_name",
         "train_classes",
+        "python_version",
         "sample_rate_hz",
         "activation_rate_hz",
+        "device",
+        "dtype",
     }
     if any(key not in value for key in required):
         raise IdmBackendError("worker ready response is invalid", code="worker_ready_invalid")
@@ -426,6 +438,10 @@ def _validate_ready(value: Mapping[str, object], lock: IdmModelLock) -> None:
         raise IdmBackendError("worker backend id is invalid", code="worker_identity_invalid")
     if value.get("model_id") != lock.model_id:
         raise IdmBackendError("worker model id is invalid", code="worker_identity_invalid")
+    if value.get("model_name") != lock.model_name:
+        raise IdmBackendError("worker model name is invalid", code="worker_identity_invalid")
+    if value.get("python_version") != lock.python_version:
+        raise IdmBackendError("worker Python version is invalid", code="worker_identity_invalid")
     classes = value.get("train_classes")
     if not isinstance(classes, (list, tuple)) or tuple(classes) != lock.train_classes:
         raise IdmBackendError("worker classes are invalid", code="worker_identity_invalid")
@@ -439,6 +455,12 @@ def _validate_ready(value: Mapping[str, object], lock: IdmModelLock) -> None:
         raise IdmBackendError("worker frame rate is invalid", code="worker_identity_invalid")
     if float(frame_rate) != lock.activation_rate_hz:
         raise IdmBackendError("worker frame rate is invalid", code="worker_identity_invalid")
+    if value.get("device") != lock.device or value.get("dtype") != lock.dtype:
+        raise IdmBackendError("worker device or dtype is invalid", code="worker_identity_invalid")
+    if lock.device != "cpu" or lock.dtype != "float32":
+        raise IdmBackendError(
+            "IDM KISS runtime supports only CPU float32", code="worker_identity_invalid"
+        )
 
 
 def _decode_native_event(value: object, lock: IdmModelLock, frame_limit: int) -> NativeEvent:
