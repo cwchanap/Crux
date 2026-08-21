@@ -487,6 +487,27 @@ def test_full_mix_smoke_materializes_infers_scores_and_reports_separately(
     assert factory_calls[0]["input_root"] == outcome.run_path.parent / "inputs"
     assert len(materialize_calls) == 5
 
+    preseeded_request = replace(request, output_dir=tmp_path / "preseeded-output")
+    preseeded_run_dir = preseeded_request.output_dir / "full-mix-smoke" / "runs" / outcome.run_id
+    preseeded_outside = tmp_path / "preseeded-outside"
+    preseeded_outside.mkdir()
+    preseeded_sentinel = preseeded_outside / "sentinel"
+    preseeded_sentinel.write_bytes(b"must remain untouched")
+    preseeded_run_dir.mkdir(parents=True)
+    (preseeded_run_dir / "predictions").symlink_to(preseeded_outside, target_is_directory=True)
+    preseeded = run_idm_full_mix_smoke(
+        preseeded_request,
+        backend_factory=backend_factory,
+        perf_counter=lambda: 1.0,
+    )
+    assert preseeded.overall_status == "failed"
+    assert preseeded.exit_code == 2
+    assert not (preseeded_run_dir / "run.json").exists()
+    assert preseeded_sentinel.read_bytes() == b"must remain untouched"
+    assert list(preseeded_outside.iterdir()) == [preseeded_sentinel]
+    assert len(factory_calls) == 1
+    assert len(materialize_calls) == 5
+
     publication_request = replace(request, output_dir=tmp_path / "publication-output")
     publication_factory_calls: list[dict[str, object]] = []
 
@@ -528,6 +549,32 @@ def test_full_mix_smoke_materializes_infers_scores_and_reports_separately(
     assert outcome.run_path is not None
     complete_snapshot = outcome.run_path.read_bytes()
     materialize_before_repeat = len(materialize_calls)
+    mapping_calls: list[object] = []
+
+    def mapping_must_not_run(*args: object, **kwargs: object) -> object:
+        mapping_calls.append((args, kwargs))
+        raise AssertionError("duplicate-run rejection must precede mapping reconstruction")
+
+    cache_load_calls: list[Path] = []
+
+    def cache_load_must_not_run(cls: object, cache_dir: Path) -> object:
+        del cls
+        cache_load_calls.append(cache_dir)
+        raise AssertionError("duplicate-run rejection must precede cache loading")
+
+    write_calls: list[Path] = []
+
+    def snapshot_write_must_not_run(path: Path, *_args: object, **_kwargs: object) -> None:
+        write_calls.append(path)
+        raise AssertionError("duplicate-run rejection must precede snapshot writes")
+
+    monkeypatch.setattr(run_module, "preflight_reference_mappings", mapping_must_not_run)
+    monkeypatch.setattr(
+        run_module.CacheIndexStore,
+        "load",
+        classmethod(cache_load_must_not_run),
+    )
+    monkeypatch.setattr(run_module, "_write_full_mix_smoke_snapshot", snapshot_write_must_not_run)
     repeated = run_idm_full_mix_smoke(
         request,
         backend_factory=backend_factory,
@@ -538,6 +585,9 @@ def test_full_mix_smoke_materializes_infers_scores_and_reports_separately(
     assert outcome.run_path.read_bytes() == complete_snapshot
     assert len(factory_calls) == 1
     assert len(materialize_calls) == materialize_before_repeat
+    assert mapping_calls == []
+    assert cache_load_calls == []
+    assert write_calls == []
 
     interrupted_request = replace(request, output_dir=tmp_path / "interrupted-output")
     interrupted_path = (
@@ -556,6 +606,9 @@ def test_full_mix_smoke_materializes_infers_scores_and_reports_separately(
     assert interrupted_path.read_bytes() == interrupted_snapshot
     assert len(factory_calls) == 1
     assert len(materialize_calls) == materialize_before_repeat
+    assert mapping_calls == []
+    assert cache_load_calls == []
+    assert write_calls == []
 
 
 @pytest.mark.parametrize("component", ("full-mix-smoke", "runs", "inputs", "reports"))

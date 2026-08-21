@@ -2121,9 +2121,40 @@ def _validate_full_mix_smoke_namespace(
             raise IdmSmokeManifestError(f"{field} is unavailable") from error
         if not resolved.is_relative_to(output_root):
             raise IdmSmokeManifestError(f"{field} escapes output_dir")
-    if run_path.exists():
-        raise IdmSmokeManifestError("full-mix smoke run already exists")
+    if run_dir.exists():
+        raise IdmSmokeManifestError("full-mix smoke run directory already exists")
     return run_dir, run_path, reports_path, input_root
+
+
+def _validate_full_mix_smoke_prediction_target(
+    run_dir: Path, output_root: Path, target: Path
+) -> None:
+    """Reject dynamic prediction parents that are symlinked or escape output."""
+    if not isinstance(run_dir, Path) or not isinstance(output_root, Path):
+        raise TypeError("prediction roots must be Paths")
+    if not isinstance(target, Path):
+        raise TypeError("prediction target must be a Path")
+    try:
+        relative = target.relative_to(run_dir)
+        run_root = run_dir.resolve(strict=True)
+        output_resolved = output_root.resolve(strict=True)
+    except (OSError, ValueError) as error:
+        raise IdmSmokeManifestError("full-mix smoke prediction path is unavailable") from error
+    if not relative.parts or not run_root.is_relative_to(output_resolved):
+        raise IdmSmokeManifestError("full-mix smoke prediction path escapes output_dir")
+    cursor = run_dir
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise IdmSmokeManifestError("full-mix smoke prediction path must not use symlinks")
+        try:
+            resolved = cursor.resolve()
+        except OSError as error:
+            raise IdmSmokeManifestError("full-mix smoke prediction path is unavailable") from error
+        if not resolved.is_relative_to(output_resolved):
+            raise IdmSmokeManifestError("full-mix smoke prediction path escapes output_dir")
+        if cursor != target and cursor.exists() and not cursor.is_dir():
+            raise IdmSmokeManifestError("full-mix smoke prediction parent is not a directory")
 
 
 def _smoke_run_id(
@@ -2225,11 +2256,6 @@ def run_idm_full_mix_smoke(
         _validate_lineage(handoff, reference, timing)
         smoke_content = read_regular_file_no_follow(request.smoke_manifest_path)
         smoke_manifest = parse_idm_smoke_manifest(smoke_content, handoff=handoff)
-        mappings = preflight_reference_mappings(
-            reference,
-            timing,
-            timing_output_root=request.timing_manifest_path.parent.parent,
-        )
         lock = load_idm_model_lock(request.model_lock_path)
         model_lock_sha256 = compute_model_lock_sha256(request.model_lock_path)
         descriptor = descriptor_for_lock(lock)
@@ -2256,6 +2282,11 @@ def run_idm_full_mix_smoke(
     try:
         run_dir, run_path, reports_path, input_root = _validate_full_mix_smoke_namespace(
             request, run_id=run_id
+        )
+        mappings = preflight_reference_mappings(
+            reference,
+            timing,
+            timing_output_root=request.timing_manifest_path.parent.parent,
         )
         run_dir.mkdir(parents=True, exist_ok=True)
         input_root.mkdir(parents=True, exist_ok=True)
@@ -2373,6 +2404,10 @@ def run_idm_full_mix_smoke(
                 backend_descriptor_sha256=descriptor.sha256,
                 inference_config_sha256=inference_config_sha,
             )
+            try:
+                _validate_full_mix_smoke_prediction_target(run_dir, request.output_dir, target)
+            except (OSError, RuntimeError, TypeError, ValueError, IdmSmokeManifestError):
+                return _fatal_full_mix_smoke()
             if target.exists():
                 _set_full_mix_smoke_failed(
                     item,
