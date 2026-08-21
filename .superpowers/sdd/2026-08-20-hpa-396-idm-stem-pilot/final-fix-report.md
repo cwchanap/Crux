@@ -249,3 +249,123 @@ The checkout still has no production HPA-328 immutable handoff and no
 production-like evidence; production five-song membership, full-corpus stem
 inference, scored comparison, and the operational smoke remain blocked until
 that upstream handoff and attested production evidence exist.
+
+## Fix Round 3 — held-directory identity guards
+
+This round closes the remaining re-review finding that a held descriptor could
+continue writing after its directory had been renamed outside `output_dir`.
+The Round 1 and Round 2 IDM WAV request, worker, and backend attestation
+changes are unchanged.
+
+### TDD RED
+
+Before the identity guards were implemented, the injected publication seams
+swapped the held run, dynamic prediction, and report directories, then
+replaced the expected paths with symlinks to different attacker-controlled
+directories. The focused regression run observed the old behavior:
+
+```text
+.venv/bin/pytest -q tests/benchmark/test_idm_pilot_run_acceptance.py \
+  -k 'primary_run_checkpoint_uses_held_run_directory_after_swap or \
+      primary_prediction_publication_uses_held_dynamic_parent_after_swap or \
+      primary_reports_publication_uses_held_report_directories_after_swap'
+3 failed, 20 deselected
+```
+
+### GREEN and verification
+
+The focused IDM acceptance/backend/worker suites, including run-resume,
+checkpoint, staged-input, prediction, and report swap seams, passed:
+
+```text
+.venv/bin/pytest -q tests/benchmark/test_idm_pilot_run_acceptance.py \
+  tests/benchmark/test_idm_backend.py tests/benchmark/test_worker_process.py
+85 passed in 21.30s
+```
+
+The complete HPA-396 matrix passed:
+
+```text
+.venv/bin/pytest -q \
+  tests/benchmark/test_idm_model.py tests/benchmark/test_idm_backend.py \
+  tests/benchmark/test_idm_pilot_run.py \
+  tests/benchmark/test_idm_pilot_run_acceptance.py \
+  tests/benchmark/test_idm_comparison.py tests/benchmark/test_backend_identity.py \
+  tests/benchmark/test_cohort_scoring.py tests/benchmark/test_mapping.py \
+  tests/benchmark/test_prediction_artifact.py \
+  tests/benchmark/test_prediction_artifact_coverage.py \
+  tests/runtime/test_idm_wheel_builder.py tests/test_cli_benchmark.py \
+  tests/test_cli_benchmark_coverage.py
+369 passed in 24.62s
+```
+
+The first full-repository run had one transient
+`test_commit_blobs_ignore_staged_and_unstaged_source_edits` failure and 3143
+passing tests. The failing test passed when reproduced alone, and the required
+full suite was rerun to a clean result:
+
+```text
+.venv/bin/pytest -q tests/runtime/test_idm_wheel_builder.py::\
+  test_commit_blobs_ignore_staged_and_unstaged_source_edits -vv
+1 passed in 1.26s
+
+.venv/bin/pytest -q
+3144 passed in 265.49s (0:04:25)
+```
+
+Static checks passed after the final source and test changes:
+
+```text
+.venv/bin/ruff check .
+All checks passed!
+
+.venv/bin/ruff format --check src tests
+170 files already formatted
+
+.venv/bin/pylint --errors-only --disable=E1120,E0401 --jobs=1 src
+exit 0; no output
+
+git diff --check
+exit 0; no output
+```
+
+### Files changed in Round 3
+
+- `src/benchmark/idm_pilot_run.py`
+- `tests/benchmark/test_idm_pilot_run_acceptance.py`
+- this report
+
+### Self-review
+
+The primary namespace now records the exact held `(st_dev, st_ino)` identity
+for the output root, `runs`, exact run, run-owned inputs, dynamic prediction
+parents, reports, and each report cohort. Immediately before checkpoint,
+staged-input, prediction, and report publication, a no-follow descriptor walk
+rechecks every lexical component beneath the held output root. Disappearance,
+replacement, symlink, non-directory, or identity mismatch raises the bounded
+`output_integrity_failed` outcome before publication. Atomic checkpoint/report
+replacement also rechecks at the replacement seam, restores an existing leaf
+or removes a newly created leaf through the held descriptor after a post-write
+mismatch, and report publication rechecks between every leaf and on
+completion. Resume tests confirm the existing `run.json` snapshot is
+preserved when the run directory is moved.
+
+The strengthened seams move the authorized directory outside the output root,
+replace its expected path with a symlink to a different attacker target, and
+assert failure, no backend invocation where applicable, unchanged sentinels,
+and no new run, prediction, report, or staged-input leaves under either
+location. This is a narrow primary-run guard; it is not a generic filesystem
+framework. The fail-closed guarantee covers path movement/replacement,
+symlink, disappearance, and non-directory changes observed by each guard. It
+does not claim immunity if an unprivileged actor owns or can chmod the entire
+output root and can race the final checked operation; that remains outside the
+documented trust model.
+
+### Remaining production operational block
+
+The production block is unchanged: this checkout still has no production
+HPA-328 immutable handoff and no `runtime/idm/smoke.json`. The pinned demo
+WAV probe remains the available production-like evidence; production
+five-song membership, full-corpus stem inference, scored comparison, and
+operational smoke remain blocked until that upstream handoff and attested
+production evidence exist.

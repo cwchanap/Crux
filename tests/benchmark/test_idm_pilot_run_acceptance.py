@@ -435,14 +435,27 @@ def test_primary_output_namespace_rejects_preseeded_symlinks_without_outside_wri
     assert sentinel.read_bytes() == b"must remain untouched"
 
 
-def _swap_held_directory(path: Path, outside: Path) -> Path:
+def _swap_held_directory(path: Path, outside: Path) -> tuple[Path, Path, Path, Path]:
     outside.mkdir(parents=True, exist_ok=True)
     moved = outside / path.name
     path.rename(moved)
-    path.symlink_to(moved, target_is_directory=True)
-    sentinel = outside / "sentinel"
-    sentinel.write_bytes(b"must remain untouched")
-    return sentinel
+    attacker = outside / "attacker-target"
+    attacker.mkdir()
+    path.symlink_to(attacker, target_is_directory=True)
+    moved_sentinel = outside / "moved-sentinel"
+    attacker_sentinel = outside / "attacker-sentinel"
+    moved_sentinel.write_bytes(b"must remain untouched")
+    attacker_sentinel.write_bytes(b"must remain untouched")
+    return moved, attacker, moved_sentinel, attacker_sentinel
+
+
+def _assert_no_new_primary_leaves(*roots: Path) -> None:
+    for root in roots:
+        assert not any(
+            path.is_file()
+            for path in root.rglob("*")
+            if path.name not in {"moved-sentinel", "attacker-sentinel"}
+        )
 
 
 def test_primary_run_checkpoint_uses_held_run_directory_after_swap(
@@ -475,8 +488,46 @@ def test_primary_run_checkpoint_uses_held_run_directory_after_swap(
     )
 
     assert swapped
-    assert outcome.overall_status in {"complete", "partial"}
-    assert (tmp_path / "outside-run" / "sentinel").read_bytes() == b"must remain untouched"
+    assert outcome.overall_status == "failed"
+    outside = tmp_path / "outside-run"
+    assert (outside / "moved-sentinel").read_bytes() == b"must remain untouched"
+    assert (outside / "attacker-sentinel").read_bytes() == b"must remain untouched"
+    _assert_no_new_primary_leaves(outside)
+
+
+def test_primary_checkpoint_swap_preserves_existing_resume_snapshot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runner, _handoff, request, _calls, first = _run_first_synthetic(tmp_path, monkeypatch)
+    assert first.run_id is not None
+    assert first.run_path is not None
+    original_snapshot = first.run_path.read_bytes()
+    original_open = runner._open_primary_namespace
+    swapped = False
+
+    def open_then_swap(*args, **kwargs):
+        nonlocal swapped
+        handles = original_open(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            _swap_held_directory(
+                request.output_dir / "runs" / handles.run_id,
+                tmp_path / "outside-resume-run",
+            )
+        return handles
+
+    monkeypatch.setattr(runner, "_open_primary_namespace", open_then_swap)
+    resumed = run_idm_pilot(
+        replace(request, resume=True),
+        backend_factory=lambda **_: pytest.fail("swapped resume must fail before IDM"),
+        perf_counter=lambda: 1.0,
+    )
+
+    assert swapped
+    assert resumed.overall_status == "failed"
+    moved = tmp_path / "outside-resume-run" / first.run_id
+    assert (moved / "run.json").read_bytes() == original_snapshot
+    _assert_no_new_primary_leaves(tmp_path / "outside-resume-run" / "attacker-target")
 
 
 def test_primary_prediction_publication_uses_held_dynamic_parent_after_swap(
@@ -488,6 +539,7 @@ def test_primary_prediction_publication_uses_held_dynamic_parent_after_swap(
     runner = _install_synthetic_seams(monkeypatch, reference, timing, mappings)
     original_open = runner._open_primary_prediction_parent
     swapped = False
+    calls: list[int] = []
 
     def open_then_swap(*args, **kwargs):
         nonlocal swapped
@@ -501,13 +553,55 @@ def test_primary_prediction_publication_uses_held_dynamic_parent_after_swap(
     descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
     outcome = run_idm_pilot(
         request,
-        backend_factory=_healthy_backend_factory(descriptor, []),
+        backend_factory=_healthy_backend_factory(descriptor, calls),
         perf_counter=lambda: 1.0,
     )
 
     assert swapped
-    assert outcome.overall_status in {"complete", "partial"}
-    assert (tmp_path / "outside-prediction" / "sentinel").read_bytes() == b"must remain untouched"
+    assert outcome.exit_code != 0
+    assert calls == []
+    outside = tmp_path / "outside-prediction"
+    assert (outside / "moved-sentinel").read_bytes() == b"must remain untouched"
+    assert (outside / "attacker-sentinel").read_bytes() == b"must remain untouched"
+    _assert_no_new_primary_leaves(outside / "attacker-target", outside)
+
+
+def test_primary_staged_input_rejects_held_song_directory_after_swap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    handoff, reference, timing, mappings = _synthetic_handoff(tmp_path)
+    request = _request(tmp_path)
+    write_actual_handoff(request.separation_handoff_path, handoff)
+    runner = _install_synthetic_seams(monkeypatch, reference, timing, mappings)
+    original_guard = runner._primary_input_directory_identities
+    swapped = False
+    calls: list[int] = []
+
+    def guard_then_swap(namespace, simfile_id, directory_fd):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            _swap_held_directory(
+                request.output_dir / "runs" / namespace.run_id / "inputs" / str(simfile_id),
+                tmp_path / "outside-input",
+            )
+        return original_guard(namespace, simfile_id, directory_fd)
+
+    monkeypatch.setattr(runner, "_primary_input_directory_identities", guard_then_swap)
+    descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
+    outcome = run_idm_pilot(
+        request,
+        backend_factory=_healthy_backend_factory(descriptor, calls),
+        perf_counter=lambda: 1.0,
+    )
+
+    assert swapped
+    assert outcome.overall_status == "failed"
+    assert calls == []
+    outside = tmp_path / "outside-input"
+    assert (outside / "moved-sentinel").read_bytes() == b"must remain untouched"
+    assert (outside / "attacker-sentinel").read_bytes() == b"must remain untouched"
+    _assert_no_new_primary_leaves(outside)
 
 
 def test_primary_reports_publication_uses_held_report_directories_after_swap(
@@ -537,8 +631,11 @@ def test_primary_reports_publication_uses_held_report_directories_after_swap(
     )
 
     assert swapped
-    assert outcome.overall_status in {"complete", "partial"}
-    assert (tmp_path / "outside-reports" / "sentinel").read_bytes() == b"must remain untouched"
+    assert outcome.overall_status == "failed"
+    outside = tmp_path / "outside-reports"
+    assert (outside / "moved-sentinel").read_bytes() == b"must remain untouched"
+    assert (outside / "attacker-sentinel").read_bytes() == b"must remain untouched"
+    _assert_no_new_primary_leaves(outside / "attacker-target", outside)
 
 
 def test_interrupted_resume_preserves_unvisited_exact_ledger_items(
