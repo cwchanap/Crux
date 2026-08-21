@@ -846,13 +846,11 @@ class IdmPilotRunRequest:
     stem_cache_root: Path
     output_dir: Path
     model_lock_path: Path
-    model_root: Path = DEFAULT_IDM_MODEL_ROOT
     runtime_python: Path
+    model_root: Path = DEFAULT_IDM_MODEL_ROOT
     resume: bool = False
     crux_commit: str | None = None
 ```
-
-If dataclass ordering makes a defaulted `model_root` awkward, keep the request field required but give the CLI/factory `DEFAULT_IDM_MODEL_ROOT`. Do not invent a second cache abstraction.
 
 ### Step 1: Write failure-table/request-shape tests
 
@@ -1164,8 +1162,8 @@ class IdmFullMixSmokeRequest:
     source_cache_dir: Path
     output_dir: Path
     model_lock_path: Path
-    model_root: Path
     runtime_python: Path
+    model_root: Path = DEFAULT_IDM_MODEL_ROOT
     crux_commit: str | None = None
 ```
 
