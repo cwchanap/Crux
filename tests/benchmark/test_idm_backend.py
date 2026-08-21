@@ -1,19 +1,28 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
 import shutil
+import stat
 import struct
+import subprocess
+import sys
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
-from src.benchmark.backend_identity import IDM_BACKEND_ID, sha256_hex
+from src.benchmark.backend_identity import IDM_BACKEND_ID, canonical_json_bytes, sha256_hex
 from src.benchmark.backends.base import CanonicalAudio
 from src.benchmark.backends.idm import (
     IDM_ADAPTER_REVISION,
     IdmBackend,
     IdmBackendError,
+    _attest_runtime_artifacts,
+    _isolated_worker_environment,
+    build_worker_command,
 )
 from src.benchmark.idm_model import (
     IDM_REQUEST_TIMEOUT_SECONDS,
@@ -26,12 +35,14 @@ from src.benchmark.worker_process import WorkerProcessError
 REPOSITORY_ROOT = Path(__file__).parents[2]
 RUNTIME_ROOT = REPOSITORY_ROOT / "runtime" / "idm"
 MODEL_LOCK_PATH = RUNTIME_ROOT / "model.json"
-MODEL_ROOT_SOURCE = Path("/Users/chanwaichan/.cache/uv/git-v0/checkouts/6b3af2406ab45d55/4566568")
 WHEEL_NAME = "inverse_drum_machine-0.1.0-py3-none-any.whl"
 MODEL_RELATIVE_PATHS = (
     "pretrained/idm-44-train-kits/checkpoints/model.yaml",
     "pretrained/idm-44-train-kits/checkpoints/val-epoch=518-global_step=0.ckpt",
 )
+SYNTHETIC_CONFIG = b"synthetic IDM model config\n"
+SYNTHETIC_CHECKPOINT = b"synthetic IDM checkpoint\n"
+WHEEL_SHA256 = hashlib.sha256((RUNTIME_ROOT / "wheels" / WHEEL_NAME).read_bytes()).hexdigest()
 
 
 def _audio(
@@ -55,8 +66,8 @@ def _audio(
     )
 
 
-def _ready(**overrides: object) -> dict[str, object]:
-    lock = load_idm_model_lock(MODEL_LOCK_PATH)
+def _ready(lock_path: Path = MODEL_LOCK_PATH, **overrides: object) -> dict[str, object]:
+    lock = load_idm_model_lock(lock_path)
     ready: dict[str, object] = {
         "type": "ready",
         "backend_id": IDM_BACKEND_ID,
@@ -101,15 +112,36 @@ def _copy_attested_runtime(tmp_path: Path) -> tuple[Path, Path]:
     artifact_root = tmp_path / "runtime"
     wheel_root = artifact_root / "wheels"
     wheel_root.mkdir(parents=True)
-    for name in ("model.json", "uv.lock", "idm-wheel-provenance.json"):
+    for name in ("uv.lock", "idm-wheel-provenance.json"):
         shutil.copyfile(RUNTIME_ROOT / name, artifact_root / name)
     shutil.copyfile(RUNTIME_ROOT / "wheels" / WHEEL_NAME, wheel_root / WHEEL_NAME)
 
+    config_sha256 = hashlib.sha256(SYNTHETIC_CONFIG).hexdigest()
+    checkpoint_sha256 = hashlib.sha256(SYNTHETIC_CHECKPOINT).hexdigest()
+    lock_payload = json.loads((RUNTIME_ROOT / "model.json").read_text(encoding="utf-8"))
+    lock_payload["activation_rate_hz"] = Decimal("172.265625")
+    lock_payload["velocity_max_value"] = Decimal("2.0")
+    lock_payload.update(
+        {
+            "model_config_sha256": config_sha256,
+            "model_config_byte_length": len(SYNTHETIC_CONFIG),
+            "checkpoint_sha256": checkpoint_sha256,
+            "checkpoint_byte_length": len(SYNTHETIC_CHECKPOINT),
+            "model_id": f"idm-44-train-kits-456656868538-{checkpoint_sha256[:12]}",
+        }
+    )
+    (artifact_root / "model.json").write_bytes(
+        canonical_json_bytes(lock_payload, trailing_newline=True)
+    )
+
     model_root = tmp_path / "model-root"
-    for relative in MODEL_RELATIVE_PATHS:
+    for relative, content in (
+        (MODEL_RELATIVE_PATHS[0], SYNTHETIC_CONFIG),
+        (MODEL_RELATIVE_PATHS[1], SYNTHETIC_CHECKPOINT),
+    ):
         destination = model_root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(MODEL_ROOT_SOURCE / relative, destination)
+        destination.write_bytes(content)
     return artifact_root, model_root
 
 
@@ -125,13 +157,19 @@ def _backend(
     runtime_python = tmp_path / "runtime-python"
     input_root = tmp_path / "input"
     if artifact_root is None:
-        model_lock_path = MODEL_LOCK_PATH
-        model_root = MODEL_ROOT_SOURCE if model_root is None else model_root
+        artifact_root, default_model_root = _copy_attested_runtime(tmp_path)
+        model_lock_path = artifact_root / "model.json"
+        model_root = default_model_root if model_root is None else model_root
     else:
         model_lock_path = artifact_root / "model.json"
         model_root = artifact_root.parent / "model-root" if model_root is None else model_root
     model_root.mkdir(parents=True, exist_ok=True)
     input_root.mkdir(exist_ok=True)
+
+    expected_model_id = load_idm_model_lock(model_lock_path).model_id
+    source_model_id = load_idm_model_lock(MODEL_LOCK_PATH).model_id
+    if worker.ready.get("model_id") == source_model_id:
+        worker.ready["model_id"] = expected_model_id
 
     def factory(command: list[str], **factory_kwargs: object) -> _FakeWorker:
         if calls is not None:
@@ -151,9 +189,16 @@ def _backend(
 def test_idm_backend_launches_isolated_python_and_forwards_frozen_timeouts(
     tmp_path: Path,
 ) -> None:
+    artifact_root, model_root = _copy_attested_runtime(tmp_path)
     worker = _FakeWorker(_ready(), {"id": "request", "events": []})
     calls: list[tuple[list[str], dict[str, object]]] = []
-    backend = _backend(tmp_path, worker, calls)
+    backend = _backend(
+        tmp_path,
+        worker,
+        calls,
+        artifact_root=artifact_root,
+        model_root=model_root,
+    )
     try:
         backend.transcribe(_audio(tmp_path / "input"))
     finally:
@@ -163,17 +208,34 @@ def test_idm_backend_launches_isolated_python_and_forwards_frozen_timeouts(
         (
             [
                 str(tmp_path / "runtime-python"),
+                "-I",
+                "-S",
                 str(RUNTIME_ROOT / "worker.py"),
                 "--model-root",
-                str(MODEL_ROOT_SOURCE),
+                str(model_root),
+                "--site-packages",
+                str(tmp_path.parent / "lib" / "python3.11" / "site-packages"),
                 "--wheel-path",
-                str(RUNTIME_ROOT / "wheels" / WHEEL_NAME),
+                str(artifact_root / "wheels" / WHEEL_NAME),
                 "--wheel-sha256",
-                "b4e8dc567e3d013cddecec5e8ba16b9424951af18e28dcd1d94854d6bcbe7ab5",
+                WHEEL_SHA256,
+                "--model-config-path",
+                str(model_root / MODEL_RELATIVE_PATHS[0]),
+                "--model-config-sha256",
+                hashlib.sha256(SYNTHETIC_CONFIG).hexdigest(),
+                "--model-config-byte-length",
+                str(len(SYNTHETIC_CONFIG)),
+                "--checkpoint-path",
+                str(model_root / MODEL_RELATIVE_PATHS[1]),
+                "--checkpoint-sha256",
+                hashlib.sha256(SYNTHETIC_CHECKPOINT).hexdigest(),
+                "--checkpoint-byte-length",
+                str(len(SYNTHETIC_CHECKPOINT)),
             ],
             {
                 "timeout_seconds": IDM_REQUEST_TIMEOUT_SECONDS,
                 "close_timeout_seconds": IDM_WORKER_CLOSE_TIMEOUT_SECONDS,
+                "env": _isolated_worker_environment(),
             },
         )
     ]
@@ -374,7 +436,8 @@ def test_idm_backend_binds_worker_import_to_attested_wheel_path(tmp_path: Path) 
 
     command = calls[0][0]
     assert command[command.index("--wheel-path") + 1] == str(artifact_root / "wheels" / WHEEL_NAME)
-    assert str(MODEL_ROOT_SOURCE / "idm") not in command
+    assert command[command.index("--model-root") + 1] == str(model_root)
+    assert str(model_root / "idm") not in command
 
 
 def test_idm_backend_accepts_exact_activation_frame_boundary(tmp_path: Path) -> None:
@@ -405,3 +468,116 @@ def test_idm_backend_rejects_one_past_activation_frame_boundary(tmp_path: Path) 
         backend.transcribe(audio)
 
     assert raised.value.code == "native_event_invalid"
+
+
+def test_idm_worker_stages_verified_model_bytes_before_source_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from runtime.idm import worker
+
+    config_path = tmp_path / "model.yaml"
+    checkpoint_path = tmp_path / "model.ckpt"
+    config_path.write_bytes(SYNTHETIC_CONFIG)
+    checkpoint_path.write_bytes(SYNTHETIC_CHECKPOINT)
+    original_read = worker._read_attested_file
+
+    def read_then_swap(path: Path, digest: str, length: int) -> bytes:
+        content = original_read(path, digest, length)
+        if path == config_path:
+            path.write_bytes(b"swapped after host preflight")
+        return content
+
+    monkeypatch.setattr(worker, "_read_attested_file", read_then_swap)
+    project_root = tmp_path / "project"
+    worker._stage_model_files(
+        project_root,
+        config_path,
+        hashlib.sha256(SYNTHETIC_CONFIG).hexdigest(),
+        len(SYNTHETIC_CONFIG),
+        checkpoint_path,
+        hashlib.sha256(SYNTHETIC_CHECKPOINT).hexdigest(),
+        len(SYNTHETIC_CHECKPOINT),
+    )
+
+    staged_config = project_root / MODEL_RELATIVE_PATHS[0]
+    staged_checkpoint = project_root / MODEL_RELATIVE_PATHS[1]
+    assert staged_config.read_bytes() == SYNTHETIC_CONFIG
+    assert staged_checkpoint.read_bytes() == SYNTHETIC_CHECKPOINT
+    for staged in (staged_config, staged_checkpoint):
+        assert not staged.is_symlink()
+        assert stat.S_IMODE(staged.stat().st_mode) == 0o600
+
+
+def test_idm_worker_rejects_source_swap_after_host_preflight(tmp_path: Path) -> None:
+    artifact_root, model_root = _copy_attested_runtime(tmp_path)
+    lock_path = artifact_root / "model.json"
+    lock = load_idm_model_lock(lock_path)
+    attested = _attest_runtime_artifacts(lock, lock_path, model_root)
+    model_config_path = model_root / MODEL_RELATIVE_PATHS[0]
+    model_config_path.write_bytes(b"swapped after host preflight")
+
+    from runtime.idm import worker
+
+    with pytest.raises(ValueError, match="attested file"):
+        worker._stage_model_files(
+            tmp_path / "project",
+            attested[2],
+            attested[3],
+            attested[4],
+            attested[5],
+            attested[6],
+            attested[7],
+        )
+
+
+def test_idm_worker_command_blocks_pythonpath_sitecustomize_preload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attacker_root = tmp_path / "attacker"
+    attacker_root.mkdir()
+    marker = tmp_path / "preloaded"
+    (attacker_root / "idm").mkdir()
+    (attacker_root / "idm" / "__init__.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('idm')\n",
+        encoding="utf-8",
+    )
+    (attacker_root / "sitecustomize.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('sitecustomize')\nimport idm\n",
+        encoding="utf-8",
+    )
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'idm': any(name == 'idm' or name.startswith('idm.') "
+        "for name in sys.modules), 'sitecustomize': 'sitecustomize' in sys.modules}))\n",
+        encoding="utf-8",
+    )
+    for key in ("PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE"):
+        monkeypatch.setenv(key, str(attacker_root))
+    command = build_worker_command(
+        Path(sys.executable),
+        tmp_path / "model-root",
+        wheel_path=tmp_path / WHEEL_NAME,
+        wheel_sha256=WHEEL_SHA256,
+        site_packages=tmp_path / "site-packages",
+        model_config_path=tmp_path / "model.yaml",
+        model_config_sha256="a" * 64,
+        model_config_byte_length=1,
+        checkpoint_path=tmp_path / "model.ckpt",
+        checkpoint_sha256="b" * 64,
+        checkpoint_byte_length=1,
+    )
+    command[command.index(str(RUNTIME_ROOT / "worker.py"))] = str(probe)
+    result = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+    )
+
+    assert command[1:3] == ["-I", "-S"]
+    assert json.loads(result.stdout) == {"idm": False, "sitecustomize": False}
+    assert not marker.exists()
+    isolated = _isolated_worker_environment()
+    assert all(key not in isolated for key in ("PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE"))

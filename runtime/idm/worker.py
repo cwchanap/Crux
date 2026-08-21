@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import sys
 import tempfile
 import zipfile
@@ -71,13 +72,34 @@ def _load_model(
     *,
     wheel_path: Path | None = None,
     wheel_sha256: str | None = None,
+    site_packages: Path | None = None,
+    model_config_path: Path | None = None,
+    model_config_sha256: str | None = None,
+    model_config_byte_length: int | None = None,
+    checkpoint_path: Path | None = None,
+    checkpoint_sha256: str | None = None,
+    checkpoint_byte_length: int | None = None,
 ) -> tuple[Any, Any, Any]:
-    import torch
-
     global _WHEEL_PROJECT
-    if wheel_path is None or wheel_sha256 is None or wheel_path.is_symlink():
-        raise ValueError("attested IDM wheel is required")
-    wheel_bytes = wheel_path.read_bytes()
+    if sys.flags.isolated != 1 or sys.flags.no_site != 1:
+        raise ValueError("IDM worker requires isolated no-site interpreter startup")
+    if any(name == "idm" or name.startswith("idm.") for name in sys.modules):
+        raise ValueError("IDM package was imported before attestation")
+    if "sitecustomize" in sys.modules or "usercustomize" in sys.modules:
+        raise ValueError("Python customization was imported before attestation")
+    if (
+        wheel_path is None
+        or wheel_sha256 is None
+        or site_packages is None
+        or model_config_path is None
+        or model_config_sha256 is None
+        or model_config_byte_length is None
+        or checkpoint_path is None
+        or checkpoint_sha256 is None
+        or checkpoint_byte_length is None
+    ):
+        raise ValueError("attested IDM runtime and model files are required")
+    wheel_bytes = _read_regular_file_no_follow(wheel_path)
     if hashlib.sha256(wheel_bytes).hexdigest() != wheel_sha256:
         raise ValueError("attested IDM wheel digest does not match")
 
@@ -88,20 +110,138 @@ def _load_model(
     with zipfile.ZipFile(_bytes_as_file(wheel_bytes)) as wheel:
         wheel.extractall(project_root)
     (project_root / ".project-root").touch()
-    model_data_root = project_root / MODEL_CONFIG_RELATIVE_PATH.parent
-    model_data_root.mkdir(parents=True)
-    for relative_path in (MODEL_CONFIG_RELATIVE_PATH, CHECKPOINT_RELATIVE_PATH):
-        (model_data_root / relative_path.name).symlink_to(
-            (model_root / relative_path).resolve(strict=True)
-        )
+    _stage_model_files(
+        project_root,
+        model_config_path,
+        model_config_sha256,
+        model_config_byte_length,
+        checkpoint_path,
+        checkpoint_sha256,
+        checkpoint_byte_length,
+    )
+    _configure_isolated_imports(site_packages, project_root)
+    import torch
+
     os.chdir(project_root)
-    sys.path.insert(0, os.fspath(project_root))
     from idm.inference import load_model
 
     with contextlib.redirect_stdout(sys.stderr):
         model, _ = load_model("idm-44-train-kits", torch.device("cpu"), log_dir=Path("pretrained"))
     model.eval()
     return model, torch, torch.device("cpu")
+
+
+def _read_regular_file_no_follow(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+    expected_length: int | None = None,
+) -> bytes:
+    if not isinstance(path, Path):
+        raise TypeError("path must be a Path")
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise ValueError("no-follow file reads are unavailable")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("attested file is not regular")
+        chunks: list[bytes] = []
+        digest = hashlib.sha256()
+        length = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                content = b"".join(chunks)
+                if expected_length is not None and length != expected_length:
+                    raise ValueError("attested file length does not match")
+                if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
+                    raise ValueError("attested file digest does not match")
+                return content
+            chunks.append(chunk)
+            digest.update(chunk)
+            length += len(chunk)
+    finally:
+        os.close(descriptor)
+
+
+def _read_attested_file(path: Path, digest: str, length: int) -> bytes:
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        or type(length) is not int
+        or length < 0
+    ):
+        raise ValueError("attested file identity is invalid")
+    return _read_regular_file_no_follow(
+        path,
+        expected_sha256=digest,
+        expected_length=length,
+    )
+
+
+def _write_private_file(path: Path, content: bytes) -> None:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise ValueError("no-follow file writes are unavailable")
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short private file write")
+            view = view[written:]
+    finally:
+        os.close(descriptor)
+    metadata = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise ValueError("staged model file is not private")
+
+
+def _stage_model_files(
+    project_root: Path,
+    model_config_path: Path,
+    model_config_sha256: str,
+    model_config_byte_length: int,
+    checkpoint_path: Path,
+    checkpoint_sha256: str,
+    checkpoint_byte_length: int,
+) -> None:
+    model_config = _read_attested_file(
+        model_config_path,
+        model_config_sha256,
+        model_config_byte_length,
+    )
+    checkpoint = _read_attested_file(
+        checkpoint_path,
+        checkpoint_sha256,
+        checkpoint_byte_length,
+    )
+    model_data_root = project_root / MODEL_CONFIG_RELATIVE_PATH.parent
+    model_data_root.mkdir(parents=True)
+    _write_private_file(model_data_root / MODEL_CONFIG_RELATIVE_PATH.name, model_config)
+    _write_private_file(model_data_root / CHECKPOINT_RELATIVE_PATH.name, checkpoint)
+
+
+def _configure_isolated_imports(site_packages: Path, wheel_project: Path) -> None:
+    if (
+        not isinstance(site_packages, Path)
+        or site_packages.is_symlink()
+        or not site_packages.is_dir()
+    ):
+        raise ValueError("isolated runtime site-packages are unavailable")
+    sys.path.insert(0, os.fspath(wheel_project))
+    sys.path.insert(1, os.fspath(site_packages))
 
 
 def _load_audio(path: str, torch: Any, device: Any) -> Any:
@@ -168,6 +308,13 @@ def serve_requests(
     model_root: Path,
     wheel_path: Path | None = None,
     wheel_sha256: str | None = None,
+    site_packages: Path | None = None,
+    model_config_path: Path | None = None,
+    model_config_sha256: str | None = None,
+    model_config_byte_length: int | None = None,
+    checkpoint_path: Path | None = None,
+    checkpoint_sha256: str | None = None,
+    checkpoint_byte_length: int | None = None,
     model_loader: Callable[..., tuple[Any, Any, Any]] = _load_model,
 ) -> int:
     if model_loader is _load_model:
@@ -175,6 +322,13 @@ def serve_requests(
             model_root,
             wheel_path=wheel_path,
             wheel_sha256=wheel_sha256,
+            site_packages=site_packages,
+            model_config_path=model_config_path,
+            model_config_sha256=model_config_sha256,
+            model_config_byte_length=model_config_byte_length,
+            checkpoint_path=checkpoint_path,
+            checkpoint_sha256=checkpoint_sha256,
+            checkpoint_byte_length=checkpoint_byte_length,
         )
     else:
         model, torch, device = model_loader(model_root)
@@ -233,11 +387,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model-root", type=Path, required=True)
     parser.add_argument("--wheel-path", type=Path, required=True)
     parser.add_argument("--wheel-sha256", required=True)
+    parser.add_argument("--site-packages", type=Path, required=True)
+    parser.add_argument("--model-config-path", type=Path, required=True)
+    parser.add_argument("--model-config-sha256", required=True)
+    parser.add_argument("--model-config-byte-length", type=int, required=True)
+    parser.add_argument("--checkpoint-path", type=Path, required=True)
+    parser.add_argument("--checkpoint-sha256", required=True)
+    parser.add_argument("--checkpoint-byte-length", type=int, required=True)
     args = parser.parse_args(argv)
     return serve_requests(
         model_root=args.model_root,
         wheel_path=args.wheel_path,
         wheel_sha256=args.wheel_sha256,
+        site_packages=args.site_packages,
+        model_config_path=args.model_config_path,
+        model_config_sha256=args.model_config_sha256,
+        model_config_byte_length=args.model_config_byte_length,
+        checkpoint_path=args.checkpoint_path,
+        checkpoint_sha256=args.checkpoint_sha256,
+        checkpoint_byte_length=args.checkpoint_byte_length,
     )
 
 
