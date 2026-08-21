@@ -90,10 +90,18 @@ class _FakeWorker:
         self.ready = ready
         self.response = response
         self.requests: list[str] = []
+        self.request_identities: list[tuple[int | None, str | None]] = []
         self.close_count = 0
 
-    def request(self, path: str) -> dict[str, object]:
+    def request(
+        self,
+        path: str,
+        *,
+        audio_byte_length: int | None = None,
+        audio_sha256: str | None = None,
+    ) -> dict[str, object]:
         self.requests.append(path)
+        self.request_identities.append((audio_byte_length, audio_sha256))
         if isinstance(self.response, BaseException):
             raise self.response
         return self.response
@@ -265,6 +273,135 @@ def test_idm_backend_decodes_events_and_reuses_worker(tmp_path: Path) -> None:
     assert event.confidence == 0.83
     assert event.velocity_midi == round((1.337421 / 2.0) * 127)
     assert worker.requests == [str(audio.path.resolve()), str(audio.path.resolve())]
+    assert worker.request_identities == [
+        (audio.byte_length, audio.input_audio_sha256),
+        (audio.byte_length, audio.input_audio_sha256),
+    ]
+
+
+@pytest.mark.parametrize("replacement", ("leaf", "ancestor"))
+def test_idm_worker_reads_only_verified_staged_audio_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement: str
+) -> None:
+    from runtime.idm import worker
+
+    original = b"verified wav bytes"
+    substituted = b"substituted wav bytes"
+    input_root = tmp_path / "inputs"
+    staged_parent = input_root / "20"
+    staged_parent.mkdir(parents=True)
+    staged_path = staged_parent / "verified.wav"
+    staged_path.write_bytes(original)
+
+    if replacement == "leaf":
+        staged_path.unlink()
+        staged_path.symlink_to(tmp_path / "substituted.wav")
+        (tmp_path / "substituted.wav").write_bytes(substituted)
+    else:
+        staged_parent.rename(tmp_path / "original-parent")
+        (tmp_path / "substituted-parent").mkdir()
+        (tmp_path / "substituted-parent" / "verified.wav").write_bytes(substituted)
+        staged_parent.symlink_to(tmp_path / "substituted-parent", target_is_directory=True)
+
+    class FakeSoundFile:
+        @staticmethod
+        def info(stream):
+            assert not isinstance(stream, (str, Path))
+            assert stream.read() == original
+            return type(
+                "Info",
+                (),
+                {"format": "WAV", "subtype": "PCM_16", "samplerate": 44100, "channels": 1},
+            )()
+
+        @staticmethod
+        def read(stream, *, dtype, always_2d):
+            assert dtype == "float32"
+            assert always_2d is True
+            stream.seek(0)
+            assert stream.read() == original
+            return [[0.0]], 44100
+
+    monkeypatch.setitem(sys.modules, "soundfile", FakeSoundFile)
+
+    class FakeTensor:
+        def to(self, _device):
+            return self
+
+        def unsqueeze(self, _axis):
+            return self
+
+    class FakeTorch:
+        @staticmethod
+        def from_numpy(_samples):
+            return FakeTensor()
+
+    with pytest.raises(ValueError, match="audio"):
+        worker._load_audio(
+            str(staged_path),
+            len(original),
+            hashlib.sha256(original).hexdigest(),
+            FakeTorch(),
+            "cpu",
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"id": "request", "audio_path": "/tmp/verified.wav"},
+        {
+            "id": "request",
+            "audio_path": "/tmp/verified.wav",
+            "audio_byte_length": True,
+            "audio_sha256": "0" * 64,
+        },
+        {
+            "id": "request",
+            "audio_path": "/tmp/verified.wav",
+            "audio_byte_length": 1,
+            "audio_sha256": "not-a-sha",
+        },
+    ],
+)
+def test_idm_worker_validates_audio_identity_protocol(payload: dict[str, object]) -> None:
+    from runtime.idm import worker
+
+    with pytest.raises(ValueError, match="request|byte length|digest"):
+        worker._valid_request(payload)
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_message"),
+    [
+        ("mismatch", "audio"),
+        ("directory", "audio"),
+    ],
+)
+def test_idm_worker_rejects_staged_audio_identity_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, expected_message: str
+) -> None:
+    from runtime.idm import worker
+
+    original = b"verified wav bytes"
+    staged_path = tmp_path / "verified.wav"
+    staged_path.write_bytes(original)
+    if kind == "directory":
+        staged_path.unlink()
+        staged_path.mkdir()
+
+    class FakeTorch:
+        pass
+
+    monkeypatch.setitem(sys.modules, "soundfile", object())
+    with pytest.raises(ValueError, match=expected_message):
+        worker._load_audio(
+            str(staged_path),
+            len(original) + (1 if kind == "mismatch" else 0),
+            hashlib.sha256(original).hexdigest(),
+            FakeTorch(),
+            "cpu",
+        )
 
 
 @pytest.mark.parametrize(

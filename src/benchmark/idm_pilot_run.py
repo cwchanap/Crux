@@ -11,7 +11,9 @@ from __future__ import annotations
 import math
 import os
 import re
+import secrets
 import stat
+import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
@@ -23,6 +25,7 @@ from typing import Any, Literal
 
 from src.benchmark.artifact_io import (
     ArtifactPublicationError,
+    PublishedArtifact,
     publish_immutable_file_at,
     read_regular_file_no_follow,
 )
@@ -70,6 +73,7 @@ from src.benchmark.prediction_artifact import (
     prediction_path,
     publish_prediction_artifact,
     read_prediction_artifact,
+    render_prediction_artifact,
 )
 from src.benchmark.reference_set import ReferenceMappingResult
 from src.benchmark.reference_set_manifest import (
@@ -916,6 +920,258 @@ _PRIMARY_REPORT_FILENAMES = (
 )
 
 
+@dataclass
+class _PrimaryNamespace:
+    """Held descriptors for the primary run-owned output namespace."""
+
+    run_id: str
+    output_fd: int
+    runs_fd: int
+    predictions_fd: int
+    run_fd: int
+    input_fd: int
+    reports_fd: int
+    oaf_reports_fd: int
+    idm_reports_fd: int
+
+
+def _close_primary_namespace(namespace: _PrimaryNamespace | None) -> None:
+    if namespace is None:
+        return
+    for descriptor in (
+        namespace.idm_reports_fd,
+        namespace.oaf_reports_fd,
+        namespace.reports_fd,
+        namespace.input_fd,
+        namespace.run_fd,
+        namespace.predictions_fd,
+        namespace.runs_fd,
+        namespace.output_fd,
+    ):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _close_primary_prediction_parents(parents: Mapping[str, int]) -> None:
+    for descriptor in set(parents.values()):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _open_primary_child_directory(parent_fd: int, name: str) -> int:
+    """Open or create one private directory relative to a held parent."""
+    if not isinstance(parent_fd, int) or not isinstance(name, str):
+        raise TypeError("primary directory parent and name are invalid")
+    if not name or "/" in name or name in {".", ".."}:
+        raise ValueError("primary directory name is invalid")
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory is None:
+        raise OSError("primary directory no-follow support is unavailable")
+    flags = os.O_RDONLY | no_follow | directory | getattr(os, "O_CLOEXEC", 0)
+    try:
+        return os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except FileExistsError:
+            pass
+        return os.open(name, flags, dir_fd=parent_fd)
+
+
+def _open_primary_report_directories(
+    reports_path: Path, namespace: _PrimaryNamespace
+) -> tuple[int, int]:
+    """Open the two report roots relative to the held run report directory."""
+    if not isinstance(reports_path, Path):
+        raise TypeError("reports_path must be a Path")
+    oaf_fd: int | None = None
+    try:
+        oaf_fd = _open_primary_child_directory(namespace.reports_fd, "oaf")
+        idm_fd = _open_primary_child_directory(namespace.reports_fd, "idm")
+    except BaseException:
+        if oaf_fd is not None:
+            os.close(oaf_fd)
+        raise
+    return oaf_fd, idm_fd
+
+
+def _open_primary_namespace(
+    request: IdmPilotRunRequest,
+    *,
+    run_id: str,
+    run_dir: Path,
+    reports_path: Path,
+) -> _PrimaryNamespace:
+    """Hold every primary output directory used after preflight."""
+    ensure_durable_directory(request.output_dir)
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory is None:
+        raise OSError("primary output no-follow support is unavailable")
+    flags = os.O_RDONLY | no_follow | directory | getattr(os, "O_CLOEXEC", 0)
+    descriptors: list[int] = []
+    try:
+        output_fd = os.open(request.output_dir, flags)
+        descriptors.append(output_fd)
+        runs_fd = _open_primary_child_directory(output_fd, "runs")
+        descriptors.append(runs_fd)
+        predictions_fd = _open_primary_child_directory(output_fd, "predictions")
+        descriptors.append(predictions_fd)
+        run_fd = _open_primary_child_directory(runs_fd, run_id)
+        descriptors.append(run_fd)
+        input_fd = _open_primary_child_directory(run_fd, "inputs")
+        descriptors.append(input_fd)
+        reports_fd = _open_primary_child_directory(run_fd, "reports")
+        descriptors.append(reports_fd)
+        namespace = _PrimaryNamespace(
+            run_id=run_id,
+            output_fd=output_fd,
+            runs_fd=runs_fd,
+            predictions_fd=predictions_fd,
+            run_fd=run_fd,
+            input_fd=input_fd,
+            reports_fd=reports_fd,
+            oaf_reports_fd=-1,
+            idm_reports_fd=-1,
+        )
+        oaf_fd, idm_fd = _open_primary_report_directories(reports_path, namespace)
+        namespace.oaf_reports_fd = oaf_fd
+        namespace.idm_reports_fd = idm_fd
+        descriptors.extend((oaf_fd, idm_fd))
+        return namespace
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+
+def _read_primary_file_at(directory_fd: int, name: str) -> bytes:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise OSError("primary file no-follow support is unavailable")
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=directory_fd,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("primary output is not a regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+
+
+def _primary_atomic_replace_at(directory_fd: int, name: str, content: bytes) -> None:
+    """Atomically replace one primary leaf relative to a held directory."""
+    if not isinstance(name, str) or not name or "/" in name or name in {".", ".."}:
+        raise ValueError("primary output leaf name is invalid")
+    if not isinstance(content, bytes):
+        raise TypeError("primary output content must be bytes")
+    temporary_name = f".{name}.{secrets.token_hex(12)}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short primary output write")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(temporary_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _open_primary_prediction_parent(
+    target: Path, namespace: _PrimaryNamespace, output_dir: Path
+) -> int:
+    """Hold the dynamic prediction parent through inference publication."""
+    try:
+        relative = target.relative_to(output_dir)
+    except ValueError as error:
+        raise IdmPilotRunError(
+            "prediction path escapes output root", code="prediction_artifact_invalid"
+        ) from error
+    if len(relative.parts) < 3 or relative.parts[0] != "predictions":
+        raise IdmPilotRunError(
+            "prediction path is outside the primary namespace", code="prediction_artifact_invalid"
+        )
+    parent_fd = namespace.predictions_fd
+    opened: list[int] = []
+    try:
+        for component in relative.parts[1:-1]:
+            child_fd = _open_primary_child_directory(parent_fd, component)
+            opened.append(child_fd)
+            if parent_fd != namespace.predictions_fd:
+                os.close(parent_fd)
+            parent_fd = child_fd
+        return parent_fd
+    except BaseException:
+        for descriptor in reversed(opened):
+            if descriptor != parent_fd:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        if parent_fd != namespace.predictions_fd:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+        raise
+
+
+def _publish_primary_prediction_at(
+    directory_fd: int, target: Path, prediction: object
+) -> PublishedArtifact:
+    content = render_prediction_artifact(prediction)  # type: ignore[arg-type]
+    try:
+        digest = publish_immutable_file_at(directory_fd, target.name, content)
+        persisted = _read_primary_file_at(directory_fd, target.name)
+        artifact = read_prediction_artifact(persisted)
+    except ArtifactPublicationError:
+        raise
+    except (OSError, PredictionArtifactError, TypeError, ValueError) as error:
+        raise PredictionArtifactError("published prediction bytes are invalid") from error
+    if artifact.content != content or artifact.artifact_sha256 != digest:
+        raise PredictionArtifactError("published prediction bytes changed")
+    return PublishedArtifact(path=target, sha256=digest)
+
+
 def _validate_primary_namespace_path(
     path: Path,
     output_dir: Path,
@@ -1084,6 +1340,8 @@ def _stage_primary_verified_input(
     output_dir: Path,
     simfile_id: int,
     content: bytes,
+    *,
+    input_root_fd: int | None = None,
 ) -> Path:
     """Persist verified handoff bytes in a private, run-owned regular file."""
     if type(simfile_id) is not int or simfile_id <= 0:
@@ -1106,19 +1364,24 @@ def _stage_primary_verified_input(
             field,
             leaf_kind="file" if path == staged_path else "directory",
         )
+    directory_fd: int | None = None
     try:
-        ensure_durable_directory(song_root)
-        directory_fd = os.open(
-            song_root,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-        )
+        if input_root_fd is None:
+            ensure_durable_directory(song_root)
+            directory_fd = os.open(
+                song_root,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+        else:
+            directory_fd = _open_primary_child_directory(input_root_fd, str(simfile_id))
     except OSError as error:
         raise IdmPilotRunError(
             "verified IDM input directory is unavailable", code="retained_input_invalid"
         ) from error
+    assert directory_fd is not None
     try:
         try:
             publish_immutable_file_at(directory_fd, staged_path.name, content)
@@ -1129,17 +1392,25 @@ def _stage_primary_verified_input(
     finally:
         os.close(directory_fd)
     try:
-        persisted = read_regular_file_no_follow(staged_path)
-        metadata = staged_path.lstat()
+        if input_root_fd is None:
+            persisted = read_regular_file_no_follow(staged_path)
+            metadata = staged_path.lstat()
+            regular = stat.S_ISREG(metadata.st_mode)
+            private = not stat.S_IMODE(metadata.st_mode) & 0o077
+        else:
+            verify_fd = _open_primary_child_directory(input_root_fd, str(simfile_id))
+            try:
+                persisted = _read_primary_file_at(verify_fd, staged_path.name)
+                metadata = os.stat(staged_path.name, dir_fd=verify_fd, follow_symlinks=False)
+            finally:
+                os.close(verify_fd)
+            regular = stat.S_ISREG(metadata.st_mode)
+            private = not stat.S_IMODE(metadata.st_mode) & 0o077
     except OSError as error:
         raise IdmPilotRunError(
             "verified IDM input could not be re-read", code="retained_input_invalid"
         ) from error
-    if (
-        persisted != content
-        or not stat.S_ISREG(metadata.st_mode)
-        or stat.S_IMODE(metadata.st_mode) & 0o077
-    ):
+    if persisted != content or not regular or not private:
         raise IdmPilotRunError(
             "verified IDM input bytes or permissions changed", code="retained_input_invalid"
         )
@@ -1450,7 +1721,12 @@ def _validate_lineage(
 
 def _backend_failure_code(error: BaseException) -> str:
     raw = getattr(error, "code", None)
-    if raw in {"input_path_invalid", "input_audio_invalid", "runtime_artifact_invalid"}:
+    if raw in {
+        "input_path_invalid",
+        "input_audio_invalid",
+        "invalid_request",
+        "runtime_artifact_invalid",
+    }:
         return "retained_input_invalid"
     if isinstance(raw, str) and raw:
         return raw
@@ -1495,6 +1771,21 @@ def _set_quarantined(item: dict[str, object], detail: str = "reference is quaran
 
 def _prediction_relative_path(path: Path, output_dir: Path) -> str:
     return path.resolve().relative_to(output_dir.resolve()).as_posix()
+
+
+def _primary_prediction_relative_path(path: Path, output_dir: Path) -> str:
+    """Return the lexical primary path without resolving a swapped directory."""
+    try:
+        relative = path.relative_to(output_dir)
+    except ValueError as error:
+        raise IdmPilotRunError(
+            "prediction path escapes output root", code="prediction_artifact_invalid"
+        ) from error
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        raise IdmPilotRunError(
+            "prediction path contains invalid components", code="prediction_artifact_invalid"
+        )
+    return relative.as_posix()
 
 
 def _prediction_matches(
@@ -1569,6 +1860,7 @@ def build_idm_cohort_from_snapshot(
     *,
     mappings: Mapping[int, ReferenceMappingResult | None],
     output_dir: Path,
+    prediction_parent_fds: Mapping[str, int] | None = None,
 ) -> tuple[CohortIdentity, tuple[CohortItem, ...]]:
     """Re-read IDM artifacts and reconstruct the complete HPA-325 cohort."""
     descriptor_payload = snapshot.get("backend_descriptor")
@@ -1612,8 +1904,16 @@ def build_idm_cohort_from_snapshot(
                 continue
             if not isinstance(prediction_path_value, str):
                 raise ValueError("successful IDM item has no prediction path")
-            path = _owned_path(output_dir, prediction_path_value, "IDM prediction")
-            content = read_regular_file_no_follow(path)
+            held_parent_fd = (
+                prediction_parent_fds.get(prediction_path_value)
+                if prediction_parent_fds is not None
+                else None
+            )
+            if held_parent_fd is not None:
+                content = _read_primary_file_at(held_parent_fd, Path(prediction_path_value).name)
+            else:
+                path = _owned_path(output_dir, prediction_path_value, "IDM prediction")
+                content = read_regular_file_no_follow(path)
             expected_sha = raw_item.get("prediction_artifact_sha256")
             if sha256_hex(content) != expected_sha:
                 raise ValueError("IDM prediction artifact hash differs from snapshot")
@@ -1836,6 +2136,7 @@ def _write_checkpoint(
     completed_at: str | None = None,
     close_error: Mapping[str, object] | None = None,
     native_failure_counts: Mapping[str, int] | None = None,
+    run_fd: int | None = None,
 ) -> None:
     snapshot: dict[str, object] = dict(header)
     snapshot["items"] = [
@@ -1850,7 +2151,11 @@ def _write_checkpoint(
         snapshot["close_error"] = dict(close_error)
     if native_failure_counts is not None:
         snapshot["native_failure_counts"] = dict(sorted(native_failure_counts.items()))
-    write_idm_pilot_run(run_path, snapshot)
+    content = render_idm_pilot_run(snapshot)
+    if run_fd is None:
+        write_idm_pilot_run(run_path, snapshot)
+    else:
+        _primary_atomic_replace_at(run_fd, run_path.name, content)
 
 
 def _build_report_cohorts(
@@ -1861,6 +2166,7 @@ def _build_report_cohorts(
     separation_artifact_root: Path,
     stem_cache_root: Path,
     output_dir: Path,
+    prediction_parent_fds: Mapping[str, int] | None = None,
 ) -> tuple[
     tuple[CohortIdentity, tuple[CohortItem, ...]], tuple[CohortIdentity, tuple[CohortItem, ...]]
 ]:
@@ -1871,8 +2177,23 @@ def _build_report_cohorts(
         separation_artifact_root=separation_artifact_root,
         stem_cache_root=stem_cache_root,
     )
-    idm = build_idm_cohort_from_snapshot(snapshot, mappings=mappings, output_dir=output_dir)
+    idm = build_idm_cohort_from_snapshot(
+        snapshot,
+        mappings=mappings,
+        output_dir=output_dir,
+        prediction_parent_fds=prediction_parent_fds,
+    )
     return oaf, idm
+
+
+def _publish_primary_cohort_reports(result: object, reports_fd: int) -> None:
+    """Render reports privately, then publish their fixed leaves by descriptor."""
+    with tempfile.TemporaryDirectory(prefix=".idm-primary-report-stage-") as stage_name:
+        staged_dir = Path(stage_name)
+        write_cohort_reports(result, staged_dir)  # type: ignore[arg-type]
+        for filename in _PRIMARY_REPORT_FILENAMES:
+            content = read_regular_file_no_follow(staged_dir / filename)
+            _primary_atomic_replace_at(reports_fd, filename, content)
 
 
 def _outcome_from_scores(
@@ -1979,14 +2300,20 @@ def run_idm_pilot(
         )
     except (OSError, RuntimeError, TypeError, ValueError, IdmPilotRunError):
         return _fatal_outcome()
+    namespace: _PrimaryNamespace | None = None
     try:
         started_at = _timestamp(clock())
-        ensure_durable_directory(request.output_dir / "runs")
-        ensure_durable_directory(run_dir)
+        ensure_durable_directory(request.output_dir)
         _validate_primary_namespace(
             request,
             run_id=run_id,
             allow_existing_run=True,
+        )
+        namespace = _open_primary_namespace(
+            request,
+            run_id=run_id,
+            run_dir=run_dir,
+            reports_path=reports_path,
         )
         header = _build_header(
             request,
@@ -2002,18 +2329,21 @@ def run_idm_pilot(
             started_at=started_at,
         )
         prior_items: dict[int, Mapping[str, object]] = {}
-        if request.resume and run_path.exists():
-            prior_snapshot = parse_idm_pilot_run(
-                read_regular_file_no_follow(run_path), expected_run_id=run_id
-            )
-            raw_prior_items = prior_snapshot.get("items", [])
-            if not isinstance(raw_prior_items, list):
-                raise ValueError("prior run items are invalid")
-            prior_items = {
-                int(item["simfile_id"]): item
-                for item in raw_prior_items
-                if isinstance(item, Mapping) and type(item.get("simfile_id")) is int
-            }
+        if request.resume:
+            try:
+                prior_content = _read_primary_file_at(namespace.run_fd, run_path.name)
+            except FileNotFoundError:
+                prior_content = None
+            if prior_content is not None:
+                prior_snapshot = parse_idm_pilot_run(prior_content, expected_run_id=run_id)
+                raw_prior_items = prior_snapshot.get("items", [])
+                if not isinstance(raw_prior_items, list):
+                    raise ValueError("prior run items are invalid")
+                prior_items = {
+                    int(item["simfile_id"]): item
+                    for item in raw_prior_items
+                    if isinstance(item, Mapping) and type(item.get("simfile_id")) is int
+                }
         items: list[dict[str, object]] = []
         for row in handoff.rows:
             item = _initial_item(row)
@@ -2027,9 +2357,14 @@ def run_idm_pilot(
             header,
             items,
             native_failure_counts=native_failure_counts,
+            run_fd=namespace.run_fd,
         )
     except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError):
+        _close_primary_namespace(namespace)
         return _fatal_outcome()
+
+    assert namespace is not None
+    held_prediction_parents: dict[str, int] = {}
 
     backend: Any | None = None
     backend_poisoned = False
@@ -2039,6 +2374,8 @@ def run_idm_pilot(
     try:
         for index, row in enumerate(handoff.rows):
             item = items[index]
+            prediction_parent_fd: int | None = None
+            prediction_parent_key: str | None = None
             try:
                 mapping = mappings.get(int(row["simfile_id"]))
                 if mapping is None:
@@ -2075,6 +2412,23 @@ def run_idm_pilot(
                     native_failure_counts["prediction_artifact_invalid"] += 1
                     continue
                 try:
+                    prediction_parent_fd = _open_primary_prediction_parent(
+                        target, namespace, request.output_dir
+                    )
+                    prediction_parent_key = _primary_prediction_relative_path(
+                        target, request.output_dir
+                    )
+                    previous_parent_fd = held_prediction_parents.get(prediction_parent_key)
+                    if previous_parent_fd is None:
+                        held_prediction_parents[prediction_parent_key] = prediction_parent_fd
+                    else:
+                        os.close(prediction_parent_fd)
+                        prediction_parent_fd = previous_parent_fd
+                except (OSError, RuntimeError, TypeError, ValueError, IdmPilotRunError) as error:
+                    _set_failed(item, "prediction_artifact_invalid", error)
+                    native_failure_counts["prediction_artifact_invalid"] += 1
+                    continue
+                try:
                     if prepared.input_content is None:
                         raise IdmPilotRunError(
                             "verified IDM input bytes are unavailable",
@@ -2085,13 +2439,17 @@ def run_idm_pilot(
                         request.output_dir,
                         int(row["simfile_id"]),
                         prepared.input_content,
+                        input_root_fd=namespace.input_fd,
                     )
                 except (OSError, RuntimeError, TypeError, ValueError, IdmPilotRunError) as error:
                     _set_failed(item, "retained_input_invalid", error)
                     native_failure_counts["retained_input_invalid"] += 1
                     continue
                 audio = replace(audio, path=staged_path)
-                existing = _read_output_prediction(target, request.output_dir)
+                try:
+                    existing = _read_primary_file_at(prediction_parent_fd, target.name)
+                except FileNotFoundError:
+                    existing = None
                 prior = prior_items.get(int(row["simfile_id"]))
                 if existing is not None:
                     if not request.resume:
@@ -2125,9 +2483,9 @@ def run_idm_pilot(
                     item.update(
                         {
                             "execution_disposition": "resumed",
-                            "prediction_path": _prediction_relative_path(
-                                target, request.output_dir
-                            ),
+                            "prediction_path": prediction_parent_key
+                            if prediction_parent_key is not None
+                            else _primary_prediction_relative_path(target, request.output_dir),
                             "prediction_artifact_sha256": artifact.artifact_sha256,
                         }
                     )
@@ -2215,10 +2573,13 @@ def run_idm_pilot(
                     backend_poisoned = True
                     continue
                 try:
-                    _validate_primary_prediction_target(target, output_dir=request.output_dir)
-                    ensure_durable_directory(target.parent)
-                    _validate_primary_prediction_target(target, output_dir=request.output_dir)
-                    published = publish_prediction_artifact(target, mapped)
+                    if prediction_parent_fd is None:
+                        raise OSError("prediction parent is not held")
+                    published = _publish_primary_prediction_at(
+                        prediction_parent_fd,
+                        target,
+                        mapped,
+                    )
                 except ArtifactPublicationError as error:
                     _set_failed(item, "prediction_publish_failed", error)
                     native_failure_counts["prediction_publish_failed"] += 1
@@ -2231,7 +2592,9 @@ def run_idm_pilot(
                 item.update(
                     {
                         "execution_disposition": "inferred",
-                        "prediction_path": _prediction_relative_path(target, request.output_dir),
+                        "prediction_path": prediction_parent_key
+                        if prediction_parent_key is not None
+                        else _primary_prediction_relative_path(target, request.output_dir),
                         "prediction_artifact_sha256": published.sha256,
                     }
                 )
@@ -2245,6 +2608,14 @@ def run_idm_pilot(
                 _set_failed(item, "retained_input_invalid", error)
                 native_failure_counts["retained_input_invalid"] += 1
             finally:
+                if (
+                    prediction_parent_fd is not None
+                    and prediction_parent_key not in held_prediction_parents
+                ):
+                    try:
+                        os.close(prediction_parent_fd)
+                    except OSError:
+                        pass
                 try:
                     native_failure_counts = _native_failure_counts(items)
                     _write_checkpoint(
@@ -2252,6 +2623,7 @@ def run_idm_pilot(
                         header,
                         items,
                         native_failure_counts=native_failure_counts,
+                        run_fd=namespace.run_fd,
                     )
                 except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError):
                     fatal_run_error = True
@@ -2305,13 +2677,18 @@ def run_idm_pilot(
             completed_at=completed_at,
             close_error=close_error,
             native_failure_counts=native_failure_counts,
+            run_fd=namespace.run_fd,
         )
         final_snapshot = parse_idm_pilot_run(
-            read_regular_file_no_follow(run_path), expected_run_id=run_id
+            _read_primary_file_at(namespace.run_fd, run_path.name), expected_run_id=run_id
         )
     except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError):
+        _close_primary_prediction_parents(held_prediction_parents)
+        _close_primary_namespace(namespace)
         return _fatal_outcome()
     if fatal_run_error:
+        _close_primary_prediction_parents(held_prediction_parents)
+        _close_primary_namespace(namespace)
         return _fatal_outcome()
     try:
         (oaf_identity, oaf_items), (idm_identity, idm_items) = _build_report_cohorts(
@@ -2321,17 +2698,15 @@ def run_idm_pilot(
             separation_artifact_root=request.separation_artifact_root,
             stem_cache_root=request.stem_cache_root,
             output_dir=request.output_dir,
+            prediction_parent_fds=held_prediction_parents,
         )
         oaf_score = score_cohort(oaf_identity, oaf_items, diagnostics_for=())
         idm_score = score_cohort(idm_identity, idm_items, diagnostics_for=())
-        oaf_reports = reports_path / "oaf"
-        idm_reports = reports_path / "idm"
-        ensure_durable_directory(oaf_reports)
-        ensure_durable_directory(idm_reports)
-        _validate_primary_reports_namespace(reports_path, request.output_dir)
-        write_cohort_reports(oaf_score, oaf_reports)
-        write_cohort_reports(idm_score, idm_reports)
+        _publish_primary_cohort_reports(oaf_score, namespace.oaf_reports_fd)
+        _publish_primary_cohort_reports(idm_score, namespace.idm_reports_fd)
     except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError, PredictionArtifactError):
+        _close_primary_prediction_parents(held_prediction_parents)
+        _close_primary_namespace(namespace)
         return _fatal_outcome()
     outcome = _outcome_from_scores(
         idm_score,
@@ -2341,14 +2716,18 @@ def run_idm_pilot(
         snapshot=final_snapshot,
     )
     if close_error is not None and outcome.overall_status == "complete":
-        return IdmPilotRunOutcome(
+        final_outcome = IdmPilotRunOutcome(
             **{
                 **outcome.__dict__,
                 "overall_status": "partial",
                 "exit_code": 1,
             }
         )
-    return outcome
+    else:
+        final_outcome = outcome
+    _close_primary_prediction_parents(held_prediction_parents)
+    _close_primary_namespace(namespace)
+    return final_outcome
 
 
 def _fatal_full_mix_smoke() -> IdmFullMixSmokeOutcome:
