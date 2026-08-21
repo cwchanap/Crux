@@ -535,6 +535,63 @@ def test_freezer_rejects_missing_component_raced_into_model_root(
     assert not (output_parent / raced_name / ".separator-publish.lock").exists()
 
 
+def test_freezer_rejects_multilevel_missing_path_raced_into_model_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing output path with more than one missing component must be
+    rejected before any deeper component is created inside the model root.
+
+    When the first missing component loses its mkdir race to a directory
+    carrying the model-root identity, ``_open_output_directory`` opens that
+    model-root inode and advances to it.  Without a per-component containment
+    check the next iteration would ``mkdir`` the second missing component
+    inside the relocated model root before the final post-loop check rejected
+    the path, mutating the model root this function guarantees it never
+    mutates.  The per-component check must reject the raced component before
+    the second directory is created.  The regression forces that interleaving
+    deterministically with two missing components.
+    """
+    interpreter, _ = _synthetic_environment(tmp_path)
+    model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)
+    output_parent = tmp_path / "out"
+    output_parent.mkdir()
+    # "nested" and "deeper" are both missing; the race targets the first one.
+    raced_name = "nested"
+    lock_path = output_parent / raced_name / "deeper" / "model.json"
+
+    real_mkdir = os.mkdir
+
+    def racing_mkdir(path, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None and os.fspath(path) == raced_name:
+            # Another process wins the mkdir race by moving the attested model
+            # root into the first missing output location before our mkdir lands;
+            # the real mkdir then collides with FileExistsError, which the
+            # publication code tolerates, and the opened descriptor is the model
+            # root.  Without a per-component containment check the next loop
+            # iteration would mkdir "deeper" inside that model root.
+            os.rename(model_root, output_parent / raced_name)
+        return real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "mkdir", racing_mkdir)
+
+    with pytest.raises(SeparatorExecutionError) as raised:
+        _freeze_separator_runtime(
+            separator_id=SPLEETER_SEPARATOR_ID,
+            interpreter=interpreter,
+            model_root=model_root,
+            repository_revision="a" * 40,
+            output=lock_path,
+        )
+
+    assert raised.value.code == "separator_output_inside_model_root"
+    # The second missing component was never created inside the relocated model
+    # root (now at output_parent / raced_name), so the model root is not mutated.
+    assert not (output_parent / raced_name / "deeper").exists()
+    assert not (output_parent / raced_name / "model.json").exists()
+    assert not (output_parent / raced_name / ".separator-publish.lock").exists()
+
+
 def test_freezer_rejects_relative_output_before_publishing(tmp_path: Path) -> None:
     interpreter, _ = _synthetic_environment(tmp_path)
     model_root, _ = _synthetic_model_root(tmp_path, SPLEETER_SEPARATOR_ID)

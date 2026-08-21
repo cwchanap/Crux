@@ -161,6 +161,15 @@ def _create_temporary_file_at(directory_fd: int, name: str, content: bytes) -> s
             )
         except FileExistsError:
             continue
+        except OSError as open_error:
+            # ENOSPC, EACCES, EMFILE, etc. are not collision retries.  This
+            # helper is called before the caller's unlink finally and OSError-
+            # to-ArtifactPublicationError wrapper are in scope, so a raw OSError
+            # here would escape unwrapped, breaking the helper's contract (OaF
+            # maps ArtifactPublicationError to prediction_publish_failed but a
+            # raw OSError to prediction_artifact_invalid).  Wrap it here so the
+            # distinction stays observable regardless of where the failure lands.
+            raise ArtifactPublicationError("artifact publication failed") from open_error
         try:
             try:
                 _write_all(descriptor, content)

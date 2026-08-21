@@ -1084,21 +1084,25 @@ def _open_output_directory(
                         os.stat(remaining, dir_fd=descriptor, follow_symlinks=False),
                         os.fstat(child_descriptor),
                     )
+                    # The identity check only proves the opened object is the
+                    # named object; it does not prove the named object is outside
+                    # the attested model root.  Another process can win the mkdir
+                    # race by moving the model root (or a descendant sharing its
+                    # identity) into the missing output location between mkdir
+                    # and open, so each newly opened component must be re-checked
+                    # against the model root by identity before it is advanced to
+                    # and used to create the next component.  Without this per-
+                    # component check a multi-level missing output path could
+                    # create deeper directories inside the relocated model root
+                    # before a single final check rejected the path, mutating the
+                    # model root this function guarantees it never mutates.
+                    _require_directory_outside_model_root(
+                        child_descriptor,
+                        model_root_metadata,
+                        directory_flags=directory_flags,
+                    )
                     os.close(descriptor)
                     descriptor = child_descriptor
-                # The identity check above only proves the opened object is the
-                # named object; it does not prove the named object is outside the
-                # attested model root.  Another process can win the mkdir race by
-                # moving the model root (or a descendant sharing its identity)
-                # into the missing output location between mkdir and open, so the
-                # final descriptor must be re-checked against the model root by
-                # identity before it is handed back, mirroring the all-existing
-                # path below.
-                _require_directory_outside_model_root(
-                    descriptor,
-                    model_root_metadata,
-                    directory_flags=directory_flags,
-                )
                 return descriptor
             _require_same_model_identity(
                 os.stat(part, dir_fd=descriptor, follow_symlinks=False),
