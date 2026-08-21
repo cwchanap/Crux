@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -197,6 +198,182 @@ def test_compare_oaf_muscriptor_command_emits_error_payload_and_exits_2(
     assert summary["paired_class_count"] == 0
     assert summary["paired_song_count"] == 0
     assert summary["pairable_success_count"] == 0
+
+
+def test_run_idm_pilot_requires_an_all_or_none_smoke_option_group(tmp_path: Path) -> None:
+    args = [
+        "benchmark",
+        "run-idm-pilot",
+        "--handoff",
+        str(tmp_path / "handoff.jsonl"),
+        "--manifest",
+        str(tmp_path / "reference.jsonl"),
+        "--timing-manifest",
+        str(tmp_path / "timing.jsonl"),
+        "--separation-artifact-root",
+        str(tmp_path / "separation-artifacts"),
+        "--stem-cache-root",
+        str(tmp_path / "stem-cache"),
+        "--output-dir",
+        str(tmp_path / "output"),
+        "--runtime-python",
+        str(tmp_path / "idm-python"),
+        "--model-lock",
+        str(tmp_path / "model.json"),
+        "--model-root",
+        str(tmp_path / "model-root"),
+        "--smoke-manifest",
+        str(tmp_path / "smoke.json"),
+    ]
+
+    result = CliRunner().invoke(main, args, catch_exceptions=False)
+
+    assert result.exit_code == 2
+    assert "--smoke-manifest and --source-cache-dir must be supplied together" in result.output
+
+
+def test_run_idm_pilot_propagates_partial_and_fatal_outcomes(tmp_path: Path, monkeypatch) -> None:
+    import src.benchmark.idm_pilot_run as pilot_module
+    import src.cli.benchmark as benchmark_module
+
+    args = [
+        "benchmark",
+        "run-idm-pilot",
+        "--handoff",
+        str(tmp_path / "handoff.jsonl"),
+        "--manifest",
+        str(tmp_path / "reference.jsonl"),
+        "--timing-manifest",
+        str(tmp_path / "timing.jsonl"),
+        "--separation-artifact-root",
+        str(tmp_path / "separation-artifacts"),
+        "--stem-cache-root",
+        str(tmp_path / "stem-cache"),
+        "--output-dir",
+        str(tmp_path / "output"),
+        "--runtime-python",
+        str(tmp_path / "idm-python"),
+        "--model-lock",
+        str(tmp_path / "model.json"),
+        "--model-root",
+        str(tmp_path / "model-root"),
+    ]
+    outcomes = [
+        pilot_module.IdmPilotRunOutcome(
+            overall_status="partial",
+            exit_code=1,
+            run_id="partial-run",
+            run_path=tmp_path / "partial-run.json",
+            reports_path=tmp_path / "partial-reports",
+            success_count=3,
+            failed_count=1,
+            skipped_count=0,
+            quarantined_count=0,
+        ),
+        pilot_module.IdmPilotRunOutcome(
+            overall_status="failed",
+            exit_code=2,
+            run_id=None,
+            run_path=None,
+            reports_path=None,
+            success_count=0,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+        ),
+    ]
+
+    monkeypatch.setattr(benchmark_module, "_current_crux_commit", lambda: "a" * 40)
+    monkeypatch.setattr(pilot_module, "run_idm_pilot", lambda _request: outcomes.pop(0))
+    monkeypatch.setattr(
+        benchmark_module,
+        "_run_idm_comparison",
+        lambda _run_path, _output_dir: tmp_path / "comparison",
+    )
+
+    partial = CliRunner().invoke(main, args, catch_exceptions=False)
+    fatal = CliRunner().invoke(main, args, catch_exceptions=False)
+
+    assert partial.exit_code == 1
+    assert json.loads(partial.output)["status"] == "partial"
+    assert fatal.exit_code == 2
+    assert json.loads(fatal.output)["status"] == "failed"
+
+
+def test_run_idm_pilot_declares_only_frozen_scope_and_runtime_options() -> None:
+    expected = {
+        "--handoff",
+        "--manifest",
+        "--timing-manifest",
+        "--separation-artifact-root",
+        "--stem-cache-root",
+        "--output-dir",
+        "--runtime-python",
+        "--model-lock",
+        "--model-root",
+        "--resume",
+        "--smoke-manifest",
+        "--source-cache-dir",
+    }
+    command = main.commands["benchmark"].commands["run-idm-pilot"]
+    declared = {
+        option
+        for param in command.params
+        if isinstance(param, click.Option)
+        for option in param.opts
+        if option.startswith("--")
+    }
+    assert declared == expected
+    help_result = CliRunner().invoke(main, ["benchmark", "run-idm-pilot", "--help"])
+    assert help_result.exit_code == 0
+    for selector in (
+        "--include-simfile-id",
+        "--exclude-simfile-id",
+        "--count",
+        "--seed",
+        "--threshold",
+        "--device",
+        "--dtype",
+        "--tuning",
+    ):
+        assert selector not in help_result.output
+
+
+def test_run_idm_pilot_help_does_not_import_idm_modules() -> None:
+    import subprocess
+    import sys
+
+    probe = """
+import json
+import sys
+
+from click.testing import CliRunner
+from src.cli.main import main
+
+result = CliRunner().invoke(main, ["benchmark", "run-idm-pilot", "--help"])
+if result.exit_code != 0:
+    raise SystemExit(result.output)
+
+print(json.dumps({
+    "pilot_imported": "src.benchmark.idm_pilot_run" in sys.modules,
+    "comparison_imported": "src.benchmark.idm_comparison" in sys.modules,
+    "backend_imported": "src.benchmark.backends.idm" in sys.modules,
+}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert json.loads(result.stdout) == {
+        "pilot_imported": False,
+        "comparison_imported": False,
+        "backend_imported": False,
+    }
 
 
 def test_current_crux_commit_raises_on_subprocess_error() -> None:
