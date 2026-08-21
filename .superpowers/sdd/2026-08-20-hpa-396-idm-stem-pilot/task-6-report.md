@@ -83,3 +83,57 @@ steps or invent IDs.
 - `src/benchmark/idm_pilot_run.py`
 - `tests/benchmark/test_idm_pilot_run.py`
 - `.superpowers/sdd/2026-08-20-hpa-396-idm-stem-pilot/task-6-report.md`
+
+## Fix Round 1
+
+### RED
+
+The review regressions were added before the implementation changes.
+
+```text
+uv run pytest tests/benchmark/test_idm_pilot_run.py -q
+28 passed, 5 failed
+```
+
+The failures showed a repeated complete run returning `partial` after
+rewriting its snapshot, and each derived symlink case reaching the worker
+path. The isolated publication regression also failed with `success_count ==
+0` instead of four later inferences after the first publication error.
+
+### GREEN
+
+```text
+uv run pytest tests/benchmark/test_idm_pilot_run.py -q
+33 passed
+
+uv run pytest tests/benchmark/test_idm_pilot_run.py \
+  tests/benchmark/test_idm_pilot_run_acceptance.py \
+  tests/benchmark/test_idm_comparison.py \
+  tests/benchmark/test_idm_backend.py \
+  tests/benchmark/test_idm_model.py -q
+117 passed
+
+uv run ruff check src/benchmark/idm_pilot_run.py tests/benchmark/test_idm_pilot_run.py
+uv run black --check src/benchmark/idm_pilot_run.py tests/benchmark/test_idm_pilot_run.py
+uv run pylint --errors-only --disable=E1120,E0401 --jobs=1 src/benchmark/idm_pilot_run.py
+git diff --check
+```
+
+All checks passed. The full-mix smoke now rejects an existing deterministic
+`run.json` before creating directories, loading the cache, materializing audio,
+or creating a backend; this applies equally to completed and interrupted
+snapshots. It validates every derived namespace/run/input/report component for
+symlinks and resolved containment before any write. Backend and mapping errors
+retain their poison policy, while publication errors remain item-local with
+`prediction_publish_failed`, allowing later rows to use the same backend.
+
+### Self-review and operational block
+
+The change is limited to the approved offline seam and keeps
+`IdmPilotRunRequest` source-cache-free, the separate full-mix report identity,
+canonical smoke selection, and the no-headline-comparison boundary. Tests use
+only deterministic synthetic fixtures and fake backends; no real IDM/HPA-328
+inference was run. The production handoff remains absent, so
+`runtime/idm/smoke.json` was not created or committed and fixture/zero IDs are
+not production membership. Operational use remains blocked until the real
+handoff is available and the separately attested smoke manifest is authored.

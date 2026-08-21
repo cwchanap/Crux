@@ -2093,6 +2093,39 @@ def _validate_full_mix_smoke_roots(request: IdmFullMixSmokeRequest) -> None:
             raise IdmSmokeManifestError("full-mix smoke output aliases an input root")
 
 
+def _validate_full_mix_smoke_namespace(
+    request: IdmFullMixSmokeRequest, *, run_id: str
+) -> tuple[Path, Path, Path, Path]:
+    """Validate and derive the smoke-only output paths before creating them."""
+    output_root = request.output_dir.resolve()
+    namespace = request.output_dir / IDM_FULL_MIX_SMOKE_DIRNAME
+    runs_root = namespace / "runs"
+    run_dir = runs_root / run_id
+    run_path = run_dir / "run.json"
+    input_root = run_dir / "inputs"
+    reports_path = run_dir / IDM_FULL_MIX_SMOKE_REPORT_DIRNAME
+    derived_paths = (
+        ("full-mix smoke namespace", namespace),
+        ("full-mix smoke runs root", runs_root),
+        ("full-mix smoke run directory", run_dir),
+        ("full-mix smoke run snapshot", run_path),
+        ("full-mix smoke input root", input_root),
+        ("full-mix smoke reports root", reports_path),
+    )
+    for field, path in derived_paths:
+        if path.is_symlink():
+            raise IdmSmokeManifestError(f"{field} must not be a symlink")
+        try:
+            resolved = path.resolve()
+        except OSError as error:
+            raise IdmSmokeManifestError(f"{field} is unavailable") from error
+        if not resolved.is_relative_to(output_root):
+            raise IdmSmokeManifestError(f"{field} escapes output_dir")
+    if run_path.exists():
+        raise IdmSmokeManifestError("full-mix smoke run already exists")
+    return run_dir, run_path, reports_path, input_root
+
+
 def _smoke_run_id(
     *,
     handoff: LoadedSeparationPilotManifest,
@@ -2220,11 +2253,10 @@ def run_idm_full_mix_smoke(
     except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError, IdmSmokeManifestError):
         return _fatal_full_mix_smoke()
 
-    run_dir = request.output_dir / IDM_FULL_MIX_SMOKE_DIRNAME / "runs" / run_id
-    run_path = run_dir / "run.json"
-    reports_path = run_dir / IDM_FULL_MIX_SMOKE_REPORT_DIRNAME
-    input_root = run_dir / "inputs"
     try:
+        run_dir, run_path, reports_path, input_root = _validate_full_mix_smoke_namespace(
+            request, run_id=run_id
+        )
         run_dir.mkdir(parents=True, exist_ok=True)
         input_root.mkdir(parents=True, exist_ok=True)
         header: dict[str, object] = {
@@ -2260,7 +2292,7 @@ def run_idm_full_mix_smoke(
             run_path,
             {**header, "items": [], "overall_status": "partial"},
         )
-    except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError):
+    except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError, IdmSmokeManifestError):
         return _fatal_full_mix_smoke()
 
     handoff_by_id = {int(row["simfile_id"]): row for row in handoff.rows}
@@ -2395,24 +2427,28 @@ def run_idm_full_mix_smoke(
                         "IDM backend returned an invalid prediction", code="native_event_invalid"
                     )
                 mapped, _diagnostics = map_idm_prediction(native)
-                published = publish_prediction_artifact(target, mapped)
-                item.update(
-                    {
-                        "execution_disposition": "inferred",
-                        "prediction_path": target.relative_to(run_dir).as_posix(),
-                        "prediction_artifact_sha256": published.sha256,
-                        "wall_time_sec": elapsed,
-                    }
-                )
             except BaseException as error:  # pylint: disable=broad-exception-caught
                 code, disposition = classify_idm_backend_error(_backend_failure_code(error))
-                if isinstance(error, ArtifactPublicationError):
-                    code = "prediction_publish_failed"
-                elif isinstance(error, (PredictionArtifactError, OSError, TypeError, ValueError)):
-                    code = "prediction_artifact_invalid"
                 _set_full_mix_smoke_failed(item, code, error)
                 if disposition == "poison":
                     backend_poisoned = True
+                continue
+            try:
+                published = publish_prediction_artifact(target, mapped)
+            except ArtifactPublicationError as error:
+                _set_full_mix_smoke_failed(item, "prediction_publish_failed", error)
+                continue
+            except BaseException as error:  # pylint: disable=broad-exception-caught
+                _set_full_mix_smoke_failed(item, "prediction_artifact_invalid", error)
+                continue
+            item.update(
+                {
+                    "execution_disposition": "inferred",
+                    "prediction_path": target.relative_to(run_dir).as_posix(),
+                    "prediction_artifact_sha256": published.sha256,
+                    "wall_time_sec": elapsed,
+                }
+            )
     finally:
         if backend is not None:
             try:

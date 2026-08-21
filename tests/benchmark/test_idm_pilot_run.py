@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from src.benchmark.backend_identity import canonical_json_bytes
+from src.benchmark.artifact_io import ArtifactPublicationError
+from src.benchmark.backend_identity import canonical_json_bytes, strict_json_loads
 from src.benchmark.backends.base import CanonicalAudio
 from src.benchmark.cohort_scoring import COHORT_FAILURE_REASONS
 from src.benchmark.corpus_cache import ResolvedSourceAudio
@@ -408,7 +409,10 @@ def test_full_mix_smoke_materializes_infers_scores_and_reports_separately(
     monkeypatch.setattr(run_module, "load_idm_model_lock", lambda _: lock)
     monkeypatch.setattr(run_module, "resolve_source_audio", resolve_source)
 
+    materialize_calls: list[Path] = []
+
     def materialize(source_audio, output_path, *, input_root):
+        materialize_calls.append(output_path)
         return CanonicalAudio(
             path=output_path,
             source_audio_id=source_audio.source_audio_id,
@@ -481,3 +485,170 @@ def test_full_mix_smoke_materializes_infers_scores_and_reports_separately(
     assert not (tmp_path / "output" / "runs").exists()
     assert len(factory_calls) == 1
     assert factory_calls[0]["input_root"] == outcome.run_path.parent / "inputs"
+    assert len(materialize_calls) == 5
+
+    publication_request = replace(request, output_dir=tmp_path / "publication-output")
+    publication_factory_calls: list[dict[str, object]] = []
+
+    def publication_backend_factory(**kwargs: object) -> FakeBackend:
+        publication_factory_calls.append(kwargs)
+        return FakeBackend()
+
+    real_publish = run_module.publish_prediction_artifact
+    publish_calls: list[Path] = []
+
+    def fail_first_publish(target: Path, mapped: object) -> object:
+        publish_calls.append(target)
+        if len(publish_calls) == 1:
+            raise ArtifactPublicationError("simulated publication failure")
+        return real_publish(target, mapped)
+
+    monkeypatch.setattr(run_module, "publish_prediction_artifact", fail_first_publish)
+    publication = run_idm_full_mix_smoke(
+        publication_request,
+        backend_factory=publication_backend_factory,
+        perf_counter=lambda: 1.0,
+    )
+    assert publication.overall_status == "partial"
+    assert publication.success_count == 4
+    assert publication.failed_count == 1
+    assert len(publication_factory_calls) == 1
+    assert publication.run_path is not None
+    publication_snapshot = strict_json_loads(
+        publication.run_path.read_bytes()[:-1], require_canonical=True
+    )
+    publication_items = publication_snapshot["items"]
+    assert publication_items[0]["native_failure_code"] == "prediction_publish_failed"
+    assert all(item["execution_disposition"] == "inferred" for item in publication_items[1:])
+    assert all(
+        item.get("native_failure_code") != "worker_protocol_failed" for item in publication_items
+    )
+    assert len(materialize_calls) == 10
+
+    assert outcome.run_path is not None
+    complete_snapshot = outcome.run_path.read_bytes()
+    materialize_before_repeat = len(materialize_calls)
+    repeated = run_idm_full_mix_smoke(
+        request,
+        backend_factory=backend_factory,
+        perf_counter=lambda: 1.0,
+    )
+    assert repeated.overall_status == "failed"
+    assert repeated.exit_code == 2
+    assert outcome.run_path.read_bytes() == complete_snapshot
+    assert len(factory_calls) == 1
+    assert len(materialize_calls) == materialize_before_repeat
+
+    interrupted_request = replace(request, output_dir=tmp_path / "interrupted-output")
+    interrupted_path = (
+        interrupted_request.output_dir / "full-mix-smoke" / "runs" / outcome.run_id / "run.json"
+    )
+    interrupted_snapshot = b'{"interrupted":true}\n'
+    interrupted_path.parent.mkdir(parents=True)
+    interrupted_path.write_bytes(interrupted_snapshot)
+    interrupted = run_idm_full_mix_smoke(
+        interrupted_request,
+        backend_factory=backend_factory,
+        perf_counter=lambda: 1.0,
+    )
+    assert interrupted.overall_status == "failed"
+    assert interrupted.exit_code == 2
+    assert interrupted_path.read_bytes() == interrupted_snapshot
+    assert len(factory_calls) == 1
+    assert len(materialize_calls) == materialize_before_repeat
+
+
+@pytest.mark.parametrize("component", ("full-mix-smoke", "runs", "inputs", "reports"))
+def test_full_mix_smoke_rejects_derived_symlink_without_outside_writes(
+    monkeypatch, tmp_path: Path, component: str
+) -> None:
+    import src.benchmark.idm_pilot_run as run_module
+    from src.benchmark.idm_model import load_idm_model_lock
+    from tests.benchmark.idm_pilot_fixtures import (
+        CRUX_COMMIT,
+        SHA_B,
+        loaded_reference_manifests,
+    )
+
+    ids = tuple(range(20, 25))
+    reference, timing, mappings = loaded_reference_manifests(
+        ids=ids,
+        reference_sha256="1" * 64,
+        reference_version="sha256:" + "2" * 64,
+        timing_sha256="3" * 64,
+        timing_version="sha256:" + "4" * 64,
+    )
+    handoff = LoadedSeparationPilotManifest(
+        manifest_sha256="8" * 64,
+        corpus_version="sha256:" + "9" * 64,
+        rows=tuple(
+            {
+                "simfile_id": simfile_id,
+                "source_audio_id": f"{simfile_id}/audio.wav",
+                "source_audio_sha256": SHA_B,
+                "source_duration_sec": 1,
+                "htdemucs": {"status": "success"},
+            }
+            for simfile_id in ids
+        ),
+    )
+    smoke_path = tmp_path / "smoke.json"
+    smoke_path.write_bytes(
+        render_idm_smoke_manifest(
+            [
+                {"reason": reason, "simfile_id": simfile_id}
+                for reason, simfile_id in zip(IDM_SMOKE_CASE_ORDER, ids, strict=True)
+            ]
+        )
+    )
+    lock = load_idm_model_lock(Path("runtime/idm/model.json"))
+    request = IdmFullMixSmokeRequest(
+        separation_handoff_path=tmp_path / "handoff.jsonl",
+        reference_manifest_path=tmp_path / "reference.jsonl",
+        timing_manifest_path=tmp_path / "timing.jsonl",
+        smoke_manifest_path=smoke_path,
+        source_cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "output",
+        model_lock_path=tmp_path / "model.json",
+        model_root=tmp_path / "model",
+        runtime_python=tmp_path / "python",
+        crux_commit=CRUX_COMMIT,
+    )
+    request.model_lock_path.write_bytes(Path("runtime/idm/model.json").read_bytes())
+    monkeypatch.setattr(run_module, "load_separation_pilot_manifest", lambda _: handoff)
+    monkeypatch.setattr(run_module, "load_reference_set_manifest", lambda _: reference)
+    monkeypatch.setattr(run_module, "load_reference_timing_manifest", lambda _: timing)
+    monkeypatch.setattr(run_module, "_validate_lineage", lambda *_args: None)
+    monkeypatch.setattr(
+        run_module, "preflight_reference_mappings", lambda *_args, **_kwargs: mappings
+    )
+    monkeypatch.setattr(run_module, "load_idm_model_lock", lambda _: lock)
+    monkeypatch.setattr(run_module, "_smoke_run_id", lambda **_kwargs: "fixed-run")
+    monkeypatch.setattr(
+        run_module,
+        "IdmBackend",
+        lambda **_kwargs: pytest.fail("derived symlink must fail before backend creation"),
+    )
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"must remain untouched")
+    namespace = request.output_dir / "full-mix-smoke"
+    if component == "full-mix-smoke":
+        request.output_dir.mkdir()
+        namespace.symlink_to(outside, target_is_directory=True)
+    elif component == "runs":
+        namespace.mkdir(parents=True)
+        (namespace / "runs").symlink_to(outside, target_is_directory=True)
+    else:
+        run_dir = namespace / "runs" / "fixed-run"
+        run_dir.mkdir(parents=True)
+        (run_dir / component).symlink_to(outside, target_is_directory=True)
+
+    outcome = run_module.run_idm_full_mix_smoke(request)
+
+    assert outcome.overall_status == "failed"
+    assert outcome.exit_code == 2
+    assert sentinel.read_bytes() == b"must remain untouched"
+    assert list(outside.iterdir()) == [sentinel]
