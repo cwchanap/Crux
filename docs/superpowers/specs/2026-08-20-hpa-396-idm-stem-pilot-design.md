@@ -1,7 +1,7 @@
 # HPA-396 Frozen IDM Stem Pilot Design
 
-**Status:** Proposed  
-**Date:** 2026-08-20  
+**Status:** Proposed
+**Date:** 2026-08-20
 **Linear:** HPA-396 — Evaluate frozen Inverse Drum Machine on fixed drum-stem benchmark pilot
 
 ## Decision summary
