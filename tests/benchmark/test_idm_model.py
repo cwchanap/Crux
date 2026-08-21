@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+import sys
 from decimal import Decimal
 from pathlib import Path
 
@@ -212,6 +214,45 @@ def test_rejects_noncanonical_lock_json(tmp_path: Path) -> None:
 
     with pytest.raises(IdmModelLockError, match="canonical"):
         load_idm_model_lock(lock_path)
+
+
+def test_optimized_freeze_validation_rejects_invalid_model_fact() -> None:
+    script = Path(__file__).parents[2] / "scripts" / "freeze_idm_model.py"
+    code = """
+from scripts.freeze_idm_model import FreezeError, _verify_model_config
+
+content = b'''
+sampling_rate: 22050
+encoder:
+  sampling_rate: 44100
+  transform:
+    sample_rate: 44100
+    n_fft: 1024
+    hop_length: 256
+    n_mels: 128
+  transcription_head:
+    onset_activation: none
+    velocity_activation: exp_sigmoid
+decoder:
+  sampling_rate: 44100
+train_classes: [CY_CR, CY_RD, HH_CHH, HH_OHH, KD, SD, TT_HFT, TT_HMT, TT_LMT]
+'''
+
+try:
+    _verify_model_config(content)
+except FreezeError:
+    raise SystemExit(0)
+raise SystemExit(1)
+"""
+    result = subprocess.run(
+        [sys.executable, "-O", "-c", code],
+        cwd=script.parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_inference_config_is_thin_and_hashes_canonical_bytes() -> None:
