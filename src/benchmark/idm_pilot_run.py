@@ -1404,13 +1404,19 @@ def run_idm_pilot(
                         )
                         native_failure_counts[item["native_failure_code"]] += 1  # type: ignore[index]
                         continue
+                    if prior is None or not isinstance(
+                        prior.get("prediction_artifact_sha256"), str
+                    ):
+                        _set_failed(
+                            item,
+                            "prediction_output_conflict",
+                            "prediction artifact has no exact-run ledger evidence",
+                        )
+                        native_failure_counts[item["native_failure_code"]] += 1  # type: ignore[index]
+                        continue
                     try:
                         artifact = _prediction_matches(existing, audio=audio, descriptor=descriptor)
-                        if (
-                            prior is not None
-                            and "prediction_artifact_sha256" in prior
-                            and prior.get("prediction_artifact_sha256") != artifact.artifact_sha256
-                        ):
+                        if prior["prediction_artifact_sha256"] != artifact.artifact_sha256:
                             raise IdmPilotRunError(
                                 "resumed prediction hash differs",
                                 code="prediction_artifact_invalid",
@@ -1428,10 +1434,9 @@ def run_idm_pilot(
                             "prediction_artifact_sha256": artifact.artifact_sha256,
                         }
                     )
-                    if prior is not None:
-                        for field in ("wall_time_sec", "rtf"):
-                            if field in prior:
-                                item[field] = prior[field]
+                    for field in ("wall_time_sec", "rtf"):
+                        if field in prior:
+                            item[field] = prior[field]
                     continue
                 if backend_poisoned:
                     _set_failed(

@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from src.benchmark.backends.base import CanonicalAudio, NativeEvent, NativePrediction
+from src.benchmark.backends.idm import IdmBackendError
 from src.benchmark.idm_model import load_idm_model_lock
-from src.benchmark.idm_pilot_run import IdmPilotRunRequest, run_idm_pilot
+from src.benchmark.idm_pilot_run import (
+    IdmPilotRunError,
+    IdmPilotRunRequest,
+    _prepare_handoff_row,
+    parse_idm_pilot_run,
+    run_idm_pilot,
+)
 from src.benchmark.reference_set_manifest import LoadedReferenceSetManifest
 from src.benchmark.separation_handoff import LoadedSeparationPilotManifest
 from src.benchmark.taxonomy import OAF_PREDICTION_MAP_ID
@@ -17,6 +28,7 @@ from tests.benchmark.idm_pilot_fixtures import (
     oaf_artifact,
     oaf_descriptor,
     sha256,
+    write_actual_handoff,
 )
 
 
@@ -162,16 +174,94 @@ def _synthetic_handoff(
     return handoff, reference, timing, mappings
 
 
-def test_synthetic_immutable_handoff_runs_both_complete_populations_and_resumes(
-    tmp_path: Path, monkeypatch
-) -> None:
+def _install_synthetic_seams(
+    monkeypatch, handoff, reference, timing, mappings, *, patch_handoff: bool = True
+):
     import src.benchmark.idm_pilot_run as runner
 
-    handoff, reference, timing, mappings = _synthetic_handoff(tmp_path)
-    monkeypatch.setattr(runner, "load_separation_pilot_manifest", lambda _: handoff)
+    if patch_handoff:
+        monkeypatch.setattr(runner, "load_separation_pilot_manifest", lambda _: handoff)
     monkeypatch.setattr(runner, "load_reference_set_manifest", lambda _: reference)
     monkeypatch.setattr(runner, "load_reference_timing_manifest", lambda _: timing)
     monkeypatch.setattr(runner, "preflight_reference_mappings", lambda *_args, **_kwargs: mappings)
+    return runner
+
+
+def _request(
+    tmp_path: Path,
+    *,
+    resume: bool = False,
+    crux_commit: str = CRUX_COMMIT,
+) -> IdmPilotRunRequest:
+    return IdmPilotRunRequest(
+        separation_handoff_path=tmp_path / "handoff.jsonl",
+        reference_manifest_path=tmp_path / "reference.jsonl",
+        timing_manifest_path=tmp_path / "manifests" / "timing.jsonl",
+        separation_artifact_root=tmp_path / "separation",
+        stem_cache_root=tmp_path / "stems",
+        output_dir=tmp_path / "output",
+        model_lock_path=Path("runtime/idm/model.json"),
+        model_root=tmp_path / "model",
+        runtime_python=tmp_path / "python",
+        resume=resume,
+        crux_commit=crux_commit,
+    )
+
+
+def _healthy_backend_factory(descriptor, calls: list[int]):
+    class FakeBackend:
+        def descriptor(self):
+            return descriptor
+
+        def transcribe(self, audio):
+            calls.append(int(audio.source_audio_id.split("/")[0]))
+            return NativePrediction(
+                audio,
+                descriptor,
+                (
+                    NativeEvent(
+                        0.25,
+                        "KD",
+                        4,
+                        None,
+                        {"frame_index": "43", "native_velocity": "1"},
+                        0.9,
+                        64,
+                    ),
+                ),
+            )
+
+        def close(self):
+            return None
+
+    return lambda **_: FakeBackend()
+
+
+def _run_first_synthetic(tmp_path: Path, monkeypatch):
+    handoff, reference, timing, mappings = _synthetic_handoff(tmp_path)
+    runner = _install_synthetic_seams(monkeypatch, handoff, reference, timing, mappings)
+    descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
+    calls: list[int] = []
+    request = _request(tmp_path)
+    outcome = run_idm_pilot(
+        request,
+        backend_factory=_healthy_backend_factory(descriptor, calls),
+        perf_counter=lambda: 1.0,
+    )
+    assert outcome.success_count == 18
+    assert len(calls) == 18
+    return runner, handoff, request, calls, outcome
+
+
+def test_synthetic_immutable_handoff_runs_both_complete_populations_and_resumes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    handoff, reference, timing, mappings = _synthetic_handoff(tmp_path)
+    request = _request(tmp_path)
+    write_actual_handoff(request.separation_handoff_path, handoff)
+    runner = _install_synthetic_seams(
+        monkeypatch, handoff, reference, timing, mappings, patch_handoff=False
+    )
     lock = load_idm_model_lock(Path("runtime/idm/model.json"))
     descriptor = runner.descriptor_for_lock(lock)
     calls: list[int] = []
@@ -201,18 +291,6 @@ def test_synthetic_immutable_handoff_runs_both_complete_populations_and_resumes(
         def close(self):
             return None
 
-    request = IdmPilotRunRequest(
-        separation_handoff_path=tmp_path / "handoff.jsonl",
-        reference_manifest_path=tmp_path / "reference.jsonl",
-        timing_manifest_path=tmp_path / "manifests" / "timing.jsonl",
-        separation_artifact_root=tmp_path / "separation",
-        stem_cache_root=tmp_path / "stems",
-        output_dir=tmp_path / "output",
-        model_lock_path=Path("runtime/idm/model.json"),
-        model_root=tmp_path / "model",
-        runtime_python=tmp_path / "python",
-        crux_commit=CRUX_COMMIT,
-    )
     outcome = run_idm_pilot(
         request, backend_factory=lambda **_: FakeBackend(), perf_counter=lambda: 1.0
     )
@@ -234,3 +312,225 @@ def test_synthetic_immutable_handoff_runs_both_complete_populations_and_resumes(
     assert resumed.success_count == 18
     assert resumed.failed_count == 2
     assert calls == []
+
+
+@pytest.mark.parametrize("identity", ("handoff", "reference", "timing", "commit"))
+def test_changed_identity_does_not_resume_shared_prediction_artifacts(
+    tmp_path: Path, monkeypatch, identity: str
+) -> None:
+    runner, handoff, request, calls, first = _run_first_synthetic(tmp_path, monkeypatch)
+    assert first.run_id is not None
+    calls.clear()
+
+    if identity == "handoff":
+        changed_handoff = replace(handoff, manifest_sha256="2" * 64)
+        monkeypatch.setattr(runner, "load_separation_pilot_manifest", lambda _: changed_handoff)
+        changed = replace(request, resume=True)
+    elif identity == "reference":
+        changed_handoff = replace(
+            handoff,
+            rows=tuple({**row, "reference_manifest_sha256": "2" * 64} for row in handoff.rows),
+        )
+        changed_reference = replace(
+            runner.load_reference_set_manifest(request.reference_manifest_path),
+            manifest_sha256="2" * 64,
+        )
+        monkeypatch.setattr(runner, "load_separation_pilot_manifest", lambda _: changed_handoff)
+        monkeypatch.setattr(runner, "load_reference_set_manifest", lambda _: changed_reference)
+        changed = replace(request, resume=True)
+    elif identity == "timing":
+        changed_handoff = replace(
+            handoff,
+            rows=tuple(
+                {**row, "reference_timing_manifest_sha256": "2" * 64} for row in handoff.rows
+            ),
+        )
+        changed_timing = replace(
+            runner.load_reference_timing_manifest(request.timing_manifest_path),
+            manifest_sha256="2" * 64,
+        )
+        monkeypatch.setattr(runner, "load_separation_pilot_manifest", lambda _: changed_handoff)
+        monkeypatch.setattr(runner, "load_reference_timing_manifest", lambda _: changed_timing)
+        changed = replace(request, resume=True)
+    else:
+        changed = replace(request, resume=True, crux_commit="2" * 40)
+    resumed = run_idm_pilot(
+        changed,
+        backend_factory=lambda **_: pytest.fail("cross-run artifact must not invoke IDM"),
+        perf_counter=lambda: 1.0,
+    )
+
+    assert resumed.overall_status == "partial"
+    assert resumed.success_count == 0
+    assert resumed.failed_count == 20
+    assert calls == []
+    assert resumed.run_path is not None
+    snapshot = parse_idm_pilot_run(resumed.run_path.read_bytes())
+    rows = {row["simfile_id"]: row for row in snapshot["items"]}
+    assert rows[20]["native_failure_code"] == "prediction_output_conflict"
+    assert rows[20]["execution_disposition"] == "failed"
+    assert resumed.run_id != first.run_id
+
+
+def test_resume_rejects_changed_retained_wav_without_rerunning_upstream(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _runner, _handoff, request, calls, _first = _run_first_synthetic(tmp_path, monkeypatch)
+    calls.clear()
+    changed_path = tmp_path / "separation" / "inputs" / "20" / "htdemucs.wav"
+    changed_path.write_bytes(canonical_wav(sample=1))
+
+    resumed = run_idm_pilot(
+        replace(request, resume=True),
+        backend_factory=lambda **_: pytest.fail("changed retained WAV must not rerun IDM"),
+        perf_counter=lambda: 1.0,
+    )
+
+    assert resumed.success_count == 17
+    assert resumed.failed_count == 3
+    assert calls == []
+    assert resumed.run_path is not None
+    rows = {
+        row["simfile_id"]: row
+        for row in parse_idm_pilot_run(resumed.run_path.read_bytes())["items"]
+    }
+    assert rows[20]["native_failure_code"] == "retained_input_invalid"
+    assert rows[20]["cohort_failure_reason"] == "prediction_artifact_invalid"
+
+
+@pytest.mark.parametrize("mismatch", ("source", "input"))
+def test_resume_rejects_oaf_header_source_or_input_identity_mismatch_without_rerun(
+    tmp_path: Path, monkeypatch, mismatch: str
+) -> None:
+    _runner, handoff, request, calls, _first = _run_first_synthetic(tmp_path, monkeypatch)
+    calls.clear()
+    row = handoff.rows[0]
+    prediction = row["htdemucs"]["prediction"]
+    original_path = tmp_path / "separation" / prediction["path"]
+    original = row["htdemucs"]["input"]
+    bad_audio = CanonicalAudio(
+        original_path,
+        "changed/audio.wav" if mismatch == "source" else row["source_audio_id"],
+        row["source_audio_sha256"],
+        original["input_view_id"],
+        SHA_C if mismatch == "input" else original["input_audio_sha256"],
+        len(canonical_wav()),
+        44100,
+        1,
+        2,
+        32,
+    )
+    bad_content = oaf_artifact(bad_audio)
+    original_path.write_bytes(bad_content)
+    prediction["artifact_sha256"] = sha256(bad_content)
+
+    resumed = run_idm_pilot(
+        replace(request, resume=True),
+        backend_factory=lambda **_: pytest.fail("changed OaF evidence must not rerun IDM"),
+        perf_counter=lambda: 1.0,
+    )
+
+    assert resumed.success_count == 17
+    assert resumed.failed_count == 3
+    assert calls == []
+    assert resumed.run_path is not None
+    rows = {
+        row["simfile_id"]: row
+        for row in parse_idm_pilot_run(resumed.run_path.read_bytes())["items"]
+    }
+    assert rows[20]["native_failure_code"] == "retained_oaf_prediction_invalid"
+
+
+def test_resume_rejects_idm_artifact_hash_mismatch_without_rerun(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _runner, _handoff, request, calls, first = _run_first_synthetic(tmp_path, monkeypatch)
+    calls.clear()
+    assert first.run_path is not None
+    first_snapshot = parse_idm_pilot_run(first.run_path.read_bytes())
+    prediction_path = tmp_path / "output" / first_snapshot["items"][0]["prediction_path"]
+    prediction_path.write_bytes(b"tampered prediction bytes")
+
+    resumed = run_idm_pilot(
+        replace(request, resume=True),
+        backend_factory=lambda **_: pytest.fail("changed IDM artifact must not rerun"),
+        perf_counter=lambda: 1.0,
+    )
+
+    assert resumed.success_count == 17
+    assert resumed.failed_count == 3
+    assert calls == []
+    assert resumed.run_path is not None
+    rows = {
+        row["simfile_id"]: row
+        for row in parse_idm_pilot_run(resumed.run_path.read_bytes())["items"]
+    }
+    assert rows[20]["native_failure_code"] == "prediction_artifact_invalid"
+
+
+def test_retained_path_escape_and_symlink_are_rejected_without_fallback_scan(
+    tmp_path: Path,
+) -> None:
+    handoff, _reference, _timing, _mappings = _synthetic_handoff(tmp_path)
+    escaped = deepcopy(handoff.rows[0])
+    escaped["htdemucs"]["input"]["path"] = "../outside.wav"
+    with pytest.raises(IdmPilotRunError, match="path is invalid"):
+        _prepare_handoff_row(
+            escaped,
+            separation_artifact_root=tmp_path / "separation",
+            stem_cache_root=tmp_path / "stems",
+        )
+
+    input_path = tmp_path / "separation" / "inputs" / "20" / "htdemucs.wav"
+    outside = tmp_path / "outside.wav"
+    outside.write_bytes(canonical_wav())
+    input_path.unlink()
+    input_path.symlink_to(outside)
+    with pytest.raises(IdmPilotRunError, match="symlinks"):
+        _prepare_handoff_row(
+            handoff.rows[0],
+            separation_artifact_root=tmp_path / "separation",
+            stem_cache_root=tmp_path / "stems",
+        )
+
+
+def test_poisoned_backend_is_not_restarted_and_remaining_rows_are_protocol_failed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    handoff, reference, timing, mappings = _synthetic_handoff(tmp_path)
+    import src.benchmark.idm_pilot_run as runner
+
+    _install_synthetic_seams(monkeypatch, handoff, reference, timing, mappings)
+    descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
+    transcribe_calls: list[int] = []
+    factory_calls: list[int] = []
+
+    class PoisonBackend:
+        def descriptor(self):
+            return descriptor
+
+        def transcribe(self, audio):
+            transcribe_calls.append(int(audio.source_audio_id.split("/")[0]))
+            raise IdmBackendError("worker protocol failed", code="worker_protocol_failed")
+
+        def close(self):
+            return None
+
+    def factory(**_kwargs):
+        factory_calls.append(1)
+        return PoisonBackend()
+
+    outcome = run_idm_pilot(_request(tmp_path), backend_factory=factory, perf_counter=lambda: 1.0)
+
+    assert outcome.success_count == 0
+    assert outcome.failed_count == 20
+    assert factory_calls == [1]
+    assert transcribe_calls == [20]
+    assert outcome.run_path is not None
+    rows = {
+        row["simfile_id"]: row
+        for row in parse_idm_pilot_run(outcome.run_path.read_bytes())["items"]
+    }
+    assert rows[20]["native_failure_code"] == "worker_protocol_failed"
+    assert rows[21]["native_failure_code"] == "worker_protocol_failed"
+    assert rows[38]["native_failure_code"] == "upstream_stem_unavailable"

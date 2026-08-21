@@ -61,6 +61,32 @@ def test_run_identity_binds_schema_lineage_backend_config_view_and_commit() -> N
     assert IDM_PILOT_RUN_SCHEMA == "crux.idm-stem-pilot-run/v1"
 
 
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    (
+        ("handoff_manifest_sha256", "6" * 64),
+        ("reference_manifest_sha256", "7" * 64),
+        ("timing_manifest_sha256", "8" * 64),
+        ("crux_commit", "9" * 40),
+    ),
+)
+def test_run_identity_changes_for_each_immutable_lineage_identity(field: str, changed: str) -> None:
+    kwargs = {
+        "handoff_manifest_sha256": "a" * 64,
+        "handoff_manifest_version": "sha256:" + "b" * 64,
+        "reference_manifest_sha256": "c" * 64,
+        "reference_manifest_version": "sha256:" + "d" * 64,
+        "timing_manifest_sha256": "e" * 64,
+        "timing_manifest_version": "sha256:" + "f" * 64,
+        "backend_descriptor_sha256": "1" * 64,
+        "model_lock_sha256": "2" * 64,
+        "inference_config_sha256": "3" * 64,
+        "input_view_id": IDM_STEM_INPUT_VIEW_ID,
+        "crux_commit": "4" * 40,
+    }
+    assert build_run_id(**kwargs) != build_run_id(**{**kwargs, field: changed})
+
+
 def test_timeout_is_part_of_the_idm_inference_identity() -> None:
     default = build_idm_inference_config("1" * 64, "2" * 64)
     changed = build_idm_inference_config("1" * 64, "2" * 64, timeout_seconds=1799)
