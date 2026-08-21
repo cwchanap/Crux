@@ -137,3 +137,58 @@ inference was run. The production handoff remains absent, so
 `runtime/idm/smoke.json` was not created or committed and fixture/zero IDs are
 not production membership. Operational use remains blocked until the real
 handoff is available and the separately attested smoke manifest is authored.
+
+## Fix Round 2
+
+### RED
+
+The re-review regressions were added before the Round 2 implementation changes.
+
+```text
+uv run pytest tests/benchmark/test_idm_pilot_run.py -q
+32 passed, 1 failed
+```
+
+The first failure showed a preseeded ordinary deterministic `run_dir` was
+accepted and `run.json` was written despite a `predictions` symlink pointing
+outside the output root. After that run-directory fix, the same focused test
+failed at the new duplicate-run guard because mapping reconstruction was still
+called before namespace/collision rejection.
+
+### GREEN
+
+```text
+uv run pytest tests/benchmark/test_idm_pilot_run.py -q
+33 passed
+
+uv run pytest tests/benchmark/test_idm_pilot_run.py \
+  tests/benchmark/test_idm_pilot_run_acceptance.py \
+  tests/benchmark/test_idm_comparison.py \
+  tests/benchmark/test_idm_backend.py \
+  tests/benchmark/test_idm_model.py -q
+117 passed
+
+uv run ruff check src/benchmark/idm_pilot_run.py tests/benchmark/test_idm_pilot_run.py
+uv run black --check src/benchmark/idm_pilot_run.py tests/benchmark/test_idm_pilot_run.py
+uv run pylint --errors-only --disable=E1120,E0401 --jobs=1 src/benchmark/idm_pilot_run.py
+git diff --check
+```
+
+All checks passed. The deterministic smoke validator now rejects any existing
+`run_dir`, including a normal directory containing a symlinked `predictions`
+tree, before mapping, cache, materialization, backend, or snapshot work. A
+second no-symlink/containment guard validates every dynamic prediction path
+component immediately before publication. Reference mapping reconstruction is
+now after namespace and duplicate-run rejection and before the first write.
+
+### Self-review and operational block
+
+Round 1 behavior remains intact: complete and interrupted snapshots remain
+byte-identical on repeat, publication failures stay item-local, and later rows
+reuse the same backend. The new sentinel regression confirms the outside tree
+is untouched; the duplicate-run regression explicitly guards mapping, cache,
+materialization, backend, and snapshot-write call counts. No production
+membership or real IDM/HPA-328 inference was introduced. The production handoff
+remains absent, so `runtime/idm/smoke.json` was not created or committed and
+fixture/zero IDs remain non-production. Operational use remains blocked pending
+the real handoff and separately attested smoke manifest.
