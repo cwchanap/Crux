@@ -242,7 +242,15 @@ At the pinned revision:
 - the selected checkpoint is committed directly under that repository's `pretrained/` tree;
 - repository search exposes no separate checkpoint/weights license or `NOTICE` that overrides the root license.
 
-HPA-396 therefore records the checkpoint-license basis as **repository Apache-2.0, no separate weight notice found at the pinned revision**. This is no longer an unspecified project-stopping unknown.
+For benchmark identity, HPA-396 records:
+
+```text
+code_license = Apache-2.0
+weight_license = Apache-2.0
+weight_license_basis = repository-license-no-separate-weight-notice/v1
+```
+
+This is a provenance statement about the pinned repository contents, not a general legal opinion about downstream commercial rights.
 
 The remaining provenance item is the training data named by upstream configuration (`StemGMD`). Task 0 records the training-data provenance/usage note for the eventual HPA-329 operational/license discussion. It does not silently reclassify the committed checkpoint license and does not block this benchmark unless contradictory upstream evidence is discovered.
 
