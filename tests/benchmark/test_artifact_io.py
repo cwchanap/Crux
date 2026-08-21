@@ -122,6 +122,58 @@ def test_publish_immutable_file_at_cleans_temporary_file_on_fill_failure(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_publish_immutable_file_at_rejects_lost_race_with_different_bytes(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Losing the os.link race to different bytes must fail loudly.
+
+    A concurrent publisher can place different content at the target name
+    between the existence check and the link; treating the FileExistsError as
+    success would silently keep bytes the caller never wrote.
+    """
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        target = tmp_path / "artifact.json"
+
+        def win_race(*_args, **_kwargs):
+            target.write_bytes(b"raced")
+            raise FileExistsError("lost publication race")
+
+        monkeypatch.setattr(os, "link", win_race)
+
+        with pytest.raises(ArtifactPublicationError):
+            publish_immutable_file_at(directory_fd, "artifact.json", b"payload")
+    finally:
+        os.close(directory_fd)
+
+    assert target.read_bytes() == b"raced"
+    # The loser's temporary file is still cleaned up.
+    assert list(tmp_path.iterdir()) == [target]
+
+
+def test_publish_immutable_file_at_wraps_unsupported_link(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """NotImplementedError from os.link is not an OSError, so it must be
+    wrapped explicitly or it escapes the helper's contract unwrapped."""
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+
+        def unsupported_link(*_args, **_kwargs):
+            raise NotImplementedError("os.link follow_symlinks unsupported")
+
+        monkeypatch.setattr(os, "link", unsupported_link)
+
+        with pytest.raises(ArtifactPublicationError):
+            publish_immutable_file_at(directory_fd, "artifact.json", b"payload")
+    finally:
+        os.close(directory_fd)
+
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_publish_immutable_file_at_wraps_temporary_open_failure(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

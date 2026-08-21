@@ -1080,34 +1080,47 @@ def _open_output_directory(
                     except FileExistsError:
                         pass
                     child_descriptor = os.open(remaining, directory_flags, dir_fd=descriptor)
-                    _require_same_model_identity(
-                        os.stat(remaining, dir_fd=descriptor, follow_symlinks=False),
-                        os.fstat(child_descriptor),
-                    )
-                    # The identity check only proves the opened object is the
-                    # named object; it does not prove the named object is outside
-                    # the attested model root.  Another process can win the mkdir
-                    # race by moving the model root (or a descendant sharing its
-                    # identity) into the missing output location between mkdir
-                    # and open, so each newly opened component must be re-checked
-                    # against the model root by identity before it is advanced to
-                    # and used to create the next component.  Without this per-
-                    # component check a multi-level missing output path could
-                    # create deeper directories inside the relocated model root
-                    # before a single final check rejected the path, mutating the
-                    # model root this function guarantees it never mutates.
-                    _require_directory_outside_model_root(
-                        child_descriptor,
-                        model_root_metadata,
-                        directory_flags=directory_flags,
-                    )
+                    try:
+                        _require_same_model_identity(
+                            os.stat(remaining, dir_fd=descriptor, follow_symlinks=False),
+                            os.fstat(child_descriptor),
+                        )
+                        # The identity check only proves the opened object is
+                        # the named object; it does not prove the named object
+                        # is outside the attested model root.  Another process
+                        # can win the mkdir race by moving the model root (or a
+                        # descendant sharing its identity) into the missing
+                        # output location between mkdir and open, so each newly
+                        # opened component must be re-checked against the model
+                        # root by identity before it is advanced to and used to
+                        # create the next component.  Without this per-component
+                        # check a multi-level missing output path could create
+                        # deeper directories inside the relocated model root
+                        # before a single final check rejected the path, mutating
+                        # the model root this function guarantees it never
+                        # mutates.
+                        _require_directory_outside_model_root(
+                            child_descriptor,
+                            model_root_metadata,
+                            directory_flags=directory_flags,
+                        )
+                    except BaseException:
+                        # Validation failed before ownership moved into
+                        # ``descriptor``; the outer cleanup only closes
+                        # ``descriptor``, so close the orphaned child here.
+                        _close_model_root_fd(child_descriptor)
+                        raise
                     os.close(descriptor)
                     descriptor = child_descriptor
                 return descriptor
-            _require_same_model_identity(
-                os.stat(part, dir_fd=descriptor, follow_symlinks=False),
-                os.fstat(child_descriptor),
-            )
+            try:
+                _require_same_model_identity(
+                    os.stat(part, dir_fd=descriptor, follow_symlinks=False),
+                    os.fstat(child_descriptor),
+                )
+            except BaseException:
+                _close_model_root_fd(child_descriptor)
+                raise
             os.close(descriptor)
             descriptor = child_descriptor
         _require_directory_outside_model_root(
@@ -1229,10 +1242,15 @@ def freeze_separator_runtime(
     # different revision cannot observe a stale environment_preexisting value
     # and delete a manifest that belongs to the winning freeze.
     with _acquire_runtime_publication_lock(output, model_root) as publication_fd:
-        environment_preexisting = _publication_name_exists(
-            publication_fd, _RUNTIME_ENVIRONMENT_MANIFEST_NAME
-        )
+        # Default to "preexisting" so a failed existence probe keeps cleanup
+        # conservative (never delete a manifest whose existence could not be
+        # proven to have started with this invocation), and so probe failures
+        # are translated to separator_lock_publication_failed below.
+        environment_preexisting = True
         try:
+            environment_preexisting = _publication_name_exists(
+                publication_fd, _RUNTIME_ENVIRONMENT_MANIFEST_NAME
+            )
             publish_immutable_file_at(
                 publication_fd, _RUNTIME_ENVIRONMENT_MANIFEST_NAME, environment_bytes
             )
