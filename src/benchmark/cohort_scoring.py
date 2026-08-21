@@ -9,7 +9,12 @@ from statistics import fmean, median
 from typing import Literal, get_args
 
 from src.benchmark import scoring
-from src.benchmark.backend_identity import MUSCRIPTOR_BACKEND_ID, OAF_BACKEND_ID, require_sha256
+from src.benchmark.backend_identity import (
+    IDM_BACKEND_ID,
+    MUSCRIPTOR_BACKEND_ID,
+    OAF_BACKEND_ID,
+    require_sha256,
+)
 from src.benchmark.models import BenchmarkEvent, ScoreSummary
 from src.benchmark.prediction_artifact import (
     PredictionArtifact,
@@ -28,6 +33,7 @@ from src.benchmark.scoring import ScoreResult, score_events_with_alignment
 from src.benchmark.taxonomy import (
     DTX_LANE_MAP,
     DTX_LANE_MAP_VERSION,
+    IDM_PREDICTION_MAP_ID,
     MUSCRIPTOR_PREDICTION_MAP_ID,
     OAF_PREDICTION_MAP_ID,
     TAXONOMY_VERSION,
@@ -40,6 +46,7 @@ SCORE_MODES = ("raw", "aligned")
 ZERO_HIT_PREDICTION_MAPS = {
     OAF_BACKEND_ID: OAF_PREDICTION_MAP_ID,
     MUSCRIPTOR_BACKEND_ID: MUSCRIPTOR_PREDICTION_MAP_ID,
+    IDM_BACKEND_ID: IDM_PREDICTION_MAP_ID,
 }
 _ORIGINAL_PREDICTION_TIME_METADATA_KEY = "_crux_original_prediction_time_sec"
 

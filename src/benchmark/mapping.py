@@ -11,6 +11,7 @@ from src.benchmark.taxonomy import (
 )
 from src.benchmark.taxonomy import (
     DTX_LANE_MAP,
+    IDM_PREDICTION_MAP,
     MUSCRIPTOR_PREDICTION_MAP,
     OAF_PREDICTION_MAP,
     ClassMapping,
@@ -107,6 +108,44 @@ def map_muscriptor_prediction(
     unmapped: dict[str, int] = {}
     for native in prediction.events:
         key = str(native.native_midi_note)
+        class_mapping = prediction_map.classes.get(key)
+        is_mapped = class_mapping is not None and class_mapping.common_class is not None
+        if not is_mapped:
+            unmapped[key] = unmapped.get(key, 0) + 1
+        mapped_events.append(
+            MappedPredictionEvent(
+                native=native,
+                canonical_class=(class_mapping.canonical_class if is_mapped else None),
+                common_class=(class_mapping.common_class if is_mapped else None),
+                mapping_status="mapped" if is_mapped else "unmapped",
+                prediction_map_version=prediction_map.map_id,
+            )
+        )
+    return MappedPrediction(
+        audio=prediction.audio,
+        descriptor=prediction.descriptor,
+        events=tuple(mapped_events),
+    ), MappingDiagnostics(unmapped=unmapped)
+
+
+def map_idm_prediction(
+    prediction: NativePrediction,
+    prediction_map: PredictionMap = IDM_PREDICTION_MAP,
+) -> tuple["MappedPrediction", MappingDiagnostics]:
+    """Map IDM native class IDs while retaining unexpected classes as evidence."""
+    from src.benchmark.prediction_artifact import MappedPrediction, MappedPredictionEvent
+
+    if prediction.descriptor.payload.get("backend_id") != prediction_map.backend_id:
+        raise ValueError("prediction backend_id does not match prediction map")
+    if prediction.descriptor.payload.get("native_output_space_id") != (
+        prediction_map.native_output_space_id
+    ):
+        raise ValueError("prediction native_output_space_id does not match prediction map")
+
+    mapped_events: list[MappedPredictionEvent] = []
+    unmapped: dict[str, int] = {}
+    for native in prediction.events:
+        key = native.native_class_id
         class_mapping = prediction_map.classes.get(key)
         is_mapped = class_mapping is not None and class_mapping.common_class is not None
         if not is_mapped:
