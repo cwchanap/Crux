@@ -3,5 +3,11 @@ name = "crux-idm-runtime"
 version = "0.0.0"
 requires-python = "==3.11.*"
 dependencies = [
-  "inverse-drum-machine @ git+https://github.com/bernardo-torres/inverse-drum-machine.git@456656868538205ef756912c7cf5b0fd936de8af",
+  "inverse-drum-machine==0.1.0",
 ]
+
+[tool.uv.sources]
+inverse-drum-machine = { path = "wheels/inverse_drum_machine-0.1.0-py3-none-any.whl" }
+
+[tool.uv]
+override-dependencies = ["setuptools==80.9.0"]

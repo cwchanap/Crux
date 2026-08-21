@@ -1,0 +1,609 @@
+{
+  "builder": {
+    "python": "3.11",
+    "source_date_epoch": 0,
+    "uv": "uv 0.7.5 (9d1a14e1f 2025-05-16)"
+  },
+  "license_basis": {
+    "checkpoint_notice_found": false,
+    "checkpoint_provenance": "repository-level Apache-2.0",
+    "note": "No separate checkpoint notice exists in the pinned repository; this records repository-level provenance and is not an independent legal conclusion.",
+    "repository_code": "Apache-2.0"
+  },
+  "original_pyproject_byte_length": 1381,
+  "original_pyproject_sha256": "debd22c8f28b76137d2d0a61668d0d0c1c8fd2c930fc9821bfbae291f2484b49",
+  "package_name": "inverse-drum-machine",
+  "package_version": "0.1.0",
+  "packaged_idm_files": [
+    {
+      "byte_length": 4065,
+      "path": "idm/__init__.py",
+      "sha256": "4b76bdbd858696c5833befe8f73d8d337d9e369f69f8d65d5611c1af66679979"
+    },
+    {
+      "byte_length": 0,
+      "path": "idm/baselines/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 0,
+      "path": "idm/baselines/larsnet/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 1726,
+      "path": "idm/baselines/larsnet/helpers.py",
+      "sha256": "2be7c0c15203fe8625e064d81973838af6682d78346f047ba31bdbf00cc6381d"
+    },
+    {
+      "byte_length": 5151,
+      "path": "idm/baselines/larsnet/larsnet.py",
+      "sha256": "1ef2dab633e68f1b1e0fcf5bdb61d8af439bbfdb8b6bcff04f6d9eeac5a32b5e"
+    },
+    {
+      "byte_length": 8926,
+      "path": "idm/baselines/larsnet/unet.py",
+      "sha256": "dca49b7cf95b65425a5b5b336ea96f59493f4d27bc60860ddfa248fb455ef5b6"
+    },
+    {
+      "byte_length": 0,
+      "path": "idm/baselines/nmf/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 11924,
+      "path": "idm/baselines/nmf/nmfd.py",
+      "sha256": "67a91d7f064e0fd9d0ac15d90b1dfa6883d611adc3b19b8b01dc5210c7aaca54"
+    },
+    {
+      "byte_length": 1913,
+      "path": "idm/baselines/nmf/utils.py",
+      "sha256": "65347844e87358e2bb3f53f16629d18952c2d03ded2fe8b8d6a1d3479ae2214a"
+    },
+    {
+      "byte_length": 0,
+      "path": "idm/callbacks/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 27082,
+      "path": "idm/callbacks/audio.py",
+      "sha256": "6d5773b131f9caa356ba65dbb9b75fd72bc2c276c8197a59643810ff5ae69d4a"
+    },
+    {
+      "byte_length": 3007,
+      "path": "idm/callbacks/base.py",
+      "sha256": "94c3633bc86774c6c505d874e54ad365fc766641470281184634c9dcea01c9da"
+    },
+    {
+      "byte_length": 1618,
+      "path": "idm/components.py",
+      "sha256": "621156a53f200c6d11de21ec13f7202cb1a571ccefe60c4fca01985cfb3647da"
+    },
+    {
+      "byte_length": 2968,
+      "path": "idm/config_resolvers.py",
+      "sha256": "2c17d31f47374ca6d7ee7664d3b8edb68483fad5f3af14eb9ad26948e233b081"
+    },
+    {
+      "byte_length": 0,
+      "path": "idm/data/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 13308,
+      "path": "idm/data/datamodule.py",
+      "sha256": "c56679eebfd63d81fc7d44f27a55c795a6713643a3639de8d3d9eb12ed99e350"
+    },
+    {
+      "byte_length": 28170,
+      "path": "idm/data/dataset.py",
+      "sha256": "2103522037c74cda53f95786480f48849f2dabb21ec0467b28c6e955d6b4dcc7"
+    },
+    {
+      "byte_length": 0,
+      "path": "idm/decoder/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 7519,
+      "path": "idm/decoder/decoder.py",
+      "sha256": "95e956f5e4cccafc40c68b819591c56ac4911f09fae8b58892cf47bc732b2ce1"
+    },
+    {
+      "byte_length": 2629,
+      "path": "idm/decoder/film.py",
+      "sha256": "3556efabd1beb738ee46ca4b9f2c0de1e9fd23ab3afdf4daf56a51a297b97809"
+    },
+    {
+      "byte_length": 16299,
+      "path": "idm/decoder/one_shot_synth.py",
+      "sha256": "e2dc7824a5763eea10a7459d036e4cd9c20238313cacfad2710b593eb50f0412"
+    },
+    {
+      "byte_length": 7773,
+      "path": "idm/decoder/sequencer.py",
+      "sha256": "c9190913f19c4eb14f22ada9ecba50aa8db0de2ee38528a84075ac5e76d39bd9"
+    },
+    {
+      "byte_length": 4620,
+      "path": "idm/decoder/synth.py",
+      "sha256": "a3fde1a1632b96a14e938ee1562c3cc3fa788159d60e4b707194b42dd205b3fb"
+    },
+    {
+      "byte_length": 0,
+      "path": "idm/feature_extractor/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 11253,
+      "path": "idm/feature_extractor/convnext.py",
+      "sha256": "1ed033b8f49a28b0e19e274e410890062e856627b5a2066d2c2ba915e1e87157"
+    },
+    {
+      "byte_length": 7425,
+      "path": "idm/feature_extractor/encoder.py",
+      "sha256": "bf99269e2b819aee55de06acd87f31e6e4f5da6dd184af2e9a2bcb6d612042e9"
+    },
+    {
+      "byte_length": 1625,
+      "path": "idm/feature_extractor/mel.py",
+      "sha256": "b90ad6b3b47265f35dee9dc310f40db6e778f3d788db49cf9fe3b56cbb23028c"
+    },
+    {
+      "byte_length": 6032,
+      "path": "idm/feature_extractor/stft.py",
+      "sha256": "afb6d58387e7c6d2ec6783dbd010840a2c8ef713221a5c0c3a8796d05f33c7db"
+    },
+    {
+      "byte_length": 13168,
+      "path": "idm/idm.py",
+      "sha256": "4e82ee3eb395d0acf401ca08f1a94c3f0748fa08222bf9e17b0a3e3bd8ee4fca"
+    },
+    {
+      "byte_length": 11391,
+      "path": "idm/inference.py",
+      "sha256": "d531bcb5a5c4eaf6ac8a4d4eb2b64649477561725e8ac03e5a28ab95f4963624"
+    },
+    {
+      "byte_length": 16429,
+      "path": "idm/logger.py",
+      "sha256": "1b8a72bcec43ad707c2b2190b4904d8f1546173ccc08ec854acb72a6efb5461c"
+    },
+    {
+      "byte_length": 1225,
+      "path": "idm/losses.py",
+      "sha256": "aeedcf965e4f13c13cf49f309fa9de8336aa04526169343c97ed17da26ebaac8"
+    },
+    {
+      "byte_length": 12612,
+      "path": "idm/metrics.py",
+      "sha256": "99d56990a7a91d131346246559dafff77c76ef3bccd0a513927fd4dd5f5b6b44"
+    },
+    {
+      "byte_length": 11755,
+      "path": "idm/run.py",
+      "sha256": "7aa8e15386abcfed42abf3b0ac25870e6359207cef76af9b4b5deb481a9f8857"
+    },
+    {
+      "byte_length": 8632,
+      "path": "idm/run_utils.py",
+      "sha256": "bee8fff80f87a63eece8f2c0372289d57de4f75ba248aeddc1c42f9697521d26"
+    },
+    {
+      "byte_length": 0,
+      "path": "idm/synthesis_conditioning/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 3680,
+      "path": "idm/synthesis_conditioning/embedding.py",
+      "sha256": "8c02fd17b9ebbababd5c2f243b87a1a8833a3dee3c675b5553e784cadf1188f6"
+    },
+    {
+      "byte_length": 9144,
+      "path": "idm/synthesis_conditioning/params_decoder.py",
+      "sha256": "be9d5b35cc653d9b47cbce33b278f7f75ba3a52db753a7846d94695f61d903b1"
+    },
+    {
+      "byte_length": 2961,
+      "path": "idm/synthesis_conditioning/peak_picking.py",
+      "sha256": "7d7cc7a8e490f217e56a046a3e27a35e8b9a838d692eb5147588af7c6e914bff"
+    },
+    {
+      "byte_length": 3897,
+      "path": "idm/synthesis_conditioning/transcription.py",
+      "sha256": "88aa9167fb6247c6446e89ab8499d5443abfb2573634180bb66c2f81cf497955"
+    },
+    {
+      "byte_length": 23576,
+      "path": "idm/utils.py",
+      "sha256": "04cb357bab826755e894eae46a9e6b0486a8a05479180c93b9704a376a5fd001"
+    }
+  ],
+  "repository": "https://github.com/bernardo-torres/inverse-drum-machine",
+  "schema": "crux.idm-wheel-provenance/v1",
+  "shim": {
+    "build_system": {
+      "build_backend": "poetry.core.masonry.api",
+      "requires": [
+        "poetry-core==2.2.1"
+      ]
+    },
+    "metadata_sha256": "bcfa197ba0f20de4c00b197f765555aab4fcf21877f4884c1704aa97cbd47efe"
+  },
+  "source_commit": "456656868538205ef756912c7cf5b0fd936de8af",
+  "source_manifest": [
+    {
+      "byte_length": 68,
+      "path": ".preetierrc",
+      "sha256": "9696c1ce9db82f8328f59d40a2d345e77f30d5e92d5b01843fffa57be6b2454a"
+    },
+    {
+      "byte_length": 0,
+      "path": ".project-root",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 11357,
+      "path": "LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "byte_length": 6174,
+      "path": "README.md",
+      "sha256": "d41da5ff8492ab5c7b728d20da019ca97dc8698dd5fd1dc8b5de90ec6b70a4af"
+    },
+    {
+      "byte_length": 1145,
+      "path": "configs/baselines/NMFD/nmfd_amen_case1a.yaml",
+      "sha256": "bfdaed3c8a71d8b27433867c09b3ad3c4780138129345504ffdc0665311acc2f"
+    },
+    {
+      "byte_length": 1125,
+      "path": "configs/baselines/NMFD/nmfd_amen_case1b.yaml",
+      "sha256": "6bab27d3e6803b1757274a3c3551d58a3de5e5661d69f4ca9af2aba0f60b31fb"
+    },
+    {
+      "byte_length": 1149,
+      "path": "configs/baselines/NMFD/nmfd_amen_case2.yaml",
+      "sha256": "f1a5dc663d4315d19abbc971efb752477de26c37c19968e8fe84148f31b87d9e"
+    },
+    {
+      "byte_length": 1145,
+      "path": "configs/baselines/NMFD/nmfd_amen_case3.yaml",
+      "sha256": "d97fe52a0dc119c364cb50e5604db0d7469f48dd0602a895feb078dc3204d557"
+    },
+    {
+      "byte_length": 1193,
+      "path": "configs/baselines/NMFD/nmfd_amen_case4.yaml",
+      "sha256": "049f371ec3daeb9d30a6b793571beb64145edd12bc585107de3065ef7008c580"
+    },
+    {
+      "byte_length": 1458,
+      "path": "configs/baselines/larsnet/config.yaml",
+      "sha256": "101590469d1c7cb732e768b19ee2cfba9e9bf2bcb521bb86bbf56adb76f90f1b"
+    },
+    {
+      "byte_length": 688,
+      "path": "configs/baselines/larsnet/eval_larsnet_44kHz.yaml",
+      "sha256": "0d9ea1a7dee6ef6ead8c40906c3445a643f40ed238e6b546afb75e0e33225b6b"
+    },
+    {
+      "byte_length": 93,
+      "path": "configs/baselines/larsnet/eval_larsnet_44kHz_mono.yaml",
+      "sha256": "43b5cf5280e6442497cae7869ab528e86b9dabbf160572b0d9da3f7f346efa3f"
+    },
+    {
+      "byte_length": 606,
+      "path": "configs/callbacks/default.yaml",
+      "sha256": "b32e36ebe163f78745347ac1c1900e34669e45aae637f749114d5ef6c5c7d730"
+    },
+    {
+      "byte_length": 815,
+      "path": "configs/data/multitrack-stem-gmd.yaml",
+      "sha256": "a5493cd23d5dd2dcc9996b2610dab1066db6903a663ab8c67b605616bca4e26c"
+    },
+    {
+      "byte_length": 1184,
+      "path": "configs/hydra/default.yaml",
+      "sha256": "4e6ece8d878d81318fcf8324b598cfa38aa23cd39e8455fb69587c79b51bf6ed"
+    },
+    {
+      "byte_length": 20,
+      "path": "configs/local.yaml",
+      "sha256": "8ad3feb4512f461c509fe1af1215e50a6d56c087587525a1857026b47d65f28a"
+    },
+    {
+      "byte_length": 95,
+      "path": "configs/logger/custom.yaml",
+      "sha256": "36368b4a0ef4ae72879799baf655c9eb31077ed32124bb715553f688c68833fd"
+    },
+    {
+      "byte_length": 2916,
+      "path": "configs/model/idm.yaml",
+      "sha256": "a263fdd9e05ca835fbfbaa0ab0fe4d7f1ce848d9d3ea847d6e94866682787fba"
+    },
+    {
+      "byte_length": 815,
+      "path": "configs/paths/default.yaml",
+      "sha256": "d5cee26bb6cda883932ef61e9b61da60fd42ca33a170ba45f86fb10bdd9aa1d6"
+    },
+    {
+      "byte_length": 918,
+      "path": "configs/train.yaml",
+      "sha256": "74c52e9ffa99ecbb4fc8e7c6b3f094f0ad9ee6930451ce3c0a31fe9e71d41ea5"
+    },
+    {
+      "byte_length": 48,
+      "path": "configs/tuner/batch_size_finder.yaml",
+      "sha256": "57eb54357154ce00e8797aeb5efb7d746948c58e657b64364ef4b15a64f195b4"
+    },
+    {
+      "byte_length": 0,
+      "path": "configs/tuner/none.yaml",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 29124,
+      "path": "demo/demo.ipynb",
+      "sha256": "52ff5733b972a9c71585c5b4588e8bd7f54a6fbc5547b0abd251622ec2fe2fdc"
+    },
+    {
+      "byte_length": 415965,
+      "path": "demo/detail.png",
+      "sha256": "03833aedbb1b78846c6e3aedd48d5065227b97e861367a8e31d263109a7b4a8c"
+    },
+    {
+      "byte_length": 881532,
+      "path": "demo/mix.wav",
+      "sha256": "9a3db5fd7697d5c28082d86438cb7c789c50d7b91f680604cc0f5d0081fb8198"
+    },
+    {
+      "byte_length": 303858,
+      "path": "demo/overview.png",
+      "sha256": "f04c880617e5b24bfd7077c017eb24c236784d87b8b7abb2aafd884d6f09d19b"
+    },
+    {
+      "byte_length": 11765963,
+      "path": "demo/separate.ipynb",
+      "sha256": "fd0b7bb5347f464ddd147c6453acbd832cb4a92d540f7ad221257b57bd4ba1b3"
+    },
+    {
+      "byte_length": 4065,
+      "path": "idm/__init__.py",
+      "sha256": "4b76bdbd858696c5833befe8f73d8d337d9e369f69f8d65d5611c1af66679979"
+    },
+    {
+      "byte_length": 0,
+      "path": "idm/baselines/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 0,
+      "path": "idm/baselines/larsnet/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 1726,
+      "path": "idm/baselines/larsnet/helpers.py",
+      "sha256": "2be7c0c15203fe8625e064d81973838af6682d78346f047ba31bdbf00cc6381d"
+    },
+    {
+      "byte_length": 5151,
+      "path": "idm/baselines/larsnet/larsnet.py",
+      "sha256": "1ef2dab633e68f1b1e0fcf5bdb61d8af439bbfdb8b6bcff04f6d9eeac5a32b5e"
+    },
+    {
+      "byte_length": 8926,
+      "path": "idm/baselines/larsnet/unet.py",
+      "sha256": "dca49b7cf95b65425a5b5b336ea96f59493f4d27bc60860ddfa248fb455ef5b6"
+    },
+    {
+      "byte_length": 0,
+      "path": "idm/baselines/nmf/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 11924,
+      "path": "idm/baselines/nmf/nmfd.py",
+      "sha256": "67a91d7f064e0fd9d0ac15d90b1dfa6883d611adc3b19b8b01dc5210c7aaca54"
+    },
+    {
+      "byte_length": 1913,
+      "path": "idm/baselines/nmf/utils.py",
+      "sha256": "65347844e87358e2bb3f53f16629d18952c2d03ded2fe8b8d6a1d3479ae2214a"
+    },
+    {
+      "byte_length": 0,
+      "path": "idm/callbacks/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 27082,
+      "path": "idm/callbacks/audio.py",
+      "sha256": "6d5773b131f9caa356ba65dbb9b75fd72bc2c276c8197a59643810ff5ae69d4a"
+    },
+    {
+      "byte_length": 3007,
+      "path": "idm/callbacks/base.py",
+      "sha256": "94c3633bc86774c6c505d874e54ad365fc766641470281184634c9dcea01c9da"
+    },
+    {
+      "byte_length": 1618,
+      "path": "idm/components.py",
+      "sha256": "621156a53f200c6d11de21ec13f7202cb1a571ccefe60c4fca01985cfb3647da"
+    },
+    {
+      "byte_length": 2968,
+      "path": "idm/config_resolvers.py",
+      "sha256": "2c17d31f47374ca6d7ee7664d3b8edb68483fad5f3af14eb9ad26948e233b081"
+    },
+    {
+      "byte_length": 0,
+      "path": "idm/data/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 13308,
+      "path": "idm/data/datamodule.py",
+      "sha256": "c56679eebfd63d81fc7d44f27a55c795a6713643a3639de8d3d9eb12ed99e350"
+    },
+    {
+      "byte_length": 28170,
+      "path": "idm/data/dataset.py",
+      "sha256": "2103522037c74cda53f95786480f48849f2dabb21ec0467b28c6e955d6b4dcc7"
+    },
+    {
+      "byte_length": 0,
+      "path": "idm/decoder/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 7519,
+      "path": "idm/decoder/decoder.py",
+      "sha256": "95e956f5e4cccafc40c68b819591c56ac4911f09fae8b58892cf47bc732b2ce1"
+    },
+    {
+      "byte_length": 2629,
+      "path": "idm/decoder/film.py",
+      "sha256": "3556efabd1beb738ee46ca4b9f2c0de1e9fd23ab3afdf4daf56a51a297b97809"
+    },
+    {
+      "byte_length": 16299,
+      "path": "idm/decoder/one_shot_synth.py",
+      "sha256": "e2dc7824a5763eea10a7459d036e4cd9c20238313cacfad2710b593eb50f0412"
+    },
+    {
+      "byte_length": 7773,
+      "path": "idm/decoder/sequencer.py",
+      "sha256": "c9190913f19c4eb14f22ada9ecba50aa8db0de2ee38528a84075ac5e76d39bd9"
+    },
+    {
+      "byte_length": 4620,
+      "path": "idm/decoder/synth.py",
+      "sha256": "a3fde1a1632b96a14e938ee1562c3cc3fa788159d60e4b707194b42dd205b3fb"
+    },
+    {
+      "byte_length": 0,
+      "path": "idm/feature_extractor/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 11253,
+      "path": "idm/feature_extractor/convnext.py",
+      "sha256": "1ed033b8f49a28b0e19e274e410890062e856627b5a2066d2c2ba915e1e87157"
+    },
+    {
+      "byte_length": 7425,
+      "path": "idm/feature_extractor/encoder.py",
+      "sha256": "bf99269e2b819aee55de06acd87f31e6e4f5da6dd184af2e9a2bcb6d612042e9"
+    },
+    {
+      "byte_length": 1625,
+      "path": "idm/feature_extractor/mel.py",
+      "sha256": "b90ad6b3b47265f35dee9dc310f40db6e778f3d788db49cf9fe3b56cbb23028c"
+    },
+    {
+      "byte_length": 6032,
+      "path": "idm/feature_extractor/stft.py",
+      "sha256": "afb6d58387e7c6d2ec6783dbd010840a2c8ef713221a5c0c3a8796d05f33c7db"
+    },
+    {
+      "byte_length": 13168,
+      "path": "idm/idm.py",
+      "sha256": "4e82ee3eb395d0acf401ca08f1a94c3f0748fa08222bf9e17b0a3e3bd8ee4fca"
+    },
+    {
+      "byte_length": 11391,
+      "path": "idm/inference.py",
+      "sha256": "d531bcb5a5c4eaf6ac8a4d4eb2b64649477561725e8ac03e5a28ab95f4963624"
+    },
+    {
+      "byte_length": 16429,
+      "path": "idm/logger.py",
+      "sha256": "1b8a72bcec43ad707c2b2190b4904d8f1546173ccc08ec854acb72a6efb5461c"
+    },
+    {
+      "byte_length": 1225,
+      "path": "idm/losses.py",
+      "sha256": "aeedcf965e4f13c13cf49f309fa9de8336aa04526169343c97ed17da26ebaac8"
+    },
+    {
+      "byte_length": 12612,
+      "path": "idm/metrics.py",
+      "sha256": "99d56990a7a91d131346246559dafff77c76ef3bccd0a513927fd4dd5f5b6b44"
+    },
+    {
+      "byte_length": 11755,
+      "path": "idm/run.py",
+      "sha256": "7aa8e15386abcfed42abf3b0ac25870e6359207cef76af9b4b5deb481a9f8857"
+    },
+    {
+      "byte_length": 8632,
+      "path": "idm/run_utils.py",
+      "sha256": "bee8fff80f87a63eece8f2c0372289d57de4f75ba248aeddc1c42f9697521d26"
+    },
+    {
+      "byte_length": 0,
+      "path": "idm/synthesis_conditioning/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "byte_length": 3680,
+      "path": "idm/synthesis_conditioning/embedding.py",
+      "sha256": "8c02fd17b9ebbababd5c2f243b87a1a8833a3dee3c675b5553e784cadf1188f6"
+    },
+    {
+      "byte_length": 9144,
+      "path": "idm/synthesis_conditioning/params_decoder.py",
+      "sha256": "be9d5b35cc653d9b47cbce33b278f7f75ba3a52db753a7846d94695f61d903b1"
+    },
+    {
+      "byte_length": 2961,
+      "path": "idm/synthesis_conditioning/peak_picking.py",
+      "sha256": "7d7cc7a8e490f217e56a046a3e27a35e8b9a838d692eb5147588af7c6e914bff"
+    },
+    {
+      "byte_length": 3897,
+      "path": "idm/synthesis_conditioning/transcription.py",
+      "sha256": "88aa9167fb6247c6446e89ab8499d5443abfb2573634180bb66c2f81cf497955"
+    },
+    {
+      "byte_length": 23576,
+      "path": "idm/utils.py",
+      "sha256": "04cb357bab826755e894eae46a9e6b0486a8a05479180c93b9704a376a5fd001"
+    },
+    {
+      "byte_length": 7483,
+      "path": "pretrained/idm-44-train-kits/.hydra/config_resolved.yaml",
+      "sha256": "59924e5a135a0545fda6d43b3d05a95af075151cda2632d1305f994a2708d2af"
+    },
+    {
+      "byte_length": 2750,
+      "path": "pretrained/idm-44-train-kits/checkpoints/model.yaml",
+      "sha256": "2300e60bfaa8c4c4756568d8ede8992d2e56231b2a519acf30fda1d1bb36f2e6"
+    },
+    {
+      "byte_length": 2544694,
+      "path": "pretrained/idm-44-train-kits/checkpoints/val-epoch=518-global_step=0.ckpt",
+      "sha256": "5856a9bee7c6d503842795756d238dc8470f6f3e010e9e4f33ede0362850cb4c"
+    },
+    {
+      "byte_length": 8,
+      "path": "pretrained/idm-44-train-kits/hash.txt",
+      "sha256": "87a550401fc2f6a1cbf90a13ba34a794a7c70be2cd5547164dead9e801e64170"
+    },
+    {
+      "byte_length": 1381,
+      "path": "pyproject.toml",
+      "sha256": "debd22c8f28b76137d2d0a61668d0d0c1c8fd2c930fc9821bfbae291f2484b49"
+    }
+  ],
+  "wheel": {
+    "byte_length": 94552,
+    "path": "inverse_drum_machine-0.1.0-py3-none-any.whl",
+    "sha256": "b4e8dc567e3d013cddecec5e8ba16b9424951af18e28dcd1d94854d6bcbe7ab5",
+    "tag": "py3-none-any"
+  }
+}
