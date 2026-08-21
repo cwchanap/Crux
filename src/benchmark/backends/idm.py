@@ -47,6 +47,20 @@ IDM_TIME_TOLERANCE_FRAMES = 0.5
 # The locked transform pads to a hop multiple, centered mel adds one frame, and
 # the pinned temporal backbone adds twelve frames (three padded convolutions).
 IDM_ACTIVATION_FRAME_PADDING = 13
+_PYTHON_IMPORT_DISCOVERY_ENVIRONMENT_KEYS = frozenset(
+    {
+        "PYTHONCASEOK",
+        "PYTHONHOME",
+        "PYTHONINSPECT",
+        "PYTHONNOUSERSITE",
+        "PYTHONPATH",
+        "PYTHONPLATLIBDIR",
+        "PYTHONSAFEPATH",
+        "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+        "PYTHONWARNINGS",
+    }
+)
 
 
 class IdmBackendError(RuntimeError):
@@ -178,26 +192,45 @@ class IdmBackend:
         if self._poisoned:
             raise IdmBackendError("worker is poisoned", code="worker_protocol_failed")
 
-        wheel_path, wheel_sha256 = _attest_runtime_artifacts(
+        (
+            wheel_path,
+            wheel_sha256,
+            model_config_path,
+            model_config_sha256,
+            model_config_byte_length,
+            checkpoint_path,
+            checkpoint_sha256,
+            checkpoint_byte_length,
+        ) = _attest_runtime_artifacts(
             self._lock,
             self._model_lock_path,
             self._model_root,
         )
+        site_packages = _runtime_site_packages(self._runtime_python, self._lock)
         command = build_worker_command(
             self._runtime_python,
             self._model_root,
             wheel_path=wheel_path,
             wheel_sha256=wheel_sha256,
+            site_packages=site_packages,
+            model_config_path=model_config_path,
+            model_config_sha256=model_config_sha256,
+            model_config_byte_length=model_config_byte_length,
+            checkpoint_path=checkpoint_path,
+            checkpoint_sha256=checkpoint_sha256,
+            checkpoint_byte_length=checkpoint_byte_length,
         )
         try:
             factory_params = inspect.signature(self._process_factory).parameters
         except (TypeError, ValueError):
             factory_params = {}
-        kwargs = _build_factory_kwargs(
+        kwargs: dict[str, Any] = _build_factory_kwargs(
             factory_params,
             timeout_seconds=self._timeout_seconds,
             close_timeout_seconds=self._close_timeout_seconds,
         )
+        if _factory_accepts_keyword(factory_params, "env"):
+            kwargs["env"] = _isolated_worker_environment()
         try:
             process = self._process_factory(command, **kwargs)
         except (OSError, RuntimeError, ValueError) as error:
@@ -252,6 +285,13 @@ def build_worker_command(
     *,
     wheel_path: Path | None = None,
     wheel_sha256: str | None = None,
+    site_packages: Path | None = None,
+    model_config_path: Path | None = None,
+    model_config_sha256: str | None = None,
+    model_config_byte_length: int | None = None,
+    checkpoint_path: Path | None = None,
+    checkpoint_sha256: str | None = None,
+    checkpoint_byte_length: int | None = None,
 ) -> list[str]:
     """Build the exact command that keeps IDM in its isolated Python runtime."""
     if not isinstance(runtime_python, Path) or not isinstance(model_root, Path):
@@ -260,11 +300,54 @@ def build_worker_command(
         wheel_path = IDM_WORKER_PATH.parent / IDM_WHEEL_NAME
     if not isinstance(wheel_path, Path):
         raise TypeError("wheel_path must be a Path")
+    artifact_arguments = (
+        site_packages,
+        model_config_path,
+        model_config_sha256,
+        model_config_byte_length,
+        checkpoint_path,
+        checkpoint_sha256,
+        checkpoint_byte_length,
+    )
+    if any(argument is None for argument in artifact_arguments):
+        if any(argument is not None for argument in artifact_arguments):
+            raise ValueError("all attested runtime and model arguments are required")
+        if wheel_sha256 is not None:
+            raise ValueError("all attested runtime and model arguments are required")
+        return [
+            os.fspath(runtime_python),
+            "-I",
+            "-S",
+            os.fspath(IDM_WORKER_PATH),
+            "--model-root",
+            os.fspath(model_root),
+            "--wheel-path",
+            os.fspath(wheel_path),
+        ]
+    if wheel_sha256 is None:
+        raise ValueError("all attested runtime and model arguments are required")
+    if not isinstance(site_packages, Path) or not isinstance(model_config_path, Path):
+        raise TypeError("site_packages and model_config_path must be Paths")
+    if not isinstance(checkpoint_path, Path):
+        raise TypeError("checkpoint_path must be a Path")
+    if (
+        not isinstance(model_config_sha256, str)
+        or not isinstance(checkpoint_sha256, str)
+        or type(model_config_byte_length) is not int
+        or model_config_byte_length < 0
+        or type(checkpoint_byte_length) is not int
+        or checkpoint_byte_length < 0
+    ):
+        raise ValueError("attested model file identities are invalid")
     command = [
         os.fspath(runtime_python),
+        "-I",
+        "-S",
         os.fspath(IDM_WORKER_PATH),
         "--model-root",
         os.fspath(model_root),
+        "--site-packages",
+        os.fspath(site_packages),
         "--wheel-path",
         os.fspath(wheel_path),
     ]
@@ -276,6 +359,22 @@ def build_worker_command(
         ):
             raise ValueError("wheel_sha256 must be lowercase SHA-256")
         command.extend(("--wheel-sha256", wheel_sha256))
+    command.extend(
+        (
+            "--model-config-path",
+            os.fspath(model_config_path),
+            "--model-config-sha256",
+            model_config_sha256,
+            "--model-config-byte-length",
+            str(model_config_byte_length),
+            "--checkpoint-path",
+            os.fspath(checkpoint_path),
+            "--checkpoint-sha256",
+            checkpoint_sha256,
+            "--checkpoint-byte-length",
+            str(checkpoint_byte_length),
+        )
+    )
     return command
 
 
@@ -427,17 +526,39 @@ def _activation_frame_limit(audio: CanonicalAudio, lock: IdmModelLock) -> int:
     ) // lock.mel_hop_length + IDM_ACTIVATION_FRAME_PADDING
 
 
+def _runtime_site_packages(runtime_python: Path, lock: IdmModelLock) -> Path:
+    if not isinstance(runtime_python, Path) or not isinstance(lock, IdmModelLock):
+        raise TypeError("runtime_python and lock have invalid types")
+    version_parts = lock.python_version.split(".")
+    version = ".".join(version_parts[:2])
+    return runtime_python.parent.parent / "lib" / f"python{version}" / "site-packages"
+
+
+def _factory_accepts_keyword(params: Mapping[str, inspect.Parameter], name: str) -> bool:
+    parameter = params.get(name)
+    return (
+        parameter is not None and parameter.kind is not inspect.Parameter.POSITIONAL_ONLY
+    ) or any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in params.values())
+
+
+def _isolated_worker_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    for key in _PYTHON_IMPORT_DISCOVERY_ENVIRONMENT_KEYS:
+        environment.pop(key, None)
+    return environment
+
+
 def _attest_runtime_artifacts(
     lock: IdmModelLock,
     model_lock_path: Path,
     model_root: Path,
-) -> tuple[Path, str]:
+) -> tuple[Path, str, Path, str, int, Path, str, int]:
     runtime_root = model_lock_path.parent
     runtime_lock_path = runtime_root / IDM_RUNTIME_LOCK_NAME
     wheel_path = runtime_root / "wheels" / IDM_WHEEL_NAME
     provenance_path = runtime_root / IDM_PROVENANCE_NAME
     try:
-        verify_idm_model_files(lock, model_root)
+        model_config_path, checkpoint_path = verify_idm_model_files(lock, model_root)
         verify_idm_runtime_lock(lock, runtime_lock_path)
         runtime_lock_bytes = read_regular_file_no_follow(runtime_lock_path)
         wheel_sha256 = _wheel_sha256_from_runtime_lock(runtime_lock_bytes, lock)
@@ -453,7 +574,16 @@ def _attest_runtime_artifacts(
             wheel_sha256,
             lock,
         )
-        return wheel_path.absolute(), wheel_sha256
+        return (
+            wheel_path.absolute(),
+            wheel_sha256,
+            model_config_path.absolute(),
+            lock.model_config_sha256,
+            lock.model_config_byte_length,
+            checkpoint_path.absolute(),
+            lock.checkpoint_sha256,
+            lock.checkpoint_byte_length,
+        )
     except (OSError, TypeError, ValueError, KeyError, IndexError, zipfile.BadZipFile) as error:
         raise IdmBackendError(
             "IDM runtime or model artifacts are not attested", code="runtime_artifact_invalid"
