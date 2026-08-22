@@ -1826,10 +1826,15 @@ def test_default_runtime_sync_rejects_uv_sync_oserror(
         _default_runtime_sync(runtime_root, venv_python)
 
 
-def test_default_runtime_sync_strips_uv_project_environment(
+def test_default_runtime_sync_strips_uv_override_env_vars(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """UV_PROJECT_ENVIRONMENT must not redirect the frozen sync to another env."""
+    """Inherited uv overrides must not subvert the mandatory frozen sync.
+
+    ``UV_PROJECT_ENVIRONMENT`` would redirect the sync to another env;
+    ``UV_NO_SYNC`` makes uv skip environment updates entirely (no-op'ing the
+    sync); ``UV_OFFLINE`` blocks the registry fetches a partial install needs.
+    """
     runtime_root = tmp_path / "runtime"
     venv_python = runtime_root / ".venv" / "bin" / "python"
     venv_python.parent.mkdir(parents=True)
@@ -1837,11 +1842,15 @@ def test_default_runtime_sync_strips_uv_project_environment(
 
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/uv")
     monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", str(tmp_path / "other-env"))
+    monkeypatch.setenv("UV_NO_SYNC", "1")
+    monkeypatch.setenv("UV_OFFLINE", "1")
 
     def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
         env = kwargs.get("env")
         assert isinstance(env, dict)
         assert "UV_PROJECT_ENVIRONMENT" not in env
+        assert "UV_NO_SYNC" not in env
+        assert "UV_OFFLINE" not in env
         return subprocess.CompletedProcess(args=args[0], returncode=0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
