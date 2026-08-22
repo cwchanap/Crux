@@ -12,6 +12,11 @@ from pathlib import Path
 
 from src.benchmark.artifact_io import read_regular_file_no_follow
 from src.benchmark.backend_identity import (
+    IDM_MODEL_ID_RE,
+    IDM_NATIVE_METADATA_SCHEMA_ID,
+    IDM_NATIVE_OUTPUT_SPACE_ID,
+    IDM_RELEASE_COMMIT,
+    IDM_TRAINING_DATA_MAP_ID,
     StrictJsonError,
     canonical_json_bytes,
     require_sha256,
@@ -19,8 +24,6 @@ from src.benchmark.backend_identity import (
 )
 
 IDM_MODEL_SCHEMA = "crux.idm-model/v1"
-IDM_RELEASE_COMMIT = "456656868538205ef756912c7cf5b0fd936de8af"
-IDM_MODEL_ID_RE = re.compile(r"idm-44-train-kits-[0-9a-f]{12}-[0-9a-f]{12}\Z")
 IDM_REQUEST_TIMEOUT_SECONDS = 1800.0
 IDM_WORKER_CLOSE_TIMEOUT_SECONDS = 30.0
 IDM_AUDIO_LOADER_REVISION = "soundfile-preserve-wav/v1"
@@ -43,21 +46,21 @@ IDM_PACKAGE_NAME = "inverse-drum-machine"
 IDM_PACKAGE_VERSION = "0.1.0"
 IDM_CODE_LICENSE = "Apache-2.0"
 IDM_WEIGHT_LICENSE = "Apache-2.0"
+IDM_WEIGHT_LICENSE_BASIS = "repository-license-no-separate-weight-notice/v1"
 IDM_MODEL_NAME = "idm-44-train-kits"
 IDM_MODEL_CONFIG_RELATIVE_PATH = "pretrained/idm-44-train-kits/checkpoints/model.yaml"
 IDM_CHECKPOINT_RELATIVE_PATH = (
     "pretrained/idm-44-train-kits/checkpoints/val-epoch=518-global_step=0.ckpt"
 )
-IDM_NATIVE_OUTPUT_SPACE_ID = "idm-44-train-kits-9class-v1"
-IDM_NATIVE_METADATA_SCHEMA_ID = "idm-peak-event-metadata-v1"
-IDM_TRAINING_DATA_MAP_ID = "idm-training-contract-44-train-kits-v1"
+IDM_VELOCITY_ACTIVATION = "exp_sigmoid"
+IDM_VELOCITY_EXPONENT = 10.0
+IDM_VELOCITY_THRESHOLD = 1e-7
 
 IDM_INFERENCE_CONFIG_SCHEMA = "crux.idm-inference-config/v1"
 IDM_ADAPTER_REVISION = "crux.idm-adapter/v1"
 IDM_PREDICTION_MAP_VERSION = "crux.prediction-map/idm-44-train-kits-v1"
 IDM_DEFAULT_INPUT_VIEW_ID = "crux.oaf-htdemucs-drums-mono44k1-pcm16/v1"
 
-_DEVICE_RE = re.compile(r"(?:cpu|mps|cuda(?::[0-9]+)?)\Z")
 _PYTHON_RE = re.compile(r"3\.11\.[0-9]+\Z")
 
 
@@ -73,6 +76,7 @@ class IdmModelLock:
     package_version: str
     code_license: str
     weight_license: str
+    weight_license_basis: str
     runtime_lock_sha256: str
     python_version: str
     model_name: str
@@ -104,7 +108,9 @@ class IdmModelLock:
     peak_pick_div_threshold: int
     peak_pick_normalize: bool
     velocity_activation: str
+    velocity_exponent: float
     velocity_max_value: float
+    velocity_threshold: float
     velocity_to_midi_revision: str
     native_velocity_persistence_revision: str
     manual_onset_override: bool
@@ -118,7 +124,9 @@ class IdmModelLock:
     def __post_init__(self) -> None:
         _validate_lock(self)
         object.__setattr__(self, "activation_rate_hz", float(self.activation_rate_hz))
+        object.__setattr__(self, "velocity_exponent", float(self.velocity_exponent))
         object.__setattr__(self, "velocity_max_value", float(self.velocity_max_value))
+        object.__setattr__(self, "velocity_threshold", float(self.velocity_threshold))
 
 
 _MODEL_KEYS = frozenset(field.name for field in fields(IdmModelLock)) | {"schema"}
@@ -168,7 +176,9 @@ def load_idm_model_lock(path: Path) -> IdmModelLock:
         if isinstance(train_classes, list):
             train_classes = tuple(train_classes)
         activation_rate_hz = _numeric_float(value["activation_rate_hz"], "activation_rate_hz")
+        velocity_exponent = _numeric_float(value["velocity_exponent"], "velocity_exponent")
         velocity_max_value = _numeric_float(value["velocity_max_value"], "velocity_max_value")
+        velocity_threshold = _numeric_float(value["velocity_threshold"], "velocity_threshold")
         return IdmModelLock(
             repository_url=value["repository_url"],
             repository_revision=value["repository_revision"],
@@ -176,6 +186,7 @@ def load_idm_model_lock(path: Path) -> IdmModelLock:
             package_version=value["package_version"],
             code_license=value["code_license"],
             weight_license=value["weight_license"],
+            weight_license_basis=value["weight_license_basis"],
             runtime_lock_sha256=value["runtime_lock_sha256"],
             python_version=value["python_version"],
             model_name=value["model_name"],
@@ -207,7 +218,9 @@ def load_idm_model_lock(path: Path) -> IdmModelLock:
             peak_pick_div_threshold=value["peak_pick_div_threshold"],
             peak_pick_normalize=value["peak_pick_normalize"],
             velocity_activation=value["velocity_activation"],
+            velocity_exponent=velocity_exponent,
             velocity_max_value=velocity_max_value,
+            velocity_threshold=velocity_threshold,
             velocity_to_midi_revision=value["velocity_to_midi_revision"],
             native_velocity_persistence_revision=value["native_velocity_persistence_revision"],
             manual_onset_override=value["manual_onset_override"],
@@ -336,6 +349,9 @@ def _validate_lock(lock: IdmModelLock) -> None:
     _require_exact_string(lock.package_version, "package_version", IDM_PACKAGE_VERSION)
     _require_exact_string(lock.code_license, "code_license", IDM_CODE_LICENSE)
     _require_exact_string(lock.weight_license, "weight_license", IDM_WEIGHT_LICENSE)
+    _require_exact_string(
+        lock.weight_license_basis, "weight_license_basis", IDM_WEIGHT_LICENSE_BASIS
+    )
     _require_hash(lock.runtime_lock_sha256, "runtime_lock_sha256")
     if (
         not isinstance(lock.python_version, str)
@@ -361,10 +377,8 @@ def _validate_lock(lock: IdmModelLock) -> None:
         raise IdmModelLockError("model_id is invalid")
     if lock.model_id != _derive_model_id(lock):
         raise IdmModelLockError("model_id does not match the locked digest fragments")
-    if not isinstance(lock.device, str) or _DEVICE_RE.fullmatch(lock.device) is None:
-        raise IdmModelLockError("device is invalid")
-    if not isinstance(lock.dtype, str) or lock.dtype not in {"float16", "float32", "bfloat16"}:
-        raise IdmModelLockError("dtype is invalid")
+    _require_exact_string(lock.device, "device", "cpu")
+    _require_exact_string(lock.dtype, "dtype", "float32")
     _require_exact_int(lock.sample_rate_hz, "sample_rate_hz", 44100)
     _require_exact_int(lock.input_channel_count, "input_channel_count", 1)
     _require_exact_string(lock.input_container, "input_container", "WAV")
@@ -392,12 +406,10 @@ def _validate_lock(lock: IdmModelLock) -> None:
     _require_exact_int(lock.peak_pick_div_wait, "peak_pick_div_wait", 16)
     _require_exact_int(lock.peak_pick_div_threshold, "peak_pick_div_threshold", 5)
     _require_exact_bool(lock.peak_pick_normalize, "peak_pick_normalize", False)
-    _require_exact_string(
-        lock.velocity_activation,
-        "velocity_activation",
-        "exp_sigmoid(exponent=10,max_value=2,threshold=1e-7)",
-    )
+    _require_exact_string(lock.velocity_activation, "velocity_activation", IDM_VELOCITY_ACTIVATION)
+    _require_exact_number(lock.velocity_exponent, "velocity_exponent", IDM_VELOCITY_EXPONENT)
     _require_exact_number(lock.velocity_max_value, "velocity_max_value", 2.0)
+    _require_exact_number(lock.velocity_threshold, "velocity_threshold", IDM_VELOCITY_THRESHOLD)
     _require_exact_string(
         lock.velocity_to_midi_revision,
         "velocity_to_midi_revision",
@@ -430,7 +442,7 @@ def _validate_lock(lock: IdmModelLock) -> None:
 
 
 def _derive_model_id(lock: IdmModelLock) -> str:
-    return f"idm-44-train-kits-{lock.repository_revision[:12]}-{lock.checkpoint_sha256[:12]}"
+    return derive_idm_model_id(lock)
 
 
 def _verify_file(
@@ -553,8 +565,12 @@ __all__ = [
     "IDM_REPOSITORY_URL",
     "IDM_TRAINING_DATA_MAP_ID",
     "IDM_TRAIN_CLASSES",
+    "IDM_VELOCITY_ACTIVATION",
+    "IDM_VELOCITY_EXPONENT",
+    "IDM_VELOCITY_THRESHOLD",
     "IDM_VELOCITY_TO_MIDI_REVISION",
     "IDM_WEIGHT_LICENSE",
+    "IDM_WEIGHT_LICENSE_BASIS",
     "IdmModelLock",
     "IdmModelLockError",
     "derive_idm_model_id",

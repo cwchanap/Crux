@@ -301,7 +301,8 @@ The complete HPA-396 matrix passed:
 
 The first full-repository run had one transient
 `test_commit_blobs_ignore_staged_and_unstaged_source_edits` failure and 3143
-passing tests. The failing test passed when reproduced alone, and the required
+passing tests. The failure is tracked as cwchanap/Crux#28 for follow-up before
+the next CI run. The failing test passed when reproduced alone, and the required
 full suite was rerun to a clean result:
 
 ```text
@@ -469,14 +470,14 @@ without changing production code or the prediction error-preservation fix.
 
 ### Test-first result
 
-The adjusted test is proof-only: it moves the swap from the first-leaf
-completion seam to the start of the third report leaf, after two complete
-leaf publications. It records every report guard invocation and completed
-publication, then asserts that the observed sequence—not an assumed constant—
-has eight guard calls and two completed leaves before the swap at call nine.
-Because the Round 4 transaction already satisfied this stronger seam, the
-adjusted test was green immediately; no production RED or implementation
-change was required in Round 5.
+The adjusted test is proof-only: it triggers the swap from the two-completed-
+leaf seam rather than the first-leaf completion seam. It records every
+completed report publication and swaps exactly once—the trigger is guarded by
+`not swapped` and fires when the completed-leaf count reaches two—so the
+assertion does not depend on any hardcoded guard-call count. Because the
+Round 4 transaction already satisfied this stronger seam, the adjusted test
+was green immediately; no production RED or implementation change was
+required in Round 5.
 
 ### GREEN and verification
 

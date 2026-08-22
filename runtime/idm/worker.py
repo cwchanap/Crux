@@ -171,21 +171,18 @@ def _read_regular_file_no_follow(
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise ValueError("attested file is not regular")
-        chunks: list[bytes] = []
+        content = bytearray()
         digest = hashlib.sha256()
-        length = 0
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
             if not chunk:
-                content = b"".join(chunks)
-                if expected_length is not None and length != expected_length:
+                if expected_length is not None and len(content) != expected_length:
                     raise ValueError("attested file length does not match")
                 if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
                     raise ValueError("attested file digest does not match")
-                return content
-            chunks.append(chunk)
+                return bytes(content)
+            content.extend(chunk)
             digest.update(chunk)
-            length += len(chunk)
     finally:
         os.close(descriptor)
 
@@ -355,7 +352,9 @@ def _load_audio(
             raise ValueError("audio format is invalid")
         stream.seek(0)
         samples, sample_rate = soundfile.read(stream, dtype="float32", always_2d=True)
-    except Exception as error:
+    except ValueError:
+        raise
+    except (OSError, RuntimeError, soundfile.LibsndfileError) as error:
         raise ValueError("audio input or format is invalid") from error
     if sample_rate != SAMPLE_RATE_HZ or samples.shape[1] != 1:
         raise ValueError("audio format is invalid")

@@ -24,6 +24,7 @@ from src.benchmark.separation_handoff import (
 from src.benchmark.taxonomy import OAF_PREDICTION_MAP_ID
 from tests.benchmark.idm_pilot_fixtures import (
     CRUX_COMMIT,
+    IDM_MODEL_LOCK_PATH,
     SHA_B,
     SHA_C,
     canonical_wav,
@@ -199,7 +200,7 @@ def _request(
         separation_artifact_root=tmp_path / "separation",
         stem_cache_root=tmp_path / "stems",
         output_dir=tmp_path / "output",
-        model_lock_path=Path("runtime/idm/model.json"),
+        model_lock_path=IDM_MODEL_LOCK_PATH,
         model_root=tmp_path / "model",
         runtime_python=tmp_path / "python",
         resume=resume,
@@ -242,7 +243,7 @@ def _run_first_synthetic(tmp_path: Path, monkeypatch):
     write_actual_handoff(request.separation_handoff_path, handoff)
     runner = _install_synthetic_seams(monkeypatch, reference, timing, mappings)
     loaded_handoff = runner.load_separation_pilot_manifest(request.separation_handoff_path)
-    descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
+    descriptor = runner.descriptor_for_lock(load_idm_model_lock(IDM_MODEL_LOCK_PATH))
     calls: list[int] = []
     outcome = run_idm_pilot(
         request,
@@ -269,7 +270,7 @@ def test_synthetic_immutable_handoff_runs_both_complete_populations_and_resumes(
     request = _request(tmp_path)
     write_actual_handoff(request.separation_handoff_path, handoff)
     runner = _install_synthetic_seams(monkeypatch, reference, timing, mappings)
-    lock = load_idm_model_lock(Path("runtime/idm/model.json"))
+    lock = load_idm_model_lock(IDM_MODEL_LOCK_PATH)
     descriptor = runner.descriptor_for_lock(lock)
     calls: list[int] = []
 
@@ -312,7 +313,7 @@ def test_synthetic_immutable_handoff_runs_both_complete_populations_and_resumes(
 
     calls.clear()
     resumed = run_idm_pilot(
-        request.__class__(**{**request.__dict__, "resume": True}),
+        replace(request, resume=True),
         backend_factory=lambda **_: FakeBackend(),
         perf_counter=lambda: 1.0,
     )
@@ -328,7 +329,7 @@ def test_primary_worker_consumes_private_verified_input_after_retained_path_swap
     request = _request(tmp_path)
     write_actual_handoff(request.separation_handoff_path, handoff)
     runner = _install_synthetic_seams(monkeypatch, reference, timing, mappings)
-    lock = load_idm_model_lock(Path("runtime/idm/model.json"))
+    lock = load_idm_model_lock(IDM_MODEL_LOCK_PATH)
     descriptor = runner.descriptor_for_lock(lock)
     canonical = canonical_wav()
     retained_path = request.separation_artifact_root / "inputs" / "20" / "htdemucs.wav"
@@ -379,6 +380,14 @@ def test_primary_worker_consumes_private_verified_input_after_retained_path_swap
     assert staged_path.stat().st_mode & 0o077 == 0
 
 
+def _snapshot_tree(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
 @pytest.mark.parametrize("component", ("runs", "run-dir", "predictions", "reports"))
 def test_primary_output_namespace_rejects_preseeded_symlinks_without_outside_writes(
     tmp_path: Path, monkeypatch, component: str
@@ -387,7 +396,7 @@ def test_primary_output_namespace_rejects_preseeded_symlinks_without_outside_wri
     request = _request(tmp_path)
     write_actual_handoff(request.separation_handoff_path, handoff)
     runner = _install_synthetic_seams(monkeypatch, reference, timing, mappings)
-    lock = load_idm_model_lock(Path("runtime/idm/model.json"))
+    lock = load_idm_model_lock(IDM_MODEL_LOCK_PATH)
     descriptor = runner.descriptor_for_lock(lock)
     first = run_idm_pilot(
         request,
@@ -423,6 +432,7 @@ def test_primary_output_namespace_rejects_preseeded_symlinks_without_outside_wri
         shutil.copytree(run_dir / "reports", source)
         shutil.rmtree(run_dir / "reports")
         (run_dir / "reports").symlink_to(source, target_is_directory=True)
+    outside_snapshot = _snapshot_tree(source)
 
     resumed = run_idm_pilot(
         replace(request, resume=True),
@@ -433,6 +443,7 @@ def test_primary_output_namespace_rejects_preseeded_symlinks_without_outside_wri
     assert resumed.overall_status == "failed"
     assert resumed.exit_code == 2
     assert sentinel.read_bytes() == b"must remain untouched"
+    assert _snapshot_tree(source) == outside_snapshot
 
 
 def _swap_held_directory(path: Path, outside: Path) -> tuple[Path, Path, Path, Path]:
@@ -480,7 +491,7 @@ def test_primary_run_checkpoint_uses_held_run_directory_after_swap(
         return handles
 
     monkeypatch.setattr(runner, "_open_primary_namespace", open_then_swap)
-    descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
+    descriptor = runner.descriptor_for_lock(load_idm_model_lock(IDM_MODEL_LOCK_PATH))
     outcome = run_idm_pilot(
         request,
         backend_factory=_healthy_backend_factory(descriptor, []),
@@ -550,7 +561,7 @@ def test_primary_prediction_publication_uses_held_dynamic_parent_after_swap(
         return parent_fd
 
     monkeypatch.setattr(runner, "_open_primary_prediction_parent", open_then_swap)
-    descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
+    descriptor = runner.descriptor_for_lock(load_idm_model_lock(IDM_MODEL_LOCK_PATH))
     outcome = run_idm_pilot(
         request,
         backend_factory=_healthy_backend_factory(descriptor, calls),
@@ -587,7 +598,7 @@ def test_primary_prediction_guard_failure_preserves_integrity_code_and_stops_bac
         return original_guard(namespace, target)
 
     monkeypatch.setattr(runner, "_primary_verify_prediction_parent", guard_then_swap)
-    descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
+    descriptor = runner.descriptor_for_lock(load_idm_model_lock(IDM_MODEL_LOCK_PATH))
     outcome = run_idm_pilot(
         request,
         backend_factory=_healthy_backend_factory(descriptor, calls),
@@ -633,7 +644,7 @@ def test_primary_staged_input_rejects_held_song_directory_after_swap(
         return original_guard(namespace, simfile_id, directory_fd)
 
     monkeypatch.setattr(runner, "_primary_input_directory_identities", guard_then_swap)
-    descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
+    descriptor = runner.descriptor_for_lock(load_idm_model_lock(IDM_MODEL_LOCK_PATH))
     outcome = run_idm_pilot(
         request,
         backend_factory=_healthy_backend_factory(descriptor, calls),
@@ -668,7 +679,7 @@ def test_primary_reports_publication_uses_held_report_directories_after_swap(
         return report_fds
 
     monkeypatch.setattr(runner, "_open_primary_report_directories", open_then_swap)
-    descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
+    descriptor = runner.descriptor_for_lock(load_idm_model_lock(IDM_MODEL_LOCK_PATH))
     outcome = run_idm_pilot(
         request,
         backend_factory=_healthy_backend_factory(descriptor, []),
@@ -724,7 +735,7 @@ def test_primary_reports_publication_rolls_back_all_completed_leaves_after_swap(
     def guard_then_swap(namespace, cohort, directory_fd):
         nonlocal swapped
         guard_calls.append(cohort)
-        if cohort == "oaf" and len(guard_calls) == 9:
+        if cohort == "oaf" and not swapped and len(completed_report_leaves) == 2:
             completed_at_swap.append(tuple(completed_report_leaves))
             _swap_held_directory(report_dir, tmp_path / "outside-reports-transaction")
             swapped = True
@@ -745,8 +756,6 @@ def test_primary_reports_publication_rolls_back_all_completed_leaves_after_swap(
     assert resumed.overall_status == "failed"
     assert resumed.exit_code == 2
     assert calls == []
-    assert len(guard_calls) == 9
-    assert guard_calls == ["oaf"] * 9
     assert completed_at_swap == [(preexisting_name, initially_absent_name)]
     assert completed_report_leaves == [preexisting_name, initially_absent_name]
     assert integrity_codes == ["output_integrity_failed"]
@@ -872,7 +881,7 @@ def test_resume_clears_transient_failure_fields_after_successful_retry(
     request = _request(tmp_path)
     write_actual_handoff(request.separation_handoff_path, handoff)
     runner = _install_synthetic_seams(monkeypatch, reference, timing, mappings)
-    descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
+    descriptor = runner.descriptor_for_lock(load_idm_model_lock(IDM_MODEL_LOCK_PATH))
 
     def prediction(audio):
         return NativePrediction(
@@ -1105,7 +1114,7 @@ def test_poisoned_backend_is_not_restarted_and_remaining_rows_are_protocol_faile
     import src.benchmark.idm_pilot_run as runner
 
     _install_synthetic_seams(monkeypatch, reference, timing, mappings)
-    descriptor = runner.descriptor_for_lock(load_idm_model_lock(Path("runtime/idm/model.json")))
+    descriptor = runner.descriptor_for_lock(load_idm_model_lock(IDM_MODEL_LOCK_PATH))
     transcribe_calls: list[int] = []
     factory_calls: list[int] = []
 

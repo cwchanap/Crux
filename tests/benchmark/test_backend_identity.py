@@ -104,9 +104,26 @@ def test_muscriptor_descriptor_accepts_only_its_frozen_family_shape() -> None:
 
 
 def test_idm_descriptor_accepts_its_frozen_family_and_patterned_model_id() -> None:
+    assert backend_identity.IDM_BACKEND_ID == IDM_BACKEND_ID
+    assert backend_identity.IDM_NATIVE_METADATA_SCHEMA_ID == IDM_NATIVE_METADATA_SCHEMA
+    assert backend_identity.IDM_NATIVE_OUTPUT_SPACE_ID == IDM_NATIVE_OUTPUT_SPACE
+    assert backend_identity.IDM_TRAINING_DATA_MAP_ID == IDM_TRAINING_DATA
+    assert backend_identity.IDM_RELEASE_COMMIT == IDM_COMMIT
     payload = _idm_payload()
+    assert set(payload) == set(backend_identity.IDM_DESCRIPTOR_KEYS)
+    assert backend_identity.IDM_MODEL_ID_RE.fullmatch(payload["model_id"])
 
     assert normalize_known_backend_descriptor(payload) == payload
+
+    missing = _idm_payload()
+    missing.pop("model_id")
+    with pytest.raises(StrictJsonError, match="exact key set"):
+        normalize_known_backend_descriptor(missing)
+
+    extra = _idm_payload()
+    extra["unexpected"] = "value"
+    with pytest.raises(StrictJsonError, match="exact key set"):
+        normalize_known_backend_descriptor(extra)
 
 
 @pytest.mark.parametrize(

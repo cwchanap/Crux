@@ -306,24 +306,6 @@ def test_muscriptor_prediction_rejects_native_event_invariant_violations(
             {
                 "native_metadata": {
                     "frame_index": "215",
-                    "native_velocity": "0",
-                }
-            },
-            "idm_native_metadata",
-        ),
-        (
-            {
-                "native_metadata": {
-                    "frame_index": "215",
-                    "native_velocity": "2.000001",
-                }
-            },
-            "idm_native_metadata",
-        ),
-        (
-            {
-                "native_metadata": {
-                    "frame_index": "215",
                     "native_velocity": "nan",
                 }
             },
@@ -339,3 +321,15 @@ def test_idm_prediction_rejects_native_event_invariant_violations(
 
     with pytest.raises(PredictionArtifactError, match=match):
         render_prediction_artifact(_idm_prediction(native))
+
+
+@pytest.mark.parametrize("native_velocity", ["0", "2.000001"])
+def test_idm_prediction_accepts_canonical_native_velocity_boundaries(
+    native_velocity: str,
+) -> None:
+    native = replace(
+        _idm_native_event(),
+        native_metadata={"frame_index": "215", "native_velocity": native_velocity},
+    )
+
+    render_prediction_artifact(_idm_prediction(native))

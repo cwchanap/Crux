@@ -556,6 +556,7 @@ def test_compare_oaf_idm_rejects_prediction_artifact_wrong_for_run_row(
     idm_run: Path, tmp_path: Path
 ) -> None:
     artifact = _idm_prediction_bytes(source_audio_id="different-song")
+    _set_prediction_artifact_sha(idm_run, artifact, source_audio_id="song-1")
     target = idm_run.parents[2] / "predictions" / "1.jsonl"
     target.parent.mkdir(parents=True)
     target.write_bytes(artifact)

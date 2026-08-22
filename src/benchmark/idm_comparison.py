@@ -15,6 +15,7 @@ from src.benchmark.backend_identity import (
     IDM_BACKEND_ID,
     OAF_BACKEND_ID,
     StrictJsonError,
+    canonical_json_bytes,
     require_sha256,
 )
 from src.benchmark.cohort_scoring import SCORING_VERSION, CohortIdentity
@@ -459,13 +460,17 @@ def _append_diagnostics_markdown(path: Path, summary: Mapping[str, object]) -> N
         "",
         "## IDM Diagnostics",
         "",
-        f"- native_failure_histogram: `{idm.get('native_failure_histogram', {})}`",
-        f"- coverage: `{coverage}`",
-        f"- runtime: `{runtime_info}`",
-        f"- velocity: `{velocity}`",
+        f"- native_failure_histogram: `{_diagnostic_json(idm.get('native_failure_histogram', {}))}`",
+        f"- coverage: `{_diagnostic_json(coverage)}`",
+        f"- runtime: `{_diagnostic_json(runtime_info)}`",
+        f"- velocity: `{_diagnostic_json(velocity)}`",
     ]
     with path.open("a", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
+
+
+def _diagnostic_json(value: object) -> str:
+    return canonical_json_bytes(value).decode("utf-8")
 
 
 def compare_oaf_idm(request: IdmComparisonRequest) -> Path:
@@ -473,6 +478,8 @@ def compare_oaf_idm(request: IdmComparisonRequest) -> Path:
     if not isinstance(request, IdmComparisonRequest):
         raise TypeError("request must be IdmComparisonRequest")
     try:
+        if len(request.run_path.parents) < 3:
+            _fail("IDM run path must remain beneath the Task-4 output root")
         snapshot = _load_snapshot(request.run_path)
         _validate_snapshot_identity(snapshot)
         _validate_run_identity(snapshot)

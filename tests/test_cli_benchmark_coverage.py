@@ -366,6 +366,7 @@ print(json.dumps({
         check=False,
         capture_output=True,
         text=True,
+        timeout=60,
     )
 
     assert result.returncode == 0, result.stderr or result.stdout

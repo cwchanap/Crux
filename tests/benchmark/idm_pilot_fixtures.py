@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import struct
 import wave
 from copy import deepcopy
 from pathlib import Path
 
-from src.benchmark.backend_identity import canonical_json_bytes
 from src.benchmark.backends.base import CanonicalAudio, NativeEvent, NativePrediction
 from src.benchmark.corpus_manifest import render_manifest
 from src.benchmark.mapping import map_oaf_prediction
@@ -32,6 +30,7 @@ SHA_B = "b" * 64
 SHA_C = "c" * 64
 SHA_D = "d" * 64
 CRUX_COMMIT = "1" * 40
+IDM_MODEL_LOCK_PATH = Path(__file__).resolve().parents[2] / "runtime" / "idm" / "model.json"
 
 
 def canonical_wav(*, frame_count: int = 32, sample: int = 0) -> bytes:
@@ -47,44 +46,8 @@ def canonical_wav(*, frame_count: int = 32, sample: int = 0) -> bytes:
     return stream.getvalue()
 
 
-def write_canonical_wav(path: Path, *, frame_count: int = 32) -> bytes:
-    content = canonical_wav(frame_count=frame_count)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(content)
-    return content
-
-
-def write_jsonl(path: Path, rows: list[dict[str, object]]) -> bytes:
-    content = b"".join(canonical_json_bytes(row, trailing_newline=True) for row in rows)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(content)
-    return content
-
-
 def sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
-
-
-def native_idm_prediction(audio: CanonicalAudio, descriptor: object) -> NativePrediction:
-    return NativePrediction(
-        audio=audio,
-        descriptor=descriptor,  # type: ignore[arg-type]
-        events=(
-            NativeEvent(
-                time_sec=0.25,
-                native_class_id="KD",
-                model_output_bin=4,
-                native_midi_note=None,
-                native_metadata={"frame_index": "43", "native_velocity": "1"},
-                confidence=0.9,
-                velocity_midi=64,
-            ),
-        ),
-    )
-
-
-def load_json(path: Path) -> object:
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def oaf_descriptor() -> object:

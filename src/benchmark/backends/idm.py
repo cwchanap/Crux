@@ -306,6 +306,7 @@ def build_worker_command(
     if not isinstance(wheel_path, Path):
         raise TypeError("wheel_path must be a Path")
     artifact_arguments = (
+        wheel_sha256,
         site_packages,
         model_config_path,
         model_config_sha256,
@@ -315,21 +316,6 @@ def build_worker_command(
         checkpoint_byte_length,
     )
     if any(argument is None for argument in artifact_arguments):
-        if any(argument is not None for argument in artifact_arguments):
-            raise ValueError("all attested runtime and model arguments are required")
-        if wheel_sha256 is not None:
-            raise ValueError("all attested runtime and model arguments are required")
-        return [
-            os.fspath(runtime_python),
-            "-I",
-            "-S",
-            os.fspath(IDM_WORKER_PATH),
-            "--model-root",
-            os.fspath(model_root),
-            "--wheel-path",
-            os.fspath(wheel_path),
-        ]
-    if wheel_sha256 is None:
         raise ValueError("all attested runtime and model arguments are required")
     if not isinstance(site_packages, Path) or not isinstance(model_config_path, Path):
         raise TypeError("site_packages and model_config_path must be Paths")
@@ -344,6 +330,12 @@ def build_worker_command(
         or checkpoint_byte_length < 0
     ):
         raise ValueError("attested model file identities are invalid")
+    if (
+        not isinstance(wheel_sha256, str)
+        or len(wheel_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in wheel_sha256)
+    ):
+        raise ValueError("wheel_sha256 must be lowercase SHA-256")
     command = [
         os.fspath(runtime_python),
         "-I",
@@ -356,14 +348,7 @@ def build_worker_command(
         "--wheel-path",
         os.fspath(wheel_path),
     ]
-    if wheel_sha256 is not None:
-        if (
-            not isinstance(wheel_sha256, str)
-            or len(wheel_sha256) != 64
-            or any(character not in "0123456789abcdef" for character in wheel_sha256)
-        ):
-            raise ValueError("wheel_sha256 must be lowercase SHA-256")
-        command.extend(("--wheel-sha256", wheel_sha256))
+    command.extend(("--wheel-sha256", wheel_sha256))
     command.extend(
         (
             "--model-config-path",
