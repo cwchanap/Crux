@@ -81,13 +81,17 @@ RuntimeSync = Callable[[Path, Path], None]
 def _default_runtime_sync(runtime_root: Path, runtime_python: Path) -> None:
     """Materialize or reconcile the isolated runtime from the frozen uv.lock.
 
-    Runs ``uv sync --project <runtime_root> --frozen``.  When the project venv
-    already exists the sync stays ``--offline``, verifying/reconciling strictly
-    from the local uv cache; on a fresh checkout (no venv) the sync may reach
-    the registry to materialize ``<runtime_root>/.venv`` from the frozen lock.
-    Then verifies that the venv python sits at the expected path.  Raises
-    ``RuntimeError`` on any failure (missing ``uv``, non-zero exit, timeout,
-    wrong venv path).
+    Runs ``uv sync --project <runtime_root> --frozen`` (never ``--offline``).
+    The frozen lock controls dependency identity while uv uses its local cache
+    normally and fetches only what is missing from the registry.  ``--offline``
+    is intentionally omitted: ``uv sync`` creates ``.venv/bin/python`` before
+    the full dependency set is installed, so the existence of the venv
+    interpreter is not a reliable "fully materialized" marker.  Conditioning
+    ``--offline`` on it would trap a partially-installed runtime (e.g. an
+    interrupted first sync) into perpetual offline retries that can never
+    fetch the uncached packages.  Then verifies that the venv python sits at
+    the expected path.  Raises ``RuntimeError`` on any failure (missing ``uv``,
+    non-zero exit, timeout, wrong venv path).
 
     The venv-path guard compares lexically rather than via ``resolve()``: uv
     symlinks ``.venv/bin/python`` to the underlying base/managed interpreter,
@@ -105,11 +109,8 @@ def _default_runtime_sync(runtime_root: Path, runtime_python: Path) -> None:
         raise RuntimeError("uv is not available on PATH")
     sync_env = dict(os.environ)
     sync_env.pop("UV_PROJECT_ENVIRONMENT", None)
-    offline = expected_python.exists()
-    sync_label = "uv sync --frozen --offline" if offline else "uv sync --frozen"
+    sync_label = "uv sync --frozen"
     command = [uv_binary, "sync", "--project", os.fspath(runtime_root), "--frozen"]
-    if offline:
-        command.append("--offline")
     try:
         subprocess.run(
             command,

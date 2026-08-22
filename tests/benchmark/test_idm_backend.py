@@ -1704,6 +1704,13 @@ def test_validate_wheel_provenance_rejects_inventory_names_mismatch() -> None:
 def test_default_runtime_sync_succeeds_when_venv_matches_and_uv_syncs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """An existing venv must not trigger --offline (recovery from partial install).
+
+    uv creates ``.venv/bin/python`` before the full dependency set is installed,
+    so the venv interpreter existing is not proof the environment is complete.
+    The sync must stay online-capable so a partially-installed runtime can be
+    reconciled by fetching the missing packages from the registry.
+    """
     runtime_root = tmp_path / "runtime"
     venv_python = runtime_root / ".venv" / "bin" / "python"
     venv_python.parent.mkdir(parents=True)
@@ -1729,7 +1736,7 @@ def test_default_runtime_sync_succeeds_when_venv_matches_and_uv_syncs(
     assert "--project" in captured_commands[0]
     assert str(runtime_root) in captured_commands[0]
     assert "--frozen" in captured_commands[0]
-    assert "--offline" in captured_commands[0]
+    assert "--offline" not in captured_commands[0]
 
 
 def test_default_runtime_sync_rejects_unresolvable_runtime_python(
@@ -1796,7 +1803,7 @@ def test_default_runtime_sync_rejects_uv_sync_failure(
         lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.CalledProcessError(1, args[0])),
     )
 
-    with pytest.raises(RuntimeError, match="uv sync --frozen --offline failed"):
+    with pytest.raises(RuntimeError, match="uv sync --frozen failed"):
         _default_runtime_sync(runtime_root, venv_python)
 
 
@@ -1815,7 +1822,7 @@ def test_default_runtime_sync_rejects_uv_sync_oserror(
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("spawn failed")),
     )
 
-    with pytest.raises(RuntimeError, match="uv sync --frozen --offline failed"):
+    with pytest.raises(RuntimeError, match="uv sync --frozen failed"):
         _default_runtime_sync(runtime_root, venv_python)
 
 
@@ -1868,7 +1875,7 @@ def test_default_runtime_sync_rejects_symlink_resolved_base_interpreter(
 def test_default_runtime_sync_bootstraps_fresh_checkout_without_offline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A fresh checkout has no venv and no cache guarantee, so first sync drops --offline."""
+    """A fresh checkout (no venv) syncs without --offline and materializes the venv."""
     runtime_root = tmp_path / "runtime"
     runtime_root.mkdir()
     venv_python = runtime_root / ".venv" / "bin" / "python"
@@ -1907,7 +1914,7 @@ def test_default_runtime_sync_reports_captured_stderr(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    with pytest.raises(RuntimeError, match="uv sync --frozen --offline failed") as raised:
+    with pytest.raises(RuntimeError, match="uv sync --frozen failed") as raised:
         _default_runtime_sync(runtime_root, venv_python)
     assert "boom diagnostic" in str(raised.value)
 
@@ -1927,5 +1934,5 @@ def test_default_runtime_sync_wraps_sync_timeout(
         lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired(args[0], 1)),
     )
 
-    with pytest.raises(RuntimeError, match="uv sync --frozen --offline timed out"):
+    with pytest.raises(RuntimeError, match="uv sync --frozen timed out"):
         _default_runtime_sync(runtime_root, venv_python)
