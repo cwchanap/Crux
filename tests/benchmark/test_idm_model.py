@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from src.benchmark.backend_identity import canonical_json_bytes
+from src.benchmark.backend_identity import StrictJsonError, canonical_json_bytes
 from src.benchmark.idm_model import (
     IDM_AUDIO_LOADER_REVISION,
     IDM_MODEL_SCHEMA,
@@ -26,6 +26,7 @@ from src.benchmark.idm_model import (
     idm_inference_config,
     idm_inference_config_sha256,
     load_idm_model_lock,
+    model_lock_payload,
     verify_idm_model_files,
     verify_idm_runtime_lock,
 )
@@ -322,3 +323,205 @@ def test_inference_config_hash_rejects_invalid_payload(field: str, value: object
 
     with pytest.raises(ValueError):
         idm_inference_config_sha256(config)
+
+
+def test_derive_idm_model_id_rejects_non_lock() -> None:
+    with pytest.raises(TypeError, match="lock must be an IdmModelLock"):
+        derive_idm_model_id("not-a-lock")  # type: ignore[arg-type]
+
+
+def test_load_idm_model_lock_rejects_non_path() -> None:
+    with pytest.raises(TypeError, match="path must be a Path"):
+        load_idm_model_lock("not-a-path")  # type: ignore[arg-type]
+
+
+def test_load_idm_model_lock_rejects_unavailable_file(tmp_path: Path) -> None:
+    with pytest.raises(IdmModelLockError, match="model lock is unavailable"):
+        load_idm_model_lock(tmp_path / "missing.json")
+
+
+@pytest.mark.parametrize("content", [b'{"schema": "x"}', b'{"schema": "x"}\n\n'])
+def test_load_idm_model_lock_rejects_non_canonical_newlines(tmp_path: Path, content: bytes) -> None:
+    lock_path = tmp_path / "model.json"
+    lock_path.write_bytes(content)
+
+    with pytest.raises(IdmModelLockError, match="one final newline"):
+        load_idm_model_lock(lock_path)
+
+
+def test_load_idm_model_lock_rejects_wrong_key_set(tmp_path: Path) -> None:
+    payload = _lock_payload()
+    del payload["device"]
+    lock_path = tmp_path / "model.json"
+    lock_path.write_bytes(canonical_json_bytes(payload, trailing_newline=True))
+
+    with pytest.raises(IdmModelLockError, match="exact key set"):
+        load_idm_model_lock(lock_path)
+
+
+def test_load_idm_model_lock_rejects_wrong_schema(tmp_path: Path) -> None:
+    lock_path, _, _ = _write_lock(tmp_path / "model.json", schema="crux.wrong/v1")
+
+    with pytest.raises(IdmModelLockError, match="schema is invalid"):
+        load_idm_model_lock(lock_path)
+
+
+def test_load_idm_model_lock_wraps_field_overflow_as_lock_error(tmp_path: Path) -> None:
+    lock_path, _, _ = _write_lock(tmp_path / "model.json", velocity_exponent=10**999)
+
+    with pytest.raises(IdmModelLockError, match="model lock fields are invalid"):
+        load_idm_model_lock(lock_path)
+
+
+def test_verify_idm_model_files_rejects_non_lock(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="lock must be an IdmModelLock"):
+        verify_idm_model_files("not-a-lock", tmp_path)  # type: ignore[arg-type]
+
+
+def test_verify_idm_model_files_rejects_non_path_root(tmp_path: Path) -> None:
+    lock_path, _, _ = _write_lock(tmp_path / "model.json")
+    lock = load_idm_model_lock(lock_path)
+
+    with pytest.raises(TypeError, match="model_root must be a Path"):
+        verify_idm_model_files(lock, "not-a-path")  # type: ignore[arg-type]
+
+
+def test_verify_idm_model_files_rejects_missing_model_root(tmp_path: Path) -> None:
+    lock_path, _, _ = _write_lock(tmp_path / "model.json")
+    lock = load_idm_model_lock(lock_path)
+
+    with pytest.raises(IdmModelLockError, match="model root is unavailable"):
+        verify_idm_model_files(lock, tmp_path / "does-not-exist")
+
+
+def test_verify_idm_runtime_lock_rejects_non_lock(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="lock must be an IdmModelLock"):
+        verify_idm_runtime_lock("not-a-lock", tmp_path)  # type: ignore[arg-type]
+
+
+def test_verify_idm_runtime_lock_rejects_non_path(tmp_path: Path) -> None:
+    lock_path, _, _ = _write_lock(tmp_path / "model.json")
+    lock = load_idm_model_lock(lock_path)
+
+    with pytest.raises(TypeError, match="path must be a Path"):
+        verify_idm_runtime_lock(lock, "not-a-path")  # type: ignore[arg-type]
+
+
+def test_model_lock_payload_round_trips_canonical_fields(tmp_path: Path) -> None:
+    lock_path, _, _ = _write_lock(tmp_path / "model.json")
+    lock = load_idm_model_lock(lock_path)
+
+    payload = model_lock_payload(lock)
+
+    assert payload["schema"] == IDM_MODEL_SCHEMA
+    assert payload["train_classes"] == list(IDM_TRAIN_CLASSES)
+    assert payload["velocity_exponent"] == Decimal("10")
+    # The payload must re-serialize canonically.
+    canonical_json_bytes(payload)
+
+
+def test_model_lock_payload_rejects_non_lock() -> None:
+    with pytest.raises(TypeError, match="lock must be an IdmModelLock"):
+        model_lock_payload("not-a-lock")  # type: ignore[arg-type]
+
+
+def test_inference_config_hash_rejects_non_mapping() -> None:
+    with pytest.raises(TypeError, match="config must be a Mapping"):
+        idm_inference_config_sha256(["not", "a", "mapping"])  # type: ignore[arg-type]
+
+
+def test_inference_config_hash_rejects_wrong_key_set() -> None:
+    config = idm_inference_config(SHA_A, SHA_B, "crux.input/v1")
+    del config["input_view_id"]
+
+    with pytest.raises(StrictJsonError, match="exact key set"):
+        idm_inference_config_sha256(config)
+
+
+def test_inference_config_hash_rejects_wrong_schema() -> None:
+    config = idm_inference_config(SHA_A, SHA_B, "crux.input/v1")
+    config["schema"] = "crux.wrong/v1"
+
+    with pytest.raises(StrictJsonError, match="schema is invalid"):
+        idm_inference_config_sha256(config)
+
+
+def test_inference_config_hash_rejects_non_string_descriptor_hash() -> None:
+    config = idm_inference_config(SHA_A, SHA_B, "crux.input/v1")
+    config["backend_descriptor_sha256"] = 123
+
+    with pytest.raises(StrictJsonError, match="lowercase SHA-256"):
+        idm_inference_config_sha256(config)
+
+
+def test_inference_config_hash_reraises_strict_json_on_unencodable_input_view(
+    tmp_path: Path,
+) -> None:
+    config = idm_inference_config(SHA_A, SHA_B, "\ud800")
+
+    with pytest.raises(StrictJsonError):
+        idm_inference_config_sha256(config)
+
+
+def test_load_rejects_invalid_python_version(tmp_path: Path) -> None:
+    lock_path, _, _ = _write_lock(tmp_path / "model.json", python_version="3.10.5")
+
+    with pytest.raises(IdmModelLockError, match="python_version is invalid"):
+        load_idm_model_lock(lock_path)
+
+
+def test_load_rejects_malformed_model_id(tmp_path: Path) -> None:
+    lock_path, _, _ = _write_lock(tmp_path / "model.json", model_id="idm-bad-format")
+
+    with pytest.raises(IdmModelLockError, match="model_id is invalid"):
+        load_idm_model_lock(lock_path)
+
+
+def test_load_rejects_model_id_not_matching_digest_fragments(tmp_path: Path) -> None:
+    mismatched = "idm-44-train-kits-aaaaaaaaaaaa-bbbbbbbbbbbb"
+    lock_path, _, _ = _write_lock(tmp_path / "model.json", model_id=mismatched)
+
+    with pytest.raises(IdmModelLockError, match="locked digest fragments"):
+        load_idm_model_lock(lock_path)
+
+
+def test_load_rejects_non_numeric_float_field(tmp_path: Path) -> None:
+    lock_path, _, _ = _write_lock(tmp_path / "model.json", activation_rate_hz="not-a-number")
+
+    with pytest.raises(IdmModelLockError, match="activation_rate_hz is invalid"):
+        load_idm_model_lock(lock_path)
+
+
+def test_load_rejects_nonfinite_float_field(tmp_path: Path) -> None:
+    from src.benchmark.idm_model import _numeric_float
+
+    with pytest.raises(IdmModelLockError, match="activation_rate_hz is invalid"):
+        _numeric_float(float("inf"), "activation_rate_hz")
+
+
+def test_load_rejects_non_string_hash_field(tmp_path: Path) -> None:
+    lock_path, _, _ = _write_lock(tmp_path / "model.json", runtime_lock_sha256=123)
+
+    with pytest.raises(IdmModelLockError, match="runtime_lock_sha256 is invalid"):
+        load_idm_model_lock(lock_path)
+
+
+def test_load_rejects_malformed_hash_field(tmp_path: Path) -> None:
+    lock_path, _, _ = _write_lock(tmp_path / "model.json", runtime_lock_sha256="not-a-hash")
+
+    with pytest.raises(IdmModelLockError, match="runtime_lock_sha256 is invalid"):
+        load_idm_model_lock(lock_path)
+
+
+def test_load_rejects_non_positive_byte_length(tmp_path: Path) -> None:
+    lock_path, _, _ = _write_lock(tmp_path / "model.json", model_config_byte_length=0)
+
+    with pytest.raises(IdmModelLockError, match="model_config_byte_length is invalid"):
+        load_idm_model_lock(lock_path)
+
+
+def test_require_commit_rejects_invalid_revision() -> None:
+    from src.benchmark.idm_model import _require_commit
+
+    with pytest.raises(IdmModelLockError, match="repository_revision is invalid"):
+        _require_commit("not-a-commit", "repository_revision")

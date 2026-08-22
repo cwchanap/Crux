@@ -296,3 +296,24 @@ def test_idm_prediction_map_uses_native_class_ids_for_all_fixed_classes_and_unma
     ]
     assert diagnostics.unmapped == {"UNEXPECTED": 1}
     assert all(event.prediction_map_version == IDM_PREDICTION_MAP_ID for event in mapped.events)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"backend_id": "other-backend"},
+        {"native_output_space_id": "other-output-space"},
+    ],
+)
+def test_map_idm_prediction_rejects_identity_mismatch(change: dict[str, str]):
+    prediction_map = getattr(taxonomy, "IDM_PREDICTION_MAP", None)
+    map_idm_prediction = getattr(mapping, "map_idm_prediction", None)
+    assert callable(map_idm_prediction)
+    prediction = build_idm_prediction(("KD",))
+    descriptor = replace(
+        prediction.descriptor,
+        payload={**prediction.descriptor.payload, **change},
+    )
+
+    with pytest.raises(ValueError):
+        map_idm_prediction(replace(prediction, descriptor=descriptor), prediction_map)
