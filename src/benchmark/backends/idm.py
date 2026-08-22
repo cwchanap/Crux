@@ -31,6 +31,7 @@ from src.benchmark.backends.base import CanonicalAudio, NativeEvent, NativePredi
 from src.benchmark.backends.oaf import _build_factory_kwargs
 from src.benchmark.idm_model import (
     IDM_REQUEST_TIMEOUT_SECONDS,
+    IDM_RUNTIME_SYNC_TIMEOUT_SECONDS,
     IDM_WORKER_CLOSE_TIMEOUT_SECONDS,
     IdmModelLock,
     IdmModelLockError,
@@ -80,9 +81,10 @@ RuntimeSync = Callable[[Path, Path], None]
 def _default_runtime_sync(runtime_root: Path, runtime_python: Path) -> None:
     """Materialize and verify the isolated runtime from the frozen uv.lock.
 
-    Runs ``uv sync --project <runtime_root> --frozen --offline`` so the venv
-    matches the attested lock exactly.  Raises ``RuntimeError`` on any failure
-    (missing ``uv``, non-zero exit, wrong venv path).
+    Runs ``uv sync --project <runtime_root> --frozen --offline`` first so a
+    fresh checkout can bootstrap ``<runtime_root>/.venv``, then verifies that
+    the created venv python sits at the expected path.  Raises ``RuntimeError``
+    on any failure (missing ``uv``, non-zero exit, timeout, wrong venv path).
 
     The venv-path guard compares lexically rather than via ``resolve()``: uv
     symlinks ``.venv/bin/python`` to the underlying base/managed interpreter,
@@ -93,8 +95,6 @@ def _default_runtime_sync(runtime_root: Path, runtime_python: Path) -> None:
     ``<runtime_root>/.venv`` even when ``--project`` targets ``runtime_root``.
     """
     expected_python = runtime_root / ".venv" / "bin" / "python"
-    if not runtime_python.exists() or not expected_python.exists():
-        raise RuntimeError("runtime python is unavailable")
     if runtime_python != expected_python:
         raise RuntimeError("runtime python must point to the locked project venv")
     uv_binary = shutil.which("uv")
@@ -109,9 +109,18 @@ def _default_runtime_sync(runtime_root: Path, runtime_python: Path) -> None:
             capture_output=True,
             text=True,
             env=sync_env,
+            timeout=IDM_RUNTIME_SYNC_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.CalledProcessError) as error:
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("uv sync --frozen --offline timed out") from error
+    except subprocess.CalledProcessError as error:
+        stderr = (error.stderr or "").strip()
+        suffix = f": {stderr}" if stderr else ""
+        raise RuntimeError(f"uv sync --frozen --offline failed{suffix}") from error
+    except OSError as error:
         raise RuntimeError("uv sync --frozen --offline failed") from error
+    if not runtime_python.exists() or not expected_python.exists():
+        raise RuntimeError("runtime python is unavailable")
 
 
 class IdmBackend:
@@ -442,7 +451,7 @@ def _validate_descriptor(value: BackendDescriptor, expected: BackendDescriptor) 
         raise IdmBackendError(
             "backend descriptor does not match the model lock", code="descriptor_invalid"
         )
-    try:  # pragma: no cover - equality with expected guarantees normalization
+    try:
         normalized = build_descriptor(value.payload, IDM_DESCRIPTOR_KEYS, IDM_DESCRIPTOR_SCHEMA)
         if (
             normalized != value
@@ -776,6 +785,7 @@ __all__ = [
     "IDM_ADAPTER_REVISION",
     "IDM_BACKEND_ID",
     "IDM_REQUEST_TIMEOUT_SECONDS",
+    "IDM_RUNTIME_SYNC_TIMEOUT_SECONDS",
     "IDM_TIME_TOLERANCE_FRAMES",
     "IDM_WORKER_CLOSE_TIMEOUT_SECONDS",
     "IdmBackend",

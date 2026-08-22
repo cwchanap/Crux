@@ -334,27 +334,24 @@ def test_worker_process_request_attaches_valid_audio_identity(tmp_path: Path) ->
         process.close()
 
 
-@pytest.mark.parametrize(
-    ("audio_byte_length", "audio_sha256"),
-    [
-        (-1, "a" * 64),
-        (4096, "short"),
-        (4096, "g" * 64),
-        ("4096", "a" * 64),
-    ],
-)
-def test_worker_process_request_rejects_invalid_audio_identity(
-    tmp_path: Path, audio_byte_length: object, audio_sha256: str
-) -> None:
+def test_worker_process_request_rejects_invalid_audio_identity(tmp_path: Path) -> None:
+    """Invalid audio identity is rejected host-side without poisoning the child."""
     script = _script(tmp_path, [{"type": "ready"}])
     process = WorkerProcess.start([sys.executable, str(script)], timeout_seconds=1)
     try:
-        with pytest.raises(WorkerProcessError, match="worker audio identity is invalid"):
-            process.request(
-                "one.wav",
-                audio_byte_length=audio_byte_length,  # type: ignore[arg-type]
-                audio_sha256=audio_sha256,
-            )
+        for audio_byte_length, audio_sha256 in [
+            (-1, "a" * 64),
+            (4096, "short"),
+            (4096, "g" * 64),
+            ("4096", "a" * 64),
+        ]:
+            with pytest.raises(WorkerProcessError, match="worker audio identity is invalid"):
+                process.request(
+                    "one.wav",
+                    audio_byte_length=audio_byte_length,  # type: ignore[arg-type]
+                    audio_sha256=audio_sha256,
+                )
+            assert not process.closed
     finally:
         process.close()
 

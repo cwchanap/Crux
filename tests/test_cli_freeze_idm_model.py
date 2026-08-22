@@ -83,6 +83,20 @@ def _make_fake_python(tmp_path: Path, version: str = "Python 3.11.0") -> Path:
     return script
 
 
+def _git_env() -> dict[str, str]:
+    """Isolate test git from user and system configuration."""
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+
+
 def _init_git_repo(source_root: Path) -> str:
     """Create a git repo with the required IDM files and return the commit SHA."""
     config_dir = source_root / "pretrained" / "idm-44-train-kits" / "checkpoints"
@@ -91,14 +105,7 @@ def _init_git_repo(source_root: Path) -> str:
     (config_dir / "val-epoch=518-global_step=0.ckpt").write_bytes(CHECKPOINT_BYTES)
     (source_root / "LICENSE").write_bytes(LICENSE_BYTES)
 
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "HOME": os.environ.get("HOME", ""),
-        "GIT_AUTHOR_NAME": "Test",
-        "GIT_AUTHOR_EMAIL": "test@example.com",
-        "GIT_COMMITTER_NAME": "Test",
-        "GIT_COMMITTER_EMAIL": "test@example.com",
-    }
+    env = _git_env()
     subprocess.run(["git", "init", "-q"], cwd=source_root, check=True, env=env)
     subprocess.run(["git", "add", "."], cwd=source_root, check=True, env=env)
     subprocess.run(["git", "commit", "-q", "-m", "test"], cwd=source_root, check=True, env=env)
@@ -292,6 +299,40 @@ def test_verify_source_revision_rejects_revision_mismatch(
     monkeypatch.setattr("src.cli.freeze_idm_model.IDM_RELEASE_COMMIT", "b" * 40)
     with pytest.raises(FreezeError, match="source revision mismatch"):
         _verify_source_revision(tmp_path)
+
+
+def test_git_env_isolates_user_and_system_git_config() -> None:
+    env = _git_env()
+    assert env["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+
+
+def test_freeze_subprocess_calls_are_bounded_and_wrap_timeouts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every freeze subprocess needs a timeout and TimeoutExpired becomes FreezeError."""
+    fake_python = _make_fake_python(tmp_path)
+    seen: list[dict[str, object]] = []
+
+    def fake_check_output(cmd, **kwargs):
+        seen.append(kwargs)
+        raise subprocess.TimeoutExpired(cmd, 1)
+
+    monkeypatch.setattr(subprocess, "check_output", fake_check_output)
+    cases = [
+        (lambda: _verify_source_revision(tmp_path), "pinned source revision is unavailable"),
+        (lambda: _resolve_device("auto", fake_python), "runtime device feasibility probe failed"),
+        (lambda: _runtime_python_version(fake_python), "isolated runtime Python is unavailable"),
+        (
+            lambda: _read_git_blob(tmp_path, "0" * 40, "LICENSE"),
+            "pinned source file is unavailable: LICENSE",
+        ),
+    ]
+    for caller, match in cases:
+        with pytest.raises(FreezeError, match=match):
+            caller()
+    assert len(seen) == 4
+    assert all(kwargs.get("timeout") is not None for kwargs in seen)
 
 
 # --- _verify_model_config ---
@@ -633,14 +674,7 @@ def test_freeze_model_rejects_invalid_config(
     config_path = source_root / "pretrained" / "idm-44-train-kits" / "checkpoints" / "model.yaml"
     config_path.write_bytes(b"invalid: true\n")
     # Re-commit so the git blob matches the tampered content
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "HOME": os.environ.get("HOME", ""),
-        "GIT_AUTHOR_NAME": "Test",
-        "GIT_AUTHOR_EMAIL": "test@example.com",
-        "GIT_COMMITTER_NAME": "Test",
-        "GIT_COMMITTER_EMAIL": "test@example.com",
-    }
+    env = _git_env()
     subprocess.run(["git", "add", "."], cwd=source_root, check=True, env=env)
     subprocess.run(["git", "commit", "-q", "-m", "tamper"], cwd=source_root, check=True, env=env)
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source_root, text=True).strip()
@@ -671,14 +705,7 @@ def test_freeze_model_rejects_non_apache_license(
     )
     # Replace LICENSE with non-Apache and re-commit
     (source_root / "LICENSE").write_bytes(b"MIT License\n")
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "HOME": os.environ.get("HOME", ""),
-        "GIT_AUTHOR_NAME": "Test",
-        "GIT_AUTHOR_EMAIL": "test@example.com",
-        "GIT_COMMITTER_NAME": "Test",
-        "GIT_COMMITTER_EMAIL": "test@example.com",
-    }
+    env = _git_env()
     subprocess.run(["git", "add", "."], cwd=source_root, check=True, env=env)
     subprocess.run(["git", "commit", "-q", "-m", "mit"], cwd=source_root, check=True, env=env)
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source_root, text=True).strip()

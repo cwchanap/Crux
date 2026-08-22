@@ -908,23 +908,21 @@ def _build_idm_smoke_payload(outcome: IdmFullMixSmokeOutcome) -> dict[str, objec
 
 
 def _emit_idm_pilot_summary(
-    outcome: object,
+    outcome: IdmPilotRunOutcome,
     *,
     comparison_path: Path | None,
-    smoke_outcome: object | None,
+    smoke_outcome: IdmFullMixSmokeOutcome | None,
     comparison_error: str | None,
     status: str,
     exit_code: int,
 ) -> None:
-    payload = _build_idm_outcome_payload(outcome)  # type: ignore[arg-type]
+    payload = _build_idm_outcome_payload(outcome)
     payload.update(
         {
             "comparison_error": comparison_error,
             "comparison_path": None if comparison_path is None else str(comparison_path),
             "exit_code": exit_code,
-            "smoke": (
-                None if smoke_outcome is None else _build_idm_smoke_payload(smoke_outcome)  # type: ignore[arg-type]
-            ),
+            "smoke": (None if smoke_outcome is None else _build_idm_smoke_payload(smoke_outcome)),
             "status": status,
         }
     )
@@ -979,7 +977,7 @@ def _execute_idm_pilot(
     resume: bool,
     smoke_manifest: Path | None,
     source_cache_dir: Path | None,
-) -> tuple[object, Path | None, object | None, str | None, str, int]:
+) -> tuple[IdmPilotRunOutcome, Path | None, IdmFullMixSmokeOutcome | None, str | None, str, int]:
     """Construct the fixed requests and run the primary/derived IDM paths."""
     from src.benchmark.idm_pilot_run import (
         IdmFullMixSmokeRequest,
@@ -1022,7 +1020,7 @@ def _execute_idm_pilot(
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             comparison_error = f"{type(error).__name__}: {error}"
 
-    smoke_outcome: object | None = None
+    smoke_outcome: IdmFullMixSmokeOutcome | None = None
     if (
         smoke_manifest is not None
         and source_cache_dir is not None
