@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -207,6 +208,8 @@ def _write_reports(
         "scoring_version": SCORING_VERSION,
     }
     statuses = {"1": "success", "2": "failed" if failed else "success"}
+    success_count = sum(1 for s in statuses.values() if s == "success")
+    failed_count = sum(1 for s in statuses.values() if s == "failed")
     _write_csv(
         root / "items.csv",
         _ITEM_FIELDS,
@@ -318,11 +321,11 @@ def _write_reports(
         "tolerances_ms": [50],
         "population": {
             "total_count": 2,
-            "success_count": 1,
-            "failed_count": 1,
+            "success_count": success_count,
+            "failed_count": failed_count,
             "skipped_count": 0,
             "quarantined_count": 0,
-            "reason_counts": {"backend_unavailable": 1},
+            "reason_counts": {"backend_unavailable": failed_count} if failed_count else {},
         },
         "aggregates": [aggregate, {**aggregate, "mode": "aligned"}],
     }
@@ -565,3 +568,222 @@ def test_compare_oaf_idm_rejects_prediction_artifact_wrong_for_run_row(
 
     summary = json.loads((tmp_path / "comparison" / "summary.json").read_text(encoding="utf-8"))
     assert summary["models"]["idm"]["velocity"]["available_event_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Coverage tests for idm_comparison.py error and edge-case paths
+# ---------------------------------------------------------------------------
+
+
+def _write_mutated_snapshot(run_path: Path, mutations: dict[str, object]) -> None:
+    """Write a snapshot with mutated fields, bypassing render validation."""
+    from decimal import Decimal
+
+    snapshot = json.loads(_snapshot().decode("utf-8"), parse_float=Decimal)
+    snapshot.update(mutations)
+    run_path.write_bytes(canonical_json_bytes(snapshot))
+
+
+def test_idm_comparison_request_rejects_non_path_field() -> None:
+    with pytest.raises(TypeError, match="run_path must be a Path"):
+        IdmComparisonRequest(run_path="not-a-path", output_dir=Path("/tmp"))  # type: ignore[arg-type]
+
+
+def test_compare_oaf_idm_rejects_non_request() -> None:
+    with pytest.raises(TypeError, match="request must be IdmComparisonRequest"):
+        compare_oaf_idm("not-a-request")  # type: ignore[arg-type]
+
+
+def test_compare_oaf_idm_rejects_run_path_with_too_few_parents(tmp_path: Path) -> None:
+    # A path with fewer than 3 parents (e.g., a bare filename) is rejected
+    # before the snapshot is even loaded.
+    shallow = Path("run.json")
+    assert len(shallow.parents) < 3
+
+    with pytest.raises(ComparisonIntegrityError, match="Task-4 output root"):
+        compare_oaf_idm(IdmComparisonRequest(run_path=shallow, output_dir=tmp_path / "out"))
+
+
+def test_compare_oaf_idm_rejects_invalid_run_snapshot_file(idm_run: Path, tmp_path: Path) -> None:
+    idm_run.write_bytes(b"not valid json\n")
+
+    with pytest.raises(ComparisonIntegrityError, match="invalid IDM run snapshot"):
+        compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "out"))
+
+
+def test_compare_oaf_idm_rejects_backend_descriptor_identity_mismatch(
+    idm_run: Path, tmp_path: Path
+) -> None:
+    _write_mutated_snapshot(idm_run, {"backend_descriptor": {"backend_id": "wrong-backend"}})
+
+    with pytest.raises(ComparisonIntegrityError, match="backend descriptor identity mismatch"):
+        compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "out"))
+
+
+def test_compare_oaf_idm_rejects_taxonomy_version_mismatch(idm_run: Path, tmp_path: Path) -> None:
+    _write_mutated_snapshot(idm_run, {"taxonomy_version": "wrong"})
+
+    with pytest.raises(ComparisonIntegrityError, match="taxonomy_version identity mismatch"):
+        compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "out"))
+
+
+def test_compare_oaf_idm_rejects_malformed_inference_config(idm_run: Path, tmp_path: Path) -> None:
+    _write_mutated_snapshot(idm_run, {"inference_config": "not-a-mapping"})
+
+    with pytest.raises(ComparisonIntegrityError, match="inference_config is malformed"):
+        compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "out"))
+
+
+def test_compare_oaf_idm_rejects_inference_config_field_mismatch(
+    idm_run: Path, tmp_path: Path
+) -> None:
+    _write_mutated_snapshot(
+        idm_run,
+        {"inference_config": {"input_view_id": "crux.wrong/v1"}},
+    )
+
+    with pytest.raises(ComparisonIntegrityError, match="inference_config.*identity mismatch"):
+        compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "out"))
+
+
+def test_compare_oaf_idm_rejects_invalid_run_identity_inputs(idm_run: Path, tmp_path: Path) -> None:
+    _write_mutated_snapshot(idm_run, {"handoff_manifest_sha256": "not-a-hash"})
+
+    with pytest.raises(ComparisonIntegrityError, match="run identity inputs are invalid"):
+        compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "out"))
+
+
+def test_compare_oaf_idm_rejects_report_population_mismatch(idm_run: Path, tmp_path: Path) -> None:
+    snapshot = json.loads(_snapshot().decode("utf-8"))
+    snapshot["items"].append(
+        {
+            "simfile_id": 3,
+            "source_audio_id": "song-3",
+            "source_audio_sha256": "e" * 64,
+            "input_audio_sha256": "c" * 64,
+            "input_view_id": "crux.oaf-htdemucs-drums-mono44k1-pcm16/v1",
+            "execution_disposition": "inferred",
+            "prediction_path": "predictions/3.jsonl",
+            "prediction_artifact_sha256": "f" * 64,
+            "wall_time_sec": 1.0,
+            "rtf": 0.1,
+        }
+    )
+    snapshot["success_count"] = 2
+    idm_run.write_bytes(render_idm_pilot_run(snapshot))
+
+    with pytest.raises(ComparisonIntegrityError, match="published report population"):
+        compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "out"))
+
+
+def test_compare_oaf_idm_rejects_idm_status_not_matching_snapshot(
+    idm_run: Path, tmp_path: Path
+) -> None:
+    _write_reports(idm_run.parent / "reports" / "idm", label="idm", failed=False)
+
+    with pytest.raises(ComparisonIntegrityError, match="status does not match run snapshot"):
+        compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "out"))
+
+
+def test_compare_oaf_idm_rejects_native_failure_counts_not_object(
+    idm_run: Path, tmp_path: Path
+) -> None:
+    _write_mutated_snapshot(idm_run, {"native_failure_counts": "not-an-object"})
+
+    with pytest.raises(ComparisonIntegrityError, match="native_failure_counts must be an object"):
+        compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "out"))
+
+
+def test_compare_oaf_idm_rejects_native_failure_counts_invalid_code(
+    idm_run: Path, tmp_path: Path
+) -> None:
+    _write_mutated_snapshot(idm_run, {"native_failure_counts": {"": 1}})
+
+    with pytest.raises(ComparisonIntegrityError, match="native_failure_counts.*invalid code"):
+        compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "out"))
+
+
+def test_compare_oaf_idm_rejects_native_failure_counts_invalid_count(
+    idm_run: Path, tmp_path: Path
+) -> None:
+    _write_mutated_snapshot(idm_run, {"native_failure_counts": {"worker_protocol_failed": -1}})
+
+    with pytest.raises(ComparisonIntegrityError, match="native_failure_counts.*invalid count"):
+        compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=tmp_path / "out"))
+
+
+def test_compare_oaf_idm_wraps_unexpected_os_error(idm_run: Path, tmp_path: Path) -> None:
+    output = tmp_path / "comparison"
+    output.mkdir()
+    (output / "summary.json").mkdir()
+
+    with pytest.raises(ComparisonIntegrityError):
+        compare_oaf_idm(IdmComparisonRequest(run_path=idm_run, output_dir=output))
+
+
+# --- Direct helper tests ---
+
+
+def test_runtime_diagnostics_skips_non_numeric_and_nonfinite_rtf() -> None:
+    from src.benchmark.idm_comparison import _runtime_diagnostics
+
+    snapshot = {
+        "items": [
+            {"execution_disposition": "inferred", "rtf": True},
+            {"execution_disposition": "inferred", "rtf": float("inf")},
+            {"execution_disposition": "inferred", "rtf": 0.25},
+            {"execution_disposition": "failed", "rtf": 0.5},
+        ],
+    }
+    result = _runtime_diagnostics(snapshot)
+    assert result["rtf_distribution"]["available_count"] == 1
+    assert result["rtf_distribution"]["median"] == Decimal("0.250000")
+
+
+def test_owned_prediction_path_rejects_non_string() -> None:
+    from src.benchmark.idm_comparison import _owned_prediction_path
+
+    assert _owned_prediction_path(Path("/tmp"), 123) is None
+    assert _owned_prediction_path(Path("/tmp"), "") is None
+
+
+def test_owned_prediction_path_rejects_absolute_and_dot_parts() -> None:
+    from src.benchmark.idm_comparison import _owned_prediction_path
+
+    assert _owned_prediction_path(Path("/tmp"), "/etc/passwd") is None
+    assert _owned_prediction_path(Path("/tmp"), "../etc/passwd") is None
+
+
+def test_owned_prediction_path_rejects_unresolvable_path(tmp_path: Path) -> None:
+    from src.benchmark.idm_comparison import _owned_prediction_path
+
+    # Create a symlink that resolves outside root to trigger resolve failure
+    link = tmp_path / "link"
+    target = tmp_path.parent / "outside"
+    link.symlink_to(target)
+
+    assert _owned_prediction_path(tmp_path, "link") is None
+
+
+def test_velocity_diagnostics_skips_when_prediction_path_is_none(tmp_path: Path) -> None:
+    from src.benchmark.idm_comparison import _velocity_diagnostics
+
+    snapshot: dict[str, object] = {
+        "items": [
+            {
+                "execution_disposition": "inferred",
+                "prediction_path": None,
+            }
+        ]
+    }
+    result = _velocity_diagnostics(snapshot, output_root=tmp_path, total_event_count=0)
+    assert result["available_event_count"] == 0
+
+
+def test_append_diagnostics_markdown_skips_when_models_not_mapping(tmp_path: Path) -> None:
+    from src.benchmark.idm_comparison import _append_diagnostics_markdown
+
+    summary_path = tmp_path / "summary.md"
+    summary_path.write_text("existing\n", encoding="utf-8")
+    _append_diagnostics_markdown(summary_path, {"models": "not-a-mapping"})
+    assert summary_path.read_text(encoding="utf-8") == "existing\n"

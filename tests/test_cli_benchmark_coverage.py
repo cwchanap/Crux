@@ -472,3 +472,175 @@ def test_finalize_oaf_separation_pilot_command_emits_failed_outcome_on_invalid_d
     assert summary["exit_code"] == 2
     assert summary["manifest_path"] is None
     assert "decision is invalid" in summary["failure_reason"]
+
+
+def _idm_pilot_args(tmp_path: Path, *, with_smoke: bool = False) -> list[str]:
+    args = [
+        "benchmark",
+        "run-idm-pilot",
+        "--handoff",
+        str(tmp_path / "handoff.jsonl"),
+        "--manifest",
+        str(tmp_path / "reference.jsonl"),
+        "--timing-manifest",
+        str(tmp_path / "timing.jsonl"),
+        "--separation-artifact-root",
+        str(tmp_path / "separation-artifacts"),
+        "--stem-cache-root",
+        str(tmp_path / "stem-cache"),
+        "--output-dir",
+        str(tmp_path / "output"),
+        "--runtime-python",
+        str(tmp_path / "idm-python"),
+        "--model-lock",
+        str(tmp_path / "model.json"),
+        "--model-root",
+        str(tmp_path / "model-root"),
+    ]
+    if with_smoke:
+        args += [
+            "--smoke-manifest",
+            str(tmp_path / "smoke.json"),
+            "--source-cache-dir",
+            str(tmp_path / "source-cache"),
+        ]
+    return args
+
+
+def test_run_idm_pilot_emits_fatal_outcome_when_request_construction_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A failure while building IdmPilotRunRequest yields a fatal outcome (exit 2)."""
+    import src.benchmark.idm_pilot_run as pilot_module
+
+    def _raising_request(*_args, **_kwargs):
+        raise ValueError("request construction failed")
+
+    monkeypatch.setattr(benchmark_module, "_current_crux_commit", lambda: "a" * 40)
+    monkeypatch.setattr(pilot_module, "IdmPilotRunRequest", _raising_request)
+
+    result = CliRunner().invoke(main, _idm_pilot_args(tmp_path), catch_exceptions=False)
+
+    assert result.exit_code == 2
+    summary = json.loads(result.output)
+    assert summary["status"] == "failed"
+    assert summary["exit_code"] == 2
+    assert summary["run_id"] is None
+
+
+def test_run_idm_pilot_emits_fatal_outcome_when_pilot_run_raises(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An exception from run_idm_pilot is swallowed into a fatal outcome (exit 2)."""
+    import src.benchmark.idm_pilot_run as pilot_module
+
+    monkeypatch.setattr(benchmark_module, "_current_crux_commit", lambda: "a" * 40)
+    monkeypatch.setattr(
+        pilot_module,
+        "run_idm_pilot",
+        lambda _request: (_ for _ in ()).throw(RuntimeError("pilot run crashed")),
+    )
+
+    result = CliRunner().invoke(main, _idm_pilot_args(tmp_path), catch_exceptions=False)
+
+    assert result.exit_code == 2
+    summary = json.loads(result.output)
+    assert summary["status"] == "failed"
+    assert summary["exit_code"] == 2
+    assert summary["run_id"] is None
+
+
+def test_run_idm_pilot_emits_fatal_smoke_outcome_when_smoke_raises(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A crash during full-mix smoke is swallowed into a fatal smoke outcome (exit 2)."""
+    import src.benchmark.idm_pilot_run as pilot_module
+
+    output_dir = tmp_path / "output"
+    run_path = output_dir / "runs" / "idm-run" / "run.json"
+
+    def fake_run(_request):
+        return pilot_module.IdmPilotRunOutcome(
+            overall_status="complete",
+            exit_code=0,
+            run_id="idm-run",
+            run_path=run_path,
+            reports_path=run_path.parent / "reports",
+            success_count=12,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+        )
+
+    def crashing_smoke(_request):
+        raise RuntimeError("smoke crashed")
+
+    monkeypatch.setattr(benchmark_module, "_current_crux_commit", lambda: "a" * 40)
+    monkeypatch.setattr(pilot_module, "run_idm_pilot", fake_run)
+    monkeypatch.setattr(pilot_module, "run_idm_full_mix_smoke", crashing_smoke)
+    monkeypatch.setattr(
+        benchmark_module, "_run_idm_comparison", lambda _run_path, _out: _out / "comparison"
+    )
+
+    result = CliRunner().invoke(
+        main, _idm_pilot_args(tmp_path, with_smoke=True), catch_exceptions=False
+    )
+
+    assert result.exit_code == 2
+    summary = json.loads(result.output)
+    assert summary["status"] == "failed"
+    assert summary["exit_code"] == 2
+    assert summary["smoke"]["status"] == "failed"
+
+
+def test_run_idm_pilot_emits_partial_status_when_smoke_exit_code_is_one(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A smoke outcome with exit_code 1 downgrades the final status to partial (exit 1)."""
+    import src.benchmark.idm_pilot_run as pilot_module
+
+    output_dir = tmp_path / "output"
+    run_path = output_dir / "runs" / "idm-run" / "run.json"
+
+    def fake_run(_request):
+        return pilot_module.IdmPilotRunOutcome(
+            overall_status="complete",
+            exit_code=0,
+            run_id="idm-run",
+            run_path=run_path,
+            reports_path=run_path.parent / "reports",
+            success_count=12,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+        )
+
+    def partial_smoke(_request):
+        return pilot_module.IdmFullMixSmokeOutcome(
+            overall_status="partial",
+            exit_code=1,
+            run_id="smoke-run",
+            run_path=output_dir / "full-mix-smoke" / "run.json",
+            reports_path=output_dir / "full-mix-smoke" / "reports",
+            success_count=3,
+            failed_count=1,
+            skipped_count=0,
+            quarantined_count=0,
+        )
+
+    monkeypatch.setattr(benchmark_module, "_current_crux_commit", lambda: "a" * 40)
+    monkeypatch.setattr(pilot_module, "run_idm_pilot", fake_run)
+    monkeypatch.setattr(pilot_module, "run_idm_full_mix_smoke", partial_smoke)
+    monkeypatch.setattr(
+        benchmark_module, "_run_idm_comparison", lambda _run_path, _out: _out / "comparison"
+    )
+
+    result = CliRunner().invoke(
+        main, _idm_pilot_args(tmp_path, with_smoke=True), catch_exceptions=False
+    )
+
+    assert result.exit_code == 1
+    summary = json.loads(result.output)
+    assert summary["status"] == "partial"
+    assert summary["exit_code"] == 1
+    assert summary["smoke"]["run_id"] == "smoke-run"
