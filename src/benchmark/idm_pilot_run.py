@@ -2090,11 +2090,12 @@ def _validate_lineage(
 
 def _backend_failure_code(error: BaseException) -> str:
     raw = getattr(error, "code", None)
+    if raw == "runtime_artifact_invalid":
+        return "worker_start_failed"
     if raw in {
         "input_path_invalid",
         "input_audio_invalid",
         "invalid_request",
-        "runtime_artifact_invalid",
     }:
         return "retained_input_invalid"
     if isinstance(raw, str) and raw:

@@ -152,6 +152,20 @@ def test_unknown_backend_codes_poison_the_persistent_worker() -> None:
     )
 
 
+def test_runtime_artifact_invalid_poisons_backend_as_unavailable() -> None:
+    """A broken frozen wheel/lock/model attestation is backend-global, not item-local."""
+    from src.benchmark.idm_pilot_run import _backend_failure_code
+
+    code = _backend_failure_code(
+        type("Error", (Exception,), {"code": "runtime_artifact_invalid"})()
+    )
+    assert code == "worker_start_failed"
+    persisted, disposition = classify_idm_backend_error(code)
+    assert disposition == "poison"
+    assert persisted == "worker_start_failed"
+    assert IDM_FAILURE_TO_COHORT_REASON[persisted] == "backend_unavailable"
+
+
 @pytest.mark.parametrize(
     "field",
     [

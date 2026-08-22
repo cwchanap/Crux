@@ -198,6 +198,7 @@ def _backend(
             calls.append((command, factory_kwargs))
         return worker
 
+    kwargs.setdefault("runtime_sync", lambda *_: None)
     return IdmBackend(
         runtime_python,
         model_lock_path,
@@ -578,6 +579,7 @@ def test_idm_backend_maps_worker_start_failure(tmp_path: Path) -> None:
         model_root,
         root,
         process_factory=factory,
+        runtime_sync=lambda *_: None,
     )
     with pytest.raises(IdmBackendError) as raised:
         backend.transcribe(_audio(root))
@@ -687,6 +689,66 @@ def test_idm_backend_rejects_tampered_attested_artifacts_before_worker_start(
     assert raised.value.code == "runtime_artifact_invalid"
     assert calls == []
     assert worker.requests == []
+
+
+def test_idm_backend_invokes_runtime_sync_before_worker_start(tmp_path: Path) -> None:
+    artifact_root, model_root = _copy_attested_runtime(tmp_path)
+    worker = _FakeWorker(_ready(), {"id": "request", "events": []})
+    calls: list[tuple[Path, Path]] = []
+    sync_calls: list[tuple[Path, Path]] = []
+
+    def sync(runtime_root: Path, runtime_python: Path) -> None:
+        sync_calls.append((runtime_root, runtime_python))
+
+    backend = _backend(
+        tmp_path,
+        worker,
+        calls,
+        artifact_root=artifact_root,
+        model_root=model_root,
+        runtime_sync=sync,
+    )
+    try:
+        backend.transcribe(_audio(tmp_path / "input"))
+    finally:
+        backend.close()
+
+    assert len(sync_calls) == 1
+    assert sync_calls[0][0] == artifact_root
+    assert sync_calls[0][1] == tmp_path / "runtime-python"
+    # Worker was started only after the sync succeeded.
+    assert len(calls) == 1
+
+
+def test_idm_backend_poisons_on_runtime_sync_failure(tmp_path: Path) -> None:
+    artifact_root, model_root = _copy_attested_runtime(tmp_path)
+    worker = _FakeWorker(_ready(), {"id": "request", "events": []})
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def failing_sync(_root: Path, _python: Path) -> None:
+        raise RuntimeError("venv does not match uv.lock")
+
+    backend = _backend(
+        tmp_path,
+        worker,
+        calls,
+        artifact_root=artifact_root,
+        model_root=model_root,
+        runtime_sync=failing_sync,
+    )
+
+    with pytest.raises(IdmBackendError) as raised:
+        backend.transcribe(_audio(tmp_path / "input"))
+
+    assert raised.value.code == "runtime_artifact_invalid"
+    assert calls == []
+    assert worker.requests == []
+    assert backend._poisoned
+
+    # A poisoned backend must not retry the sync on a second transcribe.
+    with pytest.raises(IdmBackendError) as again:
+        backend.transcribe(_audio(tmp_path / "input"))
+    assert again.value.code == "worker_protocol_failed"
 
 
 def test_idm_backend_binds_worker_import_to_attested_wheel_path(tmp_path: Path) -> None:
@@ -1077,6 +1139,7 @@ def test_ensure_process_poisons_on_ready_attribute_error(tmp_path: Path) -> None
         model_root,
         input_root,
         process_factory=factory,
+        runtime_sync=lambda *_: None,
     )
     with pytest.raises(IdmBackendError, match="worker ready response is invalid") as raised:
         backend.transcribe(_audio(input_root))
@@ -1465,6 +1528,7 @@ def test_ensure_process_poisons_on_missing_ready_attribute(tmp_path: Path) -> No
         model_root,
         input_root,
         process_factory=factory,
+        runtime_sync=lambda *_: None,
     )
     with pytest.raises(IdmBackendError, match="worker ready response is invalid") as raised:
         backend.transcribe(_audio(input_root))
