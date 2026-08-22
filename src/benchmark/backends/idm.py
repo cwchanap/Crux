@@ -7,6 +7,8 @@ import inspect
 import json
 import math
 import os
+import shutil
+import subprocess
 import tomllib
 import zipfile
 from collections.abc import Callable, Mapping
@@ -72,6 +74,36 @@ class IdmBackendError(RuntimeError):
 
 
 ProcessFactory = Callable[..., Any]
+RuntimeSync = Callable[[Path, Path], None]
+
+
+def _default_runtime_sync(runtime_root: Path, runtime_python: Path) -> None:
+    """Materialize and verify the isolated runtime from the frozen uv.lock.
+
+    Runs ``uv sync --project <runtime_root> --frozen --offline`` so the venv
+    matches the attested lock exactly.  Raises ``RuntimeError`` on any failure
+    (missing ``uv``, non-zero exit, wrong venv path).
+    """
+    expected_python = runtime_root / ".venv" / "bin" / "python"
+    try:
+        resolved_runtime = runtime_python.resolve(strict=True)
+        resolved_expected = expected_python.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError("runtime python is unavailable") from error
+    if resolved_runtime != resolved_expected:
+        raise RuntimeError("runtime python must point to the locked project venv")
+    uv_binary = shutil.which("uv")
+    if uv_binary is None:
+        raise RuntimeError("uv is not available on PATH")
+    try:
+        subprocess.run(
+            [uv_binary, "sync", "--project", os.fspath(runtime_root), "--frozen", "--offline"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError("uv sync --frozen --offline failed") from error
 
 
 class IdmBackend:
@@ -88,6 +120,7 @@ class IdmBackend:
         timeout_seconds: float = IDM_REQUEST_TIMEOUT_SECONDS,
         close_timeout_seconds: float = IDM_WORKER_CLOSE_TIMEOUT_SECONDS,
         descriptor: BackendDescriptor | None = None,
+        runtime_sync: RuntimeSync | None = None,
     ) -> None:
         for name, value in (
             ("runtime_python", runtime_python),
@@ -123,6 +156,7 @@ class IdmBackend:
         self._close_timeout_seconds = close_timeout_seconds
         self._lock = lock
         self._descriptor = descriptor
+        self._runtime_sync = runtime_sync if runtime_sync is not None else _default_runtime_sync
         self._process: Any | None = None
         self._closed = False
         self._poisoned = False
@@ -213,6 +247,15 @@ class IdmBackend:
             self._model_lock_path,
             self._model_root,
         )
+        runtime_root = self._model_lock_path.parent
+        try:
+            self._runtime_sync(runtime_root, self._runtime_python)
+        except Exception as error:
+            self._poisoned = True
+            raise IdmBackendError(
+                "IDM runtime environment does not match the frozen uv.lock",
+                code="runtime_artifact_invalid",
+            ) from error
         site_packages = _runtime_site_packages(self._runtime_python, self._lock)
         command = build_worker_command(
             self._runtime_python,
