@@ -1659,3 +1659,233 @@ def test_compare_oaf_muscriptor_command_builds_request_and_emits_summary(
         "paired_song_count": 14,
         "pairable_success_count": 7,
     }
+
+
+def _idm_pilot_cli_args(tmp_path: Path) -> list[str]:
+    return [
+        "benchmark",
+        "run-idm-pilot",
+        "--handoff",
+        str(tmp_path / "handoff.jsonl"),
+        "--manifest",
+        str(tmp_path / "reference.jsonl"),
+        "--timing-manifest",
+        str(tmp_path / "timing.jsonl"),
+        "--separation-artifact-root",
+        str(tmp_path / "separation-artifacts"),
+        "--stem-cache-root",
+        str(tmp_path / "stem-cache"),
+        "--output-dir",
+        str(tmp_path / "output"),
+        "--runtime-python",
+        str(tmp_path / "idm-python"),
+        "--model-lock",
+        str(tmp_path / "model.json"),
+        "--model-root",
+        str(tmp_path / "model-root"),
+        "--resume",
+    ]
+
+
+def test_run_idm_pilot_builds_request_compares_and_emits_canonical_summary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.idm_comparison as comparison_module
+    import src.benchmark.idm_pilot_run as pilot_module
+    import src.cli.benchmark as benchmark_module
+
+    output_dir = tmp_path / "output"
+    run_path = output_dir / "runs" / "idm-run" / "run.json"
+    reports_path = run_path.parent / "reports"
+    comparison_path = output_dir / "comparison"
+    captured: list[object] = []
+
+    def fake_run(request: object) -> pilot_module.IdmPilotRunOutcome:
+        captured.append(request)
+        return pilot_module.IdmPilotRunOutcome(
+            overall_status="complete",
+            exit_code=0,
+            run_id="idm-run",
+            run_path=run_path,
+            reports_path=reports_path,
+            success_count=12,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+            native_failure_counts=(),
+        )
+
+    comparison_requests: list[object] = []
+
+    def fake_compare(request: object) -> Path:
+        comparison_requests.append(request)
+        return comparison_path
+
+    monkeypatch.setattr(benchmark_module, "_current_crux_commit", lambda: "a" * 40)
+    monkeypatch.setattr(pilot_module, "run_idm_pilot", fake_run)
+    monkeypatch.setattr(comparison_module, "compare_oaf_idm", fake_compare)
+
+    result = CliRunner().invoke(main, _idm_pilot_cli_args(tmp_path), catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.separation_handoff_path == tmp_path / "handoff.jsonl"
+    assert request.reference_manifest_path == tmp_path / "reference.jsonl"
+    assert request.timing_manifest_path == tmp_path / "timing.jsonl"
+    assert request.separation_artifact_root == tmp_path / "separation-artifacts"
+    assert request.stem_cache_root == tmp_path / "stem-cache"
+    assert request.output_dir == output_dir
+    assert request.runtime_python == tmp_path / "idm-python"
+    assert request.model_lock_path == tmp_path / "model.json"
+    assert request.model_root == tmp_path / "model-root"
+    assert request.resume is True
+    assert request.crux_commit == "a" * 40
+    assert len(comparison_requests) == 1
+    comparison_request = comparison_requests[0]
+    assert comparison_request.run_path == run_path
+    assert comparison_request.output_dir == comparison_path
+
+    summary = json.loads(result.output)
+    assert summary["status"] == "complete"
+    assert summary["exit_code"] == 0
+    assert summary["run_id"] == "idm-run"
+    assert summary["comparison_path"] == str(comparison_path)
+    assert summary["smoke"] is None
+    assert result.output.encode() == benchmark_module.canonical_json_bytes(
+        summary, trailing_newline=True
+    )
+
+
+def test_run_idm_pilot_routes_explicit_smoke_group_to_separate_request(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.idm_comparison as comparison_module
+    import src.benchmark.idm_pilot_run as pilot_module
+    import src.cli.benchmark as benchmark_module
+
+    output_dir = tmp_path / "output"
+    run_path = output_dir / "runs" / "idm-run" / "run.json"
+    pilot_requests: list[object] = []
+    smoke_requests: list[object] = []
+
+    def fake_run(request: object) -> pilot_module.IdmPilotRunOutcome:
+        pilot_requests.append(request)
+        return pilot_module.IdmPilotRunOutcome(
+            overall_status="complete",
+            exit_code=0,
+            run_id="idm-run",
+            run_path=run_path,
+            reports_path=run_path.parent / "reports",
+            success_count=12,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+        )
+
+    def fake_smoke(request: object) -> pilot_module.IdmFullMixSmokeOutcome:
+        smoke_requests.append(request)
+        return pilot_module.IdmFullMixSmokeOutcome(
+            overall_status="complete",
+            exit_code=0,
+            run_id="smoke-run",
+            run_path=output_dir / "full-mix-smoke" / "run.json",
+            reports_path=output_dir / "full-mix-smoke" / "reports",
+            success_count=5,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+        )
+
+    monkeypatch.setattr(benchmark_module, "_current_crux_commit", lambda: "a" * 40)
+    monkeypatch.setattr(pilot_module, "run_idm_pilot", fake_run)
+    monkeypatch.setattr(pilot_module, "run_idm_full_mix_smoke", fake_smoke)
+    monkeypatch.setattr(
+        comparison_module, "compare_oaf_idm", lambda _request: output_dir / "comparison"
+    )
+
+    args = _idm_pilot_cli_args(tmp_path) + [
+        "--smoke-manifest",
+        str(tmp_path / "smoke.json"),
+        "--source-cache-dir",
+        str(tmp_path / "source-cache"),
+    ]
+    result = CliRunner().invoke(main, args, catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert len(pilot_requests) == 1
+    assert not hasattr(pilot_requests[0], "source_cache_dir")
+    assert len(smoke_requests) == 1
+    smoke_request = smoke_requests[0]
+    assert smoke_request.separation_handoff_path == tmp_path / "handoff.jsonl"
+    assert smoke_request.reference_manifest_path == tmp_path / "reference.jsonl"
+    assert smoke_request.timing_manifest_path == tmp_path / "timing.jsonl"
+    assert smoke_request.smoke_manifest_path == tmp_path / "smoke.json"
+    assert smoke_request.source_cache_dir == tmp_path / "source-cache"
+    assert smoke_request.output_dir == output_dir
+    assert smoke_request.model_lock_path == tmp_path / "model.json"
+    assert smoke_request.model_root == tmp_path / "model-root"
+    assert smoke_request.runtime_python == tmp_path / "idm-python"
+    assert smoke_request.crux_commit == "a" * 40
+    assert json.loads(result.output)["smoke"]["run_id"] == "smoke-run"
+
+
+def test_run_idm_pilot_skips_smoke_when_comparison_fails(tmp_path: Path, monkeypatch) -> None:
+    import src.benchmark.idm_pilot_run as pilot_module
+    import src.cli.benchmark as benchmark_module
+
+    output_dir = tmp_path / "output"
+    run_path = output_dir / "runs" / "idm-run" / "run.json"
+    smoke_calls: list[object] = []
+
+    def fake_run(_request: object) -> pilot_module.IdmPilotRunOutcome:
+        return pilot_module.IdmPilotRunOutcome(
+            overall_status="complete",
+            exit_code=0,
+            run_id="idm-run",
+            run_path=run_path,
+            reports_path=run_path.parent / "reports",
+            success_count=12,
+            failed_count=0,
+            skipped_count=0,
+            quarantined_count=0,
+        )
+
+    def fake_smoke(_request: object) -> pilot_module.IdmFullMixSmokeOutcome:
+        smoke_calls.append(_request)
+        raise AssertionError("full-mix smoke must not run after comparison failure")
+
+    def fake_compare(_run_path: Path, _output_dir: Path) -> Path:
+        raise ValueError("comparison failed")
+
+    monkeypatch.setattr(benchmark_module, "_current_crux_commit", lambda: "a" * 40)
+    monkeypatch.setattr(pilot_module, "run_idm_pilot", fake_run)
+    monkeypatch.setattr(pilot_module, "run_idm_full_mix_smoke", fake_smoke)
+    monkeypatch.setattr(benchmark_module, "_run_idm_comparison", fake_compare)
+
+    args = _idm_pilot_cli_args(tmp_path) + [
+        "--smoke-manifest",
+        str(tmp_path / "smoke.json"),
+        "--source-cache-dir",
+        str(tmp_path / "source-cache"),
+    ]
+    result = CliRunner().invoke(main, args, catch_exceptions=False)
+
+    assert result.exit_code == 2
+    summary = json.loads(result.output)
+    assert summary["status"] == "failed"
+    assert summary["exit_code"] == 2
+    assert summary["comparison_error"] == "ValueError: comparison failed"
+    assert summary["smoke"] is None
+    assert smoke_calls == []
+
+
+def test_run_idm_pilot_rejects_smoke_options_supplied_alone(tmp_path: Path) -> None:
+    args = _idm_pilot_cli_args(tmp_path) + [
+        "--smoke-manifest",
+        str(tmp_path / "smoke.json"),
+    ]
+    result = CliRunner().invoke(main, args)
+
+    assert result.exit_code == 2
+    assert "--smoke-manifest and --source-cache-dir must be supplied together" in result.output

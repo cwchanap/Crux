@@ -23,6 +23,10 @@ MUSCRIPTOR_BACKEND_ID = "muscriptor-v0.3.0-drums-v1"
 MUSCRIPTOR_DESCRIPTOR_SCHEMA = "crux.transcription-backend-descriptor/v2"
 MUSCRIPTOR_PREDICTION_MAP_ID = "crux.prediction-map/muscriptor-drums-v1"
 
+IDM_BACKEND_ID = "idm-44-train-kits-v1"
+IDM_DESCRIPTOR_SCHEMA = "crux.transcription-backend-descriptor/v2"
+IDM_PREDICTION_MAP_ID = "crux.prediction-map/idm-44-train-kits-v1"
+
 
 def _muscriptor_descriptor():
     assert backend_identity.MUSCRIPTOR_BACKEND_ID == MUSCRIPTOR_BACKEND_ID
@@ -80,6 +84,60 @@ def _muscriptor_prediction(native: NativeEvent | None = None) -> MappedPredictio
     )
 
 
+def _idm_descriptor():
+    payload = {
+        "architecture_id": "inverse-drum-machine-v0.1.0",
+        "backend_id": IDM_BACKEND_ID,
+        "descriptor_schema": IDM_DESCRIPTOR_SCHEMA,
+        "model_id": "idm-44-train-kits-0123456789ab-fedcba987654",
+        "native_metadata_schema_id": "idm-peak-event-metadata-v1",
+        "native_output_space_id": "idm-44-train-kits-9class-v1",
+        "prediction_schema": "crux.drum-prediction-events/v2",
+        "training_data_map_id": "idm-training-contract-44-train-kits-v1",
+        "upstream_source_commit": "456656868538205ef756912c7cf5b0fd936de8af",
+    }
+    return build_descriptor(payload, frozenset(payload), IDM_DESCRIPTOR_SCHEMA)
+
+
+def _idm_native_event() -> NativeEvent:
+    return NativeEvent(
+        time_sec=1.25,
+        native_class_id="KD",
+        model_output_bin=4,
+        native_midi_note=None,
+        native_metadata={"frame_index": "215", "native_velocity": "1.337421"},
+        confidence=0.83,
+        velocity_midi=85,
+    )
+
+
+def _idm_prediction(native: NativeEvent | None = None) -> MappedPrediction:
+    return MappedPrediction(
+        audio=CanonicalAudio(
+            path=Path(),
+            source_audio_id="song",
+            source_audio_sha256="f" * 64,
+            input_view_id="full-mix-v1",
+            input_audio_sha256="b" * 64,
+            byte_length=46,
+            sample_rate=44100,
+            channel_count=1,
+            sample_width_bytes=2,
+            audio_frame_count=1,
+        ),
+        descriptor=_idm_descriptor(),
+        events=(
+            MappedPredictionEvent(
+                native=_idm_native_event() if native is None else native,
+                canonical_class="kick",
+                common_class="kick",
+                mapping_status="mapped",
+                prediction_map_version=IDM_PREDICTION_MAP_ID,
+            ),
+        ),
+    )
+
+
 SHA_A = "a" * 64
 SHA_B = "b" * 64
 SHA_C = "c" * 64
@@ -104,6 +162,18 @@ def test_muscriptor_prediction_round_trip_is_byte_identical() -> None:
 
     round_tripped = read_prediction_artifact(content)
 
+    assert render_prediction_artifact(round_tripped.prediction) == content
+
+
+def test_idm_prediction_round_trip_preserves_peak_metadata() -> None:
+    content = render_prediction_artifact(_idm_prediction())
+
+    round_tripped = read_prediction_artifact(content)
+
+    assert round_tripped.prediction.events[0].native.native_metadata == {
+        "frame_index": "215",
+        "native_velocity": "1.337421",
+    }
     assert render_prediction_artifact(round_tripped.prediction) == content
 
 
@@ -201,3 +271,101 @@ def test_muscriptor_prediction_rejects_native_event_invariant_violations(
 
     with pytest.raises(PredictionArtifactError):
         render_prediction_artifact(_muscriptor_prediction(native))
+
+
+@pytest.mark.parametrize(
+    ("change", "match"),
+    [
+        ({"model_output_bin": -1}, "model_output_bin"),
+        ({"model_output_bin": 9}, "model_output_bin"),
+        ({"native_class_id": "SD"}, "idm_native_identity"),
+        ({"native_midi_note": 36}, "idm_native_identity"),
+        ({"confidence": None}, "idm_event_nullability"),
+        ({"velocity_midi": None}, "idm_event_nullability"),
+        ({"native_metadata": {"frame_index": "215"}}, "idm_native_metadata"),
+        (
+            {
+                "native_metadata": {
+                    "frame_index": "215",
+                    "native_velocity": "1.337421",
+                    "unexpected": "value",
+                }
+            },
+            "idm_native_metadata",
+        ),
+        (
+            {
+                "native_metadata": {
+                    "frame_index": "01",
+                    "native_velocity": "1.337421",
+                }
+            },
+            "idm_native_metadata",
+        ),
+        (
+            {
+                "native_metadata": {
+                    "frame_index": "215",
+                    "native_velocity": "nan",
+                }
+            },
+            "idm_native_metadata",
+        ),
+        (
+            {
+                "native_metadata": {
+                    "frame_index": "215",
+                    "native_velocity": None,
+                }
+            },
+            "idm_native_metadata",
+        ),
+        (
+            {
+                "native_metadata": {
+                    "frame_index": "215",
+                    "native_velocity": "abc",
+                }
+            },
+            "idm_native_metadata",
+        ),
+        (
+            {
+                "native_metadata": {
+                    "frame_index": "215",
+                    "native_velocity": "1.0",
+                }
+            },
+            "idm_native_metadata",
+        ),
+        (
+            {
+                "native_metadata": {
+                    "frame_index": "215",
+                    "native_velocity": "-0",
+                }
+            },
+            "idm_native_metadata",
+        ),
+    ],
+)
+def test_idm_prediction_rejects_native_event_invariant_violations(
+    change: dict[str, object],
+    match: str,
+) -> None:
+    native = replace(_idm_native_event(), **change)
+
+    with pytest.raises(PredictionArtifactError, match=match):
+        render_prediction_artifact(_idm_prediction(native))
+
+
+@pytest.mark.parametrize("native_velocity", ["0", "2.000001"])
+def test_idm_prediction_accepts_canonical_native_velocity_boundaries(
+    native_velocity: str,
+) -> None:
+    native = replace(
+        _idm_native_event(),
+        native_metadata={"frame_index": "215", "native_velocity": native_velocity},
+    )
+
+    render_prediction_artifact(_idm_prediction(native))

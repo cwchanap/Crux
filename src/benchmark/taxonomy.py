@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal, TypeAlias
 
-from src.benchmark.backend_identity import MUSCRIPTOR_BACKEND_ID, OAF_BACKEND_ID
+from src.benchmark.backend_identity import IDM_BACKEND_ID, MUSCRIPTOR_BACKEND_ID, OAF_BACKEND_ID
 
 DetailedDrumClass: TypeAlias = Literal[
     "kick",
@@ -31,6 +31,7 @@ TAXONOMY_VERSION = "crux.drum-taxonomy/v1"
 DTX_LANE_MAP_VERSION = "crux.dtx-lane-map/v1"
 OAF_PREDICTION_MAP_ID = "crux.prediction-map/oaf-egmd-8hit-v1"
 MUSCRIPTOR_PREDICTION_MAP_ID = "crux.prediction-map/muscriptor-drums-v1"
+IDM_PREDICTION_MAP_ID = "crux.prediction-map/idm-44-train-kits-v1"
 
 DETAILED_TO_COMMON: Mapping[DetailedDrumClass, CommonDrumClass] = MappingProxyType(
     {
@@ -130,6 +131,25 @@ MUSCRIPTOR_PREDICTION_MAP = PredictionMap(
             "51": ClassMapping("ride", "ride"),
             "53": ClassMapping("ride", "ride"),
             "59": ClassMapping("ride", "ride"),
+        }
+    ),
+)
+
+IDM_PREDICTION_MAP = PredictionMap(
+    map_id=IDM_PREDICTION_MAP_ID,
+    backend_id=IDM_BACKEND_ID,
+    native_output_space_id="idm-44-train-kits-9class-v1",
+    classes=MappingProxyType(
+        {
+            "KD": ClassMapping("kick", "kick"),
+            "SD": ClassMapping("snare", "snare"),
+            "HH_CHH": ClassMapping("closed_hihat", "hihat"),
+            "HH_OHH": ClassMapping("open_hihat", "hihat"),
+            "CY_CR": ClassMapping("crash", "crash"),
+            "CY_RD": ClassMapping("ride", "ride"),
+            "TT_HMT": ClassMapping("high_tom", "tom"),
+            "TT_LMT": ClassMapping(None, "tom"),
+            "TT_HFT": ClassMapping("low_or_floor_tom", "tom"),
         }
     ),
 )

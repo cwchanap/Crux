@@ -19,6 +19,13 @@ MUSCRIPTOR_OUTPUT_SPACE = "muscriptor-drums-midi128-v1"
 MUSCRIPTOR_TRAINING_DATA = "muscriptor-training-data-v0.3.0"
 MUSCRIPTOR_COMMIT = "d73147e75e5b9b0c0a79ebe154587db4fd603e0c"
 
+IDM_BACKEND_ID = "idm-44-train-kits-v1"
+IDM_DESCRIPTOR_SCHEMA = "crux.transcription-backend-descriptor/v2"
+IDM_NATIVE_METADATA_SCHEMA = "idm-peak-event-metadata-v1"
+IDM_NATIVE_OUTPUT_SPACE = "idm-44-train-kits-9class-v1"
+IDM_TRAINING_DATA = "idm-training-contract-44-train-kits-v1"
+IDM_COMMIT = "456656868538205ef756912c7cf5b0fd936de8af"
+
 
 def _oaf_payload() -> dict[str, str]:
     return {
@@ -45,6 +52,20 @@ def _muscriptor_payload() -> dict[str, str]:
         "prediction_schema": "crux.drum-prediction-events/v2",
         "training_data_map_id": MUSCRIPTOR_TRAINING_DATA,
         "upstream_source_commit": MUSCRIPTOR_COMMIT,
+    }
+
+
+def _idm_payload() -> dict[str, str]:
+    return {
+        "architecture_id": "inverse-drum-machine-v0.1.0",
+        "backend_id": IDM_BACKEND_ID,
+        "descriptor_schema": IDM_DESCRIPTOR_SCHEMA,
+        "model_id": "idm-44-train-kits-0123456789ab-fedcba987654",
+        "native_metadata_schema_id": IDM_NATIVE_METADATA_SCHEMA,
+        "native_output_space_id": IDM_NATIVE_OUTPUT_SPACE,
+        "prediction_schema": "crux.drum-prediction-events/v2",
+        "training_data_map_id": IDM_TRAINING_DATA,
+        "upstream_source_commit": IDM_COMMIT,
     }
 
 
@@ -80,6 +101,76 @@ def test_muscriptor_descriptor_accepts_only_its_frozen_family_shape() -> None:
     extra["unexpected"] = "value"
     with pytest.raises(StrictJsonError, match="exact key set"):
         normalize_known_backend_descriptor(extra)
+
+
+def test_idm_descriptor_accepts_its_frozen_family_and_patterned_model_id() -> None:
+    assert backend_identity.IDM_BACKEND_ID == IDM_BACKEND_ID
+    assert backend_identity.IDM_NATIVE_METADATA_SCHEMA_ID == IDM_NATIVE_METADATA_SCHEMA
+    assert backend_identity.IDM_NATIVE_OUTPUT_SPACE_ID == IDM_NATIVE_OUTPUT_SPACE
+    assert backend_identity.IDM_TRAINING_DATA_MAP_ID == IDM_TRAINING_DATA
+    assert backend_identity.IDM_RELEASE_COMMIT == IDM_COMMIT
+    payload = _idm_payload()
+    assert set(payload) == set(backend_identity.IDM_DESCRIPTOR_KEYS)
+    assert backend_identity.IDM_MODEL_ID_RE.fullmatch(payload["model_id"])
+
+    assert normalize_known_backend_descriptor(payload) == payload
+
+    missing = _idm_payload()
+    missing.pop("model_id")
+    with pytest.raises(StrictJsonError, match="exact key set"):
+        normalize_known_backend_descriptor(missing)
+
+    extra = _idm_payload()
+    extra["unexpected"] = "value"
+    with pytest.raises(StrictJsonError, match="exact key set"):
+        normalize_known_backend_descriptor(extra)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("architecture_id", "other-architecture"),
+        ("native_metadata_schema_id", "other-metadata/v1"),
+        ("native_output_space_id", "other-output/v1"),
+        ("prediction_schema", "other/v1"),
+        ("training_data_map_id", "other-training/v1"),
+        ("upstream_source_commit", "0" * 40),
+    ],
+)
+def test_idm_descriptor_rejects_mixed_or_unfrozen_identities(
+    field: str,
+    value: str,
+) -> None:
+    payload = _idm_payload()
+    payload[field] = value
+
+    with pytest.raises(StrictJsonError):
+        normalize_known_backend_descriptor(payload)
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "idm-44-train-kits-0123456789ab-fedcba98765",
+        "idm-44-train-kits-0123456789a-fedcba987654",
+        "idm-44-train-kits-0123456789AB-fedcba987654",
+        "idm-other-0123456789ab-fedcba987654",
+    ],
+)
+def test_idm_descriptor_rejects_model_ids_outside_the_frozen_pattern(model_id: str) -> None:
+    payload = _idm_payload()
+    payload["model_id"] = model_id
+
+    with pytest.raises(StrictJsonError):
+        normalize_known_backend_descriptor(payload)
+
+
+def test_unknown_descriptor_family_remains_rejected() -> None:
+    payload = _idm_payload()
+    payload["backend_id"] = "unknown-backend-v1"
+
+    with pytest.raises(StrictJsonError, match="backend_id is unknown"):
+        normalize_known_backend_descriptor(payload)
 
 
 @pytest.mark.parametrize(

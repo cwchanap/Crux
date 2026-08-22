@@ -4,9 +4,10 @@ from __future__ import annotations
 
 # The fixed JSONL union intentionally validates each record branch explicitly.
 # pylint: disable=too-many-branches,too-many-locals,too-many-statements
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, cast
@@ -17,6 +18,8 @@ from src.benchmark.artifact_io import (
     read_regular_file_no_follow,
 )
 from src.benchmark.backend_identity import (
+    IDM_BACKEND_ID,
+    IDM_NATIVE_METADATA_SCHEMA_ID,
     MUSCRIPTOR_BACKEND_ID,
     OAF_BACKEND_ID,
     BackendDescriptor,
@@ -30,6 +33,7 @@ from src.benchmark.backend_identity import (
     strict_json_loads,
 )
 from src.benchmark.backends import CanonicalAudio, NativeEvent
+from src.benchmark.idm_model import IDM_TRAIN_CLASSES
 
 PREDICTION_SCHEMA = "crux.drum-prediction-events/v2"
 OAF_METADATA_SCHEMA = "magenta-oaf-native-metadata-v1"
@@ -40,7 +44,11 @@ OAF_GROUP_IDS = frozenset(
 NATIVE_METADATA_SCHEMAS = {
     OAF_METADATA_SCHEMA: {"upstream_8hit_group_id": OAF_GROUP_IDS | {None}},
     MUSCRIPTOR_METADATA_SCHEMA: {"instrument_group": {"drums"}},
+    IDM_NATIVE_METADATA_SCHEMA_ID: {},
 }
+_IDM_FRAME_INDEX_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+_IDM_NATIVE_VELOCITY_QUANTUM = Decimal("0.000001")
+_IDM_NATIVE_VELOCITY_MAX = Decimal("2.000001")
 HEADER_KEYS = frozenset(
     {
         "architecture_id",
@@ -450,6 +458,15 @@ def _normalize_event(
             or native.native_class_id != f"drums:midi_{native.native_midi_note}"
         ):
             raise PredictionArtifactError("muscriptor_native_identity")
+    elif backend_id == IDM_BACKEND_ID:
+        if native.model_output_bin is None or native.model_output_bin >= len(IDM_TRAIN_CLASSES):
+            raise PredictionArtifactError("idm_model_output_bin")
+        if native.native_class_id != IDM_TRAIN_CLASSES[native.model_output_bin]:
+            raise PredictionArtifactError("idm_native_identity")
+        if native.native_midi_note is not None:
+            raise PredictionArtifactError("idm_native_identity")
+        if confidence is None or native.velocity_midi is None:
+            raise PredictionArtifactError("idm_event_nullability")
     else:  # pragma: no cover - descriptor normalization rejects unknown families.
         raise PredictionArtifactError("unknown_backend")
     _validate_mapping_values(event)
@@ -474,6 +491,8 @@ def _validate_metadata(
 ) -> dict[str, str | None]:
     if not isinstance(metadata, Mapping):
         raise PredictionArtifactError("native_metadata must be an object")
+    if metadata_schema == IDM_NATIVE_METADATA_SCHEMA_ID:
+        return _validate_idm_metadata(metadata)
     policy = NATIVE_METADATA_SCHEMAS[metadata_schema]
     if set(metadata) != set(policy):
         raise PredictionArtifactError("native_metadata must contain the exact schema keys")
@@ -483,6 +502,29 @@ def _validate_metadata(
             raise PredictionArtifactError("native_metadata contains an invalid value")
         result[key] = value
     return result
+
+
+def _validate_idm_metadata(metadata: Mapping[str, str | None]) -> dict[str, str | None]:
+    if set(metadata) != {"frame_index", "native_velocity"}:
+        raise PredictionArtifactError("idm_native_metadata keys are invalid")
+    frame_index = metadata["frame_index"]
+    if not isinstance(frame_index, str) or _IDM_FRAME_INDEX_RE.fullmatch(frame_index) is None:
+        raise PredictionArtifactError("idm_native_metadata frame_index is invalid")
+
+    native_velocity = metadata["native_velocity"]
+    if not isinstance(native_velocity, str):
+        raise PredictionArtifactError("idm_native_metadata native_velocity is invalid")
+    try:
+        value = Decimal(native_velocity)
+        quantized = value.quantize(_IDM_NATIVE_VELOCITY_QUANTUM)
+    except InvalidOperation:
+        raise PredictionArtifactError("idm_native_metadata native_velocity is invalid") from None
+    if not value.is_finite() or value < 0 or value > _IDM_NATIVE_VELOCITY_MAX:
+        raise PredictionArtifactError("idm_native_metadata native_velocity is invalid")
+    canonical = format(abs(quantized), "f").rstrip("0").rstrip(".") or "0"
+    if value != quantized or native_velocity != canonical:
+        raise PredictionArtifactError("idm_native_metadata native_velocity is invalid")
+    return {"frame_index": frame_index, "native_velocity": native_velocity}
 
 
 def _event_record(event: _NormalizedEvent, event_index: int) -> dict[str, JsonValue]:

@@ -8,10 +8,15 @@ import subprocess
 import time
 from dataclasses import asdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 
 from runtime.oaf_tf1.model import load_model_config
+
+if TYPE_CHECKING:
+    from src.benchmark.idm_pilot_run import IdmFullMixSmokeOutcome, IdmPilotRunOutcome
+
 from src.benchmark.artifact_io import read_regular_file_no_follow
 from src.benchmark.backend_identity import canonical_json_bytes, quantize_six
 from src.benchmark.backend_registry import default_backend_registry
@@ -856,6 +861,329 @@ def run_muscriptor_corpus_command(
     standard_output.flush()
     if outcome.exit_code:
         ctx.exit(outcome.exit_code)
+
+
+def _run_idm_comparison(run_path: Path, output_dir: Path) -> Path:
+    """Join the persisted IDM/OaF reports without importing IDM at CLI load."""
+    from src.benchmark.idm_comparison import IdmComparisonRequest, compare_oaf_idm
+
+    return compare_oaf_idm(IdmComparisonRequest(run_path=run_path, output_dir=output_dir))
+
+
+def _build_idm_outcome_payload(outcome: IdmPilotRunOutcome) -> dict[str, object]:
+    """Render one IDM runner outcome as JSON-safe values."""
+    return {
+        "aggregate_rtf": (
+            None if outcome.aggregate_rtf is None else quantize_six(outcome.aggregate_rtf)
+        ),
+        "failed_count": outcome.failed_count,
+        "native_failure_counts": dict(outcome.native_failure_counts or ()),
+        "projected_full_wall_time_sec": (
+            None
+            if outcome.projected_full_wall_time_sec is None
+            else quantize_six(outcome.projected_full_wall_time_sec)
+        ),
+        "quarantined_count": outcome.quarantined_count,
+        "reports_path": (None if outcome.reports_path is None else str(outcome.reports_path)),
+        "run_id": outcome.run_id,
+        "run_path": None if outcome.run_path is None else str(outcome.run_path),
+        "skipped_count": outcome.skipped_count,
+        "status": outcome.overall_status,
+        "success_count": outcome.success_count,
+    }
+
+
+def _build_idm_smoke_payload(outcome: IdmFullMixSmokeOutcome) -> dict[str, object]:
+    return {
+        "exit_code": outcome.exit_code,
+        "failed_count": outcome.failed_count,
+        "quarantined_count": outcome.quarantined_count,
+        "reports_path": None if outcome.reports_path is None else str(outcome.reports_path),
+        "run_id": outcome.run_id,
+        "run_path": None if outcome.run_path is None else str(outcome.run_path),
+        "skipped_count": outcome.skipped_count,
+        "status": outcome.overall_status,
+        "success_count": outcome.success_count,
+    }
+
+
+def _emit_idm_pilot_summary(
+    outcome: IdmPilotRunOutcome,
+    *,
+    comparison_path: Path | None,
+    smoke_outcome: IdmFullMixSmokeOutcome | None,
+    comparison_error: str | None,
+    status: str,
+    exit_code: int,
+) -> None:
+    payload = _build_idm_outcome_payload(outcome)
+    payload.update(
+        {
+            "comparison_error": comparison_error,
+            "comparison_path": None if comparison_path is None else str(comparison_path),
+            "exit_code": exit_code,
+            "smoke": (None if smoke_outcome is None else _build_idm_smoke_payload(smoke_outcome)),
+            "status": status,
+        }
+    )
+    standard_output = click.get_binary_stream("stdout")
+    standard_output.write(canonical_json_bytes(payload, trailing_newline=True))
+    standard_output.flush()
+
+
+def _build_idm_fatal_outcome() -> IdmPilotRunOutcome:
+    from src.benchmark.idm_pilot_run import IdmPilotRunOutcome
+
+    return IdmPilotRunOutcome(
+        overall_status="failed",
+        exit_code=2,
+        run_id=None,
+        run_path=None,
+        reports_path=None,
+        success_count=0,
+        failed_count=0,
+        skipped_count=0,
+        quarantined_count=0,
+    )
+
+
+def _build_idm_fatal_smoke_outcome() -> IdmFullMixSmokeOutcome:
+    from src.benchmark.idm_pilot_run import IdmFullMixSmokeOutcome
+
+    return IdmFullMixSmokeOutcome(
+        overall_status="failed",
+        exit_code=2,
+        run_id=None,
+        run_path=None,
+        reports_path=None,
+        success_count=0,
+        failed_count=0,
+        skipped_count=0,
+        quarantined_count=0,
+    )
+
+
+def _execute_idm_pilot(
+    *,
+    separation_handoff_path: Path,
+    reference_manifest_path: Path,
+    timing_manifest_path: Path,
+    separation_artifact_root: Path,
+    stem_cache_root: Path,
+    output_dir: Path,
+    runtime_python: Path,
+    model_lock_path: Path,
+    model_root: Path,
+    resume: bool,
+    smoke_manifest: Path | None,
+    source_cache_dir: Path | None,
+) -> tuple[IdmPilotRunOutcome, Path | None, IdmFullMixSmokeOutcome | None, str | None, str, int]:
+    """Construct the fixed requests and run the primary/derived IDM paths."""
+    from src.benchmark.idm_pilot_run import (
+        IdmFullMixSmokeRequest,
+        IdmPilotRunRequest,
+        run_idm_full_mix_smoke,
+        run_idm_pilot,
+    )
+
+    if (smoke_manifest is None) != (source_cache_dir is None):
+        raise click.UsageError("--smoke-manifest and --source-cache-dir must be supplied together")
+
+    try:
+        crux_commit = _current_crux_commit()
+        request = IdmPilotRunRequest(
+            separation_handoff_path=separation_handoff_path,
+            reference_manifest_path=reference_manifest_path,
+            timing_manifest_path=timing_manifest_path,
+            separation_artifact_root=separation_artifact_root,
+            stem_cache_root=stem_cache_root,
+            output_dir=output_dir,
+            model_lock_path=model_lock_path,
+            model_root=model_root,
+            runtime_python=runtime_python,
+            resume=resume,
+            crux_commit=crux_commit,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError, subprocess.SubprocessError):
+        return _build_idm_fatal_outcome(), None, None, None, "failed", 2
+
+    try:
+        outcome = run_idm_pilot(request)
+    except (OSError, RuntimeError, TypeError, ValueError, subprocess.SubprocessError):
+        outcome = _build_idm_fatal_outcome()
+
+    comparison_path: Path | None = None
+    comparison_error: str | None = None
+    if outcome.run_path is not None and outcome.exit_code != 2:
+        try:
+            comparison_path = _run_idm_comparison(outcome.run_path, output_dir / "comparison")
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            comparison_error = f"{type(error).__name__}: {error}"
+
+    smoke_outcome: IdmFullMixSmokeOutcome | None = None
+    if (
+        smoke_manifest is not None
+        and source_cache_dir is not None
+        and outcome.exit_code != 2
+        and comparison_error is None
+    ):
+        try:
+            smoke_outcome = run_idm_full_mix_smoke(
+                IdmFullMixSmokeRequest(
+                    separation_handoff_path=separation_handoff_path,
+                    reference_manifest_path=reference_manifest_path,
+                    timing_manifest_path=timing_manifest_path,
+                    smoke_manifest_path=smoke_manifest,
+                    source_cache_dir=source_cache_dir,
+                    output_dir=output_dir,
+                    model_lock_path=model_lock_path,
+                    model_root=model_root,
+                    runtime_python=runtime_python,
+                    crux_commit=crux_commit,
+                )
+            )
+        except (OSError, RuntimeError, TypeError, ValueError, subprocess.SubprocessError):
+            smoke_outcome = _build_idm_fatal_smoke_outcome()
+
+    final_exit_code = outcome.exit_code
+    final_status = outcome.overall_status
+    if comparison_error is not None or (smoke_outcome is not None and smoke_outcome.exit_code == 2):
+        final_exit_code = 2
+        final_status = "failed"
+    elif smoke_outcome is not None and smoke_outcome.exit_code == 1:
+        final_exit_code = 1
+        final_status = "partial"
+    return (
+        outcome,
+        comparison_path,
+        smoke_outcome,
+        comparison_error,
+        final_status,
+        final_exit_code,
+    )
+
+
+@benchmark.command("run-idm-pilot")
+@click.option(
+    "--handoff",
+    "separation_handoff_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required immutable HPA-328 separation handoff manifest.",
+)
+@click.option(
+    "--manifest",
+    "reference_manifest_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required immutable HPA-324 reference-set manifest.",
+)
+@click.option(
+    "--timing-manifest",
+    "timing_manifest_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required immutable HPA-323 reference-timing manifest.",
+)
+@click.option(
+    "--separation-artifact-root",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+    help="Required retained HPA-328 handoff artifact root.",
+)
+@click.option(
+    "--stem-cache-root",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+    help="Required retained HTDemucs stem cache root.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+    help="Directory where the IDM pilot and comparison outputs are written.",
+)
+@click.option(
+    "--runtime-python",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required isolated Python 3.11 IDM runtime interpreter.",
+)
+@click.option(
+    "--model-lock",
+    "model_lock_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Required frozen IDM model lock JSON.",
+)
+@click.option(
+    "--model-root",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+    help="Required verified IDM model root.",
+)
+@click.option("--resume", is_flag=True)
+@click.option(
+    "--smoke-manifest",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Optional fixed five-song full-mix smoke manifest.",
+)
+@click.option(
+    "--source-cache-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Optional HPA-321 source cache for the separate full-mix smoke.",
+)
+@click.pass_context
+def run_idm_pilot_command(
+    ctx: click.Context,
+    separation_handoff_path: Path,
+    reference_manifest_path: Path,
+    timing_manifest_path: Path,
+    separation_artifact_root: Path,
+    stem_cache_root: Path,
+    output_dir: Path,
+    runtime_python: Path,
+    model_lock_path: Path,
+    model_root: Path,
+    resume: bool,
+    smoke_manifest: Path | None,
+    source_cache_dir: Path | None,
+) -> None:
+    """Run the fixed HPA-328 IDM stem pilot and publish its paired reports."""
+    (
+        outcome,
+        comparison_path,
+        smoke_outcome,
+        comparison_error,
+        final_status,
+        final_exit_code,
+    ) = _execute_idm_pilot(
+        separation_handoff_path=separation_handoff_path,
+        reference_manifest_path=reference_manifest_path,
+        timing_manifest_path=timing_manifest_path,
+        separation_artifact_root=separation_artifact_root,
+        stem_cache_root=stem_cache_root,
+        output_dir=output_dir,
+        runtime_python=runtime_python,
+        model_lock_path=model_lock_path,
+        model_root=model_root,
+        resume=resume,
+        smoke_manifest=smoke_manifest,
+        source_cache_dir=source_cache_dir,
+    )
+
+    _emit_idm_pilot_summary(
+        outcome,
+        comparison_path=comparison_path,
+        smoke_outcome=smoke_outcome,
+        comparison_error=comparison_error,
+        status=final_status,
+        exit_code=final_exit_code,
+    )
+    if final_exit_code:
+        ctx.exit(final_exit_code)
 
 
 @benchmark.command("sync-r2-corpus")

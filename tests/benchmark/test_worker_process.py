@@ -308,6 +308,54 @@ def test_worker_process_poisoned_after_malformed_output(tmp_path: Path) -> None:
         process.close()
 
 
+def test_worker_process_request_attaches_valid_audio_identity(tmp_path: Path) -> None:
+    script = tmp_path / "echo_identity_worker.py"
+    script.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'type':'ready'}), flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    request = json.loads(line)\n"
+        "    response = {'id': request['id'], 'events': [], "
+        "'audio_byte_length': request.get('audio_byte_length'), "
+        "'audio_sha256': request.get('audio_sha256')}\n"
+        "    print(json.dumps(response), flush=True)\n",
+        encoding="utf-8",
+    )
+    process = WorkerProcess.start([sys.executable, str(script)], timeout_seconds=1)
+    try:
+        response = process.request(
+            "one.wav",
+            audio_byte_length=4096,
+            audio_sha256="a" * 64,
+        )
+        assert response["audio_byte_length"] == 4096
+        assert response["audio_sha256"] == "a" * 64
+    finally:
+        process.close()
+
+
+def test_worker_process_request_rejects_invalid_audio_identity(tmp_path: Path) -> None:
+    """Invalid audio identity is rejected host-side without poisoning the child."""
+    script = _script(tmp_path, [{"type": "ready"}])
+    process = WorkerProcess.start([sys.executable, str(script)], timeout_seconds=1)
+    try:
+        for audio_byte_length, audio_sha256 in [
+            (-1, "a" * 64),
+            (4096, "short"),
+            (4096, "g" * 64),
+            ("4096", "a" * 64),
+        ]:
+            with pytest.raises(WorkerProcessError, match="worker audio identity is invalid"):
+                process.request(
+                    "one.wav",
+                    audio_byte_length=audio_byte_length,  # type: ignore[arg-type]
+                    audio_sha256=audio_sha256,
+                )
+            assert not process.closed
+    finally:
+        process.close()
+
+
 def test_worker_process_preserves_correlated_error_without_poisoning_child(
     tmp_path: Path,
 ) -> None:

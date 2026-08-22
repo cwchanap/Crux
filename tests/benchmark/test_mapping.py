@@ -10,12 +10,21 @@ from src.benchmark.mapping import (
     DTX_LANE_MAP,
     MUSCRIPTOR_PREDICTION_MAP,
     map_dtx_events,
+    map_idm_prediction,
     map_midi_events,
     map_muscriptor_prediction,
 )
 from src.benchmark.models import BenchmarkEvent
 from src.benchmark.prediction_artifact import read_prediction_artifact, render_prediction_artifact
-from src.benchmark.taxonomy import MUSCRIPTOR_PREDICTION_MAP_ID
+from src.benchmark.taxonomy import (
+    IDM_PREDICTION_MAP,
+    MUSCRIPTOR_PREDICTION_MAP_ID,
+    ClassMapping,
+)
+
+IDM_BACKEND_ID = "idm-44-train-kits-v1"
+IDM_DESCRIPTOR_SCHEMA = "crux.transcription-backend-descriptor/v2"
+IDM_PREDICTION_MAP_ID = "crux.prediction-map/idm-44-train-kits-v1"
 
 
 def test_default_dtx_mapping_supports_drumery_editor_lanes():
@@ -98,6 +107,21 @@ def build_muscriptor_descriptor():
     return build_descriptor(payload, frozenset(payload), payload["descriptor_schema"])
 
 
+def build_idm_descriptor():
+    payload = {
+        "architecture_id": "inverse-drum-machine-v0.1.0",
+        "backend_id": IDM_BACKEND_ID,
+        "descriptor_schema": IDM_DESCRIPTOR_SCHEMA,
+        "model_id": "idm-44-train-kits-0123456789ab-fedcba987654",
+        "native_metadata_schema_id": "idm-peak-event-metadata-v1",
+        "native_output_space_id": "idm-44-train-kits-9class-v1",
+        "prediction_schema": "crux.drum-prediction-events/v2",
+        "training_data_map_id": "idm-training-contract-44-train-kits-v1",
+        "upstream_source_commit": "456656868538205ef756912c7cf5b0fd936de8af",
+    }
+    return build_descriptor(payload, frozenset(payload), IDM_DESCRIPTOR_SCHEMA)
+
+
 def build_muscriptor_prediction(notes: tuple[int, ...]) -> NativePrediction:
     return NativePrediction(
         audio=CanonicalAudio(
@@ -124,6 +148,36 @@ def build_muscriptor_prediction(notes: tuple[int, ...]) -> NativePrediction:
                 velocity_midi=None,
             )
             for index, note in enumerate(notes)
+        ),
+    )
+
+
+def build_idm_prediction(native_classes: tuple[str, ...]) -> NativePrediction:
+    return NativePrediction(
+        audio=CanonicalAudio(
+            path=Path(),
+            source_audio_id="song",
+            source_audio_sha256="a" * 64,
+            input_view_id="full-mix-v1",
+            input_audio_sha256="b" * 64,
+            byte_length=46,
+            sample_rate=44100,
+            channel_count=1,
+            sample_width_bytes=2,
+            audio_frame_count=1,
+        ),
+        descriptor=build_idm_descriptor(),
+        events=tuple(
+            NativeEvent(
+                time_sec=float(index),
+                native_class_id=native_class,
+                model_output_bin=index,
+                native_midi_note=None,
+                native_metadata={"frame_index": str(index), "native_velocity": "1"},
+                confidence=0.8,
+                velocity_midi=90,
+            )
+            for index, native_class in enumerate(native_classes)
         ),
     )
 
@@ -196,3 +250,68 @@ def test_map_muscriptor_prediction_rejects_identity_mismatch(change: dict[str, s
 
     with pytest.raises(ValueError):
         map_muscriptor_prediction(replace(prediction, descriptor=descriptor))
+
+
+def test_idm_prediction_map_uses_native_class_ids_for_all_fixed_classes_and_unmapped_evidence():
+    prediction_map = IDM_PREDICTION_MAP
+    assert prediction_map.map_id == IDM_PREDICTION_MAP_ID
+    assert prediction_map.classes["TT_LMT"] == ClassMapping(None, "tom")
+
+    native_classes = (
+        "KD",
+        "SD",
+        "HH_CHH",
+        "HH_OHH",
+        "CY_CR",
+        "CY_RD",
+        "TT_HMT",
+        "TT_LMT",
+        "TT_HFT",
+        "UNEXPECTED",
+    )
+    mapped, diagnostics = map_idm_prediction(build_idm_prediction(native_classes), prediction_map)
+
+    assert [(event.canonical_class, event.common_class) for event in mapped.events] == [
+        ("kick", "kick"),
+        ("snare", "snare"),
+        ("closed_hihat", "hihat"),
+        ("open_hihat", "hihat"),
+        ("crash", "crash"),
+        ("ride", "ride"),
+        ("high_tom", "tom"),
+        (None, "tom"),
+        ("low_or_floor_tom", "tom"),
+        (None, None),
+    ]
+    assert [event.mapping_status for event in mapped.events] == [
+        "mapped",
+        "mapped",
+        "mapped",
+        "mapped",
+        "mapped",
+        "mapped",
+        "mapped",
+        "mapped",
+        "mapped",
+        "unmapped",
+    ]
+    assert diagnostics.unmapped == {"UNEXPECTED": 1}
+    assert all(event.prediction_map_version == IDM_PREDICTION_MAP_ID for event in mapped.events)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"backend_id": "other-backend"},
+        {"native_output_space_id": "other-output-space"},
+    ],
+)
+def test_map_idm_prediction_rejects_identity_mismatch(change: dict[str, str]):
+    prediction = build_idm_prediction(("KD",))
+    descriptor = replace(
+        prediction.descriptor,
+        payload={**prediction.descriptor.payload, **change},
+    )
+
+    with pytest.raises(ValueError):
+        map_idm_prediction(replace(prediction, descriptor=descriptor), IDM_PREDICTION_MAP)
