@@ -96,10 +96,14 @@ def _default_runtime_sync(runtime_root: Path, runtime_python: Path) -> None:
     The venv-path guard compares lexically rather than via ``resolve()``: uv
     symlinks ``.venv/bin/python`` to the underlying base/managed interpreter,
     so a resolve()-based equality would accept that base interpreter directly
-    and let the worker import packages from the wrong environment.  The
+    and let the worker import packages from the wrong environment. The
     subprocess environment is also sanitized to drop ``UV_PROJECT_ENVIRONMENT``,
     which would otherwise redirect ``uv sync`` away from
     ``<runtime_root>/.venv`` even when ``--project`` targets ``runtime_root``.
+    ``UV_NO_SYNC`` is dropped because uv honors it by skipping environment
+    updates entirely (silently no-op'ing this mandatory sync), and
+    ``UV_OFFLINE`` is dropped because it would recreate the partial-install
+    trap described above.
     """
     expected_python = runtime_root / ".venv" / "bin" / "python"
     if runtime_python != expected_python:
@@ -109,6 +113,8 @@ def _default_runtime_sync(runtime_root: Path, runtime_python: Path) -> None:
         raise RuntimeError("uv is not available on PATH")
     sync_env = dict(os.environ)
     sync_env.pop("UV_PROJECT_ENVIRONMENT", None)
+    sync_env.pop("UV_NO_SYNC", None)
+    sync_env.pop("UV_OFFLINE", None)
     sync_label = "uv sync --frozen"
     command = [uv_binary, "sync", "--project", os.fspath(runtime_root), "--frozen"]
     try:
