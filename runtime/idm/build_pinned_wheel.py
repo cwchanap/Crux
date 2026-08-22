@@ -30,6 +30,8 @@ SHIM_BUILD_SYSTEM = (
     'build-backend = "poetry.core.masonry.api"\n'
 )
 
+BUILDER_TIMEOUT = 300
+
 
 def calculate_sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
@@ -39,8 +41,18 @@ def calculate_sha256_file(path: Path) -> str:
     return calculate_sha256_bytes(path.read_bytes())
 
 
+def _run_command(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+    """Run *argv* with the builder timeout, converting hangs into build failures."""
+    try:
+        return subprocess.run(argv, timeout=BUILDER_TIMEOUT, **kwargs)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"command timed out after {BUILDER_TIMEOUT}s: {' '.join(argv)}"
+        ) from error
+
+
 def run_git(source: Path, *args: str) -> str:
-    result = subprocess.run(
+    result = _run_command(
         ["git", "-C", str(source), *args],
         check=True,
         stdout=subprocess.PIPE,
@@ -51,7 +63,7 @@ def run_git(source: Path, *args: str) -> str:
 
 
 def _commit_files(source: Path, commit: str) -> tuple[PurePosixPath, ...]:
-    result = subprocess.run(
+    result = _run_command(
         ["git", "-C", str(source), "ls-tree", "-r", "--name-only", commit],
         check=True,
         stdout=subprocess.PIPE,
@@ -62,7 +74,7 @@ def _commit_files(source: Path, commit: str) -> tuple[PurePosixPath, ...]:
 
 
 def _commit_blob(source: Path, commit: str, relative: PurePosixPath) -> bytes:
-    result = subprocess.run(
+    result = _run_command(
         ["git", "-C", str(source), "show", f"{commit}:{relative.as_posix()}"],
         check=True,
         stdout=subprocess.PIPE,
@@ -146,7 +158,7 @@ def _build_wheel(source: Path, commit: str, wheel_output: Path, uv: str) -> tupl
         environment = os.environ.copy()
         environment["SOURCE_DATE_EPOCH"] = "0"
         environment["PYTHONHASHSEED"] = "0"
-        subprocess.run(
+        _run_command(
             [
                 uv,
                 "build",
@@ -171,7 +183,12 @@ def _build_wheel(source: Path, commit: str, wheel_output: Path, uv: str) -> tupl
 
 
 def get_uv_version(uv: str) -> str:
-    return subprocess.check_output([uv, "--version"], text=True).strip()
+    try:
+        return subprocess.check_output(
+            [uv, "--version"], text=True, timeout=BUILDER_TIMEOUT
+        ).strip()
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"command timed out after {BUILDER_TIMEOUT}s: {uv} --version") from error
 
 
 def build_pinned_wheel(source: Path, wheel_output: Path, provenance_output: Path) -> None:

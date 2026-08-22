@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import zipfile
 from pathlib import Path
@@ -9,6 +10,16 @@ from types import ModuleType
 import pytest
 
 BUILDER_PATH = Path(__file__).parents[2] / "runtime" / "idm" / "build_pinned_wheel.py"
+
+_GIT_ENV = {
+    "PATH": os.environ.get("PATH", ""),
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_AUTHOR_NAME": "IDM wheel test",
+    "GIT_AUTHOR_EMAIL": "test@example.invalid",
+    "GIT_COMMITTER_NAME": "IDM wheel test",
+    "GIT_COMMITTER_EMAIL": "test@example.invalid",
+}
 
 
 def _load_builder() -> ModuleType:
@@ -27,6 +38,7 @@ def run_git(repo: Path, *arguments: str) -> str:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=_GIT_ENV,
     )
     return result.stdout.strip()
 
