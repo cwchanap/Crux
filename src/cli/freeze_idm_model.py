@@ -11,14 +11,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from src.benchmark.artifact_io import (  # noqa: E402
-    publish_immutable_file,
-    read_regular_file_no_follow,
-)
-from src.benchmark.backend_identity import canonical_json_bytes  # noqa: E402
-from src.benchmark.idm_model import (  # noqa: E402
+from src.benchmark.artifact_io import publish_immutable_file, read_regular_file_no_follow
+from src.benchmark.backend_identity import canonical_json_bytes
+from src.benchmark.idm_model import (
     IDM_CHECKPOINT_RELATIVE_PATH,
     IDM_CODE_LICENSE,
     IDM_MODEL_CONFIG_RELATIVE_PATH,
@@ -31,7 +26,11 @@ from src.benchmark.idm_model import (  # noqa: E402
     IDM_REPOSITORY_URL,
     IDM_TRAIN_CLASSES,
     IDM_TRAINING_DATA_MAP_ID,
+    IDM_VELOCITY_ACTIVATION,
+    IDM_VELOCITY_EXPONENT,
+    IDM_VELOCITY_THRESHOLD,
     IDM_WEIGHT_LICENSE,
+    IDM_WEIGHT_LICENSE_BASIS,
     IdmModelLock,
     IdmModelLockError,
     derive_idm_model_id,
@@ -42,8 +41,6 @@ from src.benchmark.idm_model import (  # noqa: E402
 )
 
 _REVISION_RE = re.compile(r"[0-9a-f]{40}\Z")
-_DEVICE_RE = re.compile(r"(?:cpu|mps|cuda(?::[0-9]+)?)\Z")
-_DTYPE_VALUES = frozenset({"float16", "float32", "bfloat16"})
 _LICENSE_NOTE = (
     "No separate checkpoint notice exists in the pinned repository; this records repository-level "
     "provenance and is not an independent legal conclusion."
@@ -95,12 +92,12 @@ def freeze_model(
     _verify_license_evidence(license_bytes, license_provenance_path)
 
     resolved_device = _resolve_device(device, runtime_python)
-    resolved_dtype = _resolve_dtype(dtype, resolved_device)
+    resolved_dtype = _resolve_dtype(dtype)
     python_version = _runtime_python_version(runtime_python)
 
+    model_root = model_root.resolve()
     if model_root != source_root:
         _publish_model_inputs(model_root, config_bytes, checkpoint_bytes)
-    model_root = model_root.resolve()
     runtime_lock_sha256 = hashlib.sha256(runtime_lock_bytes).hexdigest()
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()
     checkpoint_sha256 = hashlib.sha256(checkpoint_bytes).hexdigest()
@@ -112,6 +109,7 @@ def freeze_model(
         package_version=IDM_PACKAGE_VERSION,
         code_license=IDM_CODE_LICENSE,
         weight_license=IDM_WEIGHT_LICENSE,
+        weight_license_basis=IDM_WEIGHT_LICENSE_BASIS,
         runtime_lock_sha256=runtime_lock_sha256,
         python_version=python_version,
         model_name=IDM_MODEL_NAME,
@@ -142,8 +140,10 @@ def freeze_model(
         peak_pick_div_wait=16,
         peak_pick_div_threshold=5,
         peak_pick_normalize=False,
-        velocity_activation="exp_sigmoid(exponent=10,max_value=2,threshold=1e-7)",
+        velocity_activation=IDM_VELOCITY_ACTIVATION,
+        velocity_exponent=IDM_VELOCITY_EXPONENT,
         velocity_max_value=2.0,
+        velocity_threshold=IDM_VELOCITY_THRESHOLD,
         velocity_to_midi_revision="clamp-half-round-midi127/v1",
         native_velocity_persistence_revision="quantize-six-canonical-string/v1",
         manual_onset_override=False,
@@ -265,8 +265,8 @@ def _publish_model_inputs(model_root: Path, config: bytes, checkpoint: bytes) ->
 
 def _resolve_device(requested: str, runtime_python: Path) -> str:
     if requested != "auto":
-        if not isinstance(requested, str) or _DEVICE_RE.fullmatch(requested) is None:
-            raise FreezeError("device must be auto, cpu, mps, cuda, or cuda:<index>")
+        if requested != "cpu":
+            raise FreezeError("device must be auto or cpu")
         return requested
     probe = (
         "import torch; "
@@ -282,17 +282,15 @@ def _resolve_device(requested: str, runtime_python: Path) -> str:
         ).strip()
     except (OSError, subprocess.CalledProcessError) as error:
         raise FreezeError("runtime device feasibility probe failed") from error
-    if _DEVICE_RE.fullmatch(selected) is None:
-        raise FreezeError("runtime device feasibility probe returned an invalid device")
+    if selected != "cpu":
+        raise FreezeError("IDM KISS runtime supports only CPU")
     return selected
 
 
-def _resolve_dtype(requested: str, device: str) -> str:
-    if requested == "auto":
-        return "float16" if device == "mps" else "float32"
-    if requested not in _DTYPE_VALUES:
-        raise FreezeError("dtype must be auto, float16, float32, or bfloat16")
-    return requested
+def _resolve_dtype(requested: str) -> str:
+    if requested not in {"auto", "float32"}:
+        raise FreezeError("dtype must be auto or float32")
+    return "float32"
 
 
 def _runtime_python_version(runtime_python: Path) -> str:

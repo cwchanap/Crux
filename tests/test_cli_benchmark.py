@@ -1875,6 +1875,17 @@ def test_run_idm_pilot_skips_smoke_when_comparison_fails(tmp_path: Path, monkeyp
     summary = json.loads(result.output)
     assert summary["status"] == "failed"
     assert summary["exit_code"] == 2
-    assert summary["comparison_error"] == "ValueError"
+    assert summary["comparison_error"] == "ValueError: comparison failed"
     assert summary["smoke"] is None
     assert smoke_calls == []
+
+
+def test_run_idm_pilot_rejects_smoke_options_supplied_alone(tmp_path: Path) -> None:
+    args = _idm_pilot_cli_args(tmp_path) + [
+        "--smoke-manifest",
+        str(tmp_path / "smoke.json"),
+    ]
+    result = CliRunner().invoke(main, args)
+
+    assert result.exit_code == 2
+    assert "--smoke-manifest and --source-cache-dir must be supplied together" in result.output

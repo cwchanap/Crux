@@ -133,7 +133,9 @@ def _copy_attested_runtime(tmp_path: Path) -> tuple[Path, Path]:
     checkpoint_sha256 = hashlib.sha256(SYNTHETIC_CHECKPOINT).hexdigest()
     lock_payload = json.loads((RUNTIME_ROOT / "model.json").read_text(encoding="utf-8"))
     lock_payload["activation_rate_hz"] = Decimal("172.265625")
+    lock_payload["velocity_exponent"] = Decimal(str(lock_payload["velocity_exponent"]))
     lock_payload["velocity_max_value"] = Decimal("2.0")
+    lock_payload["velocity_threshold"] = Decimal(str(lock_payload["velocity_threshold"]))
     lock_payload.update(
         {
             "model_config_sha256": config_sha256,
@@ -279,7 +281,7 @@ def test_idm_backend_decodes_events_and_reuses_worker(tmp_path: Path) -> None:
     ]
 
 
-@pytest.mark.parametrize("replacement", ("leaf", "ancestor"))
+@pytest.mark.parametrize("replacement", ("leaf", "ancestor", "none"))
 def test_idm_worker_reads_only_verified_staged_audio_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement: str
 ) -> None:
@@ -297,17 +299,22 @@ def test_idm_worker_reads_only_verified_staged_audio_bytes(
         staged_path.unlink()
         staged_path.symlink_to(tmp_path / "substituted.wav")
         (tmp_path / "substituted.wav").write_bytes(substituted)
-    else:
+    elif replacement == "ancestor":
         staged_parent.rename(tmp_path / "original-parent")
         (tmp_path / "substituted-parent").mkdir()
         (tmp_path / "substituted-parent" / "verified.wav").write_bytes(substituted)
         staged_parent.symlink_to(tmp_path / "substituted-parent", target_is_directory=True)
 
+    soundfile_calls: list[str] = []
+
     class FakeSoundFile:
+        LibsndfileError = RuntimeError
+
         @staticmethod
         def info(stream):
             assert not isinstance(stream, (str, Path))
             assert stream.read() == original
+            soundfile_calls.append("info")
             return type(
                 "Info",
                 (),
@@ -320,7 +327,16 @@ def test_idm_worker_reads_only_verified_staged_audio_bytes(
             assert always_2d is True
             stream.seek(0)
             assert stream.read() == original
-            return [[0.0]], 44100
+            soundfile_calls.append("read")
+
+            class Samples:
+                shape = (1, 1)
+
+                def __getitem__(self, key):
+                    del key
+                    return object()
+
+            return Samples(), 44100
 
     monkeypatch.setitem(sys.modules, "soundfile", FakeSoundFile)
 
@@ -336,7 +352,19 @@ def test_idm_worker_reads_only_verified_staged_audio_bytes(
         def from_numpy(_samples):
             return FakeTensor()
 
-    with pytest.raises(ValueError, match="audio"):
+    if replacement == "none":
+        result = worker._load_audio(
+            str(staged_path),
+            len(original),
+            hashlib.sha256(original).hexdigest(),
+            FakeTorch(),
+            "cpu",
+        )
+        assert isinstance(result, FakeTensor)
+        assert soundfile_calls == ["info", "read"]
+        return
+
+    with pytest.raises(ValueError, match="audio input or format is invalid"):
         worker._load_audio(
             str(staged_path),
             len(original),
@@ -344,38 +372,47 @@ def test_idm_worker_reads_only_verified_staged_audio_bytes(
             FakeTorch(),
             "cpu",
         )
+    assert soundfile_calls == []
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("payload", "expected_message"),
     [
-        {"id": "request", "audio_path": "/tmp/verified.wav"},
-        {
-            "id": "request",
-            "audio_path": "/tmp/verified.wav",
-            "audio_byte_length": True,
-            "audio_sha256": "0" * 64,
-        },
-        {
-            "id": "request",
-            "audio_path": "/tmp/verified.wav",
-            "audio_byte_length": 1,
-            "audio_sha256": "not-a-sha",
-        },
+        ({"id": "request", "audio_path": "/tmp/verified.wav"}, "request is invalid"),
+        (
+            {
+                "id": "request",
+                "audio_path": "/tmp/verified.wav",
+                "audio_byte_length": True,
+                "audio_sha256": "0" * 64,
+            },
+            "audio byte length is invalid",
+        ),
+        (
+            {
+                "id": "request",
+                "audio_path": "/tmp/verified.wav",
+                "audio_byte_length": 1,
+                "audio_sha256": "not-a-sha",
+            },
+            "audio digest is invalid",
+        ),
     ],
 )
-def test_idm_worker_validates_audio_identity_protocol(payload: dict[str, object]) -> None:
+def test_idm_worker_validates_audio_identity_protocol(
+    payload: dict[str, object], expected_message: str
+) -> None:
     from runtime.idm import worker
 
-    with pytest.raises(ValueError, match="request|byte length|digest"):
+    with pytest.raises(ValueError, match=expected_message):
         worker._valid_request(payload)
 
 
 @pytest.mark.parametrize(
     ("kind", "expected_message"),
     [
-        ("mismatch", "audio"),
-        ("directory", "audio"),
+        ("mismatch", "audio bytes do not match verified identity"),
+        ("directory", "audio input is not regular"),
     ],
 )
 def test_idm_worker_rejects_staged_audio_identity_failures(
@@ -439,23 +476,30 @@ def test_idm_backend_rejects_non_kiss_runtime_lock_before_worker_start(
     lock_path = artifact_root / "model.json"
     payload = json.loads(lock_path.read_text(encoding="utf-8"))
     payload["activation_rate_hz"] = Decimal("172.265625")
+    payload["velocity_exponent"] = Decimal(str(payload["velocity_exponent"]))
     payload["velocity_max_value"] = Decimal("2.0")
+    payload["velocity_threshold"] = Decimal(str(payload["velocity_threshold"]))
     payload[field] = value
     lock_path.write_bytes(canonical_json_bytes(payload, trailing_newline=True))
 
     worker = _FakeWorker(_ready(), {"id": "request", "events": []})
-    calls: list[tuple[list[str], dict[str, object]]] = []
+    factory_calls: list[object] = []
+
+    def factory(*_args: object, **_kwargs: object) -> _FakeWorker:
+        factory_calls.append(1)
+        return worker
+
     with pytest.raises(IdmBackendError) as raised:
-        _backend(
-            tmp_path,
-            worker,
-            calls,
-            artifact_root=artifact_root,
-            model_root=model_root,
+        IdmBackend(
+            tmp_path / "runtime-python",
+            lock_path,
+            model_root,
+            tmp_path / "input",
+            process_factory=factory,
         )
 
     assert raised.value.code == "descriptor_invalid"
-    assert calls == []
+    assert factory_calls == []
 
 
 def test_idm_worker_ready_reports_effective_runtime_model_and_tensor_facts(

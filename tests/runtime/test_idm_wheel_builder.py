@@ -20,7 +20,7 @@ def _load_builder() -> ModuleType:
     return builder
 
 
-def _git(repo: Path, *arguments: str) -> str:
+def run_git(repo: Path, *arguments: str) -> str:
     result = subprocess.run(
         ["git", "-C", str(repo), *arguments],
         check=True,
@@ -32,18 +32,18 @@ def _git(repo: Path, *arguments: str) -> str:
 
 
 def _fixture_repository(repo: Path) -> str:
-    _git(repo, "init", "--quiet")
-    _git(repo, "config", "user.email", "test@example.invalid")
-    _git(repo, "config", "user.name", "IDM wheel test")
+    run_git(repo, "init", "--quiet")
+    run_git(repo, "config", "user.email", "test@example.invalid")
+    run_git(repo, "config", "user.name", "IDM wheel test")
     (repo / "idm").mkdir()
     (repo / "idm" / "__init__.py").write_text("VALUE = 'committed'\n", encoding="utf-8")
     (repo / "pyproject.toml").write_text(
         "[project]\nname = 'inverse-drum-machine'\nversion = '0.1.0'\n",
         encoding="utf-8",
     )
-    _git(repo, "add", "idm", "pyproject.toml")
-    _git(repo, "commit", "--quiet", "-m", "initial")
-    return _git(repo, "rev-parse", "HEAD")
+    run_git(repo, "add", "idm", "pyproject.toml")
+    run_git(repo, "commit", "--quiet", "-m", "initial")
+    return run_git(repo, "rev-parse", "HEAD")
 
 
 def _write_idm_wheel(builder: ModuleType, path: Path, repo: Path, commit: str) -> None:
@@ -71,7 +71,7 @@ def test_commit_blobs_ignore_staged_and_unstaged_source_edits(tmp_path: Path) ->
 
     module = repo / "idm" / "__init__.py"
     module.write_text("VALUE = 'staged'\n", encoding="utf-8")
-    _git(repo, "add", "idm/__init__.py")
+    run_git(repo, "add", "idm/__init__.py")
     module.write_text("VALUE = 'unstaged'\n", encoding="utf-8")
 
     second_tree = tmp_path / "second-tree"

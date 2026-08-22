@@ -16,7 +16,11 @@ from src.benchmark.idm_model import (
     IDM_NATIVE_VELOCITY_PERSISTENCE_REVISION,
     IDM_RELEASE_COMMIT,
     IDM_TRAIN_CLASSES,
+    IDM_VELOCITY_ACTIVATION,
+    IDM_VELOCITY_EXPONENT,
+    IDM_VELOCITY_THRESHOLD,
     IDM_VELOCITY_TO_MIDI_REVISION,
+    IDM_WEIGHT_LICENSE_BASIS,
     IdmModelLockError,
     derive_idm_model_id,
     idm_inference_config,
@@ -50,6 +54,7 @@ def _lock_payload(
         "package_version": "0.1.0",
         "code_license": "Apache-2.0",
         "weight_license": "Apache-2.0",
+        "weight_license_basis": IDM_WEIGHT_LICENSE_BASIS,
         "runtime_lock_sha256": hashlib.sha256(RUNTIME_LOCK).hexdigest(),
         "python_version": "3.11.12",
         "model_name": "idm-44-train-kits",
@@ -82,8 +87,10 @@ def _lock_payload(
         "peak_pick_div_wait": 16,
         "peak_pick_div_threshold": 5,
         "peak_pick_normalize": False,
-        "velocity_activation": "exp_sigmoid(exponent=10,max_value=2,threshold=1e-7)",
+        "velocity_activation": IDM_VELOCITY_ACTIVATION,
+        "velocity_exponent": Decimal("10"),
         "velocity_max_value": Decimal("2.0"),
+        "velocity_threshold": Decimal("0.0000001"),
         "velocity_to_midi_revision": IDM_VELOCITY_TO_MIDI_REVISION,
         "native_velocity_persistence_revision": IDM_NATIVE_VELOCITY_PERSISTENCE_REVISION,
         "manual_onset_override": False,
@@ -129,6 +136,11 @@ def test_loads_the_frozen_identity_and_verifies_exact_model_files(tmp_path: Path
     assert lock.repository_revision == IDM_RELEASE_COMMIT
     assert lock.python_version.startswith("3.11.")
     assert lock.model_name == "idm-44-train-kits"
+    assert lock.code_license == "Apache-2.0"
+    assert lock.weight_license == "Apache-2.0"
+    assert lock.weight_license_basis == IDM_WEIGHT_LICENSE_BASIS
+    assert lock.device == "cpu"
+    assert lock.dtype == "float32"
     assert lock.sample_rate_hz == 44100
     assert lock.input_channel_count == 1
     assert lock.input_container == "WAV"
@@ -142,6 +154,10 @@ def test_loads_the_frozen_identity_and_verifies_exact_model_files(tmp_path: Path
     assert lock.peak_pick_div_wait == 16
     assert lock.peak_pick_div_threshold == 5
     assert lock.peak_pick_normalize is False
+    assert lock.velocity_activation == IDM_VELOCITY_ACTIVATION == "exp_sigmoid"
+    assert lock.velocity_exponent == IDM_VELOCITY_EXPONENT == 10
+    assert lock.velocity_max_value == 2
+    assert lock.velocity_threshold == IDM_VELOCITY_THRESHOLD == 1e-7
     assert lock.velocity_to_midi_revision == IDM_VELOCITY_TO_MIDI_REVISION
     assert lock.native_velocity_persistence_revision == IDM_NATIVE_VELOCITY_PERSISTENCE_REVISION
     assert lock.manual_onset_override is False
@@ -158,6 +174,7 @@ def test_loads_the_frozen_identity_and_verifies_exact_model_files(tmp_path: Path
     [
         ("code_license", "MIT"),
         ("weight_license", "unknown"),
+        ("weight_license_basis", "repository-license-separate-notice/v1"),
         ("audio_loader_revision", "librosa-default"),
         ("resampling", "allowed"),
         ("mixdown", "allowed"),
@@ -167,7 +184,12 @@ def test_loads_the_frozen_identity_and_verifies_exact_model_files(tmp_path: Path
         ("peak_pick_div_threshold", 6),
         ("peak_pick_normalize", True),
         ("device", "tpu"),
+        ("device", "mps"),
         ("dtype", "float64"),
+        ("dtype", "float16"),
+        ("velocity_activation", "sigmoid(exponent=10)"),
+        ("velocity_exponent", Decimal("11")),
+        ("velocity_threshold", Decimal("0.000001")),
     ],
 )
 def test_rejects_edited_identity_facts(tmp_path: Path, field: str, value: object) -> None:
@@ -217,9 +239,9 @@ def test_rejects_noncanonical_lock_json(tmp_path: Path) -> None:
 
 
 def test_optimized_freeze_validation_rejects_invalid_model_fact() -> None:
-    script = Path(__file__).parents[2] / "scripts" / "freeze_idm_model.py"
+    script = Path(__file__).parents[2] / "src" / "cli" / "freeze_idm_model.py"
     code = """
-from scripts.freeze_idm_model import FreezeError, _verify_model_config
+from src.cli.freeze_idm_model import FreezeError, _verify_model_config
 
 content = b'''
 sampling_rate: 22050
@@ -240,16 +262,19 @@ train_classes: [CY_CR, CY_RD, HH_CHH, HH_OHH, KD, SD, TT_HFT, TT_HMT, TT_LMT]
 
 try:
     _verify_model_config(content)
-except FreezeError:
+except FreezeError as error:
+    if str(error) != "model config facts differ from the frozen IDM contract":
+        raise SystemExit(3)
     raise SystemExit(0)
 raise SystemExit(1)
 """
     result = subprocess.run(
         [sys.executable, "-O", "-c", code],
-        cwd=script.parents[1],
+        cwd=script.parents[2],
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
 
     assert result.returncode == 0, result.stderr

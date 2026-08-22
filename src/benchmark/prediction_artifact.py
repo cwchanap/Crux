@@ -48,6 +48,7 @@ NATIVE_METADATA_SCHEMAS = {
 }
 _IDM_FRAME_INDEX_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _IDM_NATIVE_VELOCITY_QUANTUM = Decimal("0.000001")
+_IDM_NATIVE_VELOCITY_MAX = Decimal("2.000001")
 HEADER_KEYS = frozenset(
     {
         "architecture_id",
@@ -518,7 +519,7 @@ def _validate_idm_metadata(metadata: Mapping[str, str | None]) -> dict[str, str 
         quantized = value.quantize(_IDM_NATIVE_VELOCITY_QUANTUM)
     except InvalidOperation:
         raise PredictionArtifactError("idm_native_metadata native_velocity is invalid") from None
-    if not value.is_finite() or value <= 0 or value > 2:
+    if not value.is_finite() or value < 0 or value > _IDM_NATIVE_VELOCITY_MAX:
         raise PredictionArtifactError("idm_native_metadata native_velocity is invalid")
     canonical = format(quantized, "f").rstrip("0").rstrip(".") or "0"
     if value != quantized or native_velocity != canonical:

@@ -32,6 +32,7 @@ from src.benchmark.idm_pilot_run import (
     select_idm_smoke_cases,
 )
 from src.benchmark.separation_handoff import LoadedSeparationPilotManifest
+from tests.benchmark.idm_pilot_fixtures import IDM_MODEL_LOCK_PATH
 
 
 def _smoke_handoff(*rows: dict[str, object]) -> LoadedSeparationPilotManifest:
@@ -298,7 +299,7 @@ def test_full_mix_materializer_uses_historical_view_and_neutral_rail(
     assert calls[0]["max_input_audio_frames"] is None
 
 
-def test_full_mix_smoke_uses_a_separate_report_namespace(monkeypatch, tmp_path: Path) -> None:
+def test_full_mix_smoke_uses_a_separate_report_namespace() -> None:
     # The offline seam must remain explicit: smoke output cannot be written
     # below the primary ``runs``/``reports`` namespace or selected for the
     # headline comparison.
@@ -306,7 +307,7 @@ def test_full_mix_smoke_uses_a_separate_report_namespace(monkeypatch, tmp_path: 
 
     assert run_module.IDM_FULL_MIX_SMOKE_DIRNAME == "full-mix-smoke"
     assert run_module.IDM_FULL_MIX_SMOKE_REPORT_DIRNAME == "reports"
-    assert run_module.IDM_FULL_MIX_SMOKE_DIRNAME not in "runs/idm-stem/reports"
+    assert run_module.IDM_FULL_MIX_SMOKE_DIRNAME != "runs"
 
 
 def test_full_mix_smoke_rejects_output_alias_before_loading_inputs(
@@ -337,144 +338,163 @@ def test_full_mix_smoke_rejects_output_alias_before_loading_inputs(
     assert outcome.exit_code == 2
 
 
-def test_full_mix_smoke_materializes_infers_scores_and_reports_separately(
-    monkeypatch, tmp_path: Path
-) -> None:
-    import src.benchmark.idm_pilot_run as run_module
-    from src.benchmark.backends.base import NativeEvent, NativePrediction
-    from src.benchmark.idm_model import load_idm_model_lock
-    from src.benchmark.idm_pilot_run import run_idm_full_mix_smoke
-    from tests.benchmark.idm_pilot_fixtures import (
-        CRUX_COMMIT,
-        SHA_B,
-        canonical_wav,
-        loaded_reference_manifests,
-        sha256,
-    )
+class _FullMixSmokeEnvironment:
+    """One isolated offline full-mix smoke setup with per-test counters."""
 
-    ids = tuple(range(20, 40))
-    reference, timing, mappings = loaded_reference_manifests(
-        ids=ids,
-        reference_sha256="1" * 64,
-        reference_version="sha256:" + "2" * 64,
-        timing_sha256="3" * 64,
-        timing_version="sha256:" + "4" * 64,
-    )
-    rows = tuple(
-        {
-            "simfile_id": simfile_id,
-            "source_audio_id": f"{simfile_id}/audio.wav",
-            "source_audio_sha256": SHA_B,
-            "source_duration_sec": 1,
-            "htdemucs": {"status": "success"},
-        }
-        for simfile_id in ids
-    )
-    handoff = LoadedSeparationPilotManifest(
-        manifest_sha256="8" * 64,
-        corpus_version="sha256:" + "9" * 64,
-        rows=rows,
-    )
-    smoke_path = tmp_path / "smoke.json"
-    smoke_path.write_bytes(
-        render_idm_smoke_manifest(
-            [
-                {"reason": reason, "simfile_id": simfile_id}
-                for reason, simfile_id in zip(IDM_SMOKE_CASE_ORDER, ids[:5], strict=True)
-            ]
-        )
-    )
-    wav = canonical_wav()
-
-    def resolve_source(source_row, *_args, **_kwargs):
-        return ResolvedSourceAudio(
-            path=tmp_path / "source.wav",
-            source_audio_id=source_row["source_audio_key"],
-            source_audio_sha256=source_row["source_audio_content_hash"],
-            duration_sec=1.0,
-            content=wav,
+    def __init__(self, monkeypatch, tmp_path: Path) -> None:
+        import src.benchmark.idm_pilot_run as run_module
+        from src.benchmark.backends.base import NativeEvent, NativePrediction
+        from src.benchmark.idm_model import load_idm_model_lock
+        from tests.benchmark.idm_pilot_fixtures import (
+            CRUX_COMMIT,
+            SHA_B,
+            canonical_wav,
+            loaded_reference_manifests,
+            sha256,
         )
 
-    lock = load_idm_model_lock(Path("runtime/idm/model.json"))
-    descriptor = run_module.descriptor_for_lock(lock)
-    input_sha = sha256(wav)
-
-    monkeypatch.setattr(run_module, "load_separation_pilot_manifest", lambda _: handoff)
-    monkeypatch.setattr(run_module, "load_reference_set_manifest", lambda _: reference)
-    monkeypatch.setattr(run_module, "load_reference_timing_manifest", lambda _: timing)
-    monkeypatch.setattr(run_module, "_validate_lineage", lambda *_args: None)
-    monkeypatch.setattr(
-        run_module, "preflight_reference_mappings", lambda *_args, **_kwargs: mappings
-    )
-    monkeypatch.setattr(run_module, "load_idm_model_lock", lambda _: lock)
-    monkeypatch.setattr(run_module, "resolve_source_audio", resolve_source)
-
-    materialize_calls: list[Path] = []
-
-    def materialize(source_audio, output_path, *, input_root):
-        materialize_calls.append(output_path)
-        return CanonicalAudio(
-            path=output_path,
-            source_audio_id=source_audio.source_audio_id,
-            source_audio_sha256=source_audio.source_audio_sha256,
-            input_view_id=IDM_FULL_MIX_INPUT_VIEW_ID,
-            input_audio_sha256=input_sha,
-            byte_length=len(wav),
-            sample_rate=44100,
-            channel_count=1,
-            sample_width_bytes=2,
-            audio_frame_count=32,
+        self.monkeypatch = monkeypatch
+        self.run_module = run_module
+        ids = tuple(range(20, 40))
+        reference, timing, mappings = loaded_reference_manifests(
+            ids=ids,
+            reference_sha256="1" * 64,
+            reference_version="sha256:" + "2" * 64,
+            timing_sha256="3" * 64,
+            timing_version="sha256:" + "4" * 64,
         )
+        rows = tuple(
+            {
+                "simfile_id": simfile_id,
+                "source_audio_id": f"{simfile_id}/audio.wav",
+                "source_audio_sha256": SHA_B,
+                "source_duration_sec": 1,
+                "htdemucs": {"status": "success"},
+            }
+            for simfile_id in ids
+        )
+        handoff = LoadedSeparationPilotManifest(
+            manifest_sha256="8" * 64,
+            corpus_version="sha256:" + "9" * 64,
+            rows=rows,
+        )
+        smoke_path = tmp_path / "smoke.json"
+        smoke_path.write_bytes(
+            render_idm_smoke_manifest(
+                [
+                    {"reason": reason, "simfile_id": simfile_id}
+                    for reason, simfile_id in zip(IDM_SMOKE_CASE_ORDER, ids[:5], strict=True)
+                ]
+            )
+        )
+        wav = canonical_wav()
 
-    monkeypatch.setattr(run_module, "materialize_idm_full_mix_audio", materialize)
-    factory_calls: list[dict[str, object]] = []
-
-    class FakeBackend:
-        def descriptor(self):
-            return descriptor
-
-        def transcribe(self, audio):
-            return NativePrediction(
-                audio=audio,
-                descriptor=descriptor,
-                events=(
-                    NativeEvent(
-                        time_sec=0.25,
-                        native_class_id="KD",
-                        model_output_bin=4,
-                        native_midi_note=None,
-                        native_metadata={"frame_index": "43", "native_velocity": "1"},
-                        confidence=0.9,
-                        velocity_midi=64,
-                    ),
-                ),
+        def resolve_source(source_row, *_args, **_kwargs):
+            return ResolvedSourceAudio(
+                path=tmp_path / "source.wav",
+                source_audio_id=source_row["source_audio_key"],
+                source_audio_sha256=source_row["source_audio_content_hash"],
+                duration_sec=1.0,
+                content=wav,
             )
 
-        def close(self):
-            return None
+        lock = load_idm_model_lock(IDM_MODEL_LOCK_PATH)
+        descriptor = run_module.descriptor_for_lock(lock)
+        self.descriptor = descriptor
+        input_sha = sha256(wav)
 
-    def backend_factory(**kwargs: object) -> FakeBackend:
-        factory_calls.append(kwargs)
-        return FakeBackend()
+        monkeypatch.setattr(run_module, "load_separation_pilot_manifest", lambda _: handoff)
+        monkeypatch.setattr(run_module, "load_reference_set_manifest", lambda _: reference)
+        monkeypatch.setattr(run_module, "load_reference_timing_manifest", lambda _: timing)
+        monkeypatch.setattr(run_module, "_validate_lineage", lambda *_args: None)
+        monkeypatch.setattr(
+            run_module, "preflight_reference_mappings", lambda *_args, **_kwargs: mappings
+        )
+        monkeypatch.setattr(run_module, "load_idm_model_lock", lambda _: lock)
+        monkeypatch.setattr(run_module, "resolve_source_audio", resolve_source)
 
-    request = IdmFullMixSmokeRequest(
-        separation_handoff_path=tmp_path / "handoff.jsonl",
-        reference_manifest_path=tmp_path / "reference.jsonl",
-        timing_manifest_path=tmp_path / "timing.jsonl",
-        smoke_manifest_path=smoke_path,
-        source_cache_dir=tmp_path / "cache",
-        output_dir=tmp_path / "output",
-        model_lock_path=tmp_path / "model.json",
-        model_root=tmp_path / "model",
-        runtime_python=tmp_path / "python",
-        crux_commit=CRUX_COMMIT,
-    )
-    request.model_lock_path.write_bytes(Path("runtime/idm/model.json").read_bytes())
-    outcome = run_idm_full_mix_smoke(
-        request,
-        backend_factory=backend_factory,
-        perf_counter=lambda: 1.0,
-    )
+        self.materialize_calls: list[Path] = []
+
+        def materialize(source_audio, output_path, *, input_root):
+            self.materialize_calls.append(output_path)
+            return CanonicalAudio(
+                path=output_path,
+                source_audio_id=source_audio.source_audio_id,
+                source_audio_sha256=source_audio.source_audio_sha256,
+                input_view_id=IDM_FULL_MIX_INPUT_VIEW_ID,
+                input_audio_sha256=input_sha,
+                byte_length=len(wav),
+                sample_rate=44100,
+                channel_count=1,
+                sample_width_bytes=2,
+                audio_frame_count=32,
+            )
+
+        monkeypatch.setattr(run_module, "materialize_idm_full_mix_audio", materialize)
+        self.factory_calls: list[dict[str, object]] = []
+
+        class FakeBackend:
+            def descriptor(self):
+                return descriptor
+
+            def transcribe(self, audio):
+                return NativePrediction(
+                    audio=audio,
+                    descriptor=descriptor,
+                    events=(
+                        NativeEvent(
+                            time_sec=0.25,
+                            native_class_id="KD",
+                            model_output_bin=4,
+                            native_midi_note=None,
+                            native_metadata={"frame_index": "43", "native_velocity": "1"},
+                            confidence=0.9,
+                            velocity_midi=64,
+                        ),
+                    ),
+                )
+
+            def close(self):
+                return None
+
+        self.FakeBackend = FakeBackend
+        self.request = IdmFullMixSmokeRequest(
+            separation_handoff_path=tmp_path / "handoff.jsonl",
+            reference_manifest_path=tmp_path / "reference.jsonl",
+            timing_manifest_path=tmp_path / "timing.jsonl",
+            smoke_manifest_path=smoke_path,
+            source_cache_dir=tmp_path / "cache",
+            output_dir=tmp_path / "output",
+            model_lock_path=tmp_path / "model.json",
+            model_root=tmp_path / "model",
+            runtime_python=tmp_path / "python",
+            crux_commit=CRUX_COMMIT,
+        )
+        self.request.model_lock_path.write_bytes(IDM_MODEL_LOCK_PATH.read_bytes())
+
+    def backend_factory(self, **kwargs: object):
+        self.factory_calls.append(kwargs)
+        return self.FakeBackend()
+
+    def run(self, request: IdmFullMixSmokeRequest | None = None):
+        from src.benchmark.idm_pilot_run import run_idm_full_mix_smoke
+
+        return run_idm_full_mix_smoke(
+            self.request if request is None else request,
+            backend_factory=self.backend_factory,
+            perf_counter=lambda: 1.0,
+        )
+
+
+@pytest.fixture
+def full_mix_smoke(monkeypatch, tmp_path: Path) -> _FullMixSmokeEnvironment:
+    return _FullMixSmokeEnvironment(monkeypatch, tmp_path)
+
+
+def test_full_mix_smoke_materializes_infers_and_reports_in_its_own_namespace(
+    full_mix_smoke: _FullMixSmokeEnvironment,
+) -> None:
+    outcome = full_mix_smoke.run()
 
     assert outcome.overall_status == "complete"
     assert outcome.success_count == 5
@@ -482,12 +502,19 @@ def test_full_mix_smoke_materializes_infers_scores_and_reports_separately(
     assert "full-mix-smoke" in outcome.reports_path.as_posix()
     assert outcome.reports_path.name == "reports"
     assert (outcome.reports_path / "summary.json").exists()
-    assert not (tmp_path / "output" / "runs").exists()
-    assert len(factory_calls) == 1
-    assert factory_calls[0]["input_root"] == outcome.run_path.parent / "inputs"
-    assert len(materialize_calls) == 5
+    assert not (full_mix_smoke.request.output_dir / "runs").exists()
+    assert len(full_mix_smoke.factory_calls) == 1
+    assert full_mix_smoke.factory_calls[0]["input_root"] == outcome.run_path.parent / "inputs"
+    assert len(full_mix_smoke.materialize_calls) == 5
 
-    preseeded_request = replace(request, output_dir=tmp_path / "preseeded-output")
+
+def test_full_mix_smoke_rejects_preseeded_symlinked_run_directory(
+    full_mix_smoke: _FullMixSmokeEnvironment, tmp_path: Path
+) -> None:
+    outcome = full_mix_smoke.run()
+    assert outcome.run_id is not None
+
+    preseeded_request = replace(full_mix_smoke.request, output_dir=tmp_path / "preseeded-output")
     preseeded_run_dir = preseeded_request.output_dir / "full-mix-smoke" / "runs" / outcome.run_id
     preseeded_outside = tmp_path / "preseeded-outside"
     preseeded_outside.mkdir()
@@ -495,26 +522,25 @@ def test_full_mix_smoke_materializes_infers_scores_and_reports_separately(
     preseeded_sentinel.write_bytes(b"must remain untouched")
     preseeded_run_dir.mkdir(parents=True)
     (preseeded_run_dir / "predictions").symlink_to(preseeded_outside, target_is_directory=True)
-    preseeded = run_idm_full_mix_smoke(
-        preseeded_request,
-        backend_factory=backend_factory,
-        perf_counter=lambda: 1.0,
-    )
+
+    preseeded = full_mix_smoke.run(preseeded_request)
+
     assert preseeded.overall_status == "failed"
     assert preseeded.exit_code == 2
     assert not (preseeded_run_dir / "run.json").exists()
     assert preseeded_sentinel.read_bytes() == b"must remain untouched"
     assert list(preseeded_outside.iterdir()) == [preseeded_sentinel]
-    assert len(factory_calls) == 1
-    assert len(materialize_calls) == 5
+    assert len(full_mix_smoke.factory_calls) == 1
+    assert len(full_mix_smoke.materialize_calls) == 5
 
-    publication_request = replace(request, output_dir=tmp_path / "publication-output")
-    publication_factory_calls: list[dict[str, object]] = []
 
-    def publication_backend_factory(**kwargs: object) -> FakeBackend:
-        publication_factory_calls.append(kwargs)
-        return FakeBackend()
-
+def test_full_mix_smoke_records_partial_publication_failure(
+    full_mix_smoke: _FullMixSmokeEnvironment, tmp_path: Path
+) -> None:
+    publication_request = replace(
+        full_mix_smoke.request, output_dir=tmp_path / "publication-output"
+    )
+    run_module = full_mix_smoke.run_module
     real_publish = run_module.publish_prediction_artifact
     publish_calls: list[Path] = []
 
@@ -524,16 +550,16 @@ def test_full_mix_smoke_materializes_infers_scores_and_reports_separately(
             raise ArtifactPublicationError("simulated publication failure")
         return real_publish(target, mapped)
 
-    monkeypatch.setattr(run_module, "publish_prediction_artifact", fail_first_publish)
-    publication = run_idm_full_mix_smoke(
-        publication_request,
-        backend_factory=publication_backend_factory,
-        perf_counter=lambda: 1.0,
+    full_mix_smoke.monkeypatch.setattr(
+        run_module, "publish_prediction_artifact", fail_first_publish
     )
+    publication = full_mix_smoke.run(publication_request)
+
     assert publication.overall_status == "partial"
     assert publication.success_count == 4
     assert publication.failed_count == 1
-    assert len(publication_factory_calls) == 1
+    assert len(full_mix_smoke.factory_calls) == 1
+    assert len(full_mix_smoke.materialize_calls) == 5
     assert publication.run_path is not None
     publication_snapshot = strict_json_loads(
         publication.run_path.read_bytes()[:-1], require_canonical=True
@@ -544,71 +570,94 @@ def test_full_mix_smoke_materializes_infers_scores_and_reports_separately(
     assert all(
         item.get("native_failure_code") != "worker_protocol_failed" for item in publication_items
     )
-    assert len(materialize_calls) == 10
 
-    assert outcome.run_path is not None
-    complete_snapshot = outcome.run_path.read_bytes()
-    materialize_before_repeat = len(materialize_calls)
-    mapping_calls: list[object] = []
+
+def _guard_against_duplicate_run_rewrites(
+    full_mix_smoke: _FullMixSmokeEnvironment,
+) -> dict[str, list[object]]:
+    run_module = full_mix_smoke.run_module
+    observed: dict[str, list[object]] = {
+        "mapping_calls": [],
+        "cache_load_calls": [],
+        "write_calls": [],
+    }
 
     def mapping_must_not_run(*args: object, **kwargs: object) -> object:
-        mapping_calls.append((args, kwargs))
+        observed["mapping_calls"].append((args, kwargs))
         raise AssertionError("duplicate-run rejection must precede mapping reconstruction")
 
-    cache_load_calls: list[Path] = []
-
-    def cache_load_must_not_run(cls: object, cache_dir: Path) -> object:
+    def cache_load_must_not_run(cls: object, cache_dir: object) -> object:
         del cls
-        cache_load_calls.append(cache_dir)
+        observed["cache_load_calls"].append(cache_dir)
         raise AssertionError("duplicate-run rejection must precede cache loading")
 
-    write_calls: list[Path] = []
-
     def snapshot_write_must_not_run(path: Path, *_args: object, **_kwargs: object) -> None:
-        write_calls.append(path)
+        observed["write_calls"].append(path)
         raise AssertionError("duplicate-run rejection must precede snapshot writes")
 
-    monkeypatch.setattr(run_module, "preflight_reference_mappings", mapping_must_not_run)
-    monkeypatch.setattr(
+    full_mix_smoke.monkeypatch.setattr(
+        run_module, "preflight_reference_mappings", mapping_must_not_run
+    )
+    full_mix_smoke.monkeypatch.setattr(
         run_module.CacheIndexStore,
         "load",
         classmethod(cache_load_must_not_run),
     )
-    monkeypatch.setattr(run_module, "_write_full_mix_smoke_snapshot", snapshot_write_must_not_run)
-    repeated = run_idm_full_mix_smoke(
-        request,
-        backend_factory=backend_factory,
-        perf_counter=lambda: 1.0,
+    full_mix_smoke.monkeypatch.setattr(
+        run_module, "_write_full_mix_smoke_snapshot", snapshot_write_must_not_run
     )
+    return observed
+
+
+def test_full_mix_smoke_rejects_repeated_complete_run_without_rewrites(
+    full_mix_smoke: _FullMixSmokeEnvironment,
+) -> None:
+    outcome = full_mix_smoke.run()
+    assert outcome.run_path is not None
+    complete_snapshot = outcome.run_path.read_bytes()
+    materialize_before_repeat = len(full_mix_smoke.materialize_calls)
+
+    observed = _guard_against_duplicate_run_rewrites(full_mix_smoke)
+    repeated = full_mix_smoke.run()
+
     assert repeated.overall_status == "failed"
     assert repeated.exit_code == 2
     assert outcome.run_path.read_bytes() == complete_snapshot
-    assert len(factory_calls) == 1
-    assert len(materialize_calls) == materialize_before_repeat
-    assert mapping_calls == []
-    assert cache_load_calls == []
-    assert write_calls == []
+    assert len(full_mix_smoke.factory_calls) == 1
+    assert len(full_mix_smoke.materialize_calls) == materialize_before_repeat
+    assert observed["mapping_calls"] == []
+    assert observed["cache_load_calls"] == []
+    assert observed["write_calls"] == []
 
-    interrupted_request = replace(request, output_dir=tmp_path / "interrupted-output")
+
+def test_full_mix_smoke_rejects_interrupted_snapshot_without_rewrites(
+    full_mix_smoke: _FullMixSmokeEnvironment, tmp_path: Path
+) -> None:
+    outcome = full_mix_smoke.run()
+    assert outcome.run_id is not None
+    materialize_before_repeat = len(full_mix_smoke.materialize_calls)
+
+    interrupted_request = replace(
+        full_mix_smoke.request, output_dir=tmp_path / "interrupted-output"
+    )
     interrupted_path = (
         interrupted_request.output_dir / "full-mix-smoke" / "runs" / outcome.run_id / "run.json"
     )
     interrupted_snapshot = b'{"interrupted":true}\n'
     interrupted_path.parent.mkdir(parents=True)
     interrupted_path.write_bytes(interrupted_snapshot)
-    interrupted = run_idm_full_mix_smoke(
-        interrupted_request,
-        backend_factory=backend_factory,
-        perf_counter=lambda: 1.0,
-    )
+
+    observed = _guard_against_duplicate_run_rewrites(full_mix_smoke)
+    interrupted = full_mix_smoke.run(interrupted_request)
+
     assert interrupted.overall_status == "failed"
     assert interrupted.exit_code == 2
     assert interrupted_path.read_bytes() == interrupted_snapshot
-    assert len(factory_calls) == 1
-    assert len(materialize_calls) == materialize_before_repeat
-    assert mapping_calls == []
-    assert cache_load_calls == []
-    assert write_calls == []
+    assert len(full_mix_smoke.factory_calls) == 1
+    assert len(full_mix_smoke.materialize_calls) == materialize_before_repeat
+    assert observed["mapping_calls"] == []
+    assert observed["cache_load_calls"] == []
+    assert observed["write_calls"] == []
 
 
 @pytest.mark.parametrize("component", ("full-mix-smoke", "runs", "inputs", "reports"))
@@ -654,7 +703,7 @@ def test_full_mix_smoke_rejects_derived_symlink_without_outside_writes(
             ]
         )
     )
-    lock = load_idm_model_lock(Path("runtime/idm/model.json"))
+    lock = load_idm_model_lock(IDM_MODEL_LOCK_PATH)
     request = IdmFullMixSmokeRequest(
         separation_handoff_path=tmp_path / "handoff.jsonl",
         reference_manifest_path=tmp_path / "reference.jsonl",
@@ -667,7 +716,7 @@ def test_full_mix_smoke_rejects_derived_symlink_without_outside_writes(
         runtime_python=tmp_path / "python",
         crux_commit=CRUX_COMMIT,
     )
-    request.model_lock_path.write_bytes(Path("runtime/idm/model.json").read_bytes())
+    request.model_lock_path.write_bytes(IDM_MODEL_LOCK_PATH.read_bytes())
     monkeypatch.setattr(run_module, "load_separation_pilot_manifest", lambda _: handoff)
     monkeypatch.setattr(run_module, "load_reference_set_manifest", lambda _: reference)
     monkeypatch.setattr(run_module, "load_reference_timing_manifest", lambda _: timing)

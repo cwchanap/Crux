@@ -8,10 +8,15 @@ import subprocess
 import time
 from dataclasses import asdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 
 from runtime.oaf_tf1.model import load_model_config
+
+if TYPE_CHECKING:
+    from src.benchmark.idm_pilot_run import IdmFullMixSmokeOutcome, IdmPilotRunOutcome
+
 from src.benchmark.artifact_io import read_regular_file_no_follow
 from src.benchmark.backend_identity import canonical_json_bytes, quantize_six
 from src.benchmark.backend_registry import default_backend_registry
@@ -865,33 +870,30 @@ def _run_idm_comparison(run_path: Path, output_dir: Path) -> Path:
     return compare_oaf_idm(IdmComparisonRequest(run_path=run_path, output_dir=output_dir))
 
 
-def _idm_outcome_payload(outcome: object) -> dict[str, object]:
+def _build_idm_outcome_payload(outcome: IdmPilotRunOutcome) -> dict[str, object]:
     """Render one IDM runner outcome as JSON-safe values."""
-    native_failure_counts = getattr(outcome, "native_failure_counts", ())
-    aggregate_rtf = getattr(outcome, "aggregate_rtf", None)
-    projected_full_wall_time_sec = getattr(outcome, "projected_full_wall_time_sec", None)
     return {
-        "aggregate_rtf": None if aggregate_rtf is None else quantize_six(aggregate_rtf),
-        "failed_count": getattr(outcome, "failed_count", 0),
-        "native_failure_counts": dict(native_failure_counts or ()),
+        "aggregate_rtf": (
+            None if outcome.aggregate_rtf is None else quantize_six(outcome.aggregate_rtf)
+        ),
+        "failed_count": outcome.failed_count,
+        "native_failure_counts": dict(outcome.native_failure_counts or ()),
         "projected_full_wall_time_sec": (
             None
-            if projected_full_wall_time_sec is None
-            else quantize_six(projected_full_wall_time_sec)
+            if outcome.projected_full_wall_time_sec is None
+            else quantize_six(outcome.projected_full_wall_time_sec)
         ),
-        "quarantined_count": getattr(outcome, "quarantined_count", 0),
-        "reports_path": (
-            None if getattr(outcome, "reports_path", None) is None else str(outcome.reports_path)
-        ),
-        "run_id": getattr(outcome, "run_id", None),
-        "run_path": (None if getattr(outcome, "run_path", None) is None else str(outcome.run_path)),
-        "skipped_count": getattr(outcome, "skipped_count", 0),
-        "status": getattr(outcome, "overall_status", "failed"),
-        "success_count": getattr(outcome, "success_count", 0),
+        "quarantined_count": outcome.quarantined_count,
+        "reports_path": (None if outcome.reports_path is None else str(outcome.reports_path)),
+        "run_id": outcome.run_id,
+        "run_path": None if outcome.run_path is None else str(outcome.run_path),
+        "skipped_count": outcome.skipped_count,
+        "status": outcome.overall_status,
+        "success_count": outcome.success_count,
     }
 
 
-def _idm_smoke_payload(outcome: object) -> dict[str, object]:
+def _build_idm_smoke_payload(outcome: IdmFullMixSmokeOutcome) -> dict[str, object]:
     return {
         "exit_code": outcome.exit_code,
         "failed_count": outcome.failed_count,
@@ -914,13 +916,15 @@ def _emit_idm_pilot_summary(
     status: str,
     exit_code: int,
 ) -> None:
-    payload = _idm_outcome_payload(outcome)
+    payload = _build_idm_outcome_payload(outcome)  # type: ignore[arg-type]
     payload.update(
         {
             "comparison_error": comparison_error,
             "comparison_path": None if comparison_path is None else str(comparison_path),
             "exit_code": exit_code,
-            "smoke": None if smoke_outcome is None else _idm_smoke_payload(smoke_outcome),
+            "smoke": (
+                None if smoke_outcome is None else _build_idm_smoke_payload(smoke_outcome)  # type: ignore[arg-type]
+            ),
             "status": status,
         }
     )
@@ -929,7 +933,7 @@ def _emit_idm_pilot_summary(
     standard_output.flush()
 
 
-def _idm_fatal_outcome() -> object:
+def _build_idm_fatal_outcome() -> IdmPilotRunOutcome:
     from src.benchmark.idm_pilot_run import IdmPilotRunOutcome
 
     return IdmPilotRunOutcome(
@@ -945,7 +949,7 @@ def _idm_fatal_outcome() -> object:
     )
 
 
-def _idm_fatal_smoke_outcome() -> object:
+def _build_idm_fatal_smoke_outcome() -> IdmFullMixSmokeOutcome:
     from src.benchmark.idm_pilot_run import IdmFullMixSmokeOutcome
 
     return IdmFullMixSmokeOutcome(
@@ -1003,12 +1007,12 @@ def _execute_idm_pilot(
             crux_commit=crux_commit,
         )
     except (OSError, RuntimeError, TypeError, ValueError, subprocess.SubprocessError):
-        return _idm_fatal_outcome(), None, None, None, "failed", 2
+        return _build_idm_fatal_outcome(), None, None, None, "failed", 2
 
     try:
         outcome = run_idm_pilot(request)
     except (OSError, RuntimeError, TypeError, ValueError, subprocess.SubprocessError):
-        outcome = _idm_fatal_outcome()
+        outcome = _build_idm_fatal_outcome()
 
     comparison_path: Path | None = None
     comparison_error: str | None = None
@@ -1016,7 +1020,7 @@ def _execute_idm_pilot(
         try:
             comparison_path = _run_idm_comparison(outcome.run_path, output_dir / "comparison")
         except (OSError, RuntimeError, TypeError, ValueError) as error:
-            comparison_error = type(error).__name__
+            comparison_error = f"{type(error).__name__}: {error}"
 
     smoke_outcome: object | None = None
     if (
@@ -1041,7 +1045,7 @@ def _execute_idm_pilot(
                 )
             )
         except (OSError, RuntimeError, TypeError, ValueError, subprocess.SubprocessError):
-            smoke_outcome = _idm_fatal_smoke_outcome()
+            smoke_outcome = _build_idm_fatal_smoke_outcome()
 
     final_exit_code = outcome.exit_code
     final_status = outcome.overall_status

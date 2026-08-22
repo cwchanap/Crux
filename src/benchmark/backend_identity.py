@@ -53,7 +53,10 @@ MUSCRIPTOR_DESCRIPTOR_IDENTITIES = {
 }
 IDM_BACKEND_ID = "idm-44-train-kits-v1"
 IDM_DESCRIPTOR_SCHEMA = "crux.transcription-backend-descriptor/v2"
+IDM_RELEASE_COMMIT = "456656868538205ef756912c7cf5b0fd936de8af"
 IDM_NATIVE_METADATA_SCHEMA_ID = "idm-peak-event-metadata-v1"
+IDM_NATIVE_OUTPUT_SPACE_ID = "idm-44-train-kits-9class-v1"
+IDM_TRAINING_DATA_MAP_ID = "idm-training-contract-44-train-kits-v1"
 IDM_MODEL_ID_RE = re.compile(r"idm-44-train-kits-[0-9a-f]{12}-[0-9a-f]{12}\Z")
 IDM_DESCRIPTOR_KEYS = frozenset(OAF_DESCRIPTOR_KEYS)
 IDM_DESCRIPTOR_IDENTITIES = {
@@ -61,10 +64,10 @@ IDM_DESCRIPTOR_IDENTITIES = {
     "backend_id": IDM_BACKEND_ID,
     "descriptor_schema": IDM_DESCRIPTOR_SCHEMA,
     "native_metadata_schema_id": IDM_NATIVE_METADATA_SCHEMA_ID,
-    "native_output_space_id": "idm-44-train-kits-9class-v1",
+    "native_output_space_id": IDM_NATIVE_OUTPUT_SPACE_ID,
     "prediction_schema": "crux.drum-prediction-events/v2",
-    "training_data_map_id": "idm-training-contract-44-train-kits-v1",
-    "upstream_source_commit": "456656868538205ef756912c7cf5b0fd936de8af",
+    "training_data_map_id": IDM_TRAINING_DATA_MAP_ID,
+    "upstream_source_commit": IDM_RELEASE_COMMIT,
 }
 
 

@@ -31,15 +31,15 @@ SHIM_BUILD_SYSTEM = (
 )
 
 
-def _sha256_bytes(content: bytes) -> str:
+def calculate_sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def _sha256_file(path: Path) -> str:
-    return _sha256_bytes(path.read_bytes())
+def calculate_sha256_file(path: Path) -> str:
+    return calculate_sha256_bytes(path.read_bytes())
 
 
-def _git(source: Path, *args: str) -> str:
+def run_git(source: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", "-C", str(source), *args],
         check=True,
@@ -89,7 +89,7 @@ def _source_manifest(
         manifest.append(
             {
                 "path": relative.as_posix(),
-                "sha256": _sha256_bytes(content),
+                "sha256": calculate_sha256_bytes(content),
                 "byte_length": len(content),
             }
         )
@@ -120,7 +120,7 @@ def _verify_wheel_sources(
             verified.append(
                 {
                     "path": relative.as_posix(),
-                    "sha256": _sha256_bytes(source_bytes),
+                    "sha256": calculate_sha256_bytes(source_bytes),
                     "byte_length": len(source_bytes),
                 }
             )
@@ -171,22 +171,22 @@ def _build_wheel(source: Path, commit: str, wheel_output: Path) -> tuple[Path, s
         wheel_path = wheels[0]
         wheel_output.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(wheel_path, wheel_output)
-        return wheel_output, _sha256_file(wheel_output)
+        return wheel_output, calculate_sha256_file(wheel_output)
 
 
-def _uv_version() -> str:
+def get_uv_version() -> str:
     uv = shutil.which("uv")
     if uv is None:
         raise RuntimeError("uv is required to build the pinned wheel")
     return subprocess.check_output([uv, "--version"], text=True).strip()
 
 
-def build(source: Path, wheel_output: Path, provenance_output: Path) -> None:
+def build_pinned_wheel(source: Path, wheel_output: Path, provenance_output: Path) -> None:
     source = source.resolve()
     wheel_output = wheel_output.resolve()
     provenance_output = provenance_output.resolve()
 
-    actual_commit = _git(source, "rev-parse", "HEAD")
+    actual_commit = run_git(source, "rev-parse", "HEAD")
     if actual_commit != UPSTREAM_COMMIT:
         raise RuntimeError(
             f"source commit mismatch: expected {UPSTREAM_COMMIT}, got {actual_commit}"
@@ -207,19 +207,19 @@ def build(source: Path, wheel_output: Path, provenance_output: Path) -> None:
         "source_commit": actual_commit,
         "package_name": EXPECTED_PACKAGE,
         "package_version": EXPECTED_VERSION,
-        "original_pyproject_sha256": _sha256_bytes(original_pyproject),
+        "original_pyproject_sha256": calculate_sha256_bytes(original_pyproject),
         "original_pyproject_byte_length": len(original_pyproject),
         "shim": {
             "build_system": {
                 "requires": [POETRY_CORE_REQUIREMENT],
                 "build_backend": "poetry.core.masonry.api",
             },
-            "metadata_sha256": _sha256_bytes(
+            "metadata_sha256": calculate_sha256_bytes(
                 original_pyproject.rstrip() + b"\n\n" + SHIM_BUILD_SYSTEM.encode("utf-8")
             ),
         },
         "builder": {
-            "uv": _uv_version(),
+            "uv": get_uv_version(),
             "python": "3.11",
             "source_date_epoch": 0,
         },
@@ -254,7 +254,7 @@ def main() -> None:
     parser.add_argument("--wheel-output", type=Path, required=True)
     parser.add_argument("--provenance-output", type=Path, required=True)
     arguments = parser.parse_args()
-    build(arguments.source, arguments.wheel_output, arguments.provenance_output)
+    build_pinned_wheel(arguments.source, arguments.wheel_output, arguments.provenance_output)
 
 
 if __name__ == "__main__":
