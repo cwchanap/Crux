@@ -79,12 +79,15 @@ RuntimeSync = Callable[[Path, Path], None]
 
 
 def _default_runtime_sync(runtime_root: Path, runtime_python: Path) -> None:
-    """Materialize and verify the isolated runtime from the frozen uv.lock.
+    """Materialize or reconcile the isolated runtime from the frozen uv.lock.
 
-    Runs ``uv sync --project <runtime_root> --frozen --offline`` first so a
-    fresh checkout can bootstrap ``<runtime_root>/.venv``, then verifies that
-    the created venv python sits at the expected path.  Raises ``RuntimeError``
-    on any failure (missing ``uv``, non-zero exit, timeout, wrong venv path).
+    Runs ``uv sync --project <runtime_root> --frozen``.  When the project venv
+    already exists the sync stays ``--offline``, verifying/reconciling strictly
+    from the local uv cache; on a fresh checkout (no venv) the sync may reach
+    the registry to materialize ``<runtime_root>/.venv`` from the frozen lock.
+    Then verifies that the venv python sits at the expected path.  Raises
+    ``RuntimeError`` on any failure (missing ``uv``, non-zero exit, timeout,
+    wrong venv path).
 
     The venv-path guard compares lexically rather than via ``resolve()``: uv
     symlinks ``.venv/bin/python`` to the underlying base/managed interpreter,
@@ -102,9 +105,14 @@ def _default_runtime_sync(runtime_root: Path, runtime_python: Path) -> None:
         raise RuntimeError("uv is not available on PATH")
     sync_env = dict(os.environ)
     sync_env.pop("UV_PROJECT_ENVIRONMENT", None)
+    offline = expected_python.exists()
+    sync_label = "uv sync --frozen --offline" if offline else "uv sync --frozen"
+    command = [uv_binary, "sync", "--project", os.fspath(runtime_root), "--frozen"]
+    if offline:
+        command.append("--offline")
     try:
         subprocess.run(
-            [uv_binary, "sync", "--project", os.fspath(runtime_root), "--frozen", "--offline"],
+            command,
             check=True,
             capture_output=True,
             text=True,
@@ -112,13 +120,13 @@ def _default_runtime_sync(runtime_root: Path, runtime_python: Path) -> None:
             timeout=IDM_RUNTIME_SYNC_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as error:
-        raise RuntimeError("uv sync --frozen --offline timed out") from error
+        raise RuntimeError(f"{sync_label} timed out") from error
     except subprocess.CalledProcessError as error:
         stderr = (error.stderr or "").strip()
         suffix = f": {stderr}" if stderr else ""
-        raise RuntimeError(f"uv sync --frozen --offline failed{suffix}") from error
+        raise RuntimeError(f"{sync_label} failed{suffix}") from error
     except OSError as error:
-        raise RuntimeError("uv sync --frozen --offline failed") from error
+        raise RuntimeError(f"{sync_label} failed") from error
     if not runtime_python.exists() or not expected_python.exists():
         raise RuntimeError("runtime python is unavailable")
 
@@ -270,7 +278,7 @@ class IdmBackend:
         except Exception as error:
             self._poisoned = True
             raise IdmBackendError(
-                "IDM runtime environment does not match the frozen uv.lock",
+                f"IDM runtime environment does not match the frozen uv.lock: {error}",
                 code="runtime_artifact_invalid",
             ) from error
         site_packages = _runtime_site_packages(self._runtime_python, self._lock)

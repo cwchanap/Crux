@@ -752,6 +752,40 @@ def test_idm_backend_poisons_on_runtime_sync_failure(tmp_path: Path) -> None:
     assert again.value.code == "worker_protocol_failed"
 
 
+def test_idm_backend_preserves_uv_stderr_through_runtime_sync_wrapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """uv stderr captured by _default_runtime_sync must survive _ensure_process()'s wrap."""
+    artifact_root, model_root = _copy_attested_runtime(tmp_path)
+    worker = _FakeWorker(_ready(), {"id": "request", "events": []})
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/uv")
+
+    def failing_run(*args: object, **_kwargs: object) -> subprocess.CompletedProcess:
+        raise subprocess.CalledProcessError(1, args[0], stderr="boom diagnostic")
+
+    monkeypatch.setattr(subprocess, "run", failing_run)
+
+    backend = _backend(
+        tmp_path,
+        worker,
+        calls,
+        artifact_root=artifact_root,
+        model_root=model_root,
+        runtime_sync=lambda root, _python: _default_runtime_sync(
+            root, root / ".venv" / "bin" / "python"
+        ),
+    )
+
+    with pytest.raises(IdmBackendError) as raised:
+        backend.transcribe(_audio(tmp_path / "input"))
+
+    assert raised.value.code == "runtime_artifact_invalid"
+    assert "boom diagnostic" in str(raised.value)
+    assert calls == []
+
+
 def test_idm_backend_binds_worker_import_to_attested_wheel_path(tmp_path: Path) -> None:
     artifact_root, model_root = _copy_attested_runtime(tmp_path)
     worker = _FakeWorker(_ready(), {"id": "request", "events": []})
@@ -1677,22 +1711,25 @@ def test_default_runtime_sync_succeeds_when_venv_matches_and_uv_syncs(
 
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/uv")
 
-    captured: list[list[str]] = []
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda *args, **kwargs: captured.append(args[0])
-        or subprocess.CompletedProcess(args=args[0], returncode=0),
-    )
+    captured_commands: list[list[str]] = []
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+        assert kwargs.get("timeout") is not None, "uv sync must be bounded by a timeout"
+        command = args[0]
+        assert isinstance(command, list)
+        captured_commands.append(command)
+        return subprocess.CompletedProcess(args=command, returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
 
     _default_runtime_sync(runtime_root, venv_python)
 
-    assert len(captured) == 1
-    assert captured[0][0] == "/usr/local/bin/uv"
-    assert "--project" in captured[0]
-    assert str(runtime_root) in captured[0]
-    assert "--frozen" in captured[0]
-    assert "--offline" in captured[0]
+    assert len(captured_commands) == 1
+    assert captured_commands[0][0] == "/usr/local/bin/uv"
+    assert "--project" in captured_commands[0]
+    assert str(runtime_root) in captured_commands[0]
+    assert "--frozen" in captured_commands[0]
+    assert "--offline" in captured_commands[0]
 
 
 def test_default_runtime_sync_rejects_unresolvable_runtime_python(
@@ -1828,10 +1865,10 @@ def test_default_runtime_sync_rejects_symlink_resolved_base_interpreter(
         _default_runtime_sync(runtime_root, base_interpreter)
 
 
-def test_default_runtime_sync_materializes_venv_on_first_setup(
+def test_default_runtime_sync_bootstraps_fresh_checkout_without_offline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A fresh checkout with no venv must bootstrap it via uv sync, not fail early."""
+    """A fresh checkout has no venv and no cache guarantee, so first sync drops --offline."""
     runtime_root = tmp_path / "runtime"
     runtime_root.mkdir()
     venv_python = runtime_root / ".venv" / "bin" / "python"
@@ -1840,9 +1877,13 @@ def test_default_runtime_sync_materializes_venv_on_first_setup(
 
     def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
         assert kwargs.get("timeout") is not None, "uv sync must be bounded by a timeout"
+        command = args[0]
+        assert isinstance(command, list)
+        assert "--frozen" in command
+        assert "--offline" not in command
         venv_python.parent.mkdir(parents=True, exist_ok=True)
         venv_python.write_text("#!/bin/sh\n", encoding="utf-8")
-        return subprocess.CompletedProcess(args=args[0], returncode=0)
+        return subprocess.CompletedProcess(args=command, returncode=0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
