@@ -83,24 +83,32 @@ def _default_runtime_sync(runtime_root: Path, runtime_python: Path) -> None:
     Runs ``uv sync --project <runtime_root> --frozen --offline`` so the venv
     matches the attested lock exactly.  Raises ``RuntimeError`` on any failure
     (missing ``uv``, non-zero exit, wrong venv path).
+
+    The venv-path guard compares lexically rather than via ``resolve()``: uv
+    symlinks ``.venv/bin/python`` to the underlying base/managed interpreter,
+    so a resolve()-based equality would accept that base interpreter directly
+    and let the worker import packages from the wrong environment.  The
+    subprocess environment is also sanitized to drop ``UV_PROJECT_ENVIRONMENT``,
+    which would otherwise redirect ``uv sync`` away from
+    ``<runtime_root>/.venv`` even when ``--project`` targets ``runtime_root``.
     """
     expected_python = runtime_root / ".venv" / "bin" / "python"
-    try:
-        resolved_runtime = runtime_python.resolve(strict=True)
-        resolved_expected = expected_python.resolve(strict=True)
-    except OSError as error:
-        raise RuntimeError("runtime python is unavailable") from error
-    if resolved_runtime != resolved_expected:
+    if not runtime_python.exists() or not expected_python.exists():
+        raise RuntimeError("runtime python is unavailable")
+    if runtime_python != expected_python:
         raise RuntimeError("runtime python must point to the locked project venv")
     uv_binary = shutil.which("uv")
     if uv_binary is None:
         raise RuntimeError("uv is not available on PATH")
+    sync_env = dict(os.environ)
+    sync_env.pop("UV_PROJECT_ENVIRONMENT", None)
     try:
         subprocess.run(
             [uv_binary, "sync", "--project", os.fspath(runtime_root), "--frozen", "--offline"],
             check=True,
             capture_output=True,
             text=True,
+            env=sync_env,
         )
     except (OSError, subprocess.CalledProcessError) as error:
         raise RuntimeError("uv sync --frozen --offline failed") from error

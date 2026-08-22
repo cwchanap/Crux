@@ -1777,3 +1777,49 @@ def test_default_runtime_sync_rejects_uv_sync_oserror(
 
     with pytest.raises(RuntimeError, match="uv sync --frozen --offline failed"):
         _default_runtime_sync(runtime_root, venv_python)
+
+
+def test_default_runtime_sync_strips_uv_project_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """UV_PROJECT_ENVIRONMENT must not redirect the frozen sync to another env."""
+    runtime_root = tmp_path / "runtime"
+    venv_python = runtime_root / ".venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/uv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", str(tmp_path / "other-env"))
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+        env = kwargs.get("env")
+        assert isinstance(env, dict)
+        assert "UV_PROJECT_ENVIRONMENT" not in env
+        return subprocess.CompletedProcess(args=args[0], returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    _default_runtime_sync(runtime_root, venv_python)
+
+
+def test_default_runtime_sync_rejects_symlink_resolved_base_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resolve()-equivalent base interpreter must not pass the lexical guard.
+
+    uv symlinks ``.venv/bin/python`` to the underlying managed interpreter; the
+    guard must compare lexically so a caller cannot pass that base interpreter
+    directly and have the worker derive site-packages from the wrong root.
+    """
+    runtime_root = tmp_path / "runtime"
+    venv_python = runtime_root / ".venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    # Create the venv python as a symlink to a base interpreter, mirroring uv.
+    base_interpreter = tmp_path / "base-python"
+    base_interpreter.write_text("#!/bin/sh\n", encoding="utf-8")
+    venv_python.symlink_to(base_interpreter)
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/uv")
+
+    with pytest.raises(RuntimeError, match="runtime python must point to the locked project venv"):
+        _default_runtime_sync(runtime_root, base_interpreter)
