@@ -521,7 +521,7 @@ def _validate_idm_metadata(metadata: Mapping[str, str | None]) -> dict[str, str 
         raise PredictionArtifactError("idm_native_metadata native_velocity is invalid") from None
     if not value.is_finite() or value < 0 or value > _IDM_NATIVE_VELOCITY_MAX:
         raise PredictionArtifactError("idm_native_metadata native_velocity is invalid")
-    canonical = format(quantized, "f").rstrip("0").rstrip(".") or "0"
+    canonical = format(abs(quantized), "f").rstrip("0").rstrip(".") or "0"
     if value != quantized or native_velocity != canonical:
         raise PredictionArtifactError("idm_native_metadata native_velocity is invalid")
     return {"frame_index": frame_index, "native_velocity": native_velocity}

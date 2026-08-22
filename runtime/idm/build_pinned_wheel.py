@@ -127,11 +127,7 @@ def _verify_wheel_sources(
     return verified
 
 
-def _build_wheel(source: Path, commit: str, wheel_output: Path) -> tuple[Path, str]:
-    uv = shutil.which("uv")
-    if uv is None:
-        raise RuntimeError("uv is required to build the pinned wheel")
-
+def _build_wheel(source: Path, commit: str, wheel_output: Path, uv: str) -> tuple[Path, str]:
     with tempfile.TemporaryDirectory(prefix="crux-idm-wheel-") as temporary:
         temporary_path = Path(temporary)
         build_source = temporary_path / "source"
@@ -174,10 +170,7 @@ def _build_wheel(source: Path, commit: str, wheel_output: Path) -> tuple[Path, s
         return wheel_output, calculate_sha256_file(wheel_output)
 
 
-def get_uv_version() -> str:
-    uv = shutil.which("uv")
-    if uv is None:
-        raise RuntimeError("uv is required to build the pinned wheel")
+def get_uv_version(uv: str) -> str:
     return subprocess.check_output([uv, "--version"], text=True).strip()
 
 
@@ -198,7 +191,11 @@ def build_pinned_wheel(source: Path, wheel_output: Path, provenance_output: Path
     tracked = _commit_files(source, actual_commit)
     source_manifest = _source_manifest(source, actual_commit, tracked)
 
-    built_wheel, wheel_sha256 = _build_wheel(source, actual_commit, wheel_output)
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError("uv is required to build the pinned wheel")
+
+    built_wheel, wheel_sha256 = _build_wheel(source, actual_commit, wheel_output, uv)
     packaged_idm_files = _verify_wheel_sources(built_wheel, source, actual_commit, tracked)
 
     provenance = {
@@ -219,7 +216,7 @@ def build_pinned_wheel(source: Path, wheel_output: Path, provenance_output: Path
             ),
         },
         "builder": {
-            "uv": get_uv_version(),
+            "uv": get_uv_version(uv),
             "python": "3.11",
             "source_date_epoch": 0,
         },

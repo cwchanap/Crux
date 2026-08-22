@@ -338,6 +338,15 @@ def test_muscriptor_prediction_rejects_native_event_invariant_violations(
             },
             "idm_native_metadata",
         ),
+        (
+            {
+                "native_metadata": {
+                    "frame_index": "215",
+                    "native_velocity": "-0",
+                }
+            },
+            "idm_native_metadata",
+        ),
     ],
 )
 def test_idm_prediction_rejects_native_event_invariant_violations(

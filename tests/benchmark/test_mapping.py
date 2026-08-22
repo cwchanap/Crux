@@ -3,7 +3,6 @@ from pathlib import Path
 
 import pytest
 
-from src.benchmark import mapping, taxonomy
 from src.benchmark.backend_identity import build_descriptor
 from src.benchmark.backends import CanonicalAudio, NativeEvent, NativePrediction
 from src.benchmark.mapping import (
@@ -11,12 +10,17 @@ from src.benchmark.mapping import (
     DTX_LANE_MAP,
     MUSCRIPTOR_PREDICTION_MAP,
     map_dtx_events,
+    map_idm_prediction,
     map_midi_events,
     map_muscriptor_prediction,
 )
 from src.benchmark.models import BenchmarkEvent
 from src.benchmark.prediction_artifact import read_prediction_artifact, render_prediction_artifact
-from src.benchmark.taxonomy import MUSCRIPTOR_PREDICTION_MAP_ID, ClassMapping
+from src.benchmark.taxonomy import (
+    IDM_PREDICTION_MAP,
+    MUSCRIPTOR_PREDICTION_MAP_ID,
+    ClassMapping,
+)
 
 IDM_BACKEND_ID = "idm-44-train-kits-v1"
 IDM_DESCRIPTOR_SCHEMA = "crux.transcription-backend-descriptor/v2"
@@ -249,8 +253,7 @@ def test_map_muscriptor_prediction_rejects_identity_mismatch(change: dict[str, s
 
 
 def test_idm_prediction_map_uses_native_class_ids_for_all_fixed_classes_and_unmapped_evidence():
-    prediction_map = getattr(taxonomy, "IDM_PREDICTION_MAP", None)
-    assert prediction_map is not None
+    prediction_map = IDM_PREDICTION_MAP
     assert prediction_map.map_id == IDM_PREDICTION_MAP_ID
     assert prediction_map.classes["TT_LMT"] == ClassMapping(None, "tom")
 
@@ -266,8 +269,6 @@ def test_idm_prediction_map_uses_native_class_ids_for_all_fixed_classes_and_unma
         "TT_HFT",
         "UNEXPECTED",
     )
-    map_idm_prediction = getattr(mapping, "map_idm_prediction", None)
-    assert callable(map_idm_prediction)
     mapped, diagnostics = map_idm_prediction(build_idm_prediction(native_classes), prediction_map)
 
     assert [(event.canonical_class, event.common_class) for event in mapped.events] == [
@@ -306,9 +307,6 @@ def test_idm_prediction_map_uses_native_class_ids_for_all_fixed_classes_and_unma
     ],
 )
 def test_map_idm_prediction_rejects_identity_mismatch(change: dict[str, str]):
-    prediction_map = getattr(taxonomy, "IDM_PREDICTION_MAP", None)
-    map_idm_prediction = getattr(mapping, "map_idm_prediction", None)
-    assert callable(map_idm_prediction)
     prediction = build_idm_prediction(("KD",))
     descriptor = replace(
         prediction.descriptor,
@@ -316,4 +314,4 @@ def test_map_idm_prediction_rejects_identity_mismatch(change: dict[str, str]):
     )
 
     with pytest.raises(ValueError):
-        map_idm_prediction(replace(prediction, descriptor=descriptor), prediction_map)
+        map_idm_prediction(replace(prediction, descriptor=descriptor), IDM_PREDICTION_MAP)

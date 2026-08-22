@@ -41,6 +41,9 @@ from src.benchmark.idm_model import (
 )
 
 _REVISION_RE = re.compile(r"[0-9a-f]{40}\Z")
+# ponytail: one ceiling for all freeze subprocesses; split per-command if a cold
+# torch import in _resolve_device ever needs longer than 60 seconds.
+_SUBPROCESS_TIMEOUT_SECONDS = 60.0
 _LICENSE_NOTE = (
     "No separate checkpoint notice exists in the pinned repository; this records repository-level "
     "provenance and is not an independent legal conclusion."
@@ -176,8 +179,9 @@ def _verify_source_revision(source_root: Path) -> str:
             ["git", "-C", str(source_root), "rev-parse", "HEAD"],
             stderr=subprocess.STDOUT,
             text=True,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
         ).strip()
-    except (OSError, subprocess.CalledProcessError) as error:
+    except (OSError, subprocess.SubprocessError) as error:
         raise FreezeError("pinned source revision is unavailable") from error
     if _REVISION_RE.fullmatch(revision) is None or revision != IDM_RELEASE_COMMIT:
         raise FreezeError(
@@ -279,8 +283,9 @@ def _resolve_device(requested: str, runtime_python: Path) -> str:
             [str(runtime_python), "-c", probe],
             stderr=subprocess.STDOUT,
             text=True,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
         ).strip()
-    except (OSError, subprocess.CalledProcessError) as error:
+    except (OSError, subprocess.SubprocessError) as error:
         raise FreezeError("runtime device feasibility probe failed") from error
     if selected != "cpu":
         raise FreezeError("IDM KISS runtime supports only CPU")
@@ -299,8 +304,9 @@ def _runtime_python_version(runtime_python: Path) -> str:
             [str(runtime_python), "--version"],
             stderr=subprocess.STDOUT,
             text=True,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
         ).strip()
-    except (OSError, subprocess.CalledProcessError) as error:
+    except (OSError, subprocess.SubprocessError) as error:
         raise FreezeError("isolated runtime Python is unavailable") from error
     match = re.search(r"Python (3\.11\.[0-9]+)\Z", output)
     if match is None:
@@ -320,8 +326,9 @@ def _read_git_blob(source_root: Path, revision: str, relative_path: str) -> byte
         return subprocess.check_output(
             ["git", "-C", str(source_root), "show", f"{revision}:{relative_path}"],
             stderr=subprocess.STDOUT,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.CalledProcessError) as error:
+    except (OSError, subprocess.SubprocessError) as error:
         raise FreezeError(f"pinned source file is unavailable: {relative_path}") from error
 
 

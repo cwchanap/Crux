@@ -51,7 +51,9 @@ def _write_idm_wheel(builder: ModuleType, path: Path, repo: Path, commit: str) -
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as wheel:
         for relative in tracked:
             if relative.parts[0] == "idm":
-                wheel.writestr(relative.as_posix(), builder._commit_blob(repo, commit, relative))
+                info = zipfile.ZipInfo(relative.as_posix(), date_time=(1980, 1, 1, 0, 0, 0))
+                info.compress_type = zipfile.ZIP_DEFLATED
+                wheel.writestr(info, builder._commit_blob(repo, commit, relative))
 
 
 def test_commit_blobs_ignore_staged_and_unstaged_source_edits(tmp_path: Path) -> None:
@@ -85,6 +87,8 @@ def test_commit_blobs_ignore_staged_and_unstaged_source_edits(tmp_path: Path) ->
     assert second_tree.joinpath("idm", "__init__.py").read_text() == "VALUE = 'committed'\n"
     assert second_manifest == original_manifest
     assert second_verified == first_verified
+    with zipfile.ZipFile(first_wheel) as wheel:
+        assert wheel.getinfo("idm/__init__.py").date_time == (1980, 1, 1, 0, 0, 0)
     assert second_wheel.read_bytes() == first_wheel.read_bytes()
 
     tampered_wheel = tmp_path / "tampered.whl"
@@ -92,3 +96,16 @@ def test_commit_blobs_ignore_staged_and_unstaged_source_edits(tmp_path: Path) ->
         wheel.writestr("idm/__init__.py", module.read_bytes())
     with pytest.raises(RuntimeError, match="wheel source bytes differ"):
         builder._verify_wheel_sources(tampered_wheel, repo, commit, tracked)
+
+
+def test_get_uv_version_reports_the_provided_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    builder = _load_builder()
+    calls: list[list[str]] = []
+
+    def fake_check_output(argv: list[str], **_kwargs: object) -> str:
+        calls.append(list(argv))
+        return "uv 9.9.9\n"
+
+    monkeypatch.setattr(builder.subprocess, "check_output", fake_check_output)
+    assert builder.get_uv_version("/resolved/uv") == "uv 9.9.9"
+    assert calls == [["/resolved/uv", "--version"]]
