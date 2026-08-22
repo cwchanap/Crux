@@ -23,6 +23,7 @@ from src.benchmark.backends.idm import (
     IdmBackendError,
     _attest_runtime_artifacts,
     _decode_native_event,
+    _default_runtime_sync,
     _isolated_worker_environment,
     _raise_worker_error,
     _validate_descriptor,
@@ -1666,3 +1667,113 @@ def test_validate_wheel_provenance_rejects_inventory_names_mismatch() -> None:
     content = (json.dumps(provenance) + "\n").encode("utf-8")
     with pytest.raises(ValueError, match="package inventory does not match"):
         _validate_wheel_provenance(content, WHEEL_NAME, wheel_bytes, "a" * 64, lock)
+
+
+# --- _default_runtime_sync ---
+
+
+def test_default_runtime_sync_succeeds_when_venv_matches_and_uv_syncs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    venv_python = runtime_root / ".venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/uv")
+
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: captured.append(args[0])
+        or subprocess.CompletedProcess(args=args[0], returncode=0),
+    )
+
+    _default_runtime_sync(runtime_root, venv_python)
+
+    assert len(captured) == 1
+    assert captured[0][0] == "/usr/local/bin/uv"
+    assert "--project" in captured[0]
+    assert str(runtime_root) in captured[0]
+    assert "--frozen" in captured[0]
+    assert "--offline" in captured[0]
+
+
+def test_default_runtime_sync_rejects_unresolvable_runtime_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    runtime_python = tmp_path / "nonexistent" / "python"
+
+    with pytest.raises(RuntimeError, match="runtime python is unavailable"):
+        _default_runtime_sync(runtime_root, runtime_python)
+
+
+def test_default_runtime_sync_rejects_mismatched_venv_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    expected = runtime_root / ".venv" / "bin" / "python"
+    expected.parent.mkdir(parents=True)
+    expected.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    other = tmp_path / "other-venv" / "bin" / "python"
+    other.parent.mkdir(parents=True)
+    other.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="runtime python must point to the locked project venv"):
+        _default_runtime_sync(runtime_root, other)
+
+
+def test_default_runtime_sync_rejects_missing_uv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    venv_python = runtime_root / ".venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+
+    with pytest.raises(RuntimeError, match="uv is not available on PATH"):
+        _default_runtime_sync(runtime_root, venv_python)
+
+
+def test_default_runtime_sync_rejects_uv_sync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    venv_python = runtime_root / ".venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/uv")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.CalledProcessError(1, args[0])),
+    )
+
+    with pytest.raises(RuntimeError, match="uv sync --frozen --offline failed"):
+        _default_runtime_sync(runtime_root, venv_python)
+
+
+def test_default_runtime_sync_rejects_uv_sync_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    venv_python = runtime_root / ".venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/uv")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("spawn failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="uv sync --frozen --offline failed"):
+        _default_runtime_sync(runtime_root, venv_python)
