@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -109,11 +110,25 @@ def test_cross_comparison_artifact_index_rejects_directory_walk_error(
 ) -> None:
     stage = _artifact_stage(tmp_path, "oaf_muscriptor_full_mix")
 
-    def fail_rglob(_path: Path, _pattern: str):
-        raise OSError("walk denied")
+    def fail_walk(_root, onerror=None):
+        if onerror is not None:
+            onerror(OSError("walk denied"))
+        raise AssertionError("os.walk must surface failures through onerror")
 
-    monkeypatch.setattr(cross_comparison.Path, "rglob", fail_rglob)
+    monkeypatch.setattr(cross_comparison.os, "walk", fail_walk)
     with pytest.raises(ComparisonIntegrityError, match="cannot inspect comparison artifacts"):
+        cross_comparison._artifact_index(stage, "oaf_muscriptor_full_mix")
+
+
+def test_cross_comparison_artifact_index_rejects_symlinked_directory(
+    tmp_path: Path,
+) -> None:
+    if not hasattr(os, "symlink"):
+        pytest.skip("symlinks unavailable")
+    stage = _artifact_stage(tmp_path, "oaf_muscriptor_full_mix")
+    (stage / "intruder").symlink_to(stage)
+
+    with pytest.raises(ComparisonIntegrityError, match="unexpected comparison artifact"):
         cross_comparison._artifact_index(stage, "oaf_muscriptor_full_mix")
 
 

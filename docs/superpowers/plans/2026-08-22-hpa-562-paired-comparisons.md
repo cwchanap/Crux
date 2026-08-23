@@ -6,7 +6,9 @@
 
 **Architecture:** Keep the three existing pairwise comparison drivers authoritative. Add one concrete `cross_comparison.py` coordinator that stages those outputs, validates shared reference/scoring identity plus the frozen OaF model lock, verifies a closed nested-artifact contract, and publishes only a top-level index/matrix. MuScriptor stays broad with `subset_manifest_path=None`; separation owns the supplied HPA-327 subset identity; IDM remains pilot-scoped by its validated HPA-396 run without adding another HPA-328 handoff input.
 
-**Tech Stack:** Python 3.12, dataclasses, `pathlib`, existing strict/canonical JSON and SHA-256 helpers, Click, pytest, pytest-cov.
+**Tech Stack:** Python 3.12, dataclasses, `pathlib`, existing strict/canonical JSON and SHA-256 helpers, Click (>=8.2; the CLI tests assert on `CliRunner`'s separately captured stderr), pytest, pytest-cov.
+
+> Python-version note: this plan pins 3.12 to match `pyproject.toml` (`requires-python = "==3.12.*"`), the ruff/black/pylint `py312` targets, and CI's `python-version: '3.12'`. AGENTS.md's "Python 3.13" prose is stale and is intentionally not touched by this one-ticket PR.
 
 **Spec:** `docs/superpowers/specs/2026-08-22-hpa-562-paired-comparisons-design.md`
 
@@ -229,6 +231,8 @@ class CrossComparisonOutcome:
     pairable_success_counts: dict[str, int]
 ```
 
+Both frozen dataclasses enforce these constraints at the runtime boundary in `__post_init__`: Path-only request fields, `separation_cache_dir` as `Path | None`, non-empty comparison paths keyed by non-empty strings, and counts that are non-negative `int`s with `bool` rejected. Step 1 pins each constraint with direct `TypeError`/`ValueError` tests.
+
 - [ ] **Step 1: Write request/outcome validation tests**
 
 Pin Path-only request fields, optional `separation_cache_dir`, non-empty comparison paths, and non-negative integer counts. Reject booleans as counts.
@@ -352,13 +356,15 @@ For each field, require a non-empty value and exact equality. Raise `ComparisonI
 
 - [ ] **Step 7: Implement frozen OaF lock and HTDemucs-view checks**
 
-Load exact model entries:
+Load exact model entries through a safe accessor so missing or malformed nested entries raise `ComparisonIntegrityError` instead of leaking `KeyError`:
 
 ```python
-muscriptor_oaf = muscriptor_summary["models"]["oaf"]
-separation_full_mix = separation_summary["models"]["full_mix"]
-idm_oaf = idm_summary["models"]["oaf"]
+muscriptor_oaf = _model(muscriptor_summary, "oaf")
+separation_full_mix = _model(separation_summary, "full_mix")
+idm_oaf = _model(idm_summary, "oaf")
 ```
+
+`_model(summary, key)` requires `summary["models"]` to be a mapping and the entry itself to be a mapping, raising `ComparisonIntegrityError("comparison summary models[...] is malformed")` otherwise.
 
 Require all three `model_lock_sha256` values to be valid SHA-256 strings and equal. Then require:
 
@@ -403,7 +409,7 @@ def test_cross_publication_rejects_shared_identity_mismatch(..., field: str) -> 
     assert not request.output_dir.exists()
 ```
 
-Add separate tests for malformed/mismatched OaF `model_lock_sha256`, mismatched HTDemucs `input_view_id`, malformed nested `models` mappings, and an existing final output directory. Every failure leaves no final HPA-562 bundle.
+Add separate tests for malformed/mismatched OaF `model_lock_sha256`, mismatched HTDemucs `input_view_id`, malformed nested `models` mappings (including valid mappings whose required model keys are absent), and an existing final output directory. Every failure leaves no final HPA-562 bundle, so the CLI emits its canonical exit-2 integrity payload.
 
 - [ ] **Step 9: Run the focused suite GREEN**
 
@@ -935,10 +941,11 @@ Expected: PASS.
 
 `codecov.yml` has a blocking 90% patch target with zero threshold. Run a focused module gate:
 
+`pytest.ini` sets a global `addopts = --cov=src`; override it so coverage scopes to the coordinator module instead of accumulating over the whole tree:
+
 ```bash
-uv run pytest tests/benchmark/test_cross_comparison.py -q \
-  --cov=src.benchmark.cross_comparison \
-  --cov-report=term-missing \
+uv run pytest tests/benchmark/test_cross_comparison.py tests/benchmark/test_cross_comparison_coverage.py -q \
+  -o addopts="--cov=src.benchmark.cross_comparison --cov-report=term-missing" \
   --cov-fail-under=90
 ```
 
@@ -1015,38 +1022,151 @@ If any production input is missing, do not substitute fixture evidence. Keep HPA
 
 - [ ] **Step 7: Validate the production bundle before closing HPA-562**
 
+Enforce the complete documented bundle contract with strict canonical JSON parsing, reusing the production validation helpers:
+
 ```bash
-python - <<'PY'
+uv run python - <<'PY'
 import csv
-import json
 import os
 from pathlib import Path
 
+from src.benchmark.artifact_io import read_regular_file_no_follow
+from src.benchmark.backend_identity import require_sha256, sha256_hex, strict_json_loads
+from src.benchmark.cross_comparison import PAIRED_BENCHMARK_PUBLICATION_SCHEMA
+from src.benchmark.idm_comparison import IDM_COMPARISON_SCHEMA
+from src.benchmark.muscriptor_comparison import COMPARISON_SCHEMA
+from src.benchmark.separation_comparison import SEPARATION_COMPARISON_SCHEMA
+
 root = Path(os.environ["HPA562_OUTPUT_DIR"])
-summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
-assert summary["schema"] == "crux.paired-benchmark-publication/v1"
+shared_fields = (
+    "reference_manifest_sha256",
+    "reference_manifest_version",
+    "reference_timing_manifest_sha256",
+    "reference_timing_version",
+    "taxonomy_version",
+    "lane_map_version",
+    "scoring_version",
+)
+comparisons = {
+    "oaf_muscriptor_full_mix": (
+        "comparisons/oaf-muscriptor",
+        COMPARISON_SCHEMA,
+        ("summary.json", "summary.md", "paired_per_song.csv", "paired_per_class.csv"),
+    ),
+    "oaf_separation_pilot": (
+        "comparisons/oaf-separation",
+        SEPARATION_COMPARISON_SCHEMA,
+        (
+            "summary.json",
+            "summary.md",
+            "spleeter/paired_per_song.csv",
+            "spleeter/paired_per_class.csv",
+            "htdemucs/paired_per_song.csv",
+            "htdemucs/paired_per_class.csv",
+        ),
+    ),
+    "oaf_idm_htdemucs": (
+        "comparisons/oaf-idm",
+        IDM_COMPARISON_SCHEMA,
+        ("summary.json", "summary.md", "paired_per_song.csv", "paired_per_class.csv"),
+    ),
+}
+
+
+def load(path):
+    return strict_json_loads(read_regular_file_no_follow(path), require_canonical=True)
+
+
+def safe(relative):
+    candidate = Path(relative)
+    assert not candidate.is_absolute() and ".." not in candidate.parts, relative
+    return root / candidate
+
+
+def with_parents(relative):
+    parts = Path(relative).parts
+    return {"/".join(parts[: index + 1]) for index in range(len(parts))}
+
+
+expected_entries = {
+    entry for name in ("summary.json", "summary.md", "headline_matrix.csv")
+    for entry in with_parents(name)
+}
+for comparison_dir, _schema, artifacts in comparisons.values():
+    for artifact in artifacts:
+        expected_entries |= with_parents(f"{comparison_dir}/{artifact}")
+
+seen_files = set()
+seen_dirs = set()
+for current, dirnames, filenames in os.walk(root):
+    base = Path(current)
+    for name in dirnames:
+        target = seen_dirs if not (base / name).is_symlink() else seen_files
+        target.add((base / name).relative_to(root).as_posix())
+    for name in filenames:
+        seen_files.add((base / name).relative_to(root).as_posix())
+assert seen_files | seen_dirs == expected_entries, (
+    f"bundle entries diverge from contract: "
+    f"missing={sorted(expected_entries - (seen_files | seen_dirs))} "
+    f"unexpected={sorted((seen_files | seen_dirs) - expected_entries)}"
+)
+
+summary = load(safe("summary.json"))
+assert summary["schema"] == PAIRED_BENCHMARK_PUBLICATION_SCHEMA, summary.get("schema")
 assert "reviewed_subset" not in summary
-assert set(summary["pairable_success_counts"]) == {
+identity = summary["identity"]
+assert set(identity) == {*shared_fields, "oaf_model_lock_sha256"}
+lock = require_sha256(identity["oaf_model_lock_sha256"], "identity.oaf_model_lock_sha256")
+counts = summary["pairable_success_counts"]
+assert set(counts) == {
     "oaf_muscriptor_full_mix",
     "oaf_separation_pilot.spleeter",
     "oaf_separation_pilot.htdemucs",
     "oaf_idm_htdemucs",
 }
-assert summary["comparisons"]["oaf_separation_pilot"]["scope_identity"][
-    "reviewed_subset_cross_verified"
-] is True
-assert summary["comparisons"]["oaf_idm_htdemucs"]["scope_identity"][
-    "reviewed_subset_cross_verified"
-] is False
-with (root / "headline_matrix.csv").open(encoding="utf-8", newline="") as handle:
+assert all(
+    isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    for value in counts.values()
+)
+assert set(summary["comparisons"]) == set(comparisons)
+assert summary["headline_matrix"]["path"] == "headline_matrix.csv"
+
+for comparison_id, (comparison_dir, schema, artifacts) in comparisons.items():
+    entry = summary["comparisons"][comparison_id]
+    assert entry["path"] == comparison_dir
+    nested = load(safe(comparison_dir) / "summary.json")
+    assert nested["schema"] == schema
+    nested_identity = nested["identity"]
+    for field in shared_fields:
+        assert nested_identity[field] == identity[field], field
+    if comparison_id == "oaf_muscriptor_full_mix":
+        assert nested["models"]["oaf"]["model_lock_sha256"] == lock
+    elif comparison_id == "oaf_separation_pilot":
+        assert entry["scope_identity"]["reviewed_subset_cross_verified"] is True
+        assert nested["models"]["full_mix"]["model_lock_sha256"] == lock
+        htdemucs_view = nested["models"]["htdemucs"]["input_view_id"]
+    else:
+        assert entry["scope_identity"] == {
+            "pilot_lineage": "validated_hpa396_run",
+            "reviewed_subset_cross_verified": False,
+        }
+        assert nested["models"]["oaf"]["model_lock_sha256"] == lock
+        assert nested["models"]["oaf"]["input_view_id"] == htdemucs_view
+
+    assert [item["path"] for item in entry["artifacts"]] == [
+        f"{comparison_dir}/{relative}" for relative in artifacts
+    ]
+    for item in entry["artifacts"]:
+        content = read_regular_file_no_follow(safe(item["path"]))
+        assert item["sha256"] == sha256_hex(content), item["path"]
+
+headline_bytes = read_regular_file_no_follow(
+    safe(summary["headline_matrix"]["path"])
+)
+assert summary["headline_matrix"]["sha256"] == sha256_hex(headline_bytes), "headline hash"
+with safe(summary["headline_matrix"]["path"]).open(encoding="utf-8", newline="") as handle:
     rows = list(csv.DictReader(handle))
-assert len(rows) == 6
-for rel in (
-    "comparisons/oaf-muscriptor/summary.json",
-    "comparisons/oaf-separation/summary.json",
-    "comparisons/oaf-idm/summary.json",
-):
-    assert (root / rel).is_file(), rel
+assert len(rows) == 6, f"headline rows={len(rows)}"
 print(root)
 PY
 ```

@@ -19,7 +19,7 @@ dependencies = [
     "celery>=5.3.4",
     "soundfile>=0.12.1",
     "httpx>=0.25.2",
-    "click>=8.1.7",
+    "click>=8.2",
     "uuid6>=2024.1.12",
 ]
 
