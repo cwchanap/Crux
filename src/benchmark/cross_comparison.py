@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import os
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from src.benchmark.artifact_io import read_regular_file_no_follow
-from src.benchmark.backend_identity import StrictJsonError, require_sha256, strict_json_loads
+from src.benchmark.backend_identity import (
+    StrictJsonError,
+    canonical_json_bytes,
+    require_sha256,
+    sha256_hex,
+    strict_json_loads,
+)
 from src.benchmark.idm_comparison import (
     IDM_COMPARISON_SCHEMA,
     IdmComparisonRequest,
@@ -21,10 +28,13 @@ from src.benchmark.muscriptor_comparison import (
     ComparisonRequest,
     compare_oaf_muscriptor,
 )
-from src.benchmark.published_comparison import ComparisonIntegrityError
+from src.benchmark.muscriptor_corpus_run import MUSCRIPTOR_FULL_MIX_INPUT_VIEW_ID
+from src.benchmark.oaf_corpus_run import OAF_FULL_MIX_INPUT_VIEW_ID
+from src.benchmark.published_comparison import ComparisonIntegrityError, write_csv
 from src.benchmark.separation_comparison import (
     HTDEMUCS_INPUT_VIEW_ID,
     SEPARATION_COMPARISON_SCHEMA,
+    SPLEETER_INPUT_VIEW_ID,
     SeparationComparisonRequest,
     compare_oaf_separation,
 )
@@ -45,6 +55,110 @@ _SHARED_FIELDS = (
     "lane_map_version",
     "scoring_version",
 )
+_POPULATION_FIELDS = (
+    "total_count",
+    "eligible_count",
+    "success_count",
+    "failed_count",
+    "skipped_count",
+    "quarantined_count",
+)
+_HEADLINE_FIELDS = (
+    "scope",
+    "model",
+    "input_view_id",
+    "total_count",
+    "eligible_count",
+    "success_count",
+    "failed_count",
+    "skipped_count",
+    "quarantined_count",
+    "comparison_ids",
+)
+_HEADLINE_SOURCES = (
+    (
+        "broad_full_mix",
+        "oaf",
+        OAF_FULL_MIX_INPUT_VIEW_ID,
+        "oaf_muscriptor_full_mix",
+        "oaf",
+    ),
+    (
+        "broad_full_mix",
+        "muscriptor",
+        MUSCRIPTOR_FULL_MIX_INPUT_VIEW_ID,
+        "oaf_muscriptor_full_mix",
+        "muscriptor",
+    ),
+    (
+        "reviewed_pilot",
+        "oaf",
+        OAF_FULL_MIX_INPUT_VIEW_ID,
+        "oaf_separation_pilot",
+        "full_mix",
+    ),
+    (
+        "reviewed_pilot",
+        "oaf",
+        SPLEETER_INPUT_VIEW_ID,
+        "oaf_separation_pilot",
+        "spleeter",
+    ),
+    (
+        "reviewed_pilot",
+        "oaf",
+        HTDEMUCS_INPUT_VIEW_ID,
+        "oaf_separation_pilot",
+        "htdemucs",
+    ),
+    (
+        "reviewed_pilot",
+        "idm",
+        IDM_STEM_INPUT_VIEW_ID,
+        "oaf_idm_htdemucs",
+        "idm",
+    ),
+)
+_EXPECTED_ARTIFACTS = {
+    "oaf_muscriptor_full_mix": (
+        "summary.json",
+        "summary.md",
+        "paired_per_song.csv",
+        "paired_per_class.csv",
+    ),
+    "oaf_separation_pilot": (
+        "summary.json",
+        "summary.md",
+        "spleeter/paired_per_song.csv",
+        "spleeter/paired_per_class.csv",
+        "htdemucs/paired_per_song.csv",
+        "htdemucs/paired_per_class.csv",
+    ),
+    "oaf_idm_htdemucs": (
+        "summary.json",
+        "summary.md",
+        "paired_per_song.csv",
+        "paired_per_class.csv",
+    ),
+}
+_PAIR_COUNT_SOURCES = {
+    "oaf_muscriptor_full_mix": (
+        "oaf_muscriptor_full_mix",
+        ("pairing", "pairable_success_intersection"),
+    ),
+    "oaf_separation_pilot.spleeter": (
+        "oaf_separation_pilot",
+        ("pairing", "spleeter", "pairable_success_intersection"),
+    ),
+    "oaf_separation_pilot.htdemucs": (
+        "oaf_separation_pilot",
+        ("pairing", "htdemucs", "pairable_success_intersection"),
+    ),
+    "oaf_idm_htdemucs": (
+        "oaf_idm_htdemucs",
+        ("pairing", "pairable_success_intersection"),
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -152,7 +266,7 @@ def _validate_shared_identity(summaries: Mapping[str, Mapping[str, object]]) -> 
             raise ComparisonIntegrityError(f"{field} mismatch")
 
 
-def _validate_oaf_identity(summaries: Mapping[str, Mapping[str, object]]) -> None:
+def _validate_oaf_identity(summaries: Mapping[str, Mapping[str, object]]) -> str:
     muscriptor_oaf = _model(summaries["oaf_muscriptor_full_mix"], "oaf")
     separation_full_mix = _model(summaries["oaf_separation_pilot"], "full_mix")
     separation_htdemucs = _model(summaries["oaf_separation_pilot"], "htdemucs")
@@ -184,6 +298,190 @@ def _validate_oaf_identity(summaries: Mapping[str, Mapping[str, object]]) -> Non
         or separation_view != idm_view
     ):
         raise ComparisonIntegrityError("HTDemucs input_view_id mismatch")
+    return locks[0]
+
+
+def _validate_population(
+    model: Mapping[str, object], *, comparison_id: str, model_key: str
+) -> dict[str, int]:
+    value = model.get("population")
+    if not isinstance(value, Mapping):
+        raise ComparisonIntegrityError(
+            f"{comparison_id} models[{model_key!r}] population is malformed"
+        )
+    if set(value) != set(_POPULATION_FIELDS):
+        raise ComparisonIntegrityError(
+            f"{comparison_id} models[{model_key!r}] population fields are invalid"
+        )
+    result: dict[str, int] = {}
+    for field in _POPULATION_FIELDS:
+        count = value[field]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ComparisonIntegrityError(
+                f"{comparison_id} models[{model_key!r}] population.{field} is invalid"
+            )
+        result[field] = count
+    return result
+
+
+def _headline_rows(summaries: Mapping[str, Mapping[str, object]]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for scope, model_name, expected_view, comparison_id, model_key in _HEADLINE_SOURCES:
+        model = _model(summaries[comparison_id], model_key)
+        input_view_id = model.get("input_view_id")
+        if input_view_id != expected_view:
+            raise ComparisonIntegrityError(
+                f"{comparison_id} models[{model_key!r}] input_view_id mismatch"
+            )
+        population = _validate_population(
+            model,
+            comparison_id=comparison_id,
+            model_key=model_key,
+        )
+        rows.append(
+            {
+                "scope": scope,
+                "model": model_name,
+                "input_view_id": expected_view,
+                **population,
+                "comparison_ids": comparison_id,
+            }
+        )
+    return rows
+
+
+def _pairable_success_counts(
+    summaries: Mapping[str, Mapping[str, object]],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for count_key, (comparison_id, path) in _PAIR_COUNT_SOURCES.items():
+        value: object = summaries[comparison_id]
+        for key in path:
+            if not isinstance(value, Mapping) or key not in value:
+                raise ComparisonIntegrityError(f"{count_key} missing {'.'.join(path)}")
+            value = value[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ComparisonIntegrityError(f"{count_key} {path[-1]} must be a non-negative integer")
+        counts[count_key] = value
+    return counts
+
+
+def _artifact_index(stage_root: Path, comparison_id: str) -> list[dict[str, str]]:
+    expected = _EXPECTED_ARTIFACTS[comparison_id]
+    actual: set[str] = set()
+    try:
+        for path in stage_root.rglob("*"):
+            if stat.S_ISREG(path.lstat().st_mode):
+                actual.add(path.relative_to(stage_root).as_posix())
+    except OSError as error:
+        raise ComparisonIntegrityError(
+            f"cannot inspect comparison artifacts for {comparison_id}: {error}"
+        ) from error
+    expected_set = set(expected)
+    missing = [relative for relative in expected if relative not in actual]
+    if missing:
+        raise ComparisonIntegrityError(
+            f"missing expected comparison artifact: {comparison_id}/{missing[0]}"
+        )
+    unexpected = sorted(actual - expected_set)
+    if unexpected:
+        raise ComparisonIntegrityError(
+            f"unexpected comparison artifact: {comparison_id}/{unexpected[0]}"
+        )
+
+    artifacts: list[dict[str, str]] = []
+    for relative in expected:
+        path = stage_root / relative
+        try:
+            digest = sha256_hex(read_regular_file_no_follow(path))
+        except (OSError, TypeError) as error:
+            raise ComparisonIntegrityError(
+                f"invalid comparison artifact: {comparison_id}/{relative}: {error}"
+            ) from error
+        artifacts.append(
+            {
+                "path": (_COMPARISON_DIRS[comparison_id] / relative).as_posix(),
+                "sha256": digest,
+            }
+        )
+    return artifacts
+
+
+def _scope_identities(
+    summaries: Mapping[str, Mapping[str, object]],
+) -> dict[str, dict[str, object]]:
+    separation_identity = _mapping(
+        summaries["oaf_separation_pilot"].get("identity"),
+        "oaf_separation_pilot comparison identity",
+    )
+    reviewed_subset_hash = separation_identity.get("reviewed_subset_manifest_sha256")
+    if not isinstance(reviewed_subset_hash, str):
+        raise ComparisonIntegrityError("reviewed_subset_manifest_sha256 is malformed")
+    try:
+        reviewed_subset_hash = require_sha256(
+            reviewed_subset_hash, "reviewed_subset_manifest_sha256"
+        )
+    except (StrictJsonError, TypeError) as error:
+        raise ComparisonIntegrityError(
+            f"reviewed_subset_manifest_sha256 is malformed: {error}"
+        ) from error
+    return {
+        "oaf_muscriptor_full_mix": {},
+        "oaf_separation_pilot": {
+            "reviewed_subset_manifest_sha256": reviewed_subset_hash,
+            "reviewed_subset_cross_verified": True,
+        },
+        "oaf_idm_htdemucs": {
+            "pilot_lineage": "validated_hpa396_run",
+            "reviewed_subset_cross_verified": False,
+        },
+    }
+
+
+def _write_top_level_markdown(
+    path: Path,
+    *,
+    identity: Mapping[str, object],
+    rows: list[Mapping[str, object]],
+    counts: Mapping[str, int],
+    comparisons: Mapping[str, Mapping[str, object]],
+) -> None:
+    lines = [
+        "# HPA-562 Paired Benchmark Publication",
+        "",
+        "## Identity",
+        "",
+        *[f"- {key}: `{value}`" for key, value in identity.items()],
+        "",
+        "## Headline Matrix",
+        "",
+        "| scope | model | input_view_id | total | eligible | success | failed | skipped | quarantined | comparison_ids |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for row in rows:
+        lines.append(
+            f"| {row['scope']} | {row['model']} | {row['input_view_id']} | "
+            f"{row['total_count']} | {row['eligible_count']} | {row['success_count']} | "
+            f"{row['failed_count']} | {row['skipped_count']} | {row['quarantined_count']} | "
+            f"{row['comparison_ids']} |"
+        )
+    lines.extend(["", "## Pairable Success Counts", ""])
+    lines.extend(f"- {key}: {value}" for key, value in counts.items())
+    lines.extend(["", "## Comparisons", ""])
+    lines.extend(
+        f"- {comparison_id}: `{entry['path']}`" for comparison_id, entry in comparisons.items()
+    )
+    lines.extend(
+        [
+            "",
+            "## Scope Cautions",
+            "",
+            "Broad full-mix and reviewed-pilot rows have different populations and must not be ranked as one leaderboard.",
+            "The IDM pilot lineage is validated inside its HPA-396 run; HPA-562 does not cross-verify its reviewed-subset identity against the HPA-328 separation publication.",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def publish_cross_comparisons(request: CrossComparisonRequest) -> CrossComparisonOutcome:
@@ -245,7 +543,54 @@ def publish_cross_comparisons(request: CrossComparisonRequest) -> CrossCompariso
                 ),
             }
             _validate_shared_identity(summaries)
-            _validate_oaf_identity(summaries)
+            oaf_model_lock_sha256 = _validate_oaf_identity(summaries)
+            headline_rows = _headline_rows(summaries)
+            pairable_success_counts = _pairable_success_counts(summaries)
+            artifacts = {
+                comparison_id: _artifact_index(
+                    stage / _COMPARISON_DIRS[comparison_id], comparison_id
+                )
+                for comparison_id in _COMPARISON_DIRS
+            }
+            scope_identities = _scope_identities(summaries)
+            shared_identity = dict(
+                _mapping(
+                    summaries["oaf_muscriptor_full_mix"].get("identity"),
+                    "oaf_muscriptor_full_mix comparison identity",
+                )
+            )
+            top_identity = {field: shared_identity[field] for field in _SHARED_FIELDS}
+            top_identity["oaf_model_lock_sha256"] = oaf_model_lock_sha256
+
+            headline_path = stage / "headline_matrix.csv"
+            write_csv(headline_path, _HEADLINE_FIELDS, headline_rows)
+            headline_hash = sha256_hex(read_regular_file_no_follow(headline_path))
+            comparisons = {
+                comparison_id: {
+                    "path": _COMPARISON_DIRS[comparison_id].as_posix(),
+                    "artifacts": artifacts[comparison_id],
+                    "scope_identity": scope_identities[comparison_id],
+                }
+                for comparison_id in _COMPARISON_DIRS
+            }
+            top_summary = {
+                "schema": PAIRED_BENCHMARK_PUBLICATION_SCHEMA,
+                "identity": top_identity,
+                "pairable_success_counts": pairable_success_counts,
+                "comparisons": comparisons,
+                "headline_matrix": {
+                    "path": "headline_matrix.csv",
+                    "sha256": headline_hash,
+                },
+            }
+            (stage / "summary.json").write_bytes(canonical_json_bytes(top_summary))
+            _write_top_level_markdown(
+                stage / "summary.md",
+                identity=top_identity,
+                rows=headline_rows,
+                counts=pairable_success_counts,
+                comparisons=comparisons,
+            )
             os.rename(stage, request.output_dir)
     except ComparisonIntegrityError:
         raise
@@ -256,7 +601,7 @@ def publish_cross_comparisons(request: CrossComparisonRequest) -> CrossCompariso
         output_dir=request.output_dir,
         headline_matrix_path=request.output_dir / "headline_matrix.csv",
         comparison_paths=comparison_paths,
-        pairable_success_counts={},
+        pairable_success_counts=pairable_success_counts,
     )
 
 
