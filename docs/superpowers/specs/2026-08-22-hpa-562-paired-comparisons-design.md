@@ -321,7 +321,7 @@ Matrix tests give every possible source key a different population count, includ
 
 The three existing drivers expose pair counts in different return shapes. HPA-562 does not propagate those driver return types into its API. It reads the counts uniformly from the validated nested summaries after publication.
 
-`CrossComparisonOutcome.pairable_success_counts` and the CLI use exactly four flat keys:
+`CrossComparisonOutcome.pairable_success_counts`, top-level `summary.json["pairable_success_counts"]`, and the CLI all use exactly four flat keys:
 
 ```text
 oaf_muscriptor_full_mix
@@ -348,6 +348,8 @@ oaf_idm_htdemucs
 
 Each value must be a non-negative integer. Missing, boolean, negative, or malformed counts fail closed. The coordinator does not depend on MuScriptor's scalar outcome count, separation's nested outcome dict, or IDM's bare `Path` return.
 
+The four-key map is persisted once at top level. Individual comparison index entries do not duplicate it.
+
 ## Top-level summary
 
 Use schema:
@@ -360,7 +362,8 @@ crux.paired-benchmark-publication/v1
 
 - shared reference/timing/taxonomy/lane/scoring identity;
 - the validated frozen OaF `model_lock_sha256`;
-- one entry per pairwise comparison with relative path, closed artifact path/hash index, pairable intersection count(s), and scope information copied from the validated nested summary;
+- the four-key top-level `pairable_success_counts` map;
+- one entry per pairwise comparison with relative path, closed artifact path/hash index, and scope information copied from the validated nested summary;
 - separation-only reviewed-subset identity under `comparisons.oaf_separation_pilot.scope_identity`;
 - an IDM scope note under `comparisons.oaf_idm_htdemucs.scope_identity` stating that HPA-562 does not cross-verify its reviewed subset against separation;
 - `headline_matrix.csv` relative path and SHA-256.
@@ -417,7 +420,7 @@ Focused tests must prove:
 
 The real-driver fixture reuses existing comparison fixture builders/evidence conventions and remains test-only. It is the authority that the three real summary shapes can satisfy HPA-562; production evidence is not required for this identity test.
 
-If focused coverage is below 90%, add a sibling `tests/benchmark/test_cross_comparison_coverage.py` only for concrete uncovered branches, following the existing comparison/runner coverage-suite convention. Do not add production abstractions solely for coverage.
+If focused coverage is below 90%, add concrete tests for uncovered branches. If the main test module becomes materially harder to navigate, use a sibling `tests/benchmark/test_cross_comparison_coverage.py`, following the existing comparison/runner coverage-suite convention. Do not add production abstractions solely for coverage.
 
 Existing pairwise comparator suites remain the acceptance authority for per-song/per-class pairing behavior.
 
