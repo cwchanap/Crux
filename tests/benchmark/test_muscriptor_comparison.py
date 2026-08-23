@@ -13,6 +13,7 @@ from src.benchmark.backend_identity import (
     OAF_BACKEND_ID,
     canonical_json_bytes,
 )
+from src.benchmark.cohort_scoring import SCORING_VERSION
 from src.benchmark.muscriptor_comparison import (
     ComparisonIntegrityError,
     ComparisonRequest,
@@ -425,6 +426,9 @@ def test_compare_joins_published_song_and_class_rows_without_rescoring(
 
     summary = json.loads((result.output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["schema"] == "crux.oaf-muscriptor-comparison/v1"
+    assert summary["identity"]["taxonomy_version"] == TAXONOMY_VERSION
+    assert summary["identity"]["lane_map_version"] == DTX_LANE_MAP_VERSION
+    assert summary["identity"]["scoring_version"] == SCORING_VERSION
     assert summary["pairing"]["pairable_success_intersection"] == 1
     assert summary["aggregates"]["song"][0]["mean_delta_precision"] == 0.3
     assert (

@@ -709,6 +709,16 @@ def compare_oaf_muscriptor(request: ComparisonRequest) -> ComparisonOutcome:
             timing_manifest,
             request.subset_manifest_path,
             subset_manifest,
+            identity={
+                "reference_manifest_sha256": reference_manifest.manifest_sha256,
+                "reference_manifest_version": reference_manifest.corpus_version,
+                "reference_timing_manifest_sha256": timing_manifest.manifest_sha256,
+                "reference_timing_version": timing_manifest.corpus_version,
+                "taxonomy_version": TAXONOMY_VERSION,
+                "lane_map_version": DTX_LANE_MAP_VERSION,
+                "input_view_id": oaf.identity.input_view_id,
+                "scoring_version": SCORING_VERSION,
+            },
         )
         request.output_dir.mkdir(parents=True, exist_ok=True)
         names = ("paired_per_song.csv", "paired_per_class.csv", "summary.json", "summary.md")
