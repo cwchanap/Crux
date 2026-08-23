@@ -330,9 +330,13 @@ if len(locks) != 1:
 Then require:
 
 ```python
-assert_view = separation_summary["models"]["htdemucs"]["input_view_id"]
+separation_view = separation_summary["models"]["htdemucs"]["input_view_id"]
 idm_view = idm_oaf["input_view_id"]
-if assert_view != HTDEMUCS_INPUT_VIEW_ID or idm_view != IDM_STEM_INPUT_VIEW_ID or assert_view != idm_view:
+if (
+    separation_view != HTDEMUCS_INPUT_VIEW_ID
+    or idm_view != IDM_STEM_INPUT_VIEW_ID
+    or separation_view != idm_view
+):
     raise ComparisonIntegrityError("HTDemucs input_view_id mismatch")
 ```
 
@@ -531,7 +535,7 @@ identity
   reference_manifest_sha256
   reference_manifest_version
   reference_timing_manifest_sha256
-  reference_timing_manifest_version
+  reference_timing_version
   taxonomy_version
   lane_map_version
   scoring_version
