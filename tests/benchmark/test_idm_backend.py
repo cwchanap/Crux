@@ -696,10 +696,10 @@ def test_idm_backend_invokes_runtime_sync_before_worker_start(tmp_path: Path) ->
     artifact_root, model_root = _copy_attested_runtime(tmp_path)
     worker = _FakeWorker(_ready(), {"id": "request", "events": []})
     calls: list[tuple[Path, Path]] = []
-    sync_calls: list[tuple[Path, Path]] = []
+    sync_calls: list[tuple[Path, Path, str]] = []
 
-    def sync(runtime_root: Path, runtime_python: Path) -> None:
-        sync_calls.append((runtime_root, runtime_python))
+    def sync(runtime_root: Path, runtime_python: Path, python_version: str) -> None:
+        sync_calls.append((runtime_root, runtime_python, python_version))
 
     backend = _backend(
         tmp_path,
@@ -714,9 +714,12 @@ def test_idm_backend_invokes_runtime_sync_before_worker_start(tmp_path: Path) ->
     finally:
         backend.close()
 
+    expected_version = load_idm_model_lock(artifact_root / "model.json").python_version
     assert len(sync_calls) == 1
     assert sync_calls[0][0] == artifact_root
     assert sync_calls[0][1] == tmp_path / "runtime-python"
+    # The exact frozen interpreter triple must reach the runtime sync.
+    assert sync_calls[0][2] == expected_version
     # Worker was started only after the sync succeeded.
     assert len(calls) == 1
 
@@ -726,7 +729,7 @@ def test_idm_backend_poisons_on_runtime_sync_failure(tmp_path: Path) -> None:
     worker = _FakeWorker(_ready(), {"id": "request", "events": []})
     calls: list[tuple[list[str], dict[str, object]]] = []
 
-    def failing_sync(_root: Path, _python: Path) -> None:
+    def failing_sync(_root: Path, _python: Path, _version: str) -> None:
         raise RuntimeError("venv does not match uv.lock")
 
     backend = _backend(
@@ -773,8 +776,8 @@ def test_idm_backend_preserves_uv_stderr_through_runtime_sync_wrapping(
         calls,
         artifact_root=artifact_root,
         model_root=model_root,
-        runtime_sync=lambda root, _python: _default_runtime_sync(
-            root, root / ".venv" / "bin" / "python"
+        runtime_sync=lambda root, _python, version: _default_runtime_sync(
+            root, root / ".venv" / "bin" / "python", version
         ),
     )
 
@@ -1729,7 +1732,7 @@ def test_default_runtime_sync_succeeds_when_venv_matches_and_uv_syncs(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    _default_runtime_sync(runtime_root, venv_python)
+    _default_runtime_sync(runtime_root, venv_python, "3.11.12")
 
     assert len(captured_commands) == 1
     assert captured_commands[0][0] == "/usr/local/bin/uv"
@@ -1737,6 +1740,9 @@ def test_default_runtime_sync_succeeds_when_venv_matches_and_uv_syncs(
     assert str(runtime_root) in captured_commands[0]
     assert "--frozen" in captured_commands[0]
     assert "--offline" not in captured_commands[0]
+    # The exact frozen interpreter triple must pin uv's choice; the pyproject
+    # only constrains ==3.11.* and an ambient UV_PYTHON would win otherwise.
+    assert captured_commands[0][-2:] == ["--python", "3.11.12"]
 
 
 def test_default_runtime_sync_rejects_unresolvable_runtime_python(
@@ -1755,7 +1761,7 @@ def test_default_runtime_sync_rejects_unresolvable_runtime_python(
     )
 
     with pytest.raises(RuntimeError, match="runtime python is unavailable"):
-        _default_runtime_sync(runtime_root, runtime_python)
+        _default_runtime_sync(runtime_root, runtime_python, "3.11.12")
 
 
 def test_default_runtime_sync_rejects_mismatched_venv_path(
@@ -1771,7 +1777,7 @@ def test_default_runtime_sync_rejects_mismatched_venv_path(
     other.write_text("#!/bin/sh\n", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="runtime python must point to the locked project venv"):
-        _default_runtime_sync(runtime_root, other)
+        _default_runtime_sync(runtime_root, other, "3.11.12")
 
 
 def test_default_runtime_sync_rejects_missing_uv(
@@ -1785,7 +1791,7 @@ def test_default_runtime_sync_rejects_missing_uv(
     monkeypatch.setattr(shutil, "which", lambda name: None)
 
     with pytest.raises(RuntimeError, match="uv is not available on PATH"):
-        _default_runtime_sync(runtime_root, venv_python)
+        _default_runtime_sync(runtime_root, venv_python, "3.11.12")
 
 
 def test_default_runtime_sync_rejects_uv_sync_failure(
@@ -1804,7 +1810,7 @@ def test_default_runtime_sync_rejects_uv_sync_failure(
     )
 
     with pytest.raises(RuntimeError, match="uv sync --frozen failed"):
-        _default_runtime_sync(runtime_root, venv_python)
+        _default_runtime_sync(runtime_root, venv_python, "3.11.12")
 
 
 def test_default_runtime_sync_rejects_uv_sync_oserror(
@@ -1823,7 +1829,7 @@ def test_default_runtime_sync_rejects_uv_sync_oserror(
     )
 
     with pytest.raises(RuntimeError, match="uv sync --frozen failed"):
-        _default_runtime_sync(runtime_root, venv_python)
+        _default_runtime_sync(runtime_root, venv_python, "3.11.12")
 
 
 def test_default_runtime_sync_strips_uv_override_env_vars(
@@ -1855,7 +1861,7 @@ def test_default_runtime_sync_strips_uv_override_env_vars(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    _default_runtime_sync(runtime_root, venv_python)
+    _default_runtime_sync(runtime_root, venv_python, "3.11.12")
 
 
 def test_default_runtime_sync_rejects_symlink_resolved_base_interpreter(
@@ -1878,7 +1884,7 @@ def test_default_runtime_sync_rejects_symlink_resolved_base_interpreter(
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/uv")
 
     with pytest.raises(RuntimeError, match="runtime python must point to the locked project venv"):
-        _default_runtime_sync(runtime_root, base_interpreter)
+        _default_runtime_sync(runtime_root, base_interpreter, "3.11.12")
 
 
 def test_default_runtime_sync_bootstraps_fresh_checkout_without_offline(
@@ -1903,7 +1909,7 @@ def test_default_runtime_sync_bootstraps_fresh_checkout_without_offline(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    _default_runtime_sync(runtime_root, venv_python)
+    _default_runtime_sync(runtime_root, venv_python, "3.11.12")
 
     assert venv_python.exists()
 
@@ -1924,7 +1930,7 @@ def test_default_runtime_sync_reports_captured_stderr(
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     with pytest.raises(RuntimeError, match="uv sync --frozen failed") as raised:
-        _default_runtime_sync(runtime_root, venv_python)
+        _default_runtime_sync(runtime_root, venv_python, "3.11.12")
     assert "boom diagnostic" in str(raised.value)
 
 
@@ -1944,4 +1950,4 @@ def test_default_runtime_sync_wraps_sync_timeout(
     )
 
     with pytest.raises(RuntimeError, match="uv sync --frozen timed out"):
-        _default_runtime_sync(runtime_root, venv_python)
+        _default_runtime_sync(runtime_root, venv_python, "3.11.12")

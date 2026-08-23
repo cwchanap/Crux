@@ -75,13 +75,19 @@ class IdmBackendError(RuntimeError):
 
 
 ProcessFactory = Callable[..., Any]
-RuntimeSync = Callable[[Path, Path], None]
+RuntimeSync = Callable[[Path, Path, str], None]
 
 
-def _default_runtime_sync(runtime_root: Path, runtime_python: Path) -> None:
+def _default_runtime_sync(runtime_root: Path, runtime_python: Path, python_version: str) -> None:
     """Materialize or reconcile the isolated runtime from the frozen uv.lock.
 
-    Runs ``uv sync --project <runtime_root> --frozen`` (never ``--offline``).
+    ``python_version`` is the exact interpreter triple frozen in the model lock
+    (e.g. ``3.11.12``); it is passed as uv's ``--python`` so the venv cannot be
+    created at a different patch release (the pyproject only constrains
+    ``==3.11.*``) and an ambient ``UV_PYTHON`` cannot redirect the choice.
+
+    Runs ``uv sync --project <runtime_root> --frozen --python <python_version>``
+    (never ``--offline``).
     The frozen lock controls dependency identity while uv uses its local cache
     normally and fetches only what is missing from the registry.  ``--offline``
     is intentionally omitted: ``uv sync`` creates ``.venv/bin/python`` before
@@ -116,7 +122,15 @@ def _default_runtime_sync(runtime_root: Path, runtime_python: Path) -> None:
     sync_env.pop("UV_NO_SYNC", None)
     sync_env.pop("UV_OFFLINE", None)
     sync_label = "uv sync --frozen"
-    command = [uv_binary, "sync", "--project", os.fspath(runtime_root), "--frozen"]
+    command = [
+        uv_binary,
+        "sync",
+        "--project",
+        os.fspath(runtime_root),
+        "--frozen",
+        "--python",
+        python_version,
+    ]
     try:
         subprocess.run(
             command,
@@ -281,7 +295,7 @@ class IdmBackend:
         )
         runtime_root = self._model_lock_path.parent
         try:
-            self._runtime_sync(runtime_root, self._runtime_python)
+            self._runtime_sync(runtime_root, self._runtime_python, self._lock.python_version)
         except Exception as error:
             self._poisoned = True
             raise IdmBackendError(
