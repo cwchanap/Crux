@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import shutil
 from collections.abc import Mapping
 from copy import deepcopy
@@ -15,7 +16,6 @@ from src.benchmark.backend_identity import canonical_json_bytes, sha256_hex, str
 from src.benchmark.cohort_scoring import SCORING_VERSION
 from src.benchmark.idm_pilot_run import IDM_STEM_INPUT_VIEW_ID
 from src.benchmark.muscriptor_comparison import ComparisonOutcome
-from src.benchmark.muscriptor_corpus_run import MUSCRIPTOR_FULL_MIX_INPUT_VIEW_ID
 from src.benchmark.oaf_corpus_run import OAF_FULL_MIX_INPUT_VIEW_ID
 from src.benchmark.published_comparison import ComparisonIntegrityError
 from src.benchmark.separation_comparison import (
@@ -449,18 +449,12 @@ def test_publish_cross_comparisons_rejects_existing_output_directory(
     assert marker.read_text(encoding="utf-8") == "existing"
 
 
-@pytest.mark.parametrize(
-    "comparison_id,field",
-    [("oaf_muscriptor_full_mix", "schema"), ("oaf_separation_pilot", "schema")],
-)
+@pytest.mark.parametrize("comparison_id", ["oaf_muscriptor_full_mix", "oaf_separation_pilot"])
 def test_publish_cross_comparisons_rejects_noncanonical_or_wrong_schema(
-    tmp_path: Path, monkeypatch, comparison_id: str, field: str
+    tmp_path: Path, monkeypatch, comparison_id: str
 ) -> None:
     summaries = _summaries()
-    if comparison_id == "oaf_muscriptor_full_mix":
-        summaries[comparison_id][field] = "wrong.schema/v0"
-    else:
-        summaries[comparison_id][field] = "wrong.schema/v0"
+    summaries[comparison_id]["schema"] = "wrong.schema/v0"
     calls = _patch_drivers(monkeypatch, summaries)
 
     with pytest.raises(ComparisonIntegrityError, match="schema"):
@@ -580,8 +574,11 @@ def test_publish_cross_comparisons_rejects_idm_view_mismatch(tmp_path: Path, mon
     "comparison_id,models",
     [
         ("oaf_muscriptor_full_mix", []),
+        ("oaf_muscriptor_full_mix", {}),
         ("oaf_separation_pilot", []),
+        ("oaf_separation_pilot", {}),
         ("oaf_idm_htdemucs", []),
+        ("oaf_idm_htdemucs", {}),
     ],
 )
 def test_publish_cross_comparisons_rejects_malformed_models_mapping(
@@ -615,7 +612,7 @@ def test_publish_cross_comparisons_renders_closed_headline_matrix_and_index(
         ("reviewed_pilot", "oaf", 203),
         ("reviewed_pilot", "idm", 301),
     ]
-    assert rows[0]["input_view_id"] == MUSCRIPTOR_FULL_MIX_INPUT_VIEW_ID
+    assert rows[0]["input_view_id"] == OAF_FULL_MIX_INPUT_VIEW_ID
     assert rows[-1]["input_view_id"] == IDM_STEM_INPUT_VIEW_ID
 
     summary = json.loads((tmp_path / "published" / "summary.json").read_text())
@@ -683,6 +680,39 @@ def test_cross_publication_rejects_unexpected_artifact(tmp_path: Path, monkeypat
     def mutate(comparison_id: str, output_dir: Path) -> None:
         if comparison_id == "oaf_separation_pilot":
             (output_dir / "extra.csv").write_text("unexpected\n", encoding="utf-8")
+
+    _patch_task3_drivers(monkeypatch, summaries, mutate=mutate)
+
+    with pytest.raises(ComparisonIntegrityError, match="unexpected comparison artifact"):
+        cross_comparison.publish_cross_comparisons(_request(tmp_path))
+
+    assert not (tmp_path / "published").exists()
+
+
+@pytest.mark.parametrize("entry_kind", ["symlink", "directory", "fifo", "dotfile"])
+def test_cross_publication_rejects_non_regular_stage_entries(
+    tmp_path: Path, monkeypatch, entry_kind: str
+) -> None:
+    if entry_kind == "symlink" and not hasattr(os, "symlink"):
+        pytest.skip("symlinks unavailable")
+    if entry_kind == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("FIFOs unavailable")
+
+    summaries = _task3_summaries()
+
+    def mutate(comparison_id: str, output_dir: Path) -> None:
+        if comparison_id == "oaf_muscriptor_full_mix":
+            intruder = output_dir / "intruder"
+            if entry_kind == "symlink":
+                intruder.symlink_to(output_dir / "summary.md")
+            elif entry_kind == "directory":
+                intruder.mkdir()
+                (intruder / "nested.txt").write_text("unexpected\n", encoding="utf-8")
+            elif entry_kind == "dotfile":
+                intruder = output_dir / ".hidden.csv"
+                intruder.write_text("unexpected\n", encoding="utf-8")
+            else:
+                os.mkfifo(intruder)
 
     _patch_task3_drivers(monkeypatch, summaries, mutate=mutate)
 

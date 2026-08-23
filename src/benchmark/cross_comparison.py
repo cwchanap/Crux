@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -368,22 +367,40 @@ def _pairable_success_counts(
 
 def _artifact_index(stage_root: Path, comparison_id: str) -> list[dict[str, str]]:
     expected = _EXPECTED_ARTIFACTS[comparison_id]
-    actual: set[str] = set()
+    expected_files = set(expected)
+    expected_dirs = {
+        parent.as_posix()
+        for parent in (Path(relative).parent for relative in expected)
+        if parent != Path(".")
+    }
+    actual_files: set[str] = set()
+    actual_dirs: set[str] = set()
+
+    def _raise_walk_error(error: OSError) -> None:
+        raise error
+
     try:
-        for path in stage_root.rglob("*"):
-            if stat.S_ISREG(path.lstat().st_mode):
-                actual.add(path.relative_to(stage_root).as_posix())
+        for current, dirnames, filenames in os.walk(stage_root, onerror=_raise_walk_error):
+            current_dir = Path(current)
+            for name in dirnames:
+                path = current_dir / name
+                relative = path.relative_to(stage_root).as_posix()
+                if path.is_symlink():
+                    actual_files.add(relative)
+                else:
+                    actual_dirs.add(relative)
+            for name in filenames:
+                actual_files.add((current_dir / name).relative_to(stage_root).as_posix())
     except OSError as error:
         raise ComparisonIntegrityError(
             f"cannot inspect comparison artifacts for {comparison_id}: {error}"
         ) from error
-    expected_set = set(expected)
-    missing = [relative for relative in expected if relative not in actual]
+    missing = [relative for relative in expected if relative not in actual_files]
     if missing:
         raise ComparisonIntegrityError(
             f"missing expected comparison artifact: {comparison_id}/{missing[0]}"
         )
-    unexpected = sorted(actual - expected_set)
+    unexpected = sorted((actual_files - expected_files) | (actual_dirs - expected_dirs))
     if unexpected:
         raise ComparisonIntegrityError(
             f"unexpected comparison artifact: {comparison_id}/{unexpected[0]}"
