@@ -1661,6 +1661,160 @@ def test_compare_oaf_muscriptor_command_builds_request_and_emits_summary(
     }
 
 
+def _paired_comparison_cli_args(tmp_path: Path, output_dir: Path) -> list[str]:
+    input_paths = (
+        tmp_path / "oaf-run.json",
+        tmp_path / "muscriptor-run.json",
+        tmp_path / "separation-run.json",
+        tmp_path / "idm-run.json",
+        tmp_path / "reference.jsonl",
+        tmp_path / "timing.jsonl",
+        tmp_path / "subset.jsonl",
+    )
+    for path in input_paths:
+        path.write_bytes(b"fixture")
+    cache_dir = tmp_path / "separation-cache"
+    cache_dir.mkdir()
+    return [
+        "benchmark",
+        "publish-paired-comparisons",
+        "--oaf-run",
+        str(input_paths[0]),
+        "--muscriptor-run",
+        str(input_paths[1]),
+        "--separation-run",
+        str(input_paths[2]),
+        "--idm-run",
+        str(input_paths[3]),
+        "--manifest",
+        str(input_paths[4]),
+        "--timing-manifest",
+        str(input_paths[5]),
+        "--subset-manifest",
+        str(input_paths[6]),
+        "--separation-cache-dir",
+        str(cache_dir),
+        "--output-dir",
+        str(output_dir),
+    ]
+
+
+def test_publish_paired_comparisons_emits_canonical_summary(tmp_path: Path, monkeypatch) -> None:
+    import src.benchmark.cross_comparison as comparison_module
+
+    output_dir = tmp_path / "publication"
+    expected_counts = {
+        "oaf_muscriptor_full_mix": 11,
+        "oaf_separation_pilot.spleeter": 12,
+        "oaf_separation_pilot.htdemucs": 13,
+        "oaf_idm_htdemucs": 14,
+    }
+    fake_outcome = type(
+        "Outcome",
+        (),
+        {
+            "comparison_paths": {
+                "oaf_idm_htdemucs": output_dir / "comparisons/oaf-idm",
+                "oaf_muscriptor_full_mix": output_dir / "comparisons/oaf-muscriptor",
+                "oaf_separation_pilot": output_dir / "comparisons/oaf-separation",
+            },
+            "headline_matrix_path": output_dir / "headline_matrix.csv",
+            "output_dir": output_dir,
+            "pairable_success_counts": expected_counts,
+        },
+    )()
+    captured: list[object] = []
+
+    def fake_publish(request: object) -> object:
+        captured.append(request)
+        return fake_outcome
+
+    monkeypatch.setattr(comparison_module, "publish_cross_comparisons", fake_publish)
+    result = CliRunner().invoke(
+        main,
+        _paired_comparison_cli_args(tmp_path, output_dir),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.oaf_run_path == tmp_path / "oaf-run.json"
+    assert request.muscriptor_run_path == tmp_path / "muscriptor-run.json"
+    assert request.separation_run_path == tmp_path / "separation-run.json"
+    assert request.idm_run_path == tmp_path / "idm-run.json"
+    assert request.reference_manifest_path == tmp_path / "reference.jsonl"
+    assert request.timing_manifest_path == tmp_path / "timing.jsonl"
+    assert request.subset_manifest_path == tmp_path / "subset.jsonl"
+    assert request.separation_cache_dir == tmp_path / "separation-cache"
+    assert request.output_dir == output_dir
+    assert json.loads(result.stdout) == {
+        "comparison_paths": {
+            "oaf_idm_htdemucs": str(output_dir / "comparisons/oaf-idm"),
+            "oaf_muscriptor_full_mix": str(output_dir / "comparisons/oaf-muscriptor"),
+            "oaf_separation_pilot": str(output_dir / "comparisons/oaf-separation"),
+        },
+        "exit_code": 0,
+        "headline_matrix_path": str(output_dir / "headline_matrix.csv"),
+        "output_dir": str(output_dir),
+        "pairable_success_counts": expected_counts,
+    }
+
+
+def test_publish_paired_comparisons_emits_integrity_failure(tmp_path: Path, monkeypatch) -> None:
+    import src.benchmark.cross_comparison as comparison_module
+    from src.benchmark.published_comparison import ComparisonIntegrityError
+
+    def fake_publish(_request: object) -> object:
+        raise ComparisonIntegrityError("taxonomy_version mismatch")
+
+    monkeypatch.setattr(comparison_module, "publish_cross_comparisons", fake_publish)
+    result = CliRunner().invoke(
+        main,
+        _paired_comparison_cli_args(tmp_path, tmp_path / "publication"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert "taxonomy_version mismatch" in result.stderr
+    assert json.loads(result.stdout) == {
+        "comparison_paths": {},
+        "error": "ComparisonIntegrityError",
+        "exit_code": 2,
+        "headline_matrix_path": None,
+        "output_dir": None,
+        "pairable_success_counts": {},
+    }
+
+
+def test_publish_paired_comparisons_emits_request_validation_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.cross_comparison as comparison_module
+
+    def raising_request(**_kwargs: object) -> object:
+        raise ValueError("invalid comparison request")
+
+    monkeypatch.setattr(comparison_module, "CrossComparisonRequest", raising_request)
+    result = CliRunner().invoke(
+        main,
+        _paired_comparison_cli_args(tmp_path, tmp_path / "publication"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert "invalid comparison request" in result.stderr
+    assert json.loads(result.stdout) == {
+        "comparison_paths": {},
+        "error": "ValueError",
+        "exit_code": 2,
+        "headline_matrix_path": None,
+        "output_dir": None,
+        "pairable_success_counts": {},
+    }
+
+
 def _idm_pilot_cli_args(tmp_path: Path) -> list[str]:
     return [
         "benchmark",

@@ -1618,6 +1618,125 @@ def compare_oaf_muscriptor_command(
     click.echo(canonical_json_bytes(payload).decode("utf-8"))
 
 
+@benchmark.command("publish-paired-comparisons")
+@click.option(
+    "--oaf-run",
+    "oaf_run_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required persisted full-mix OaF run snapshot.",
+)
+@click.option(
+    "--muscriptor-run",
+    "muscriptor_run_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required persisted MuScriptor run snapshot.",
+)
+@click.option(
+    "--separation-run",
+    "separation_run_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required persisted OaF separation pilot run snapshot.",
+)
+@click.option(
+    "--idm-run",
+    "idm_run_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required persisted IDM pilot run snapshot.",
+)
+@click.option(
+    "--manifest",
+    "reference_manifest_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required HPA-324 reference-set manifest.",
+)
+@click.option(
+    "--timing-manifest",
+    "timing_manifest_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required HPA-323 reference-timing manifest.",
+)
+@click.option(
+    "--subset-manifest",
+    "subset_manifest_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Required HPA-327 reviewed-subset manifest.",
+)
+@click.option(
+    "--separation-cache-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Optional HPA-328 separation cache root.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+    help="Directory where the complete paired comparison bundle is written.",
+)
+def publish_paired_comparisons_command(
+    oaf_run_path: Path,
+    muscriptor_run_path: Path,
+    separation_run_path: Path,
+    idm_run_path: Path,
+    reference_manifest_path: Path,
+    timing_manifest_path: Path,
+    subset_manifest_path: Path,
+    separation_cache_dir: Path | None,
+    output_dir: Path,
+) -> None:
+    """Publish the complete HPA-562 paired comparison bundle."""
+    from src.benchmark.cross_comparison import (
+        ComparisonIntegrityError,
+        CrossComparisonRequest,
+        publish_cross_comparisons,
+    )
+
+    try:
+        outcome = publish_cross_comparisons(
+            CrossComparisonRequest(
+                oaf_run_path=oaf_run_path,
+                muscriptor_run_path=muscriptor_run_path,
+                separation_run_path=separation_run_path,
+                idm_run_path=idm_run_path,
+                reference_manifest_path=reference_manifest_path,
+                timing_manifest_path=timing_manifest_path,
+                subset_manifest_path=subset_manifest_path,
+                separation_cache_dir=separation_cache_dir,
+                output_dir=output_dir,
+            )
+        )
+    except (ComparisonIntegrityError, OSError, TypeError, ValueError) as error:
+        payload = {
+            "comparison_paths": {},
+            "error": type(error).__name__,
+            "exit_code": 2,
+            "headline_matrix_path": None,
+            "output_dir": None,
+            "pairable_success_counts": {},
+        }
+        click.echo(str(error), err=True)
+        click.echo(canonical_json_bytes(payload).decode("utf-8"))
+        raise click.exceptions.Exit(2)
+
+    payload = {
+        "comparison_paths": {
+            comparison_id: str(path) for comparison_id, path in outcome.comparison_paths.items()
+        },
+        "exit_code": 0,
+        "headline_matrix_path": str(outcome.headline_matrix_path),
+        "output_dir": str(outcome.output_dir),
+        "pairable_success_counts": outcome.pairable_success_counts,
+    }
+    click.echo(canonical_json_bytes(payload).decode("utf-8"))
+
+
 @benchmark.command("run-oaf-separation-pilot")
 @click.option(
     "--manifest",
