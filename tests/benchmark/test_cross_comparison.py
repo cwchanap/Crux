@@ -22,7 +22,11 @@ from src.benchmark.separation_comparison import (
     HTDEMUCS_INPUT_VIEW_ID,
     SeparationComparisonOutcome,
 )
-from src.benchmark.taxonomy import DTX_LANE_MAP_VERSION, TAXONOMY_VERSION
+from src.benchmark.taxonomy import (
+    DTX_LANE_MAP_VERSION,
+    OAF_PREDICTION_MAP_ID,
+    TAXONOMY_VERSION,
+)
 
 _MODEL_LOCK = "a" * 64
 _IDENTITY_FIELDS = (
@@ -73,10 +77,12 @@ def _summaries() -> dict[str, dict[str, Any]]:
             "models": {
                 "oaf": {
                     "model_lock_sha256": _MODEL_LOCK,
+                    "prediction_map_version": OAF_PREDICTION_MAP_ID,
                     "input_view_id": OAF_FULL_MIX_INPUT_VIEW_ID,
                 },
                 "muscriptor": {
                     "model_lock_sha256": "b" * 64,
+                    "prediction_map_version": OAF_PREDICTION_MAP_ID,
                     "input_view_id": OAF_FULL_MIX_INPUT_VIEW_ID,
                 },
             },
@@ -90,14 +96,17 @@ def _summaries() -> dict[str, dict[str, Any]]:
             "models": {
                 "full_mix": {
                     "model_lock_sha256": _MODEL_LOCK,
+                    "prediction_map_version": OAF_PREDICTION_MAP_ID,
                     "input_view_id": OAF_FULL_MIX_INPUT_VIEW_ID,
                 },
                 "spleeter": {
-                    "model_lock_sha256": "c" * 64,
+                    "model_lock_sha256": _MODEL_LOCK,
+                    "prediction_map_version": OAF_PREDICTION_MAP_ID,
                     "input_view_id": "crux.oaf-spleeter4-drums-mono44k1-pcm16/v1",
                 },
                 "htdemucs": {
-                    "model_lock_sha256": "d" * 64,
+                    "model_lock_sha256": _MODEL_LOCK,
+                    "prediction_map_version": OAF_PREDICTION_MAP_ID,
                     "input_view_id": HTDEMUCS_INPUT_VIEW_ID,
                 },
             },
@@ -108,6 +117,7 @@ def _summaries() -> dict[str, dict[str, Any]]:
             "models": {
                 "oaf": {
                     "model_lock_sha256": _MODEL_LOCK,
+                    "prediction_map_version": OAF_PREDICTION_MAP_ID,
                     "input_view_id": IDM_STEM_INPUT_VIEW_ID,
                 },
                 "idm": {
@@ -533,14 +543,49 @@ def test_publish_cross_comparisons_rejects_missing_shared_identity(
 
 
 @pytest.mark.parametrize("lock", ("not-a-sha", "b" * 64))
+@pytest.mark.parametrize(
+    "comparison_id,model_key",
+    [
+        ("oaf_muscriptor_full_mix", "oaf"),
+        ("oaf_separation_pilot", "full_mix"),
+        ("oaf_separation_pilot", "spleeter"),
+        ("oaf_separation_pilot", "htdemucs"),
+        ("oaf_idm_htdemucs", "oaf"),
+    ],
+)
 def test_publish_cross_comparisons_rejects_malformed_or_mismatched_oaf_lock(
-    tmp_path: Path, monkeypatch, lock: str
+    tmp_path: Path, monkeypatch, comparison_id: str, model_key: str, lock: str
 ) -> None:
     summaries = _summaries()
-    summaries["oaf_separation_pilot"]["models"]["full_mix"]["model_lock_sha256"] = lock
+    summaries[comparison_id]["models"][model_key]["model_lock_sha256"] = lock
     _patch_drivers(monkeypatch, summaries)
 
     with pytest.raises(ComparisonIntegrityError, match="model_lock_sha256"):
+        cross_comparison.publish_cross_comparisons(_request(tmp_path))
+
+    assert not (tmp_path / "published").exists()
+
+
+@pytest.mark.parametrize(
+    "comparison_id,model_key",
+    [
+        ("oaf_muscriptor_full_mix", "oaf"),
+        ("oaf_separation_pilot", "full_mix"),
+        ("oaf_separation_pilot", "spleeter"),
+        ("oaf_separation_pilot", "htdemucs"),
+        ("oaf_idm_htdemucs", "oaf"),
+    ],
+)
+def test_publish_cross_comparisons_rejects_oaf_prediction_map_mismatch(
+    tmp_path: Path, monkeypatch, comparison_id: str, model_key: str
+) -> None:
+    summaries = _summaries()
+    summaries[comparison_id]["models"][model_key]["prediction_map_version"] = (
+        "crux.prediction-map/oaf-egmd-8hit-v0"
+    )
+    _patch_drivers(monkeypatch, summaries)
+
+    with pytest.raises(ComparisonIntegrityError, match="prediction_map_version mismatch"):
         cross_comparison.publish_cross_comparisons(_request(tmp_path))
 
     assert not (tmp_path / "published").exists()

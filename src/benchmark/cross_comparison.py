@@ -268,13 +268,17 @@ def _validate_shared_identity(summaries: Mapping[str, Mapping[str, object]]) -> 
 def _validate_oaf_identity(summaries: Mapping[str, Mapping[str, object]]) -> str:
     muscriptor_oaf = _model(summaries["oaf_muscriptor_full_mix"], "oaf")
     separation_full_mix = _model(summaries["oaf_separation_pilot"], "full_mix")
+    separation_spleeter = _model(summaries["oaf_separation_pilot"], "spleeter")
     separation_htdemucs = _model(summaries["oaf_separation_pilot"], "htdemucs")
     idm_oaf = _model(summaries["oaf_idm_htdemucs"], "oaf")
 
     locks: list[str] = []
+    maps: list[str] = []
     for label, model in (
         ("MuScriptor OaF", muscriptor_oaf),
         ("separation full_mix", separation_full_mix),
+        ("separation spleeter", separation_spleeter),
+        ("separation htdemucs", separation_htdemucs),
         ("IDM OaF", idm_oaf),
     ):
         value = model.get("model_lock_sha256")
@@ -286,8 +290,14 @@ def _validate_oaf_identity(summaries: Mapping[str, Mapping[str, object]]) -> str
             raise ComparisonIntegrityError(
                 f"{label} model_lock_sha256 is malformed: {error}"
             ) from error
+        map_value = model.get("prediction_map_version")
+        if not isinstance(map_value, str) or not map_value:
+            raise ComparisonIntegrityError(f"{label} prediction_map_version is malformed")
+        maps.append(map_value)
     if len(set(locks)) != 1:
         raise ComparisonIntegrityError("model_lock_sha256 mismatch")
+    if len(set(maps)) != 1:
+        raise ComparisonIntegrityError("prediction_map_version mismatch")
 
     separation_view = separation_htdemucs.get("input_view_id")
     idm_view = idm_oaf.get("input_view_id")
