@@ -690,16 +690,18 @@ identity
   lane_map_version
   scoring_version
   oaf_model_lock_sha256
+pairable_success_counts
 comparisons
   <comparison id>
     path
     artifacts
-    pairable_success_counts
     scope_identity
 headline_matrix
   path
   sha256
 ```
+
+`pairable_success_counts` is the single persisted copy of the four-key map from Step 5. Comparison entries do not duplicate those counts.
 
 Every artifact path is relative to the HPA-562 root. `artifacts` follows `_EXPECTED_ARTIFACTS` order and contains `{path, sha256}` objects.
 
@@ -1066,7 +1068,7 @@ If Steps 1–7 require no code correction, do not create an empty commit. If a r
 - **Pilot lineage:** no unverified bundle-level reviewed-subset field. Separation exposes its verified subset; IDM is explicitly marked as not cross-verified against separation at HPA-562 level.
 - **Population labeling:** the matrix uses a closed source table and never uses IDM `models["oaf"]` as a headline source.
 - **Artifact integrity:** every nested comparison has a fixed expected file set; missing/unexpected files fail closed; no glob-based contract.
-- **Counts:** `pairable_success_counts` has four exact keys and comes from nested summaries, independent of driver return-shape differences.
+- **Counts:** `pairable_success_counts` has four exact keys, is persisted once at top level, and comes from nested summaries independent of driver return-shape differences.
 - **Determinism:** only relative paths are persisted; duplicate publications under different roots must have byte-identical top-level files.
 - **Breaking-change policy:** regenerated separation-summary hashes may differ from historical HPA-328 handoff hashes after taxonomy/lane fields are added; no compatibility layer is added.
 - **Coverage:** focused `cross_comparison.py` coverage must reach >=90% before the blocking Codecov patch gate.
