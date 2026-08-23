@@ -38,6 +38,7 @@ from src.benchmark.reference_set_manifest import load_reference_set_manifest
 from src.benchmark.reference_timing_manifest import load_reference_timing_manifest
 from src.benchmark.reports import PublishedCohortReports, read_cohort_reports
 from src.benchmark.reviewed_subset import load_reviewed_subset_manifest
+from src.benchmark.taxonomy import DTX_LANE_MAP_VERSION, TAXONOMY_VERSION
 
 SEPARATION_COMPARISON_SCHEMA = "crux.oaf-separation-comparison/v1"
 SEPARATION_COMPARISON_TITLE = "HPA-328 OaF Separation Published Comparison"
@@ -564,6 +565,8 @@ def _comparison_identity(
         "reference_timing_version": getattr(timing_manifest, "corpus_version"),
         "reviewed_subset_manifest_sha256": getattr(subset_manifest, "manifest_sha256"),
         "input_views": dict(_VIEW_IDS),
+        "taxonomy_version": TAXONOMY_VERSION,
+        "lane_map_version": DTX_LANE_MAP_VERSION,
         "scoring_version": SCORING_VERSION,
     }
 

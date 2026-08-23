@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.benchmark.backend_identity import OAF_BACKEND_ID, canonical_json_bytes
-from src.benchmark.cohort_scoring import CohortIdentity
+from src.benchmark.cohort_scoring import SCORING_VERSION, CohortIdentity
 from src.benchmark.oaf_corpus_run import OAF_FULL_MIX_INPUT_VIEW_ID
 from src.benchmark.published_comparison import (
     ComparisonIntegrityError,
@@ -261,6 +261,11 @@ def test_comparison_publishes_paired_csvs_summary_and_native_evidence(
 
     summary = json.loads((comparison_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["schema"] == "crux.oaf-separation-comparison/v1"
+    # HPA-562 intentionally changes summary bytes; historical HPA-328 hashes
+    # are not compatibility targets.
+    assert summary["identity"]["taxonomy_version"] == TAXONOMY_VERSION
+    assert summary["identity"]["lane_map_version"] == DTX_LANE_MAP_VERSION
+    assert summary["identity"]["scoring_version"] == SCORING_VERSION
     for view_name in ("spleeter", "htdemucs"):
         assert summary["pairing"][view_name]["pairable_success_intersection"] == 20
         assert summary["models"][view_name]["failure_code_histogram"] == {}
