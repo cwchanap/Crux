@@ -93,31 +93,35 @@ Add:
 src/benchmark/cross_comparison.py
 ```
 
-with one public request/outcome pair and one public operation:
+with one public request/outcome pair and one public operation.
 
-```python
-@dataclass(frozen=True)
-class CrossComparisonRequest:
-    oaf_run_path: Path
-    muscriptor_run_path: Path
-    separation_run_path: Path
-    idm_run_path: Path
-    reference_manifest_path: Path
-    timing_manifest_path: Path
-    subset_manifest_path: Path
-    output_dir: Path
-    separation_cache_dir: Path | None = None
+`CrossComparisonRequest` fields:
 
-@dataclass(frozen=True)
-class CrossComparisonOutcome:
-    output_dir: Path
-    headline_matrix_path: Path
-    comparison_paths: dict[str, Path]
-    pairable_success_counts: dict[str, int]
+```text
+oaf_run_path: Path
+muscriptor_run_path: Path
+separation_run_path: Path
+idm_run_path: Path
+reference_manifest_path: Path
+timing_manifest_path: Path
+subset_manifest_path: Path
+output_dir: Path
+separation_cache_dir: Path | None = None
+```
 
+`CrossComparisonOutcome` fields:
 
-def publish_cross_comparisons(request: CrossComparisonRequest) -> CrossComparisonOutcome:
-    ...
+```text
+output_dir: Path
+headline_matrix_path: Path
+comparison_paths: dict[str, Path]
+pairable_success_counts: dict[str, int]
+```
+
+Public operation:
+
+```text
+publish_cross_comparisons(request: CrossComparisonRequest) -> CrossComparisonOutcome
 ```
 
 `publish_cross_comparisons()` uses a sibling staging directory and requires the final `output_dir` not to exist. It invokes:
