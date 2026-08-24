@@ -172,6 +172,8 @@ Require exact equality of:
 ```text
 MuScriptor summary: models["oaf"]["model_lock_sha256"]
 Separation summary: models["full_mix"]["model_lock_sha256"]
+Separation summary: models["spleeter"]["model_lock_sha256"]
+Separation summary: models["htdemucs"]["model_lock_sha256"]
 IDM summary: models["oaf"]["model_lock_sha256"]
 ```
 

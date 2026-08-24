@@ -1146,9 +1146,9 @@ for comparison_id, (comparison_dir, schema, artifacts) in comparisons.items():
         assert isinstance(oaf_prediction_map, str) and bool(oaf_prediction_map)
     elif comparison_id == "oaf_separation_pilot":
         assert entry["scope_identity"]["reviewed_subset_cross_verified"] is True
-        assert nested["models"]["full_mix"]["model_lock_sha256"] == lock
         htdemucs_view = nested["models"]["htdemucs"]["input_view_id"]
         for view_key in ("full_mix", "spleeter", "htdemucs"):
+            assert nested["models"][view_key]["model_lock_sha256"] == lock, view_key
             assert (
                 nested["models"][view_key]["prediction_map_version"] == oaf_prediction_map
             ), view_key
