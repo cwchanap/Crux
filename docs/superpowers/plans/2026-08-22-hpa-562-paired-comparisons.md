@@ -4,7 +4,7 @@
 
 **Goal:** Publish one deterministic HPA-562 bundle that composes the existing OaF/MuScriptor, OaF/separation, and OaF/IDM pairwise comparisons and exposes a clearly scoped model × input-view population matrix.
 
-**Architecture:** Keep the three existing pairwise comparison drivers authoritative. Add one concrete `cross_comparison.py` coordinator that stages those outputs, validates shared reference/scoring identity plus the frozen OaF model lock, verifies a closed nested-artifact contract, and publishes only a top-level index/matrix. MuScriptor stays broad with `subset_manifest_path=None`; separation owns the supplied HPA-327 subset identity; IDM remains pilot-scoped by its validated HPA-396 run without adding another HPA-328 handoff input.
+**Architecture:** Keep the three existing pairwise comparison drivers authoritative. Add one concrete `cross_comparison.py` coordinator that stages those outputs, validates shared reference/scoring identity plus frozen OaF model-lock and prediction-map identity, verifies a closed nested-artifact contract, and publishes only a top-level index/matrix. MuScriptor stays broad with `subset_manifest_path=None`; separation owns the supplied HPA-327 subset identity; IDM remains pilot-scoped by its validated HPA-396 run without adding another HPA-328 handoff input.
 
 **Tech Stack:** Python 3.12, dataclasses, `pathlib`, existing strict/canonical JSON and SHA-256 helpers, Click (>=8.2; the CLI tests assert on `CliRunner`'s separately captured stderr), pytest, pytest-cov.
 
@@ -21,6 +21,7 @@
 - Full-corpus and pilot populations remain explicitly distinct; the headline matrix is not a leaderboard.
 - Headline rows come from one closed `(scope, model, expected view, comparison id, models-key)` table; never select by a generic `"oaf"` lookup.
 - Require OaF `model_lock_sha256` equality across MuScriptor, separation, and IDM summaries.
+- Require nonempty equal OaF `prediction_map_version` across the five model entries checked by `_validate_oaf_identity()`: MuScriptor `oaf`, separation `full_mix`/`spleeter`/`htdemucs`, IDM `oaf`.
 - Require separation HTDemucs and IDM's OaF peer to name the same HTDemucs stem input view.
 - Do not publish a top-level reviewed-subset identity. Separation owns its HPA-327 subset identity; IDM is explicitly marked as not cross-verified against that subset at HPA-562 level.
 - Nested artifact composition is a closed contract, not a glob. Missing or unexpected files fail closed.
@@ -354,7 +355,7 @@ _SHARED_FIELDS = (
 
 For each field, require a non-empty value and exact equality. Raise `ComparisonIntegrityError` naming the field on missing/mismatch.
 
-- [ ] **Step 7: Implement frozen OaF lock and HTDemucs-view checks**
+- [ ] **Step 7: Implement frozen OaF lock/map and HTDemucs-view checks**
 
 Load exact model entries through a safe accessor so missing or malformed nested entries raise `ComparisonIntegrityError` instead of leaking `KeyError`:
 
@@ -366,7 +367,7 @@ idm_oaf = _model(idm_summary, "oaf")
 
 `_model(summary, key)` requires `summary["models"]` to be a mapping and the entry itself to be a mapping, raising `ComparisonIntegrityError("comparison summary models[...] is malformed")` otherwise.
 
-Require all three `model_lock_sha256` values to be valid SHA-256 strings and equal. Then require:
+Require all five OaF/separation model entries (`muscriptor_oaf`, `separation_full_mix`, separation `spleeter` and `htdemucs`, `idm_oaf`) to carry valid SHA-256 `model_lock_sha256` values, all equal. Require the same five entries to carry nonempty string `prediction_map_version` values, also equal; a missing or malformed value is a fatal error naming `prediction_map_version`. Then require:
 
 ```python
 separation_view = separation_summary["models"]["htdemucs"]["input_view_id"]
@@ -409,7 +410,7 @@ def test_cross_publication_rejects_shared_identity_mismatch(..., field: str) -> 
     assert not request.output_dir.exists()
 ```
 
-Add separate tests for malformed/mismatched OaF `model_lock_sha256`, mismatched HTDemucs `input_view_id`, malformed nested `models` mappings (including valid mappings whose required model keys are absent), and an existing final output directory. Every failure leaves no final HPA-562 bundle, so the CLI emits its canonical exit-2 integrity payload.
+Add separate tests for malformed/mismatched OaF `model_lock_sha256`, mismatched OaF `prediction_map_version`, mismatched HTDemucs `input_view_id`, malformed nested `models` mappings (including valid mappings whose required model keys are absent), and an existing final output directory. Every failure leaves no final HPA-562 bundle, so the CLI emits its canonical exit-2 integrity payload.
 
 - [ ] **Step 9: Run the focused suite GREEN**
 
@@ -1141,10 +1142,16 @@ for comparison_id, (comparison_dir, schema, artifacts) in comparisons.items():
         assert nested_identity[field] == identity[field], field
     if comparison_id == "oaf_muscriptor_full_mix":
         assert nested["models"]["oaf"]["model_lock_sha256"] == lock
+        oaf_prediction_map = nested["models"]["oaf"]["prediction_map_version"]
+        assert isinstance(oaf_prediction_map, str) and bool(oaf_prediction_map)
     elif comparison_id == "oaf_separation_pilot":
         assert entry["scope_identity"]["reviewed_subset_cross_verified"] is True
         assert nested["models"]["full_mix"]["model_lock_sha256"] == lock
         htdemucs_view = nested["models"]["htdemucs"]["input_view_id"]
+        for view_key in ("full_mix", "spleeter", "htdemucs"):
+            assert (
+                nested["models"][view_key]["prediction_map_version"] == oaf_prediction_map
+            ), view_key
     else:
         assert entry["scope_identity"] == {
             "pilot_lineage": "validated_hpa396_run",
@@ -1152,6 +1159,7 @@ for comparison_id, (comparison_dir, schema, artifacts) in comparisons.items():
         }
         assert nested["models"]["oaf"]["model_lock_sha256"] == lock
         assert nested["models"]["oaf"]["input_view_id"] == htdemucs_view
+        assert nested["models"]["oaf"]["prediction_map_version"] == oaf_prediction_map
 
     assert [item["path"] for item in entry["artifacts"]] == [
         f"{comparison_dir}/{relative}" for relative in artifacts

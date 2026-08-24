@@ -177,6 +177,8 @@ IDM summary: models["oaf"]["model_lock_sha256"]
 
 A missing or unequal value is a fatal `ComparisonIntegrityError` naming `model_lock_sha256`.
 
+The same five model entries checked by the coordinator — `models["oaf"]` in MuScriptor, `models["full_mix"]`, `models["spleeter"]`, and `models["htdemucs"]` in separation, and `models["oaf"]` in IDM — must also carry equal non-empty `prediction_map_version` values. A missing, malformed, or unequal value is a fatal `ComparisonIntegrityError` naming `prediction_map_version`.
+
 Also require the two HTDemucs-stem identities to agree:
 
 ```text
@@ -365,7 +367,7 @@ crux.paired-benchmark-publication/v1
 `summary.json` contains:
 
 - shared reference/timing/taxonomy/lane/scoring identity;
-- the validated frozen OaF `model_lock_sha256`;
+- the validated frozen OaF `model_lock_sha256`, with nested OaF `prediction_map_version` equality validated before publication;
 - the four-key top-level `pairable_success_counts` map;
 - one entry per pairwise comparison with relative path, closed artifact path/hash index, and scope information copied from the validated nested summary;
 - separation-only reviewed-subset identity under `comparisons.oaf_separation_pilot.scope_identity`;
@@ -408,7 +410,7 @@ Focused tests must prove:
 - MuScriptor and separation summaries expose taxonomy/lane identity; separation's pre-existing scoring identity remains unchanged;
 - the coordinator calls the three existing comparison drivers rather than reimplementing joins;
 - the coordinator passes `subset_manifest_path=None` to MuScriptor, the supplied subset to separation, and no subset argument to IDM;
-- reference, timing, taxonomy, lane-map, scoring, or cross-comparison OaF model-lock mismatch fails closed before final publication;
+- reference, timing, taxonomy, lane-map, scoring, or cross-comparison OaF model-lock or prediction-map mismatch fails closed before final publication;
 - separation HTDemucs and IDM OaF input-view identities match the same frozen stem view;
 - same-view input-hash enforcement remains owned by the existing MuScriptor/IDM drivers;
 - there is no top-level reviewed-subset identity; separation owns its reviewed-subset scope identity and IDM is explicitly marked as not cross-verified at HPA-562 level;
