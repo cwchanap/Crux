@@ -367,7 +367,7 @@ idm_oaf = _model(idm_summary, "oaf")
 
 `_model(summary, key)` requires `summary["models"]` to be a mapping and the entry itself to be a mapping, raising `ComparisonIntegrityError("comparison summary models[...] is malformed")` otherwise.
 
-Require the three OaF inference entries (`muscriptor_oaf`, `separation_full_mix`, `idm_oaf`) to carry valid SHA-256 `model_lock_sha256` values, all equal; the separation `spleeter` and `htdemucs` entries carry their own separation-model locks and are not compared here. Require the same five entries to carry nonempty string `prediction_map_version` values, also equal; a missing or malformed value is a fatal error naming `prediction_map_version`. Then require:
+Require all five OaF/separation model entries (`muscriptor_oaf`, `separation_full_mix`, separation `spleeter` and `htdemucs`, `idm_oaf`) to carry valid SHA-256 `model_lock_sha256` values, all equal. Require the same five entries to carry nonempty string `prediction_map_version` values, also equal; a missing or malformed value is a fatal error naming `prediction_map_version`. Then require:
 
 ```python
 separation_view = separation_summary["models"]["htdemucs"]["input_view_id"]
