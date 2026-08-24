@@ -591,6 +591,20 @@ def test_publish_cross_comparisons_rejects_oaf_prediction_map_mismatch(
     assert not (tmp_path / "published").exists()
 
 
+@pytest.mark.parametrize("bad_map", (None, ""))
+def test_publish_cross_comparisons_rejects_malformed_oaf_prediction_map(
+    tmp_path: Path, monkeypatch, bad_map: object
+) -> None:
+    summaries = _summaries()
+    summaries["oaf_muscriptor_full_mix"]["models"]["oaf"]["prediction_map_version"] = bad_map
+    _patch_drivers(monkeypatch, summaries)
+
+    with pytest.raises(ComparisonIntegrityError, match="prediction_map_version is malformed"):
+        cross_comparison.publish_cross_comparisons(_request(tmp_path))
+
+    assert not (tmp_path / "published").exists()
+
+
 def test_publish_cross_comparisons_rejects_htdemucs_view_mismatch(
     tmp_path: Path, monkeypatch
 ) -> None:
