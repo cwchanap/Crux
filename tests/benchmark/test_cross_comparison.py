@@ -548,8 +548,6 @@ def test_publish_cross_comparisons_rejects_missing_shared_identity(
     [
         ("oaf_muscriptor_full_mix", "oaf"),
         ("oaf_separation_pilot", "full_mix"),
-        ("oaf_separation_pilot", "spleeter"),
-        ("oaf_separation_pilot", "htdemucs"),
         ("oaf_idm_htdemucs", "oaf"),
     ],
 )
@@ -564,6 +562,23 @@ def test_publish_cross_comparisons_rejects_malformed_or_mismatched_oaf_lock(
         cross_comparison.publish_cross_comparisons(_request(tmp_path))
 
     assert not (tmp_path / "published").exists()
+
+
+def test_publish_cross_comparisons_allows_distinct_separation_model_locks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    summaries = _task3_summaries()
+    summaries["oaf_separation_pilot"]["models"]["spleeter"]["model_lock_sha256"] = "f" * 64
+    summaries["oaf_separation_pilot"]["models"]["htdemucs"]["model_lock_sha256"] = "9" * 64
+    _patch_task3_drivers(monkeypatch, summaries)
+
+    outcome = cross_comparison.publish_cross_comparisons(_request(tmp_path))
+
+    assert set(outcome.comparison_paths) == {
+        "oaf_muscriptor_full_mix",
+        "oaf_separation_pilot",
+        "oaf_idm_htdemucs",
+    }
 
 
 @pytest.mark.parametrize(
