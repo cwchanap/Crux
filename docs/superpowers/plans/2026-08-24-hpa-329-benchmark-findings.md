@@ -270,6 +270,21 @@ For each production artifact record its concrete path, schema/version, published
 
 Include the real resolved paths/IDs and the exact reader/CLI invocation. This committed appendix is the future rerun recipe; do not refer to an uncommitted helper script.
 
+Also record the fixed machine-checked table formats used later:
+
+```text
+aggregate row:
+| scope | tolerance_ms | mode | event_micro_precision | event_micro_recall | event_micro_f1 | song_macro_f1 | class_macro_f1 | successful_song_count |
+
+population row:
+| scope | total | success | failed | skipped | quarantined |
+
+pair-count row:
+| comparison_id | pairable_success_count |
+```
+
+Task 8 reconstructs these exact lines directly from typed source objects and the fresh HPA-562 outcome.
+
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -287,23 +302,13 @@ git commit -m "docs: start HPA-329 benchmark findings"
 
 - [ ] **Step 1: Add fixed aggregate tables**
 
-Use six rows per scope in order `30 raw`, `30 aligned`, `50 raw`, `50 aligned`, `100 raw`, `100 aligned` with this exact row shape:
-
-```text
-| scope | tolerance_ms | mode | event_micro_precision | event_micro_recall | event_micro_f1 | song_macro_f1 | class_macro_f1 | successful_song_count |
-```
+Use six rows per scope in order `30 raw`, `30 aligned`, `50 raw`, `50 aligned`, `100 raw`, `100 aligned` with the aggregate row shape defined in Task 1.
 
 Copy values from `PublishedAggregate`; never derive event-micro from song rows.
 
 - [ ] **Step 2: Add population/coverage rows**
 
-Use this exact shape from `PublishedCohortReports.population` and item coverage:
-
-```text
-| scope | total | success | failed | skipped | quarantined |
-```
-
-Include failure reason counts and native/mapping coverage evidence before interpreting paired results.
+Use the population row shape from Task 1 and `PublishedCohortReports.population`. Include failure reason counts and native/mapping coverage evidence before interpreting paired results.
 
 - [ ] **Step 3: Add per-class/distribution evidence and explain raw vs aligned**
 
@@ -326,7 +331,7 @@ git commit -m "docs: summarize OaF benchmark capability"
 
 - [ ] **Step 1: Record pairable counts/exclusions and paired song/class deltas from the existing publication**
 
-The pairable intersections must equal the fresh outcome keys for Spleeter and HTDemucs.
+The pairable intersections must equal the fresh outcome keys for Spleeter and HTDemucs. Use the Task 1 pair-count row format for machine-checked counts.
 
 - [ ] **Step 2: Add measured runtime/storage/operational evidence**
 
@@ -382,7 +387,7 @@ Include `reviewed_subset_cross_verified == false` and the HPA-396 lineage qualif
 
 - [ ] **Step 2: Add population/pairing/native/runtime evidence**
 
-The pairable intersection must equal the fresh `oaf_idm_htdemucs` outcome count.
+The pairable intersection must equal the fresh `oaf_idm_htdemucs` outcome count. Use the Task 1 pair-count row format for the machine-checked count.
 
 - [ ] **Step 3: Keep direct-full-mix smoke separate and decide whether larger IDM work is justified**
 
@@ -465,7 +470,7 @@ Revalidate the MuScriptor lock/run equality, broad typed reports, regenerated re
 
 - [ ] **Step 2: Regenerate and check every absolute headline row in the same invocation**
 
-Use the fixed Task 2/4 row shape. Render Decimal/`None` values with:
+Use the fixed Task 1 aggregate/population row formats. Render Decimal/`None` values with:
 
 ```python
 from src.benchmark.backend_identity import canonical_json_bytes
@@ -474,21 +479,27 @@ def metric(value):
     return "N/A" if value is None else canonical_json_bytes(value).decode("ascii")
 ```
 
-For every expected row constructed directly from `PublishedAggregate`/`PublishedCohortReports.population`, assert the full Markdown line occurs exactly once in the report text. Do not persist the expected rows as a cross-session `/tmp` verification artifact.
+Open the findings Markdown in that invocation. For every expected aggregate/population row constructed directly from `PublishedAggregate` and `PublishedCohortReports.population`, assert `report_text.count(expected_row) == 1`.
+
+This check is generated fresh from the typed objects; it does not read an expected-row `/tmp` file produced by an earlier task/session.
 
 - [ ] **Step 3: Regenerate and check paired counts/scopes**
 
-Require the fresh four `CrossComparisonOutcome.pairable_success_counts` values and nested pairing/exclusion counts to equal the report. Verify reviewed absolute rows are sourced from reviewed HPA-325 objects, and the IDM section still states `reviewed_subset_cross_verified == false`.
+For each fresh `CrossComparisonOutcome.pairable_success_counts` entry, construct the Task 1 pair-count row and assert it occurs exactly once. Verify nested pairing/exclusion counts against their validated summaries, reviewed absolute rows against the reviewed HPA-325 objects, and the IDM caveat against the report text.
 
 - [ ] **Step 4: Verify diagnostic examples**
 
 Every event-level reviewed/separation example must still resolve to at least one parsed diagnostic row for the cited song/view.
 
-- [ ] **Step 5: Run prose/scope hygiene**
+- [ ] **Step 5: Keep the exact Step 2/3 verification invocation in the report appendix**
+
+After the report is final, copy the exact command/snippet used by Steps 2-3 into `Reproducibility appendix`, with the actual artifact paths/IDs. A later reader can therefore rerun the numeric verification without reconstructing an extractor from prose.
+
+- [ ] **Step 6: Run prose/scope and diff hygiene**
 
 Reject unfinished placeholders, an unlabeled pilot/broad leaderboard, aligned-as-headline wording, hidden failure populations, license/accuracy conflation, definite claims for ambiguous examples, or more than one primary decision.
 
-- [ ] **Step 6: Run diff hygiene**
+Then run:
 
 ```bash
 git diff --check main...HEAD
