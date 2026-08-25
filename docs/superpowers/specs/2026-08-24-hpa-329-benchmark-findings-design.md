@@ -75,7 +75,7 @@ Freshly run `publish_cross_comparisons()` (or its existing CLI) from the product
 
 ### Per-scope prechecks
 
-These checks may be performed independently while upstream evidence is still arriving. They are local validation only; they do **not** authorize committing a partial findings report.
+These checks may be performed independently while upstream evidence is still arriving. They are **local validation only** and do not authorize committing a partial findings report.
 
 1. **OaF broad/reviewed:** production OaF run loads, typed broad report loads, reviewed report regenerates and loads.
 2. **OaF separator pilot:** HPA-328 run/view reports/handoff load and retain the expected pilot lineage.
@@ -100,7 +100,7 @@ If the final gate fails, record the missing evidence on HPA-329 and leave the PR
 
 `write_cohort_reports()` always creates `event_diagnostics.jsonl`, so existence alone proves nothing.
 
-Require non-empty diagnostic content for the reviewed OaF/MuScriptor reports and for the HPA-328 view reports used for event-level examples. When Task 6 selects a concrete example, require at least one diagnostic row for that cited song/view before making an event-level causal claim.
+Require non-empty diagnostic content for the reviewed OaF/MuScriptor reports and for the HPA-328 view reports used for event-level examples. When the failure-taxonomy task selects a concrete example, require at least one diagnostic row for that cited song/view before making an event-level causal claim.
 
 Reviewed reports already request diagnostics for every successful selected song; if a reviewed diagnostic file is empty or incomplete, rerun the existing reviewed-subset command. Do not call `score_cohort()` from an HPA-329 scratch path.
 
@@ -153,9 +153,11 @@ Evaluate all eight HPA-329 options and select exactly one primary next step. A m
 
 Do not add `scripts/hpa329_headline_rows.py`; HPA-329 remains a one-report closeout with no new Python file.
 
-The final report's reproducibility appendix must commit the exact reader/CLI invocation used to validate its numbers, including the concrete production paths/identities. Task 8 reruns that committed recipe fresh and compares generated headline rows/counts against the report in the same verification step; it must not depend on a `/tmp` file surviving between commits or sessions.
+The final report's reproducibility appendix must commit the exact reader/CLI invocation used to validate its numbers, including the concrete production paths/identities and the fixed machine-checked table formats. Final verification reruns that committed recipe fresh, reconstructs expected rows directly from typed source objects and `CrossComparisonOutcome`, and asserts those lines occur exactly once in the report.
 
-This makes verification repeatable without creating a maintained report/extractor surface.
+Verification must not depend on an expected-row `/tmp` file surviving between commits or sessions. Temporary files used inside one command are fine, but they are never the source of truth.
+
+This keeps verification repeatable without creating a maintained report/extractor surface.
 
 Before review:
 
