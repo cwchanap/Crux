@@ -4,9 +4,9 @@
 
 **Goal:** Publish one traceable Markdown findings report that closes the pretrained drum-transcription benchmark phase and selects one evidence-supported next step for Crux.
 
-**Architecture:** Do not add a findings-report subsystem. Read absolute cohort metrics from the existing HPA-325 report artifacts and paired populations/deltas from the existing HPA-562 publication, verify that all evidence belongs to the same frozen benchmark lineage, then write one versioned Markdown report. Keep the current planning branch and draft PR for the eventual findings report; if production evidence is missing, stop at the evidence gate and leave the PR planning-only.
+**Architecture:** Do not add a findings-report subsystem. Load absolute cohort metrics through the existing HPA-325 readers, regenerate reviewed-subset reports through their existing commands when needed, and republish paired evidence through the existing HPA-562 coordinator. Keep broad full-mix, reviewed full-mix, separator-pilot, and IDM-pilot evidence separate. If production evidence is missing or any identity check fails, stop at Task 0 and leave the PR planning-only.
 
-**Tech Stack:** Python 3.12, existing Crux benchmark readers/validators, Markdown, shell/git. No new runtime dependency, notebook stack, database, dashboard, scorer, comparison engine, or inference path.
+**Tech Stack:** Python 3.12, existing Crux benchmark readers/validators and CLI commands, Markdown, shell/git. No new runtime dependency, notebook stack, database, dashboard, scorer, comparison engine, or inference path.
 
 **Spec:** `docs/superpowers/specs/2026-08-24-hpa-329-benchmark-findings-design.md`
 
@@ -14,19 +14,30 @@
 
 - Keep all HPA-329 planning, evidence review, and the final report on `agent/hpa-329-benchmark-findings-plan` and its single draft PR. Do not open a second HPA-329 PR.
 - The final deliverable is `docs/benchmark/2026-08-24-drum-transcription-findings.md`.
-- `runtime/muscriptor/model.json` must exist and identify the exact MuScriptor checkpoint used for scored evidence before any final MuScriptor conclusion is published.
+- `runtime/muscriptor/model.json` must exist and its exact file hash/model/checkpoint identity must match the production MuScriptor run before any final MuScriptor conclusion is published.
 - Do not use fixtures, synthetic runs, test goldens, or unit-test populations as benchmark evidence.
-- HPA-325 `summary.json`/validated `PublishedCohortReports` are authoritative for absolute event-micro, song-macro, class-macro, distribution, per-class, and population metrics.
-- HPA-562 `crux.paired-benchmark-publication/v1` is authoritative for paired scope, pairable-success counts, exclusions, paired per-song/per-class rows, and the model × input-view population matrix.
+- HPA-325 `PublishedCohortReports` are authoritative for absolute event-micro, song-macro, class-macro, distribution, per-class, coverage, and population metrics.
+- HPA-562 is authoritative for the paired scopes it actually publishes: broad OaF/MuScriptor full mix, OaF separator pilot, and OaF/IDM HTDemucs pilot. Its OaF/MuScriptor comparison is **not** a reviewed-subset pair.
+- `reviewed_subset_full_mix` uses the two HPA-325 reports produced by `score-oaf-reviewed-subset` and `score-muscriptor-reviewed-subset`. A reviewed OaF/MuScriptor pair is not required for HPA-329; if the written decision later genuinely needs one, reuse `compare-oaf-muscriptor --subset-manifest`.
 - Do not recompute event-micro F1 by averaging song rows or reconstruct a second paired join.
 - Keep `broad_full_mix`, `reviewed_subset_full_mix`, `reviewed_separator_pilot`, and `idm_htdemucs_pilot` visibly separate. There is no global leaderboard across those scopes.
+- Preserve HPA-562's IDM qualification: `reviewed_subset_cross_verified` is false for `oaf_idm_htdemucs`.
 - Present complete success/failure/quarantine populations before paired-intersection metrics.
 - Treat aligned scoring as diagnostics; do not present it as a replacement for raw audio-relative ground truth.
 - Discuss common-canonical score, native class coverage, runtime/reliability, and license suitability as separate dimensions.
-- If event-level examples are needed and not already published, rescore only persisted predictions for a small reviewed-song set with the existing HPA-325 diagnostics seam. Never rerun inference.
+- Use already-published `event_diagnostics.jsonl` for reviewed/subset/separation event examples. Do not call `score_cohort()` from an HPA-329 scratch script. If reviewed OaF/MuScriptor diagnostics are missing, regenerate the reviewed report with the existing subset command.
 - Select exactly one of HPA-329's eight decision options as the primary next step. Create follow-up Linear issues only after that decision and only when measured evidence justifies them.
 - No backward compatibility for old benchmark-report schemas.
 - No generic findings generator, reporting framework, notebook platform, dashboard, automatic winner policy, significance/bootstrap layer, fine-tuning, full-corpus IDM run, or editor integration in HPA-329.
+
+## Frozen evidence-source map
+
+| HPA-329 scope | Absolute metrics | Paired deltas |
+| --- | --- | --- |
+| `broad_full_mix` | HPA-325 OaF + MuScriptor broad reports | HPA-562 `comparisons/oaf-muscriptor/` |
+| `reviewed_subset_full_mix` | HPA-325 reports from the two reviewed-subset commands | Not required. Optional only through existing `compare-oaf-muscriptor --subset-manifest` if the final decision needs it. |
+| `reviewed_separator_pilot` | HPA-328 full-mix/Spleeter/HTDemucs view reports | HPA-562 `comparisons/oaf-separation/` |
+| `idm_htdemucs_pilot` | HPA-396 OaF/IDM pilot reports | HPA-562 `comparisons/oaf-idm/` |
 
 ---
 
@@ -41,97 +52,206 @@ Create only after Task 0 passes
   docs/benchmark/2026-08-24-drum-transcription-findings.md
 ```
 
-No production Python file or test file is planned. Temporary local extraction snippets are disposable analysis tools and remain uncommitted.
+No production Python file or test file is planned. Temporary local extraction/checking snippets are disposable analysis tools and remain uncommitted.
 
 ---
 
-### Task 0: Prove the production evidence is complete before writing conclusions
+### Task 0: Load the production evidence through existing readers/CLIs, or stop
 
 **Files:**
 - Read: `runtime/oaf_tf1/model.json`
 - Read: `runtime/muscriptor/model.json`
-- Read: production HPA-325 cohort report directories
+- Read: production OaF/MuScriptor run snapshots
+- Read/regenerate: production reviewed-subset HPA-325 reports
 - Read: production HPA-327 reviewed-subset manifest
 - Read: production HPA-328 separation run/comparison/handoff artifacts
 - Read: production HPA-396 IDM run/comparison artifacts
-- Read: production HPA-562 publication bundle
+- Regenerate/validate: production HPA-562 publication bundle
 - Modify only if the gate fails: Linear HPA-329 discussion, not repository files
 
 **Interfaces:**
-- Consumes: the immutable run/report/publication outputs produced by HPA-325/HPA-327/HPA-328/HPA-395/HPA-396/HPA-562.
-- Produces: a recorded set of exact evidence paths and identities that every later task uses.
+- Consumes:
+  - `load_muscriptor_model_lock(Path) -> MuscriptorModelLock`
+  - `compute_model_lock_sha256(Path) -> str`
+  - `parse_muscriptor_corpus_run(bytes) -> Mapping[str, object]`
+  - `muscriptor_comparison._load_evidence(...)` for the exact broad run/report validation path already used by the comparator
+  - `score_oaf_reviewed_subset()` / `score_muscriptor_reviewed_subset()` through their existing CLI commands
+  - `read_cohort_reports(report_dir, expected_identity=...)`
+  - `publish_cross_comparisons(CrossComparisonRequest) -> CrossComparisonOutcome`
+- Produces: one recorded set of concrete production paths, typed cohort objects, the fresh HPA-562 outcome, and exact identities used by every later task.
 
-- [ ] **Step 1: Verify the MuScriptor lock exists and validates**
+- [ ] **Step 1: Resolve the concrete production paths before validating anything**
 
-Run from the repository root:
+Record the real paths from the completed upstream executions/handoffs:
+
+```text
+OAF_RUN
+MUSCRIPTOR_RUN
+REFERENCE_MANIFEST
+TIMING_MANIFEST
+SUBSET_MANIFEST
+OAF_REVIEWED_REPORTS
+MUSCRIPTOR_REVIEWED_REPORTS
+SEPARATION_RUN
+SEPARATION_CACHE (optional)
+IDM_RUN
+HPA562_REPUBLISH_DIR (a new, non-existing directory)
+```
+
+The runner output roots are caller-owned; do not invent a repository-default artifact location. If any required run/manifest path cannot be resolved, stop and record that missing evidence on HPA-329.
+
+- [ ] **Step 2: Load the checked-in MuScriptor lock and require exact equality with the production run**
+
+Run a one-off check using the production `MUSCRIPTOR_RUN` path:
+
+```python
+from pathlib import Path
+
+from src.benchmark.artifact_io import read_regular_file_no_follow
+from src.benchmark.muscriptor_corpus_run import (
+    compute_model_lock_sha256,
+    parse_muscriptor_corpus_run,
+)
+from src.benchmark.muscriptor_model import load_muscriptor_model_lock
+
+lock_path = Path("runtime/muscriptor/model.json")
+run_path = Path(MUSCRIPTOR_RUN)
+
+lock = load_muscriptor_model_lock(lock_path)
+snapshot = parse_muscriptor_corpus_run(read_regular_file_no_follow(run_path))
+
+assert snapshot["model_id"] == lock.model_id
+assert snapshot["model_lock_sha256"] == compute_model_lock_sha256(lock_path)
+assert snapshot["checkpoint_revision"] == lock.checkpoint_revision
+assert snapshot["checkpoint_sha256"] == lock.checkpoint_sha256
+```
+
+Do not replace this with `pytest tests/benchmark/test_muscriptor_model.py`: that suite exercises synthetic `tmp_path` locks and does not prove the checked-in production lock matches the scored run. If `runtime/muscriptor/model.json` is absent because HPA-627 is still blocked, stop HPA-329 here.
+
+- [ ] **Step 3: Load the broad OaF and MuScriptor run/report evidence through the comparator's existing loader**
+
+Use the exact validation seam already used by the OaF/MuScriptor comparator instead of reconstructing `CohortIdentity` manually:
+
+```python
+from pathlib import Path
+
+from src.benchmark.backend_identity import MUSCRIPTOR_BACKEND_ID, OAF_BACKEND_ID
+from src.benchmark.muscriptor_comparison import _load_evidence
+
+oaf_broad = _load_evidence(
+    Path(OAF_RUN),
+    expected_backend_id=OAF_BACKEND_ID,
+    argument="oaf-run",
+)
+muscriptor_broad = _load_evidence(
+    Path(MUSCRIPTOR_RUN),
+    expected_backend_id=MUSCRIPTOR_BACKEND_ID,
+    argument="muscriptor-run",
+)
+```
+
+This deliberately reuses a private existing seam in a disposable HPA-329 analysis invocation; do not copy its parser into HPA-329. Do not use `_compat_report_identity()` for production evidence because its dummy backend-descriptor hash is only a narrow legacy test seam.
+
+- [ ] **Step 4: Regenerate/validate the two reviewed-subset HPA-325 reports through the existing commands**
+
+Run the current reviewed-subset paths over the persisted parent runs; these commands do not rerun model inference:
 
 ```bash
-test -f runtime/muscriptor/model.json
-uv run pytest tests/benchmark/test_muscriptor_model.py -q
+uv run crux benchmark score-oaf-reviewed-subset \
+  --run "$OAF_RUN" \
+  --manifest "$REFERENCE_MANIFEST" \
+  --timing-manifest "$TIMING_MANIFEST" \
+  --subset-manifest "$SUBSET_MANIFEST" \
+  --output-dir "$OAF_REVIEWED_REPORTS"
+
+uv run crux benchmark score-muscriptor-reviewed-subset \
+  --run "$MUSCRIPTOR_RUN" \
+  --manifest "$REFERENCE_MANIFEST" \
+  --timing-manifest "$TIMING_MANIFEST" \
+  --subset-manifest "$SUBSET_MANIFEST" \
+  --output-dir "$MUSCRIPTOR_REVIEWED_REPORTS"
 ```
 
-Expected: the file exists and the focused lock suite passes. If the file is absent because HPA-627 is still blocked on gated Hugging Face access, stop HPA-329 here. Do not substitute metadata-only revision information for the canonical lock.
+Capture each command's `cohort_id`. Load each report directory with `read_cohort_reports()` using the corresponding broad typed identity with only `cohort_id` replaced by that command's returned reviewed-subset cohort ID:
 
-- [ ] **Step 2: Resolve the exact production evidence paths from the completed upstream runs**
+```python
+from dataclasses import replace
+from pathlib import Path
 
-Collect and record these concrete paths before continuing:
+from src.benchmark.reports import read_cohort_reports
+
+oaf_reviewed = read_cohort_reports(
+    Path(OAF_REVIEWED_REPORTS),
+    expected_identity=replace(oaf_broad.reports.identity, cohort_id=OAF_REVIEWED_COHORT_ID),
+)
+muscriptor_reviewed = read_cohort_reports(
+    Path(MUSCRIPTOR_REVIEWED_REPORTS),
+    expected_identity=replace(
+        muscriptor_broad.reports.identity,
+        cohort_id=MUSCRIPTOR_REVIEWED_COHORT_ID,
+    ),
+)
+```
+
+Do not require a reviewed OaF/MuScriptor paired comparison in Task 0. The two reviewed HPA-325 reports are the required `reviewed_subset_full_mix` evidence.
+
+- [ ] **Step 5: Republish HPA-562 from the production run inputs and use its outcome as the pair-count source**
+
+Run the existing `publish-paired-comparisons` path into the new `HPA562_REPUBLISH_DIR`, or call `publish_cross_comparisons()` directly with the same inputs. The output directory must not already exist.
+
+The successful outcome must expose exactly these four non-negative counts:
 
 ```text
-OaF broad run + HPA-325 report directory
-MuScriptor broad run + HPA-325 report directory
-OaF reviewed-subset HPA-325 report directory
-MuScriptor reviewed-subset HPA-325 report directory
-HPA-327 accepted subset manifest
-HPA-328 separation run/comparison/handoff
-HPA-396 IDM run/comparison
-HPA-562 paired publication directory
-reference-set manifest
-reference-timing manifest
+oaf_muscriptor_full_mix
+oaf_separation_pilot.spleeter
+oaf_separation_pilot.htdemucs
+oaf_idm_htdemucs
 ```
 
-The values come from the actual completed upstream executions/handoffs. Do not invent repository-default paths: the runners accept caller-owned output directories, so the real paths are part of the evidence being frozen in the final report.
+Treat `CrossComparisonOutcome.pairable_success_counts` (or the CLI JSON rendered directly from that outcome) as authoritative. Do not hand-open a stale `summary.json`, check its schema, and call that equivalent validation: `publish_cross_comparisons()` already re-runs the owning comparison validators, cross-validates shared identity, checks the closed artifact set, and publishes atomically.
 
-- [ ] **Step 3: Verify the HPA-562 publication is real and complete**
+- [ ] **Step 6: Freeze the four-scope evidence map**
 
-Inspect the production HPA-562 `summary.json` and require:
+Record this exact mapping with the concrete paths resolved in Steps 1-5:
 
 ```text
-schema == crux.paired-benchmark-publication/v1
-pairable_success_counts has exactly:
-  oaf_muscriptor_full_mix
-  oaf_separation_pilot.spleeter
-  oaf_separation_pilot.htdemucs
-  oaf_idm_htdemucs
-headline_matrix.csv exists
-all indexed nested artifacts exist and match their recorded SHA-256
+broad_full_mix
+  absolute: oaf_broad.reports + muscriptor_broad.reports
+  pair:     HPA562_REPUBLISH_DIR/comparisons/oaf-muscriptor
+
+reviewed_subset_full_mix
+  absolute: oaf_reviewed + muscriptor_reviewed
+  pair:     none required
+
+reviewed_separator_pilot
+  absolute: HPA-328 full_mix/spleeter/htdemucs view reports
+  pair:     HPA562_REPUBLISH_DIR/comparisons/oaf-separation
+
+idm_htdemucs_pilot
+  absolute: HPA-396 OaF/IDM pilot reports
+  pair:     HPA562_REPUBLISH_DIR/comparisons/oaf-idm
+  caution:  reviewed_subset_cross_verified == false
 ```
 
-Prefer regenerating/validating the bundle through the existing `crux benchmark publish-paired-comparisons` path from the immutable production run inputs rather than manually repairing a stale bundle. Any HPA-562 identity failure is an upstream evidence problem, not something to paper over in HPA-329.
+HPA-562's `comparisons/oaf-muscriptor/` is broad-only because the coordinator invokes `compare_oaf_muscriptor(..., subset_manifest_path=None)`. Never reuse it as reviewed-subset pairing.
 
-- [ ] **Step 4: Prove the source cohort reports are production reports, not fixtures**
+- [ ] **Step 7: Confirm required event-diagnostic artifacts already exist where HPA-329 will use them**
 
-For each HPA-325 report directory, validate the six report artifacts with the existing `read_cohort_reports()` contract and the run-derived `CohortIdentity`. Confirm the report schema is `crux.single-cohort-report/v1` and that the report identity matches the associated run/model/input view.
-
-Use the existing application readers in a one-off Python invocation; do not write a second parser. The check must fail if `summary.json`, `items.csv`, `per_song.csv`, or `per_class.csv` has mixed identity or malformed canonical data.
-
-- [ ] **Step 5: Prove all required scopes are represented**
-
-Before proceeding, the evidence set must contain:
+Require canonical `event_diagnostics.jsonl` in:
 
 ```text
-broad_full_mix: OaF + MuScriptor
-reviewed_subset_full_mix: OaF + MuScriptor
-reviewed_separator_pilot: OaF full mix + Spleeter + HTDemucs
-idm_htdemucs_pilot: OaF + IDM on identical retained HTDemucs stems
+OAF_REVIEWED_REPORTS
+MUSCRIPTOR_REVIEWED_REPORTS
+HPA-328 full-mix/Spleeter/HTDemucs view report directories used for examples
 ```
 
-If a scope is missing, stop instead of silently shrinking the requested HPA-329 analysis.
+The reviewed-subset scorer and HPA-328 separation scorer already request diagnostics for every successful selected song. `read_cohort_reports()` does not parse this file, so its presence is checked separately. Do not require or manufacture IDM event diagnostics.
 
-- [ ] **Step 6: Record the gate result**
+- [ ] **Step 8: Record the gate result**
 
-If all checks pass, record the exact evidence paths plus their immutable identities for use in Task 1.
+If every check passes, record the exact paths, model/run/cohort IDs, lock hashes, manifest/timing hashes, input views, the fresh HPA-562 output path, and its four pairable counts for Task 1.
 
-If any check fails, add a concise Linear HPA-329 comment naming the missing artifact/identity and leave the draft PR planning-only. There is intentionally no repository commit for a failed Task 0.
+If any check fails, add a concise Linear HPA-329 comment naming the missing/mismatched artifact and leave the draft PR planning-only. There is intentionally no repository commit for a failed Task 0.
 
 ---
 
@@ -141,8 +261,8 @@ If any check fails, add a concise Linear HPA-329 comment naming the missing arti
 - Create: `docs/benchmark/2026-08-24-drum-transcription-findings.md`
 
 **Interfaces:**
-- Consumes: the concrete evidence path set from Task 0.
-- Produces: one report with a fixed scope vocabulary and a traceability table reused by all later sections.
+- Consumes: the concrete evidence set from Task 0.
+- Produces: one report with a fixed scope vocabulary, evidence-source table, and traceability table reused by all later sections.
 
 - [ ] **Step 1: Create the fixed report outline**
 
@@ -165,20 +285,20 @@ Create the file with exactly these top-level sections:
 
 Leave `Executive summary` semantically empty until Task 7; do not write a provisional winner.
 
-- [ ] **Step 2: Add the scope table**
+- [ ] **Step 2: Add the fixed scope/evidence-source table**
 
-Use these four scope labels and no alternatives:
+Use:
 
 ```markdown
-| scope | models/views | population meaning |
-| --- | --- | --- |
-| broad_full_mix | OaF full mix, MuScriptor full mix | complete technically eligible broad corpus with model failures preserved |
-| reviewed_subset_full_mix | OaF full mix, MuScriptor full mix | accepted HPA-327 reviewed membership |
-| reviewed_separator_pilot | OaF full mix, Spleeter drums, HTDemucs drums | fixed HPA-328 pilot only |
-| idm_htdemucs_pilot | OaF HTDemucs stem, IDM HTDemucs stem | fixed HPA-396 identical-input pilot only |
+| scope | absolute source | paired source | population meaning |
+| --- | --- | --- | --- |
+| broad_full_mix | HPA-325 OaF + MuScriptor broad reports | HPA-562 oaf-muscriptor | complete technically eligible broad corpus with model failures preserved |
+| reviewed_subset_full_mix | HPA-325 OaF + MuScriptor reviewed reports | none required | accepted HPA-327 reviewed membership |
+| reviewed_separator_pilot | HPA-328 full mix/Spleeter/HTDemucs view reports | HPA-562 oaf-separation | fixed HPA-328 pilot only |
+| idm_htdemucs_pilot | HPA-396 OaF/IDM pilot reports | HPA-562 oaf-idm | fixed HPA-396 identical-input pilot; HPA-562 does not cross-verify reviewed membership against HPA-328 |
 ```
 
-This table is the report-level guard against an unlabeled leaderboard.
+This table is the report-level guard against both an unlabeled leaderboard and the broad-vs-reviewed OaF/MuScriptor mix-up.
 
 - [ ] **Step 3: Add the evidence identity table**
 
@@ -201,7 +321,7 @@ lane-map version
 scoring version
 ```
 
-Do not copy a value from another model/view merely because it is expected to match; use the existing validation to prove equality and list the authoritative value.
+Do not copy a value from another model/view merely because it is expected to match; use Task 0 validation to prove equality and list the authoritative value.
 
 - [ ] **Step 4: Record the exact Crux revision used to validate the report**
 
@@ -211,7 +331,7 @@ Run:
 git rev-parse HEAD
 ```
 
-Record that SHA in the reproducibility appendix as the analysis implementation revision. If later commits change any benchmark reader used by this report, update the recorded SHA during Task 8.
+Record that SHA in the reproducibility appendix. If later commits change any benchmark reader used by this report, update the recorded SHA during Task 8.
 
 - [ ] **Step 5: Commit the traceable report shell**
 
@@ -226,14 +346,15 @@ git commit -m "docs: start HPA-329 benchmark findings"
 
 **Files:**
 - Modify: `docs/benchmark/2026-08-24-drum-transcription-findings.md`
+- Local-only: `/tmp/hpa329-headline-rows.txt`
 
 **Interfaces:**
-- Consumes: validated OaF broad and reviewed-subset `PublishedCohortReports`.
-- Produces: absolute OaF capability tables and the raw-versus-aligned diagnostic interpretation.
+- Consumes: `oaf_broad.reports` and `oaf_reviewed` from Task 0.
+- Produces: absolute OaF capability tables and exact Markdown headline rows that Task 8 can regenerate and compare.
 
-- [ ] **Step 1: Extract the six canonical aggregate rows per OaF scope**
+- [ ] **Step 1: Emit the six canonical aggregate rows per OaF scope from typed `PublishedAggregate` objects**
 
-For each OaF report, use `read_cohort_reports()` and its `PublishedAggregate` values. Keep fixed order:
+Keep fixed order:
 
 ```text
 30 raw
@@ -244,7 +365,7 @@ For each OaF report, use `read_cohort_reports()` and its `PublishedAggregate` va
 100 aligned
 ```
 
-For each row copy the canonical persisted values for:
+For each row emit and paste the canonical persisted values for:
 
 ```text
 event-micro precision
@@ -256,11 +377,11 @@ event-micro precision
  song F1 min/p10/p25/median/p75/p90/max
 ```
 
-Do not derive event-micro values from `per_song.csv`.
+Append the exact generated Markdown table rows to `/tmp/hpa329-headline-rows.txt`; do not retype decimals from memory or derive event-micro values from `per_song.csv`.
 
 - [ ] **Step 2: Add complete population/coverage context before score interpretation**
 
-For broad and reviewed scopes, report:
+For broad and reviewed scopes, copy from the typed report objects/items:
 
 ```text
 total
@@ -272,17 +393,19 @@ failure reason counts
 prediction mapping coverage/native-output coverage evidence
 ```
 
+Append any headline population table rows to `/tmp/hpa329-headline-rows.txt` as exact lines.
+
 Call out selection bias explicitly: the reviewed subset is a diagnostic quality-control view, not a replacement for broad-corpus performance.
 
 - [ ] **Step 3: Add the per-class evidence that explains the conclusion**
 
-Start from the HPA-325 aggregate `per_class` rows. Include all classes in an appendix/table when practical, and in prose call out only material classes that explain the observed strengths/weaknesses. Preserve reference/prediction support so a high or low F1 cannot be interpreted without population size.
+Start from each HPA-325 aggregate `per_class`. Include all classes in an appendix/table when practical, and in prose call out only material classes that explain observed strengths/weaknesses. Preserve reference/prediction support.
 
 - [ ] **Step 4: Explain the raw/aligned gap without promoting aligned scores to the headline**
 
-Use the persisted raw/aligned aggregates and timing diagnostics. State whether alignment materially changes the interpretation and what that implies about residual timing/source semantics. Keep raw scores as the ground-truth-facing benchmark view; aligned scores are diagnostic evidence.
+Use the persisted raw/aligned aggregates and timing diagnostics. State whether alignment materially changes the interpretation and what that implies about residual timing/source semantics. Keep raw scores as the ground-truth-facing benchmark view.
 
-- [ ] **Step 5: Commit the OaF evidence section**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add docs/benchmark/2026-08-24-drum-transcription-findings.md
@@ -295,14 +418,15 @@ git commit -m "docs: summarize OaF benchmark capability"
 
 **Files:**
 - Modify: `docs/benchmark/2026-08-24-drum-transcription-findings.md`
+- Append local verification rows: `/tmp/hpa329-headline-rows.txt`
 
 **Interfaces:**
-- Consumes: HPA-562 `comparisons/oaf-separation/` plus HPA-328 runtime/storage/handoff evidence.
+- Consumes: fresh HPA-562 `comparisons/oaf-separation/`, `CrossComparisonOutcome.pairable_success_counts`, and HPA-328 runtime/storage/view reports.
 - Produces: one pilot-scoped full-mix vs Spleeter vs HTDemucs conclusion.
 
 - [ ] **Step 1: Copy the exact paired population evidence**
 
-Use HPA-562/HPA-328 to report for Spleeter and HTDemucs:
+Use the validated HPA-562 nested summary and outcome for Spleeter and HTDemucs:
 
 ```text
 pairable_success_intersection
@@ -312,11 +436,11 @@ paired song-row count
 paired class-row count
 ```
 
-These counts must match top-level HPA-562 `pairable_success_counts` exactly.
+The pairable intersections must equal `CrossComparisonOutcome.pairable_success_counts["oaf_separation_pilot.spleeter"]` and `["oaf_separation_pilot.htdemucs"]`. Append the exact report lines to `/tmp/hpa329-headline-rows.txt`.
 
 - [ ] **Step 2: Summarize paired score movement without rebuilding the join**
 
-Read the existing:
+Read the already-generated:
 
 ```text
 comparisons/oaf-separation/spleeter/paired_per_song.csv
@@ -325,11 +449,11 @@ comparisons/oaf-separation/htdemucs/paired_per_song.csv
 comparisons/oaf-separation/htdemucs/paired_per_class.csv
 ```
 
-Use the published aggregate deltas and representative rows to identify which separator/classes/songs improve or regress. Do not recompute a new paired population.
+Use the published aggregate deltas and representative rows. Do not recompute a new paired population.
 
 - [ ] **Step 3: Add measured cost/complexity evidence**
 
-Use HPA-328 persisted runtime and retained-byte evidence to compare direct OaF with separator + OaF. Discuss wall time, storage, extra runtime/environment/model dependencies, and operational steps. Do not invent dollar costs when the upstream artifacts did not measure them.
+Use HPA-328 persisted runtime and retained-byte evidence to compare direct OaF with separator + OaF. Discuss wall time, storage, extra environment/model dependencies, and operational steps. Do not invent dollar costs.
 
 - [ ] **Step 4: Write one explicit separator conclusion**
 
@@ -342,7 +466,7 @@ use HTDemucs before OaF
 pilot is inconclusive
 ```
 
-Tie the statement to both quality delta and added cost. Keep the conclusion labeled `reviewed_separator_pilot`; do not imply full-corpus validation.
+Tie it to both quality delta and added cost. Keep it labeled `reviewed_separator_pilot`.
 
 - [ ] **Step 5: Commit**
 
@@ -353,22 +477,23 @@ git commit -m "docs: conclude OaF separation pilot"
 
 ---
 
-### Task 4: Populate MuScriptor independent and paired findings
+### Task 4: Populate MuScriptor independent and broad-paired findings
 
 **Files:**
 - Modify: `docs/benchmark/2026-08-24-drum-transcription-findings.md`
+- Append local verification rows: `/tmp/hpa329-headline-rows.txt`
 
 **Interfaces:**
-- Consumes: validated MuScriptor broad/reviewed HPA-325 reports, HPA-562 OaF/MuScriptor comparison, MuScriptor run/model-lock evidence.
+- Consumes: `muscriptor_broad.reports`, `muscriptor_reviewed`, fresh HPA-562 broad OaF/MuScriptor comparison, and the validated MuScriptor run/model lock.
 - Produces: separate accuracy, coverage, reliability, runtime, and license conclusions for MuScriptor.
 
 - [ ] **Step 1: Report MuScriptor independently on broad and reviewed scopes**
 
-Use the same six-row 30/50/100 raw/aligned aggregate shape as Task 2. Include complete success/failure population before any OaF pairing.
+Use the same six-row typed HPA-325 aggregate shape as Task 2. Include complete success/failure population before any OaF pairing. Append the exact generated Markdown headline rows to `/tmp/hpa329-headline-rows.txt`.
 
-- [ ] **Step 2: Add the exact OaF/MuScriptor paired comparison**
+- [ ] **Step 2: Add only the broad OaF/MuScriptor paired comparison from HPA-562**
 
-Use HPA-562 `comparisons/oaf-muscriptor/` for:
+Use fresh HPA-562 `comparisons/oaf-muscriptor/` for:
 
 ```text
 pairable success count
@@ -377,15 +502,17 @@ paired song deltas
 paired class deltas
 ```
 
-Keep paired deltas separate from each model's independent population so a model-specific failure cannot disappear from the headline.
+This is `broad_full_mix` only. Do **not** present it as reviewed-subset pairing. Reviewed OaF and MuScriptor remain independent HPA-325 cohorts unless the final decision specifically requires an additional pair.
+
+If that additional reviewed pair becomes necessary, run the already-existing `compare-oaf-muscriptor --subset-manifest` command against the same parent runs/manifests and label the resulting artifact `reviewed_subset_full_mix`; do not add a new join or modify HPA-562.
 
 - [ ] **Step 3: Add native-output and timing evidence**
 
-Report native pitch/class coverage, mapped/unmapped counts, timing behavior, and representative errors from the persisted run/reports. Explicitly state that the released MuScriptor transcription path does not preserve velocity.
+Report native pitch/class coverage, mapped/unmapped counts, timing behavior, and representative errors from persisted run/reports. Explicitly state that the released MuScriptor transcription path does not preserve velocity.
 
 - [ ] **Step 4: Add runtime/memory and license suitability**
 
-Use measured run evidence for runtime, real-time factor, process/device memory where available, and operational reliability. Record the checkpoint weight license from the canonical model lock and explain what `cc-by-nc-4.0` means for the intended Crux usage without treating license suitability as an accuracy metric.
+Use measured run evidence for runtime, real-time factor, process/device memory where available, and operational reliability. Record the checkpoint weight license from the checked-in lock that Task 0 proved matches the run. Treat license suitability separately from accuracy.
 
 - [ ] **Step 5: Commit**
 
@@ -400,30 +527,40 @@ git commit -m "docs: summarize MuScriptor comparison"
 
 **Files:**
 - Modify: `docs/benchmark/2026-08-24-drum-transcription-findings.md`
+- Append local verification rows: `/tmp/hpa329-headline-rows.txt`
 
 **Interfaces:**
-- Consumes: HPA-562 `comparisons/oaf-idm/` plus HPA-396 run/model/runtime evidence.
-- Produces: an IDM pilot conclusion that cannot be confused with broad/full-mix evidence.
+- Consumes: fresh HPA-562 `comparisons/oaf-idm/`, its top-level `scope_identity`, and HPA-396 run/model/runtime evidence.
+- Produces: an IDM pilot conclusion that cannot be confused with broad/full-mix or cross-verified reviewed-subset evidence.
 
-- [ ] **Step 1: State the identical-input pilot contract before metrics**
+- [ ] **Step 1: State the identical-input pilot contract and scope caution before metrics**
 
-Record the exact pilot membership/input-view identity and the upstream proof that OaF and IDM consumed identical retained HTDemucs stem hashes. Label the entire section `idm_htdemucs_pilot`.
+Record the exact pilot input-view identity and the upstream proof that OaF and IDM consumed identical retained HTDemucs stem hashes. Label the section `idm_htdemucs_pilot`.
+
+Also copy the HPA-562 scope qualification:
+
+```text
+pilot_lineage == validated_hpa396_run
+reviewed_subset_cross_verified == false
+```
+
+Do not claim that HPA-562 proved the IDM pilot and HPA-328 separator publication use one cross-verified HPA-327 reviewed membership.
 
 - [ ] **Step 2: Report population and paired deltas**
 
-Use HPA-562/HPA-396 for exact success/failure population, pairable-success intersection/exclusions, and existing paired song/class deltas. Do not compare IDM's pilot absolute number directly with a broad-corpus OaF/MuScriptor headline as though populations were equal.
+Use HPA-562/HPA-396 for exact success/failure population, pairable-success intersection/exclusions, and existing paired song/class deltas. The intersection must equal `CrossComparisonOutcome.pairable_success_counts["oaf_idm_htdemucs"]`. Append exact headline rows to `/tmp/hpa329-headline-rows.txt`.
 
 - [ ] **Step 3: Add native capability and operational evidence**
 
 Report checkpoint-native class coverage, velocity availability, mapping coverage, failure reasons, install/runtime maturity, measured runtime, and memory where available.
 
-- [ ] **Step 4: Keep any direct-full-mix smoke result in a separate diagnostic subsection**
+- [ ] **Step 4: Keep any direct-full-mix smoke result separate**
 
-If HPA-396 contains a direct-full-mix compatibility smoke, label it as smoke/compatibility evidence only. It is not a full-corpus or scored-peer result.
+If HPA-396 contains a direct-full-mix compatibility smoke, label it smoke/compatibility evidence only. It is not a full-corpus or scored-peer result.
 
 - [ ] **Step 5: State whether a larger IDM experiment is justified**
 
-Write `yes`, `no`, or `inconclusive` with one evidence-based reason. Do not start or create a full-corpus IDM task until Task 7 chooses the primary next step or explicitly justifies that follow-up.
+Write `yes`, `no`, or `inconclusive` with one evidence-based reason. Do not create a full-corpus IDM issue until Task 7 chooses the primary next step or directly justifies that follow-up.
 
 - [ ] **Step 6: Commit**
 
@@ -434,19 +571,19 @@ git commit -m "docs: summarize IDM stem pilot"
 
 ---
 
-### Task 6: Build a small evidence-backed failure taxonomy from reviewed examples
+### Task 6: Build a small failure taxonomy from existing diagnostics and paired rows only
 
 **Files:**
 - Modify: `docs/benchmark/2026-08-24-drum-transcription-findings.md`
-- Optional local-only analysis output: uncommitted temporary files under the developer's scratch directory
+- Read only: reviewed/separation `event_diagnostics.jsonl`, HPA-562 paired CSVs, native-coverage/runtime artifacts
 
 **Interfaces:**
-- Consumes: HPA-327 reviewed evidence, HPA-325 event diagnostics, HPA-562 paired per-song/per-class rows, persisted prediction/reference artifacts.
+- Consumes: canonical diagnostics already emitted by reviewed-subset scoring and HPA-328 view scoring; paired song/class rows; native coverage/failure evidence.
 - Produces: representative examples classified by cause with ambiguity called out explicitly.
 
 - [ ] **Step 1: Select a bounded diagnostic sample from already-published evidence**
 
-Choose a small set that covers useful contrasts rather than a new statistical study:
+Choose a small set that covers useful contrasts:
 
 ```text
 one strong matched case
@@ -457,29 +594,36 @@ one material cross-model disagreement
 one ambiguous timing/source/reference case if present
 ```
 
-Prefer reviewed-subset songs and use score/delta extremes only to select examples for diagnosis, never to change benchmark membership.
+Prefer reviewed-subset songs. Score/delta extremes may select examples for diagnosis but never change benchmark membership.
 
-- [ ] **Step 2: Reuse existing event diagnostics where present**
+- [ ] **Step 2: Read canonical event diagnostics directly for reviewed/subset/separation examples**
 
-Inspect persisted matched/FP/FN diagnostic rows plus native mapping/coverage evidence. Do not infer event-level causes from aggregate F1 alone.
-
-- [ ] **Step 3: If diagnostics are missing, rescore persisted predictions only for the selected IDs**
-
-Use the existing HPA-325 `score_cohort(..., diagnostics_for=...)` / report path over persisted predictions and the same frozen reference/taxonomy/scoring identities. This is diagnostic rescoring only:
+`read_cohort_reports()` intentionally excludes event diagnostics from `PublishedCohortReports`, so read each `event_diagnostics.jsonl` line with the existing strict JSON loader and require the published fields:
 
 ```text
-no model inference
-no separator rerun
-no map change
-no tolerance change outside the frozen 30/50/100 set
-no benchmark membership change
+cohort_id
+simfile_id
+tolerance_ms
+mode
+outcome
+common_class
+reference_time_sec
+prediction_time_sec
+scored_prediction_time_sec
+timing_error_sec
 ```
 
-Do not commit a new diagnostic framework.
+Use these persisted matched/FP/FN rows plus native mapping/coverage evidence. Do not infer event-level causes from aggregate F1 alone.
+
+- [ ] **Step 3: Do not create an HPA-329 diagnostic rescore path**
+
+There is no `score_cohort(..., diagnostics_for=...)` call in HPA-329.
+
+If OaF or MuScriptor reviewed diagnostics are missing, rerun the existing `score-oaf-reviewed-subset` / `score-muscriptor-reviewed-subset` command from Task 0 against the persisted predictions. If a separation example lacks event diagnostics, stay on its existing paired song/class evidence rather than rerunning separation or inference. For IDM, use HPA-562 paired CSVs plus native coverage/failure/runtime evidence only; do not add event diagnostics after the fact.
 
 - [ ] **Step 4: Classify examples into the ticket's failure taxonomy**
 
-Use these labels:
+Use:
 
 ```text
 recognition/model limit
@@ -494,11 +638,11 @@ operational/runtime failure
 license/deployment constraint
 ```
 
-For each example, cite the evidence that supports the classification. If two causes remain plausible, mark the example ambiguous rather than forcing one label.
+For each example, cite the persisted evidence. If two causes remain plausible, mark it ambiguous rather than forcing one label.
 
 - [ ] **Step 5: Summarize the dominant measured limitations**
 
-Rank only limitations that have evidence in the reviewed examples and population-level metrics. Do not claim a causal percentage split that the benchmark did not measure.
+Rank only limitations supported by reviewed examples and population-level metrics. Do not claim a causal percentage split that the benchmark did not measure.
 
 - [ ] **Step 6: Commit**
 
@@ -574,36 +718,71 @@ git commit -m "docs: decide next Crux transcription step"
 
 ---
 
-### Task 8: Verify traceability, close the report PR, and hand the result back to Linear
+### Task 8: Re-read typed evidence, verify every headline cell, then hand the result back to Linear
 
 **Files:**
 - Modify if verification finds a report defect: `docs/benchmark/2026-08-24-drum-transcription-findings.md`
 - No production-code changes
 
 **Interfaces:**
-- Consumes: complete HPA-329 report and all source evidence.
-- Produces: review-ready single-PR closeout with no unsupported claims.
+- Consumes: complete HPA-329 report and the same Task 0 typed readers/outcome.
+- Produces: review-ready single-PR closeout with no unsupported or mistyped headline values.
 
-- [ ] **Step 1: Trace every headline row back to an immutable source**
+- [ ] **Step 1: Re-run the full Task 0 reader/publication pass**
 
-For each absolute score table, verify the source HPA-325 report path/cohort identity. For each paired table, verify the HPA-562 nested comparison path and pairable count. For each runtime/storage/license statement, verify the owning run/model-lock/handoff evidence.
+Freshly reload:
 
-No headline number may exist only in prose or a scratch calculation.
+```text
+checked-in MuScriptor lock + production MuScriptor run equality
+broad OaF/MuScriptor via _load_evidence()
+reviewed OaF/MuScriptor via read_cohort_reports() with exact reviewed cohort IDs
+fresh HPA-562 publish_cross_comparisons() outcome
+HPA-328/HPA-396 owning report/runtime/handoff evidence
+```
 
-- [ ] **Step 2: Reconcile all population and pairing counts**
+Do not validate from values copied earlier into notes.
+
+- [ ] **Step 2: Regenerate exact Markdown headline rows from typed fields and require line-for-line equality**
+
+Regenerate `/tmp/hpa329-headline-rows.final.txt` from the same source objects used in Tasks 2-5. Every absolute row must take values directly from fields such as:
+
+```text
+PublishedAggregate.event_micro.precision/recall/f1
+PublishedAggregate.song_macro_f1
+PublishedAggregate.class_macro_f1
+PublishedAggregate.successful_song_count
+PublishedAggregate.song_f1_distribution.*
+PublishedCohortReports.population.*
+```
+
+Every paired count must come from the fresh `CrossComparisonOutcome`/validated nested summary fields such as `pairing.pairable_success_intersection`; runtime/storage/license rows must come from their owning persisted evidence.
+
+For every generated exact Markdown line, require exactly one identical line in the report:
+
+```bash
+while IFS= read -r row; do
+  test "$(grep -Fxc -- "$row" docs/benchmark/2026-08-24-drum-transcription-findings.md)" -eq 1 || exit 1
+done < /tmp/hpa329-headline-rows.final.txt
+```
+
+A copied 50 ms value from the 30 ms row must fail this check. Grep for unfinished prose later is only supplementary verification.
+
+- [ ] **Step 3: Reconcile populations, pairing, and scope contracts**
 
 Require:
 
 ```text
 complete per-model populations balance
-HPA-562 four pairable-success counts equal the report
+fresh HPA-562 four pairable-success counts equal the report
 paired row counts/exclusions match nested summaries
+reviewed absolute rows come from reviewed HPA-325 reports, not HPA-562 oaf-muscriptor
 reviewed/pilot memberships match their owning manifests/runs
+IDM section explicitly preserves reviewed_subset_cross_verified == false
 ```
 
 Fix the report or upstream evidence; never hand-adjust a number to make totals fit.
 
-- [ ] **Step 3: Scan for scope and conclusion mistakes**
+- [ ] **Step 4: Scan for conclusion mistakes**
 
 Reject the report if it:
 
@@ -617,7 +796,7 @@ calls ambiguous DTX disagreement a definite model error
 selects more than one primary next step
 ```
 
-- [ ] **Step 4: Scan for incomplete planning language**
+- [ ] **Step 5: Scan for incomplete planning language**
 
 Run:
 
@@ -626,9 +805,9 @@ grep -nE 'TBD|TODO|placeholder|fill in|to be determined' \
   docs/benchmark/2026-08-24-drum-transcription-findings.md && exit 1 || true
 ```
 
-Expected: no matches that indicate an unfinished report.
+Expected: no unfinished-report matches.
 
-- [ ] **Step 5: Run repository diff hygiene and confirm the task stayed docs-only**
+- [ ] **Step 6: Run repository diff hygiene and confirm the task stayed docs-only**
 
 ```bash
 git diff --check main...HEAD
@@ -645,7 +824,7 @@ docs/benchmark/2026-08-24-drum-transcription-findings.md
 
 If an upstream fix became necessary, land/track it in its owning issue rather than silently widening HPA-329.
 
-- [ ] **Step 6: Refresh the recorded analysis revision after the final report commit**
+- [ ] **Step 7: Refresh the recorded analysis revision after the final report commit**
 
 Run:
 
@@ -653,11 +832,11 @@ Run:
 git rev-parse HEAD
 ```
 
-Update the reproducibility appendix if the report currently names an earlier analysis SHA, commit that one-line correction, then re-run `git diff --check`.
+Update the reproducibility appendix if it names an earlier analysis SHA, commit that one-line correction, then rerun the headline-row verification and `git diff --check`.
 
-- [ ] **Step 7: Move the draft PR to review and update Linear**
+- [ ] **Step 8: Move the draft PR to review and update Linear**
 
-When the report passes every gate:
+When every gate passes:
 
 ```text
 mark the existing HPA-329 draft PR ready for review
@@ -667,6 +846,6 @@ add the PR/report link and one-paragraph executive conclusion to HPA-329
 
 Do not mark HPA-329 Done until the report PR is accepted/merged and any child-completion/removal-with-reason condition required to close HPA-319 has been checked.
 
-- [ ] **Step 8: After merge, close HPA-329 and evaluate HPA-319 closeout**
+- [ ] **Step 9: After merge, close HPA-329 and evaluate HPA-319 closeout**
 
 Confirm all HPA-319 children are completed or explicitly removed with reason, then mark HPA-329 Done and close HPA-319 only when its parent acceptance criteria are satisfied. HPA-627 cannot be silently ignored if the final report depends on MuScriptor scored evidence.
