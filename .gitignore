@@ -19,6 +19,7 @@ runtime/oaf_tf1/wheelhouse/
 .superpowers/
 .pytest_cache/
 .ruff_cache/
+.wrangler/
 
 # HPA-320 native-host evidence (generated per-job, not source-controlled)
 .github/hpa320-native-evidence/
