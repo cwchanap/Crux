@@ -516,7 +516,7 @@ docs/benchmark/2026-08-24-drum-transcription-findings.md
 
 - [ ] **Step 7: Refresh the recorded analysis revision and rerun Steps 1-6**
 
-Record the final `git rev-parse HEAD` in the reproducibility appendix, commit that correction, then rerun verification fresh.
+Commit the reproducibility-appendix correction first, so `HEAD` is the commit containing the completed report. Only then run `git rev-parse HEAD`, record that hash in the reproducibility appendix, and commit the recording. The documented hash must identify the commit containing the completed report — not the prior revision the appendix corrected. Finally, rerun Steps 1-6 verification fresh from that final revision.
 
 - [ ] **Step 8: Move to review and update Linear**
 
