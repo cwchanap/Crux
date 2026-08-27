@@ -24,6 +24,7 @@ The spec is authoritative for scope ownership, reader choice, diagnostics policy
 
 ```text
 Already in the planning PR
+  .gitignore
   docs/superpowers/specs/2026-08-24-hpa-329-benchmark-findings-design.md
   docs/superpowers/plans/2026-08-24-hpa-329-benchmark-findings.md
 

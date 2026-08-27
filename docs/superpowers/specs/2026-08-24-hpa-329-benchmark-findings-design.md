@@ -167,7 +167,7 @@ Before review:
 - IDM retains the non-cross-verified subset caveat;
 - exactly one decision option is primary;
 - `git diff --check` passes;
-- the PR contains only the two planning docs plus the final findings Markdown report.
+- the PR contains only the two planning docs, the intentional `.gitignore` housekeeping file, and the final findings Markdown report.
 
 ## Non-goals
 
