@@ -12,6 +12,8 @@ static/assets/
 web_model*/
 runtime/oaf_tf1/system-packages/
 runtime/oaf_tf1/wheelhouse/
+# Separator flock mutex; keep model.json + environment.json eligible for HPA-328.
+runtime/separators/**/.separator-publish.lock
 .claude/settings.local.json
 
 # Tool working directories (kept self-contained vs. global gitignore)
