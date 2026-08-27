@@ -4,7 +4,7 @@
 
 **Goal:** Make the HPA-328 separation pilot resolve reviewed-subset audio from the already-validated authoritative HPA-324 source rows instead of the slim HPA-327 rows.
 
-**Architecture:** Reuse `_validate_subset_population()` as the single HPA-327 -> HPA-324 authority boundary and return its validated source-row mapping. Thread that in-memory mapping into `_resolve_pilot_sources()` and leave `corpus_cache.resolve_source_audio()`, manifest schemas, execution order, and persisted pilot semantics unchanged.
+**Architecture:** Reuse `_validate_subset_population()` as the single HPA-327 -> HPA-324 authority boundary and return its validated source-row mapping. Thread that in-memory mapping into `_resolve_pilot_sources()` while preserving the resolver call ordering, result validation, fixed-membership checks, row mutation, manifest schemas, and persisted pilot semantics.
 
 **Tech Stack:** Python 3.13, existing benchmark manifest loaders/cache resolver, pytest, Ruff, Black, Pylint.
 
@@ -17,7 +17,7 @@
 - Reuse its existing `simfile_id`, selected-chart/audio identity, and `source_row_sha256` checks verbatim; do not duplicate them in `_resolve_pilot_sources()`.
 - `resolve_source_audio()` must receive the authoritative HPA-324 source row and `_source_audio_kwargs()` derived from that same row.
 - Keep source resolution before separator attestation and OaF execution.
-- Keep the existing post-resolution `source_audio_id` and `source_audio_sha256` checks unchanged.
+- Preserve `_resolve_pilot_sources()` result-type validation, `source_audio_id` / `source_audio_sha256` comparison, error strings, and row updates.
 - Do not modify HPA-324/HPA-327 schemas, `src/benchmark/corpus_cache.py`, CLI contracts, separator locks, scoring, comparison, reports, or handoff schemas.
 - Add no dependency, reusable manifest-join framework, compatibility path, or network-backed automated test.
 
@@ -36,7 +36,7 @@ No new implementation files are required.
 
 **Files:**
 - Modify: `tests/benchmark/test_separation_pilot.py:128-176, 334-385`
-- Modify: `src/benchmark/separation_pilot.py:686-708, 1240-1285, 1965-1980`
+- Modify: `src/benchmark/separation_pilot.py:686-708, 1246-1281, 1965-1980`
 
 **Interfaces:**
 
@@ -101,7 +101,7 @@ def resolve(source: object, *_args: object, **kwargs: object) -> ResolvedSourceA
     )
 ```
 
-Keep `test_task6_infers_only_the_two_derived_views_after_resolving_membership()` as the integration regression and add these assertions after the existing 20-resolution assertion:
+Keep `test_task6_infers_only_the_two_derived_views_after_resolving_membership()` as the integration regression and add:
 
 ```python
 assert len(calls["resolve_source_rows"]) == 20
@@ -128,7 +128,7 @@ Expected: FAIL inside the fake resolver because the current `_resolve_pilot_sour
 
 - [ ] **Step 3: Return the existing validated HPA-324 source-row binding**
 
-Change only the return contract of `_validate_subset_population()`; preserve its existing loop and error messages:
+Change only the return contract of `_validate_subset_population()`; preserve its existing loop and error messages exactly:
 
 ```python
 def _validate_subset_population(
@@ -162,9 +162,9 @@ reference_rows = _validate_subset_population(subset, reference)
 
 Do not add a second hash check at the resolver boundary.
 
-- [ ] **Step 4: Resolve each fixed row from that authoritative binding**
+- [ ] **Step 4: Change only the source-row owner used by `_resolve_pilot_sources()`**
 
-Change `_resolve_pilot_sources()` to accept `reference_rows` rather than `subset` and remove its `loaded_by_id` map over HPA-327 rows:
+Replace the `subset` argument and its `loaded_by_id` map with the validated HPA-324 mapping. Preserve every other current check and side effect:
 
 ```python
 def _resolve_pilot_sources(
@@ -176,38 +176,39 @@ def _resolve_pilot_sources(
     cache_index = CacheIndexStore.load(request.cache_dir)
     sources: dict[int, ResolvedSourceAudio] = {}
     for row in rows:
-        simfile_id = row.get("simfile_id")
-        if isinstance(simfile_id, bool) or not isinstance(simfile_id, int):
+        simfile_id = row["simfile_id"]
+        if not isinstance(simfile_id, int):
             raise SeparationRunError("pilot row simfile_id is invalid")
         source_row = reference_rows.get(simfile_id)
         if source_row is None:
-            raise SeparationRunError("pilot source reference member is unavailable")
-        try:
-            source = resolve_source_audio(
-                source_row,
-                request.cache_dir,
-                cache_index,
-                **_source_audio_kwargs(source_row),
-                load_body=False,
-            )
-        except (OSError, RuntimeError, TypeError, ValueError) as error:
-            raise SeparationRunError("pilot source audio is unavailable") from error
-        if (
-            source.source_audio_id != row.get("source_audio_key")
-            or source.source_audio_sha256 != row.get("source_audio_content_hash")
-        ):
-            raise SeparationRunError("pilot source audio identity changed")
+            raise SeparationRunError("pilot row source member is unavailable")
+        source = resolve_source_audio(
+            source_row,
+            request.cache_dir,
+            cache_index,
+            **_source_audio_kwargs(source_row),
+            load_body=False,
+        )
+        if not isinstance(source, ResolvedSourceAudio):
+            raise SeparationRunError("source resolver returned an invalid result")
+        if source.source_audio_id != row.get(
+            "source_audio_id"
+        ) or source.source_audio_sha256 != row.get("source_audio_sha256"):
+            raise SeparationRunError("resolved source identity does not match fixed membership")
+        row["source_audio_id"] = source.source_audio_id
+        row["source_audio_sha256"] = source.source_audio_sha256
+        row["source_duration_sec"] = source.duration_sec
         sources[simfile_id] = source
     return sources
 ```
 
-Update the caller:
+Update only the call argument:
 
 ```python
 sources = _resolve_pilot_sources(request, reference_rows, rows)
 ```
 
-Do not alter the surrounding source-resolution ordering, separator attestation, snapshot creation, or full-mix control path.
+Do not add exception wrapping, new failure codes, stricter `simfile_id` typing, different fixed-membership fields, or different row mutation. Those would be unrelated behavior changes.
 
 - [ ] **Step 5: Run the focused regression and the complete pilot unit file**
 
@@ -252,6 +253,6 @@ Keep this implementation on the same HPA-424 branch and draft PR as the design a
 
 ## Self-review
 
-- Spec coverage: the single task covers validated binding reuse, authoritative row resolution, preserved source identity checks, focused regression coverage, quality gates, and the real-run failure checkpoint.
-- Placeholder scan: there are no implementation placeholders or unspecified new types/functions. The only environment-dependent action explicitly reuses the already-recorded real HPA-328 run because its local artifact paths are intentionally not repository state.
+- Spec coverage: the single task covers validated binding reuse, authoritative row resolution, preserved result/fixed-membership semantics, focused regression coverage, quality gates, and the real-run failure checkpoint.
+- Placeholder scan: there are no implementation placeholders or unspecified new types/functions. The environment-dependent action explicitly reuses the already-recorded real HPA-328 run because its local artifact paths are intentionally not repository state.
 - Type consistency: `_validate_subset_population()` returns `dict[int, Mapping[str, object]]`; `_resolve_pilot_sources()` consumes `Mapping[int, Mapping[str, object]]`; `run_oaf_separation_pilot()` threads that value directly between them.
