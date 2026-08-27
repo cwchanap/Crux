@@ -12,6 +12,7 @@ static/assets/
 web_model*/
 runtime/oaf_tf1/system-packages/
 runtime/oaf_tf1/wheelhouse/
+runtime/separators/
 .claude/settings.local.json
 
 # Tool working directories (kept self-contained vs. global gitignore)
