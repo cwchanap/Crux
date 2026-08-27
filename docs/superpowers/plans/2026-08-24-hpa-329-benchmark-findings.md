@@ -487,7 +487,7 @@ git commit -m "docs: decide next Crux transcription step"
 
 - [ ] **Step 1: Rerun the exact committed reproducibility commands in a fresh shell**
 
-Revalidate the MuScriptor lock/run equality, broad typed reports, regenerated reviewed typed reports, HPA-328/HPA-396 owning evidence, diagnostic content, and a fresh HPA-562 publication into a newly derived output directory under the fixed `HPA562_REPUBLISH_ROOT`, exactly as recorded in the committed appendix.
+Revalidate the MuScriptor lock/run equality, broad typed reports, the reviewed-subset reports loaded through the typed reader, HPA-328/HPA-396 owning evidence, diagnostic content, and a fresh HPA-562 publication into a newly derived output directory under the fixed `HPA562_REPUBLISH_ROOT`, exactly as recorded in the committed appendix.
 
 - [ ] **Step 2: Regenerate and check every absolute headline row in the same invocation**
 
@@ -530,6 +530,7 @@ git diff --name-only main...HEAD
 Expected HPA-329 files only:
 
 ```text
+.gitignore
 docs/superpowers/specs/2026-08-24-hpa-329-benchmark-findings-design.md
 docs/superpowers/plans/2026-08-24-hpa-329-benchmark-findings.md
 docs/benchmark/2026-08-24-drum-transcription-findings.md
