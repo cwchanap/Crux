@@ -4,7 +4,7 @@
 
 **Goal:** Make the HPA-328 separation pilot resolve reviewed-subset audio from the already-validated authoritative HPA-324 source rows instead of the slim HPA-327 rows, with deterministic coverage of the source-inventory contract that originally failed.
 
-**Architecture:** Reuse `_validate_subset_population()` as the single HPA-327 -> HPA-324 authority boundary and return only the HPA-324 rows that passed its existing identity checks. Thread that in-memory binding into `_resolve_pilot_sources()`, align the flow with the existing IDM full-mix source lookup, and leave `corpus_cache.py`, schemas, execution order, resolver error propagation, and persisted pilot semantics unchanged.
+**Architecture:** Reuse `_validate_subset_population()` as the single HPA-327 -> HPA-324 authority boundary and return only the HPA-324 rows that passed its existing identity checks. Thread that in-memory binding into `_resolve_pilot_sources()`, aligning the flow with `src/benchmark/idm_pilot_run.py:3454-3503`, and leave `corpus_cache.py`, schemas, execution order, resolver error propagation, and persisted pilot semantics unchanged.
 
 **Tech Stack:** Python 3.13, existing benchmark manifest loaders/cache resolver, pytest, Ruff, Pylint.
 
@@ -191,7 +191,7 @@ def test_reviewed_subset_reference_fixture_contains_resolvable_source_audio_remo
     assert remote.sha256 == source_row["source_audio_content_hash"]
 ```
 
-This test intentionally targets `_remote_from_source_mapping()` rather than recreating a second cache-body fixture. `test_oaf_corpus_run.py` already proves verified body resolution once a valid remote exists.
+This test intentionally targets `_remote_from_source_mapping()` rather than recreating a second cache-body fixture. `tests/benchmark/test_oaf_corpus_run.py` already proves verified body resolution once a valid remote exists, while `tests/benchmark/test_oaf_corpus_run_branches.py` pins the mapping helper's invalid-shape branches.
 
 - [ ] **Step 3: Run the mapping-contract test**
 
@@ -400,7 +400,7 @@ Update only the call argument:
 sources = _resolve_pilot_sources(request, reference_rows, rows)
 ```
 
-Do not add exception wrapping, a second hash check, new failure codes, stricter typing, different membership fields, or different row mutation. This matches the existing authoritative-row pattern in `src/benchmark/idm_pilot_run.py`.
+Do not add exception wrapping, a second hash check, new failure codes, stricter typing, different membership fields, or different row mutation. This matches the existing authoritative-row pattern in `src/benchmark/idm_pilot_run.py:3454-3503`.
 
 - [ ] **Step 5: Prove all six importer suites are green**
 
