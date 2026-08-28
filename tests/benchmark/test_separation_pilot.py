@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from src.benchmark.backend_identity import canonical_json_bytes, strict_json_loads
+from src.benchmark.corpus_cache import _remote_from_source_mapping
 from src.benchmark.corpus_manifest import render_manifest
 from src.benchmark.oaf_corpus_run import OAF_FULL_MIX_INPUT_VIEW_ID, parse_oaf_corpus_run
 from src.benchmark.reference_set_manifest import load_reference_set_manifest
@@ -29,7 +30,10 @@ from src.benchmark.reviewed_subset import (
 )
 from src.benchmark.separation_pilot import HTDEMUCS_INPUT_VIEW_ID, SPLEETER_INPUT_VIEW_ID
 from src.benchmark.separators import HTDEMUCS_SEPARATOR_ID, SPLEETER_SEPARATOR_ID
-from tests.benchmark.reviewed_subset_fixtures import build_reviewed_subset_oaf_fixture
+from tests.benchmark.reviewed_subset_fixtures import (
+    build_reviewed_subset_oaf_fixture,
+    build_reviewed_subset_reference_fixture,
+)
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "separators"
 _GOLDEN = Path(__file__).parent / "schema_goldens/crux.reviewed-reference-subset-v1.jsonl"
@@ -112,6 +116,24 @@ def _runtime_sentinels() -> dict[str, object]:
 
 def _run_with_runtime_sentinels(run: object, request: object) -> object:
     return run(request, **_runtime_sentinels())  # type: ignore[operator]
+
+
+def test_reviewed_subset_reference_fixture_contains_resolvable_source_audio_remote(
+    tmp_path: Path,
+) -> None:
+    fixture = build_reviewed_subset_reference_fixture(tmp_path, eligible_count=20)
+    reference = load_reference_set_manifest(fixture.reference_manifest_path)
+    source_row = reference.rows[0].source_row
+    source_audio_key = source_row["source_audio_key"]
+    assert isinstance(source_audio_key, str)
+
+    remote = _remote_from_source_mapping(
+        source_row,
+        source_audio_key=source_audio_key,
+    )
+
+    assert remote.key == source_audio_key
+    assert remote.sha256 == source_row["source_audio_content_hash"]
 
 
 def _task6_seams(
