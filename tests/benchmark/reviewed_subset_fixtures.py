@@ -120,9 +120,27 @@ def build_reviewed_subset_reference_fixture(
         row.pop("corpus_version", None)
         row["simfile_id"] = simfile_id
         row["object_prefix"] = f"{simfile_id}/"
-        row["objects"] = [{**remote, "key": selected_chart_key} for remote in ready_row["objects"]]
+        source_audio_key = f"{simfile_id}/bgm.wav"
+        source_audio_hash = str(ready_row["source_audio_content_hash"])
+        objects = ready_row["objects"]
+        assert isinstance(objects, list) and objects
+        remote_template = objects[0]
+        assert isinstance(remote_template, dict)
+
+        chart_remote = {**remote_template, "key": selected_chart_key}
+        audio_remote = {
+            **remote_template,
+            "key": source_audio_key,
+            "content_type": "audio/wav",
+            "etag": f'"audio-{simfile_id}"',
+            "size": 88244,
+            "sha256": source_audio_hash,
+            "cache_path": f"sha256/{source_audio_hash[:2]}/{source_audio_hash}",
+        }
+
+        row["objects"] = [chart_remote, audio_remote]
         row["selected_chart_key"] = selected_chart_key
-        row["source_audio_key"] = f"{simfile_id}/bgm.wav"
+        row["source_audio_key"] = source_audio_key
         row["reference_events_cache_path"] = f"events/{event_hash}.jsonl"
         row["timing_warnings"] = list(spec.timing_warnings)
         timing_rows.append(row)
