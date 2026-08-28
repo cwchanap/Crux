@@ -163,6 +163,7 @@ def _task6_seams(
     )
     calls: dict[str, list[object]] = {
         "resolve": [],
+        "resolve_source_rows": [],
         "separate": [],
         "materialize": [],
         "backend": [],
@@ -177,6 +178,17 @@ def _task6_seams(
     def resolve(source: object, *_args: object, **kwargs: object) -> ResolvedSourceAudio:
         calls["resolve"].append(kwargs.get("load_body"))
         assert isinstance(source, Mapping)
+        calls["resolve_source_rows"].append(source)
+
+        objects = source.get("objects")
+        assert isinstance(objects, list)
+        source_audio_key = source["source_audio_key"]
+        assert isinstance(source_audio_key, str)
+        assert any(
+            isinstance(obj, Mapping) and obj.get("key") == source_audio_key for obj in objects
+        )
+        assert isinstance(source.get("source_endpoint_sha256"), str)
+        assert isinstance(source.get("source_bucket"), str)
         source_id = source["source_audio_key"]
         source_sha = source["source_audio_content_hash"]
         return ResolvedSourceAudio(
@@ -378,6 +390,17 @@ def test_task6_infers_only_the_two_derived_views_after_resolving_membership(
     assert outcome.exit_code == 0
     assert len(calls["resolve"]) == 20
     assert set(calls["resolve"]) == {False}
+    assert len(calls["resolve_source_rows"]) == 20
+    assert all(
+        isinstance(source, Mapping)
+        and isinstance(source.get("objects"), list)
+        and isinstance(source.get("source_audio_key"), str)
+        and any(
+            isinstance(obj, Mapping) and obj.get("key") == source["source_audio_key"]
+            for obj in source["objects"]
+        )
+        for source in calls["resolve_source_rows"]
+    )
     assert set(calls["separate"]) == {SPLEETER_INPUT_VIEW_ID, HTDEMUCS_INPUT_VIEW_ID}
     assert set(calls["materialize"]) == {SPLEETER_INPUT_VIEW_ID, HTDEMUCS_INPUT_VIEW_ID}
     assert set(calls["transcribe"]) == {SPLEETER_INPUT_VIEW_ID, HTDEMUCS_INPUT_VIEW_ID}
