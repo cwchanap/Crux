@@ -136,7 +136,9 @@ Use the existing golden object as the field template and construct the audio rem
 ```python
 source_audio_key = f"{simfile_id}/bgm.wav"
 source_audio_hash = str(ready_row["source_audio_content_hash"])
-remote_template = ready_row["objects"][0]
+objects = ready_row["objects"]
+assert isinstance(objects, list) and objects
+remote_template = objects[0]
 assert isinstance(remote_template, dict)
 
 chart_remote = {**remote_template, "key": selected_chart_key}
@@ -267,8 +269,10 @@ calls["resolve_source_rows"].append(source)
 
 objects = source.get("objects")
 assert isinstance(objects, list)
+source_audio_key = source["source_audio_key"]
+assert isinstance(source_audio_key, str)
 assert any(
-    isinstance(obj, Mapping) and obj.get("key") == source["source_audio_key"]
+    isinstance(obj, Mapping) and obj.get("key") == source_audio_key
     for obj in objects
 )
 assert isinstance(source.get("source_endpoint_sha256"), str)
@@ -284,6 +288,7 @@ assert len(calls["resolve_source_rows"]) == 20
 assert all(
     isinstance(source, Mapping)
     and isinstance(source.get("objects"), list)
+    and isinstance(source.get("source_audio_key"), str)
     and any(
         isinstance(obj, Mapping) and obj.get("key") == source["source_audio_key"]
         for obj in source["objects"]
