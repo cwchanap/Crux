@@ -65,7 +65,7 @@ This makes the returned value exactly the validated pilot binding rather than th
 
 ### Existing IDM code is the precedent
 
-`src/benchmark/idm_pilot_run.py` already uses the same runtime shape for full-mix smoke inference:
+`src/benchmark/idm_pilot_run.py:3454-3503` already uses the same runtime shape for full-mix smoke inference:
 
 ```text
 reference rows keyed by simfile_id
@@ -93,7 +93,7 @@ It works for an authoritative HPA-324 row. No new request object or resolver ada
 
 `src/benchmark/corpus_cache.py::resolve_source_audio()` and `_remote_from_source_mapping()` legitimately require the source mapping to expose the selected audio object plus endpoint/bucket identity. HPA-424 leaves this generic cache boundary unchanged.
 
-The repo already has direct `_remote_from_source_mapping()` branch tests and end-to-end verified-cache tests for `resolve_source_audio()`. HPA-424 should reuse those rails rather than adding another cache framework.
+The repo already has direct `_remote_from_source_mapping()` branch tests in `tests/benchmark/test_oaf_corpus_run_branches.py` and verified-cache `resolve_source_audio()` coverage in `tests/benchmark/test_oaf_corpus_run.py`. HPA-424 reuses those rails rather than adding another cache framework.
 
 ## Design
 
