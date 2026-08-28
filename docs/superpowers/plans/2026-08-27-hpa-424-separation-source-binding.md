@@ -18,15 +18,18 @@
 - `resolve_source_audio()` must receive the authoritative HPA-324 source row and `_source_audio_kwargs()` derived from that same row.
 - Keep source resolution before separator attestation and OaF execution.
 - Preserve `_resolve_pilot_sources()` result-type validation, `source_audio_id` / `source_audio_sha256` comparison, error strings, and row updates.
+- Do not wrap `resolve_source_audio()` `ValueError`; `run_oaf_separation_pilot()` already owns fatal error mapping.
 - Do not modify HPA-324/HPA-327 schemas, `src/benchmark/corpus_cache.py`, CLI contracts, separator locks, scoring, comparison, reports, or handoff schemas.
 - Add no dependency, reusable manifest-join framework, compatibility path, or network-backed automated test.
+- The strengthened `_task6_seams()` resolver is a shared cross-suite contract. Every suite importing it must be green before the implementation is considered verified.
+- The real HPA-328 rerun is the production-error gate because the synthetic fixture cannot successfully exercise `_remote_from_source_mapping()` with its real cache inventory. Do not mark HPA-424 ready/merged/done on unit coverage alone.
 
 ## File Structure
 
 | File | Responsibility in HPA-424 |
 | --- | --- |
 | `src/benchmark/separation_pilot.py` | Preserve the existing subset/reference validation, return its authoritative source-row binding, and feed that binding into source resolution. |
-| `tests/benchmark/test_separation_pilot.py` | Turn the existing Task 6 fake resolver into a regression guard that rejects the slim HPA-327 row shape. |
+| `tests/benchmark/test_separation_pilot.py` | Turn the existing shared Task 6 fake resolver into a regression guard that rejects the slim HPA-327 row shape. |
 
 No new implementation files are required.
 
@@ -36,7 +39,13 @@ No new implementation files are required.
 
 **Files:**
 - Modify: `tests/benchmark/test_separation_pilot.py:128-176, 334-385`
-- Modify: `src/benchmark/separation_pilot.py:686-708, 1246-1281, 1965-1980`
+- Modify: `src/benchmark/separation_pilot.py:686-716, 1245-1278, 1955-1980`
+- Verify shared seam consumers:
+  - `tests/benchmark/test_separation_pilot_acceptance.py`
+  - `tests/benchmark/test_separation_comparison.py`
+  - `tests/benchmark/test_cross_comparison.py`
+  - `tests/benchmark/test_separation_handoff.py`
+  - `tests/test_cli_benchmark.py`
 
 **Interfaces:**
 
@@ -59,9 +68,9 @@ def _resolve_pilot_sources(
 - Consumes: the already-loaded `LoadedReviewedSubsetManifest`, `LoadedReferenceSetManifest`, `_source_row_sha256()`, `_source_audio_kwargs()`, `CacheIndexStore`, and `resolve_source_audio()`.
 - Produces: the same `dict[int, ResolvedSourceAudio]` currently consumed by the pilot; no persisted interface changes.
 
-- [ ] **Step 1: Strengthen the existing Task 6 fake resolver so current `main` is red**
+- [ ] **Step 1: Strengthen the existing shared Task 6 fake resolver so current `main` is red**
 
-In `_task6_seams()`, add one call bucket for the mappings passed into the resolver:
+In `_task6_seams()`, add one call bucket for the source mappings passed into the resolver:
 
 ```python
 calls: dict[str, list[object]] = {
@@ -101,7 +110,7 @@ def resolve(source: object, *_args: object, **kwargs: object) -> ResolvedSourceA
     )
 ```
 
-Keep `test_task6_infers_only_the_two_derived_views_after_resolving_membership()` as the integration regression and add:
+Keep `test_task6_infers_only_the_two_derived_views_after_resolving_membership()` as the direct integration regression and add:
 
 ```python
 assert len(calls["resolve_source_rows"]) == 20
@@ -114,17 +123,24 @@ assert all(
 )
 ```
 
-Do not make the fake accept both HPA-327 and HPA-324 shapes; that would recreate the blind spot.
+Do not make the fake accept both HPA-327 and HPA-324 shapes; `_task6_seams()` is shared intentionally, so all importers should trip on the old wiring.
 
-- [ ] **Step 2: Run the regression test and verify the current wiring fails**
+- [ ] **Step 2: Verify the strengthened shared seam is red on the current wiring**
 
-Run:
+Run every suite that imports `_task6_seams()`:
 
 ```bash
-uv run pytest tests/benchmark/test_separation_pilot.py::test_task6_infers_only_the_two_derived_views_after_resolving_membership -q
+uv run pytest \
+  tests/benchmark/test_separation_pilot.py \
+  tests/benchmark/test_separation_pilot_acceptance.py \
+  tests/benchmark/test_separation_comparison.py \
+  tests/benchmark/test_cross_comparison.py \
+  tests/benchmark/test_separation_handoff.py \
+  tests/test_cli_benchmark.py \
+  -q
 ```
 
-Expected: FAIL inside the fake resolver because the current `_resolve_pilot_sources()` passes the reviewed-subset row and `source.get("objects")` is not a list.
+Expected before the production fix: failures reach the shared fake resolver because current `_resolve_pilot_sources()` passes the reviewed-subset row and `source.get("objects")` is not a list. Do not weaken the fake to make individual importer suites pass.
 
 - [ ] **Step 3: Return the existing validated HPA-324 source-row binding**
 
@@ -160,11 +176,13 @@ At the existing preflight call site, retain the returned mapping:
 reference_rows = _validate_subset_population(subset, reference)
 ```
 
-Do not add a second hash check at the resolver boundary.
+Returning the complete HPA-324 map is intentional. `_subset_parent_rows()` constructs execution rows only by iterating `subset.rows`, so the current path cannot introduce an unbound reference ID.
+
+Do not add a second membership/hash check at the resolver boundary.
 
 - [ ] **Step 4: Change only the source-row owner used by `_resolve_pilot_sources()`**
 
-Replace the `subset` argument and its `loaded_by_id` map with the validated HPA-324 mapping. Preserve every other current check and side effect:
+Replace the `subset` argument and its `loaded_by_id` map with the validated HPA-324 mapping. Preserve every other current check, error string, and side effect:
 
 ```python
 def _resolve_pilot_sources(
@@ -208,51 +226,82 @@ Update only the call argument:
 sources = _resolve_pilot_sources(request, reference_rows, rows)
 ```
 
-Do not add exception wrapping, new failure codes, stricter `simfile_id` typing, different fixed-membership fields, or different row mutation. Those would be unrelated behavior changes.
+Do not add exception wrapping, new failure codes, stricter `simfile_id` typing, different fixed-membership fields, or different row mutation. `run_oaf_separation_pilot()` already turns source-resolution `ValueError` into the existing fatal exit-2 behavior.
 
-- [ ] **Step 5: Run the focused regression and the complete pilot unit file**
+- [ ] **Step 5: Run every shared-seam importer after the fix**
 
-Run:
+Run the same complete importer set used for the red gate:
 
 ```bash
-uv run pytest tests/benchmark/test_separation_pilot.py::test_task6_infers_only_the_two_derived_views_after_resolving_membership -q
-uv run pytest tests/benchmark/test_separation_pilot.py -q
+uv run pytest \
+  tests/benchmark/test_separation_pilot.py \
+  tests/benchmark/test_separation_pilot_acceptance.py \
+  tests/benchmark/test_separation_comparison.py \
+  tests/benchmark/test_cross_comparison.py \
+  tests/benchmark/test_separation_handoff.py \
+  tests/test_cli_benchmark.py \
+  -q
 ```
 
-Expected: PASS. The Task 6 test records 20 resolver calls, every resolver source mapping has the HPA-324 inventory/endpoint/bucket fields, and existing preflight/resume/failure tests remain green.
+Expected after the fix: PASS. Every resolver source mapping reaching the shared fake has the HPA-324 `objects`, `source_endpoint_sha256`, and `source_bucket` fields, and all comparison/handoff/CLI consumers remain compatible with the unchanged persisted pilot contract.
 
-- [ ] **Step 6: Run the HPA-328 acceptance regression and static checks**
+- [ ] **Step 6: Run focused static checks and diff hygiene**
 
 Run:
 
 ```bash
-uv run pytest tests/benchmark/test_separation_pilot_acceptance.py -q
 uv run ruff check src/benchmark/separation_pilot.py tests/benchmark/test_separation_pilot.py
 uv run black --check src/benchmark/separation_pilot.py tests/benchmark/test_separation_pilot.py
 uv run pylint src/benchmark/separation_pilot.py tests/benchmark/test_separation_pilot.py
+git diff --check main...HEAD
+git diff --name-only main...HEAD
 ```
 
-Expected: all commands PASS. There should be no change to `src/benchmark/corpus_cache.py`, manifest schema goldens, CLI snapshots, separator fixtures, or persisted run schemas.
+Expected implementation surface in addition to this PR's two planning docs:
 
-- [ ] **Step 7: Record the real-run confirmation when the local evidence workspace is available**
+```text
+src/benchmark/separation_pilot.py
+tests/benchmark/test_separation_pilot.py
+```
 
-The real HPA-328 evidence is intentionally workstation-local and is not checked into this repository. On the workstation that produced the HPA-328 comment evidence, rerun the same `run-oaf-separation-pilot` invocation against parent OaF run `oaf-149faa97328e20eb` and the published 30-row HPA-327 subset. Record the command exit/result in HPA-424.
+There must be no change to `src/benchmark/corpus_cache.py`, manifest schema goldens, CLI contracts, separator fixtures, or persisted run schemas.
 
-Acceptance for this step is narrow: the run must proceed past source resolution without `source manifest does not contain an object inventory`. Any later separator/runtime/inference failure is separate evidence and must not be hidden by HPA-424.
+- [ ] **Step 7: Pass the real production-error gate before review/merge/closure**
 
-- [ ] **Step 8: Commit the implementation to the existing HPA-424 PR**
+Automated tests intentionally keep the fake resolver. The synthetic HPA-324 fixture's `objects` inventory does not contain the source-audio key shape needed for a successful real `resolve_source_audio()` call, so these tests do not execute the production `_remote_from_source_mapping()` path that originally raised `source manifest does not contain an object inventory`.
 
-Run:
+On the workstation that produced the HPA-328 evidence, rerun the same real `run-oaf-separation-pilot` invocation against:
+
+```text
+parent OaF run: oaf-149faa97328e20eb
+reviewed subset: published 30-row HPA-327 manifest
+reference source: matching published HPA-324 manifest
+cache: the existing verified local HPA-321 cache used by the failed run
+```
+
+Required result: the run proceeds past authoritative source resolution without:
+
+```text
+source manifest does not contain an object inventory
+```
+
+Any later separator/runtime/inference failure is separate evidence; record it without hiding or reclassifying it as HPA-424 success/failure.
+
+Record the exact rerun command/result on HPA-424 and PR #31. If the workstation-local evidence is unavailable, state that explicitly on PR #31, keep HPA-424 open, and do not mark the PR ready, merge it, or close the ticket based on unit tests alone.
+
+- [ ] **Step 8: Commit implementation and finish the same PR**
+
+After Steps 5-7 pass, commit the implementation on the existing HPA-424 branch:
 
 ```bash
 git add src/benchmark/separation_pilot.py tests/benchmark/test_separation_pilot.py
 git commit -m "fix: bind separation sources to reference rows"
 ```
 
-Keep this implementation on the same HPA-424 branch and draft PR as the design and plan. Do not open a second implementation PR.
+Re-run Steps 5-7 from the committed revision, update PR #31 with the verification evidence, then mark the same PR ready for review. Do not open a second implementation PR.
 
 ## Self-review
 
-- Spec coverage: the single task covers validated binding reuse, authoritative row resolution, preserved result/fixed-membership semantics, focused regression coverage, quality gates, and the real-run failure checkpoint.
-- Placeholder scan: there are no implementation placeholders or unspecified new types/functions. The environment-dependent action explicitly reuses the already-recorded real HPA-328 run because its local artifact paths are intentionally not repository state.
+- Spec coverage: the single task covers validated binding reuse, authoritative row resolution, preserved result/fixed-membership semantics, every importer of the shared Task 6 seam, static hygiene, and the real production-error gate.
+- Placeholder scan: there are no implementation placeholders or unspecified new types/functions. The environment-dependent production gate references the exact already-recorded run identity and requires the original failure mode to disappear before review/merge/closure.
 - Type consistency: `_validate_subset_population()` returns `dict[int, Mapping[str, object]]`; `_resolve_pilot_sources()` consumes `Mapping[int, Mapping[str, object]]`; `run_oaf_separation_pilot()` threads that value directly between them.
