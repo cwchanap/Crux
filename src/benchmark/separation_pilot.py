@@ -697,9 +697,10 @@ def _validate_output_paths(request: OafSeparationPilotRequest) -> None:
 def _validate_subset_population(
     subset: LoadedReviewedSubsetManifest,
     reference: LoadedReferenceSetManifest,
-) -> None:
+) -> dict[int, Mapping[str, object]]:
     """Bind every HPA-327 row to the corresponding HPA-324 reference row."""
     reference_rows = {loaded.view.simfile_id: loaded.source_row for loaded in reference.rows}
+    validated: dict[int, Mapping[str, object]] = {}
     for loaded in subset.rows:
         reference_row = reference_rows.get(loaded.view.simfile_id)
         if reference_row is None:
@@ -714,6 +715,8 @@ def _validate_subset_population(
                 raise SeparationRunError("reviewed subset member reference identity is invalid")
         if loaded.source_row["source_row_sha256"] != _source_row_sha256(reference_row):
             raise SeparationRunError("reviewed subset source row identity is invalid")
+        validated[loaded.view.simfile_id] = reference_row
+    return validated
 
 
 def _subset_parent_rows(
@@ -1244,25 +1247,24 @@ def _source_audio_kwargs(source_row: Mapping[str, object]) -> dict[str, str | No
 
 def _resolve_pilot_sources(
     request: OafSeparationPilotRequest,
-    subset: LoadedReviewedSubsetManifest,
+    reference_rows: Mapping[int, Mapping[str, object]],
     rows: tuple[dict[str, object], ...],
 ) -> dict[int, ResolvedSourceAudio]:
     """Resolve every fixed member's authoritative source before execution."""
     cache_index = CacheIndexStore.load(request.cache_dir)
-    loaded_by_id = {loaded.view.simfile_id: loaded for loaded in subset.rows}
     sources: dict[int, ResolvedSourceAudio] = {}
     for row in rows:
         simfile_id = row["simfile_id"]
         if not isinstance(simfile_id, int):
             raise SeparationRunError("pilot row simfile_id is invalid")
-        loaded = loaded_by_id.get(simfile_id)
-        if loaded is None:
+        source_row = reference_rows.get(simfile_id)
+        if source_row is None:
             raise SeparationRunError("pilot row source member is unavailable")
         source = resolve_source_audio(
-            loaded.source_row,
+            source_row,
             request.cache_dir,
             cache_index,
-            **_source_audio_kwargs(loaded.source_row),
+            **_source_audio_kwargs(source_row),
             load_body=False,
         )
         if not isinstance(source, ResolvedSourceAudio):
@@ -1952,7 +1954,7 @@ def run_oaf_separation_pilot(
             or subset.source_timing_manifest_version != timing.corpus_version
         ):
             raise SeparationRunError("reviewed subset timing identity does not match")
-        _validate_subset_population(subset, reference)
+        reference_rows = _validate_subset_population(subset, reference)
         # Reconstruct the exact HPA-323/HPA-324 mapping once at the fatal
         # boundary.  The returned mapping is intentionally not used to score
         # full mix: the public wrapper owns that operation.
@@ -1973,7 +1975,7 @@ def run_oaf_separation_pilot(
 
         # Resolve all authoritative source identities before either report
         # scoring or an expensive separator/OaF operation.
-        sources = _resolve_pilot_sources(request, subset, rows)
+        sources = _resolve_pilot_sources(request, reference_rows, rows)
         raw_descriptor = parent.get("backend_descriptor")
         if not isinstance(raw_descriptor, Mapping):
             raise SeparationRunError("parent backend descriptor is unavailable")
