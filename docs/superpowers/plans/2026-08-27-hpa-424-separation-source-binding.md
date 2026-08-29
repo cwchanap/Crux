@@ -15,6 +15,7 @@
 - Keep HPA-424 in one PR; planning docs, fixture correction, tests, and production fix stay on the same branch/PR.
 - Do not implement until the production precondition proves the real HPA-324 rows used by HPA-328 actually contain and can resolve each reviewed member's `source_audio_key`.
 - If that precondition fails because the authoritative inventory is chart-scoped or otherwise lacks the audio remote, stop HPA-424 and move the defect upstream; do not compensate in HPA-327 or `corpus_cache.py`.
+- Gate PR readiness and merge on two recorded pieces of evidence, in order: (1) documented passing preflight results (Task 0) proving every reviewed `source_audio_key` resolves from its authoritative HPA-324 row, and (2) one real HPA-328 rerun against the final committed implementation tree (Task 3 Step 4) whose source resolution completes for the fixed population. Do not mark the PR ready or merge until both are recorded on HPA-424 and PR #31.
 - `_validate_subset_population()` remains the only HPA-327 -> HPA-324 membership/identity validator.
 - Reuse its existing `simfile_id`, selected-chart/audio identity, and `source_row_sha256` checks verbatim; do not duplicate them in `_resolve_pilot_sources()`.
 - Return only validated subset members, not the complete HPA-324 population.
