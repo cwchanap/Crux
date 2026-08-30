@@ -21,6 +21,7 @@ from src.benchmark.published_comparison import (
     aggregate_delta_rows,
     comparison_summary,
     pairable_success_ids,
+    paired_class_rows,
     paired_song_rows,
     write_comparison_artifacts,
     write_markdown,
@@ -83,6 +84,95 @@ def test_paired_song_rows_rejects_key_grid_mismatch() -> None:
             {key: row},
             {key: row, extra_key: row},
             {"1", "2"},
+        )
+
+
+def _class_row(
+    *,
+    reference_support: object = 1,
+    prediction_support: object = 1,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        reference_support=reference_support,
+        prediction_support=prediction_support,
+        precision=Decimal("0.5"),
+        recall=Decimal("0.5"),
+        f1=Decimal("0.5"),
+    )
+
+
+def test_paired_class_rows_counts_left_only_prediction_rows() -> None:
+    keys = {
+        ("241", tolerance_ms, mode, "ride")
+        for tolerance_ms in (30, 50, 100)
+        for mode in ("raw", "aligned")
+    }
+    left = {key: _class_row(reference_support=0, prediction_support=1) for key in keys}
+
+    rows, exclusions = paired_class_rows(
+        left,
+        {},
+        {"241"},
+        left_label="full_mix",
+        right_label="spleeter",
+    )
+
+    assert rows == []
+    assert exclusions == {
+        "full_mix_only_prediction_class": 6,
+        "spleeter_only_prediction_class": 0,
+    }
+
+
+def test_paired_class_rows_counts_right_only_prediction_row() -> None:
+    key = ("241", 50, "raw", "ride")
+    rows, exclusions = paired_class_rows(
+        {},
+        {key: _class_row(reference_support=0, prediction_support=2)},
+        {"241"},
+        left_label="full_mix",
+        right_label="spleeter",
+    )
+    assert rows == []
+    assert exclusions == {
+        "full_mix_only_prediction_class": 0,
+        "spleeter_only_prediction_class": 1,
+    }
+
+
+def test_paired_class_rows_rejects_shared_reference_support_mismatch() -> None:
+    key = ("241", 50, "raw", "ride")
+    with pytest.raises(ComparisonIntegrityError, match="reference_support mismatch"):
+        paired_class_rows(
+            {key: _class_row(reference_support=1)},
+            {key: _class_row(reference_support=2)},
+            {"241"},
+            left_label="full_mix",
+            right_label="spleeter",
+        )
+
+
+def test_paired_class_rows_rejects_one_sided_zero_zero_row() -> None:
+    key = ("241", 50, "raw", "ride")
+    with pytest.raises(ComparisonIntegrityError, match="has no prediction support"):
+        paired_class_rows(
+            {key: _class_row(reference_support=0, prediction_support=0)},
+            {},
+            {"241"},
+            left_label="full_mix",
+            right_label="spleeter",
+        )
+
+
+def test_paired_class_rows_rejects_malformed_one_sided_support() -> None:
+    key = ("241", 50, "raw", "ride")
+    with pytest.raises(ComparisonIntegrityError, match="reference_support is malformed"):
+        paired_class_rows(
+            {key: _class_row(reference_support=True, prediction_support=1)},
+            {},
+            {"241"},
+            left_label="full_mix",
+            right_label="spleeter",
         )
 
 
