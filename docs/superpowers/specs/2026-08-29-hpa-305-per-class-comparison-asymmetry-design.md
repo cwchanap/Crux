@@ -93,19 +93,13 @@ Simply join `left_keys & right_keys`, as the earlier MuScriptor comparator did. 
 
 ### Shared comparison helper
 
-Change `src/benchmark/published_comparison.py::paired_class_rows()` to return both paired rows and class-level exclusions:
+Change `src/benchmark/published_comparison.py::paired_class_rows()` to preserve its inputs and labels but return:
 
 ```python
-def paired_class_rows(
-    left: Mapping[tuple[str, int, str, str], PublishedClassRow | object],
-    right: Mapping[tuple[str, int, str, str], PublishedClassRow | object],
-    pairable_ids: set[str],
-    *,
-    left_label: str = "oaf",
-    right_label: str = "muscriptor",
-) -> tuple[list[dict[str, str]], dict[str, int]]:
-    raise NotImplementedError
+tuple[list[dict[str, str]], dict[str, int]]
 ```
+
+The first element is the existing paired row list. The second is the per-side prediction-only exclusion counts.
 
 Continue filtering both input maps to `pairable_ids` first. Build:
 
