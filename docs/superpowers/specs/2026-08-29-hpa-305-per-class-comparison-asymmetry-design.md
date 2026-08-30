@@ -219,6 +219,6 @@ Documentation/planning stays on this same HPA-305 branch and PR.
 
 ## Delivery
 
-Use one PR for HPA-305. The draft begins with this design spec and the implementation plan. After planning review, the implementation and production verification land on the same branch/PR; do not open a second implementation PR.
+Use one PR for HPA-305. This draft starts with the design spec. After the written design is approved, add the implementation plan to this same branch/PR; after planning review, implementation and production verification also land on this same PR. Do not open a second implementation PR.
 
 Planned branch: `agent/hpa-305-per-class-comparison-asymmetry`.
