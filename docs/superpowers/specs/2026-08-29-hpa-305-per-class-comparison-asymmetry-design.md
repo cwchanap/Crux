@@ -104,7 +104,7 @@ def paired_class_rows(
     left_label: str = "oaf",
     right_label: str = "muscriptor",
 ) -> tuple[list[dict[str, str]], dict[str, int]]:
-    ...
+    raise NotImplementedError
 ```
 
 Continue filtering both input maps to `pairable_ids` first. Build:
