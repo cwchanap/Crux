@@ -872,7 +872,7 @@ Do not mark HPA-305 complete if Task 0 was never recorded or the real comparison
 
 **Type consistency:** `paired_class_rows()` has one new tuple return contract used identically by MuScriptor, IDM, and separation callers. The private `_paired_class_rows` migration alias naturally shares that contract.
 
-**Placeholder scan:** no undefined implementation bodies, `TBD`, or `TODO` steps remain. Production environment variables are explicit references to the already reproduced PR #31 evidence.
+**Completeness scan:** every implementation step names concrete files, functions, commands, and expected outcomes; production environment variables point explicitly to the already reproduced PR #31 evidence.
 
 **YAGNI:** no dense grid, policy configuration, new result type, schema bump, scorer rewrite, or compatibility layer. A tuple plus the existing exclusions maps is sufficient.
 
