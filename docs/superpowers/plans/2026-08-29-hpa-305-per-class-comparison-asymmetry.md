@@ -2,41 +2,47 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Let published per-class comparisons tolerate legitimate prediction-only class rows on either side while remaining fail-closed for missing or inconsistent reference-supported evidence, then prove the recorded HPA-328 separation comparison can publish.
+**Goal:** Let published per-class comparisons tolerate legitimate prediction-only class rows on either side, report exactly how many class rows were excluded from paired deltas, remain fail-closed for reference-supported evidence, and prove the recorded HPA-328 comparison can publish.
 
-**Architecture:** Keep the production change entirely in `src/benchmark/published_comparison.py::paired_class_rows()`. Validate the union of pairable class keys, omit only one-sided rows whose published support proves prediction-only evidence, render only shared keys, and leave HPA-325 scoring, report schemas, `paired_song_rows()`, and separation-specific join wiring unchanged.
+**Architecture:** Keep class-join semantics centralized in `src/benchmark/published_comparison.py::paired_class_rows()`. The helper validates the union of pairable class keys, returns paired rows plus per-side prediction-only exclusion counts, and renders only shared rows. The three existing comparison callers merge those counts into their existing `pairing.exclusions` maps; HPA-325 scoring, report schemas, `paired_song_rows()`, and separation execution stay unchanged.
 
-**Tech Stack:** Python 3.13, existing HPA-325 published report models, pytest, Ruff, Pylint, existing Crux benchmark artifact readers.
+**Tech Stack:** Python 3.12, existing HPA-325 published report models/readers, pytest, Ruff, Pylint, existing Crux benchmark artifact readers.
 
 **Spec:** `docs/superpowers/specs/2026-08-29-hpa-305-per-class-comparison-asymmetry-design.md`
 
 ## Global Constraints
 
-- Keep HPA-305 in one PR: design, implementation plan, tests, production fix, and verification evidence stay on PR #32.
+- Keep HPA-305 in one PR: planning, Task 0 evidence, tests, production fix, and closeout stay on PR #32.
 - Task 0 is a hard gate. Do not change tests or production code until the six recorded simfile-241 full-mix `ride` rows are inspected and recorded.
-- Proceed only if every recorded one-sided `ride` row has `reference_support == 0` and `prediction_support > 0`; otherwise stop HPA-305's comparison-layer implementation and investigate upstream reference/scoring evidence.
-- Change production behavior only in `src/benchmark/published_comparison.py::paired_class_rows()` plus one small private support-reading helper in that module.
+- Proceed only if every recorded row has `reference_support == 0` and `prediction_support > 0`.
+- If Task 0 fails, HPA-305 remains the owning ticket and PR #32 remains the single PR; re-scope the same branch from artifact evidence instead of opening another implementation PR.
 - Keep `paired_song_rows()` exact-grid and unchanged.
-- Do not modify HPA-325 scoring, `src/benchmark/cohort_scoring.py`, taxonomy/mapping, report schemas, comparison artifact schemas, separator execution, or `src/benchmark/separation_comparison.py` join wiring.
-- A shared class key must have equal authoritative `reference_support` on both sides.
-- A one-sided class key may be omitted only when its present row has non-boolean integer `reference_support == 0` and non-boolean integer `prediction_support > 0`.
-- A one-sided row with positive reference support, zero prediction support, negative/malformed support, or a shared row with unequal reference support raises `ComparisonIntegrityError`.
-- Do not synthesize missing `PublishedClassRow` values; `paired_per_class.csv` remains a paired-delta product over rows actually published by both cohorts.
-- Cover both left-only and right-only prediction asymmetry because separation, MuScriptor, and IDM all consume the shared helper.
-- Retarget the existing MuScriptor positive-reference asymmetry regression instead of deleting it.
-- Reuse the already reproduced HPA-328 artifacts for verification. Do not rerun Spleeter, HTDemucs, or OaF merely to repair comparison semantics.
-- Do not add a join-policy option, framework, schema version, compatibility layer, new dependency, or second PR.
+- `paired_class_rows()` returns paired rows plus per-side prediction-only class-row exclusion counts.
+- Shared class keys validate and compare `reference_support` only; do not add dead shared `prediction_support` validation.
+- One-sided keys validate both supports and are valid only for `reference_support == 0 && prediction_support > 0`.
+- Add module-level `_class_key_sort_key()` next to `_song_key_sort_key()`; do not use an assigned lambda or retain duplicate class sort definitions.
+- Keep `_support_count()` as a small defensive duck-typed helper. Production `PublishedClassRow` supports have already been validated by report readers.
+- Merge class exclusion counts into the existing exclusions map in MuScriptor, IDM, and separation comparisons; do not add a second reporting structure.
+- Exclusion counters count omitted per-class score rows (`song × tolerance × mode × common_class`), not unique class names.
+- Do not synthesize missing class rows. Source reports and event diagnostics remain the evidence for prediction-only false positives.
+- Do not modify HPA-325 scoring, `cohort_scoring.py`, HPA-325 report schemas, taxonomy/mapping, separator execution, or OaF inference.
+- Do not add a join-policy option, framework, schema version, compatibility wrapper, new dependency, or second PR.
 
 ## File Structure
 
 | File | Responsibility in HPA-305 |
 | --- | --- |
-| `src/benchmark/published_comparison.py` | Validate shared/one-sided class support and render only safely pairable class rows. |
-| `tests/benchmark/test_published_comparison.py` | Pin symmetric prediction-only omission, shared-support equality, malformed support, and strict song-grid semantics. |
-| `tests/benchmark/test_muscriptor_comparison_coverage.py` | Preserve the existing positive-reference one-sided fail-closed regression with the new error contract. |
-| `tests/benchmark/test_separation_comparison.py` | Prove the HPA-328 publish path succeeds when full mix has a real FP-only class absent from a derived view. |
+| `src/benchmark/published_comparison.py` | Central class-key validation, deterministic sorting, paired row rendering, and class exclusion counts. |
+| `src/benchmark/muscriptor_comparison.py` | Merge class exclusions into the existing OaF/MuScriptor exclusions map. |
+| `src/benchmark/idm_comparison.py` | Merge class exclusions into the existing OaF/IDM exclusions map. |
+| `src/benchmark/separation_comparison.py` | Merge per-view class exclusions inside `_pair_summary()` before `comparison_summary()`. |
+| `tests/benchmark/test_published_comparison.py` | Pin symmetric omission/counting, support mismatch, malformed one-sided evidence, and song-grid strictness. |
+| `tests/benchmark/test_muscriptor_comparison_coverage.py` | Retarget direct migration-seam tests for the new return shape and positive-reference failure message. |
+| `tests/benchmark/test_muscriptor_comparison.py` | Prove class exclusion keys reach the OaF/MuScriptor summary. |
+| `tests/benchmark/test_idm_comparison.py` | Prove class exclusion keys reach the OaF/IDM summary. |
+| `tests/benchmark/test_separation_comparison.py` | Prove real FP-only source evidence is omitted from paired rows but counted in each affected pair summary. |
 
-No new production module, schema, or fixture file is required.
+No new module, schema, or fixture file is required.
 
 ---
 
@@ -46,10 +52,10 @@ No new production module, schema, or fixture file is required.
 
 **Interfaces:**
 - Input: `artifacts/benchmark/oaf-separation-pilot/runs/oaf-separation-8e66abde20b8f590/views/full_mix/reports/per_class.csv`
-- Evidence contract: six `(tolerance_ms, mode, reference_support, prediction_support)` rows for `simfile_id=241`, `common_class=ride`.
-- Produces: a recorded PASS/STOP result on HPA-305 and PR #32.
+- Pass contract: six rows for `simfile_id=241`, `common_class=ride`, covering 30/50/100 ms × raw/aligned; every row has zero reference support and positive prediction support.
+- Stop fallback input: `views/spleeter/reports/event_diagnostics.jsonl` from the same run.
 
-- [ ] **Step 1: Confirm the exact reproduced report is present**
+- [ ] **Step 1: Confirm the reproduced full-mix report is present**
 
 Run:
 
@@ -59,7 +65,7 @@ FULL_MIX_CLASS_REPORT="$RUN_DIR/views/full_mix/reports/per_class.csv"
 test -f "$FULL_MIX_CLASS_REPORT"
 ```
 
-Expected: exit 0. If the reproduced artifact is unavailable, stop before Task 1 and restore/reproduce the PR #31 evidence first; do not encode the hypothesis in tests without the production check.
+Expected: exit 0. If absent, restore the PR #31 reproduced artifacts before doing any code work.
 
 - [ ] **Step 2: Inspect and assert all six `ride` support tuples**
 
@@ -107,35 +113,89 @@ print("HPA-305 preflight PASS: six prediction-only full-mix ride rows")
 PY
 ```
 
-Expected: six support lines followed by:
+Expected: six support lines and the PASS line.
 
-```text
-HPA-305 preflight PASS: six prediction-only full-mix ride rows
+- [ ] **Step 3: Record PASS before implementation, or execute the STOP fallback**
+
+If Step 2 passes, post the six tuples and PASS line on HPA-305 and PR #32 before Task 1.
+
+If Step 2 fails, do not add the tests below and do not modify `paired_class_rows()`. Keep HPA-305/PR #32 as the owner and inspect Spleeter diagnostics first:
+
+```bash
+uv run python - <<'PY'
+import json
+from pathlib import Path
+
+path = Path(
+    "artifacts/benchmark/oaf-separation-pilot/runs/"
+    "oaf-separation-8e66abde20b8f590/views/spleeter/reports/event_diagnostics.jsonl"
+)
+rows = []
+for line in path.read_text(encoding="utf-8").splitlines():
+    row = json.loads(line)
+    if row["simfile_id"] == "241" and row["common_class"] == "ride":
+        rows.append(row)
+for row in rows:
+    print(
+        row["tolerance_ms"],
+        row["mode"],
+        row["outcome"],
+        row["reference_time_sec"],
+        row["prediction_time_sec"],
+    )
+print(f"spleeter ride diagnostics={len(rows)}")
+PY
 ```
 
-- [ ] **Step 3: Record the gate result before implementation**
+Interpretation:
 
-Post the six printed tuples and the PASS line verbatim on both HPA-305 and PR #32. If any assertion in Step 2 fails, record the actual row(s), stop this plan, and do not modify `paired_class_rows()`.
+- If `ride` false negatives exist but Spleeter `per_class.csv` has no `ride` row, rewrite this same HPA-305 spec/plan around the HPA-325 scorer/report emission path, starting with `_class_scores()` and `write_cohort_reports()`.
+- If Spleeter diagnostics also contain no `ride` evidence despite positive full-mix reference support, compare the HPA-323/HPA-324 reference mapping evidence used by the two cohorts before changing scoring or comparison code.
 
-There is intentionally no commit for Task 0.
+There is intentionally no Task 0 commit.
 
 ---
 
-### Task 1: TDD the shared reference-aware asymmetric class join
+### Task 1: TDD the shared reference-aware class join and exclusion result
 
 **Files:**
-- Modify: `tests/benchmark/test_published_comparison.py:10-85`
-- Modify: `tests/benchmark/test_muscriptor_comparison_coverage.py:1022-1037`
-- Modify: `src/benchmark/published_comparison.py:177-292`
+- Modify: `tests/benchmark/test_published_comparison.py`
+- Modify: `tests/benchmark/test_muscriptor_comparison_coverage.py`
+- Modify: `src/benchmark/published_comparison.py`
 
 **Interfaces:**
-- Consumes the existing public `paired_class_rows(left, right, pairable_ids, *, left_label, right_label) -> list[dict[str, str]]` signature.
-- Produces the same public signature and paired CSV row shape, with reference-aware union validation before rendering shared keys.
-- Adds private `_support_count(row, field, *, key, label) -> int` for nonnegative integer support validation and `ComparisonIntegrityError` conversion.
 
-- [ ] **Step 1: Add shared-helper test data and the six-key left-only production regression**
+Current public helper:
 
-In `tests/benchmark/test_published_comparison.py`, import `paired_class_rows` next to `paired_song_rows`, then add:
+```python
+paired_class_rows(
+    left,
+    right,
+    pairable_ids,
+    *,
+    left_label="oaf",
+    right_label="muscriptor",
+)
+```
+
+New return contract:
+
+```python
+tuple[list[dict[str, str]], dict[str, int]]
+```
+
+The second element always contains:
+
+```python
+{
+    f"{left_label}_only_prediction_class": left_only_count,
+    f"{right_label}_only_prediction_class": right_only_count,
+}
+```
+
+- [ ] **Step 1: Add shared-helper test rows and the six-key production regression**
+
+In `tests/benchmark/test_published_comparison.py`, import `paired_class_rows` and add:
 
 ```python
 def _class_row(
@@ -152,7 +212,7 @@ def _class_row(
     )
 
 
-def test_paired_class_rows_omits_left_only_prediction_only_rows() -> None:
+def test_paired_class_rows_counts_left_only_prediction_rows() -> None:
     keys = {
         ("241", tolerance_ms, mode, "ride")
         for tolerance_ms in (30, 50, 100)
@@ -163,7 +223,7 @@ def test_paired_class_rows_omits_left_only_prediction_only_rows() -> None:
         for key in keys
     }
 
-    rows = paired_class_rows(
+    rows, exclusions = paired_class_rows(
         left,
         {},
         {"241"},
@@ -172,16 +232,20 @@ def test_paired_class_rows_omits_left_only_prediction_only_rows() -> None:
     )
 
     assert rows == []
+    assert exclusions == {
+        "full_mix_only_prediction_class": 6,
+        "spleeter_only_prediction_class": 0,
+    }
 ```
 
-- [ ] **Step 2: Add the symmetric and fail-closed support regressions**
+- [ ] **Step 2: Add symmetric and fail-closed tests**
 
 Add:
 
 ```python
-def test_paired_class_rows_omits_right_only_prediction_only_row() -> None:
+def test_paired_class_rows_counts_right_only_prediction_row() -> None:
     key = ("241", 50, "raw", "ride")
-    rows = paired_class_rows(
+    rows, exclusions = paired_class_rows(
         {},
         {key: _class_row(reference_support=0, prediction_support=2)},
         {"241"},
@@ -189,21 +253,25 @@ def test_paired_class_rows_omits_right_only_prediction_only_row() -> None:
         right_label="spleeter",
     )
     assert rows == []
+    assert exclusions == {
+        "full_mix_only_prediction_class": 0,
+        "spleeter_only_prediction_class": 1,
+    }
 
 
 def test_paired_class_rows_rejects_shared_reference_support_mismatch() -> None:
     key = ("241", 50, "raw", "ride")
     with pytest.raises(ComparisonIntegrityError, match="reference_support mismatch"):
         paired_class_rows(
-            {key: _class_row(reference_support=1, prediction_support=1)},
-            {key: _class_row(reference_support=2, prediction_support=1)},
+            {key: _class_row(reference_support=1)},
+            {key: _class_row(reference_support=2)},
             {"241"},
             left_label="full_mix",
             right_label="spleeter",
         )
 
 
-def test_paired_class_rows_rejects_one_sided_zero_support_without_predictions() -> None:
+def test_paired_class_rows_rejects_one_sided_zero_zero_row() -> None:
     key = ("241", 50, "raw", "ride")
     with pytest.raises(ComparisonIntegrityError, match="has no prediction support"):
         paired_class_rows(
@@ -215,13 +283,12 @@ def test_paired_class_rows_rejects_one_sided_zero_support_without_predictions() 
         )
 
 
-@pytest.mark.parametrize("bad_support", (True, -1, "0", None))
-def test_paired_class_rows_rejects_malformed_support(bad_support: object) -> None:
+def test_paired_class_rows_rejects_malformed_one_sided_support() -> None:
     key = ("241", 50, "raw", "ride")
     with pytest.raises(ComparisonIntegrityError, match="reference_support is malformed"):
         paired_class_rows(
-            {key: _class_row(reference_support=bad_support, prediction_support=1)},
-            {key: _class_row(reference_support=0, prediction_support=1)},
+            {key: _class_row(reference_support=True, prediction_support=1)},
+            {},
             {"241"},
             left_label="full_mix",
             right_label="spleeter",
@@ -230,44 +297,50 @@ def test_paired_class_rows_rejects_malformed_support(bad_support: object) -> Non
 
 Keep `test_paired_song_rows_rejects_key_grid_mismatch()` unchanged.
 
-- [ ] **Step 3: Retarget the existing MuScriptor positive-reference asymmetry regression**
+- [ ] **Step 3: Retarget the existing MuScriptor direct-helper coverage**
 
-In `tests/benchmark/test_muscriptor_comparison_coverage.py`, keep the existing left-only `snare` row with `reference_support=1`; change only the expected error:
+In `tests/benchmark/test_muscriptor_comparison_coverage.py`:
+
+1. Change `test_paired_class_rows_skips_non_pairable_ids` to unpack the result and assert the default zero counters:
 
 ```python
-with pytest.raises(
-    ComparisonIntegrityError,
-    match="reference-supported class row is missing",
-):
-    _paired_class_rows(
-        {key: row, extra_key: extra_row},
-        {key: row},
-        pairable_ids={"1"},
-    )
+rows, exclusions = _paired_class_rows(oaf, muscriptor, pairable_ids=set())
+assert rows == []
+assert exclusions == {
+    "oaf_only_prediction_class": 0,
+    "muscriptor_only_prediction_class": 0,
+}
 ```
 
-Do not weaken the row to `reference_support=0`; this remains the fail-closed regression that blind intersection would break.
+2. Keep `test_paired_class_rows_rejects_asymmetric_pairable_key_grid` with its existing left-only `snare` row whose `reference_support=1`, but change the expected message to `reference-supported class row is missing`.
 
-- [ ] **Step 4: Run the focused tests and confirm RED behavior**
+Do not weaken that row to prediction-only evidence.
+
+- [ ] **Step 4: Run focused tests and confirm RED behavior**
 
 Run:
 
 ```bash
 uv run pytest -q \
   tests/benchmark/test_published_comparison.py \
+  tests/benchmark/test_muscriptor_comparison_coverage.py::test_paired_class_rows_skips_non_pairable_ids \
   tests/benchmark/test_muscriptor_comparison_coverage.py::test_paired_class_rows_rejects_asymmetric_pairable_key_grid
 ```
 
-Expected before production changes:
+Expected before production changes: the new return/count tests fail, the shared-support mismatch is not rejected, and the old MuScriptor message/return shape no longer match.
 
-- left-only and right-only prediction-only tests fail with the current generic grid mismatch;
-- shared unequal reference-support test fails because current code silently renders it;
-- one-sided `0/0` and malformed-support tests fail because the current helper lacks these support contracts;
-- the retargeted MuScriptor test fails because the old message is still generic.
+- [ ] **Step 5: Add one canonical class sort key and the defensive support reader**
 
-- [ ] **Step 5: Implement the minimal support reader**
+In `src/benchmark/published_comparison.py`, add next to `_song_key_sort_key()`:
 
-In `src/benchmark/published_comparison.py`, keep `_row_value()` and add immediately after it:
+```python
+def _class_key_sort_key(
+    value: tuple[str, int, str, str],
+) -> tuple[int, int, int, str]:
+    return int(value[0]), value[1], _MODES[value[2]], value[3]
+```
+
+Keep `_row_value()` and add:
 
 ```python
 def _support_count(
@@ -283,25 +356,32 @@ def _support_count(
     return value
 ```
 
-- [ ] **Step 6: Replace only `paired_class_rows()` key-grid validation with union validation**
+This helper guards the duck-typed shared helper boundary; production report readers remain the canonical parser/validator.
 
-Keep the existing labels and output fields. Replace the current `left_keys != right_keys` block and render-key selection with:
+- [ ] **Step 6: Replace exact-grid validation with reference-aware union validation**
+
+Change `paired_class_rows()` return annotation to:
 
 ```python
-    class_key_sort = lambda value: (int(value[0]), value[1], _MODES[value[2]], value[3])
+) -> tuple[list[dict[str, str]], dict[str, int]]:
+```
+
+Replace the current grid-mismatch block with this shape:
+
+```python
     left_keys = {key for key in left if str(key[0]) in pairable_ids}
     right_keys = {key for key in right if str(key[0]) in pairable_ids}
     shared_keys = left_keys & right_keys
+    left_only = left_keys - right_keys
+    right_only = right_keys - left_keys
 
-    for key in sorted(shared_keys, key=class_key_sort):
+    for key in sorted(shared_keys, key=_class_key_sort_key):
         left_reference_support = _support_count(
             left[key], "reference_support", key=key, label=left_label
         )
         right_reference_support = _support_count(
             right[key], "reference_support", key=key, label=right_label
         )
-        _support_count(left[key], "prediction_support", key=key, label=left_label)
-        _support_count(right[key], "prediction_support", key=key, label=right_label)
         if left_reference_support != right_reference_support:
             _fail(
                 "per_class reference_support mismatch"
@@ -310,10 +390,10 @@ Keep the existing labels and output fields. Replace the current `left_keys != ri
             )
 
     for present, present_keys, present_label, missing_label in (
-        (left, left_keys - right_keys, left_label, right_label),
-        (right, right_keys - left_keys, right_label, left_label),
+        (left, left_only, left_label, right_label),
+        (right, right_only, right_label, left_label),
     ):
-        for key in sorted(present_keys, key=class_key_sort):
+        for key in sorted(present_keys, key=_class_key_sort_key):
             reference_support = _support_count(
                 present[key], "reference_support", key=key, label=present_label
             )
@@ -329,55 +409,134 @@ Keep the existing labels and output fields. Replace the current `left_keys != ri
             if prediction_support <= 0:
                 _fail(
                     "per_class one-sided class row has no prediction support"
-                    f" for key={key} ({present_label}_prediction_support={prediction_support})"
+                    f" for key={key}"
+                    f" ({present_label}_prediction_support={prediction_support})"
                 )
 
     rows: list[dict[str, str]] = []
-    for key in sorted(shared_keys, key=class_key_sort):
+    for key in sorted(shared_keys, key=_class_key_sort_key):
 ```
 
-Keep the existing row-rendering dictionary below that loop unchanged. Do not synthesize rows for `left_keys - right_keys` or `right_keys - left_keys`.
+Keep the existing row-rendering dictionary unchanged below the loop. Do not validate shared `prediction_support` solely for validation's sake.
 
-- [ ] **Step 7: Run the focused tests and confirm GREEN behavior**
+Return:
+
+```python
+    return rows, {
+        f"{left_label}_only_prediction_class": len(left_only),
+        f"{right_label}_only_prediction_class": len(right_only),
+    }
+```
+
+- [ ] **Step 7: Run focused tests and the lint gate**
 
 Run:
 
 ```bash
 uv run pytest -q \
   tests/benchmark/test_published_comparison.py \
+  tests/benchmark/test_muscriptor_comparison_coverage.py::test_paired_class_rows_skips_non_pairable_ids \
   tests/benchmark/test_muscriptor_comparison_coverage.py::test_paired_class_rows_rejects_asymmetric_pairable_key_grid
+uv run ruff check src/benchmark/published_comparison.py
+uv run ruff format --check src/benchmark/published_comparison.py
 ```
 
-Expected: PASS.
+Expected: all pass. The module-level sort helper avoids Ruff E731 and removes the old nested/inline class sort duplication.
 
-- [ ] **Step 8: Commit the shared-helper fix**
-
-Run:
+- [ ] **Step 8: Commit the shared helper change**
 
 ```bash
 git add \
   src/benchmark/published_comparison.py \
   tests/benchmark/test_published_comparison.py \
   tests/benchmark/test_muscriptor_comparison_coverage.py
-git commit -m "fix: allow prediction-only class asymmetry"
+git commit -m "fix: classify prediction-only class rows"
 ```
 
 ---
 
-### Task 2: Prove the HPA-328 publish path with a real FP-only full-mix class
+### Task 2: Thread class exclusion counts through all three comparison callers
 
 **Files:**
-- Modify: `tests/benchmark/test_separation_comparison.py` near `test_comparison_publishes_paired_csvs_summary_and_native_evidence`.
-- No production change in `src/benchmark/separation_comparison.py`.
+- Modify: `src/benchmark/muscriptor_comparison.py`
+- Modify: `src/benchmark/idm_comparison.py`
+- Modify: `src/benchmark/separation_comparison.py`
+- Modify: `tests/benchmark/test_muscriptor_comparison.py`
+- Modify: `tests/benchmark/test_idm_comparison.py`
+- Modify: `tests/benchmark/test_separation_comparison.py`
 
 **Interfaces:**
-- Consumes the existing `build_reviewed_subset_oaf_fixture()`, `_subset_path()`, `_task6_seams()`, real HPA-325 scoring wrapper, and `run_oaf_separation_pilot()` integration path.
-- Produces one synthetic fixture mutation in the test module only: parent full-mix OaF predicts `ride` once while the reference and derived OaF predictions do not.
-- The full comparison continues through `_pair_summary() -> paired_class_rows()`; no test-only join is substituted.
+- Consumes Task 1 `paired_class_rows() -> (class_rows, class_exclusions)`.
+- Produces the same comparison summaries/artifact names, with the two class exclusion counters merged into each existing `pairing.exclusions` mapping.
 
-- [ ] **Step 1: Add a test-only helper that injects one valid full-mix `ride` false positive**
+- [ ] **Step 1: Update MuScriptor and IDM caller plumbing**
 
-Add this helper in `tests/benchmark/test_separation_comparison.py`:
+In `compare_oaf_muscriptor()` replace the class helper call with:
+
+```python
+class_rows, class_exclusions = _paired_class_rows(
+    oaf_classes,
+    muscriptor_classes,
+    pairable_ids,
+)
+exclusions = {**exclusions, **class_exclusions}
+```
+
+Keep the existing `_summary(..., exclusions, song_rows, class_rows, ...)` call otherwise unchanged.
+
+In `compare_oaf_idm()` replace the class helper call with:
+
+```python
+class_rows, class_exclusions = paired_class_rows(
+    oaf_classes,
+    idm_classes,
+    pairable_ids,
+    left_label="oaf",
+    right_label="idm",
+)
+exclusions = {**exclusions, **class_exclusions}
+```
+
+Keep the existing `comparison_summary(..., exclusions, song_rows, class_rows, ...)` call otherwise unchanged.
+
+- [ ] **Step 2: Update separation `_pair_summary()` without adding another join**
+
+Replace only its class helper/result plumbing:
+
+```python
+class_rows, class_exclusions = paired_class_rows(
+    full_classes,
+    view_classes,
+    pairable_ids,
+    left_label="full_mix",
+    right_label=view_name,
+)
+merged_exclusions = {**exclusions, **class_exclusions}
+```
+
+Pass `merged_exclusions` to `comparison_summary()` instead of the original `exclusions` mapping. Keep `_pair_summary()` as the only separation caller of the shared helper.
+
+- [ ] **Step 3: Pin zero-counter plumbing in existing MuScriptor and IDM comparison tests**
+
+In `test_compare_joins_published_song_and_class_rows_without_rescoring` after loading `summary`, add:
+
+```python
+assert summary["pairing"]["exclusions"]["oaf_only_prediction_class"] == 0
+assert summary["pairing"]["exclusions"]["muscriptor_only_prediction_class"] == 0
+```
+
+In `test_compare_oaf_idm_publishes_deterministic_pair_and_diagnostics`, after its existing `summary = json.loads(...)`, add:
+
+```python
+assert summary["pairing"]["exclusions"]["oaf_only_prediction_class"] == 0
+assert summary["pairing"]["exclusions"]["idm_only_prediction_class"] == 0
+```
+
+These assertions prove the two model callers do not silently discard Task 1's exclusion result even when the baseline fixtures have no asymmetry.
+
+- [ ] **Step 4: Add a test-only parent full-mix `ride` false positive to the separation publish regression**
+
+In `tests/benchmark/test_separation_comparison.py`, add:
 
 ```python
 def _add_parent_prediction_only_ride(fixture) -> str:
@@ -421,23 +580,19 @@ def _add_parent_prediction_only_ride(fixture) -> str:
     return str(row["simfile_id"])
 ```
 
-The helper changes only test fixture bytes and the fixture run's matching artifact hash. It does not change `reviewed_subset_fixtures.py` or production artifact behavior.
+The helper changes only test fixture bytes and the matching run-snapshot artifact hash.
 
-- [ ] **Step 2: Strengthen the existing publish integration test with the asymmetry**
+- [ ] **Step 5: Strengthen the existing separation publish test with source evidence, paired omission, and counts**
 
-Inside `test_comparison_publishes_paired_csvs_summary_and_native_evidence`, immediately after building the `failed_count=0` fixture, call:
+Inside `test_comparison_publishes_paired_csvs_summary_and_native_evidence`, immediately after building the `failed_count=0` fixture:
 
 ```python
 prediction_only_simfile_id = _add_parent_prediction_only_ride(fixture)
 ```
 
-Keep the existing derived `aligned_backend_factory`: it emits only the fixture's kick prediction, so the derived reports have no `ride` row.
-
-After the pilot succeeds, prove the source report contains the legal one-sided row:
+After the pilot succeeds, read full-mix `per_class.csv` and require six source rows:
 
 ```python
-import csv
-
 with (outcome.run_path.parent / "views/full_mix/reports/per_class.csv").open(
     "r", encoding="utf-8", newline=""
 ) as handle:
@@ -453,7 +608,7 @@ assert all(row["reference_support"] == "0" for row in full_mix_ride_rows)
 assert all(int(row["prediction_support"]) > 0 for row in full_mix_ride_rows)
 ```
 
-Then prove both paired delta products deliberately omit that source-only class while still publishing:
+For each derived view, prove the paired class CSV omits the source-only `ride` rows and the pair summary counts all six omissions:
 
 ```python
 for view_name in ("spleeter", "htdemucs"):
@@ -466,24 +621,14 @@ for view_name in ("spleeter", "htdemucs"):
         and row["common_class"] == "ride"
         for row in paired_rows
     )
+    exclusions = summary["pairing"][view_name]["exclusions"]
+    assert exclusions["full_mix_only_prediction_class"] == 6
+    assert exclusions[f"{view_name}_only_prediction_class"] == 0
 ```
 
-Keep the existing artifact-set, population, resource, and summary assertions unchanged.
+Keep the existing population/resource/event-micro assertions unchanged.
 
-- [ ] **Step 3: Run the strengthened separation integration test**
-
-Run:
-
-```bash
-uv run pytest -q \
-  tests/benchmark/test_separation_comparison.py::test_comparison_publishes_paired_csvs_summary_and_native_evidence
-```
-
-Expected: PASS after Task 1. Against the old helper, the strengthened test reaches the final comparison and fails on the one-sided `ride` grid.
-
-- [ ] **Step 4: Run every current shared-helper caller/regression suite together**
-
-Run:
+- [ ] **Step 6: Run all caller suites together**
 
 ```bash
 uv run pytest -q \
@@ -495,69 +640,91 @@ uv run pytest -q \
   tests/benchmark/test_cross_comparison.py
 ```
 
-Expected: PASS. This is the caller-symmetry gate: HPA-305 must not repair the full-mix-left/Spleeter-right case while leaving model comparisons broken for right-only prediction classes.
+Expected: PASS. This is the atomic return-signature/caller-plumbing gate.
 
-- [ ] **Step 5: Commit the publish-path regression**
-
-Run:
+- [ ] **Step 7: Run focused formatting/lint for every production caller**
 
 ```bash
-git add tests/benchmark/test_separation_comparison.py
-git commit -m "test: cover asymmetric separation class comparison"
+uv run ruff check \
+  src/benchmark/published_comparison.py \
+  src/benchmark/muscriptor_comparison.py \
+  src/benchmark/idm_comparison.py \
+  src/benchmark/separation_comparison.py
+uv run ruff format --check \
+  src/benchmark/published_comparison.py \
+  src/benchmark/muscriptor_comparison.py \
+  src/benchmark/idm_comparison.py \
+  src/benchmark/separation_comparison.py
+```
+
+Expected: PASS.
+
+- [ ] **Step 8: Commit caller plumbing and publish regression**
+
+```bash
+git add \
+  src/benchmark/muscriptor_comparison.py \
+  src/benchmark/idm_comparison.py \
+  src/benchmark/separation_comparison.py \
+  tests/benchmark/test_muscriptor_comparison.py \
+  tests/benchmark/test_idm_comparison.py \
+  tests/benchmark/test_separation_comparison.py
+git commit -m "fix: report asymmetric class exclusions"
 ```
 
 ---
 
 ### Task 3: Re-run comparison only, close repository verification, and record production evidence
 
-**Files:**
-- No new production files expected.
-- Update PR #32 and HPA-305 with evidence after commands complete.
-- Generated benchmark outputs remain outside git.
+**Files:** no new repository files expected; update PR #32 and HPA-305 with command evidence only.
 
 **Interfaces:**
 - Consumes `SeparationComparisonRequest` and `compare_oaf_separation()` from `src/benchmark/separation_comparison.py`.
-- Produces the existing HPA-328 comparison directory and `SeparationComparisonOutcome` without re-running separator/OaF inference.
+- Produces the existing HPA-328 comparison directory and summary with explicit class exclusion counters, without rerunning separator/OaF inference.
 
-- [ ] **Step 1: Run focused static checks on the final touched files**
-
-Run:
+- [ ] **Step 1: Run focused static checks on all touched files**
 
 ```bash
 uv run ruff check \
   src/benchmark/published_comparison.py \
+  src/benchmark/muscriptor_comparison.py \
+  src/benchmark/idm_comparison.py \
+  src/benchmark/separation_comparison.py \
   tests/benchmark/test_published_comparison.py \
   tests/benchmark/test_muscriptor_comparison_coverage.py \
+  tests/benchmark/test_muscriptor_comparison.py \
+  tests/benchmark/test_idm_comparison.py \
   tests/benchmark/test_separation_comparison.py
 uv run ruff format --check \
   src/benchmark/published_comparison.py \
+  src/benchmark/muscriptor_comparison.py \
+  src/benchmark/idm_comparison.py \
+  src/benchmark/separation_comparison.py \
   tests/benchmark/test_published_comparison.py \
   tests/benchmark/test_muscriptor_comparison_coverage.py \
+  tests/benchmark/test_muscriptor_comparison.py \
+  tests/benchmark/test_idm_comparison.py \
   tests/benchmark/test_separation_comparison.py
 uv run pylint --errors-only --disable=E1120,E0401 --jobs=1 \
-  src/benchmark/published_comparison.py
+  src/benchmark/published_comparison.py \
+  src/benchmark/muscriptor_comparison.py \
+  src/benchmark/idm_comparison.py \
+  src/benchmark/separation_comparison.py
 ```
 
 Expected: all commands exit 0.
 
-- [ ] **Step 2: Reuse the PR #31 production paths and run only `compare_oaf_separation()`**
-
-Set the fixed run path:
+- [ ] **Step 2: Run only the recorded production comparison**
 
 ```bash
 export SEPARATION_RUN="artifacts/benchmark/oaf-separation-pilot/runs/oaf-separation-8e66abde20b8f590/run.json"
-```
-
-Reuse the exact published HPA-324/HPA-323/HPA-327/cache paths from the PR #31 reproduction workspace. Require those existing values rather than substituting regenerated evidence:
-
-```bash
 : "${REFERENCE_MANIFEST:?set REFERENCE_MANIFEST to the PR #31 reproduced HPA-324 manifest}"
 : "${TIMING_MANIFEST:?set TIMING_MANIFEST to the PR #31 reproduced HPA-323 manifest}"
 : "${REVIEWED_SUBSET_MANIFEST:?set REVIEWED_SUBSET_MANIFEST to the PR #31 reproduced HPA-327 manifest}"
 : "${CORPUS_CACHE:?set CORPUS_CACHE to the PR #31 verified HPA-321 cache}"
 ```
 
-Run:
+Then:
 
 ```bash
 uv run python - <<'PY'
@@ -584,44 +751,42 @@ print(outcome)
 PY
 ```
 
-Expected:
+Expected: a `SeparationComparisonOutcome` is printed and comparison artifacts publish without a simfile-241 `ride` integrity error.
 
-- no `per_class score key grid mismatch`;
-- no `reference-supported class row is missing` for simfile 241 `ride`;
-- a `SeparationComparisonOutcome` is printed;
-- `artifacts/benchmark/oaf-separation-pilot/runs/oaf-separation-8e66abde20b8f590/comparison/summary.json` exists;
-- both Spleeter and HTDemucs paired CSV directories are published.
+Do not rerun Spleeter, HTDemucs, or OaF inference.
 
-Do not rerun separator or OaF inference for this step.
-
-- [ ] **Step 3: Verify the production paired class output intentionally omits the one-sided `ride` keys**
-
-Run:
+- [ ] **Step 3: Verify the production Spleeter exclusion evidence**
 
 ```bash
 uv run python - <<'PY'
 import csv
+import json
 from pathlib import Path
 
-root = Path(
+run_dir = Path(
     "artifacts/benchmark/oaf-separation-pilot/runs/"
-    "oaf-separation-8e66abde20b8f590/comparison/spleeter"
+    "oaf-separation-8e66abde20b8f590"
 )
-with (root / "paired_per_class.csv").open("r", encoding="utf-8", newline="") as handle:
+with (run_dir / "comparison/spleeter/paired_per_class.csv").open(
+    "r", encoding="utf-8", newline=""
+) as handle:
     rows = list(csv.DictReader(handle))
 assert not any(
     row["simfile_id"] == "241" and row["common_class"] == "ride"
     for row in rows
 )
-print("HPA-305 production comparison PASS: simfile 241 ride remains source-only evidence")
+
+summary = json.loads((run_dir / "comparison/summary.json").read_text(encoding="utf-8"))
+exclusions = summary["pairing"]["spleeter"]["exclusions"]
+assert exclusions["full_mix_only_prediction_class"] == 6, exclusions
+assert exclusions["spleeter_only_prediction_class"] == 0, exclusions
+print("HPA-305 production comparison PASS: six source-only ride rows counted")
 PY
 ```
 
-Expected: the PASS line above.
+Expected: the PASS line above. Record the HTDemucs class exclusion counters as observed, but do not assume they are zero unless the production evidence says so.
 
-- [ ] **Step 4: Confirm the HPA-328 finalizer prerequisite is restored without choosing a new benchmark decision**
-
-Confirm the comparison bundle required by the existing finalizer is now present:
+- [ ] **Step 4: Confirm the HPA-328 finalizer prerequisite is restored**
 
 ```bash
 RUN_DIR="${SEPARATION_RUN%/run.json}"
@@ -632,11 +797,9 @@ test -f "$RUN_DIR/comparison/htdemucs/paired_per_song.csv"
 test -f "$RUN_DIR/comparison/htdemucs/paired_per_class.csv"
 ```
 
-Expected: all checks exit 0. HPA-305 does not invent or change HPA-328's evidence-backed `decision`/`rationale`; if an existing handoff decision is already recorded, its finalizer may be rerun separately with those exact values.
+Expected: all checks exit 0. HPA-305 does not choose or alter HPA-328's benchmark decision/rationale.
 
 - [ ] **Step 5: Run repository-wide verification**
-
-Run:
 
 ```bash
 uv run pytest -q
@@ -647,55 +810,70 @@ git diff --check origin/main...HEAD
 git status --short
 ```
 
-Expected: test/static gates pass; `git status --short` contains no unintended generated benchmark artifacts staged for commit.
+Expected: all test/static gates pass and no generated benchmark artifacts are staged.
 
 - [ ] **Step 6: Scope audit**
-
-Run:
 
 ```bash
 git diff --stat origin/main...HEAD
 git diff --name-only origin/main...HEAD
 ```
 
-Expected implementation files beyond the already committed planning docs:
+Expected implementation files beyond the planning docs:
 
 ```text
 src/benchmark/published_comparison.py
+src/benchmark/muscriptor_comparison.py
+src/benchmark/idm_comparison.py
+src/benchmark/separation_comparison.py
 tests/benchmark/test_published_comparison.py
 tests/benchmark/test_muscriptor_comparison_coverage.py
+tests/benchmark/test_muscriptor_comparison.py
+tests/benchmark/test_idm_comparison.py
 tests/benchmark/test_separation_comparison.py
 ```
 
-Reject any implementation diff in `cohort_scoring.py`, `reports.py`, `separation_comparison.py`, taxonomy/mapping, schemas, or separator/OaF execution unless a new independently demonstrated defect invalidates this plan.
+Reject implementation changes in `cohort_scoring.py`, `reports.py`, taxonomy/mapping, schemas, or separator/OaF execution unless new artifact evidence invalidates this plan.
 
-- [ ] **Step 7: Record the production closeout**
+- [ ] **Step 7: Record production closeout**
 
 Post on PR #32 and HPA-305:
 
 - the six Task 0 support tuples;
-- focused shared-caller suite result;
+- focused caller-suite result;
 - repository-wide test/static result;
 - production `SeparationComparisonOutcome`;
-- confirmation that simfile 241 `ride` is omitted only from the paired delta product while remaining present in full-mix `per_class.csv`;
-- confirmation that the HPA-328 comparison bundle/finalizer prerequisite is restored.
+- Spleeter `full_mix_only_prediction_class=6` and `spleeter_only_prediction_class=0`;
+- observed HTDemucs class exclusion counters;
+- confirmation that simfile 241 `ride` remains in source full-mix `per_class.csv` but not in the paired Spleeter class product;
+- confirmation that HPA-328's comparison/finalizer prerequisite is restored.
 
 Do not mark HPA-305 complete if Task 0 was never recorded or the real comparison was not rerun on the final implementation tree.
 
 ---
 
+## Risks and Stop Conditions
+
+**Task 0 invalidates the design:** HPA-305/PR #32 stay open and are re-scoped from `views/spleeter/reports/event_diagnostics.jsonl` as described in Task 0 Step 3. Do not merge a partial comparison relaxation.
+
+**Shared helper return change:** all three callers are updated in Task 2 and gated by MuScriptor, IDM, separation, and cross-comparison suites. No compatibility wrapper is added for this internal seam.
+
+**Exclusion interpretation:** the two new counters count omitted score rows, not unique class identities. Keep the naming/documentation stable so later report consumers do not treat `6` as six distinct drum classes.
+
 ## Plan Self-Review
 
-**Spec coverage:** Task 0 enforces the production hypothesis gate before code. Task 1 implements symmetric reference-aware class pairing and support validation while preserving song-grid strictness. Task 2 covers the actual HPA-328 publish path and all current shared-helper caller families. Task 3 proves the recorded production run publishes and closes the repository/operational gates.
+**Spec coverage:** Task 0 enforces the hypothesis before code. Task 1 centralizes reference-aware pairing, deterministic sorting, support validation, and exclusion counts. Task 2 threads those counts through every current caller and proves zero/nonzero summary behavior. Task 3 validates the real run and repository gates.
 
-**Test-surface correction:** The pre-existing MuScriptor coverage test is explicitly retained and retargeted; HPA-305 does not leave a stale assertion on the old generic grid-mismatch message. Both left-only and right-only prediction asymmetry are pinned in the shared helper so IDM/model callers receive the same semantics as separation.
+**Review corrections:** Python is pinned to 3.12. `_class_key_sort_key()` replaces the assigned lambda/nested duplicate. Shared prediction support is not redundantly validated. One malformed direct-helper test is sufficient because production report readers already validate support types/ranges.
 
-**Malformed-evidence boundary:** `_support_count()` converts malformed support evidence into `ComparisonIntegrityError` before arithmetic/comparison. One-sided `0/0` rows remain invalid because HPA-325 `_class_scores()` cannot legitimately emit a class absent from both reference and prediction events.
+**Reference invariant:** class-constrained matching plus `_class_scores()` unmatched-reference inclusion means any reference-supported class must publish a row in every successfully scored view. That is why only prediction-only one-sided rows are droppable.
 
-**Type consistency:** The plan preserves the public `paired_class_rows()` signature and uses one `_support_count(...)->int` helper consistently. The integration helper updates the same `prediction_artifact_sha256` field consumed by the existing persisted OaF run readers.
+**Paired-product accounting:** one-sided source rows are not synthesized; their omission is counted in `pairing.exclusions`, and source `per_class.csv`/diagnostics retain the actual false-positive evidence.
 
-**Placeholder scan:** There are no `TBD`, `TODO`, ellipsis bodies, or undefined implementation functions. Production environment variables are explicit gates to the already reproduced PR #31 artifacts, not substitute inputs.
+**Type consistency:** `paired_class_rows()` has one new tuple return contract used identically by MuScriptor, IDM, and separation callers. The private `_paired_class_rows` migration alias naturally shares that contract.
 
-**YAGNI:** One private support reader plus an in-place `paired_class_rows()` change is sufficient. There is no dense class grid, join-policy configuration, new comparison engine, schema bump, scorer change, or compatibility layer.
+**Placeholder scan:** no undefined implementation bodies, `TBD`, or `TODO` steps remain. Production environment variables are explicit references to the already reproduced PR #31 evidence.
 
-**Single-PR delivery:** Planning and implementation stay on PR #32. The implementation is blocked on Task 0, not split into a second PR.
+**YAGNI:** no dense grid, policy configuration, new result type, schema bump, scorer rewrite, or compatibility layer. A tuple plus the existing exclusions maps is sufficient.
+
+**Single-PR delivery:** planning and implementation stay on PR #32; Task 0 is the only gate before code changes.
