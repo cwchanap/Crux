@@ -1016,7 +1016,12 @@ def test_paired_class_rows_skips_non_pairable_ids() -> None:
     muscriptor = {
         key: _ClassRow("1", 50, "raw", "kick", 2, 1, Decimal("0.8"), Decimal("0.5"), Decimal("0.5"))
     }
-    assert _paired_class_rows(oaf, muscriptor, pairable_ids=set()) == []
+    rows, exclusions = _paired_class_rows(oaf, muscriptor, pairable_ids=set())
+    assert rows == []
+    assert exclusions == {
+        "oaf_only_prediction_class": 0,
+        "muscriptor_only_prediction_class": 0,
+    }
 
 
 def test_paired_class_rows_rejects_asymmetric_pairable_key_grid() -> None:
@@ -1027,7 +1032,7 @@ def test_paired_class_rows_rejects_asymmetric_pairable_key_grid() -> None:
     row = _ClassRow("1", 50, "raw", "kick", 2, 1, Decimal("0.5"), Decimal("0.5"), Decimal("0.5"))
     extra_row = _ClassRow("1", 50, "raw", "snare", 1, 0, Decimal("1"), Decimal("1"), Decimal("1"))
 
-    with pytest.raises(ComparisonIntegrityError, match="per_class score key grid mismatch"):
+    with pytest.raises(ComparisonIntegrityError, match="reference-supported class row is missing"):
         _paired_class_rows(
             {key: row, extra_key: extra_row},
             {key: row},

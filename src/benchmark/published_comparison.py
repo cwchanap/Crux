@@ -178,8 +178,27 @@ def _row_value(row: object, field: str) -> object:
     return getattr(row, field)
 
 
+def _support_count(
+    row: object,
+    field: str,
+    *,
+    key: tuple[str, int, str, str],
+    label: str,
+) -> int:
+    value = _row_value(row, field)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        _fail(f"per_class {field} is malformed for {label} key={key}")
+    return value
+
+
 def _song_key_sort_key(value: tuple[str, int, str]) -> tuple[int, int, int]:
     return int(value[0]), value[1], _MODES[value[2]]
+
+
+def _class_key_sort_key(
+    value: tuple[str, int, str, str],
+) -> tuple[int, int, int, str]:
+    return int(value[0]), value[1], _MODES[value[2]], value[3]
 
 
 def paired_song_rows(
@@ -240,29 +259,56 @@ def paired_class_rows(
     *,
     left_label: str = "oaf",
     right_label: str = "muscriptor",
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], dict[str, int]]:
     """Join per-class score rows and render deterministic metric deltas."""
     left_label = _label(left_label, "left_label")
     right_label = _label(right_label, "right_label")
     left_keys = {key for key in left if str(key[0]) in pairable_ids}
     right_keys = {key for key in right if str(key[0]) in pairable_ids}
-    if left_keys != right_keys:
+    shared_keys = left_keys & right_keys
+    left_only = left_keys - right_keys
+    right_only = right_keys - left_keys
 
-        def class_key_sort(value: tuple[str, int, str, str]) -> tuple[int, int, int, str]:
-            return int(value[0]), value[1], _MODES[value[2]], value[3]
-
-        missing_right = sorted(left_keys - right_keys, key=class_key_sort)
-        missing_left = sorted(right_keys - left_keys, key=class_key_sort)
-        _fail(
-            "per_class score key grid mismatch"
-            f" (missing from {right_label}: {missing_right},"
-            f" missing from {left_label}: {missing_left})"
+    for key in sorted(shared_keys, key=_class_key_sort_key):
+        left_reference_support = _support_count(
+            left[key], "reference_support", key=key, label=left_label
         )
-    rows: list[dict[str, str]] = []
-    for key in sorted(
-        left_keys,
-        key=lambda value: (int(value[0]), value[1], _MODES[value[2]], value[3]),
+        right_reference_support = _support_count(
+            right[key], "reference_support", key=key, label=right_label
+        )
+        if left_reference_support != right_reference_support:
+            _fail(
+                "per_class reference_support mismatch"
+                f" for key={key} ({left_label}={left_reference_support},"
+                f" {right_label}={right_reference_support})"
+            )
+
+    for present, present_keys, present_label, missing_label in (
+        (left, left_only, left_label, right_label),
+        (right, right_only, right_label, left_label),
     ):
+        for key in sorted(present_keys, key=_class_key_sort_key):
+            reference_support = _support_count(
+                present[key], "reference_support", key=key, label=present_label
+            )
+            prediction_support = _support_count(
+                present[key], "prediction_support", key=key, label=present_label
+            )
+            if reference_support > 0:
+                _fail(
+                    "per_class reference-supported class row is missing"
+                    f" from {missing_label} for key={key}"
+                    f" ({present_label}_reference_support={reference_support})"
+                )
+            if prediction_support <= 0:
+                _fail(
+                    "per_class one-sided class row has no prediction support"
+                    f" for key={key}"
+                    f" ({present_label}_prediction_support={prediction_support})"
+                )
+
+    rows: list[dict[str, str]] = []
+    for key in sorted(shared_keys, key=_class_key_sort_key):
         left_row, right_row = left[key], right[key]
         rows.append(
             {
@@ -295,7 +341,10 @@ def paired_class_rows(
                 ),
             }
         )
-    return rows
+    return rows, {
+        f"{left_label}_only_prediction_class": len(left_only),
+        f"{right_label}_only_prediction_class": len(right_only),
+    }
 
 
 def aggregate_delta_rows(rows: Iterable[Mapping[str, str]]) -> list[dict[str, object]]:
