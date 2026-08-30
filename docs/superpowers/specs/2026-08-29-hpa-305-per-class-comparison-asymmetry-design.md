@@ -171,9 +171,10 @@ Keep the shared helper's new semantic coverage together near the existing song-g
 1. Left-only prediction-only class (`reference_support == 0`, `prediction_support > 0`) is valid and omitted from paired rows.
 2. Right-only prediction-only class is valid and omitted from paired rows.
 3. Shared class key with unequal `reference_support` fails.
-4. Malformed support evidence fails as `ComparisonIntegrityError` rather than leaking a raw `TypeError`.
-5. Existing shared-key rendering remains unchanged.
-6. Existing per-song key-grid mismatch remains strict.
+4. One-sided `reference_support == 0`, `prediction_support == 0` fails as malformed scorer evidence.
+5. Malformed support evidence fails as `ComparisonIntegrityError` rather than leaking a raw `TypeError`.
+6. Existing shared-key rendering remains unchanged.
+7. Existing per-song key-grid mismatch remains strict.
 
 At least one omit test should use the simfile-241 shape across all six 30/50/100 ms × raw/aligned keys so the recorded failure cannot regress through a one-key-only fixture.
 
@@ -199,7 +200,7 @@ After Step 0 and the focused RED/GREEN tests:
 2. Run the normal repository static/test gates appropriate to the touched Python files.
 3. Re-run `compare_oaf_separation()` against `oaf-separation-8e66abde20b8f590` using the already reproduced evidence; do not rerun expensive separator/OaF inference unless those artifacts are unavailable.
 4. Require comparison publication to complete rather than exit 2.
-5. Run `finalize-oaf-separation-pilot` and verify HPA-328 can reach its intended final outcome.
+5. Confirm the HPA-328 comparison bundle/finalizer prerequisite is restored without inventing a new benchmark decision inside HPA-305.
 
 ## Expected implementation surface
 
@@ -219,6 +220,6 @@ Documentation/planning stays on this same HPA-305 branch and PR.
 
 ## Delivery
 
-Use one PR for HPA-305. This draft starts with the design spec. After the written design is approved, add the implementation plan to this same branch/PR; after planning review, implementation and production verification also land on this same PR. Do not open a second implementation PR.
+Use one PR for HPA-305. This draft starts with the design spec and implementation plan. After planning review, implementation and production verification also land on this same PR. Do not open a second implementation PR.
 
 Planned branch: `agent/hpa-305-per-class-comparison-asymmetry`.
