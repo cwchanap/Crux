@@ -426,6 +426,8 @@ def test_compare_joins_published_song_and_class_rows_without_rescoring(
 
     summary = json.loads((result.output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["schema"] == "crux.oaf-muscriptor-comparison/v1"
+    assert summary["pairing"]["exclusions"]["oaf_only_prediction_class"] == 0
+    assert summary["pairing"]["exclusions"]["muscriptor_only_prediction_class"] == 0
     assert summary["identity"]["taxonomy_version"] == TAXONOMY_VERSION
     assert summary["identity"]["lane_map_version"] == DTX_LANE_MAP_VERSION
     assert summary["identity"]["scoring_version"] == SCORING_VERSION

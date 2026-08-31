@@ -571,13 +571,14 @@ def compare_oaf_idm(request: IdmComparisonRequest) -> Path:
             left_label="oaf",
             right_label="idm",
         )
-        class_rows = paired_class_rows(
+        class_rows, class_exclusions = paired_class_rows(
             oaf_classes,
             idm_classes,
             pairable_ids,
             left_label="oaf",
             right_label="idm",
         )
+        exclusions = {**exclusions, **class_exclusions}
         summary = comparison_summary(
             oaf,
             idm,

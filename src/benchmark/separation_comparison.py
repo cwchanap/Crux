@@ -501,18 +501,19 @@ def _pair_summary(
         left_label="full_mix",
         right_label=view_name,
     )
-    class_rows = paired_class_rows(
+    class_rows, class_exclusions = paired_class_rows(
         full_classes,
         view_classes,
         pairable_ids,
         left_label="full_mix",
         right_label=view_name,
     )
+    merged_exclusions = {**exclusions, **class_exclusions}
     base = comparison_summary(
         full_mix,
         view,
         pairable_ids,
-        exclusions,
+        merged_exclusions,
         song_rows,
         class_rows,
         reference_manifest,

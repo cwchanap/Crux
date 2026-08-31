@@ -696,7 +696,12 @@ def compare_oaf_muscriptor(request: ComparisonRequest) -> ComparisonOutcome:
         oaf_classes = _selected_rows(oaf.reports.classes, selected_ids)
         muscriptor_classes = _selected_rows(muscriptor.reports.classes, selected_ids)
         song_rows = _paired_song_rows(oaf_songs, muscriptor_songs, pairable_ids)  # type: ignore[arg-type]
-        class_rows = _paired_class_rows(oaf_classes, muscriptor_classes, pairable_ids)  # type: ignore[arg-type]
+        class_rows, class_exclusions = _paired_class_rows(
+            oaf_classes,
+            muscriptor_classes,
+            pairable_ids,
+        )  # type: ignore[arg-type]
+        exclusions = {**exclusions, **class_exclusions}
         # No prediction or scorer is loaded by this module.
         summary = _summary(
             oaf,

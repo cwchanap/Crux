@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -186,6 +187,46 @@ def test_pilot_comparison_call_uses_run_scoped_output_after_scoring(
     assert comparison_request.subset_manifest_path == subset
 
 
+def _add_parent_prediction_only_ride(fixture) -> str:
+    from src.benchmark.backends import NativeEvent, NativePrediction
+    from src.benchmark.mapping import map_oaf_prediction
+    from src.benchmark.oaf_corpus_run import parse_oaf_corpus_run, write_oaf_corpus_run
+    from src.benchmark.prediction_artifact import (
+        read_prediction_artifact,
+        render_prediction_artifact,
+    )
+
+    snapshot = parse_oaf_corpus_run(fixture.run_path.read_bytes())
+    row = next(item for item in snapshot["items"] if item["execution_disposition"] == "inferred")
+    prediction_path = fixture.oaf_output_dir / row["prediction_path"]
+    artifact = read_prediction_artifact(prediction_path.read_bytes())
+
+    ride = NativeEvent(
+        time_sec=0.75,
+        # ponytail: brief said midi_51/51/51 but the artifact validator requires
+        # native_midi_note == model_output_bin + 21 and class id midi_{note};
+        # mapping uses upstream_8hit_group_id so the event still lands on ride.
+        native_class_id="midi_72",
+        model_output_bin=51,
+        native_midi_note=72,
+        native_metadata={"upstream_8hit_group_id": "ride"},
+        confidence=0.8,
+        velocity_midi=90,
+    )
+    native = NativePrediction(
+        audio=artifact.prediction.audio,
+        descriptor=artifact.prediction.descriptor,
+        events=tuple(event.native for event in artifact.prediction.events) + (ride,),
+    )
+    mapped, _ = map_oaf_prediction(native)
+    content = render_prediction_artifact(mapped)
+    prediction_path.write_bytes(content)
+    updated = read_prediction_artifact(content)
+    row["prediction_artifact_sha256"] = updated.artifact_sha256
+    write_oaf_corpus_run(fixture.run_path, snapshot)
+    return str(row["simfile_id"])
+
+
 def test_comparison_publishes_paired_csvs_summary_and_native_evidence(
     tmp_path,
     monkeypatch,
@@ -199,6 +240,7 @@ def test_comparison_publishes_paired_csvs_summary_and_native_evidence(
     )
 
     fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20, failed_count=0)
+    prediction_only_simfile_id = _add_parent_prediction_only_ride(fixture)
     subset = _subset_path(tmp_path, fixture)
     request = _request(tmp_path, fixture, subset)
     _install_fixture_locks(monkeypatch)
@@ -241,6 +283,18 @@ def test_comparison_publishes_paired_csvs_summary_and_native_evidence(
 
     assert outcome.exit_code == 0
     assert outcome.run_path is not None
+    with (outcome.run_path.parent / "views/full_mix/reports/per_class.csv").open(
+        "r", encoding="utf-8", newline=""
+    ) as handle:
+        full_mix_ride_rows = [
+            row
+            for row in csv.DictReader(handle)
+            if row["simfile_id"] == prediction_only_simfile_id and row["common_class"] == "ride"
+        ]
+
+    assert len(full_mix_ride_rows) == 6
+    assert all(row["reference_support"] == "0" for row in full_mix_ride_rows)
+    assert all(int(row["prediction_support"]) > 0 for row in full_mix_ride_rows)
     comparison_dir = outcome.run_path.parent / "comparison"
     expected_files = {
         "spleeter/paired_per_song.csv",
@@ -275,6 +329,18 @@ def test_comparison_publishes_paired_csvs_summary_and_native_evidence(
         assert resources["retained_prediction_bytes"] > 0
         assert resources["retained_report_bytes"] > 0
         assert summary["comparisons"][view_name]["event_micro"]
+    for view_name in ("spleeter", "htdemucs"):
+        with (comparison_dir / view_name / "paired_per_class.csv").open(
+            "r", encoding="utf-8", newline=""
+        ) as handle:
+            paired_rows = list(csv.DictReader(handle))
+        assert not any(
+            row["simfile_id"] == prediction_only_simfile_id and row["common_class"] == "ride"
+            for row in paired_rows
+        )
+        exclusions = summary["pairing"][view_name]["exclusions"]
+        assert exclusions["full_mix_only_prediction_class"] == 6
+        assert exclusions[f"{view_name}_only_prediction_class"] == 0
     assert "cost" not in summary
     assert "reason_counts" in (comparison_dir / "summary.md").read_text(encoding="utf-8")
 

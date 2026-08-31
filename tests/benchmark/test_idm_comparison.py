@@ -418,6 +418,8 @@ def test_compare_oaf_idm_publishes_deterministic_pair_and_diagnostics(
         "paired_per_class.csv",
     }
     summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["pairing"]["exclusions"]["oaf_only_prediction_class"] == 0
+    assert summary["pairing"]["exclusions"]["idm_only_prediction_class"] == 0
     assert summary["pairing"]["pairable_success_intersection"] == 1
     assert summary["models"]["oaf"]["population"]["failed_count"] == 1
     assert summary["models"]["idm"]["population"]["success_count"] == 1
