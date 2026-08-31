@@ -176,6 +176,46 @@ def test_paired_class_rows_rejects_malformed_one_sided_support() -> None:
         )
 
 
+def test_paired_class_rows_rejects_row_missing_reference_support() -> None:
+    key = ("241", 50, "raw", "ride")
+    left_row = SimpleNamespace(  # missing reference_support
+        prediction_support=1,
+        precision=Decimal("0.5"),
+        recall=Decimal("0.5"),
+        f1=Decimal("0.5"),
+    )
+    with pytest.raises(
+        ComparisonIntegrityError, match="missing required field 'reference_support'"
+    ):
+        paired_class_rows(
+            {key: left_row},
+            {key: _class_row()},
+            {"241"},
+            left_label="full_mix",
+            right_label="spleeter",
+        )
+
+
+def test_paired_class_rows_rejects_row_missing_prediction_support() -> None:
+    key = ("241", 50, "raw", "ride")
+    left_row = SimpleNamespace(  # missing prediction_support
+        reference_support=1,
+        precision=Decimal("0.5"),
+        recall=Decimal("0.5"),
+        f1=Decimal("0.5"),
+    )
+    with pytest.raises(
+        ComparisonIntegrityError, match="missing required field 'prediction_support'"
+    ):
+        paired_class_rows(
+            {key: left_row},
+            {key: _class_row()},
+            {"241"},
+            left_label="full_mix",
+            right_label="spleeter",
+        )
+
+
 def test_manifest_attr_rejects_missing_field() -> None:
     manifest = SimpleNamespace(manifest_sha256=_SHA)
     with pytest.raises(ComparisonIntegrityError, match="manifest is missing required field"):
