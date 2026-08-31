@@ -91,10 +91,16 @@ def _class_row(
     *,
     reference_support: object = 1,
     prediction_support: object = 1,
+    true_positives: object = 0,
+    false_negatives: object | None = None,
+    false_positives: object | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         reference_support=reference_support,
         prediction_support=prediction_support,
+        true_positives=true_positives,
+        false_negatives=(false_negatives if false_negatives is not None else reference_support),
+        false_positives=(false_positives if false_positives is not None else prediction_support),
         precision=Decimal("0.5"),
         recall=Decimal("0.5"),
         f1=Decimal("0.5"),
@@ -169,6 +175,50 @@ def test_paired_class_rows_rejects_malformed_one_sided_support() -> None:
     with pytest.raises(ComparisonIntegrityError, match="reference_support is malformed"):
         paired_class_rows(
             {key: _class_row(reference_support=True, prediction_support=1)},
+            {},
+            {"241"},
+            left_label="full_mix",
+            right_label="spleeter",
+        )
+
+
+def test_paired_class_rows_rejects_one_sided_reference_support_score_mismatch() -> None:
+    key = ("241", 50, "raw", "ride")
+    with pytest.raises(
+        ComparisonIntegrityError, match="reference_support disagrees with score counts"
+    ):
+        paired_class_rows(
+            {
+                key: _class_row(
+                    reference_support=0,
+                    prediction_support=1,
+                    true_positives=1,
+                    false_negatives=0,
+                    false_positives=1,
+                )
+            },
+            {},
+            {"241"},
+            left_label="full_mix",
+            right_label="spleeter",
+        )
+
+
+def test_paired_class_rows_rejects_one_sided_prediction_support_score_mismatch() -> None:
+    key = ("241", 50, "raw", "ride")
+    with pytest.raises(
+        ComparisonIntegrityError, match="prediction_support disagrees with score counts"
+    ):
+        paired_class_rows(
+            {
+                key: _class_row(
+                    reference_support=0,
+                    prediction_support=1,
+                    true_positives=0,
+                    false_negatives=0,
+                    false_positives=2,
+                )
+            },
             {},
             {"241"},
             left_label="full_mix",

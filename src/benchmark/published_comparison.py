@@ -195,6 +195,44 @@ def _support_count(
     return value
 
 
+def _validate_one_sided_support_identity(
+    row: object,
+    *,
+    reference_support: int,
+    prediction_support: int,
+    key: tuple[str, int, str, str],
+    label: str,
+) -> None:
+    """Keep the one-sided escape hatch fail-closed against truncated evidence.
+
+    The report reader parses ``reference_support`` / ``prediction_support`` as
+    plain non-negative integers and does not verify them against the score
+    counts, so an edited row such as ``tp=1, fn=0, reference_support=0`` would
+    otherwise be classified as prediction-only and silently omitted.  A genuine
+    prediction-only row satisfies ``reference_support == tp + fn`` (here ``0``)
+    and ``prediction_support == tp + fp``.
+    """
+    true_positives = _support_count(row, "true_positives", key=key, label=label)
+    false_negatives = _support_count(row, "false_negatives", key=key, label=label)
+    false_positives = _support_count(row, "false_positives", key=key, label=label)
+    if reference_support != true_positives + false_negatives:
+        _fail(
+            "per_class reference_support disagrees with score counts"
+            f" for {label} key={key}"
+            f" (reference_support={reference_support},"
+            f" true_positives={true_positives},"
+            f" false_negatives={false_negatives})"
+        )
+    if prediction_support != true_positives + false_positives:
+        _fail(
+            "per_class prediction_support disagrees with score counts"
+            f" for {label} key={key}"
+            f" (prediction_support={prediction_support},"
+            f" true_positives={true_positives},"
+            f" false_positives={false_positives})"
+        )
+
+
 def _song_key_sort_key(value: tuple[str, int, str]) -> tuple[int, int, int]:
     return int(value[0]), value[1], _MODES[value[2]]
 
@@ -304,6 +342,13 @@ def paired_class_rows(
                     f" from {missing_label} for key={key}"
                     f" ({present_label}_reference_support={reference_support})"
                 )
+            _validate_one_sided_support_identity(
+                present[key],
+                reference_support=reference_support,
+                prediction_support=prediction_support,
+                key=key,
+                label=present_label,
+            )
             if prediction_support <= 0:
                 _fail(
                     "per_class one-sided class row has no prediction support"
