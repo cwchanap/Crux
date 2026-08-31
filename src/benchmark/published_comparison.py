@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 from statistics import mean, median
+from typing import NoReturn
 
 from src.benchmark.backend_identity import StrictJsonError, canonical_json_bytes, require_sha256
 from src.benchmark.reports import (
@@ -50,7 +51,7 @@ class PublishedRunEvidence:
     label: str = "model"
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> NoReturn:
     raise ComparisonIntegrityError(message)
 
 
@@ -175,7 +176,10 @@ def csv_decimal(value: Decimal | None) -> str:
 
 
 def _row_value(row: object, field: str) -> object:
-    return getattr(row, field)
+    try:
+        return getattr(row, field)
+    except AttributeError:
+        _fail(f"row is missing required field {field!r}")
 
 
 def _support_count(
