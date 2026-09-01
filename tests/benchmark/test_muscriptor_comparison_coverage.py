@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ import pytest
 from src.benchmark.backend_identity import (
     OAF_BACKEND_ID,
     canonical_json_bytes,
+    strict_json_loads,
 )
 from src.benchmark.cohort_scoring import SCORING_VERSION
 from src.benchmark.muscriptor_comparison import (
@@ -234,6 +236,54 @@ def _write_classes(tmp_path: Path, rows: list[dict[str, str]]) -> Path:
     path = tmp_path / "per_class.csv"
     _write_csv(path, _CLASS_FIELDS, rows)
     return path
+
+
+def _add_one_sided_prediction_class(
+    root: Path, *, common_class: str, prediction_support: int
+) -> None:
+    """Append a prediction-only (reference_support=0) class to a run's reports.
+
+    The class is added to per_class.csv for both modes and to every summary.json
+    aggregate's per_class so read_cohort_reports() accepts the row (the class set
+    stays consistent across tolerances/modes). tp/fn are zero and fp equals
+    prediction_support, satisfying the one-sided support/score identity
+    (reference_support == tp + fn, prediction_support == tp + fp).
+    """
+    reports = root / "reports"
+    kick_rows = [_class_row(common_class="kick", mode=mode) for mode in ("raw", "aligned")]
+    one_sided_rows = [
+        _class_row(
+            common_class=common_class,
+            mode=mode,
+            tp="0",
+            fp=str(prediction_support),
+            fn="0",
+            reference_support="0",
+            prediction_support=str(prediction_support),
+            precision="0",
+            recall="0",
+            f1="0",
+        )
+        for mode in ("raw", "aligned")
+    ]
+    _write_csv(reports / "per_class.csv", _CLASS_FIELDS, kick_rows + one_sided_rows)
+
+    summary = strict_json_loads((reports / "summary.json").read_bytes())
+    for aggregate in summary["aggregates"]:
+        aggregate["per_class"].append(
+            {
+                "common_class": common_class,
+                "tp": 0,
+                "fp": prediction_support,
+                "fn": 0,
+                "precision": Decimal("0"),
+                "recall": Decimal("0"),
+                "f1": Decimal("0"),
+                "reference_support": 0,
+                "prediction_support": prediction_support,
+            }
+        )
+    (reports / "summary.json").write_bytes(canonical_json_bytes(summary))
 
 
 def _write_raw_run(path: Path, schema: str = OAF_CORPUS_RUN_SCHEMA) -> None:
@@ -1079,6 +1129,58 @@ def test_paired_class_rows_accepts_muscriptor_one_sided_prediction_row() -> None
         "oaf_only_prediction_class": 1,
         "muscriptor_only_prediction_class": 0,
     }
+
+
+def test_compare_oaf_muscriptor_counts_one_sided_prediction_row_through_adapter(
+    tmp_path: Path, manifest_loaders
+) -> None:
+    # Regression for HPA-305: a one-sided prediction-only class row must survive
+    # the _load_evidence() PublishedClassRow -> _ClassRow adapter (which previously
+    # dropped tp/fp/fn) and be counted as an exclusion, not rejected for missing
+    # true_positives by _validate_one_sided_support_identity. Unlike the helper
+    # test above, this exercises the production down-conversion in _load_evidence()
+    # via a real published report fixture on disk.
+    oaf_root = tmp_path / "oaf"
+    muscriptor_root = tmp_path / "muscriptor"
+    oaf = _write_run(
+        oaf_root,
+        model=_MODEL,
+        run_id=_COHORT,
+        schema=OAF_CORPUS_RUN_SCHEMA,
+        lock=_MODEL_LOCK,
+        prediction_map=_MAP,
+    )
+    muscriptor = _write_run(
+        muscriptor_root,
+        model="muscriptor-model",
+        run_id="muscriptor-run",
+        schema=MUSCRIPTOR_CORPUS_RUN_SCHEMA,
+        lock="f" * 64,
+        prediction_map="muscriptor-map",
+    )
+    _reports(oaf_root, _COHORT, _MODEL, _MODEL_LOCK, _MAP, precision="0.5")
+    _reports(
+        muscriptor_root,
+        "muscriptor-run",
+        "muscriptor-model",
+        "f" * 64,
+        "muscriptor-map",
+        precision="0.8",
+    )
+    _add_one_sided_prediction_class(oaf_root, common_class="ride", prediction_support=2)
+
+    request = ComparisonRequest(
+        oaf_run_path=oaf,
+        muscriptor_run_path=muscriptor,
+        reference_manifest_path=tmp_path / "hpa324.jsonl",
+        timing_manifest_path=tmp_path / "hpa323.jsonl",
+        output_dir=tmp_path / "comparison",
+    )
+    result = compare_oaf_muscriptor(request)
+
+    summary = json.loads((result.output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["pairing"]["exclusions"]["oaf_only_prediction_class"] == 2
+    assert summary["pairing"]["exclusions"]["muscriptor_only_prediction_class"] == 0
 
 
 def test_compare_rejects_non_comparison_request() -> None:
