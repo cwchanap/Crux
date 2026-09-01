@@ -230,6 +230,9 @@ class _ClassRow:
     common_class: str
     reference_support: int
     prediction_support: int
+    true_positives: int
+    false_positives: int
+    false_negatives: int
     precision: Decimal | None
     recall: Decimal | None
     f1: Decimal | None
@@ -392,6 +395,9 @@ def _parse_class_rows(
             row.common_class,
             row.reference_support,
             row.prediction_support,
+            row.true_positives,
+            row.false_positives,
+            row.false_negatives,
             row.precision,
             row.recall,
             row.f1,
@@ -557,6 +563,9 @@ def _load_evidence(
             row.common_class,
             row.reference_support,
             row.prediction_support,
+            row.true_positives,
+            row.false_positives,
+            row.false_negatives,
             row.precision,
             row.recall,
             row.f1,
