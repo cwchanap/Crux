@@ -1011,10 +1011,14 @@ def test_paired_class_rows_skips_non_pairable_ids() -> None:
 
     key = ("1", 50, "raw", "kick")
     oaf = {
-        key: _ClassRow("1", 50, "raw", "kick", 2, 1, Decimal("0.5"), Decimal("0.5"), Decimal("0.5"))
+        key: _ClassRow(
+            "1", 50, "raw", "kick", 2, 1, 1, 0, 1, Decimal("0.5"), Decimal("0.5"), Decimal("0.5")
+        )
     }
     muscriptor = {
-        key: _ClassRow("1", 50, "raw", "kick", 2, 1, Decimal("0.8"), Decimal("0.5"), Decimal("0.5"))
+        key: _ClassRow(
+            "1", 50, "raw", "kick", 2, 1, 1, 0, 1, Decimal("0.8"), Decimal("0.5"), Decimal("0.5")
+        )
     }
     rows, exclusions = _paired_class_rows(oaf, muscriptor, pairable_ids=set())
     assert rows == []
@@ -1029,8 +1033,12 @@ def test_paired_class_rows_rejects_asymmetric_pairable_key_grid() -> None:
 
     key = ("1", 50, "raw", "kick")
     extra_key = ("1", 50, "raw", "snare")
-    row = _ClassRow("1", 50, "raw", "kick", 2, 1, Decimal("0.5"), Decimal("0.5"), Decimal("0.5"))
-    extra_row = _ClassRow("1", 50, "raw", "snare", 1, 0, Decimal("1"), Decimal("1"), Decimal("1"))
+    row = _ClassRow(
+        "1", 50, "raw", "kick", 2, 1, 1, 0, 1, Decimal("0.5"), Decimal("0.5"), Decimal("0.5")
+    )
+    extra_row = _ClassRow(
+        "1", 50, "raw", "snare", 1, 0, 0, 0, 1, Decimal("1"), Decimal("1"), Decimal("1")
+    )
 
     with pytest.raises(ComparisonIntegrityError, match="reference-supported class row is missing"):
         _paired_class_rows(
@@ -1038,6 +1046,39 @@ def test_paired_class_rows_rejects_asymmetric_pairable_key_grid() -> None:
             {key: row},
             pairable_ids={"1"},
         )
+
+
+def test_paired_class_rows_accepts_muscriptor_one_sided_prediction_row() -> None:
+    from decimal import Decimal
+
+    # Regression for the MuScriptor _ClassRow adapter: a legitimate prediction-only
+    # one-sided row must be accepted and counted, not rejected as a missing
+    # true_positives field by _validate_one_sided_support_identity.
+    key = ("241", 50, "raw", "ride")
+    row = _ClassRow(
+        "241",
+        50,
+        "raw",
+        "ride",
+        0,
+        2,
+        0,
+        2,
+        0,
+        Decimal("0.5"),
+        Decimal("0.5"),
+        Decimal("0.5"),
+    )
+    rows, exclusions = _paired_class_rows(
+        {key: row},
+        {},
+        pairable_ids={"241"},
+    )
+    assert rows == []
+    assert exclusions == {
+        "oaf_only_prediction_class": 1,
+        "muscriptor_only_prediction_class": 0,
+    }
 
 
 def test_compare_rejects_non_comparison_request() -> None:
