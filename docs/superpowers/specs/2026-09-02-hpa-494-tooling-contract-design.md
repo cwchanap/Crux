@@ -2,90 +2,50 @@
 
 ## Context
 
-HPA-494 is active-tooling cleanup, not a source refactor.
+HPA-494 is tooling cleanup, not source cleanup.
 
-Current `main` has three small inconsistencies:
+Current `main` has three active inconsistencies:
 
-- Black is still declared twice in `pyproject.toml` and has a `[tool.black]` section even though CI/pre-commit use Ruff format.
-- Pylint error exceptions are duplicated in command lines: CI has `E1120,E0401`, while pre-commit has only `E1120`. `pyproject.toml` already has the shared `[tool.pylint.messages_control].disable` table that should own this policy.
-- `CLAUDE.md` and `README.md` still describe stale commands; README even points Black/Ruff at non-existent `app/` instead of `src/app/`.
-
-CI currently runs:
-
-```bash
-ruff check .
-ruff format --check src tests
-pylint --errors-only --disable=E1120,E0401 src
-```
-
-The lint/format path split is historical CI scope, not a desired architectural distinction. HPA-494 keeps `.github/workflows/ci.yml` unchanged to stay a five-file tooling/docs cleanup; guidance mirrors the current CI scopes without calling the split load-bearing or permanent.
+- Black is still declared twice in `pyproject.toml` and configured in `[tool.black]`, although CI/pre-commit format with Ruff.
+- Pylint error exceptions are duplicated in commands: CI has `E1120,E0401`; pre-commit has only `E1120`, while `pyproject.toml` already has a shared Pylint disable table.
+- `CLAUDE.md` and README contain stale commands; README also points Black/Ruff at non-existent `app/`.
 
 ## Decision
 
-Use the existing simple toolchain:
+Keep the existing lean toolchain:
 
-```text
-Ruff lint             -> primary lint gate
-Ruff format           -> only formatter
-Pylint --errors-only  -> secondary error gate
-pytest                 -> behavior regression gate
-```
+- Ruff format is the only formatter.
+- Ruff remains the primary lint gate.
+- Pylint blocks errors only; full-warning scores are advisory.
+- `[tool.pylint.messages_control].disable` owns `E1120,E0401` so the policy is not copied between invocations.
+- CI stays unchanged in HPA-494.
 
-Retire Black. Do not chase full-warning Pylint scores.
+The current CI split (`ruff check .` vs `ruff format --check src tests`) is historical workflow scope, not a desired invariant. Guidance mirrors it only because workflow cleanup is outside this five-file ticket.
 
-Centralize `E1120` and `E0401` in the existing Pylint configuration table so local, pre-commit, and future invocations inherit the same exceptions without copying the list again.
+## Implementation
 
-## Changes
+### `pyproject.toml`
 
-### 1. Retire Black
+- Remove both `black>=24.4.0` dev entries.
+- Delete `[tool.black]`.
+- Add `"E1120"` and `"E0401"` to the existing `[tool.pylint.messages_control].disable` list.
+- Do not reorganize dev lists or upgrade tools.
 
-In `pyproject.toml`:
+Regenerate `uv.lock` with `uv lock`. Inspect changed package name/version lines and reject unrelated version movement.
 
-- remove `black>=24.4.0` from both existing dev dependency lists;
-- delete `[tool.black]`;
-- do not reorganize the duplicated dev lists or upgrade Ruff/Pylint/pre-commit.
+### `.pre-commit-config.yaml`
 
-Regenerate `uv.lock` with `uv lock`; do not hand-edit it.
-
-Historical Superpowers records may continue to mention Black because they record past verification.
-
-### 2. Centralize Pylint error exceptions
-
-Extend the existing table:
-
-```toml
-[tool.pylint.messages_control]
-disable = [
-  "missing-module-docstring",
-  "missing-class-docstring",
-  "missing-function-docstring",
-  "too-few-public-methods",
-  "E1120",
-  "E0401",
-]
-```
-
-Then simplify pre-commit to:
+Keep staged-file behavior and Ruff hooks. Change Pylint to:
 
 ```text
 uv run pylint --errors-only
 ```
 
-Contributor guidance uses:
+Do not add path filters, wrappers, or more disables.
 
-```bash
-uv run pylint --errors-only src
-```
+### `CLAUDE.md` and `README.md`
 
-CI remains unchanged in this ticket. Its explicit `--disable=E1120,E0401` becomes redundant but harmless; a later workflow cleanup may remove that duplication.
-
-Full-warning Pylint remains advisory. Do not add a score threshold, baseline file, wrapper, or additional disables.
-
-Pre-commit keeps its existing staged-Python-file scope. HPA-494 centralizes message policy only; it does not add `files: ^src/` or otherwise align path selection with CI.
-
-### 3. Update active guidance
-
-`CLAUDE.md` and README's Code Formatting subsection use the current CI-equivalent commands:
+Use:
 
 ```bash
 uv run ruff check .
@@ -94,17 +54,15 @@ uv run pylint --errors-only src
 uv run ruff format src tests
 ```
 
-Add only a short note that the formatter scope mirrors today's historical CI scope (`src tests`) and is not widened in HPA-494. Do not turn either file into a broader documentation cleanup.
+Briefly note that `src tests` is today's historical CI formatter scope, not a policy being expanded in HPA-494. Keep full-warning Pylint advisory. Do not perform unrelated doc cleanup.
 
-### 4. Preserve the agent-guidance symlink
+### `AGENTS.md`
 
-`AGENTS.md` is a Git symlink (`mode 120000`) targeting `CLAUDE.md`. Updating `CLAUDE.md` updates agent guidance automatically.
+Do not modify it. It is the existing Git symlink (`120000 -> CLAUDE.md`), so `CLAUDE.md` remains the single source of agent guidance.
 
-Do not edit, materialize, or stage `AGENTS.md`.
+## Scope
 
-## Implementation surface
-
-Modify only:
+Implementation changes exactly five files:
 
 - `pyproject.toml`
 - `uv.lock`
@@ -112,13 +70,11 @@ Modify only:
 - `CLAUDE.md`
 - `README.md`
 
-Planning docs remain in the same PR.
-
-Do not modify `src/`, `tests/`, `runtime/`, `artifacts/`, or `.github/workflows/`.
+No changes under `src/`, `tests/`, `runtime/`, `artifacts/`, `.github/workflows/`, or `AGENTS.md`.
 
 ## Verification
 
-Before editing, require the enforced baseline to pass:
+Before edits:
 
 ```bash
 uv run ruff check .
@@ -126,15 +82,15 @@ uv run ruff format --check src tests
 uv run pylint --errors-only --disable=E1120,E0401 src
 ```
 
-Do not rerun legacy Black/full-warning Pylint merely to characterize them; their outcome cannot change this design.
+Do not rerun legacy Black/full-warning Pylint for characterization; their result cannot change the decision.
 
-After `uv lock`, inspect dependency/version churn rather than immediately proving the lock matches the input that just generated it:
+After `uv lock`:
 
 ```bash
 git diff -U0 -- uv.lock | rg '^[+-](name|version) = ' | sort -u
 ```
 
-Only Black and dependencies removed solely because Black is no longer reachable may disappear. Any unrelated package version movement stops the task for investigation.
+Only Black and Black-exclusive removals may disappear; unrelated version changes stop the task.
 
 Final gates:
 
@@ -148,18 +104,8 @@ uv run pytest -q
 git diff --check main...HEAD
 ```
 
-Final scope verification also requires:
-
-- `AGENTS.md` remains mode `120000` and target `CLAUDE.md`;
-- `AGENTS.md` is absent from the PR diff;
-- no changes exist under `src/`, `tests/`, `runtime/`, `artifacts/`, or `.github/workflows/`;
-- active tooling/guidance no longer references Black directly.
+Also verify `AGENTS.md` is still `120000 -> CLAUDE.md`, is absent from the diff, and the PR touches no forbidden paths.
 
 ## Non-goals
 
-- No source/test refactor for Pylint warnings or score.
-- No CI workflow change in HPA-494.
-- No Ruff/Pylint/pre-commit/Python upgrade.
-- No dev-dependency-list unification.
-- No wrapper, Makefile, baseline, or new lint job.
-- No second PR.
+No source refactor, Pylint baseline/score gate, CI change, wrapper/Makefile, tool upgrade, dev-list unification, historical-doc rewrite, or second PR.
