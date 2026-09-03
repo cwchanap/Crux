@@ -2,123 +2,76 @@
 
 ## Context
 
-HPA-494 was opened after HPA-481/HPA-482 deliberately left two legacy repository commands outside their native-attestation scope:
+HPA-494 was opened after HPA-481/HPA-482 left two legacy checks outside their scope: Black formatting and full-warning Pylint. Since then, Crux has converged on a simpler active contract:
 
-- `uv run black --check src tests`
-- `uv run pylint src/app src/cli`
+- CI runs `ruff check .`, `ruff format --check src tests`, and errors-only Pylint over `src` with `E1120,E0401` excluded.
+- pre-commit already runs Ruff lint, Ruff format, and errors-only Pylint for staged Python files.
+- recent Crux PRs use those same CI-equivalent gates.
 
-The repository has since converged on a different active contract:
+The remaining debt is active-tooling drift:
 
-- `.github/workflows/ci.yml` runs `ruff check .`, `ruff format --check src tests`, and errors-only Pylint over `src` with the existing `E1120,E0401` exceptions.
-- `.pre-commit-config.yaml` runs Ruff lint, Ruff format, and errors-only Pylint for staged Python files.
-- recent Crux PRs use the same Ruff / Ruff-format / errors-only-Pylint checks as their repository-wide static gates.
+- `pyproject.toml` still declares Black twice and retains `[tool.black]`;
+- `README.md` still recommends Black and an obsolete Ruff invocation;
+- `CLAUDE.md` still presents full-warning Pylint as a required check;
+- pre-commit excludes `E1120` but not CI's existing `E0401` exception.
 
-The remaining inconsistency is configuration and documentation drift, not a production-code defect:
+HPA-627 is still blocked on gated Hugging Face access, so HPA-494 is the next executable Crux backlog task.
 
-- `pyproject.toml` still installs Black in both dev dependency lists and still carries `[tool.black]` configuration;
-- `README.md` still tells contributors to run Black and an obsolete `ruff app/` command;
-- `CLAUDE.md` still lists full-warning `pylint src/app src/cli`, even though CI intentionally gates only Pylint errors;
-- pre-commit omits `E0401` from the two explicit Pylint error exceptions already used by CI.
+## Decision
 
-HPA-627 remains operationally blocked on gated Hugging Face model access, so HPA-494 is the highest-value executable Crux backlog task rather than another attempt to work around that external gate.
-
-## Goals
-
-- Make Ruff format the single authoritative Python formatter.
-- Remove Black from active project dependencies and configuration.
-- Make the repository's Pylint acceptance contract explicit: errors are blocking; score/style/refactor warnings are advisory.
-- Use the same two existing Pylint error exceptions, `E1120` and `E0401`, in CI-facing and pre-commit guidance instead of introducing a baseline file or broader disables.
-- Align active contributor documentation with the checks the repository actually enforces.
-- Preserve all runtime behavior, benchmark identities, tests, and generated evidence.
-
-## Non-goals
-
-- Do not refactor `src/app`, `src/cli`, `src/benchmark`, or tests merely to improve a Pylint score.
-- Do not add a Pylint score threshold, warning allowlist, generated baseline, or suppression framework.
-- Do not keep Black as a compatibility formatter or add formatter-cross-check tests.
-- Do not upgrade Ruff, Pylint, pre-commit, Python, or unrelated dependencies as part of this task.
-- Do not reorganize the duplicated dev-dependency declaration structure in `pyproject.toml`; only remove Black from the existing lists.
-- Do not rewrite historical Superpowers plans/reports that mention Black. They are records of the checks used when those changes were produced, not current contributor guidance.
-- Do not change CI job structure, test coverage, runtime code, benchmark artifacts, or frozen model/runtime identities.
-
-## Options considered
-
-### A. Retire Black and formalize the existing Ruff + errors-only Pylint contract — selected
-
-Keep the checks already enforced by CI:
+Use the contract that already ships in CI:
 
 ```text
-Ruff lint             -> repository-wide correctness/style lint
-Ruff format           -> sole Python formatter
-Pylint --errors-only  -> secondary error detector
+Ruff lint             -> primary lint gate
+Ruff format           -> only formatter
+Pylint --errors-only  -> secondary error gate
 pytest                 -> behavior regression gate
 ```
 
-Remove Black from the active dependency/configuration surface, align pre-commit's explicit error exceptions with CI, and update active contributor docs.
+Retire Black instead of keeping two formatters, and make full-warning Pylint advisory instead of spending time chasing a score that CI does not enforce.
 
-This is the smallest change because the desired contract already exists in CI and has been used by recent PRs. It deletes duplicate machinery rather than normalizing source code around a legacy command.
+## Options considered
 
-### B. Keep Black and require Ruff-format compatibility
+### A. Ruff-only formatting + errors-only Pylint — selected
 
-Reformat the three historically failing files, retain both formatter dependencies/configurations, and require both formatters to remain green.
+Remove Black from active dependencies/configuration, align pre-commit's two Pylint error exceptions with CI, and update contributor guidance. This deletes stale machinery and does not touch production code.
 
-Rejected because two formatters provide no useful independent correctness signal here. They create two version/configuration surfaces and can diverge later for formatting-only reasons.
+### B. Keep Black alongside Ruff format
 
-### C. Make full-warning Pylint pass
+Rejected. Two formatters add dependency/configuration/version drift without an independent correctness benefit.
 
-Refactor or suppress every convention/refactor/warning diagnostic under `src/app` and `src/cli` until `uv run pylint src/app src/cli` exits zero.
+### C. Refactor until full-warning Pylint exits zero
 
-Rejected because CI and pre-commit do not use full-warning Pylint as an acceptance gate. Spending feature-development time on a 10/10 score would create unrelated source churn and invite broad suppressions or a baseline framework solely to satisfy a legacy command.
+Rejected. It would create unrelated source churn, broad suppressions, or a baseline framework solely to satisfy a legacy non-CI command.
 
-## Canonical formatting contract
+## Contract
 
-Ruff format is the only authoritative formatter for active Python source and tests.
+### Formatting
 
-The existing repository settings remain authoritative:
+Ruff format is authoritative for `src tests` with the existing `py312` target and 100-character line length. HPA-494 does not upgrade Ruff or redesign its configuration.
 
-- Python target: `py312`
-- line length: `100`
-- format scope in CI: `src tests`
-- lint scope in CI: repository-wide via `ruff check .`
+Remove from `pyproject.toml`:
 
-No Ruff upgrade or configuration redesign is needed. `.github/workflows/ci.yml` and `.pre-commit-config.yaml` already pin the CI/pre-commit Ruff integration to `0.12.9`; HPA-494 does not change those versions.
+- both `black>=24.4.0` dev dependency entries;
+- the `[tool.black]` section.
 
-Implementation removes:
+Regenerate `uv.lock` with `uv lock`; never hand-edit it. Historical planning/report files may continue to mention Black because they document past verification.
 
-- `black>=24.4.0` from `[project.optional-dependencies].dev`;
-- `black>=24.4.0` from `[tool.uv].dev-dependencies`;
-- the entire `[tool.black]` section.
+### Pylint
 
-Then regenerate `uv.lock` through normal `uv` locking. Do not hand-edit transitive lock entries.
-
-Historical planning/report Markdown files may continue to contain old Black commands. The absence check applies only to active tooling/configuration and contributor guidance.
-
-## Canonical Pylint contract
-
-Pylint is a secondary error detector, not a project score gate.
-
-The canonical repository-wide verification command is the command already used by CI:
+The blocking repository-wide command is the one already used by CI:
 
 ```bash
 uv run pylint --errors-only --disable=E1120,E0401 src
 ```
 
-The two existing exceptions stay narrow and explicit:
+Add `E0401` to the existing pre-commit Pylint hook so staged-file checks use the same error policy. Add no new disables, score threshold, warning baseline, wrapper, or suppression framework.
 
-- `E1120` is already excluded by both CI and pre-commit.
-- `E0401` is already excluded by CI and is added to pre-commit so local staged-file checks use the same error policy.
+Full-warning Pylint remains available for manual analysis but is not an acceptance gate.
 
-Do not add any further Pylint disables in this task. Existing `pyproject.toml` Pylint settings remain untouched.
+### Active contributor guidance
 
-Full-warning Pylint may still be run manually as advisory analysis, but a nonzero score/warning result is not repository acceptance failure. `CLAUDE.md` should state this directly so future work does not reopen the same baseline debt accidentally.
-
-## Active documentation contract
-
-Update only active contributor-facing instructions:
-
-### `CLAUDE.md`
-
-The command section should list:
+Update `CLAUDE.md` and the README Code Formatting section to use:
 
 ```bash
 uv run ruff check .
@@ -127,29 +80,13 @@ uv run pylint --errors-only --disable=E1120,E0401 src
 uv run ruff format src tests
 ```
 
-The code-style guidance should state that Ruff format is canonical and that Pylint's blocking contract is errors-only. It may note that full-warning Pylint is advisory.
+`CLAUDE.md` should explicitly say Ruff format is canonical and full-warning Pylint is advisory.
 
-### `README.md`
+Do not turn HPA-494 into a general README cleanup.
 
-Replace the stale Black/old-Ruff formatting snippet with the same active check commands plus the Ruff-format apply command. Do not expand HPA-494 into a general README rewrite even though other historical content may also be stale.
+## Scope
 
-### `.pre-commit-config.yaml`
-
-Keep the existing Ruff hooks and local Pylint hook. Change only the local Pylint command so its error exceptions match CI:
-
-```text
-uv run pylint --errors-only --disable=E1120,E0401
-```
-
-Pre-commit continues to append staged Python filenames automatically; do not replace it with a repository-wide wrapper script.
-
-### `.github/workflows/ci.yml`
-
-No change. It is the current source of truth HPA-494 is aligning other active surfaces to.
-
-## Expected implementation surface
-
-Modify only:
+Implementation modifies only:
 
 - `pyproject.toml`
 - `uv.lock`
@@ -157,15 +94,13 @@ Modify only:
 - `CLAUDE.md`
 - `README.md`
 
-Planning documents in this PR remain alongside those implementation changes when execution begins.
+`.github/workflows/ci.yml` is deliberately unchanged because it already expresses the target contract.
 
-No `src/`, `tests/`, runtime lock, benchmark artifact, workflow, or generated evidence file should change. If an implementation step appears to require source reformatting or runtime behavior changes, stop and reassess rather than folding that work into HPA-494.
+Do not modify `src/`, `tests/`, `runtime/`, `artifacts/`, benchmark evidence, or frozen runtime/model identities. Do not reorganize the duplicated dev-dependency structure or upgrade unrelated tools.
 
-## Verification
+## Baseline and verification
 
-### Baseline before edits
-
-Confirm the already-enforced contract is green before changing tooling metadata:
+Before editing, require the current enforced gates to pass:
 
 ```bash
 uv run ruff check .
@@ -173,18 +108,9 @@ uv run ruff format --check src tests
 uv run pylint --errors-only --disable=E1120,E0401 src
 ```
 
-Also reproduce the two HPA-494 legacy baselines as characterization only:
+Also run the legacy Black/full-Pylint commands once as characterization and record their current exit status. Their historical nonzero state is not a gate: if later work happened to make either command green, the duplicate/stale contract still gets retired rather than preserved.
 
-```bash
-uv run black --check src tests
-uv run pylint src/app src/cli
-```
-
-Those legacy commands are expected to be nonzero before the change. They are not implementation targets.
-
-### Final gates
-
-After the cleanup:
+After implementation run:
 
 ```bash
 uv lock --check
@@ -193,42 +119,28 @@ uv run ruff format --check src tests
 uv run pylint --errors-only --disable=E1120,E0401 src
 uv run pre-commit run --all-files
 uv run pytest -q
-git diff --check
+git diff --check main...HEAD
 ```
 
-Active-surface drift checks:
+Active config/guidance should no longer contain Black:
 
 ```bash
-git grep -n -i '\bblack\b' -- \
+git grep -n -i 'black' -- \
   pyproject.toml README.md CLAUDE.md .pre-commit-config.yaml .github/workflows/ci.yml
-
-grep -n 'name = "black"' uv.lock
 ```
 
-Both searches should produce no matches after implementation. Historical planning/report files are intentionally outside the first search.
-
-Finally, the implementation diff relative to `main` should contain no changes under `src/`, `tests/`, `runtime/`, `artifacts/`, or `.github/workflows/`.
+Normally Black should also disappear from `uv.lock`. If another dependency unexpectedly retains it transitively, record that owner and keep the scope at removing Crux's direct Black contract rather than deleting unrelated dependencies.
 
 ## Acceptance mapping
 
-HPA-494's acceptance criteria map directly to this design:
+- **Formatter relationship:** Ruff format is authoritative; Black is formally retired.
+- **Black check:** no longer part of the repository contract because Black is no longer directly configured/required.
+- **Pylint baseline:** errors-only with the two existing CI exceptions is the explicit blocking policy; full-warning scores are advisory.
+- **Regression gates:** pytest, Ruff lint, Ruff format, Pylint errors, pre-commit, lock consistency, and diff whitespace stay green.
+- **HPA-481/HPA-482 isolation:** no runtime, source, workflow, artifact, or frozen-input change is planned.
 
-- **Canonical formatter relationship:** Ruff format is authoritative; Black is retired.
-- **Black check:** formally retired from the repository contract by removing the dependency/configuration and active documentation references.
-- **Pylint baseline:** errors-only Pylint with the two already-reviewed error exceptions is the explicit blocking baseline; full-warning scores are advisory and no broad warning disables are added.
-- **Regression gates:** pytest, Ruff lint, and Ruff format remain green; the stronger current repository-wide errors-only Pylint check remains green as well.
-- **Isolation from HPA-481/HPA-482 evidence:** no source, runtime, artifact, workflow, or frozen-input file changes are planned.
+## Fallbacks
 
-## Risks and fallback
+If Ruff format or errors-only Pylint is not green on the implementation base, stop before changing configuration and diagnose the moved baseline rather than folding source cleanup into HPA-494.
 
-### Ruff format is unexpectedly not clean at implementation start
-
-Stop before removing Black. HPA-494 assumes the current CI/recent-PR Ruff baseline is green. If `ruff format --check src tests` fails on the implementation base, first determine whether `main` moved or the local environment is stale; do not silently mix an unrelated formatting migration into this task.
-
-### Errors-only Pylint differs between CI and local pre-commit
-
-The policy is the two explicit exceptions already present in CI. If staged-file pre-commit still produces an import/environment-only error after adding `E0401`, diagnose that concrete environment mismatch. Do not add a third disable without separately reviewing the diagnostic.
-
-### Black remains transitively present in `uv.lock`
-
-The goal is to remove Black as an active Crux dependency. If another dependency unexpectedly requires it, do not remove or fork that dependency merely to make the lock search empty. Record the transitive owner, keep the direct/configuration removal, and change the lock verification to assert that Crux no longer declares Black directly.
+If pre-commit exposes a new Pylint error after matching CI's `E1120,E0401` policy, diagnose that concrete error; do not add another disable without separate review.
