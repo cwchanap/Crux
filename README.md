@@ -148,9 +148,13 @@ uv run pytest
 
 ### Code Formatting
 ```bash
-uv run black app/
-uv run ruff app/
+uv run ruff check .
+uv run ruff format --check src tests
+uv run pylint --errors-only src
+uv run ruff format src tests
 ```
+
+Ruff format is the only formatter; the `src tests` scope in format commands mirrors today's historical CI formatter scope, not a permanent design constraint. Full-warning Pylint (`uv run pylint src/app src/cli`) remains advisory.
 
 ## Technical Stack
 

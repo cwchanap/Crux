@@ -21,13 +21,15 @@ uv run pytest tests/test_app_endpoints.py
 uv run pytest tests/test_app_endpoints.py::test_name
 
 # Linting and formatting checks
-uv run ruff check src tests
+uv run ruff check .
 uv run ruff format --check src tests
-uv run pylint src/app src/cli
+uv run pylint --errors-only src
 
 # Format code before committing
 uv run ruff format src tests
 ```
+
+Ruff format is the only formatter; the `src tests` scope in format commands mirrors today's historical CI formatter scope, not a permanent design constraint. Full-warning Pylint (`uv run pylint src/app src/cli`) remains advisory.
 
 ## Architecture
 
