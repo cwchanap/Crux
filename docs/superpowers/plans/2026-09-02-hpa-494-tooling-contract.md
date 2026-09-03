@@ -182,7 +182,7 @@ Do not hand-edit `uv.lock`.
 Run:
 
 ```bash
-if git grep -n -i '\bblack\b' -- pyproject.toml; then
+if git grep -n -i 'black' -- pyproject.toml; then
   echo 'Black is still declared in pyproject.toml' >&2
   exit 1
 fi
@@ -292,7 +292,7 @@ Do not rewrite the architecture or environment sections.
 
 The `## Development` / `### Code Formatting` subsection should become:
 
-```markdown
+````markdown
 ### Code Formatting
 ```bash
 # Check lint and formatting
@@ -303,7 +303,7 @@ uv run pylint --errors-only --disable=E1120,E0401 src
 # Apply formatting
 uv run ruff format src tests
 ```
-```
+````
 
 Do not fix unrelated README architecture, deployment, endpoint, or quick-start drift in HPA-494.
 
@@ -313,7 +313,7 @@ Run:
 
 ```bash
 set +e
-git grep -n -i '\bblack\b' -- \
+git grep -n -i 'black' -- \
   pyproject.toml README.md CLAUDE.md .pre-commit-config.yaml .github/workflows/ci.yml
 active_black_status=$?
 set -e
@@ -423,7 +423,7 @@ Expected: all repository tests pass; HPA-494 adds no tests because it changes no
 Run:
 
 ```bash
-if git grep -n -i '\bblack\b' -- \
+if git grep -n -i 'black' -- \
   pyproject.toml README.md CLAUDE.md .pre-commit-config.yaml .github/workflows/ci.yml; then
   echo 'Active repository guidance/config still references Black' >&2
   exit 1
