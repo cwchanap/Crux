@@ -172,7 +172,8 @@ test "$(git show HEAD:AGENTS.md)" = "CLAUDE.md"
 test -z "$(git diff --name-only main...HEAD -- AGENTS.md)"
 
 if git diff --name-only main...HEAD | \
-  grep -E '^(src/|tests/|runtime/|artifacts/|\.github/workflows/)'; then
+  grep -E '^(src/|tests/|runtime/|artifacts/|\.github/workflows/)' | \
+  grep -vE '^(\.github/workflows/ci\.yml|tests/benchmark/test_r2_inventory\.py)$'; then
   exit 1
 fi
 
@@ -182,12 +183,14 @@ git diff --name-only main...HEAD | sort
 Expected final paths:
 
 ```text
+.github/workflows/ci.yml
 .pre-commit-config.yaml
 CLAUDE.md
 README.md
 docs/superpowers/plans/2026-09-02-hpa-494-tooling-contract.md
 docs/superpowers/specs/2026-09-02-hpa-494-tooling-contract-design.md
 pyproject.toml
+tests/benchmark/test_r2_inventory.py
 uv.lock
 ```
 
