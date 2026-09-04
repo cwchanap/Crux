@@ -243,10 +243,11 @@ No other workflow changes. CI's pip-installed Pylint reads the same
 
 - [ ] **Step 1: Skip the module when the `r2` extra is absent**
 
-Insert `pytest.importorskip("botocore")` after the stdlib/pytest imports and
+Insert `pytest.importorskip("boto3")` after the stdlib/pytest imports and
 before the `botocore` / `src.benchmark` imports (mark the moved imports
-`# noqa: E402`). Tests still run in CI (boto3 installed) and under
-`uv run --extra r2 pytest`.
+`# noqa: E402`). Gate on `boto3` (the dependency the `r2` extra declares), not
+`botocore` (a transitive dependency that can be present without `boto3`).
+Tests still run in CI (boto3 installed) and under `uv run --extra r2 pytest`.
 
 ### Addendum verification
 

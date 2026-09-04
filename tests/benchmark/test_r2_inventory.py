@@ -5,7 +5,7 @@ from threading import Condition, Event, Thread
 
 import pytest
 
-pytest.importorskip("botocore")
+pytest.importorskip("boto3")
 
 from botocore.exceptions import (  # noqa: E402
     ClientError,
