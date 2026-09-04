@@ -18,6 +18,7 @@
 - CI remains unchanged; its formatter scope stays `src tests` only because that is today's workflow.
 - Preserve `AGENTS.md` as `120000 -> CLAUDE.md`; never stage it.
 - No source/test/runtime/artifact/tool-upgrade work and no second PR.
+  (Superseded for Tasks 3–4 by the post-execution addendum below.)
 
 ---
 
@@ -193,3 +194,60 @@ uv.lock
 - [ ] **Step 3: Record evidence on PR #33**
 
 Record Task 2 results plus the `uv.lock` name/version diff inspection on this PR. No second PR.
+
+---
+
+## Addendum: post-execution scope expansion
+
+Executing Tasks 0–2 surfaced two follow-ups that were deliberately excluded
+from the five-file scope. With the tooling contract centralized and verified,
+both land on this same PR (still no second PR):
+
+- CI's Pylint step still passes `--disable=E1120,E0401` — redundant now that
+  the `[tool.pylint.messages_control]` table in `pyproject.toml` owns the
+  policy.
+- `tests/benchmark/test_r2_inventory.py` imports `botocore` at module level;
+  with `boto3` under the optional `r2` extra, plain `uv run pytest` fails
+  collection. Pre-existing on `main`; CI installs boto3 explicitly, so only
+  bare local environments hit it.
+
+Amended constraints (supersede the originals for Tasks 3–4 only):
+
+- Task 3 may modify `.github/workflows/ci.yml` — the Pylint flag removal only.
+- Task 4 may modify `tests/benchmark/test_r2_inventory.py` — the skip guard only.
+
+### Task 3: Align CI Pylint with the centralized policy
+
+**Files:**
+- Modify: `.github/workflows/ci.yml`
+
+- [ ] **Step 1: Drop redundant disables**
+
+```diff
+       - name: Pylint (errors-only)
+         run: |
+-          pylint --errors-only --disable=E1120,E0401 src
++          pylint --errors-only src
+```
+
+No other workflow changes. CI's pip-installed Pylint reads the same
+`pyproject.toml` table from the repo root.
+
+### Task 4: Gate r2 inventory tests on boto3 availability
+
+**Files:**
+- Modify: `tests/benchmark/test_r2_inventory.py`
+
+- [ ] **Step 1: Skip the module when the `r2` extra is absent**
+
+Insert `pytest.importorskip("botocore")` after the stdlib/pytest imports and
+before the `botocore` / `src.benchmark` imports (mark the moved imports
+`# noqa: E402`). Tests still run in CI (boto3 installed) and under
+`uv run --extra r2 pytest`.
+
+### Addendum verification
+
+- [ ] `uv run pytest -q` collects and passes in a bare environment (module skips)
+- [ ] `uv run --extra r2 pytest -q tests/benchmark/test_r2_inventory.py` passes
+- [ ] `uv run ruff check .` and `uv run ruff format --check src tests` pass
+- [ ] `uv run pylint --errors-only src` still passes

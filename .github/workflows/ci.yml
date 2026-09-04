@@ -35,7 +35,7 @@ jobs:
 
       - name: Pylint (errors-only)
         run: |
-          pylint --errors-only --disable=E1120,E0401 src
+          pylint --errors-only src
 
   test:
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
