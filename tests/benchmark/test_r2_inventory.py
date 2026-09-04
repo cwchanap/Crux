@@ -4,15 +4,22 @@ from io import BytesIO
 from threading import Condition, Event, Thread
 
 import pytest
-from botocore.exceptions import ClientError, ConnectTimeoutError, NoCredentialsError
 
-from src.benchmark.r2_corpus_models import (
+pytest.importorskip("botocore")
+
+from botocore.exceptions import (  # noqa: E402
+    ClientError,
+    ConnectTimeoutError,
+    NoCredentialsError,
+)
+
+from src.benchmark.r2_corpus_models import (  # noqa: E402
     MAX_SIMFILE_ID,
     HeadMetadata,
     ListedObject,
     R2Config,
 )
-from src.benchmark.r2_inventory import (
+from src.benchmark.r2_inventory import (  # noqa: E402
     Boto3R2Store,
     R2StoreError,
     build_inventory,
