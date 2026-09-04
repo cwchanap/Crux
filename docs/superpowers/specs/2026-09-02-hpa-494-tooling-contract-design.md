@@ -109,3 +109,32 @@ Also verify `AGENTS.md` is still `120000 -> CLAUDE.md`, is absent from the diff,
 ## Non-goals
 
 No source refactor, Pylint baseline/score gate, CI change, wrapper/Makefile, tool upgrade, dev-list unification, historical-doc rewrite, or second PR.
+
+## Addendum: post-execution scope expansion
+
+Executing the five-file plan surfaced two follow-ups that were deliberately
+excluded from the original scope. With the tooling contract centralized and
+verified, both land on this same PR (still no second PR):
+
+- CI's Pylint step still passed `--disable=E1120,E0401`, redundant once
+  `[tool.pylint.messages_control]` in `pyproject.toml` owns the policy.
+- `tests/benchmark/test_r2_inventory.py` imported `botocore` at module level;
+  with `boto3` under the optional `r2` extra, plain `uv run pytest` failed
+  collection in bare environments (CI installs `boto3` explicitly).
+
+This addendum **supersedes** the original constraints for Tasks 3–4 only:
+
+- "CI stays unchanged in HPA-494" (Decision) and "No … CI change …" (Non-goals)
+  are amended: Task 3 may modify `.github/workflows/ci.yml` for the Pylint flag
+  removal only — no other workflow change.
+- The five-file Scope list and "No changes under `tests/` …
+  `.github/workflows/`" are amended: Task 4 may modify
+  `tests/benchmark/test_r2_inventory.py` for the skip guard only. The guard
+  uses `pytest.importorskip("boto3")` — the dependency the `r2` extra declares
+  — not `botocore` (a transitive dependency that can be present without
+  `boto3`).
+- "No second PR" is reaffirmed.
+
+All other original constraints remain authoritative. The implementation plan
+(`docs/superpowers/plans/2026-09-02-hpa-494-tooling-contract.md`) carries the
+task-level detail and verification gates for Tasks 3–4.
