@@ -2,11 +2,9 @@
 
 ## Summary
 
-Add one optional, read-only projection from Crux's canonical published benchmark reports into a standard MLflow tracking server. The first operational target is hosted MLflow for zero-maintenance hobby-project visualization (initially DagsHub), but the repository must contain no DagsHub-specific API or SDK dependency. Any MLflow-compatible server can be selected through the standard MLflow environment configuration.
+Add one optional, read-only projection from Crux's canonical published benchmark reports into a standard MLflow tracking server. The first operational target is hosted MLflow for zero-maintenance hobby-project visualization (initially DagsHub), but Crux contains no DagsHub-specific API or SDK dependency.
 
-Crux remains the scientific source of truth. MLflow is an index, comparison, and visualization surface only.
-
-The integration is deliberately post-publication:
+Crux remains the scientific source of truth. MLflow is only an index, comparison, artifact-browsing, and visualization surface.
 
 ```text
 model inference
@@ -16,116 +14,88 @@ model inference
     -> optional explicit MLflow publication
 ```
 
-A tracking-server outage, authentication failure, or missing MLflow dependency must never affect inference, scoring, canonical report publication, or benchmark identity.
+A missing dependency, tracking-server outage, or authentication failure must never affect inference, scoring, canonical report publication, or benchmark identity.
 
 ## Problem
 
-Crux now publishes rich deterministic benchmark evidence, but it is cumbersome to explore visually. HPA-325 already persists aggregate, per-song, per-class, distribution, population, and provenance data. HPA-562 adds paired comparison publications. The data is trustworthy and reproducible, but the primary interfaces are JSON/CSV/JSONL/Markdown files rather than an interactive experiment UI.
+Crux already persists deterministic aggregate, per-song, per-class, distribution, population, and provenance evidence. HPA-562 adds paired comparison publications. The evidence is trustworthy but cumbersome to explore because the primary interfaces are JSON/CSV/JSONL/Markdown files.
 
-Future fine-tuning will also need a conventional experiment-tracking surface for run comparison. Introducing the standard MLflow tracking contract now gives the current pretrained benchmark a usable UI without committing Crux to a proprietary experiment model or requiring a later tracking migration.
-
-The design must avoid replacing the benchmark pipeline with MLflow. Crux has stronger domain-specific identity and evidence rules than a generic experiment tracker, and those contracts remain load-bearing.
+Future fine-tuning will also need conventional experiment tracking. Adopting the standard MLflow tracking contract now gives the pretrained benchmark an interactive UI without replacing Crux's stronger domain-specific identity/evidence rules or committing the repository to a proprietary tracking model.
 
 ## Goals
 
-1. Make existing canonical cohort results easy to compare in an MLflow UI.
-2. Preserve Crux's existing immutable report, model-lock, reference, input-view, and scoring identities.
-3. Keep MLflow entirely optional and outside the inference/scoring critical path.
-4. Keep the integration host-neutral by using only the standard MLflow Python client and environment configuration.
-5. Keep hosted storage small enough for hobby-project use by publishing metadata, scalar metrics, and selected small report artifacts only.
-6. Establish a tracking contract that future fine-tuning work can reuse without changing today's benchmark architecture.
-7. Deliver the complete integration as one HPA-86 PR.
+1. Compare existing canonical cohort results in an MLflow UI.
+2. Preserve Crux report/model-lock/reference/input-view/scoring identities as authoritative.
+3. Keep MLflow optional and outside inference/scoring.
+4. Use only the standard MLflow client and environment configuration so the hosted provider is replaceable.
+5. Keep hosted storage small by publishing metadata, scalar metrics, and selected small reports only.
+6. Establish a tracking contract future fine-tuning can reuse.
+7. Deliver design, plan, implementation, tests, docs, and hosted smoke evidence in one HPA-86 PR.
 
 ## Non-goals
 
 HPA-86 does not add:
 
-- model fine-tuning or training;
-- hyperparameter search or Optuna;
-- MLflow Model Registry;
-- MLflow dataset objects;
-- MLflow autologging;
-- CI-driven publication;
-- DagsHub SDK calls or DagsHub-specific repository APIs;
+- training or fine-tuning;
+- hyperparameter search/Optuna;
+- MLflow Model Registry or dataset objects;
+- autologging;
+- CI publication;
+- DagsHub SDK calls;
 - custom Plotly/Matplotlib dashboards;
 - MLflow evaluation-framework integration;
-- audio, separator-stem, prediction, checkpoint, or R2 synchronization;
+- audio/stem/prediction/checkpoint/R2 synchronization;
 - a replacement for HPA-325 or HPA-562 reports;
-- a new scorer, report schema, runner framework, or experiment database inside Crux.
-
-These can be separately scoped later if real usage justifies them.
+- a new scorer, report schema, runner framework, or Crux experiment database.
 
 ## Existing seams to reuse
 
-The implementation must project from existing published evidence rather than parse model-specific run internals.
+`src/benchmark/reports.py` already owns the canonical persisted-report contract through `PublishedCohortReports`, its typed rows/aggregates, and `read_cohort_reports(...)`. MLflow must project from that reader rather than model-specific run internals.
 
-`src/benchmark/reports.py` already owns the canonical HPA-325 persisted-report contract:
+`src/benchmark/backend_identity.py` already owns canonical JSON and SHA-256 helpers. Reuse those for the projection fingerprint.
 
-- `PublishedCohortReports`
-- `PublishedAggregate`
-- `PublishedSongRow`
-- `PublishedClassRow`
-- `PublishedItemRow`
-- `read_cohort_reports(...)`
+`src/cli/benchmark.py` is the only new command surface.
 
-That typed reader is the correct source for MLflow metrics.
-
-`src/benchmark/backend_identity.py` already owns canonical JSON encoding and SHA-256 helpers. HPA-86 reuses those helpers for a deterministic projection fingerprint rather than introducing a second serialization/hash convention.
-
-The existing benchmark CLI group in `src/cli/benchmark.py` is the only new command surface.
-
-No model-specific OaF, MuScriptor, IDM, separator, prediction, taxonomy, or scoring module should need to change.
+No OaF, MuScriptor, IDM, separator, prediction, taxonomy, scoring, reference-manifest, or R2/cache module should need to change.
 
 ## Architecture
 
-### Canonical versus projected state
-
 ```text
-                         canonical
-                    +----------------+
-                    | Crux manifests |
-                    | model locks    |
-                    | predictions    |
-                    | HPA-325 reports|
-                    +--------+-------+
-                             |
-                      validated read
-                             |
-                             v
-                    +----------------+
-                    | MLflow         |
-                    | projection     |
-                    +--------+-------+
-                             |
-                   standard MLflow API
-                             |
-               +-------------+-------------+
-               |                           |
-               v                           v
-        hosted MLflow UI             local/other MLflow
-        (DagsHub first)              server later
+                    canonical Crux evidence
+         manifests / locks / predictions / reports
+                              |
+                         validated read
+                              v
+                    +-------------------+
+                    | MLflow projection |
+                    +---------+---------+
+                              |
+                    standard MLflow API
+                              |
+              +---------------+---------------+
+              v                               v
+       hosted MLflow UI                local/other MLflow
+       (DagsHub first)                 server later
 ```
 
-MLflow data is disposable and reproducible. Deleting every MLflow run must not lose any benchmark evidence required to regenerate it.
+MLflow state is disposable. Deleting every MLflow run must not lose evidence needed to regenerate it.
 
-### Dependency boundary
+### Optional dependency
 
-Use an optional extra:
+Add:
 
 ```toml
 [project.optional-dependencies]
 mlflow = ["mlflow-skinny>=3.16,<4"]
 ```
 
-`mlflow-skinny` is sufficient because Crux only needs the remote tracking client. The base install does not gain MLflow server, SQL backend, UI, or data-science dependencies.
+`mlflow-skinny` is enough for a remote tracking client. Normal Crux imports must not require MLflow. Import the optional package only inside the explicit publication path and give missing-dependency guidance for `uv run --extra mlflow ...`.
 
-The repository must not import `mlflow` from normal benchmark module-import paths. The optional dependency is imported only when the explicit MLflow publication path executes. Missing dependency errors must tell the operator to run the command with `--extra mlflow`.
-
-No `dagshub` Python package is added.
+Do not add the `dagshub` package.
 
 ### Server configuration
 
-Use the standard MLflow environment contract only:
+Use the standard MLflow environment contract:
 
 ```text
 MLFLOW_TRACKING_URI
@@ -133,13 +103,11 @@ MLFLOW_TRACKING_USERNAME
 MLFLOW_TRACKING_PASSWORD
 ```
 
-DagsHub is an operational default, not an application dependency. A local MLflow server or another compatible hosted MLflow service works with the same Crux command.
+Do not accept credentials/tracking URI as Crux CLI options, persist them in benchmark artifacts, or echo secrets.
 
-Secrets are never accepted as CLI arguments, persisted in Crux reports, committed to configuration, or echoed in canonical CLI output.
+DagsHub is the initial hosted target, not an application dependency. A local server, MLflow Cloud, or another compatible MLflow host should work without code changes.
 
 ## Self-identifying published-report loader
-
-The current `read_cohort_reports(report_dir, expected_identity=...)` API intentionally verifies reports against a caller-supplied `CohortIdentity`. That is ideal for benchmark pipelines that already know the expected lineage, but a generic visualization exporter should not know which runner produced the report.
 
 Add one model-neutral helper in `reports.py`:
 
@@ -147,66 +115,56 @@ Add one model-neutral helper in `reports.py`:
 load_published_cohort_reports(report_dir: Path) -> PublishedCohortReports
 ```
 
-Its behavior is narrowly defined:
+It must:
 
 1. read canonical `summary.json` through the existing no-follow/strict-JSON path;
-2. validate that the summary uses the existing single-cohort report schema;
-3. construct `CohortIdentity` from the existing summary identity object;
-4. delegate all full report validation to `read_cohort_reports(report_dir, expected_identity=identity)`;
-5. return the resulting `PublishedCohortReports`.
+2. verify the existing single-cohort report schema;
+3. construct the existing `CohortIdentity` from `summary.json`;
+4. call `read_cohort_reports(report_dir, expected_identity=identity)`;
+5. return its typed result.
 
-This is not a second report reader. It is a convenience entry point into the existing reader and introduces no schema change.
+This is a convenience entry point, not a second report reader and not a schema change.
 
-## Projection model
+## Projection module
 
-Add a focused `src/benchmark/mlflow_export.py` module. It owns both the pure Crux-to-MLflow projection and the small side-effecting publisher.
-
-The module should keep pure mapping separate from network operations so almost all behavior can be tested without MLflow or a tracking server.
+Create `src/benchmark/mlflow_export.py`. Keep pure Crux-to-projection mapping separate from MLflow/network effects so projection correctness is testable without the optional dependency or server.
 
 Conceptually:
 
 ```text
-PublishedCohortReports + scope
-        |
-        v
-MlflowProjection
-  - run name
-  - identity tags/params
-  - scalar metrics
-  - artifact allowlist + hashes
-  - projection fingerprint
-        |
-        v
-publish via MlflowClient
+PublishedCohortReports + scope + report paths
+             |
+             v
+      MlflowProjection
+        run_name
+        tags / params
+        metrics
+        artifact hashes
+        projection_sha256
+             |
+             v
+       MlflowClient publisher
 ```
 
-### Scope
-
-The CLI requires one closed scope value:
+The allowed scope is a closed value:
 
 ```text
-broad
-reviewed
-pilot
+broad | reviewed | pilot
 ```
 
-Scope is presentation metadata. It must not alter or reinterpret any benchmark score.
+Scope is presentation metadata only and cannot alter scores.
 
-### Projection version
-
-Freeze the initial mapping as:
+Freeze the first representation as:
 
 ```text
 crux.mlflow-projection/v1
 ```
 
-Changing metric names, artifact membership, fingerprint semantics, or identity projection in a way that changes the published representation requires a new projection version. The underlying HPA-325 report schema remains unchanged.
+Changing metric names, identity mapping, artifact membership, or fingerprint semantics requires a new projection version; it does not change HPA-325 report schemas.
 
-## Run identity and metadata
+## Run metadata
 
-MLflow's generated run ID is transport metadata only. Crux identity remains authoritative.
-
-Every published run receives Crux-owned tags/params for at least:
+MLflow's generated run ID is transport metadata only. Publish Crux-owned tags for at least:
 
 ```text
 crux.projection_version
@@ -226,17 +184,17 @@ crux.prediction_map_version
 crux.scoring_version
 ```
 
-Do not use the reserved `mlflow.` prefix for Crux-owned tags.
+Do not use the reserved `mlflow.` tag prefix.
 
-The run name should be deterministic and readable, derived from model/input/scope/cohort identity rather than timestamps. The exact format is part of the v1 projection and must have a focused test.
+Use tags for identity/search/filter fields. Do not duplicate the same Crux identity into params unless a concrete MLflow UI need is demonstrated. Any v1 params should be limited to immutable projection configuration, and the fingerprint binds them.
 
-Do not duplicate every identity value into both a parameter and a tag without a UI need. Use one stable ownership rule in the implementation plan: tags for identity/search/filter fields; params only for immutable projection configuration that benefits from the parameter column. The projection fingerprint binds both.
+Run name is deterministic/readable from model + input view + scope + cohort identity, never a timestamp.
 
 ## Scalar metric projection
 
-MLflow scalar metrics are the primary visualization surface.
+MLflow scalar metrics are the v1 visualization surface.
 
-For each canonical aggregate at 30, 50, and 100 ms in both `raw` and `aligned` modes, publish:
+For every canonical 30/50/100 ms × raw/aligned aggregate:
 
 ```text
 event_micro.precision.<tolerance>ms.<mode>
@@ -246,7 +204,7 @@ song_macro.f1.<tolerance>ms.<mode>
 class_macro.f1.<tolerance>ms.<mode>
 ```
 
-Publish song-F1 distribution values for the same tolerance/mode:
+Publish the same tolerance/mode's song-F1 distribution:
 
 ```text
 song_f1.minimum.<tolerance>ms.<mode>
@@ -268,9 +226,9 @@ class.<common_class>.reference_support.<tolerance>ms.<mode>
 class.<common_class>.prediction_support.<tolerance>ms.<mode>
 ```
 
-The common taxonomy is already closed to safe stable IDs (`kick`, `snare`, `hihat`, `crash`, `ride`, `tom`); HPA-86 does not add generic key sanitization or a second taxonomy.
+The common taxonomy is already closed to `kick`, `snare`, `hihat`, `crash`, `ride`, `tom`; do not add generic key sanitization or another taxonomy.
 
-Publish population counts once per run:
+Publish population values:
 
 ```text
 population.total
@@ -278,27 +236,20 @@ population.success
 population.failed
 population.skipped
 population.quarantined
+population.reason.<closed_failure_reason>
 ```
 
-Also publish the existing closed failure-reason counts as:
+Undefined metrics are omitted. Never emit NaN, Infinity, fabricated zeroes, or sentinels.
 
-```text
-population.reason.<reason>
-```
+Convert canonical six-decimal `Decimal` values to finite floats only at the MLflow API boundary. MLflow values are visualization copies, never benchmark evidence.
 
-`None`/undefined metrics are omitted. Do not emit NaN, Infinity, fabricated zeroes, or sentinel values.
+### Per-song detail
 
-Convert Crux's canonical six-decimal `Decimal` values to finite MLflow floating-point values only at the MLflow API boundary. The canonical source value remains the report token; MLflow rounding is not benchmark evidence.
-
-### Per-song data
-
-Do not publish one MLflow scalar metric per song. Hundreds of song-specific metric keys would make the experiment view harder to use and would couple the tracker schema to corpus membership.
-
-`per_song.csv` remains the detailed song-level evidence artifact. The v1 projection exposes its distribution through the existing aggregate percentiles. If real MLflow usage proves that interactive song-level tables are necessary, that is a follow-up projection version rather than speculative HPA-86 scope.
+Do not create one MLflow metric key per song. `per_song.csv` remains the detail evidence; existing distribution percentiles provide a useful v1 overview. If actual use proves interactive song-level tables are necessary, scope that as a follow-up projection version rather than adding speculative complexity here.
 
 ## Artifact policy
 
-Publish only these existing canonical report files under a stable MLflow artifact subdirectory:
+Upload only these canonical report files under a stable MLflow artifact directory:
 
 ```text
 summary.json
@@ -308,79 +259,78 @@ per_song.csv
 per_class.csv
 ```
 
-Do not publish:
+Never upload under HPA-86:
 
 ```text
 event_diagnostics.jsonl
-raw audio
-canonicalized audio
+raw/canonical audio
 separator stems
 prediction artifacts
-model checkpoints
-R2 cache/object data
+checkpoints
+R2/cache objects
 runtime environments
 ```
 
-The publisher verifies every allowlisted file as a regular no-follow file before upload and includes each content SHA-256 in the projection fingerprint.
+Verify every allowlisted artifact as a regular no-follow file and include its content SHA-256 in the projection fingerprint. The allowlist is closed for v1.
 
-The allowlist is closed. Adding an artifact changes the projection contract and requires deliberate review.
+## Projection fingerprint
 
-## Deterministic projection fingerprint
+`cohort_id` alone is not enough for safe idempotency.
 
-Idempotency must not rely on `cohort_id` alone.
-
-Compute `crux.projection_sha256` from a canonical JSON payload containing exactly the v1 projected meaning:
+Compute `crux.projection_sha256` with existing canonical JSON/SHA helpers from exactly the projected meaning:
 
 - projection version;
 - scope;
 - deterministic run name;
-- projected Crux identity metadata;
-- projected params/tags excluding server-generated values;
-- all scalar metric keys and canonical source tokens;
-- each allowlisted artifact relative path and SHA-256.
+- projected Crux identity/tags;
+- any v1 params;
+- scalar metric keys plus canonical source tokens;
+- each allowlisted relative artifact path and SHA-256.
 
-Use the repository's existing canonical JSON and SHA-256 helpers.
+The fingerprint is computed locally before importing/contacting MLflow.
 
-The fingerprint is local and deterministic. It must be computable before importing/contacting MLflow so projection correctness can be tested offline.
+## Idempotent publication and failed attempts
 
-## Idempotent publication
-
-Within the selected MLflow experiment, search active runs by both:
+Within the requested experiment, search existing non-deleted runs matching:
 
 ```text
 crux.cohort_id
 crux.projection_version
 ```
 
+Inspect both fingerprint and run status before writing.
+
 Behavior:
 
-1. **No matching run**: create one run, log the complete projection, mark it finished, return its MLflow run ID and `created=true`.
-2. **Exactly one matching run with the same `crux.projection_sha256`**: perform no writes and return the existing run ID with `created=false`.
-3. **Exactly one matching run with a different projection fingerprint**: fail closed with a projection-conflict error; do not mutate or delete the existing run.
-4. **Multiple matching runs**: fail closed because idempotency has already been violated; do not guess a winner.
+1. **Any matching run has a different `crux.projection_sha256`**: fail closed. The same Crux cohort/projection version cannot mean two different projections, even if the older attempt failed.
+2. **Exactly one matching `FINISHED` run has the same fingerprint**: no-op; return its run ID with `created=false`.
+3. **More than one matching `FINISHED` run**: fail closed because completed-publication idempotency was violated.
+4. **A matching `RUNNING`/scheduled run exists**: fail closed as publication-in-progress; do not create a concurrent duplicate.
+5. **Only same-fingerprint failed/killed attempts exist**: retry is allowed by creating a fresh run. Failed attempts are not successful publications.
+6. **No matching run exists**: create a new run.
 
-Do not update existing benchmark runs in place. A future intentional mapping change uses a new projection version.
+For a new run, log the complete projection and mark it `FINISHED` only after tags/metrics/artifacts succeed. If any post-create operation fails, best-effort mark that new run `FAILED` and surface the original error. Crux artifacts remain untouched.
 
-If publication fails after creating a new MLflow run, attempt to mark that run failed and surface the original publication error. Crux canonical artifacts remain untouched.
+This rule fixes an important retry case: a partial failed run can never satisfy the successful no-op path.
+
+Do not mutate a completed benchmark run in place or delete failed runs automatically. A deliberate mapping change uses a new projection version.
 
 ## MLflow client usage
 
-Prefer `MlflowClient` over global fluent run state for the publication path. The exporter should explicitly:
+Use `MlflowClient` rather than global fluent run state. The side-effect path explicitly:
 
-- resolve/create the requested experiment;
-- search matching runs;
-- create a run when needed;
-- log tags/params/metrics;
-- upload the allowlisted artifacts;
-- terminate the run as finished or failed.
+- resolves/creates the experiment;
+- searches matching runs;
+- creates a run when needed;
+- logs tags/any params/metrics;
+- uploads the five allowlisted artifacts;
+- terminates the run as `FINISHED` or best-effort `FAILED`.
 
-This keeps the side-effect boundary obvious and easier to fake in unit tests.
-
-No background worker, retry engine, queue, or local publication ledger is introduced. An operator can rerun the explicit command; idempotency makes the retry safe.
+Do not add a background worker, queue, retry engine, or local publication database. The operator reruns the explicit command; idempotency makes normal retries safe.
 
 ## CLI
 
-Add one command to the existing benchmark group:
+Add one command:
 
 ```text
 crux benchmark publish-mlflow-cohort \
@@ -389,142 +339,127 @@ crux benchmark publish-mlflow-cohort \
   [--experiment crux-benchmark]
 ```
 
-The command:
+The command must:
 
-1. loads and fully validates the canonical reports before MLflow import/network work;
-2. constructs the deterministic projection;
-3. invokes the publisher;
-4. prints one canonical JSON result containing only non-secret publication metadata;
-5. exits 0 for both newly created and exact no-op publications;
-6. exits 2 for malformed reports, missing optional dependency, configuration/auth/network errors, or projection conflicts.
+1. fully validate canonical reports before MLflow import/network work;
+2. build the deterministic projection;
+3. invoke the publisher;
+4. print canonical JSON with only non-secret result metadata;
+5. exit 0 for newly-created and exact-no-op publications;
+6. exit 2 for malformed reports, missing optional dependency, configuration/auth/network errors, publication-in-progress, or projection conflicts.
 
-Do not add tracking URI, username, password, DagsHub repository, model name, metric selection, or artifact selection flags.
+Do not add tracking URI, username, password, host, model, metric-selection, or artifact-selection flags.
 
-## Hosted operation
+## Hosted operation and cost boundary
 
-DagsHub-hosted MLflow is the initial zero-maintenance target because it accepts the normal MLflow tracking protocol. HPA-86 documentation should show the standard environment-variable setup and keep all host-specific instructions outside application configuration.
+DagsHub-hosted MLflow is the first smoke target. Documentation should show its normal MLflow environment-variable setup, but the code stays provider-neutral.
 
-The code must also work unchanged against a local/self-hosted MLflow server or another fully compatible hosted service. Host choice is therefore reversible without a Crux code migration.
+Do not encode vendor pricing/quota numbers in code. External plans change. Crux controls cost through the optional client dependency and closed small-artifact policy.
 
-Do not encode current vendor pricing or quota numbers in repository code. External service plans can change. The closed small-artifact policy is the cost-control mechanism Crux owns.
+## Testing
 
-## Testing strategy
+### `tests/benchmark/test_reports.py`
 
-### Report loader tests
+Prove `load_published_cohort_reports()`:
 
-Extend `tests/benchmark/test_reports.py` to prove the self-identifying helper:
-
-- accepts a canonical published report and returns the same typed content as the explicit-identity reader;
+- produces the same typed result as the explicit-identity reader;
 - rejects malformed/non-canonical summary identity;
-- delegates full cross-file integrity validation rather than weakening it.
+- still exercises full cross-file integrity validation.
 
-### Pure projection tests
+### `tests/benchmark/test_mlflow_export.py`
 
-Add `tests/benchmark/test_mlflow_export.py` covering at least:
+Pure projection coverage:
 
 - deterministic run name;
-- exact identity/scope/projection tags;
-- all 30/50/100 ms raw/aligned event-micro, song-macro, and class-macro metric keys;
+- identity/scope/projection tags;
+- all 30/50/100 raw/aligned aggregate keys;
 - all distribution keys;
-- all six common-class aggregate mappings when present;
-- population and closed failure-reason counts;
-- undefined metric omission;
-- closed artifact allowlist;
-- artifact SHA-256 participation in the fingerprint;
-- stable projection fingerprint for the same evidence;
-- changed scope/metric/artifact content changes the fingerprint;
-- no import of MLflow for pure projection construction.
+- all six common classes when present;
+- population/failure counts;
+- undefined-value omission;
+- artifact allowlist and hashes;
+- stable fingerprint;
+- scope/metric/artifact content changes fingerprint;
+- pure projection construction does not import MLflow.
 
-### Publisher tests
-
-Use a small fake client boundary; never contact a real server from automated tests.
-
-Cover:
+Publisher coverage with a fake client boundary:
 
 - experiment resolution/creation;
 - first publication;
-- exact duplicate no-op;
-- same cohort/projection-version fingerprint conflict;
-- multiple-match conflict;
-- artifact upload allowlist;
-- run marked failed on post-create publish error;
-- server/auth/network exceptions translated to one bounded publication error without changing Crux files.
+- finished same-fingerprint no-op;
+- failed same-fingerprint retry creates a new run;
+- running attempt blocks concurrent publish;
+- differing fingerprint conflict regardless of status;
+- multiple finished-run conflict;
+- artifact allowlist;
+- post-create errors mark the new run failed;
+- server/auth/network exceptions become one bounded publication error without changing Crux files.
 
-### CLI tests
+### `tests/test_cli_benchmark.py`
 
-Extend `tests/test_cli_benchmark.py` for:
+Cover:
 
-- successful create output/exit 0;
-- duplicate no-op output/exit 0;
-- malformed canonical report exit 2;
-- missing `mlflow-skinny` guidance exit 2;
-- publisher/config/auth/network failure exit 2;
-- no credential values in output.
+- created result/exit 0;
+- no-op result/exit 0;
+- malformed report exit 2;
+- missing dependency guidance exit 2;
+- publisher/config/auth/network/conflict exit 2;
+- credentials never appear in output.
 
 ### Repository gates
-
-Final deterministic gates remain:
 
 ```bash
 uv run pytest
 uv run ruff check .
 uv run ruff format --check src tests
 uv run pylint --errors-only src
-```
-
-The optional MLflow-focused suites also run with:
-
-```bash
 uv run --extra mlflow pytest tests/benchmark/test_mlflow_export.py tests/test_cli_benchmark.py -q
 ```
 
-## Real acceptance gate
+No automated test contacts DagsHub or another real tracking server.
 
-Automated tests do not prove hosted compatibility. Before HPA-86 is considered complete, perform one operator-authenticated publication to a real hosted MLflow server using environment-provided credentials.
+## Real hosted acceptance gate
 
-Initial real evidence should publish the already-available OaF cohorts that do not depend on the still-blocked MuScriptor model lock:
+Before HPA-86 is complete, run one operator-authenticated hosted smoke using environment-provided credentials. Initial evidence should use already-available OaF cohorts rather than waiting for the blocked MuScriptor model lock:
 
 - OaF full-mix broad;
 - OaF full-mix reviewed;
-- OaF full-mix separation-pilot view;
-- OaF Spleeter separation-pilot view;
-- OaF HTDemucs separation-pilot view.
+- OaF full-mix pilot;
+- OaF Spleeter pilot;
+- OaF HTDemucs pilot.
 
-Record on HPA-86/its PR:
+Record on HPA-86/PR:
 
 - experiment name;
 - non-secret MLflow run IDs;
 - projection version/fingerprints;
-- whether each publish created or no-op'd;
-- confirmation that model/input/scope filters work;
-- confirmation that 30/50/100 ms raw/aligned metrics and per-class metrics are visible;
-- confirmation that only the five allowlisted report artifacts were uploaded;
-- a second publication of one cohort proving no duplicate run is created.
+- `created` versus no-op outcomes;
+- ability to filter by model/input/scope;
+- visibility of 30/50/100 raw/aligned and per-class metrics;
+- confirmation that only the five allowlisted artifacts uploaded;
+- a second publish proving one cohort creates no duplicate finished run.
 
-If hosted credentials or the service are unavailable, deterministic implementation may be reviewed, but the PR remains draft/not ready until the real smoke is recorded. Do not substitute fixtures for this acceptance gate.
+If hosted credentials/service access are unavailable, deterministic implementation may be reviewed but the PR stays draft/not-ready until this real smoke is recorded. Do not substitute fixtures.
 
-MuScriptor and IDM publication are not prerequisites for HPA-86 because their production evidence has separate upstream operational dependencies. Once those cohorts exist, the same command publishes them without new code.
+MuScriptor/IDM publication is not a prerequisite for HPA-86. Their eventual canonical cohorts use the same command without new code.
 
 ## Documentation
 
-Add a small `docs/benchmark/mlflow.md` during implementation with:
+Implementation adds `docs/benchmark/mlflow.md` covering:
 
-- why MLflow is a projection rather than source of truth;
+- projection-versus-source-of-truth boundary;
 - optional dependency command;
-- standard environment configuration;
-- DagsHub hosted setup example;
-- local/other-server compatibility note;
-- CLI examples for broad/reviewed/pilot cohorts;
-- metric naming contract;
+- standard MLflow environment variables;
+- DagsHub hosted example and provider-neutral compatibility note;
+- CLI examples;
+- metric naming;
 - artifact allowlist;
-- idempotency behavior;
-- reminder that secrets and large benchmark assets remain outside MLflow.
+- idempotency/retry behavior;
+- secret/large-asset exclusions.
 
-README should only link to that guide; do not duplicate the full setup.
+README receives only a link to the guide.
 
 ## Planned file surface
-
-Expected implementation surface for the single PR:
 
 ```text
 Create:
@@ -546,8 +481,8 @@ Planning:
   docs/superpowers/plans/2026-09-07-hpa-86-mlflow-benchmark-visualization.md
 ```
 
-No changes are expected in OaF/MuScriptor/IDM backends, corpus runners, separation execution, taxonomy, scoring, prediction artifacts, reference manifests, or R2/cache code.
+No expected changes to model backends/runners, separator execution, taxonomy, scoring, predictions, manifests, or R2/cache code.
 
 ## Delivery boundary
 
-HPA-86 is one ticket and one PR. The draft begins with this design and its implementation plan; implementation, tests, documentation, and hosted smoke evidence land on the same branch. Do not create a separate implementation PR.
+HPA-86 is one ticket and one PR. The same branch carries the approved design, implementation plan, implementation, tests, documentation, and hosted smoke evidence. Do not create a second implementation PR.
