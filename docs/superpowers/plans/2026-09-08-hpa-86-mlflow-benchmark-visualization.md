@@ -316,15 +316,15 @@ A same-fingerprint single `FINISHED` run returns `created=False` and performs no
 Tests must cover:
 
 ```text
-only FAILED same SHA                 -> create retry
-only KILLED same SHA                 -> create retry
-FAILED + KILLED same SHA             -> create retry
+only FAILED same SHA                  -> create retry
+only KILLED same SHA                  -> create retry
+FAILED + KILLED same SHA              -> create retry
 one FINISHED same SHA + failed/killed -> no-op to FINISHED
-RUNNING same SHA                     -> conflict
-SCHEDULED same SHA                   -> conflict
-unknown status                       -> conflict
-any different SHA                    -> conflict regardless of status
-multiple FINISHED                    -> conflict
+RUNNING same SHA                      -> conflict
+SCHEDULED same SHA                    -> conflict
+unknown status                        -> conflict
+any different SHA                     -> conflict regardless of status
+multiple FINISHED                     -> conflict
 ```
 
 `KILLED` is deliberately retryable like `FAILED` because it represents an interrupted/aborted attempt, not a successful publication.
@@ -416,21 +416,19 @@ git commit -m "feat: publish benchmark projections through MLflow"
 
 ### 4.1 Write success/no-op tests
 
-For `publish-mlflow-cohort`, monkeypatch loader/projection/publisher and require canonical JSON stdout:
+For `publish-mlflow-cohort`, monkeypatch loader/projection/publisher and require canonical JSON stdout containing:
 
-```json
-{
-  "created": true,
-  "experiment_id": "7",
-  "experiment_name": "crux-benchmark",
-  "exit_code": 0,
-  "projection_sha256": "...",
-  "run_id": "run-123",
-  "status": "published"
-}
+```text
+created
+experiment_id
+experiment_name
+exit_code = 0
+projection_sha256
+run_id
+status = published | already_published
 ```
 
-No-op uses `created=false`, same run ID, and `status="already_published"`.
+No-op uses `created=false` and the existing run ID.
 
 ### 4.2 Write failure-ordering and JSON-error tests
 
@@ -438,20 +436,18 @@ Cover invalid `--scope`, malformed reports, projection failure, missing URI/depe
 
 Malformed reports must prove the publisher was never invoked.
 
-For command-owned exit-2 domain failures, require stderr contains a bounded human-readable message and stdout remains canonical JSON, e.g.:
+For command-owned exit-2 domain failures, require stderr contains a bounded human-readable message and stdout remains canonical JSON containing:
 
-```json
-{
-  "error": "MlflowPublicationError",
-  "exit_code": 2,
-  "experiment_name": "crux-benchmark",
-  "projection_sha256": null,
-  "run_id": null,
-  "status": "failed"
-}
+```text
+error = domain exception type
+exit_code = 2
+experiment_name
+projection_sha256 = null or known local projection SHA
+run_id = null
+status = failed
 ```
 
-The exact error type may vary by domain exception, but stdout must stay parseable. Never include `MLFLOW_TRACKING_URI`, username/password, raw provider exception text, or client repr.
+Never include `MLFLOW_TRACKING_URI`, username/password, raw provider exception text, or client repr.
 
 Click's own argument-validation failures may remain Click-formatted because domain execution has not started.
 
@@ -474,7 +470,7 @@ load/validate canonical reports
 -> publish MLflow
 ```
 
-On caught domain failure, write the canonical error object to stdout, bounded message to stderr, then exit 2. Follow the style of sibling `compare-oaf-muscriptor` / `publish-paired-comparisons` commands.
+On caught domain failure, write the canonical error object to stdout, bounded message to stderr, then exit 2. Follow sibling `compare-oaf-muscriptor` / `publish-paired-comparisons` style.
 
 ### 4.4 Verify and commit
 
@@ -495,18 +491,7 @@ git commit -m "feat: expose explicit MLflow benchmark publication command"
 
 ### 5.1 Document provider-neutral hosted use
 
-Guide covers:
-
-- Crux reports are canonical; MLflow is disposable projection state.
-- `uv run --extra mlflow ...` installation/use.
-- standard `MLFLOW_TRACKING_URI`, `MLFLOW_TRACKING_USERNAME`, `MLFLOW_TRACKING_PASSWORD` setup;
-- no credentials in CLI/config;
-- metric names and identity tags;
-- five-file allowlist and explicit large-artifact exclusions;
-- exact-republish no-op and conflict semantics;
-- changing MLflow-compatible host requires environment change only.
-
-Do not encode current vendor pricing/quota numbers.
+Guide covers canonical-authority boundary, optional `mlflow` extra, standard MLflow environment variables, metric/tag names, five-file allowlist, large-artifact exclusions, idempotency/retry behavior, and provider-neutral configuration. Do not encode vendor pricing/quota numbers.
 
 README gets only a short pointer to `docs/benchmark/mlflow.md`.
 
@@ -555,14 +540,7 @@ Record only non-secret experiment/run IDs, projection SHAs, `created`, and statu
 
 Republish broad OaF exactly. Require exit 0, `created=false`, `already_published`, same run ID, same projection SHA.
 
-In hosted UI verify:
-
-- five runs appear and broad is not duplicated;
-- filters work for `crux.scope`, `crux.model_id`, `crux.input_view_id`;
-- all 30/50/100 raw/aligned metrics are visible;
-- `event_micro.f1.50ms.aligned`, per-class metrics, and population counts can be compared;
-- exactly five `crux-reports/*` artifacts are attached;
-- diagnostics/audio/stems/predictions/checkpoints are absent.
+In hosted UI verify five runs appear, filters work for scope/model/input view, all six aggregate views are visible, headline/per-class/population metrics can be compared, exactly five `crux-reports/*` artifacts are attached, and large excluded artifacts are absent.
 
 ### 5.6 Final repo verification
 
