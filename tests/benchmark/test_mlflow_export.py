@@ -772,6 +772,39 @@ def test_publish_metric_failure_terminates_new_run_as_failed(
     assert isinstance(raised.value.__cause__, OSError)
 
 
+def test_publish_metric_stage_import_failure_bounds_code_and_terminates(
+    tmp_path: Path, mlflow_entities_stub: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Half-broken install: mlflow imports but mlflow.entities does not.
+    monkeypatch.setitem(sys.modules, "mlflow.entities", None)
+    client = _FakeClient(_FakePage([]))
+    with pytest.raises(MlflowPublicationError) as raised:
+        _publish(_publisher_projection(tmp_path), client)
+    assert raised.value.code == "metric_log_failed"
+    assert str(raised.value) == MlflowPublicationError("metric_log_failed").message
+    assert isinstance(raised.value.__cause__, ImportError)
+    assert client.logged_batches == []
+    assert client.terminated == [("run-new", "FAILED")]
+
+
+def test_publish_metric_stage_metric_construction_failure_bounds_and_terminates(
+    tmp_path: Path, mlflow_entities_stub: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken_metric(*_args: object) -> None:
+        raise RuntimeError("vendor metric construction boom")
+
+    monkeypatch.setattr(sys.modules["mlflow.entities"], "Metric", broken_metric)
+    client = _FakeClient(_FakePage([]))
+    with pytest.raises(MlflowPublicationError) as raised:
+        _publish(_publisher_projection(tmp_path), client)
+    assert raised.value.code == "metric_log_failed"
+    assert str(raised.value) == MlflowPublicationError("metric_log_failed").message
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert "vendor metric construction boom" not in str(raised.value)
+    assert client.logged_batches == []
+    assert client.terminated == [("run-new", "FAILED")]
+
+
 def test_publish_artifact_failure_terminates_new_run_as_failed(
     tmp_path: Path, mlflow_entities_stub: type
 ) -> None:

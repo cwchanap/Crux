@@ -1753,15 +1753,14 @@ def _emit_mlflow_publication_failure(error_code: str, safe_message: str) -> None
 
 def _build_mlflow_client(tracking_uri: str) -> object:
     """Import mlflow lazily and construct one tracking client (CLI-owned seam)."""
-    from src.benchmark.mlflow_export import MlflowPublicationError
+    from src.benchmark.mlflow_export import MlflowPublicationError, _bounded
 
     try:
         import mlflow  # noqa: F401
+        from mlflow.tracking import MlflowClient
     except ImportError as error:
         raise MlflowPublicationError("missing_optional_dependency") from error
-    from mlflow.tracking import MlflowClient
-
-    return MlflowClient(tracking_uri=tracking_uri)
+    return _bounded("invalid_config", lambda: MlflowClient(tracking_uri=tracking_uri))
 
 
 @benchmark.command("publish-mlflow-cohort")

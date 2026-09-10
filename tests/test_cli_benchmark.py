@@ -2390,6 +2390,101 @@ def test_publish_mlflow_cohort_missing_mlflow_dependency_is_bounded(
     assert result.stderr == safe_message + "\n"
 
 
+def test_publish_mlflow_cohort_half_broken_mlflow_install_is_bounded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import sys
+    import types
+
+    import src.benchmark.mlflow_export as mlflow_module
+    import src.benchmark.reports as reports_module
+    from src.benchmark.mlflow_export import MlflowPublicationError
+
+    reports_path = tmp_path / "reports"
+    reports_path.mkdir()
+    safe_message = MlflowPublicationError("missing_optional_dependency").message
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("publication must not run without a usable mlflow install")
+
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.com")
+    monkeypatch.setitem(sys.modules, "mlflow", types.ModuleType("mlflow"))
+    monkeypatch.setitem(sys.modules, "mlflow.tracking", None)
+    monkeypatch.setattr(reports_module, "load_published_cohort_reports", lambda _path: object())
+    monkeypatch.setattr(
+        mlflow_module,
+        "build_mlflow_projection",
+        lambda reports, report_dir, *, scope: object(),
+    )
+    monkeypatch.setattr(mlflow_module, "publish_mlflow_projection", unexpected)
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "broad"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error_code": "missing_optional_dependency",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert result.stderr == safe_message + "\n"
+
+
+def test_publish_mlflow_cohort_client_construction_failure_is_bounded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import sys
+    import types
+
+    import src.benchmark.mlflow_export as mlflow_module
+    import src.benchmark.reports as reports_module
+    from src.benchmark.mlflow_export import MlflowPublicationError
+
+    reports_path = tmp_path / "reports"
+    reports_path.mkdir()
+    safe_message = MlflowPublicationError("invalid_config").message
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("publication must not run when the client cannot be built")
+
+    class ExplodingClient:
+        def __init__(self, tracking_uri: str) -> None:
+            raise RuntimeError("vendor client construction boom: operator:hunter2")
+
+    tracking = types.ModuleType("mlflow.tracking")
+    tracking.MlflowClient = ExplodingClient
+
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.com")
+    monkeypatch.setitem(sys.modules, "mlflow", types.ModuleType("mlflow"))
+    monkeypatch.setitem(sys.modules, "mlflow.tracking", tracking)
+    monkeypatch.setattr(reports_module, "load_published_cohort_reports", lambda _path: object())
+    monkeypatch.setattr(
+        mlflow_module,
+        "build_mlflow_projection",
+        lambda reports, report_dir, *, scope: object(),
+    )
+    monkeypatch.setattr(mlflow_module, "publish_mlflow_projection", unexpected)
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "broad"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error_code": "invalid_config",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert result.stderr == safe_message + "\n"
+    assert "hunter2" not in result.stdout
+    assert "hunter2" not in result.stderr
+
+
 def test_publish_mlflow_cohort_run_conflict_emits_bounded_code_without_secrets(
     tmp_path: Path, monkeypatch
 ) -> None:

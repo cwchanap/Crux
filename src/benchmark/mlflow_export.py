@@ -390,16 +390,19 @@ def _create_run(client: MlflowClient, experiment_id: str, projection: MlflowProj
 def _log_metrics(
     client: MlflowClient, run_id: str, metrics: Mapping[str, MlflowMetricValue]
 ) -> None:
-    from mlflow.entities import Metric
+    def log() -> None:
+        from mlflow.entities import Metric
 
-    timestamp_ms = int(time.time() * 1000)
-    entries = []
-    for name, value in metrics.items():
-        number = float(value)
-        if not math.isfinite(number):
-            raise MlflowPublicationError("metric_log_failed")
-        entries.append(Metric(name, number, timestamp_ms, 0))
-    _bounded("metric_log_failed", lambda: client.log_batch(run_id, metrics=entries))
+        timestamp_ms = int(time.time() * 1000)
+        entries = []
+        for name, value in metrics.items():
+            number = float(value)
+            if not math.isfinite(number):
+                raise MlflowPublicationError("metric_log_failed")
+            entries.append(Metric(name, number, timestamp_ms, 0))
+        client.log_batch(run_id, metrics=entries)
+
+    _bounded("metric_log_failed", log)
 
 
 def _log_artifacts(
