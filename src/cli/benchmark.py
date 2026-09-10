@@ -3,6 +3,7 @@ from __future__ import annotations
 # Commands keep optional and heavy implementation modules behind their Click boundary.
 # pylint: disable=import-outside-toplevel
 import json
+import os
 import re
 import subprocess
 import time
@@ -1735,6 +1736,95 @@ def publish_paired_comparisons_command(
         "pairable_success_counts": outcome.pairable_success_counts,
     }
     click.echo(canonical_json_bytes(payload).decode("utf-8"))
+
+
+_MLFLOW_SCOPE_CHOICES = ("broad", "reviewed", "pilot")
+_DEFAULT_MLFLOW_EXPERIMENT = "crux-benchmark"
+_MLFLOW_REPORT_FAILURE_MESSAGE = "published cohort report is malformed or incomplete"
+_MLFLOW_PROJECTION_FAILURE_MESSAGE = "cohort report cannot be projected for MLflow publication"
+
+
+def _emit_mlflow_publication_failure(error_code: str, safe_message: str) -> None:
+    """Emit the fixed stderr message and canonical stdout failure JSON."""
+    click.echo(safe_message, err=True)
+    payload = {"error_code": error_code, "exit_code": 2, "status": "failed"}
+    click.echo(canonical_json_bytes(payload).decode("utf-8"))
+
+
+def _build_mlflow_client(tracking_uri: str) -> object:
+    """Import mlflow lazily and construct one tracking client (CLI-owned seam)."""
+    from src.benchmark.mlflow_export import MlflowPublicationError, _bounded
+
+    try:
+        import mlflow  # noqa: F401
+        from mlflow.tracking import MlflowClient
+    except ImportError as error:
+        raise MlflowPublicationError("missing_optional_dependency") from error
+    return _bounded("invalid_config", lambda: MlflowClient(tracking_uri=tracking_uri))
+
+
+@benchmark.command("publish-mlflow-cohort")
+@click.option(
+    "--reports",
+    "reports_path",
+    type=click.Path(path_type=Path, exists=True, file_okay=False),
+    required=True,
+    help="Required path to one published HPA-325 cohort report directory.",
+)
+@click.option(
+    "--scope",
+    type=click.Choice(_MLFLOW_SCOPE_CHOICES),
+    required=True,
+    help="Required benchmark display scope for the published run.",
+)
+@click.option(
+    "--experiment",
+    "experiment_name",
+    type=str,
+    default=_DEFAULT_MLFLOW_EXPERIMENT,
+    show_default=True,
+    help="Target MLflow experiment name.",
+)
+def publish_mlflow_cohort_command(
+    reports_path: Path,
+    scope: str,
+    experiment_name: str,
+) -> None:
+    """Publish one canonical cohort report as an idempotent MLflow run."""
+    from src.benchmark.mlflow_export import (
+        MlflowProjectionError,
+        MlflowPublicationError,
+        build_mlflow_projection,
+        publish_mlflow_projection,
+        validate_tracking_uri,
+    )
+    from src.benchmark.reports import ReportIntegrityError, load_published_cohort_reports
+
+    try:
+        reports = load_published_cohort_reports(reports_path)
+    except (OSError, ReportIntegrityError):
+        _emit_mlflow_publication_failure("report_invalid", _MLFLOW_REPORT_FAILURE_MESSAGE)
+        raise click.exceptions.Exit(2)
+
+    try:
+        projection = build_mlflow_projection(reports, reports_path, scope=scope)
+    except MlflowProjectionError:
+        _emit_mlflow_publication_failure("projection_failed", _MLFLOW_PROJECTION_FAILURE_MESSAGE)
+        raise click.exceptions.Exit(2)
+
+    try:
+        tracking_uri = validate_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI", ""))
+        client = _build_mlflow_client(tracking_uri)
+        publication = publish_mlflow_projection(
+            projection,
+            client=client,
+            experiment_name=experiment_name,
+        )
+    except MlflowPublicationError as error:
+        _emit_mlflow_publication_failure(error.code, error.message)
+        raise click.exceptions.Exit(2)
+
+    click.echo(canonical_json_bytes(asdict(publication)).decode("utf-8"))
 
 
 @benchmark.command("run-oaf-separation-pilot")
