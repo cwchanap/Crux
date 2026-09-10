@@ -17,7 +17,6 @@ from src.benchmark.backend_identity import (
     OAF_BACKEND_ID,
     StrictJsonError,
     canonical_json_bytes,
-    strict_json_loads,
 )
 from src.benchmark.cohort_scoring import SCORING_VERSION, CohortIdentity
 from src.benchmark.oaf_corpus_run import OAF_FULL_MIX_INPUT_VIEW_ID
@@ -36,7 +35,12 @@ from src.benchmark.published_comparison import (
 )
 from src.benchmark.reference_set_manifest import load_reference_set_manifest
 from src.benchmark.reference_timing_manifest import load_reference_timing_manifest
-from src.benchmark.reports import PublishedCohortReports, read_cohort_reports
+from src.benchmark.reports import (
+    PublishedCohortReports,
+    ReportIntegrityError,
+    read_cohort_report_identity,
+    read_cohort_reports,
+)
 from src.benchmark.reviewed_subset import load_reviewed_subset_manifest
 from src.benchmark.taxonomy import DTX_LANE_MAP_VERSION, TAXONOMY_VERSION
 
@@ -234,18 +238,9 @@ def aggregate_paired_event_micro(
 
 def _strict_report_identity(report_dir: Path) -> CohortIdentity:
     try:
-        summary = strict_json_loads(
-            read_regular_file_no_follow(report_dir / "summary.json"),
-            require_canonical=True,
-        )
-    except (OSError, StrictJsonError) as error:
-        raise ComparisonIntegrityError(f"cannot read HPA-325 identity: {error}") from error
-    if not isinstance(summary, Mapping) or not isinstance(summary.get("identity"), Mapping):
-        raise ComparisonIntegrityError("HPA-325 summary identity is malformed")
-    try:
-        return CohortIdentity(**summary["identity"])  # type: ignore[arg-type]
-    except (TypeError, ValueError, StrictJsonError) as error:
-        raise ComparisonIntegrityError(f"HPA-325 summary identity is malformed: {error}") from error
+        return read_cohort_report_identity(report_dir)
+    except (ReportIntegrityError, OSError, TypeError, ValueError) as error:
+        raise ComparisonIntegrityError("cannot read HPA-325 identity") from error
 
 
 def _expected_cohort_id(
