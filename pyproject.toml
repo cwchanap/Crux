@@ -39,6 +39,7 @@ r2 = [
     "boto3>=1.42,<2",
 ]
 muscriptor = ["muscriptor==0.3.0"]
+mlflow = ["mlflow-skinny>=3.16,<4"]
 
 [project.scripts]
 convert-checkpoint = "src.cli.convert:main"
