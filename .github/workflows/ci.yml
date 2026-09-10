@@ -70,7 +70,8 @@ jobs:
             soundfile \
             librosa \
             pretty-midi \
-            "boto3>=1.42,<2"
+            "boto3>=1.42,<2" \
+            "mlflow-skinny>=3.16,<4"
           pip install --no-deps -e .
 
       - name: Run tests with coverage
