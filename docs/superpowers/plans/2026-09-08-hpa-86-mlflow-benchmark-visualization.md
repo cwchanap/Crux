@@ -1,34 +1,28 @@
 # HPA-86 MLflow Benchmark Visualization Implementation Plan
 
-> **Execution:** implement task-by-task on draft PR #34 / `agent/hpa-86-mlflow-benchmark-visualization`. Use TDD for production behavior. One HPA-86 ticket, one PR.
+> **Execution:** implement task-by-task on draft PR #34 / `agent/hpa-86-mlflow-benchmark-visualization`. One HPA-86 ticket, one PR. Use TDD for production behavior.
 
-**Goal:** Add one optional, host-neutral MLflow projection over canonical Crux cohort reports so existing benchmark results are browsable now and the same tracking contract can support later fine-tuning.
-
-**Architecture:** canonical HPA-325 reports remain authoritative. `reports.py` gains one self-identifying convenience loader; `mlflow_export.py` builds a deterministic pure projection and then optionally publishes it through a lazily imported `MlflowClient`. No runner/scorer/separator path knows about MLflow.
+**Goal:** Add an optional MLflow visualization/index projection over canonical Crux benchmark reports, with DagsHub as the first hosted target and no MLflow dependency in inference/scoring/report generation.
 
 **Spec:** `docs/superpowers/specs/2026-09-07-hpa-86-mlflow-benchmark-visualization-design.md`
 
 ## Global constraints
 
-- Base is `main` at `31b7784ddb951ec2f780d3b00554ec948415f526`; re-check assumptions if main moves before implementation.
-- MLflow remains absent from the base dependency set; add only `mlflow-skinny>=3.16,<4` under optional extra `mlflow`.
-- No DagsHub SDK or provider-specific API.
-- Require explicit `MLFLOW_TRACKING_URI`; do not add credential URI/user/password CLI flags.
-- V1 projection is exactly `crux.mlflow-projection/v1`.
-- V1 scope is exactly `broad | reviewed | pilot`.
-- V1 aggregate grid is exactly 30/50/100 ms × raw/aligned; do not bind this freeze to `DEFAULT_TOLERANCES_MS`.
-- V1 artifact allowlist is exactly `summary.json`, `summary.md`, `items.csv`, `per_song.csv`, `per_class.csv` under `crux-reports/`.
-- Reuse `PublishedArtifact`; do not add `ProjectedArtifact`.
-- Validate durable class metric keys against `get_args(CommonDrumClass)`.
-- Validate failure-reason metric keys against `COHORT_FAILURE_REASONS`.
-- Undefined metrics are omitted; conversion to float happens only at the MLflow API boundary.
-- No per-song scalar metrics.
-- Idempotency is scoped by `crux.cohort_id + crux.projection_version` and a deterministic projection SHA.
-- `FAILED` and `KILLED` same-fingerprint runs are retryable; `RUNNING`/`SCHEDULED`, unknown status, mismatching fingerprint, multiple finished runs, or saturated run search fail closed.
-- User-visible provider/client failures are generic; raw exceptions remain chained causes only.
-- Success and exit-2 failure stdout are canonical JSON, matching sibling publication-command conventions.
-- No Model Registry, datasets, autologging, training, Optuna, CI publication, dashboard framework, R2 sync, or model-runner changes.
-- Automated tests never contact DagsHub or another real MLflow server.
+- Planning base is `main` at `31b7784ddb951ec2f780d3b00554ec948415f526`; re-check if main moves before implementation.
+- Crux HPA-325 reports remain authoritative; MLflow is disposable projection state.
+- Add only optional `mlflow-skinny>=3.16,<4`; no DagsHub SDK.
+- Public publication accepts only explicit HTTP(S) tracking-server URIs with no inline credentials/query/fragment. Reject empty/file/sqlite/path tracking URIs.
+- Scope is `broad | reviewed | pilot` and participates in both fingerprint and run search.
+- V1 requires 30/50/100 ms raw+aligned views but also projects additional canonical tolerances if they exist.
+- Reuse `PublishedArtifact`; no second artifact dataclass.
+- Validate durable class metric keys against `CommonDrumClass`.
+- Do not duplicate failure-reason validation already enforced by `read_cohort_reports()`.
+- `FAILED`/`KILLED` matching attempts retry; `FINISHED` may satisfy no-op; nonterminal/unknown/conflicting state fails closed.
+- Do not paginate matching-run search; fail closed if MLflow returns a continuation token.
+- Use bounded MLflow error codes/messages; raw provider exceptions remain chained causes only.
+- Success and command-owned exit-2 paths keep stdout canonical JSON.
+- No registry, datasets, autologging, fine-tuning, training orchestration, CI benchmark publication, custom dashboard framework, or model-runner changes.
+- Automated tests never contact DagsHub.
 
 ## File surface
 
@@ -44,97 +38,91 @@ Modify:
 
 ```text
 src/benchmark/reports.py
-tests/benchmark/test_reports.py
+src/benchmark/separation_comparison.py
 src/cli/benchmark.py
+tests/benchmark/test_reports.py
+tests/benchmark/test_separation_comparison.py
 tests/test_cli_benchmark.py
+.github/workflows/ci.yml
 pyproject.toml
 uv.lock
 README.md
 ```
 
-Do not change `cohort_scoring.py`, model runners/backends, separation execution, prediction artifacts, taxonomy definitions, manifests, or R2/cache production code.
-
 ---
 
-## Task 1 — Self-identifying canonical cohort-report loader
+## Task 1 — One canonical report-identity reader
 
-**Files:** `src/benchmark/reports.py`, `tests/benchmark/test_reports.py`
+**Files:** `src/benchmark/reports.py`, `src/benchmark/separation_comparison.py`, `tests/benchmark/test_reports.py`, `tests/benchmark/test_separation_comparison.py`
 
-### 1.1 Write red loader-equivalence test
+### 1.1 Write red tests
 
-Add `load_published_cohort_reports` to the existing report imports and test:
-
-```python
-def test_load_published_cohort_reports_reads_identity_from_summary(tmp_path: Path) -> None:
-    write_cohort_reports(_result(), tmp_path)
-
-    explicit = read_cohort_reports(tmp_path, expected_identity=_identity())
-    discovered = load_published_cohort_reports(tmp_path)
-
-    assert discovered == explicit
-```
-
-Run:
-
-```bash
-uv run pytest tests/benchmark/test_reports.py::test_load_published_cohort_reports_reads_identity_from_summary -q
-```
-
-Expected: fails because the helper does not exist.
-
-### 1.2 Extract identity construction only
-
-Refactor existing `_parse_summary_identity()` so construction is reusable:
+Add report tests proving:
 
 ```python
-def _cohort_identity_from_summary(value: object) -> CohortIdentity:
-    payload = _require_keys(value, _IDENTITY_FIELDS, "summary identity")
-    for field in _IDENTITY_FIELDS:
-        _json_text(payload[field], f"identity.{field}")
-    try:
-        return CohortIdentity(**payload)  # type: ignore[arg-type]
-    except (TypeError, ValueError, StrictJsonError) as error:
-        _report_error(f"summary identity is malformed: {error}")
+identity = read_cohort_report_identity(report_dir)
+reports = load_published_cohort_reports(report_dir)
 
-
-def _parse_summary_identity(value: object, expected: CohortIdentity) -> CohortIdentity:
-    identity = _cohort_identity_from_summary(value)
-    if identity != expected:
-        _report_error("summary identity mismatch")
-    return identity
+assert identity == _identity()
+assert reports == read_cohort_reports(report_dir, expected_identity=_identity())
 ```
 
-Do not fold in `separation_comparison._strict_report_identity`; that path intentionally verifies an externally expected snapshot identity.
+Add a separation-comparison regression proving its existing expected-snapshot identity rejection still works after delegation.
 
-### 1.3 Implement convenience loader by delegation
+### 1.2 Add the reusable public helper
+
+In `reports.py`, extract the current summary identity construction into:
 
 ```python
-def load_published_cohort_reports(report_dir: Path) -> PublishedCohortReports:
+def read_cohort_report_identity(report_dir: Path) -> CohortIdentity:
     if not isinstance(report_dir, Path):
         raise TypeError("report_dir must be a Path")
-
     summary = _read_report_json(report_dir / "summary.json")
     _require_keys(summary, _SUMMARY_FIELDS, "summary")
     if summary["schema"] != REPORT_SCHEMA:
         _report_error("summary schema is invalid")
-    identity = _cohort_identity_from_summary(summary["identity"])
+    return _cohort_identity_from_summary(summary["identity"])
+```
+
+Keep `_parse_summary_identity(value, expected)` for the existing full reader; it delegates construction to `_cohort_identity_from_summary()` and still enforces equality.
+
+Add:
+
+```python
+def load_published_cohort_reports(report_dir: Path) -> PublishedCohortReports:
+    identity = read_cohort_report_identity(report_dir)
     return read_cohort_reports(report_dir, expected_identity=identity)
 ```
 
-Reading `summary.json` twice is acceptable; full cross-file validation remains owned by `read_cohort_reports()`.
+Reading `summary.json` twice is acceptable; the existing reader remains the only complete cross-file validator.
 
-### 1.4 Add integrity regressions
+### 1.3 Collapse the laxer separation duplicate
 
-Test malformed summary identity and one existing cross-file corruption case. Both must raise `ReportIntegrityError` through the new entry point.
+Replace `separation_comparison._strict_report_identity()` internals with delegation:
 
-### 1.5 Verify and commit
+```python
+def _strict_report_identity(report_dir: Path) -> CohortIdentity:
+    try:
+        return read_cohort_report_identity(report_dir)
+    except (ReportIntegrityError, OSError, TypeError, ValueError) as error:
+        raise ComparisonIntegrityError("cannot read HPA-325 identity") from error
+```
+
+Do not move snapshot expectations. `_validated_identity()` continues checking expected cohort/backend/model/input/reference/scoring values exactly as today.
+
+### 1.4 Verify
 
 ```bash
-uv run pytest tests/benchmark/test_reports.py -q
-uv run ruff check src/benchmark/reports.py tests/benchmark/test_reports.py
-uv run ruff format --check src/benchmark/reports.py tests/benchmark/test_reports.py
-git add src/benchmark/reports.py tests/benchmark/test_reports.py
-git commit -m "feat: load canonical cohort reports by persisted identity"
+uv run pytest tests/benchmark/test_reports.py tests/benchmark/test_separation_comparison.py -q
+uv run ruff check src/benchmark/reports.py src/benchmark/separation_comparison.py tests/benchmark/test_reports.py tests/benchmark/test_separation_comparison.py
+uv run ruff format --check src/benchmark/reports.py src/benchmark/separation_comparison.py tests/benchmark/test_reports.py tests/benchmark/test_separation_comparison.py
+```
+
+Commit:
+
+```bash
+git add src/benchmark/reports.py src/benchmark/separation_comparison.py tests/benchmark/test_reports.py tests/benchmark/test_separation_comparison.py
+git commit -m "refactor: reuse canonical cohort report identity reader"
 ```
 
 ---
@@ -145,51 +133,32 @@ git commit -m "feat: load canonical cohort reports by persisted identity"
 
 This task must not import `mlflow`.
 
-### 2.1 Write red projection fixture/tests
+### 2.1 Build a red six-baseline-view fixture
 
-Build one `PublishedCohortReports` fixture containing exactly:
+Create `PublishedCohortReports` fixture rows containing at least:
 
 ```python
-EXPECTED_VIEWS = (
-    (30, "raw"),
-    (30, "aligned"),
-    (50, "raw"),
-    (50, "aligned"),
-    (100, "raw"),
-    (100, "aligned"),
+REQUIRED_BASELINE_VIEWS = frozenset(
+    {
+        (30, "raw"),
+        (30, "aligned"),
+        (50, "raw"),
+        (50, "aligned"),
+        (100, "raw"),
+        (100, "aligned"),
+    }
 )
 ```
 
-At 50 ms aligned include aggregate class rows for all six `CommonDrumClass` values.
+At 50 ms aligned include all six common classes. Write deterministic bytes for the five allowlisted files.
 
-Write deterministic bytes for the five allowlisted files.
-
-First red test pins deterministic run name and identity tags:
-
-```python
-def test_projection_keeps_crux_identity_as_tags(tmp_path: Path) -> None:
-    reports = _published_reports()
-    _write_allowed_artifacts(tmp_path)
-
-    projection = build_mlflow_projection(reports, report_dir=tmp_path, scope="broad")
-
-    assert projection.run_name == (
-        f"broad:{reports.identity.model_id}:{reports.identity.input_view_id}:"
-        f"{reports.identity.cohort_id}"
-    )
-    assert projection.tags["crux.cohort_id"] == reports.identity.cohort_id
-    assert projection.tags["crux.projection_version"] == PROJECTION_VERSION
-    assert projection.tags["crux.projection_sha256"] == projection.projection_sha256
-```
-
-### 2.2 Add pure projection contract
+### 2.2 Add minimal projection types
 
 Use:
 
 ```python
 from src.benchmark.artifact_io import PublishedArtifact, read_regular_file_no_follow
 from src.benchmark.backend_identity import canonical_json_bytes, sha256_hex
-from src.benchmark.cohort_scoring import COHORT_FAILURE_REASONS
 from src.benchmark.taxonomy import CommonDrumClass
 ```
 
@@ -201,7 +170,7 @@ MlflowMetricValue
 PROJECTION_VERSION
 REPORT_ARTIFACT_PATH
 REPORT_ARTIFACT_NAMES
-EXPECTED_AGGREGATE_VIEWS
+REQUIRED_BASELINE_VIEWS
 MlflowProjectionError
 MlflowProjection
 build_mlflow_projection(...)
@@ -209,340 +178,358 @@ build_mlflow_projection(...)
 
 `MlflowProjection.artifacts` is `tuple[PublishedArtifact, ...]`.
 
-### 2.3 Test exact six-view grid and metric mapping
+### 2.3 Require baseline views, allow extras
 
-Tests must assert all six aggregate views expose:
+`read_cohort_reports()` already guarantees raw/aligned completeness for every declared tolerance. The exporter only checks:
+
+```python
+actual = {(row.tolerance_ms, row.mode) for row in reports.aggregates}
+if not REQUIRED_BASELINE_VIEWS <= actual:
+    raise MlflowProjectionError("required benchmark views are missing")
+```
+
+Do not reject additional tolerances. Add one test where 200 ms raw/aligned is present and assert both 200 ms metric families are projected.
+
+### 2.4 Map metrics and close class names
+
+Project every aggregate row:
 
 ```text
-event_micro.precision/recall/f1
-song_macro.f1
-class_macro.f1
-song_f1.minimum/p10/p25/median/p75/p90/maximum
+event_micro.precision/recall/f1.<tol>ms.<mode>
+song_macro.f1.<tol>ms.<mode>
+class_macro.f1.<tol>ms.<mode>
+song_f1.minimum/p10/p25/median/p75/p90/maximum.<tol>ms.<mode>
+class.<common>.precision/recall/f1.<tol>ms.<mode>
+class.<common>.reference_support/prediction_support.<tol>ms.<mode>
 ```
 
-and common-class aggregate precision/recall/f1/support metrics plus population/failure-reason metrics.
-
-Parameterize missing, extra, and duplicate aggregate views; all fail with `MlflowProjectionError`.
-
-### 2.4 Test closed class and failure-reason keys
-
-Because persisted `PublishedAggregateClass.common_class` is a bare `str`, add a regression that replaces one class with `"ride_typo"` and requires `MlflowProjectionError` before a metric key is created.
-
-Implementation validates:
+Before creating class keys:
 
 ```python
-common_classes = frozenset(get_args(CommonDrumClass))
+COMMON_CLASSES = frozenset(get_args(CommonDrumClass))
 ```
 
-Do the equivalent closed check for population reason names using `COHORT_FAILURE_REASONS` before creating `population.reason.*` keys.
+Reject an unknown `common_class` with `MlflowProjectionError`.
 
-### 2.5 Test undefined-value omission
+Population metrics:
 
-Set a macro/distribution metric to `None` and assert the MLflow metric key is absent, not zero/NaN.
+```text
+population.total/success/failed/skipped/quarantined
+population.reason.<reason>
+```
 
-### 2.6 Test/reuse artifact hashing
+Do not add a second `COHORT_FAILURE_REASONS` check. The loader already rejects unknown reasons.
 
-For each allowlisted basename:
+Omit `None`; never synthesize zero/NaN.
+
+### 2.5 Reuse artifact hashing
+
+For each closed filename:
 
 ```python
-content = read_regular_file_no_follow(report_dir / name)
-artifact = PublishedArtifact(path=report_dir / name, sha256=sha256_hex(content))
+path = report_dir / name
+content = read_regular_file_no_follow(path)
+PublishedArtifact(path=path, sha256=sha256_hex(content))
 ```
 
-Reject missing/symlink/unreadable allowed files as `MlflowProjectionError`.
+Wrap file errors as `MlflowProjectionError`. Extra files never enter the projection.
 
-Assert extra files such as `event_diagnostics.jsonl` and `audio.wav` never appear in `projection.artifacts`.
+### 2.6 Fingerprint
 
-### 2.7 Fingerprint tests
+Hash canonical JSON containing projection version, scope, run name, base identity tags, canonical metric values, and each allowlisted `{path: artifact.path.name, sha256}`. Add `crux.projection_sha256` only after computing the hash.
 
-Fingerprint canonical JSON contains projection version, scope, run name, base identity tags, canonical metric values, and `{path: artifact.path.name, sha256}` for each allowed artifact. Exclude `crux.projection_sha256` itself.
+Tests prove same input is stable and scope/metric/artifact changes alter the SHA.
 
-Prove same evidence gives the same SHA and changing scope, one metric, or one allowlisted file changes the SHA.
+### 2.7 Verify base optionality
 
-### 2.8 Protect optional-dependency boundary
+Use a subprocess test proving importing `src.benchmark.mlflow_export` does not import `mlflow`.
 
-Use a subprocess test that imports `src.benchmark.mlflow_export` and asserts `mlflow` is not added to `sys.modules`.
-
-### 2.9 Verify and commit
+Run:
 
 ```bash
 uv run pytest tests/benchmark/test_mlflow_export.py -q
 uv run ruff check src/benchmark/mlflow_export.py tests/benchmark/test_mlflow_export.py
 uv run ruff format --check src/benchmark/mlflow_export.py tests/benchmark/test_mlflow_export.py
+```
+
+Commit:
+
+```bash
 git add src/benchmark/mlflow_export.py tests/benchmark/test_mlflow_export.py
 git commit -m "feat: project canonical benchmark reports for MLflow"
 ```
 
 ---
 
-## Task 3 — Optional `mlflow-skinny` publisher and idempotency
+## Task 3 — Optional real MLflow publisher, idempotency, and CI drift guard
 
-**Files:** `pyproject.toml`, `uv.lock`, `src/benchmark/mlflow_export.py`, `tests/benchmark/test_mlflow_export.py`
+**Files:** `pyproject.toml`, `uv.lock`, `src/benchmark/mlflow_export.py`, `tests/benchmark/test_mlflow_export.py`, `.github/workflows/ci.yml`
 
-### 3.1 Add optional dependency only
+### 3.1 Add optional dependency and CI package
+
+In `pyproject.toml`:
 
 ```toml
 mlflow = ["mlflow-skinny>=3.16,<4"]
 ```
 
-Run `uv lock` and inspect `pyproject.toml`/`uv.lock`; unrelated existing-package version churn is not accepted.
-
-### 3.2 Write fake-client tests before publisher code
-
-Create a minimal `_FakeMlflowClient` exposing only:
+In the CI minimal dependency list add:
 
 ```text
-get_experiment_by_name
-create_experiment
-search_runs
-create_run
-log_batch
-log_artifact
-set_terminated
+"mlflow-skinny>=3.16,<4"
 ```
 
-and fake run objects with `.info.run_id`, `.info.status`, `.data.tags`.
+Run `uv lock` and reject unrelated lock churn.
 
-Add `MlflowPublicationError`, `MlflowProjectionConflictError`, and `MlflowPublishOutcome` only after the tests are red.
+### 3.2 Add bounded publication errors
 
-### 3.3 Pin first publish and exact no-op
+Define:
 
-First publication creates one run, logs one metric batch, uploads exactly five `PublishedArtifact.path` files to `crux-reports`, and finishes the run.
+```python
+MlflowErrorCode = Literal[
+    "missing_optional_dependency",
+    "invalid_config",
+    "experiment_access_failed",
+    "run_search_failed",
+    "run_create_failed",
+    "metric_log_failed",
+    "artifact_upload_failed",
+    "run_finalize_failed",
+    "run_conflict",
+]
+```
 
-A same-fingerprint single `FINISHED` run returns `created=False` and performs no write.
+`MlflowPublicationError` carries `.code` and a fixed bounded message. Do not inspect vendor strings to guess auth-vs-network categories.
 
-### 3.4 Pin retry/status matrix
+### 3.3 Validate public tracking URI
 
-Tests must cover:
+Add a small local validator using `urllib.parse.urlsplit`; do not reuse R2's origin-only helper because MLflow/DagsHub URIs may contain a path.
+
+Accept explicit `http`/`https` URI + hostname. Reject inline username/password, query, fragment, `file:`, `sqlite:`, bare path, or empty input with `invalid_config`.
+
+The file-store integration test below constructs `MlflowClient` directly and therefore does not weaken this public CLI contract.
+
+### 3.4 Search identity includes scope
+
+Build the run filter from:
 
 ```text
-only FAILED same SHA                  -> create retry
-only KILLED same SHA                  -> create retry
-FAILED + KILLED same SHA              -> create retry
-one FINISHED same SHA + failed/killed -> no-op to FINISHED
-RUNNING same SHA                      -> conflict
-SCHEDULED same SHA                    -> conflict
-unknown status                        -> conflict
-any different SHA                     -> conflict regardless of status
-multiple FINISHED                     -> conflict
+crux.cohort_id
+crux.projection_version
+crux.scope
 ```
 
-`KILLED` is deliberately retryable like `FAILED` because it represents an interrupted/aborted attempt, not a successful publication.
+Use valid MLflow quoted-key syntax for dotted tag names. Search with a module constant, e.g. `MATCHING_RUN_LIMIT = 1000`.
 
-### 3.5 Pin saturated search fail-closed
+Keep the returned `PagedList`; do not immediately cast to `list`. If `runs.token` is non-empty, raise `run_conflict` before any create call. No pagination loop.
 
-Publisher uses:
+### 3.5 Unit-test status/error semantics
+
+Use a minimal fake only where useful for failure injection/awkward statuses:
+
+```text
+no matches                              -> create
+FAILED same fingerprint                 -> retry
+KILLED same fingerprint                 -> retry
+FAILED + KILLED same fingerprint        -> retry
+one FINISHED same fingerprint           -> no-op
+FINISHED + failed/killed same fingerprint -> no-op to FINISHED
+RUNNING / SCHEDULED                     -> run_conflict
+unknown status                          -> run_conflict
+any different fingerprint in same search key -> run_conflict
+multiple FINISHED                       -> run_conflict
+continuation token present              -> run_conflict
+```
+
+Do not construct 1000 runs to test saturation. Return a fake paged result with a non-empty token or temporarily lower `MATCHING_RUN_LIMIT` in a focused test.
+
+### 3.6 Implement side effects with phase-specific errors
+
+Use low-level `MlflowClient`:
+
+1. resolve/create experiment;
+2. search/classify matching runs;
+3. create run;
+4. convert canonical numeric values to finite float and `log_batch()` once;
+5. `log_artifact()` exactly five times to `crux-reports`;
+6. `set_terminated(..., "FINISHED")`.
+
+Wrap each stage into its bounded code. If a post-create stage fails, best-effort terminate the new run as `FAILED`; preserve the original exception only as the cause.
+
+### 3.7 Real-client no-network integration test
+
+Inside `tests/benchmark/test_mlflow_export.py` add a test that locally does:
 
 ```python
-runs = list(
-    client.search_runs(
-        [experiment_id],
-        filter_string=_matching_run_filter(projection),
-        max_results=1000,
-    )
-)
-```
-
-Add a fake result with exactly 1000 matching runs and require `MlflowProjectionConflictError("MLflow run search is saturated")` before any create call. Do not add pagination machinery in HPA-86.
-
-### 3.6 Implement low-level client path
-
-Resolve/create experiment, classify existing runs, convert canonical values to finite floats, construct MLflow `Metric` entities, call `log_batch` once, upload each of five artifacts, then `set_terminated(..., "FINISHED")`.
-
-If a post-create call raises, best-effort set the created run to `FAILED`, then raise generic `MlflowPublicationError("MLflow publication failed")` from the original exception. Never interpolate raw provider exception text.
-
-### 3.7 Lazy real binding and explicit URI
-
-`publish_mlflow_projection()` first requires non-empty `MLFLOW_TRACKING_URI`, then lazily imports:
-
-```python
-from mlflow import MlflowClient
-from mlflow.entities import Metric
-```
-
-Missing dependency produces bounded guidance mentioning the optional `mlflow` extra. Do not inspect username/password values.
-
-### 3.8 Add no-network real-client API smoke
-
-Do not wait for DagsHub smoke to discover signature drift. Run under the optional extra with no server calls:
-
-```bash
-uv run --extra mlflow python - <<'PY'
+mlflow = pytest.importorskip("mlflow")
 from mlflow import MlflowClient
 from mlflow.entities import Metric
 
 Metric("k", 1.0, 0, 0)
-required = (
-    "get_experiment_by_name",
-    "create_experiment",
-    "search_runs",
-    "create_run",
-    "log_batch",
-    "log_artifact",
-    "set_terminated",
-)
-for name in required:
-    assert callable(getattr(MlflowClient, name, None)), name
-print("mlflow-client-api-ok")
-PY
 ```
 
-Also encode this as an automated no-network optional-extra test if the repository's test command can select it without polluting the base environment.
+Assert the required method surface exists.
 
-### 3.9 Verify and commit
+Then create a temporary `file://` tracking URI with `Path(tmp_path / "mlruns").resolve().as_uri()`, construct `MlflowClient(tracking_uri=uri)` directly, and call the internal publisher seam with a real projection. Verify:
+
+- first publication succeeds;
+- the exact dotted-tag filter finds it;
+- metric logging works;
+- all five artifacts exist in the run artifact tree;
+- run status is `FINISHED`;
+- second publication returns the same run ID with `created=False`.
+
+This is the pre-host end-to-end test for filter syntax and real client signatures. It does not contact a server.
+
+Current MLflow documentation still supports local `file:` tracking stores, and `mlflow-skinny` excludes SQL/server/UI dependencies rather than the file store; the CI test is the final executable proof for the locked package.
+
+### 3.8 Verify
 
 ```bash
+uv lock --check
 uv run pytest tests/benchmark/test_mlflow_export.py -q
 uv run python -c 'import importlib.util; assert importlib.util.find_spec("mlflow") is None'
-uv run --extra mlflow python - <<'PY'
-from mlflow import MlflowClient
-from mlflow.entities import Metric
-Metric("k", 1.0, 0, 0)
-for name in ("get_experiment_by_name", "create_experiment", "search_runs", "create_run", "log_batch", "log_artifact", "set_terminated"):
-    assert callable(getattr(MlflowClient, name, None)), name
-PY
-uv lock --check
-uv run ruff check src/benchmark/mlflow_export.py tests/benchmark/test_mlflow_export.py
+uv run --extra mlflow pytest tests/benchmark/test_mlflow_export.py -q
+uv run ruff check src/benchmark/mlflow_export.py tests/benchmark/test_mlflow_export.py .github/workflows/ci.yml
 uv run ruff format --check src/benchmark/mlflow_export.py tests/benchmark/test_mlflow_export.py
-git add pyproject.toml uv.lock src/benchmark/mlflow_export.py tests/benchmark/test_mlflow_export.py
+```
+
+Commit:
+
+```bash
+git add pyproject.toml uv.lock src/benchmark/mlflow_export.py tests/benchmark/test_mlflow_export.py .github/workflows/ci.yml
 git commit -m "feat: publish benchmark projections through MLflow"
 ```
 
 ---
 
-## Task 4 — One explicit CLI with parseable failure output
+## Task 4 — One explicit CLI with parseable errors
 
 **Files:** `src/cli/benchmark.py`, `tests/test_cli_benchmark.py`
 
-### 4.1 Write success/no-op tests
+### 4.1 Success/no-op tests
 
-For `publish-mlflow-cohort`, monkeypatch loader/projection/publisher and require canonical JSON stdout containing:
+For:
+
+```text
+crux benchmark publish-mlflow-cohort --reports PATH --scope broad|reviewed|pilot [--experiment NAME]
+```
+
+mock loader/projection/publisher and require exit 0 canonical JSON containing:
 
 ```text
 created
 experiment_id
 experiment_name
-exit_code = 0
 projection_sha256
 run_id
 status = published | already_published
 ```
 
-No-op uses `created=false` and the existing run ID.
+### 4.2 Failure tests
 
-### 4.2 Write failure-ordering and JSON-error tests
+Pin:
 
-Cover invalid `--scope`, malformed reports, projection failure, missing URI/dependency, publication conflict, and generic transport failure.
+- invalid scope -> Click exit 2 before domain work;
+- malformed report -> publisher not called;
+- projection error -> canonical failure JSON;
+- missing dependency/config -> bounded MLflow error code;
+- run conflict -> `error_code="run_conflict"`;
+- secret-looking environment values/raw provider cause never appear.
 
-Malformed reports must prove the publisher was never invoked.
+For command-owned domain failures, stdout JSON contains:
 
-For command-owned exit-2 domain failures, require stderr contains a bounded human-readable message and stdout remains canonical JSON containing:
-
-```text
-error = domain exception type
-exit_code = 2
-experiment_name
-projection_sha256 = null or known local projection SHA
-run_id = null
-status = failed
+```json
+{"error_code":"...","exit_code":2,"status":"failed"}
 ```
 
-Never include `MLFLOW_TRACKING_URI`, username/password, raw provider exception text, or client repr.
+and stderr carries only the fixed safe message.
 
-Click's own argument-validation failures may remain Click-formatted because domain execution has not started.
+Click's own option-validation error may remain Click-formatted; do not wrap parser errors into a second parser.
 
 ### 4.3 Implement thin command
 
-Command shape:
+Lazy-import reports/exporter inside the command. Order is:
 
 ```text
-crux benchmark publish-mlflow-cohort \
-  --reports PATH \
-  --scope broad|reviewed|pilot \
-  [--experiment crux-benchmark]
-```
-
-Use `click.Choice` for scope and lazy imports inside the command. Sequence is strictly:
-
-```text
-load/validate canonical reports
+load/validate canonical report
 -> build pure projection
--> publish MLflow
+-> publish to MLflow
 ```
 
-On caught domain failure, write the canonical error object to stdout, bounded message to stderr, then exit 2. Follow sibling `compare-oaf-muscriptor` / `publish-paired-comparisons` style.
+No MLflow work occurs if report/projection validation fails.
 
-### 4.4 Verify and commit
+### 4.4 Verify
 
 ```bash
-uv run pytest tests/test_cli_benchmark.py tests/benchmark/test_mlflow_export.py tests/benchmark/test_reports.py -q
+uv run pytest tests/test_cli_benchmark.py tests/benchmark/test_mlflow_export.py tests/benchmark/test_reports.py tests/benchmark/test_separation_comparison.py -q
 uv run ruff check src/cli/benchmark.py tests/test_cli_benchmark.py
 uv run ruff format --check src/cli/benchmark.py tests/test_cli_benchmark.py
-uv run pylint --errors-only src/cli/benchmark.py src/benchmark/mlflow_export.py src/benchmark/reports.py
+uv run pylint --errors-only src/cli/benchmark.py src/benchmark/mlflow_export.py src/benchmark/reports.py src/benchmark/separation_comparison.py
+```
+
+Commit:
+
+```bash
 git add src/cli/benchmark.py tests/test_cli_benchmark.py
-git commit -m "feat: expose explicit MLflow benchmark publication command"
+git commit -m "feat: expose MLflow benchmark publication command"
 ```
 
 ---
 
-## Task 5 — Docs, five-run hosted smoke, final verification
+## Task 5 — Docs, hosted smoke, and final verification
 
-**Files:** create `docs/benchmark/mlflow.md`, modify `README.md`; record non-secret evidence in PR #34 and HPA-86.
+**Files:** create `docs/benchmark/mlflow.md`, modify `README.md`, update PR #34/HPA-86 discussion.
 
-### 5.1 Document provider-neutral hosted use
+### 5.1 Document operation and recovery
 
-Guide covers canonical-authority boundary, optional `mlflow` extra, standard MLflow environment variables, metric/tag names, five-file allowlist, large-artifact exclusions, idempotency/retry behavior, and provider-neutral configuration. Do not encode vendor pricing/quota numbers.
+Document:
 
-README gets only a short pointer to `docs/benchmark/mlflow.md`.
+- Crux reports are canonical; MLflow can be deleted/rebuilt.
+- install/use `--extra mlflow`;
+- `MLFLOW_TRACKING_URI`, `MLFLOW_TRACKING_USERNAME`, `MLFLOW_TRACKING_PASSWORD` setup;
+- URI must be an explicit HTTP(S) server URL and must not embed credentials;
+- five uploaded files and explicit no-upload list;
+- metric/tag naming and UI filters;
+- `FAILED`/`KILLED` retry semantics;
+- scope is part of projection identity/search;
+- true same-scope fingerprint conflict recovery: delete the incorrect MLflow run in the tracking UI, then republish from canonical Crux reports;
+- changing provider requires environment changes only.
 
-### 5.2 Pre-host deterministic verification
+Do not encode vendor quota/pricing numbers.
 
-```bash
-uv lock --check
-uv run pytest tests/benchmark/test_reports.py tests/benchmark/test_mlflow_export.py tests/test_cli_benchmark.py -q
-uv run ruff check .
-uv run ruff format --check src tests
-uv run pylint --errors-only src
-```
+README gets one short link only.
 
-### 5.3 Resolve five already-produced report directories
+### 5.2 Gate smoke on existing evidence
 
-Known broad and separation evidence:
-
-```text
-artifacts/benchmark/oaf-corpus/runs/oaf-149faa97328e20eb/reports
-artifacts/benchmark/oaf-separation-pilot/runs/oaf-separation-76e8dc7e249deb90/views/full_mix/reports
-artifacts/benchmark/oaf-separation-pilot/runs/oaf-separation-76e8dc7e249deb90/views/spleeter/reports
-artifacts/benchmark/oaf-separation-pilot/runs/oaf-separation-76e8dc7e249deb90/views/htdemucs/reports
-```
-
-Resolve the fifth path from the already-produced HPA-327 reviewed-subset `ScoreReviewedSubsetOutcome.reports_path` on the workstation. Verify its `summary.json` identifies the reviewed OaF cohort. Do not regenerate the reviewed subset or rerun OaF merely to satisfy HPA-86.
-
-If any required existing report directory is unavailable, leave PR #34 draft at the hosted-smoke gate and restore/copy the canonical report directory instead of running inference/reference/separation work.
-
-### 5.4 Publish exactly five initial OaF projections
-
-Use one `crux-benchmark` experiment:
+Require already-produced report directories for:
 
 ```text
-OaF full-mix broad       --scope broad
-OaF full-mix reviewed    --scope reviewed
-OaF full-mix pilot       --scope pilot
-OaF Spleeter pilot       --scope pilot
-OaF HTDemucs pilot       --scope pilot
+OaF full-mix broad
+OaF full-mix reviewed
+OaF full-mix pilot
+OaF Spleeter pilot
+OaF HTDemucs pilot
 ```
 
-The reviewed run is mandatory so the `reviewed` scope is exercised in real hosted evidence.
+If an expected local report directory is missing, keep PR draft and restore/copy existing canonical evidence. Do not rerun inference, separation, R2 sync, or reference generation under HPA-86.
 
-Record only non-secret experiment/run IDs, projection SHAs, `created`, and status.
+### 5.3 Hosted smoke
 
-### 5.5 Prove idempotency and UI usefulness
+Publish all five to `crux-benchmark`. Record only non-secret experiment/run IDs, fingerprints, scope, created/status.
 
-Republish broad OaF exactly. Require exit 0, `created=false`, `already_published`, same run ID, same projection SHA.
+Verify in hosted UI:
 
-In hosted UI verify five runs appear, filters work for scope/model/input view, all six aggregate views are visible, headline/per-class/population metrics can be compared, exactly five `crux-reports/*` artifacts are attached, and large excluded artifacts are absent.
+- broad/reviewed/pilot filters all have evidence;
+- full-mix/Spleeter/HTDemucs can be compared;
+- 30/50/100 raw/aligned metrics visible;
+- per-class/population metrics visible;
+- exactly five small report artifacts attached;
+- no diagnostics/audio/stems/predictions/checkpoints uploaded.
 
-### 5.6 Final repo verification
+Repeat one exact publication and require same run ID + `created=false`.
+
+### 5.4 Final gates
 
 ```bash
 uv lock --check
@@ -550,33 +537,24 @@ uv run pytest -q
 uv run ruff check .
 uv run ruff format --check src tests
 uv run pylint --errors-only src
-uv run --extra mlflow python - <<'PY'
-from mlflow import MlflowClient
-from mlflow.entities import Metric
-Metric("k", 1.0, 0, 0)
-for name in ("get_experiment_by_name", "create_experiment", "search_runs", "create_run", "log_batch", "log_artifact", "set_terminated"):
-    assert callable(getattr(MlflowClient, name, None)), name
-PY
+uv run --extra mlflow pytest tests/benchmark/test_mlflow_export.py -q
 git diff --check origin/main...HEAD
 ```
 
-Commit docs:
+Commit docs, record hosted evidence in PR/Linear, then mark PR ready only if hosted smoke passed.
 
-```bash
-git add docs/benchmark/mlflow.md README.md
-git commit -m "docs: explain Crux MLflow benchmark visualization"
-```
-
-Record final verification + hosted evidence in PR #34/HPA-86, then and only then mark the PR ready and HPA-86 eligible for Done.
+---
 
 ## Plan self-review
 
-- Reuses `PublishedArtifact`, canonical JSON/SHA helpers, `CommonDrumClass`, and `COHORT_FAILURE_REASONS`; no duplicate artifact/taxonomy/failure abstractions.
-- `KILLED` and `FAILED` are retryable; only successful `FINISHED` publication can satisfy idempotency.
-- Exactly-full `search_runs(max_results=1000)` fails closed; no pagination framework added.
-- Pure projection validates class names before minting durable MLflow keys.
-- Optional-extra verification exercises the real `Metric` constructor and required `MlflowClient` methods without network access.
-- CLI success and domain failures both keep stdout machine-readable canonical JSON.
-- Hosted smoke exercises all three scope values with five existing OaF projections.
-- MLflow stays optional and post-publication; no benchmark source-of-truth changes.
-- One ticket / one PR remains intact.
+- One new production module only: `mlflow_export.py`.
+- No second scorer/report parser/artifact type/failure-reason taxonomy.
+- `separation_comparison` reuses the new canonical identity reader instead of leaving a weaker duplicate.
+- Baseline 30/50/100 views remain guaranteed without bricking future extra tolerances.
+- Scope correction is recoverable because scope participates in search identity.
+- Exact filter syntax and real `MlflowClient` operations run offline in CI before hosted smoke.
+- Search saturation checks the real pagination token, not a synthetic 1000-row fixture.
+- URI validation prevents local file/sqlite fallbacks and embedded credentials without rejecting DagsHub's path-bearing URL.
+- Closed error codes improve CLI diagnosis without vendor-specific exception parsing.
+- Hosted smoke is confirmation, not first discovery of client/filter behavior.
+- Remaining risks are provider artifact routing/outage/quota and genuinely conflicting disposable MLflow state; recovery is documented.
