@@ -54,6 +54,15 @@ On success the command prints one canonical JSON object with `created`,
 bounded error code on stdout and a sanitized message on stderr; vendor detail
 stays out of the CLI output.
 
+## Running from Google Colab
+
+[`notebooks/mlflow_publish_colab.ipynb`](../../notebooks/mlflow_publish_colab.ipynb)
+([open in Colab](https://colab.research.google.com/github/cwchanap/Crux/blob/main/notebooks/mlflow_publish_colab.ipynb))
+publishes report directories copied into Google Drive, reading the tracking
+URI and credentials from Colab Secrets. It then republishes the first report
+to confirm the run is reused, and prints a non-secret evidence table. No GPU
+or full Crux install is needed.
+
 ## What is uploaded
 
 Exactly five small report artifacts are attached under the `crux-reports/`
