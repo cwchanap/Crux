@@ -58,7 +58,7 @@ stays out of the CLI output.
 
 [`notebooks/mlflow_publish_colab.ipynb`](../../notebooks/mlflow_publish_colab.ipynb)
 ([open in Colab](https://colab.research.google.com/github/cwchanap/Crux/blob/main/notebooks/mlflow_publish_colab.ipynb))
-publishes report directories copied into Google Drive, reading the tracking
+publishes report directories from a `crux-mlflow-reports.zip` in Google Drive, reading the tracking
 URI and credentials from Colab Secrets. It then republishes the first report
 to confirm the run is reused, and prints a non-secret evidence table. No GPU
 or full Crux install is needed.
