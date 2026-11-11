@@ -2122,16 +2122,20 @@ def test_acquire_output_lock_closes_descriptor_on_oserror(tmp_path, monkeypatch)
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     real_open = r2_corpus_sync.os.open
+    real_fstat = r2_corpus_sync.os.fstat
+    lock_fds: set[int] = set()
 
     def fail_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
         if str(path).endswith(".r2-corpus-publication.lock"):
-            fd = real_open(path, flags, *args, **kwargs)
             # Return a valid fd, but make fstat fail to trigger the OSError path.
-            return fd
-        return real_open(path, flags, *args, **kwargs)
+            lock_fds.add(fd)
+        return fd
 
-    def fail_fstat(_fd):
-        raise OSError("SECRET fstat detail")
+    def fail_fstat(fd):
+        if fd in lock_fds:
+            raise OSError("SECRET fstat detail")
+        return real_fstat(fd)
 
     monkeypatch.setattr(r2_corpus_sync.os, "open", fail_open)
     monkeypatch.setattr(r2_corpus_sync.os, "fstat", fail_fstat)
