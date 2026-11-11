@@ -730,15 +730,29 @@ def test_open_root_closes_descriptor_on_failure(
     probe = _load_probe_module()
     target = tmp_path / "realdir"
     target.mkdir()
+    real_open = os.open
     real_close = os.close
+    real_fstat = os.fstat
+    target_fds: set[int] = set()
+
+    def tracking_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if os.fspath(path) == os.fspath(target):
+            target_fds.add(descriptor)
+        return descriptor
 
     def failing_fstat(fd: int) -> os.stat_result:
-        raise OSError("boom")
+        if fd in target_fds:
+            raise OSError("boom")
+        return real_fstat(fd)
 
     def failing_close(fd: int) -> None:
-        monkeypatch.setattr(probe.os, "close", real_close)
-        raise OSError("close boom")
+        if fd in target_fds:
+            target_fds.discard(fd)
+            raise OSError("close boom")
+        real_close(fd)
 
+    monkeypatch.setattr(probe.os, "open", tracking_open)
     monkeypatch.setattr(probe.os, "fstat", failing_fstat)
     monkeypatch.setattr(probe.os, "close", failing_close)
     with pytest.raises(probe._ProbeError):
@@ -1382,9 +1396,12 @@ def test_verify_expected_files_in_shared_root_wraps_oserror(
     root = tmp_path / "scripts"
     root.mkdir()
     file_descriptor = os.open(root, os.O_RDONLY)
+    real_fstat = os.fstat
 
     def boom(fd: int) -> os.stat_result:
-        raise OSError("boom")
+        if fd == file_descriptor:
+            raise OSError("boom")
+        return real_fstat(fd)
 
     monkeypatch.setattr(probe.os, "fstat", boom)
     try:
