@@ -764,6 +764,16 @@ def _read_report_json(path: Path) -> Mapping[str, object]:
     return value
 
 
+def _read_summary_markdown(report_dir: Path) -> None:
+    path = report_dir / "summary.md"
+    try:
+        content = read_regular_file_no_follow(path).decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        _report_error(f"cannot read report {path.name}: {error}")
+    if not content.strip():
+        _report_error(f"{path.name} must not be empty")
+
+
 def _read_report_csv(path: Path, fields: tuple[str, ...]) -> list[dict[str, str]]:
     try:
         content = read_regular_file_no_follow(path).decode("utf-8")
@@ -1257,7 +1267,9 @@ def read_cohort_report_identity(report_dir: Path) -> CohortIdentity:
 def load_published_cohort_reports(report_dir: Path) -> PublishedCohortReports:
     """Read one published report set, trusting its own summary identity."""
     identity = read_cohort_report_identity(report_dir)
-    return read_cohort_reports(report_dir, expected_identity=identity)
+    reports = read_cohort_reports(report_dir, expected_identity=identity)
+    _read_summary_markdown(report_dir)
+    return reports
 
 
 def read_cohort_reports(

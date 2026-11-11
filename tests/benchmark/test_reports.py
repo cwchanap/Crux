@@ -402,6 +402,26 @@ def test_read_cohort_report_identity_and_load_published_reports(tmp_path: Path) 
     assert reports == read_cohort_reports(tmp_path, expected_identity=_identity())
 
 
+def test_load_published_cohort_reports_rejects_missing_markdown_summary(
+    tmp_path: Path,
+) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    (tmp_path / "summary.md").unlink()
+
+    with pytest.raises(ReportIntegrityError, match="summary.md"):
+        load_published_cohort_reports(tmp_path)
+
+
+def test_load_published_cohort_reports_rejects_empty_markdown_summary(
+    tmp_path: Path,
+) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    (tmp_path / "summary.md").write_text("", encoding="utf-8")
+
+    with pytest.raises(ReportIntegrityError, match="summary.md must not be empty"):
+        load_published_cohort_reports(tmp_path)
+
+
 def test_read_cohort_report_identity_rejects_non_path_report_dir() -> None:
     with pytest.raises(TypeError, match="report_dir must be a Path"):
         read_cohort_report_identity("not a path")  # type: ignore[arg-type]
