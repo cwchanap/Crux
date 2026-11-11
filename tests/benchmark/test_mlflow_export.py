@@ -424,6 +424,7 @@ class _FakeClient:
         page: _FakePage,
         *,
         has_experiment: bool = True,
+        experiment_lifecycle_stage: str = "active",
         experiment_error: Exception | None = None,
         search_error: Exception | None = None,
         create_error: Exception | None = None,
@@ -433,6 +434,7 @@ class _FakeClient:
     ) -> None:
         self.page = page
         self.has_experiment = has_experiment
+        self.experiment_lifecycle_stage = experiment_lifecycle_stage
         self.experiment_error = experiment_error
         self.search_error = search_error
         self.create_error = create_error
@@ -445,6 +447,7 @@ class _FakeClient:
         self.created_runs: list[dict] = []
         self.logged_batches: list[dict] = []
         self.logged_artifacts: list[tuple[str, str, str | None]] = []
+        self.logged_artifact_bytes: list[bytes] = []
         self.terminated: list[tuple[str, str | None]] = []
         self.terminated_suppression: list[str | None] = []
 
@@ -457,7 +460,11 @@ class _FakeClient:
     def get_experiment_by_name(self, name: str):
         self.events.append(("get_experiment_by_name", name))
         self._fire("experiment_error")
-        return SimpleNamespace(experiment_id="exp-1") if self.has_experiment else None
+        if not self.has_experiment:
+            return None
+        return SimpleNamespace(
+            experiment_id="exp-1", lifecycle_stage=self.experiment_lifecycle_stage
+        )
 
     def create_experiment(self, name: str) -> str:
         self.events.append(("create_experiment", name))
@@ -501,6 +508,7 @@ class _FakeClient:
         self.events.append(("log_artifact", run_id))
         self._fire("artifact_error")
         self.logged_artifacts.append((run_id, str(local_path), artifact_path))
+        self.logged_artifact_bytes.append(Path(local_path).read_bytes())
 
     def set_terminated(self, run_id: str, status=None):
         self.events.append(("set_terminated", run_id, status))
@@ -554,6 +562,36 @@ def test_validate_tracking_uri_rejects_invalid(raw_uri: str) -> None:
 )
 def test_validate_tracking_uri_accepts_public_http_uris(uri: str) -> None:
     assert validate_tracking_uri(uri) == uri
+
+
+def test_validate_tracking_uri_requires_https_when_credentials_are_configured() -> None:
+    with pytest.raises(MlflowPublicationError) as raised:
+        validate_tracking_uri("http://mlflow.example.com", credentials_configured=True)
+    assert raised.value.code == "invalid_config"
+    assert (
+        validate_tracking_uri("https://mlflow.example.com", credentials_configured=True)
+        == "https://mlflow.example.com"
+    )
+
+
+def test_projection_rejects_quote_in_search_identity(tmp_path: Path) -> None:
+    identity = replace(_identity(), cohort_id="quoted'cohort")
+    with pytest.raises(MlflowProjectionError, match="unrepresentable quote"):
+        build_mlflow_projection(
+            replace(_reports(), identity=identity), _report_dir(tmp_path), scope="broad"
+        )
+
+
+def test_matching_runs_filter_does_not_escape_backslashes() -> None:
+    filter_string = build_matching_runs_filter(
+        {
+            "crux.cohort_id": "raw\\cohort",
+            "crux.projection_version": PROJECTION_VERSION,
+            "crux.scope": "broad",
+        }
+    )
+    assert "tags.\"crux.cohort_id\" = 'raw\\cohort'" in filter_string
+    assert "raw\\\\cohort" not in filter_string
 
 
 def test_matching_runs_filter_quotes_dotted_tag_keys(tmp_path: Path) -> None:
@@ -638,16 +676,68 @@ def test_publish_finished_plus_failed_is_noop_to_finished(
     assert client.created_runs == []
 
 
-@pytest.mark.parametrize("status", ["RUNNING", "SCHEDULED", "UNKNOWN"])
-def test_publish_live_or_unknown_status_conflicts(
+@pytest.mark.parametrize("status", ["RUNNING", "SCHEDULED"])
+def test_publish_resumes_orphaned_live_run(
     tmp_path: Path, mlflow_entities_stub: type, status: str
 ) -> None:
     fingerprint = _publisher_projection(tmp_path).tags["crux.projection_sha256"]
-    client = _FakeClient(_FakePage([_matching_run(fingerprint, status)]))
+    client = _FakeClient(_FakePage([_matching_run(fingerprint, status, run_id="run-orphan")]))
+    result = _publish(_publisher_projection(tmp_path), client)
+    assert result.created is False
+    assert result.status == "published"
+    assert result.run_id == "run-orphan"
+    assert client.created_runs == []
+    assert client.terminated == [("run-orphan", "FINISHED")]
+
+
+def test_publish_finished_wins_over_live_match(tmp_path: Path, mlflow_entities_stub: type) -> None:
+    fingerprint = _publisher_projection(tmp_path).tags["crux.projection_sha256"]
+    client = _FakeClient(
+        _FakePage(
+            [
+                _matching_run(fingerprint, "RUNNING", run_id="run-live"),
+                _matching_run(fingerprint, "FINISHED", run_id="run-done"),
+            ]
+        )
+    )
+    result = _publish(_publisher_projection(tmp_path), client)
+    assert result.created is False
+    assert result.status == "already_published"
+    assert result.run_id == "run-done"
+
+
+def test_publish_multiple_live_runs_conflict(tmp_path: Path, mlflow_entities_stub: type) -> None:
+    fingerprint = _publisher_projection(tmp_path).tags["crux.projection_sha256"]
+    client = _FakeClient(
+        _FakePage(
+            [
+                _matching_run(fingerprint, "RUNNING", run_id="run-a"),
+                _matching_run(fingerprint, "SCHEDULED", run_id="run-b"),
+            ]
+        )
+    )
+    with pytest.raises(MlflowPublicationError) as raised:
+        _publish(_publisher_projection(tmp_path), client)
+    assert raised.value.code == "run_conflict"
+
+
+def test_publish_unknown_status_conflicts(tmp_path: Path, mlflow_entities_stub: type) -> None:
+    fingerprint = _publisher_projection(tmp_path).tags["crux.projection_sha256"]
+    client = _FakeClient(_FakePage([_matching_run(fingerprint, "UNKNOWN")]))
     with pytest.raises(MlflowPublicationError) as raised:
         _publish(_publisher_projection(tmp_path), client)
     assert raised.value.code == "run_conflict"
     assert client.created_runs == []
+
+
+def test_publish_retries_after_failed_run_with_other_fingerprint(
+    tmp_path: Path, mlflow_entities_stub: type
+) -> None:
+    client = _FakeClient(_FakePage([_matching_run(_OTHER_FINGERPRINT, "FAILED")]))
+    result = _publish(_publisher_projection(tmp_path), client)
+    assert result.created is True
+    assert result.status == "published"
+    assert result.run_id == "run-new"
 
 
 def test_publish_different_fingerprint_conflicts(
@@ -697,6 +787,15 @@ def test_publish_creates_missing_experiment(tmp_path: Path, mlflow_entities_stub
     assert client.searches[0]["experiment_ids"] == ["exp-created"]
 
 
+def test_publish_rejects_deleted_experiment(tmp_path: Path, mlflow_entities_stub: type) -> None:
+    client = _FakeClient(_FakePage([]), experiment_lifecycle_stage="deleted")
+    with pytest.raises(MlflowPublicationError) as raised:
+        _publish(_publisher_projection(tmp_path), client)
+    assert raised.value.code == "experiment_access_failed"
+    assert client.created_experiment_names == []
+    assert client.created_runs == []
+
+
 def test_publish_success_records_client_surface_in_order(
     tmp_path: Path, mlflow_entities_stub: type
 ) -> None:
@@ -727,12 +826,40 @@ def test_publish_success_records_client_surface_in_order(
         assert isinstance(entry.value, float)
         assert math.isfinite(entry.value)
         assert entry.value == float(projection.metrics[entry.name])
-    assert client.logged_artifacts == [
-        ("run-new", str(artifact.path), REPORT_ARTIFACT_PATH) for artifact in projection.artifacts
+    assert [
+        (run_id, Path(local_path).name, artifact_path)
+        for run_id, local_path, artifact_path in client.logged_artifacts
+    ] == [
+        ("run-new", artifact.path.name, REPORT_ARTIFACT_PATH) for artifact in projection.artifacts
+    ]
+    assert client.logged_artifact_bytes == [
+        ARTIFACT_BYTES[artifact.path.name] for artifact in projection.artifacts
     ]
     assert client.terminated == [("run-new", "FINISHED")]
     assert result.created is True
     assert result.status == "published"
+
+
+def test_publish_artifact_changed_after_projection_fails_and_terminates(
+    tmp_path: Path, mlflow_entities_stub: type
+) -> None:
+    projection = _publisher_projection(tmp_path)
+    (tmp_path / "summary.md").write_bytes(b"# changed after projection\n")
+    client = _FakeClient(_FakePage([]))
+    with pytest.raises(MlflowPublicationError) as raised:
+        _publish(projection, client)
+    assert raised.value.code == "artifact_upload_failed"
+    assert client.logged_artifacts == []
+    assert client.terminated == [("run-new", "FAILED")]
+
+
+def test_publication_error_pickles_with_its_code() -> None:
+    import pickle
+
+    error = MlflowPublicationError("run_conflict")
+    restored = pickle.loads(pickle.dumps(error))
+    assert restored.code == "run_conflict"
+    assert str(restored) == error.message
 
 
 def test_publish_wraps_search_failure_with_bounded_message(

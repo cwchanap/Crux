@@ -33,7 +33,9 @@ The command reads its configuration from the environment:
 with a hostname. The command rejects local file/sqlite fallbacks, URLs with
 embedded credentials, and URLs with a query or fragment. Keep credentials in
 the separate username/password variables, never in the URI. Path-bearing
-https URLs (as used by some hosted providers) are accepted.
+https URLs (as used by some hosted providers) are accepted. When either
+credential variable is set, the URI must use `https://`: plain `http://` is
+rejected because basic auth would send the token in cleartext.
 
 ## Usage
 
@@ -76,9 +78,12 @@ per_song.csv
 per_class.csv
 ```
 
-Nothing else is uploaded. Diagnostics, audio, stems, predictions, and
-checkpoints are explicitly never uploaded to MLflow; they remain in the
-canonical report/corpus locations.
+All five are required. A missing, unreadable, or empty artifact fails the
+command with `report_invalid`; an artifact whose bytes change between
+validation and upload fails with `artifact_upload_failed`. Nothing else is
+uploaded. Diagnostics, audio, stems, predictions, and checkpoints are
+explicitly never uploaded to MLflow; they remain in the canonical
+report/corpus locations.
 
 ## Metrics, tags, and UI filters
 
@@ -127,13 +132,20 @@ scope is therefore just a republish with the right `--scope`.
 Publication is idempotent per search identity
 (`crux.cohort_id` + `crux.projection_version` + `crux.scope`):
 
-- Re-publishing an identical projection returns the existing run ID with
-  `created=false` and `status=already_published`. No duplicate run is created.
+- Re-publishing an identical projection with a `FINISHED` match returns that
+  run ID with `created=false` and `status=already_published`. No duplicate run
+  is created.
 - A matching run in `FAILED` or `KILLED` state is ignored as retriable: a new
   run is created and published.
-- Any other conflicting state (a matching run that is still `RUNNING`, more
-  than one `FINISHED` match, or a fingerprint mismatch within the search
-  identity) fails with the `run_conflict` error code.
+- A single matching `RUNNING` or `SCHEDULED` run with the same fingerprint is
+  reused and finalized, so an interrupted publish can complete. Its result has
+  `created=false` and `status=published`.
+- Any other conflicting state (more than one `FINISHED` match, more than one
+  live match when no `FINISHED` match exists, or a fingerprint mismatch among
+  non-retriable matches) fails with the `run_conflict` error code.
+- The target experiment must be active. An experiment in the deleted
+  lifecycle stage fails with `experiment_access_failed`; restore it (or
+  permanently delete it and choose a new name) before publishing.
 
 ## Recovering from a true same-scope conflict
 

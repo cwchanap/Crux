@@ -2,6 +2,8 @@ from __future__ import annotations
 
 # Commands keep optional and heavy implementation modules behind their Click boundary.
 # pylint: disable=import-outside-toplevel
+import contextlib
+import io
 import json
 import os
 import re
@@ -1753,21 +1755,23 @@ def _emit_mlflow_publication_failure(error_code: str, safe_message: str) -> None
 
 def _build_mlflow_client(tracking_uri: str) -> object:
     """Import mlflow lazily and construct one tracking client (CLI-owned seam)."""
-    from src.benchmark.mlflow_export import MlflowPublicationError, _bounded
+    from src.benchmark.mlflow_export import MlflowPublicationError
 
     try:
-        import mlflow  # noqa: F401
         from mlflow.tracking import MlflowClient
     except ImportError as error:
         raise MlflowPublicationError("missing_optional_dependency") from error
-    return _bounded("invalid_config", lambda: MlflowClient(tracking_uri=tracking_uri))
+    try:
+        return MlflowClient(tracking_uri=tracking_uri)
+    except Exception as error:
+        raise MlflowPublicationError("invalid_config") from error
 
 
 @benchmark.command("publish-mlflow-cohort")
 @click.option(
     "--reports",
     "reports_path",
-    type=click.Path(path_type=Path, exists=True, file_okay=False),
+    type=click.Path(path_type=Path),
     required=True,
     help="Required path to one published HPA-325 cohort report directory.",
 )
@@ -1813,13 +1817,20 @@ def publish_mlflow_cohort_command(
         raise click.exceptions.Exit(2)
 
     try:
-        tracking_uri = validate_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI", ""))
-        client = _build_mlflow_client(tracking_uri)
-        publication = publish_mlflow_projection(
-            projection,
-            client=client,
-            experiment_name=experiment_name,
+        tracking_uri = validate_tracking_uri(
+            os.environ.get("MLFLOW_TRACKING_URI", ""),
+            credentials_configured=bool(
+                os.environ.get("MLFLOW_TRACKING_USERNAME")
+                or os.environ.get("MLFLOW_TRACKING_PASSWORD")
+            ),
         )
+        with contextlib.redirect_stdout(io.StringIO()):
+            client = _build_mlflow_client(tracking_uri)
+            publication = publish_mlflow_projection(
+                projection,
+                client=client,
+                experiment_name=experiment_name,
+            )
     except MlflowPublicationError as error:
         _emit_mlflow_publication_failure(error.code, error.message)
         raise click.exceptions.Exit(2)

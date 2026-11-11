@@ -240,7 +240,7 @@ def _strict_report_identity(report_dir: Path) -> CohortIdentity:
     try:
         return read_cohort_report_identity(report_dir)
     except (ReportIntegrityError, OSError, TypeError, ValueError) as error:
-        raise ComparisonIntegrityError("cannot read HPA-325 identity") from error
+        raise ComparisonIntegrityError(f"cannot read HPA-325 identity: {error}") from error
 
 
 def _expected_cohort_id(

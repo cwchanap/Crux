@@ -2084,6 +2084,7 @@ def test_publish_mlflow_cohort_emits_canonical_publication_summary(
         return sentinel_client
 
     def fake_publish(projection: object, *, client: object, experiment_name: str) -> object:
+        print("vendor stdout noise")
         captured["publish"] = (projection, client, experiment_name)
         return MlflowPublication(
             created=True,
@@ -2120,6 +2121,32 @@ def test_publish_mlflow_cohort_emits_canonical_publication_summary(
         "run_id": "run-9",
         "status": "published",
     }
+
+
+def test_publish_mlflow_cohort_missing_report_dir_emits_canonical_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.mlflow_export as mlflow_module
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("MLflow work must not run for a missing report")
+
+    monkeypatch.setattr(mlflow_module, "build_mlflow_projection", unexpected)
+    monkeypatch.setattr(mlflow_module, "publish_mlflow_projection", unexpected)
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(tmp_path / "missing", "broad"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error_code": "report_invalid",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert result.stderr == "published cohort report is malformed or incomplete\n"
 
 
 def test_publish_mlflow_cohort_reports_noop_when_already_published(
@@ -2348,6 +2375,21 @@ def test_publish_mlflow_cohort_missing_tracking_uri_is_bounded_config_error(
     assert credentialed_uri not in credentialed.stdout
     assert credentialed_uri not in credentialed.stderr
 
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "http://mlflow.example.com")
+    plain_http = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "broad"),
+        catch_exceptions=False,
+    )
+
+    assert plain_http.exit_code == 2
+    assert json.loads(plain_http.stdout) == {
+        "error_code": "invalid_config",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert plain_http.stderr == safe_message + "\n"
+
 
 def test_publish_mlflow_cohort_missing_mlflow_dependency_is_bounded(
     tmp_path: Path, monkeypatch
@@ -2367,6 +2409,7 @@ def test_publish_mlflow_cohort_missing_mlflow_dependency_is_bounded(
 
     monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.com")
     monkeypatch.setitem(sys.modules, "mlflow", None)
+    monkeypatch.delitem(sys.modules, "mlflow.tracking", raising=False)
     monkeypatch.setattr(reports_module, "load_published_cohort_reports", lambda _path: object())
     monkeypatch.setattr(
         mlflow_module,

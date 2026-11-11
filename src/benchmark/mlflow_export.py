@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import math
 import os
+import tempfile
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
@@ -56,6 +57,7 @@ MlflowScope: TypeAlias = Literal["broad", "reviewed", "pilot"]
 MlflowMetricValue: TypeAlias = int | Decimal
 
 _FINGERPRINT_TAG = "crux.projection_sha256"
+_SEARCH_TAG_KEYS = ("crux.cohort_id", "crux.projection_version", "crux.scope")
 _DISTRIBUTION_STATS = ("minimum", "p10", "p25", "median", "p75", "p90", "maximum")
 
 
@@ -198,7 +200,12 @@ def build_mlflow_projection(
 
     artifacts = _read_report_artifacts(report_dir)
     base_tags = _identity_tags(reports.identity, scope)
-    run_name = f"{scope}-{reports.identity.model_id}-{reports.identity.input_view_id}-{reports.identity.cohort_id}"
+    if any("'" in base_tags[name] for name in _SEARCH_TAG_KEYS):
+        raise MlflowProjectionError("search identity contains an unrepresentable quote")
+    run_name = (
+        f"{scope}-{reports.identity.model_id}-{reports.identity.input_view_id}"
+        f"-{reports.identity.cohort_id}"
+    )
     payload: JsonValue = {
         "projection_version": PROJECTION_VERSION,
         "scope": scope,
@@ -258,9 +265,9 @@ _MLFLOW_ERROR_MESSAGES: Mapping[MlflowErrorCode, str] = MappingProxyType(
         "missing_optional_dependency": "mlflow is not installed; install the 'mlflow' extra",
         "invalid_config": (
             "tracking URI must be an http(s) URL with a hostname and no credentials,"
-            " query, or fragment"
+            " query, or fragment, and must use https when credentials are configured"
         ),
-        "experiment_access_failed": "could not resolve or create the MLflow experiment",
+        "experiment_access_failed": "could not resolve or create an active MLflow experiment",
         "run_search_failed": "could not search for matching MLflow runs",
         "run_create_failed": "could not create the MLflow run",
         "metric_log_failed": "could not log MLflow metrics",
@@ -270,8 +277,8 @@ _MLFLOW_ERROR_MESSAGES: Mapping[MlflowErrorCode, str] = MappingProxyType(
     }
 )
 
-_SEARCH_TAG_KEYS = ("crux.cohort_id", "crux.projection_version", "crux.scope")
 _RETRIABLE_RUN_STATUSES = frozenset({"FAILED", "KILLED"})
+_RESUMABLE_RUN_STATUSES = frozenset({"RUNNING", "SCHEDULED"})
 
 if TYPE_CHECKING:
     from mlflow.entities import Run
@@ -286,7 +293,10 @@ class MlflowPublicationError(Exception):
     def __init__(self, code: MlflowErrorCode) -> None:
         self.code: MlflowErrorCode = code
         self.message = _MLFLOW_ERROR_MESSAGES[code]
-        super().__init__(self.message)
+        super().__init__(code)
+
+    def __str__(self) -> str:
+        return self.message
 
 
 @dataclass(frozen=True)
@@ -301,8 +311,8 @@ class MlflowPublication:
     status: Literal["published", "already_published"]
 
 
-def validate_tracking_uri(raw_uri: str) -> str:
-    """Accept only a public http(s) MLflow/DagsHub tracking URI for CLI use."""
+def validate_tracking_uri(raw_uri: str, *, credentials_configured: bool = False) -> str:
+    """Accept only an http(s) MLflow/DagsHub tracking URI safe for CLI use."""
     try:
         parts = urlsplit(raw_uri)
     except ValueError as error:
@@ -314,6 +324,7 @@ def validate_tracking_uri(raw_uri: str) -> str:
         or parts.password is not None
         or bool(parts.query)
         or bool(parts.fragment)
+        or (credentials_configured and parts.scheme.lower() != "https")
     )
     if invalid:
         raise MlflowPublicationError("invalid_config")
@@ -321,11 +332,12 @@ def validate_tracking_uri(raw_uri: str) -> str:
 
 
 def build_matching_runs_filter(tags: Mapping[str, str]) -> str:
-    """Build an MLflow filter over the search-identity tags with quoted keys."""
-    clauses = []
-    for name in _SEARCH_TAG_KEYS:
-        value = tags[name].replace("\\", "\\\\").replace("'", "\\'")
-        clauses.append(f"tags.\"{name}\" = '{value}'")
+    """Build an MLflow filter over quote-free search-identity tag values.
+
+    MLflow strips the surrounding quotes but never unescapes the value, so a
+    tag value containing a single quote is rejected at projection time.
+    """
+    clauses = [f"tags.\"{name}\" = '{tags[name]}'" for name in _SEARCH_TAG_KEYS]
     return " and ".join(clauses)
 
 
@@ -341,22 +353,34 @@ def _bounded(code: MlflowErrorCode, operation: Callable[[], _T]) -> _T:
 
 def _classify_matching_runs(runs: Iterable[Run], fingerprint: str) -> Run | None:
     finished: list[Run] = []
+    resumable: list[Run] = []
     for run in runs:
+        status = run.info.status
+        if status in _RETRIABLE_RUN_STATUSES:
+            continue
         if run.data.tags.get(_FINGERPRINT_TAG) != fingerprint:
             raise MlflowPublicationError("run_conflict")
-        if run.info.status == "FINISHED":
+        if status == "FINISHED":
             finished.append(run)
-        elif run.info.status not in _RETRIABLE_RUN_STATUSES:
+        elif status in _RESUMABLE_RUN_STATUSES:
+            resumable.append(run)
+        else:
             raise MlflowPublicationError("run_conflict")
-    if len(finished) > 1:
+    if len(finished) > 1 or (not finished and len(resumable) > 1):
         raise MlflowPublicationError("run_conflict")
-    return finished[0] if finished else None
+    if finished:
+        return finished[0]
+    return resumable[0] if resumable else None
 
 
 def _resolve_experiment_id(client: MlflowClient, experiment_name: str) -> str:
     def existing() -> str | None:
         experiment = client.get_experiment_by_name(experiment_name)
-        return experiment.experiment_id if experiment is not None else None
+        if experiment is None:
+            return None
+        if experiment.lifecycle_stage == "deleted":
+            raise MlflowPublicationError("experiment_access_failed")
+        return experiment.experiment_id
 
     experiment_id = _bounded("experiment_access_failed", existing)
     if experiment_id is not None:
@@ -407,14 +431,32 @@ def _log_metrics(
     _bounded("metric_log_failed", log)
 
 
+def _stage_verified_artifacts(artifacts: tuple[PublishedArtifact, ...], stage: Path) -> list[Path]:
+    staged: list[Path] = []
+    for artifact in artifacts:
+        try:
+            content = read_regular_file_no_follow(artifact.path)
+            if sha256_hex(content) != artifact.sha256:
+                raise MlflowPublicationError("artifact_upload_failed")
+            path = stage / artifact.path.name
+            path.write_bytes(content)
+        except OSError as error:
+            raise MlflowPublicationError("artifact_upload_failed") from error
+        staged.append(path)
+    return staged
+
+
 def _log_artifacts(
     client: MlflowClient, run_id: str, artifacts: tuple[PublishedArtifact, ...]
 ) -> None:
-    for artifact in artifacts:
-        _bounded(
-            "artifact_upload_failed",
-            lambda path=artifact.path: client.log_artifact(run_id, str(path), REPORT_ARTIFACT_PATH),
-        )
+    # Upload the bytes the fingerprint covers, not a fresh read of the path.
+    with tempfile.TemporaryDirectory(prefix="crux-mlflow-artifacts-") as stage:
+        staged = _stage_verified_artifacts(artifacts, Path(stage))
+        for path in staged:
+            _bounded(
+                "artifact_upload_failed",
+                lambda path=path: client.log_artifact(run_id, str(path), REPORT_ARTIFACT_PATH),
+            )
 
 
 _MLFLOW_SUPPRESS_URL_ENV = "MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT"
@@ -442,8 +484,9 @@ def _finalize_run(client: MlflowClient, run_id: str) -> None:
     _bounded("run_finalize_failed", terminate)
 
 
-def _terminate_new_run_as_failed(client: MlflowClient, run_id: str) -> None:
-    # Best-effort cleanup only; the original bounded error must win.
+def _terminate_run_as_failed(client: MlflowClient, run_id: str) -> None:
+    # Best-effort cleanup only; the original error must win. A cleanup that
+    # also fails leaves a live run that the next publish resumes.
     try:
         with _suppress_mlflow_url_output():
             client.set_terminated(run_id, "FAILED")
@@ -459,15 +502,17 @@ def publish_mlflow_projection(
 ) -> MlflowPublication:
     """Publish or confirm one projection; idempotent on the search-identity tags.
 
-    Serial invocations only: concurrent publishers sharing one search identity
-    can both create runs, which a later call reports as ``run_conflict``.
+    A single matching RUNNING/SCHEDULED run is reused so an interrupted publish
+    can complete. Serial invocations only: concurrent publishers sharing one
+    search identity can both create runs, which a later call reports as
+    ``run_conflict``.
     """
     if not isinstance(projection, MlflowProjection):
         raise TypeError("projection must be MlflowProjection")
     fingerprint = projection.tags[_FINGERPRINT_TAG]
     experiment_id = _resolve_experiment_id(client, experiment_name)
     published = _find_published_run(client, experiment_id, projection)
-    if published is not None:
+    if published is not None and published.info.status == "FINISHED":
         return MlflowPublication(
             created=False,
             experiment_id=experiment_id,
@@ -476,16 +521,19 @@ def publish_mlflow_projection(
             run_id=published.info.run_id,
             status="already_published",
         )
-    run_id = _create_run(client, experiment_id, projection)
+    if published is None:
+        run_id = _create_run(client, experiment_id, projection)
+    else:
+        run_id = published.info.run_id
     try:
         _log_metrics(client, run_id, projection.metrics)
         _log_artifacts(client, run_id, projection.artifacts)
         _finalize_run(client, run_id)
-    except MlflowPublicationError:
-        _terminate_new_run_as_failed(client, run_id)
+    except BaseException:
+        _terminate_run_as_failed(client, run_id)
         raise
     return MlflowPublication(
-        created=True,
+        created=published is None,
         experiment_id=experiment_id,
         experiment_name=experiment_name,
         projection_sha256=fingerprint,
