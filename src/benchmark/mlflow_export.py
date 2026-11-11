@@ -9,9 +9,11 @@ digests, fingerprint), and publishes it through an injected low-level
 
 from __future__ import annotations
 
+import contextlib
 import math
+import os
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -400,7 +402,7 @@ def _log_metrics(
             if not math.isfinite(number):
                 raise MlflowPublicationError("metric_log_failed")
             entries.append(Metric(name, number, timestamp_ms, 0))
-        client.log_batch(run_id, metrics=entries)
+        client.log_batch(run_id, metrics=entries, synchronous=True)
 
     _bounded("metric_log_failed", log)
 
@@ -415,14 +417,36 @@ def _log_artifacts(
         )
 
 
+_MLFLOW_SUPPRESS_URL_ENV = "MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT"
+
+
+@contextlib.contextmanager
+def _suppress_mlflow_url_output() -> Iterator[None]:
+    """Keep RestStore ``set_terminated`` URL prints off the CLI's JSON stdout."""
+    previous = os.environ.get(_MLFLOW_SUPPRESS_URL_ENV)
+    os.environ[_MLFLOW_SUPPRESS_URL_ENV] = "true"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(_MLFLOW_SUPPRESS_URL_ENV, None)
+        else:
+            os.environ[_MLFLOW_SUPPRESS_URL_ENV] = previous
+
+
 def _finalize_run(client: MlflowClient, run_id: str) -> None:
-    _bounded("run_finalize_failed", lambda: client.set_terminated(run_id, "FINISHED"))
+    def terminate() -> None:
+        with _suppress_mlflow_url_output():
+            client.set_terminated(run_id, "FINISHED")
+
+    _bounded("run_finalize_failed", terminate)
 
 
 def _terminate_new_run_as_failed(client: MlflowClient, run_id: str) -> None:
     # Best-effort cleanup only; the original bounded error must win.
     try:
-        client.set_terminated(run_id, "FAILED")
+        with _suppress_mlflow_url_output():
+            client.set_terminated(run_id, "FAILED")
     except Exception:
         pass
 
@@ -433,7 +457,11 @@ def publish_mlflow_projection(
     client: MlflowClient,
     experiment_name: str,
 ) -> MlflowPublication:
-    """Publish or confirm one projection; idempotent on the search-identity tags."""
+    """Publish or confirm one projection; idempotent on the search-identity tags.
+
+    Serial invocations only: concurrent publishers sharing one search identity
+    can both create runs, which a later call reports as ``run_conflict``.
+    """
     if not isinstance(projection, MlflowProjection):
         raise TypeError("projection must be MlflowProjection")
     fingerprint = projection.tags[_FINGERPRINT_TAG]
