@@ -43,7 +43,7 @@ Do not commit generated runtime trees, checkpoints, extracted stems, environment
 
 ## Colab environments and persistence
 
-**Go/no-go first.** Colab's 2026.10 image uses Python 3.13; Crux's project requires `==3.12.*`, while the frozen TensorFlow 1.15.5 wheel is CPython 3.7 Linux x86-64. Bootstrap three isolated host environments rather than downgrade Colab's notebook interpreter:
+**Go/no-go first.** Colab's 2026.10 image uses Python 3.13; Crux's project requires `==3.12.*`, while the frozen TensorFlow 1.15.5 wheel is CPython 3.7 Linux x86-64. Bootstrap four isolated host environments rather than downgrade Colab's notebook interpreter:
 
 1. Crux CLI: managed Python 3.12 and `uv sync --extra r2` (plus `--extra mlflow` once HPA-86 merges).
 2. OaF: a separate Python 3.7.17 environment (micromamba/conda is acceptable) with both existing hashed requirements lockfiles, the required system `libsndfile1`, and CPU-only execution.
