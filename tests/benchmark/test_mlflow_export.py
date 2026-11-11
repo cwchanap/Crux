@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import subprocess
 import sys
 import types
@@ -445,6 +446,7 @@ class _FakeClient:
         self.logged_batches: list[dict] = []
         self.logged_artifacts: list[tuple[str, str, str | None]] = []
         self.terminated: list[tuple[str, str | None]] = []
+        self.terminated_suppression: list[str | None] = []
 
     def _fire(self, key: str) -> None:
         error = getattr(self, key)
@@ -488,10 +490,12 @@ class _FakeClient:
         )
         return _FakeRun("run-new", "RUNNING", stored_tags)
 
-    def log_batch(self, run_id: str, metrics=(), params=(), tags=()):
+    def log_batch(self, run_id: str, metrics=(), params=(), tags=(), synchronous=None):
         self.events.append(("log_batch", run_id))
         self._fire("log_batch_error")
-        self.logged_batches.append({"run_id": run_id, "metrics": list(metrics)})
+        self.logged_batches.append(
+            {"run_id": run_id, "metrics": list(metrics), "synchronous": synchronous}
+        )
 
     def log_artifact(self, run_id: str, local_path, artifact_path=None):
         self.events.append(("log_artifact", run_id))
@@ -500,6 +504,7 @@ class _FakeClient:
 
     def set_terminated(self, run_id: str, status=None):
         self.events.append(("set_terminated", run_id, status))
+        self.terminated_suppression.append(os.environ.get("MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT"))
         self._fire("finalize_error")
         self.terminated.append((run_id, status))
 
@@ -825,6 +830,38 @@ def test_publish_finalize_failure_terminates_new_run_as_failed(
     assert raised.value.code == "run_finalize_failed"
     assert client.terminated == [("run-new", "FAILED")]
     assert isinstance(raised.value.__cause__, OSError)
+
+
+def test_publish_requests_synchronous_metric_logging(
+    tmp_path: Path, mlflow_entities_stub: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # MLFLOW_ENABLE_ASYNC_LOGGING must not leave metrics pending past finalize.
+    monkeypatch.setenv("MLFLOW_ENABLE_ASYNC_LOGGING", "true")
+    client = _FakeClient(_FakePage([]))
+    _publish(_publisher_projection(tmp_path), client)
+    assert client.logged_batches[0]["synchronous"] is True
+
+
+def test_finalize_run_suppresses_mlflow_url_output(
+    tmp_path: Path, mlflow_entities_stub: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT", raising=False)
+    client = _FakeClient(_FakePage([]))
+    _publish(_publisher_projection(tmp_path), client)
+    assert client.terminated_suppression == ["true"]
+    assert os.environ.get("MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT") is None
+
+
+def test_failed_run_cleanup_suppresses_mlflow_url_output(
+    tmp_path: Path, mlflow_entities_stub: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT", "false")
+    client = _FakeClient(_FakePage([]), finalize_error=OSError("boom"))
+    with pytest.raises(MlflowPublicationError) as raised:
+        _publish(_publisher_projection(tmp_path), client)
+    assert raised.value.code == "run_finalize_failed"
+    assert client.terminated_suppression == ["true", "true"]
+    assert os.environ["MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT"] == "false"
 
 
 def test_real_client_file_store_publication_roundtrip(
