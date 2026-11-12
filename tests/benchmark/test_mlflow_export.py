@@ -424,14 +424,23 @@ def mlflow_entities_stub(monkeypatch: pytest.MonkeyPatch) -> type:
 
 
 class _FakeRunInfo:
-    def __init__(self, run_id: str, status: str) -> None:
+    def __init__(
+        self, run_id: str, status: str, artifact_uri: str = "https://artifacts.example.com"
+    ) -> None:
         self.run_id = run_id
         self.status = status
+        self.artifact_uri = artifact_uri
 
 
 class _FakeRun:
-    def __init__(self, run_id: str, status: str, tags: dict[str, str]) -> None:
-        self.info = _FakeRunInfo(run_id, status)
+    def __init__(
+        self,
+        run_id: str,
+        status: str,
+        tags: dict[str, str],
+        artifact_uri: str = "https://artifacts.example.com",
+    ) -> None:
+        self.info = _FakeRunInfo(run_id, status, artifact_uri)
         self.data = SimpleNamespace(tags=tags)
 
 
@@ -463,7 +472,10 @@ class _FakeClient:
         create_error: Exception | None = None,
         log_batch_error: Exception | None = None,
         artifact_error: Exception | None = None,
+        list_artifact_error: Exception | None = None,
         finalize_error: Exception | None = None,
+        artifact_uri: str = "https://artifacts.example.com",
+        listed_artifacts: list | None = None,
     ) -> None:
         self.page = page
         self.has_experiment = has_experiment
@@ -473,7 +485,10 @@ class _FakeClient:
         self.create_error = create_error
         self.log_batch_error = log_batch_error
         self.artifact_error = artifact_error
+        self.list_artifact_error = list_artifact_error
         self.finalize_error = finalize_error
+        self.artifact_uri = artifact_uri
+        self.listed_artifacts = listed_artifacts
         self.events: list[tuple] = []
         self.created_experiment_names: list[str] = []
         self.searches: list[dict] = []
@@ -484,6 +499,7 @@ class _FakeClient:
         self.terminated: list[tuple[str, str | None]] = []
         self.terminated_suppression: list[str | None] = []
         self.redirects_env: list[str | None] = []
+        self.multipart_env: list[str | None] = []
 
     def _fire(self, key: str) -> None:
         error = getattr(self, key)
@@ -530,7 +546,7 @@ class _FakeClient:
                 "run_name": run_name,
             }
         )
-        return _FakeRun("run-new", "RUNNING", stored_tags)
+        return _FakeRun("run-new", "RUNNING", stored_tags, artifact_uri=self.artifact_uri)
 
     def log_batch(self, run_id: str, metrics=(), params=(), tags=(), synchronous=None):
         self.events.append(("log_batch", run_id))
@@ -541,9 +557,28 @@ class _FakeClient:
 
     def log_artifact(self, run_id: str, local_path, artifact_path=None):
         self.events.append(("log_artifact", run_id))
+        self.redirects_env.append(os.environ.get("MLFLOW_ALLOW_HTTP_REDIRECTS"))
+        self.multipart_env.append(os.environ.get("MLFLOW_ENABLE_PROXY_MULTIPART_UPLOAD"))
         self._fire("artifact_error")
         self.logged_artifacts.append((run_id, str(local_path), artifact_path))
         self.logged_artifact_bytes.append(Path(local_path).read_bytes())
+
+    def list_artifacts(self, run_id: str, path=None):
+        self.events.append(("list_artifacts", run_id))
+        self.redirects_env.append(os.environ.get("MLFLOW_ALLOW_HTTP_REDIRECTS"))
+        self.multipart_env.append(os.environ.get("MLFLOW_ENABLE_PROXY_MULTIPART_UPLOAD"))
+        self._fire("list_artifact_error")
+        if self.listed_artifacts is not None:
+            return self.listed_artifacts
+        return [
+            SimpleNamespace(
+                path=f"{artifact_path}/{Path(local_path).name}",
+                file_size=len(content),
+            )
+            for (_, local_path, artifact_path), content in zip(
+                self.logged_artifacts, self.logged_artifact_bytes
+            )
+        ]
 
     def set_terminated(self, run_id: str, status=None):
         self.events.append(("set_terminated", run_id, status))
@@ -557,8 +592,14 @@ def _publisher_projection(tmp_path: Path) -> MlflowProjection:
     return build_mlflow_projection(_reports(), _report_dir(tmp_path), scope="broad")
 
 
-def _matching_run(fingerprint: str, status: str, *, run_id: str = "run-existing") -> _FakeRun:
-    return _FakeRun(run_id, status, {"crux.projection_sha256": fingerprint})
+def _matching_run(
+    fingerprint: str,
+    status: str,
+    *,
+    run_id: str = "run-existing",
+    artifact_uri: str = "https://artifacts.example.com",
+) -> _FakeRun:
+    return _FakeRun(run_id, status, {"crux.projection_sha256": fingerprint}, artifact_uri)
 
 
 def _publish(projection: MlflowProjection, client: _FakeClient) -> MlflowPublication:
@@ -913,6 +954,7 @@ def test_publish_success_records_client_surface_in_order(
         "log_artifact",
         "log_artifact",
         "log_artifact",
+        "list_artifacts",
         "set_terminated",
     ]
     assert client.searches[0]["filter_string"] == build_matching_runs_filter(projection.tags)
@@ -1047,6 +1089,156 @@ def test_publish_artifact_failure_terminates_new_run_as_failed(
     assert raised.value.code == "artifact_upload_failed"
     assert client.terminated == [("run-new", "FAILED")]
     assert isinstance(raised.value.__cause__, OSError)
+
+
+@pytest.mark.parametrize(
+    "artifact_uri",
+    [
+        # Plaintext http puts file bytes and resolvable credentials on the wire.
+        "http://artifacts.example.com",
+        "http://mlflow.example.com",
+        # Embedded credentials and query/fragment are rejected like tracking URIs.
+        "https://user@artifacts.example.com",
+        "https://user:pass@artifacts.example.com",
+        "https://artifacts.example.com/?x=1",
+        "https://artifacts.example.com/#frag",
+        # A host-bearing mlflow-artifacts URI repoints uploads at another origin.
+        "mlflow-artifacts://artifacts.example.com/0/run/artifacts",
+        # Other remote schemes are out of scope for the verified https policy.
+        "s3://bucket/prefix",
+        "ftp://host.example/store",
+        "runs:/other-run/artifacts",
+        "models:/model/1",
+        # Malformed URIs fail parsing outright.
+        "https://[bad",
+        # An empty destination resolves to a local root; it is not a valid one.
+        "",
+    ],
+)
+def test_publish_rejects_unsafe_artifact_destinations(
+    tmp_path: Path, mlflow_entities_stub: type, artifact_uri: str
+) -> None:
+    client = _FakeClient(_FakePage([]), artifact_uri=artifact_uri)
+    with pytest.raises(MlflowPublicationError) as raised:
+        _publish(_publisher_projection(tmp_path), client)
+    assert raised.value.code == "unsafe_artifact_uri"
+    # The run stays RUNNING so a retry resumes it after the server artifact
+    # destination is fixed; nothing is logged or terminated.
+    assert client.logged_artifacts == []
+    assert client.logged_batches == []
+    assert client.terminated == []
+
+
+def test_publish_rejects_unsafe_artifact_uri_on_resumed_run(
+    tmp_path: Path, mlflow_entities_stub: type
+) -> None:
+    projection = _publisher_projection(tmp_path)
+    fingerprint = projection.tags["crux.projection_sha256"]
+    leftover = _matching_run(fingerprint, "RUNNING", artifact_uri="http://artifacts.example.com")
+    client = _FakeClient(_FakePage([leftover]))
+    with pytest.raises(MlflowPublicationError) as raised:
+        _publish(projection, client)
+    assert raised.value.code == "unsafe_artifact_uri"
+    assert client.created_runs == []
+    assert client.logged_artifacts == []
+
+
+@pytest.mark.parametrize(
+    "artifact_uri",
+    [
+        "https://artifacts.example.com",
+        "https://artifacts.example.com:8443/base/path",
+        "mlflow-artifacts:/0/run-new/artifacts",
+        "file:///tmp/mlruns/0/run-new/artifacts",
+        "mlruns/0/run-new/artifacts",
+    ],
+)
+def test_publish_accepts_safe_artifact_destinations(
+    tmp_path: Path, mlflow_entities_stub: type, artifact_uri: str
+) -> None:
+    client = _FakeClient(_FakePage([]), artifact_uri=artifact_uri)
+    assert _publish(_publisher_projection(tmp_path), client).status == "published"
+
+
+def test_publish_disables_proxy_multipart_uploads(
+    tmp_path: Path, mlflow_entities_stub: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Presigned multipart part uploads use raw requests.put calls that bypass
+    # both the artifact-URI check and MLFLOW_ALLOW_HTTP_REDIRECTS; the env var
+    # must be forced off for artifact calls and restored afterward.
+    monkeypatch.delenv("MLFLOW_ENABLE_PROXY_MULTIPART_UPLOAD", raising=False)
+    client = _FakeClient(_FakePage([]))
+    _publish(_publisher_projection(tmp_path), client)
+    assert client.multipart_env
+    assert all(value == "false" for value in client.multipart_env)
+    assert "MLFLOW_ENABLE_PROXY_MULTIPART_UPLOAD" not in os.environ
+
+
+def test_publish_restores_proxy_multipart_env(
+    tmp_path: Path, mlflow_entities_stub: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MLFLOW_ENABLE_PROXY_MULTIPART_UPLOAD", "true")
+    client = _FakeClient(_FakePage([]))
+    _publish(_publisher_projection(tmp_path), client)
+    assert all(value == "false" for value in client.multipart_env)
+    assert os.environ["MLFLOW_ENABLE_PROXY_MULTIPART_UPLOAD"] == "true"
+
+
+def test_publish_fails_when_uploaded_artifact_is_not_listed(
+    tmp_path: Path, mlflow_entities_stub: type
+) -> None:
+    # An unfollowed 3xx passes mlflow's raise_for_status as "uploaded" while
+    # nothing was stored; the post-upload listing must catch the gap.
+    client = _FakeClient(
+        _FakePage([]),
+        listed_artifacts=[
+            SimpleNamespace(path=f"{REPORT_ARTIFACT_PATH}/summary.json", file_size=None)
+        ],
+    )
+    with pytest.raises(MlflowPublicationError) as raised:
+        _publish(_publisher_projection(tmp_path), client)
+    assert raised.value.code == "artifact_upload_failed"
+    assert client.terminated == [("run-new", "FAILED")]
+
+
+def test_publish_fails_when_listed_artifact_size_mismatches(
+    tmp_path: Path, mlflow_entities_stub: type
+) -> None:
+    client = _FakeClient(
+        _FakePage([]),
+        listed_artifacts=[
+            SimpleNamespace(path=f"{REPORT_ARTIFACT_PATH}/{name}", file_size=0)
+            for name in REPORT_ARTIFACT_NAMES
+        ],
+    )
+    with pytest.raises(MlflowPublicationError) as raised:
+        _publish(_publisher_projection(tmp_path), client)
+    assert raised.value.code == "artifact_upload_failed"
+    assert client.terminated == [("run-new", "FAILED")]
+
+
+def test_publish_list_artifacts_failure_bounds_code(
+    tmp_path: Path, mlflow_entities_stub: type
+) -> None:
+    client = _FakeClient(_FakePage([]), list_artifact_error=OSError("boom"))
+    with pytest.raises(MlflowPublicationError) as raised:
+        _publish(_publisher_projection(tmp_path), client)
+    assert raised.value.code == "artifact_upload_failed"
+    assert client.terminated == [("run-new", "FAILED")]
+    assert isinstance(raised.value.__cause__, OSError)
+
+
+def test_publish_accepts_listing_without_reported_sizes(
+    tmp_path: Path, mlflow_entities_stub: type
+) -> None:
+    client = _FakeClient(
+        _FakePage([]),
+        listed_artifacts=[
+            SimpleNamespace(path=f"{REPORT_ARTIFACT_PATH}/{name}", file_size=None)
+            for name in REPORT_ARTIFACT_NAMES
+        ],
+    )
+    assert _publish(_publisher_projection(tmp_path), client).status == "published"
 
 
 def test_publish_finalize_failure_leaves_run_status_unchanged(
