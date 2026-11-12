@@ -9,6 +9,7 @@ digests, fingerprint), and publishes it through an injected low-level
 
 from __future__ import annotations
 
+import configparser
 import contextlib
 import math
 import os
@@ -266,6 +267,8 @@ __all__ = [
     "MlflowPublication",
     "MlflowScope",
     "build_matching_runs_filter",
+    "mlflow_credentials_configured",
+    "mlflow_insecure_tls_configured",
     "publish_mlflow_projection",
     "staged_report_snapshot",
     "validate_tracking_uri",
@@ -293,7 +296,8 @@ _MLFLOW_ERROR_MESSAGES: Mapping[MlflowErrorCode, str] = MappingProxyType(
         "missing_optional_dependency": "mlflow is not installed; install the 'mlflow' extra",
         "invalid_config": (
             "tracking URI must be an http(s) URL with a hostname and no credentials,"
-            " query, or fragment, and must use https when credentials are configured"
+            " query, or fragment, and must use https with certificate verification"
+            " when credentials are configured"
         ),
         "experiment_access_failed": "could not resolve or create an active MLflow experiment",
         "run_search_failed": "could not search for matching MLflow runs",
@@ -339,7 +343,43 @@ class MlflowPublication:
     status: Literal["published", "already_published"]
 
 
-def validate_tracking_uri(raw_uri: str, *, credentials_configured: bool = False) -> str:
+# Authentication sources mlflow-skinny's get_default_host_creds consults;
+# keep in sync with the pinned mlflow-skinny range on upgrades.
+_MLFLOW_AUTH_ENV_VARS = (
+    "MLFLOW_TRACKING_USERNAME",
+    "MLFLOW_TRACKING_PASSWORD",
+    "MLFLOW_TRACKING_TOKEN",
+    "MLFLOW_TRACKING_AWS_SIGV4",
+    "MLFLOW_TRACKING_AUTH",
+)
+_MLFLOW_INSECURE_TLS_ENV_VAR = "MLFLOW_TRACKING_INSECURE_TLS"
+
+
+def mlflow_credentials_configured() -> bool:
+    """True when the environment can authenticate MLflow tracking requests."""
+    if any(os.environ.get(name) for name in _MLFLOW_AUTH_ENV_VARS):
+        return True
+    # mlflow reads basic auth from ~/.mlflow/credentials as well; an existing
+    # but malformed file must fail closed because it may still carry secrets.
+    config = configparser.ConfigParser()
+    try:
+        config.read(os.path.expanduser("~/.mlflow/credentials"))
+    except (configparser.Error, UnicodeError):
+        return True
+    if "mlflow" not in config:
+        return False
+    section = config["mlflow"]
+    return bool(section.get("mlflow_tracking_username") or section.get("mlflow_tracking_password"))
+
+
+def mlflow_insecure_tls_configured() -> bool:
+    """True when MLFLOW_TRACKING_INSECURE_TLS disables TLS verification."""
+    return os.environ.get(_MLFLOW_INSECURE_TLS_ENV_VAR, "").lower() in ("true", "1")
+
+
+def validate_tracking_uri(
+    raw_uri: str, *, credentials_configured: bool = False, insecure_tls: bool = False
+) -> str:
     """Accept only an http(s) MLflow/DagsHub tracking URI safe for CLI use."""
     try:
         parts = urlsplit(raw_uri)
@@ -353,6 +393,7 @@ def validate_tracking_uri(raw_uri: str, *, credentials_configured: bool = False)
         or bool(parts.query)
         or bool(parts.fragment)
         or (credentials_configured and parts.scheme.lower() != "https")
+        or (credentials_configured and insecure_tls)
     )
     if invalid:
         raise MlflowPublicationError("invalid_config")
@@ -566,10 +607,15 @@ def publish_mlflow_projection(
     try:
         _log_metrics(client, run_id, projection.metrics)
         _log_artifacts(client, run_id, projection.artifacts)
-        _finalize_run(client, run_id)
     except BaseException:
         _terminate_run_as_failed(client, run_id)
         raise
+    # A finalize failure is an uncertain outcome: set_terminated can commit
+    # FINISHED before its response is lost, and a follow-up FAILED can still
+    # apply to that completed run, hiding it from the idempotent match above
+    # so the next publish creates a duplicate. Leave the run untouched; the
+    # next publish resumes it (RUNNING) or confirms it (FINISHED).
+    _finalize_run(client, run_id)
     return MlflowPublication(
         created=published is None,
         experiment_id=experiment_id,

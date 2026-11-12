@@ -33,6 +33,8 @@ from src.benchmark.mlflow_export import (
     MlflowPublicationError,
     build_matching_runs_filter,
     build_mlflow_projection,
+    mlflow_credentials_configured,
+    mlflow_insecure_tls_configured,
     publish_mlflow_projection,
     staged_report_snapshot,
     validate_tracking_uri,
@@ -605,6 +607,107 @@ def test_validate_tracking_uri_requires_https_when_credentials_are_configured() 
     )
 
 
+def test_validate_tracking_uri_rejects_insecure_tls_when_credentials_are_configured() -> None:
+    with pytest.raises(MlflowPublicationError) as raised:
+        validate_tracking_uri(
+            "https://mlflow.example.com", credentials_configured=True, insecure_tls=True
+        )
+    assert raised.value.code == "invalid_config"
+    assert (
+        validate_tracking_uri("https://mlflow.example.com", insecure_tls=True)
+        == "https://mlflow.example.com"
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "MLFLOW_TRACKING_USERNAME",
+        "MLFLOW_TRACKING_PASSWORD",
+        "MLFLOW_TRACKING_TOKEN",
+        "MLFLOW_TRACKING_AWS_SIGV4",
+        "MLFLOW_TRACKING_AUTH",
+    ],
+)
+def test_mlflow_credentials_configured_detects_each_env_var(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for var in (
+        "MLFLOW_TRACKING_USERNAME",
+        "MLFLOW_TRACKING_PASSWORD",
+        "MLFLOW_TRACKING_TOKEN",
+        "MLFLOW_TRACKING_AWS_SIGV4",
+        "MLFLOW_TRACKING_AUTH",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    assert mlflow_credentials_configured() is False
+    monkeypatch.setenv(name, "configured")
+    assert mlflow_credentials_configured() is True
+
+
+def test_mlflow_credentials_configured_reads_credentials_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for var in (
+        "MLFLOW_TRACKING_USERNAME",
+        "MLFLOW_TRACKING_PASSWORD",
+        "MLFLOW_TRACKING_TOKEN",
+        "MLFLOW_TRACKING_AWS_SIGV4",
+        "MLFLOW_TRACKING_AUTH",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    credentials_dir = tmp_path / ".mlflow"
+    credentials_dir.mkdir()
+    credentials_file = credentials_dir / "credentials"
+
+    credentials_file.write_text("[other]\nmlflow_tracking_username = operator\n")
+    assert mlflow_credentials_configured() is False
+
+    credentials_file.write_text("[mlflow]\nmlflow_tracking_password = hunter2\n")
+    assert mlflow_credentials_configured() is True
+
+
+def test_mlflow_credentials_configured_fails_closed_on_malformed_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for var in (
+        "MLFLOW_TRACKING_USERNAME",
+        "MLFLOW_TRACKING_PASSWORD",
+        "MLFLOW_TRACKING_TOKEN",
+        "MLFLOW_TRACKING_AWS_SIGV4",
+        "MLFLOW_TRACKING_AUTH",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    credentials_dir = tmp_path / ".mlflow"
+    credentials_dir.mkdir()
+    (credentials_dir / "credentials").write_bytes(b"\xff\xfe no section header\n")
+    assert mlflow_credentials_configured() is True
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("true", True),
+        ("TRUE", True),
+        ("1", True),
+        ("false", False),
+        ("0", False),
+        ("", False),
+        ("yes", False),
+    ],
+)
+def test_mlflow_insecure_tls_configured_parses_boolean_env(
+    value: str, expected: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MLFLOW_TRACKING_INSECURE_TLS", value)
+    assert mlflow_insecure_tls_configured() is expected
+    monkeypatch.delenv("MLFLOW_TRACKING_INSECURE_TLS", raising=False)
+    assert mlflow_insecure_tls_configured() is False
+
+
 def test_projection_rejects_quote_in_search_identity(tmp_path: Path) -> None:
     identity = replace(_identity(), cohort_id="quoted'cohort")
     with pytest.raises(MlflowProjectionError, match="unrepresentable quote"):
@@ -979,15 +1082,42 @@ def test_publish_artifact_failure_terminates_new_run_as_failed(
     assert isinstance(raised.value.__cause__, OSError)
 
 
-def test_publish_finalize_failure_terminates_new_run_as_failed(
+def test_publish_finalize_failure_leaves_run_status_unchanged(
     tmp_path: Path, mlflow_entities_stub: type
 ) -> None:
+    # set_terminated can commit FINISHED before its response is lost, and
+    # mlflow accepts a later FAILED on that completed run; marking failed
+    # here would hide the run from the idempotent match and force a
+    # duplicate on the next publish.
     client = _FakeClient(_FakePage([]), finalize_error=OSError("boom"))
     with pytest.raises(MlflowPublicationError) as raised:
         _publish(_publisher_projection(tmp_path), client)
     assert raised.value.code == "run_finalize_failed"
-    assert client.terminated == [("run-new", "FAILED")]
+    assert client.terminated == []
+    assert [event for event in client.events if event[0] == "set_terminated"] == [
+        ("set_terminated", "run-new", "FINISHED")
+    ]
     assert isinstance(raised.value.__cause__, OSError)
+
+
+def test_publish_finalize_failure_retry_resumes_the_same_run(
+    tmp_path: Path, mlflow_entities_stub: type
+) -> None:
+    projection = _publisher_projection(tmp_path)
+    interrupted = _FakeClient(_FakePage([]), finalize_error=OSError("boom"))
+    with pytest.raises(MlflowPublicationError) as raised:
+        _publish(projection, interrupted)
+    assert raised.value.code == "run_finalize_failed"
+
+    fingerprint = projection.tags["crux.projection_sha256"]
+    leftover = _matching_run(fingerprint, "RUNNING", run_id="run-new")
+    recovered = _FakeClient(_FakePage([leftover]))
+    result = _publish(projection, recovered)
+    assert result.status == "published"
+    assert result.created is False
+    assert result.run_id == "run-new"
+    assert recovered.created_runs == []
+    assert recovered.terminated == [("run-new", "FINISHED")]
 
 
 def test_publish_requests_synchronous_metric_logging(
@@ -1035,11 +1165,11 @@ def test_failed_run_cleanup_suppresses_mlflow_url_output(
     tmp_path: Path, mlflow_entities_stub: type, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT", "false")
-    client = _FakeClient(_FakePage([]), finalize_error=OSError("boom"))
+    client = _FakeClient(_FakePage([]), log_batch_error=OSError("boom"))
     with pytest.raises(MlflowPublicationError) as raised:
         _publish(_publisher_projection(tmp_path), client)
-    assert raised.value.code == "run_finalize_failed"
-    assert client.terminated_suppression == ["true", "true"]
+    assert raised.value.code == "metric_log_failed"
+    assert client.terminated_suppression == ["true"]
     assert os.environ["MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT"] == "false"
 
 
