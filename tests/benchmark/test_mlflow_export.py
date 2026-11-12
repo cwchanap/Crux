@@ -33,8 +33,8 @@ from src.benchmark.mlflow_export import (
     MlflowPublicationError,
     build_matching_runs_filter,
     build_mlflow_projection,
-    mlflow_credentials_configured,
     mlflow_insecure_tls_configured,
+    mlflow_redirects_disabled,
     publish_mlflow_projection,
     staged_report_snapshot,
     validate_tracking_uri,
@@ -483,6 +483,7 @@ class _FakeClient:
         self.logged_artifact_bytes: list[bytes] = []
         self.terminated: list[tuple[str, str | None]] = []
         self.terminated_suppression: list[str | None] = []
+        self.redirects_env: list[str | None] = []
 
     def _fire(self, key: str) -> None:
         error = getattr(self, key)
@@ -492,6 +493,7 @@ class _FakeClient:
 
     def get_experiment_by_name(self, name: str):
         self.events.append(("get_experiment_by_name", name))
+        self.redirects_env.append(os.environ.get("MLFLOW_ALLOW_HTTP_REDIRECTS"))
         self._fire("experiment_error")
         if not self.has_experiment:
             return None
@@ -546,6 +548,7 @@ class _FakeClient:
     def set_terminated(self, run_id: str, status=None):
         self.events.append(("set_terminated", run_id, status))
         self.terminated_suppression.append(os.environ.get("MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT"))
+        self.redirects_env.append(os.environ.get("MLFLOW_ALLOW_HTTP_REDIRECTS"))
         self._fire("finalize_error")
         self.terminated.append((run_id, status))
 
@@ -571,6 +574,9 @@ def _publish(projection: MlflowProjection, client: _FakeClient) -> MlflowPublica
         "ftp://host.example/store",
         "mlruns",
         "/tmp/mlruns",
+        "http://",
+        "http://localhost:5000",
+        "http://host.example",
         "https://",
         "https://user@host.example",
         "https://user:pass@host.example",
@@ -588,103 +594,32 @@ def test_validate_tracking_uri_rejects_invalid(raw_uri: str) -> None:
 @pytest.mark.parametrize(
     "uri",
     [
-        "http://localhost:5000",
+        "https://localhost:5000",
         "https://dagshub.com/owner/repo.mlflow",
         "https://dagshub.com/owner/repo.mlflow/",
     ],
 )
-def test_validate_tracking_uri_accepts_public_http_uris(uri: str) -> None:
+def test_validate_tracking_uri_accepts_https_uris(uri: str) -> None:
     assert validate_tracking_uri(uri) == uri
 
 
-def test_validate_tracking_uri_requires_https_when_credentials_are_configured() -> None:
+def test_validate_tracking_uri_rejects_http_despite_matching_netrc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # requests would attach ~/.netrc Basic credentials to a plaintext request;
+    # the URI must be refused rather than probing every credential source.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".netrc").write_text("machine mlflow.example.com login operator password hunter2\n")
     with pytest.raises(MlflowPublicationError) as raised:
-        validate_tracking_uri("http://mlflow.example.com", credentials_configured=True)
+        validate_tracking_uri("http://mlflow.example.com")
     assert raised.value.code == "invalid_config"
-    assert (
-        validate_tracking_uri("https://mlflow.example.com", credentials_configured=True)
-        == "https://mlflow.example.com"
-    )
 
 
-def test_validate_tracking_uri_rejects_insecure_tls_when_credentials_are_configured() -> None:
+def test_validate_tracking_uri_rejects_insecure_tls() -> None:
     with pytest.raises(MlflowPublicationError) as raised:
-        validate_tracking_uri(
-            "https://mlflow.example.com", credentials_configured=True, insecure_tls=True
-        )
-    assert raised.value.code == "invalid_config"
-    assert (
         validate_tracking_uri("https://mlflow.example.com", insecure_tls=True)
-        == "https://mlflow.example.com"
-    )
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "MLFLOW_TRACKING_USERNAME",
-        "MLFLOW_TRACKING_PASSWORD",
-        "MLFLOW_TRACKING_TOKEN",
-        "MLFLOW_TRACKING_AWS_SIGV4",
-        "MLFLOW_TRACKING_AUTH",
-    ],
-)
-def test_mlflow_credentials_configured_detects_each_env_var(
-    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path))
-    for var in (
-        "MLFLOW_TRACKING_USERNAME",
-        "MLFLOW_TRACKING_PASSWORD",
-        "MLFLOW_TRACKING_TOKEN",
-        "MLFLOW_TRACKING_AWS_SIGV4",
-        "MLFLOW_TRACKING_AUTH",
-    ):
-        monkeypatch.delenv(var, raising=False)
-    assert mlflow_credentials_configured() is False
-    monkeypatch.setenv(name, "configured")
-    assert mlflow_credentials_configured() is True
-
-
-def test_mlflow_credentials_configured_reads_credentials_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path))
-    for var in (
-        "MLFLOW_TRACKING_USERNAME",
-        "MLFLOW_TRACKING_PASSWORD",
-        "MLFLOW_TRACKING_TOKEN",
-        "MLFLOW_TRACKING_AWS_SIGV4",
-        "MLFLOW_TRACKING_AUTH",
-    ):
-        monkeypatch.delenv(var, raising=False)
-    credentials_dir = tmp_path / ".mlflow"
-    credentials_dir.mkdir()
-    credentials_file = credentials_dir / "credentials"
-
-    credentials_file.write_text("[other]\nmlflow_tracking_username = operator\n")
-    assert mlflow_credentials_configured() is False
-
-    credentials_file.write_text("[mlflow]\nmlflow_tracking_password = hunter2\n")
-    assert mlflow_credentials_configured() is True
-
-
-def test_mlflow_credentials_configured_fails_closed_on_malformed_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path))
-    for var in (
-        "MLFLOW_TRACKING_USERNAME",
-        "MLFLOW_TRACKING_PASSWORD",
-        "MLFLOW_TRACKING_TOKEN",
-        "MLFLOW_TRACKING_AWS_SIGV4",
-        "MLFLOW_TRACKING_AUTH",
-    ):
-        monkeypatch.delenv(var, raising=False)
-    credentials_dir = tmp_path / ".mlflow"
-    credentials_dir.mkdir()
-    (credentials_dir / "credentials").write_bytes(b"\xff\xfe no section header\n")
-    assert mlflow_credentials_configured() is True
+    assert raised.value.code == "invalid_config"
+    assert validate_tracking_uri("https://mlflow.example.com") == "https://mlflow.example.com"
 
 
 @pytest.mark.parametrize(
@@ -706,6 +641,38 @@ def test_mlflow_insecure_tls_configured_parses_boolean_env(
     assert mlflow_insecure_tls_configured() is expected
     monkeypatch.delenv("MLFLOW_TRACKING_INSECURE_TLS", raising=False)
     assert mlflow_insecure_tls_configured() is False
+
+
+def test_mlflow_redirects_disabled_sets_and_restores_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MLFLOW_ALLOW_HTTP_REDIRECTS", raising=False)
+    with mlflow_redirects_disabled():
+        assert os.environ["MLFLOW_ALLOW_HTTP_REDIRECTS"] == "false"
+    assert "MLFLOW_ALLOW_HTTP_REDIRECTS" not in os.environ
+
+    monkeypatch.setenv("MLFLOW_ALLOW_HTTP_REDIRECTS", "true")
+    with mlflow_redirects_disabled():
+        assert os.environ["MLFLOW_ALLOW_HTTP_REDIRECTS"] == "false"
+    assert os.environ["MLFLOW_ALLOW_HTTP_REDIRECTS"] == "true"
+
+
+def test_publish_runs_client_calls_with_redirects_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An https->http (or cross-origin) redirect would let requests re-resolve
+    # ~/.netrc credentials for the target; every mlflow call must run with
+    # redirects off, not just the finalize path.
+    monkeypatch.delenv("MLFLOW_ALLOW_HTTP_REDIRECTS", raising=False)
+    projection = _publisher_projection(tmp_path)
+    client = _FakeClient(_FakePage([]))
+
+    publication = _publish(projection, client)
+
+    assert publication.status == "published"
+    assert client.redirects_env
+    assert all(value == "false" for value in client.redirects_env)
+    assert "MLFLOW_ALLOW_HTTP_REDIRECTS" not in os.environ
 
 
 def test_projection_rejects_quote_in_search_identity(tmp_path: Path) -> None:

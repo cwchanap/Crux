@@ -1799,8 +1799,8 @@ def publish_mlflow_cohort_command(
         MlflowProjectionError,
         MlflowPublicationError,
         build_mlflow_projection,
-        mlflow_credentials_configured,
         mlflow_insecure_tls_configured,
+        mlflow_redirects_disabled,
         publish_mlflow_projection,
         staged_report_snapshot,
         validate_tracking_uri,
@@ -1826,10 +1826,9 @@ def publish_mlflow_cohort_command(
         try:
             tracking_uri = validate_tracking_uri(
                 os.environ.get("MLFLOW_TRACKING_URI", ""),
-                credentials_configured=mlflow_credentials_configured(),
                 insecure_tls=mlflow_insecure_tls_configured(),
             )
-            with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stdout(io.StringIO()), mlflow_redirects_disabled():
                 client = _build_mlflow_client(tracking_uri)
                 publication = publish_mlflow_projection(
                     projection,
