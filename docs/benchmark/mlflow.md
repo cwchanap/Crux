@@ -51,6 +51,18 @@ HTTP — front it with a TLS-terminating proxy or use a hosted tracking server.
 For self-signed servers prefer `MLFLOW_TRACKING_SERVER_CERT_PATH` over
 disabling verification.
 
+The run's artifact destination, which the tracking server assigns, is checked
+with the same policy before any report bytes are uploaded: verified `https`
+artifact URIs and hostless `mlflow-artifacts:` paths (which proxy through the
+verified tracking endpoint) are accepted, as are local file destinations;
+plain `http`, `mlflow-artifacts://other-host` URIs that would repoint uploads
+at a different origin, and other remote schemes fail with
+`unsafe_artifact_uri`. Presigned multipart uploads are disabled for the
+publish (`MLFLOW_ENABLE_PROXY_MULTIPART_UPLOAD=false`) so no file part can be
+sent to a server-issued URL that skips these checks, and the uploaded files
+are re-listed afterward so an unanswered redirect cannot pass as a
+successful upload.
+
 ## Usage
 
 ```bash

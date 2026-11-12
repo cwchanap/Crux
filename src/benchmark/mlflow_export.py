@@ -281,6 +281,7 @@ MATCHING_RUN_LIMIT = 1000
 MlflowErrorCode: TypeAlias = Literal[
     "missing_optional_dependency",
     "invalid_config",
+    "unsafe_artifact_uri",
     "experiment_access_failed",
     "run_search_failed",
     "run_create_failed",
@@ -296,6 +297,10 @@ _MLFLOW_ERROR_MESSAGES: Mapping[MlflowErrorCode, str] = MappingProxyType(
         "invalid_config": (
             "tracking URI must be an https URL with a hostname and no credentials,"
             " query, or fragment, and certificate verification must stay enabled"
+        ),
+        "unsafe_artifact_uri": (
+            "artifact destination must be a verified https URL, a server-proxied"
+            " mlflow-artifacts path, or a local file destination"
         ),
         "experiment_access_failed": "could not resolve or create an active MLflow experiment",
         "run_search_failed": "could not search for matching MLflow runs",
@@ -375,6 +380,42 @@ def validate_tracking_uri(raw_uri: str, *, insecure_tls: bool = False) -> str:
     return raw_uri
 
 
+def _validate_artifact_uri(raw_uri: str | None) -> None:
+    """Gate the run's server-provided artifact destination before upload.
+
+    ``client.log_artifact`` re-resolves ``run.info.artifact_uri`` per call: an
+    ``http`` URI puts file bytes and any resolvable credentials (environment
+    variables, ``~/.netrc``) on the wire in plaintext, and an
+    ``mlflow-artifacts://host`` URI repoints uploads at an arbitrary host.
+    Hostless ``mlflow-artifacts:`` paths stay on the already-verified tracking
+    endpoint, verified-clean ``https`` stays on TLS, and local file
+    destinations never reach the network.  Anything else is rejected.
+    """
+    if not raw_uri:
+        raise MlflowPublicationError("unsafe_artifact_uri")
+    try:
+        parts = urlsplit(raw_uri)
+    except ValueError as error:
+        raise MlflowPublicationError("unsafe_artifact_uri") from error
+    scheme = parts.scheme.lower()
+    if scheme in ("", "file"):
+        return
+    if scheme == "mlflow-artifacts" and not parts.netloc:
+        return
+    if (
+        scheme == "https"
+        and parts.hostname
+        and parts.username is None
+        and parts.password is None
+        and not parts.query
+        and not parts.fragment
+    ):
+        return
+    raise MlflowPublicationError("unsafe_artifact_uri") from ValueError(
+        f"artifact URI is not an allowed destination: {raw_uri!r}"
+    )
+
+
 def build_matching_runs_filter(tags: Mapping[str, str]) -> str:
     """Build an MLflow filter over quote-free search-identity tag values.
 
@@ -448,13 +489,13 @@ def _find_published_run(
     return _classify_matching_runs(runs, projection.tags[_FINGERPRINT_TAG])
 
 
-def _create_run(client: MlflowClient, experiment_id: str, projection: MlflowProjection) -> str:
+def _create_run(client: MlflowClient, experiment_id: str, projection: MlflowProjection) -> Run:
     def create():
         return client.create_run(
             experiment_id, tags=dict(projection.tags), run_name=projection.run_name
         )
 
-    return _bounded("run_create_failed", create).info.run_id
+    return _bounded("run_create_failed", create)
 
 
 # mlflow's RestStore rejects log_batch calls carrying more than this many
@@ -500,17 +541,66 @@ def _stage_verified_artifacts(artifacts: tuple[PublishedArtifact, ...], stage: P
     return staged
 
 
+_MLFLOW_PROXY_MULTIPART_ENV = "MLFLOW_ENABLE_PROXY_MULTIPART_UPLOAD"
+
+
+@contextlib.contextmanager
+def _mlflow_proxy_multipart_disabled() -> Iterator[None]:
+    """Force artifact uploads through the verified https endpoint only.
+
+    mlflow's artifact repositories negotiate presigned multipart uploads:
+    ``mlflow-artifacts:`` repositories auto-enable them from the server's
+    ``/server-info`` capabilities, and the part uploads then go through raw
+    ``requests.put`` calls that honor neither the artifact-URI scheme check
+    nor ``MLFLOW_ALLOW_HTTP_REDIRECTS``. Setting this env var disables the
+    presigned path for both repository kinds so every artifact byte uses
+    mlflow's ``http_request`` against a destination already vetted by
+    ``_validate_artifact_uri``.
+    """
+    previous = os.environ.get(_MLFLOW_PROXY_MULTIPART_ENV)
+    os.environ[_MLFLOW_PROXY_MULTIPART_ENV] = "false"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(_MLFLOW_PROXY_MULTIPART_ENV, None)
+        else:
+            os.environ[_MLFLOW_PROXY_MULTIPART_ENV] = previous
+
+
+def _verify_uploaded_artifacts(client: MlflowClient, run_id: str, staged: list[Path]) -> None:
+    """Confirm every staged file is listed: mlflow's artifact PUTs treat an
+    unfollowed 3xx response as success, so a redirect that stored nothing
+    would otherwise publish a hollow run."""
+    remote = _bounded(
+        "artifact_upload_failed",
+        lambda: client.list_artifacts(run_id, REPORT_ARTIFACT_PATH),
+    )
+    remote_sizes = {info.path: getattr(info, "file_size", None) for info in remote}
+    for path in staged:
+        remote_path = f"{REPORT_ARTIFACT_PATH}/{path.name}"
+        if remote_path not in remote_sizes:
+            raise MlflowPublicationError("artifact_upload_failed")
+        remote_size = remote_sizes[remote_path]
+        if remote_size is not None and remote_size != path.stat().st_size:
+            raise MlflowPublicationError("artifact_upload_failed")
+
+
 def _log_artifacts(
     client: MlflowClient, run_id: str, artifacts: tuple[PublishedArtifact, ...]
 ) -> None:
     # Upload the bytes the fingerprint covers, not a fresh read of the path.
-    with tempfile.TemporaryDirectory(prefix="crux-mlflow-artifacts-") as stage:
+    with (
+        _mlflow_proxy_multipart_disabled(),
+        tempfile.TemporaryDirectory(prefix="crux-mlflow-artifacts-") as stage,
+    ):
         staged = _stage_verified_artifacts(artifacts, Path(stage))
         for path in staged:
             _bounded(
                 "artifact_upload_failed",
                 lambda path=path: client.log_artifact(run_id, str(path), REPORT_ARTIFACT_PATH),
             )
+        _verify_uploaded_artifacts(client, run_id, staged)
 
 
 _MLFLOW_ALLOW_REDIRECTS_ENV = "MLFLOW_ALLOW_HTTP_REDIRECTS"
@@ -600,9 +690,15 @@ def publish_mlflow_projection(
                 status="already_published",
             )
         if published is None:
-            run_id = _create_run(client, experiment_id, projection)
+            run = _create_run(client, experiment_id, projection)
+            run_id = run.info.run_id
+            artifact_uri = run.info.artifact_uri
         else:
             run_id = published.info.run_id
+            artifact_uri = published.info.artifact_uri
+        # Rejected before the log/finalize stage so the live run stays
+        # resumable once the server's artifact destination is fixed.
+        _validate_artifact_uri(artifact_uri)
         try:
             _log_metrics(client, run_id, projection.metrics)
             _log_artifacts(client, run_id, projection.artifacts)
