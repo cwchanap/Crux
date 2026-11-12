@@ -226,6 +226,26 @@ def build_mlflow_projection(
     )
 
 
+@contextlib.contextmanager
+def staged_report_snapshot(report_dir: Path) -> Iterator[Path]:
+    """Copy the five canonical report artifacts into one private snapshot.
+
+    ``write_cohort_reports`` replaces report files in place, so loading a
+    report and hashing its artifacts as two separate reads can observe
+    different generations of the same directory.  Loading, projection, and
+    the upload-time digest re-verify must therefore all run against this
+    staged copy, whose bytes cannot change underneath them.
+    """
+    if not isinstance(report_dir, Path):
+        raise TypeError("report_dir must be a Path")
+    with tempfile.TemporaryDirectory(prefix="crux-mlflow-reports-") as stage:
+        snapshot_dir = Path(stage)
+        for name in REPORT_ARTIFACT_NAMES:
+            content = read_regular_file_no_follow(report_dir / name)
+            (snapshot_dir / name).write_bytes(content)
+        yield snapshot_dir
+
+
 __all__ = [
     "MATCHING_RUN_LIMIT",
     "PROJECTION_VERSION",
@@ -240,6 +260,7 @@ __all__ = [
     "MlflowScope",
     "build_matching_runs_filter",
     "publish_mlflow_projection",
+    "staged_report_snapshot",
     "validate_tracking_uri",
 ]
 

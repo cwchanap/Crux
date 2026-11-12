@@ -34,6 +34,7 @@ from src.benchmark.mlflow_export import (
     build_matching_runs_filter,
     build_mlflow_projection,
     publish_mlflow_projection,
+    staged_report_snapshot,
     validate_tracking_uri,
 )
 from src.benchmark.reports import (
@@ -266,6 +267,36 @@ def test_projection_wraps_unreadable_artifact_error(tmp_path: Path) -> None:
     (report_dir / "summary.md").unlink()
     with pytest.raises(MlflowProjectionError, match="summary.md"):
         build_mlflow_projection(_reports(), report_dir, scope="broad")
+
+
+def test_staged_report_snapshot_copies_only_the_report_artifacts(tmp_path: Path) -> None:
+    report_dir = _report_dir(tmp_path)
+    with staged_report_snapshot(report_dir) as snapshot_dir:
+        assert snapshot_dir != report_dir
+        assert sorted(path.name for path in snapshot_dir.iterdir()) == sorted(REPORT_ARTIFACT_NAMES)
+        for name in REPORT_ARTIFACT_NAMES:
+            assert (snapshot_dir / name).read_bytes() == ARTIFACT_BYTES[name]
+    assert not snapshot_dir.exists()
+
+
+def test_staged_report_snapshot_isolates_from_report_dir_writes(tmp_path: Path) -> None:
+    report_dir = _report_dir(tmp_path)
+    with staged_report_snapshot(report_dir) as snapshot_dir:
+        for name in REPORT_ARTIFACT_NAMES:
+            (report_dir / name).write_bytes(b"regenerated\n")
+        projection = build_mlflow_projection(_reports(), snapshot_dir, scope="broad")
+    digests = {artifact.path.name: artifact.sha256 for artifact in projection.artifacts}
+    assert digests == {name: sha256_hex(ARTIFACT_BYTES[name]) for name in REPORT_ARTIFACT_NAMES}
+
+
+def test_staged_report_snapshot_missing_artifact_is_oserror(tmp_path: Path) -> None:
+    with pytest.raises(OSError), staged_report_snapshot(tmp_path):
+        pass
+
+
+def test_staged_report_snapshot_rejects_non_path() -> None:
+    with pytest.raises(TypeError), staged_report_snapshot("reports"):  # type: ignore[arg-type]
+        pass
 
 
 def test_projection_is_stable_for_same_input(tmp_path: Path) -> None:
