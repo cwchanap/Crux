@@ -2056,6 +2056,13 @@ def _mlflow_publication_cli_args(reports_path: Path, scope: str) -> list[str]:
     ]
 
 
+def _write_mlflow_report_files(reports_path: Path) -> None:
+    from src.benchmark.mlflow_export import REPORT_ARTIFACT_NAMES
+
+    for name in REPORT_ARTIFACT_NAMES:
+        (reports_path / name).write_bytes(name.encode() + b"\n")
+
+
 def test_publish_mlflow_cohort_emits_canonical_publication_summary(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -2066,6 +2073,7 @@ def test_publish_mlflow_cohort_emits_canonical_publication_summary(
 
     reports_path = tmp_path / "reports"
     reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
     sentinel_reports = object()
     sentinel_projection = object()
     sentinel_client = object()
@@ -2073,6 +2081,7 @@ def test_publish_mlflow_cohort_emits_canonical_publication_summary(
 
     def fake_load(path: Path) -> object:
         captured["reports_path"] = path
+        captured["staged_summary"] = (path / "summary.json").read_bytes()
         return sentinel_reports
 
     def fake_project(reports: object, report_dir: Path, *, scope: str) -> object:
@@ -2109,8 +2118,13 @@ def test_publish_mlflow_cohort_emits_canonical_publication_summary(
 
     assert result.exit_code == 0
     assert result.stderr == ""
-    assert captured["reports_path"] == reports_path
-    assert captured["projection"] == (sentinel_reports, reports_path, "reviewed")
+    assert captured["reports_path"] != reports_path
+    assert captured["staged_summary"] == b"summary.json\n"
+    assert captured["projection"] == (
+        sentinel_reports,
+        captured["reports_path"],
+        "reviewed",
+    )
     assert captured["client_uri"] == "https://mlflow.example.com"
     assert captured["publish"] == (sentinel_projection, sentinel_client, "crux-benchmark")
     assert json.loads(result.stdout) == {
@@ -2159,6 +2173,7 @@ def test_publish_mlflow_cohort_reports_noop_when_already_published(
 
     reports_path = tmp_path / "reports"
     reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
     captured: dict[str, object] = {}
 
     def fake_load(_path: Path) -> object:
@@ -2243,6 +2258,7 @@ def test_publish_mlflow_cohort_malformed_report_stops_before_mlflow(
 
     reports_path = tmp_path / "reports"
     reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
 
     def unexpected(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("MLflow work must not run for a malformed report")
@@ -2283,6 +2299,7 @@ def test_publish_mlflow_cohort_projection_error_emits_canonical_failure(
 
     reports_path = tmp_path / "reports"
     reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
 
     def unexpected(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("MLflow work must not run for a projection failure")
@@ -2325,6 +2342,7 @@ def test_publish_mlflow_cohort_missing_tracking_uri_is_bounded_config_error(
 
     reports_path = tmp_path / "reports"
     reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
     safe_message = MlflowPublicationError("invalid_config").message
 
     def unexpected(*_args: object, **_kwargs: object) -> object:
@@ -2402,6 +2420,7 @@ def test_publish_mlflow_cohort_missing_mlflow_dependency_is_bounded(
 
     reports_path = tmp_path / "reports"
     reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
     safe_message = MlflowPublicationError("missing_optional_dependency").message
 
     def unexpected(*_args: object, **_kwargs: object) -> object:
@@ -2445,6 +2464,7 @@ def test_publish_mlflow_cohort_half_broken_mlflow_install_is_bounded(
 
     reports_path = tmp_path / "reports"
     reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
     safe_message = MlflowPublicationError("missing_optional_dependency").message
 
     def unexpected(*_args: object, **_kwargs: object) -> object:
@@ -2488,6 +2508,7 @@ def test_publish_mlflow_cohort_client_construction_failure_is_bounded(
 
     reports_path = tmp_path / "reports"
     reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
     safe_message = MlflowPublicationError("invalid_config").message
 
     def unexpected(*_args: object, **_kwargs: object) -> object:
@@ -2538,6 +2559,7 @@ def test_publish_mlflow_cohort_run_conflict_emits_bounded_code_without_secrets(
 
     reports_path = tmp_path / "reports"
     reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
     safe_message = MlflowPublicationError("run_conflict").message
 
     def failing_publish(_projection: object, **_kwargs: object) -> object:

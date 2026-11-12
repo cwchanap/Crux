@@ -1800,40 +1800,45 @@ def publish_mlflow_cohort_command(
         MlflowPublicationError,
         build_mlflow_projection,
         publish_mlflow_projection,
+        staged_report_snapshot,
         validate_tracking_uri,
     )
     from src.benchmark.reports import ReportIntegrityError, load_published_cohort_reports
 
-    try:
-        reports = load_published_cohort_reports(reports_path)
-    except (OSError, ReportIntegrityError):
-        _emit_mlflow_publication_failure("report_invalid", _MLFLOW_REPORT_FAILURE_MESSAGE)
-        raise click.exceptions.Exit(2)
+    with contextlib.ExitStack() as stack:
+        try:
+            snapshot_dir = stack.enter_context(staged_report_snapshot(reports_path))
+            reports = load_published_cohort_reports(snapshot_dir)
+        except (OSError, ReportIntegrityError):
+            _emit_mlflow_publication_failure("report_invalid", _MLFLOW_REPORT_FAILURE_MESSAGE)
+            raise click.exceptions.Exit(2)
 
-    try:
-        projection = build_mlflow_projection(reports, reports_path, scope=scope)
-    except MlflowProjectionError:
-        _emit_mlflow_publication_failure("projection_failed", _MLFLOW_PROJECTION_FAILURE_MESSAGE)
-        raise click.exceptions.Exit(2)
-
-    try:
-        tracking_uri = validate_tracking_uri(
-            os.environ.get("MLFLOW_TRACKING_URI", ""),
-            credentials_configured=bool(
-                os.environ.get("MLFLOW_TRACKING_USERNAME")
-                or os.environ.get("MLFLOW_TRACKING_PASSWORD")
-            ),
-        )
-        with contextlib.redirect_stdout(io.StringIO()):
-            client = _build_mlflow_client(tracking_uri)
-            publication = publish_mlflow_projection(
-                projection,
-                client=client,
-                experiment_name=experiment_name,
+        try:
+            projection = build_mlflow_projection(reports, snapshot_dir, scope=scope)
+        except MlflowProjectionError:
+            _emit_mlflow_publication_failure(
+                "projection_failed", _MLFLOW_PROJECTION_FAILURE_MESSAGE
             )
-    except MlflowPublicationError as error:
-        _emit_mlflow_publication_failure(error.code, error.message)
-        raise click.exceptions.Exit(2)
+            raise click.exceptions.Exit(2)
+
+        try:
+            tracking_uri = validate_tracking_uri(
+                os.environ.get("MLFLOW_TRACKING_URI", ""),
+                credentials_configured=bool(
+                    os.environ.get("MLFLOW_TRACKING_USERNAME")
+                    or os.environ.get("MLFLOW_TRACKING_PASSWORD")
+                ),
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                client = _build_mlflow_client(tracking_uri)
+                publication = publish_mlflow_projection(
+                    projection,
+                    client=client,
+                    experiment_name=experiment_name,
+                )
+        except MlflowPublicationError as error:
+            _emit_mlflow_publication_failure(error.code, error.message)
+            raise click.exceptions.Exit(2)
 
     click.echo(canonical_json_bytes(asdict(publication)).decode("utf-8"))
 
