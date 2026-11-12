@@ -28,14 +28,24 @@ The command reads its configuration from the environment:
 | `MLFLOW_TRACKING_URI` | Required. Tracking server URL (see constraints below). |
 | `MLFLOW_TRACKING_USERNAME` | Optional. Username for the tracking server. |
 | `MLFLOW_TRACKING_PASSWORD` | Optional. Password for the tracking server. |
+| `MLFLOW_TRACKING_TOKEN` | Optional. Bearer token for the tracking server. |
+| `MLFLOW_TRACKING_AWS_SIGV4` | Optional. `true`/`1` signs requests with AWS SigV4. |
+| `MLFLOW_TRACKING_AUTH` | Optional. Custom request-auth hook honored by MLflow. |
+| `MLFLOW_TRACKING_INSECURE_TLS` | Optional. `true`/`1` disables TLS verification; rejected when credentials are configured. |
 
 `MLFLOW_TRACKING_URI` must be an explicit `http://` or `https://` server URL
 with a hostname. The command rejects local file/sqlite fallbacks, URLs with
 embedded credentials, and URLs with a query or fragment. Keep credentials in
-the separate username/password variables, never in the URI. Path-bearing
-https URLs (as used by some hosted providers) are accepted. When either
-credential variable is set, the URI must use `https://`: plain `http://` is
-rejected because basic auth would send the token in cleartext.
+the separate auth variables, never in the URI. Path-bearing https URLs (as
+used by some hosted providers) are accepted.
+
+Whenever the environment can authenticate requests — any of the auth
+variables above, or a `[mlflow]` section in `~/.mlflow/credentials` — the URI
+must use `https://` and certificate verification must stay enabled: plain
+`http://` sends credentials in cleartext, and `MLFLOW_TRACKING_INSECURE_TLS`
+lets a network attacker impersonate the server and receive them. For
+self-signed servers prefer `MLFLOW_TRACKING_SERVER_CERT_PATH` over disabling
+verification.
 
 ## Usage
 
