@@ -10,7 +10,7 @@ import types
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -998,6 +998,27 @@ def test_publish_requests_synchronous_metric_logging(
     client = _FakeClient(_FakePage([]))
     _publish(_publisher_projection(tmp_path), client)
     assert client.logged_batches[0]["synchronous"] is True
+
+
+def test_publish_chunks_metrics_at_mlflow_batch_limit(
+    tmp_path: Path, mlflow_entities_stub: type
+) -> None:
+    # mlflow's RestStore rejects log_batch calls over 1,000 metrics; reports
+    # with extra canonical tolerances cross that cap and must still publish.
+    projection = _publisher_projection(tmp_path)
+    metrics = dict(projection.metrics)
+    while len(metrics) <= 2 * 1000:
+        metrics[f"synthetic.metric_{len(metrics)}"] = Decimal("0.5")
+    projection = replace(projection, metrics=MappingProxyType(metrics))
+    client = _FakeClient(_FakePage([]))
+    _publish(projection, client)
+    assert len(client.logged_batches) > 1
+    logged_names = []
+    for batch in client.logged_batches:
+        assert 0 < len(batch["metrics"]) <= 1000
+        assert batch["synchronous"] is True
+        logged_names.extend(entry.name for entry in batch["metrics"])
+    assert logged_names == list(projection.metrics)
 
 
 def test_finalize_run_suppresses_mlflow_url_output(

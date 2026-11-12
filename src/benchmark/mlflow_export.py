@@ -235,6 +235,13 @@ def staged_report_snapshot(report_dir: Path) -> Iterator[Path]:
     different generations of the same directory.  Loading, projection, and
     the upload-time digest re-verify must therefore all run against this
     staged copy, whose bytes cannot change underneath them.
+
+    The copy itself is not atomic against a concurrent
+    ``write_cohort_reports``: regeneration that interleaves with these
+    reads can still produce a mixed-generation snapshot that validation
+    accepts (summary aggregates are not recomputed against the CSVs).
+    Report generation and publication must therefore run serially, same
+    as the publish calls themselves.
     """
     if not isinstance(report_dir, Path):
         raise TypeError("report_dir must be a Path")
@@ -434,6 +441,11 @@ def _create_run(client: MlflowClient, experiment_id: str, projection: MlflowProj
     return _bounded("run_create_failed", create).info.run_id
 
 
+# mlflow's RestStore rejects log_batch calls carrying more than this many
+# entities; valid reports with extra canonical tolerances can exceed it.
+_LOG_BATCH_METRIC_LIMIT = 1000
+
+
 def _log_metrics(
     client: MlflowClient, run_id: str, metrics: Mapping[str, MlflowMetricValue]
 ) -> None:
@@ -447,7 +459,12 @@ def _log_metrics(
             if not math.isfinite(number):
                 raise MlflowPublicationError("metric_log_failed")
             entries.append(Metric(name, number, timestamp_ms, 0))
-        client.log_batch(run_id, metrics=entries, synchronous=True)
+        for offset in range(0, len(entries), _LOG_BATCH_METRIC_LIMIT):
+            client.log_batch(
+                run_id,
+                metrics=entries[offset : offset + _LOG_BATCH_METRIC_LIMIT],
+                synchronous=True,
+            )
 
     _bounded("metric_log_failed", log)
 

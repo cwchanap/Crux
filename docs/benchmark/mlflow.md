@@ -83,8 +83,12 @@ command with `report_invalid`; an artifact whose bytes change between
 validation and upload fails with `artifact_upload_failed`. The command first
 copies the five artifacts into a private snapshot, so the validated report,
 the fingerprint digests, and the uploaded bytes all come from the same read —
-a report directory that is regenerated mid-publish cannot mix metrics from
-one generation with artifacts from another. Nothing else is uploaded.
+report regeneration after the snapshot cannot mix metrics from one
+generation with artifacts from another. The snapshot copy is not atomic
+against a concurrent report write, though: a regeneration that lands
+mid-copy can still produce a mixed-generation snapshot, so report
+generation and publication must run serially. Publish only from a report
+directory that is not being regenerated. Nothing else is uploaded.
 Diagnostics, audio, stems, predictions, and checkpoints are explicitly never
 uploaded to MLflow; they remain in the canonical report/corpus locations.
 
@@ -172,8 +176,8 @@ recovery is:
 
 Concurrent publishers can also produce `run_conflict` by leaving more than
 one `FINISHED` run with the *same* `crux.projection_sha256` for a scope and
-cohort. The publisher never mutates or deletes prior runs, so recovery is
-manual:
+cohort. The publisher never mutates or deletes a prior `FINISHED` run, so
+recovery is manual:
 
 1. Stop all publishers for that search identity so no further duplicates are
    created.
