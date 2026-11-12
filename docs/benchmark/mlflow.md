@@ -80,10 +80,13 @@ per_class.csv
 
 All five are required. A missing, unreadable, or empty artifact fails the
 command with `report_invalid`; an artifact whose bytes change between
-validation and upload fails with `artifact_upload_failed`. Nothing else is
-uploaded. Diagnostics, audio, stems, predictions, and checkpoints are
-explicitly never uploaded to MLflow; they remain in the canonical
-report/corpus locations.
+validation and upload fails with `artifact_upload_failed`. The command first
+copies the five artifacts into a private snapshot, so the validated report,
+the fingerprint digests, and the uploaded bytes all come from the same read —
+a report directory that is regenerated mid-publish cannot mix metrics from
+one generation with artifacts from another. Nothing else is uploaded.
+Diagnostics, audio, stems, predictions, and checkpoints are explicitly never
+uploaded to MLflow; they remain in the canonical report/corpus locations.
 
 ## Metrics, tags, and UI filters
 
@@ -130,7 +133,8 @@ scope is therefore just a republish with the right `--scope`.
 ## Idempotency and retry semantics
 
 Publication is idempotent per search identity
-(`crux.cohort_id` + `crux.projection_version` + `crux.scope`):
+(`crux.cohort_id` + `crux.projection_version` + `crux.scope`) when publish
+invocations run serially:
 
 - Re-publishing an identical projection with a `FINISHED` match returns that
   run ID with `created=false` and `status=already_published`. No duplicate run
@@ -147,6 +151,11 @@ Publication is idempotent per search identity
   lifecycle stage fails with `experiment_access_failed`; restore it (or
   permanently delete it and choose a new name) before publishing.
 
+Concurrent publishers sharing one search identity are not supported: two
+invocations can both observe no matching run and each create one. A later
+invocation then reports `run_conflict`; see "Recovering from duplicate runs"
+below.
+
 ## Recovering from a true same-scope conflict
 
 A true conflict means two different projections claim the same scope and
@@ -158,6 +167,20 @@ recovery is:
 2. Delete the incorrect MLflow run in the tracking UI.
 3. Republish from the canonical Crux reports with the correct `--reports`
    and `--scope`.
+
+## Recovering from duplicate runs
+
+Concurrent publishers can also produce `run_conflict` by leaving more than
+one `FINISHED` run with the *same* `crux.projection_sha256` for a scope and
+cohort. The publisher never mutates or deletes prior runs, so recovery is
+manual:
+
+1. Stop all publishers for that search identity so no further duplicates are
+   created.
+2. In the MLflow tracking UI, keep one of the matching runs and delete the
+   extra duplicate runs.
+3. Republish serially from the canonical Crux reports; the remaining run is
+   reused (`status=already_published`).
 
 ## Changing MLflow provider
 
