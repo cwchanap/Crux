@@ -9,7 +9,6 @@ digests, fingerprint), and publishes it through an injected low-level
 
 from __future__ import annotations
 
-import configparser
 import contextlib
 import math
 import os
@@ -267,8 +266,8 @@ __all__ = [
     "MlflowPublication",
     "MlflowScope",
     "build_matching_runs_filter",
-    "mlflow_credentials_configured",
     "mlflow_insecure_tls_configured",
+    "mlflow_redirects_disabled",
     "publish_mlflow_projection",
     "staged_report_snapshot",
     "validate_tracking_uri",
@@ -295,9 +294,8 @@ _MLFLOW_ERROR_MESSAGES: Mapping[MlflowErrorCode, str] = MappingProxyType(
     {
         "missing_optional_dependency": "mlflow is not installed; install the 'mlflow' extra",
         "invalid_config": (
-            "tracking URI must be an http(s) URL with a hostname and no credentials,"
-            " query, or fragment, and must use https with certificate verification"
-            " when credentials are configured"
+            "tracking URI must be an https URL with a hostname and no credentials,"
+            " query, or fragment, and certificate verification must stay enabled"
         ),
         "experiment_access_failed": "could not resolve or create an active MLflow experiment",
         "run_search_failed": "could not search for matching MLflow runs",
@@ -343,33 +341,7 @@ class MlflowPublication:
     status: Literal["published", "already_published"]
 
 
-# Authentication sources mlflow-skinny's get_default_host_creds consults;
-# keep in sync with the pinned mlflow-skinny range on upgrades.
-_MLFLOW_AUTH_ENV_VARS = (
-    "MLFLOW_TRACKING_USERNAME",
-    "MLFLOW_TRACKING_PASSWORD",
-    "MLFLOW_TRACKING_TOKEN",
-    "MLFLOW_TRACKING_AWS_SIGV4",
-    "MLFLOW_TRACKING_AUTH",
-)
 _MLFLOW_INSECURE_TLS_ENV_VAR = "MLFLOW_TRACKING_INSECURE_TLS"
-
-
-def mlflow_credentials_configured() -> bool:
-    """True when the environment can authenticate MLflow tracking requests."""
-    if any(os.environ.get(name) for name in _MLFLOW_AUTH_ENV_VARS):
-        return True
-    # mlflow reads basic auth from ~/.mlflow/credentials as well; an existing
-    # but malformed file must fail closed because it may still carry secrets.
-    config = configparser.ConfigParser()
-    try:
-        config.read(os.path.expanduser("~/.mlflow/credentials"))
-    except (configparser.Error, UnicodeError):
-        return True
-    if "mlflow" not in config:
-        return False
-    section = config["mlflow"]
-    return bool(section.get("mlflow_tracking_username") or section.get("mlflow_tracking_password"))
 
 
 def mlflow_insecure_tls_configured() -> bool:
@@ -377,23 +349,26 @@ def mlflow_insecure_tls_configured() -> bool:
     return os.environ.get(_MLFLOW_INSECURE_TLS_ENV_VAR, "").lower() in ("true", "1")
 
 
-def validate_tracking_uri(
-    raw_uri: str, *, credentials_configured: bool = False, insecure_tls: bool = False
-) -> str:
-    """Accept only an http(s) MLflow/DagsHub tracking URI safe for CLI use."""
+def validate_tracking_uri(raw_uri: str, *, insecure_tls: bool = False) -> str:
+    """Accept only an https MLflow/DagsHub tracking URI safe for CLI use.
+
+    HTTPS is required unconditionally: requests attaches ``~/.netrc``
+    credentials for the target host without mlflow's involvement, so no
+    credential check can prove nothing sensitive would go out over plaintext.
+    Disabled certificate verification is rejected the same way.
+    """
     try:
         parts = urlsplit(raw_uri)
     except ValueError as error:
         raise MlflowPublicationError("invalid_config") from error
     invalid = (
-        parts.scheme.lower() not in ("http", "https")
+        parts.scheme.lower() != "https"
         or not parts.hostname
         or parts.username is not None
         or parts.password is not None
         or bool(parts.query)
         or bool(parts.fragment)
-        or (credentials_configured and parts.scheme.lower() != "https")
-        or (credentials_configured and insecure_tls)
+        or insecure_tls
     )
     if invalid:
         raise MlflowPublicationError("invalid_config")
@@ -538,6 +513,29 @@ def _log_artifacts(
             )
 
 
+_MLFLOW_ALLOW_REDIRECTS_ENV = "MLFLOW_ALLOW_HTTP_REDIRECTS"
+
+
+@contextlib.contextmanager
+def mlflow_redirects_disabled() -> Iterator[None]:
+    """Force mlflow's HTTP stack to not follow redirects.
+
+    Requests re-resolves ``~/.netrc`` credentials for every redirect target,
+    so a redirect could carry Basic auth to another origin or onto plaintext
+    HTTP. mlflow reads this env var per request; with redirects off a 3xx
+    surfaces as a bounded failure instead of a silent credential handoff.
+    """
+    previous = os.environ.get(_MLFLOW_ALLOW_REDIRECTS_ENV)
+    os.environ[_MLFLOW_ALLOW_REDIRECTS_ENV] = "false"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(_MLFLOW_ALLOW_REDIRECTS_ENV, None)
+        else:
+            os.environ[_MLFLOW_ALLOW_REDIRECTS_ENV] = previous
+
+
 _MLFLOW_SUPPRESS_URL_ENV = "MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT"
 
 
@@ -589,33 +587,34 @@ def publish_mlflow_projection(
     if not isinstance(projection, MlflowProjection):
         raise TypeError("projection must be MlflowProjection")
     fingerprint = projection.tags[_FINGERPRINT_TAG]
-    experiment_id = _resolve_experiment_id(client, experiment_name)
-    published = _find_published_run(client, experiment_id, projection)
-    if published is not None and published.info.status == "FINISHED":
-        return MlflowPublication(
-            created=False,
-            experiment_id=experiment_id,
-            experiment_name=experiment_name,
-            projection_sha256=fingerprint,
-            run_id=published.info.run_id,
-            status="already_published",
-        )
-    if published is None:
-        run_id = _create_run(client, experiment_id, projection)
-    else:
-        run_id = published.info.run_id
-    try:
-        _log_metrics(client, run_id, projection.metrics)
-        _log_artifacts(client, run_id, projection.artifacts)
-    except BaseException:
-        _terminate_run_as_failed(client, run_id)
-        raise
-    # A finalize failure is an uncertain outcome: set_terminated can commit
-    # FINISHED before its response is lost, and a follow-up FAILED can still
-    # apply to that completed run, hiding it from the idempotent match above
-    # so the next publish creates a duplicate. Leave the run untouched; the
-    # next publish resumes it (RUNNING) or confirms it (FINISHED).
-    _finalize_run(client, run_id)
+    with mlflow_redirects_disabled():
+        experiment_id = _resolve_experiment_id(client, experiment_name)
+        published = _find_published_run(client, experiment_id, projection)
+        if published is not None and published.info.status == "FINISHED":
+            return MlflowPublication(
+                created=False,
+                experiment_id=experiment_id,
+                experiment_name=experiment_name,
+                projection_sha256=fingerprint,
+                run_id=published.info.run_id,
+                status="already_published",
+            )
+        if published is None:
+            run_id = _create_run(client, experiment_id, projection)
+        else:
+            run_id = published.info.run_id
+        try:
+            _log_metrics(client, run_id, projection.metrics)
+            _log_artifacts(client, run_id, projection.artifacts)
+        except BaseException:
+            _terminate_run_as_failed(client, run_id)
+            raise
+        # A finalize failure is an uncertain outcome: set_terminated can commit
+        # FINISHED before its response is lost, and a follow-up FAILED can still
+        # apply to that completed run, hiding it from the idempotent match above
+        # so the next publish creates a duplicate. Leave the run untouched; the
+        # next publish resumes it (RUNNING) or confirms it (FINISHED).
+        _finalize_run(client, run_id)
     return MlflowPublication(
         created=published is None,
         experiment_id=experiment_id,
