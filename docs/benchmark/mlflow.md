@@ -57,11 +57,30 @@ artifact URIs and hostless `mlflow-artifacts:` paths (which proxy through the
 verified tracking endpoint) are accepted, as are local file destinations;
 plain `http`, `mlflow-artifacts://other-host` URIs that would repoint uploads
 at a different origin, and other remote schemes fail with
-`unsafe_artifact_uri`. Presigned multipart uploads are disabled for the
-publish (`MLFLOW_ENABLE_PROXY_MULTIPART_UPLOAD=false`) so no file part can be
-sent to a server-issued URL that skips these checks, and the uploaded files
-are re-listed afterward so an unanswered redirect cannot pass as a
-successful upload.
+`unsafe_artifact_uri`. A `file:` URI carrying an authority
+(`file://host/share`) or a `//host`/`\\host` path form is also rejected —
+those are network shares (MLflow maps them to Windows UNC paths), not local
+destinations.
+
+That check gates the URI the server reports when the run is created or found;
+it is **not** bound to the requests MLflow makes afterward. MLflow resolves
+the upload and listing destination separately — it can re-read the run's
+`artifact_uri` per call and caches artifact repositories per run — so a
+server that changed a run's artifact destination mid-publish could route
+artifacts or credentials somewhere the check never saw. The TLS-verified
+tracking server is trusted to return a stable artifact destination for the
+duration of a publish; for this DagsHub-first workflow that trust is an
+accepted boundary, not an enforced guarantee.
+
+Presigned multipart uploads are disabled for the publish
+(`MLFLOW_ENABLE_PROXY_MULTIPART_UPLOAD=false`) so no file part can be sent to
+a server-issued URL that skips these checks. After upload, each report is
+downloaded back and compared byte-for-byte with the fingerprinted snapshot:
+MLflow's artifact PUTs treat an unfollowed 3xx response as a successful
+upload, and name/size listing alone cannot tell a swallowed upload apart
+from a same-named leftover — only the served bytes distinguish them. A
+missing or mismatched artifact fails the publish with
+`artifact_upload_failed`.
 
 ## Usage
 

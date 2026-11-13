@@ -472,10 +472,11 @@ class _FakeClient:
         create_error: Exception | None = None,
         log_batch_error: Exception | None = None,
         artifact_error: Exception | None = None,
-        list_artifact_error: Exception | None = None,
+        download_artifact_error: Exception | None = None,
         finalize_error: Exception | None = None,
         artifact_uri: str = "https://artifacts.example.com",
-        listed_artifacts: list | None = None,
+        stored_artifacts: dict[str, bytes] | None = None,
+        swallow_artifact_uploads: bool = False,
     ) -> None:
         self.page = page
         self.has_experiment = has_experiment
@@ -485,10 +486,11 @@ class _FakeClient:
         self.create_error = create_error
         self.log_batch_error = log_batch_error
         self.artifact_error = artifact_error
-        self.list_artifact_error = list_artifact_error
+        self.download_artifact_error = download_artifact_error
         self.finalize_error = finalize_error
         self.artifact_uri = artifact_uri
-        self.listed_artifacts = listed_artifacts
+        self.stored_artifacts = dict(stored_artifacts or {})
+        self.swallow_artifact_uploads = swallow_artifact_uploads
         self.events: list[tuple] = []
         self.created_experiment_names: list[str] = []
         self.searches: list[dict] = []
@@ -561,24 +563,21 @@ class _FakeClient:
         self.multipart_env.append(os.environ.get("MLFLOW_ENABLE_PROXY_MULTIPART_UPLOAD"))
         self._fire("artifact_error")
         self.logged_artifacts.append((run_id, str(local_path), artifact_path))
-        self.logged_artifact_bytes.append(Path(local_path).read_bytes())
+        content = Path(local_path).read_bytes()
+        self.logged_artifact_bytes.append(content)
+        # An unfollowed 3xx is a successful PUT that stored nothing; the
+        # swallow flag reproduces that gap for the post-upload verification.
+        if not self.swallow_artifact_uploads:
+            self.stored_artifacts[f"{artifact_path}/{Path(local_path).name}"] = content
 
-    def list_artifacts(self, run_id: str, path=None):
-        self.events.append(("list_artifacts", run_id))
+    def download_artifacts(self, run_id: str, path, dst_path=None):
+        self.events.append(("download_artifacts", run_id))
         self.redirects_env.append(os.environ.get("MLFLOW_ALLOW_HTTP_REDIRECTS"))
         self.multipart_env.append(os.environ.get("MLFLOW_ENABLE_PROXY_MULTIPART_UPLOAD"))
-        self._fire("list_artifact_error")
-        if self.listed_artifacts is not None:
-            return self.listed_artifacts
-        return [
-            SimpleNamespace(
-                path=f"{artifact_path}/{Path(local_path).name}",
-                file_size=len(content),
-            )
-            for (_, local_path, artifact_path), content in zip(
-                self.logged_artifacts, self.logged_artifact_bytes
-            )
-        ]
+        self._fire("download_artifact_error")
+        target = Path(dst_path) / Path(path).name
+        target.write_bytes(self.stored_artifacts[path])
+        return str(target)
 
     def set_terminated(self, run_id: str, status=None):
         self.events.append(("set_terminated", run_id, status))
@@ -954,7 +953,11 @@ def test_publish_success_records_client_surface_in_order(
         "log_artifact",
         "log_artifact",
         "log_artifact",
-        "list_artifacts",
+        "download_artifacts",
+        "download_artifacts",
+        "download_artifacts",
+        "download_artifacts",
+        "download_artifacts",
         "set_terminated",
     ]
     assert client.searches[0]["filter_string"] == build_matching_runs_filter(projection.tags)
@@ -1109,6 +1112,13 @@ def test_publish_artifact_failure_terminates_new_run_as_failed(
         "ftp://host.example/store",
         "runs:/other-run/artifacts",
         "models:/model/1",
+        # A file: authority or //-/\\-prefixed path is a network share, not a
+        # local destination — mlflow maps file://host/share to a Windows UNC.
+        "file://fileserver.example/share/0/run/artifacts",
+        "file://fileserver.example/share",
+        "file:////fileserver.example/share",
+        "//fileserver.example/share/artifacts",
+        "\\\\fileserver.example\\share\\artifacts",
         # Malformed URIs fail parsing outright.
         "https://[bad",
         # An empty destination resolves to a local root; it is not a valid one.
@@ -1150,6 +1160,7 @@ def test_publish_rejects_unsafe_artifact_uri_on_resumed_run(
         "https://artifacts.example.com:8443/base/path",
         "mlflow-artifacts:/0/run-new/artifacts",
         "file:///tmp/mlruns/0/run-new/artifacts",
+        "file://localhost/tmp/mlruns/0/run-new/artifacts",
         "mlruns/0/run-new/artifacts",
     ],
 )
@@ -1184,61 +1195,70 @@ def test_publish_restores_proxy_multipart_env(
     assert os.environ["MLFLOW_ENABLE_PROXY_MULTIPART_UPLOAD"] == "true"
 
 
-def test_publish_fails_when_uploaded_artifact_is_not_listed(
+def test_publish_fails_when_uploaded_artifact_is_not_served(
     tmp_path: Path, mlflow_entities_stub: type
 ) -> None:
     # An unfollowed 3xx passes mlflow's raise_for_status as "uploaded" while
-    # nothing was stored; the post-upload listing must catch the gap.
-    client = _FakeClient(
-        _FakePage([]),
-        listed_artifacts=[
-            SimpleNamespace(path=f"{REPORT_ARTIFACT_PATH}/summary.json", file_size=None)
-        ],
-    )
+    # nothing was stored; the post-upload readback must catch the gap.
+    client = _FakeClient(_FakePage([]), swallow_artifact_uploads=True)
     with pytest.raises(MlflowPublicationError) as raised:
         _publish(_publisher_projection(tmp_path), client)
     assert raised.value.code == "artifact_upload_failed"
     assert client.terminated == [("run-new", "FAILED")]
 
 
-def test_publish_fails_when_listed_artifact_size_mismatches(
+def test_publish_fails_when_swallowed_upload_leaves_stale_artifacts(
     tmp_path: Path, mlflow_entities_stub: type
 ) -> None:
+    # Resumed runs legitimately carry leftovers: an unfollowed 3xx plus
+    # same-named same-sized files with different bytes must not publish —
+    # name/size listing cannot distinguish that from a landed upload.
+    projection = _publisher_projection(tmp_path)
+    fingerprint = projection.tags["crux.projection_sha256"]
+    stale = {
+        f"{REPORT_ARTIFACT_PATH}/{name}": b"!" * len(ARTIFACT_BYTES[name])
+        for name in REPORT_ARTIFACT_NAMES
+    }
     client = _FakeClient(
-        _FakePage([]),
-        listed_artifacts=[
-            SimpleNamespace(path=f"{REPORT_ARTIFACT_PATH}/{name}", file_size=0)
-            for name in REPORT_ARTIFACT_NAMES
-        ],
+        _FakePage([_matching_run(fingerprint, "RUNNING")]),
+        stored_artifacts=stale,
+        swallow_artifact_uploads=True,
     )
     with pytest.raises(MlflowPublicationError) as raised:
-        _publish(_publisher_projection(tmp_path), client)
+        _publish(projection, client)
     assert raised.value.code == "artifact_upload_failed"
-    assert client.terminated == [("run-new", "FAILED")]
+    assert client.terminated == [("run-existing", "FAILED")]
 
 
-def test_publish_list_artifacts_failure_bounds_code(
+def test_publish_accepts_swallowed_upload_when_bytes_already_stored(
     tmp_path: Path, mlflow_entities_stub: type
 ) -> None:
-    client = _FakeClient(_FakePage([]), list_artifact_error=OSError("boom"))
+    # A swallowed upload whose bytes are already served — e.g. an earlier
+    # attempt stored them — is a complete publish, not a failure.
+    projection = _publisher_projection(tmp_path)
+    fingerprint = projection.tags["crux.projection_sha256"]
+    stored = {
+        f"{REPORT_ARTIFACT_PATH}/{name}": ARTIFACT_BYTES[name] for name in REPORT_ARTIFACT_NAMES
+    }
+    client = _FakeClient(
+        _FakePage([_matching_run(fingerprint, "RUNNING")]),
+        stored_artifacts=stored,
+        swallow_artifact_uploads=True,
+    )
+    result = _publish(projection, client)
+    assert result.status == "published"
+    assert result.created is False
+
+
+def test_publish_download_artifacts_failure_bounds_code(
+    tmp_path: Path, mlflow_entities_stub: type
+) -> None:
+    client = _FakeClient(_FakePage([]), download_artifact_error=OSError("boom"))
     with pytest.raises(MlflowPublicationError) as raised:
         _publish(_publisher_projection(tmp_path), client)
     assert raised.value.code == "artifact_upload_failed"
     assert client.terminated == [("run-new", "FAILED")]
     assert isinstance(raised.value.__cause__, OSError)
-
-
-def test_publish_accepts_listing_without_reported_sizes(
-    tmp_path: Path, mlflow_entities_stub: type
-) -> None:
-    client = _FakeClient(
-        _FakePage([]),
-        listed_artifacts=[
-            SimpleNamespace(path=f"{REPORT_ARTIFACT_PATH}/{name}", file_size=None)
-            for name in REPORT_ARTIFACT_NAMES
-        ],
-    )
-    assert _publish(_publisher_projection(tmp_path), client).status == "published"
 
 
 def test_publish_finalize_failure_leaves_run_status_unchanged(

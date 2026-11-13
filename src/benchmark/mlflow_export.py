@@ -389,7 +389,10 @@ def _validate_artifact_uri(raw_uri: str | None) -> None:
     ``mlflow-artifacts://host`` URI repoints uploads at an arbitrary host.
     Hostless ``mlflow-artifacts:`` paths stay on the already-verified tracking
     endpoint, verified-clean ``https`` stays on TLS, and local file
-    destinations never reach the network.  Anything else is rejected.
+    destinations never reach the network. A ``file`` authority or a
+    ``//host``/``\\\\host`` path is not a local destination — mlflow maps
+    ``file://host/share`` to a Windows UNC share — so only authority-free and
+    ``localhost`` forms are accepted. Anything else is rejected.
     """
     if not raw_uri:
         raise MlflowPublicationError("unsafe_artifact_uri")
@@ -399,6 +402,10 @@ def _validate_artifact_uri(raw_uri: str | None) -> None:
         raise MlflowPublicationError("unsafe_artifact_uri") from error
     scheme = parts.scheme.lower()
     if scheme in ("", "file"):
+        if parts.netloc.lower() not in ("", "localhost") or parts.path.startswith(("//", "\\\\")):
+            raise MlflowPublicationError("unsafe_artifact_uri") from ValueError(
+                f"artifact URI is not an allowed destination: {raw_uri!r}"
+            )
         return
     if scheme == "mlflow-artifacts" and not parts.netloc:
         return
@@ -568,22 +575,32 @@ def _mlflow_proxy_multipart_disabled() -> Iterator[None]:
             os.environ[_MLFLOW_PROXY_MULTIPART_ENV] = previous
 
 
+def _served_artifact_bytes(
+    client: MlflowClient, run_id: str, remote_path: str, dst: str
+) -> bytes | None:
+    downloaded = Path(client.download_artifacts(run_id, remote_path, dst))
+    return downloaded.read_bytes() if downloaded.is_file() else None
+
+
 def _verify_uploaded_artifacts(client: MlflowClient, run_id: str, staged: list[Path]) -> None:
-    """Confirm every staged file is listed: mlflow's artifact PUTs treat an
-    unfollowed 3xx response as success, so a redirect that stored nothing
-    would otherwise publish a hollow run."""
-    remote = _bounded(
-        "artifact_upload_failed",
-        lambda: client.list_artifacts(run_id, REPORT_ARTIFACT_PATH),
-    )
-    remote_sizes = {info.path: getattr(info, "file_size", None) for info in remote}
-    for path in staged:
-        remote_path = f"{REPORT_ARTIFACT_PATH}/{path.name}"
-        if remote_path not in remote_sizes:
-            raise MlflowPublicationError("artifact_upload_failed")
-        remote_size = remote_sizes[remote_path]
-        if remote_size is not None and remote_size != path.stat().st_size:
-            raise MlflowPublicationError("artifact_upload_failed")
+    """Confirm the store serves back the exact bytes the fingerprint covers.
+
+    mlflow's artifact PUTs treat an unfollowed 3xx response as success, and a
+    same-named leftover file cannot be told from a fresh upload by name or
+    size — only the served bytes distinguish a stored upload from a swallowed
+    one, so each staged file is downloaded back and compared.
+    """
+    with tempfile.TemporaryDirectory(prefix="crux-mlflow-verify-") as dst:
+        for path in staged:
+            remote_path = f"{REPORT_ARTIFACT_PATH}/{path.name}"
+            served = _bounded(
+                "artifact_upload_failed",
+                lambda path=path, remote_path=remote_path: _served_artifact_bytes(
+                    client, run_id, remote_path, dst
+                ),
+            )
+            if served != path.read_bytes():
+                raise MlflowPublicationError("artifact_upload_failed")
 
 
 def _log_artifacts(
