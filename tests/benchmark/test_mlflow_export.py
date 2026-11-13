@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import math
 import os
+import posixpath
 import subprocess
 import sys
+import threading
 import types
 from dataclasses import replace
 from decimal import Decimal
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
 
@@ -1414,3 +1420,273 @@ def test_real_client_file_store_publication_roundtrip(
     assert second.created is False
     assert second.status == "already_published"
     assert second.run_id == first.run_id
+
+
+# --- Real-client HTTP coverage ---------------------------------------------
+#
+# The fake client above cannot reproduce an unfollowed 3xx: that behavior
+# lives in mlflow's own HTTP stack (allow_redirects off + raise_for_status
+# treats 3xx as success). This threaded stub serves the tracking REST routes
+# and the /api/2.0/mlflow-artifacts/artifacts proxy routes that the pinned
+# mlflow-skinny client's RestStore and HttpArtifactRepository actually call,
+# so the publish path runs end-to-end over real HTTP.
+
+_ARTIFACT_PROXY_ROUTE = "/api/2.0/mlflow-artifacts/artifacts"
+
+
+def _stub_experiment_json(name: str = "crux-benchmarks") -> dict:
+    return {
+        "experiment_id": "0",
+        "name": name,
+        "artifact_location": "mlflow-artifacts:/0",
+        "lifecycle_stage": "active",
+        "creation_time": "0",
+        "last_update_time": "0",
+    }
+
+
+def _stub_run_json(
+    run_id: str, status: str, artifact_uri: str, run_name: str, tags: dict[str, str]
+) -> dict:
+    return {
+        "info": {
+            "run_id": run_id,
+            "run_uuid": run_id,
+            "run_name": run_name,
+            "experiment_id": "0",
+            "user_id": "crux-test",
+            "status": status,
+            "start_time": "0",
+            "artifact_uri": artifact_uri,
+            "lifecycle_stage": "active",
+        },
+        "data": {
+            "metrics": [],
+            "params": [],
+            "tags": [{"key": key, "value": value} for key, value in tags.items()],
+        },
+    }
+
+
+class _StubMlflowState:
+    """Mutable store behind the threaded stub MLflow server."""
+
+    def __init__(
+        self,
+        experiment: dict,
+        runs: list[dict],
+        stored_artifacts: dict[str, bytes],
+        *,
+        swallow_artifact_puts: bool,
+    ) -> None:
+        self.experiment = experiment
+        self.runs = {run["info"]["run_id"]: run for run in runs}
+        self.artifacts = dict(stored_artifacts)
+        self.swallow_artifact_puts = swallow_artifact_puts
+        self.artifact_puts: list[str] = []
+        self.run_updates: list[dict] = []
+        self.metric_batches = 0
+
+
+class _StubMlflowHandler(BaseHTTPRequestHandler):
+    """Answer the exact requests a real MlflowClient issues during a publish."""
+
+    @property
+    def _state(self) -> _StubMlflowState:
+        return self.server.state
+
+    def log_message(self, *_args: object) -> None:
+        pass
+
+    def _send_json(self, payload: dict, status: int = 200) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _not_found(self) -> None:
+        self._send_json({"error_code": "RESOURCE_DOES_NOT_EXIST", "message": self.path}, status=404)
+
+    def do_GET(self) -> None:
+        parsed = urlsplit(self.path)
+        if parsed.path == "/api/2.0/mlflow/experiments/get-by-name":
+            name = parse_qs(parsed.query).get("experiment_name", [""])[0]
+            if self._state.experiment["name"] != name:
+                return self._not_found()
+            return self._send_json({"experiment": self._state.experiment})
+        if parsed.path == "/api/2.0/mlflow/runs/get":
+            run = self._state.runs.get(parse_qs(parsed.query).get("run_id", [""])[0])
+            if run is None:
+                return self._not_found()
+            return self._send_json({"run": run})
+        if parsed.path == _ARTIFACT_PROXY_ROUTE:
+            return self._list_artifacts(parse_qs(parsed.query).get("path", [""])[0].rstrip("/"))
+        if parsed.path.startswith(f"{_ARTIFACT_PROXY_ROUTE}/"):
+            return self._download_artifact(unquote(parsed.path[len(_ARTIFACT_PROXY_ROUTE) + 1 :]))
+        self._not_found()
+
+    def do_POST(self) -> None:
+        parsed = urlsplit(self.path)
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if parsed.path == "/api/2.0/mlflow/runs/search":
+            return self._send_json({"runs": list(self._state.runs.values()), "next_page_token": ""})
+        if parsed.path == "/api/2.0/mlflow/runs/log-batch":
+            self._state.metric_batches += 1
+            return self._send_json({})
+        if parsed.path == "/api/2.0/mlflow/runs/update":
+            payload = json.loads(body or b"{}")
+            self._state.run_updates.append(payload)
+            run = self._state.runs[payload["run_id"]]
+            run["info"]["status"] = payload["status"]
+            return self._send_json({"run_info": run["info"]})
+        self._not_found()
+
+    def do_PUT(self) -> None:
+        parsed = urlsplit(self.path)
+        if not parsed.path.startswith(f"{_ARTIFACT_PROXY_ROUTE}/"):
+            return self._not_found()
+        artifact_path = unquote(parsed.path[len(_ARTIFACT_PROXY_ROUTE) + 1 :])
+        data = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self._state.artifact_puts.append(artifact_path)
+        if self._state.swallow_artifact_puts:
+            # mlflow's artifact PUT treats an unfollowed 3xx as success; the
+            # bytes never reach the store.
+            self.send_response(307)
+            self.send_header("Location", "http://127.0.0.1:9/unfollowed")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self._state.artifacts[artifact_path] = data
+        self._send_json({})
+
+    def _list_artifacts(self, artifact_dir: str) -> None:
+        # The real proxy route returns FileInfo basenames of direct children.
+        artifacts = self._state.artifacts
+        if artifact_dir in artifacts:
+            return self._send_json(
+                {
+                    "files": [
+                        {
+                            "path": posixpath.basename(artifact_dir),
+                            "is_dir": False,
+                            "file_size": len(artifacts[artifact_dir]),
+                        }
+                    ]
+                }
+            )
+        prefix = f"{artifact_dir}/" if artifact_dir else ""
+        children: dict[str, tuple[bool, int]] = {}
+        for stored_path, blob in artifacts.items():
+            if stored_path.startswith(prefix):
+                head, _, tail = stored_path[len(prefix) :].partition("/")
+                children[head] = (bool(tail), len(blob))
+        if not children:
+            return self._not_found()
+        self._send_json(
+            {
+                "files": [
+                    {"path": name, "is_dir": is_dir, "file_size": 0 if is_dir else size}
+                    for name, (is_dir, size) in sorted(children.items())
+                ]
+            }
+        )
+
+    def _download_artifact(self, artifact_path: str) -> None:
+        blob = self._state.artifacts.get(artifact_path)
+        if blob is None:
+            return self._not_found()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(blob)))
+        self.end_headers()
+        self.wfile.write(blob)
+
+
+@contextlib.contextmanager
+def _stub_mlflow_server(state: _StubMlflowState):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _StubMlflowHandler)
+    server.state = state
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    )
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_real_client_publish_roundtrips_over_http_stub(tmp_path: Path) -> None:
+    pytest.importorskip("mlflow")
+    from mlflow import MlflowClient
+
+    report_dir = tmp_path / "report"
+    report_dir.mkdir()
+    _report_dir(report_dir, write_extra=False)
+    projection = build_mlflow_projection(_reports(), report_dir, scope="broad")
+    run_id = "run-http-live"
+    run = _stub_run_json(
+        run_id,
+        "RUNNING",
+        f"mlflow-artifacts:/0/{run_id}/artifacts",
+        projection.run_name,
+        {"crux.projection_sha256": projection.tags["crux.projection_sha256"]},
+    )
+    state = _StubMlflowState(_stub_experiment_json(), [run], {}, swallow_artifact_puts=False)
+    with _stub_mlflow_server(state) as tracking_uri:
+        client = MlflowClient(tracking_uri=tracking_uri)
+        result = publish_mlflow_projection(
+            projection, client=client, experiment_name="crux-benchmarks"
+        )
+        assert result.status == "published"
+        assert result.created is False
+        assert result.run_id == run_id
+        assert state.metric_batches == 1
+        assert [update["status"] for update in state.run_updates] == ["FINISHED"]
+        for name in REPORT_ARTIFACT_NAMES:
+            assert (
+                state.artifacts[f"0/{run_id}/artifacts/{REPORT_ARTIFACT_PATH}/{name}"]
+                == ARTIFACT_BYTES[name]
+            )
+        again = publish_mlflow_projection(
+            projection, client=client, experiment_name="crux-benchmarks"
+        )
+        assert again.status == "already_published"
+
+
+def test_real_client_publish_fails_when_artifact_put_redirects(tmp_path: Path) -> None:
+    pytest.importorskip("mlflow")
+    from mlflow import MlflowClient
+
+    report_dir = tmp_path / "report"
+    report_dir.mkdir()
+    _report_dir(report_dir, write_extra=False)
+    projection = build_mlflow_projection(_reports(), report_dir, scope="broad")
+    run_id = "run-http-3xx"
+    artifact_root = f"0/{run_id}/artifacts"
+    # A resumed run legitimately carries same-named same-sized leftovers; only
+    # the served bytes can tell them apart from a landed upload.
+    stale = {
+        f"{artifact_root}/{REPORT_ARTIFACT_PATH}/{name}": b"!" * len(ARTIFACT_BYTES[name])
+        for name in REPORT_ARTIFACT_NAMES
+    }
+    run = _stub_run_json(
+        run_id,
+        "RUNNING",
+        f"mlflow-artifacts:/{artifact_root}",
+        projection.run_name,
+        {"crux.projection_sha256": projection.tags["crux.projection_sha256"]},
+    )
+    state = _StubMlflowState(_stub_experiment_json(), [run], stale, swallow_artifact_puts=True)
+    with _stub_mlflow_server(state) as tracking_uri:
+        client = MlflowClient(tracking_uri=tracking_uri)
+        with pytest.raises(MlflowPublicationError) as raised:
+            publish_mlflow_projection(projection, client=client, experiment_name="crux-benchmarks")
+        assert raised.value.code == "artifact_upload_failed"
+        assert len(state.artifact_puts) == len(REPORT_ARTIFACT_NAMES)
+        assert state.artifacts == stale
+        assert [update["status"] for update in state.run_updates] == ["FAILED"]
