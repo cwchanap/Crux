@@ -1,0 +1,738 @@
+"""Projection of canonical cohort reports to MLflow data, plus its publisher.
+
+The ``mlflow`` package is never imported at module scope: this module projects
+one validated ``PublishedCohortReports`` plus its report directory into the
+complete MLflow-ready payload (tags, run name, canonical metrics, artifact
+digests, fingerprint), and publishes it through an injected low-level
+``MlflowClient`` with only function-local mlflow imports.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import math
+import os
+import tempfile
+import time
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from dataclasses import dataclass
+from decimal import Decimal
+from pathlib import Path
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Literal, TypeAlias, TypeVar, get_args
+from urllib.parse import urlsplit
+
+from src.benchmark.artifact_io import PublishedArtifact, read_regular_file_no_follow
+from src.benchmark.backend_identity import JsonValue, canonical_json_bytes, sha256_hex
+from src.benchmark.cohort_scoring import CohortIdentity, PopulationSummary
+from src.benchmark.reports import (
+    PublishedAggregate,
+    PublishedAggregateClass,
+    PublishedCohortReports,
+)
+from src.benchmark.taxonomy import CommonDrumClass
+
+PROJECTION_VERSION = "crux.mlflow-projection/v1"
+REPORT_ARTIFACT_PATH = "crux-reports"
+REPORT_ARTIFACT_NAMES = (
+    "summary.json",
+    "summary.md",
+    "items.csv",
+    "per_song.csv",
+    "per_class.csv",
+)
+REQUIRED_BASELINE_VIEWS = frozenset(
+    {
+        (30, "raw"),
+        (30, "aligned"),
+        (50, "raw"),
+        (50, "aligned"),
+        (100, "raw"),
+        (100, "aligned"),
+    }
+)
+COMMON_CLASSES = frozenset(get_args(CommonDrumClass))
+
+MlflowScope: TypeAlias = Literal["broad", "reviewed", "pilot"]
+MlflowMetricValue: TypeAlias = int | Decimal
+
+_FINGERPRINT_TAG = "crux.projection_sha256"
+_SEARCH_TAG_KEYS = ("crux.cohort_id", "crux.projection_version", "crux.scope")
+_DISTRIBUTION_STATS = ("minimum", "p10", "p25", "median", "p75", "p90", "maximum")
+
+
+class MlflowProjectionError(ValueError):
+    """Raised when canonical cohort reports cannot be projected for MLflow."""
+
+
+@dataclass(frozen=True)
+class MlflowProjection:
+    """One complete MLflow-ready projection of a published cohort report."""
+
+    run_name: str
+    tags: Mapping[str, str]
+    metrics: Mapping[str, MlflowMetricValue]
+    artifacts: tuple[PublishedArtifact, ...]
+
+
+def _view_suffix(tolerance_ms: int, mode: str) -> str:
+    return f"{tolerance_ms}ms.{mode}"
+
+
+def _project_decimal_metrics(
+    metrics: dict[str, MlflowMetricValue],
+    prefix: str,
+    suffix: str,
+    values: Mapping[str, Decimal | None],
+) -> None:
+    for name, value in values.items():
+        if value is not None:
+            metrics[f"{prefix}.{name}.{suffix}"] = value
+
+
+def _project_class_row(
+    metrics: dict[str, MlflowMetricValue],
+    row: PublishedAggregateClass,
+    suffix: str,
+) -> None:
+    if row.common_class not in COMMON_CLASSES:
+        raise MlflowProjectionError(f"unknown common class: {row.common_class}")
+    _project_decimal_metrics(
+        metrics,
+        f"class.{row.common_class}",
+        suffix,
+        {
+            "precision": row.metric.precision,
+            "recall": row.metric.recall,
+            "f1": row.metric.f1,
+        },
+    )
+    metrics[f"class.{row.common_class}.reference_support.{suffix}"] = row.reference_support
+    metrics[f"class.{row.common_class}.prediction_support.{suffix}"] = row.prediction_support
+
+
+def _project_aggregate(
+    metrics: dict[str, MlflowMetricValue],
+    row: PublishedAggregate,
+) -> None:
+    suffix = _view_suffix(row.tolerance_ms, row.mode)
+    _project_decimal_metrics(
+        metrics,
+        "event_micro",
+        suffix,
+        {name: getattr(row.event_micro, name) for name in ("precision", "recall", "f1")},
+    )
+    _project_decimal_metrics(metrics, "song_macro", suffix, {"f1": row.song_macro_f1})
+    _project_decimal_metrics(metrics, "class_macro", suffix, {"f1": row.class_macro_f1})
+    _project_decimal_metrics(
+        metrics,
+        "song_f1",
+        suffix,
+        {stat: getattr(row.song_f1_distribution, stat) for stat in _DISTRIBUTION_STATS},
+    )
+    for class_row in row.per_class:
+        _project_class_row(metrics, class_row, suffix)
+
+
+def _project_population(
+    metrics: dict[str, MlflowMetricValue],
+    population: PopulationSummary,
+) -> None:
+    metrics["population.total"] = population.total_count
+    metrics["population.success"] = population.success_count
+    metrics["population.failed"] = population.failed_count
+    metrics["population.skipped"] = population.skipped_count
+    metrics["population.quarantined"] = population.quarantined_count
+    for reason, count in population.reason_counts:
+        metrics[f"population.reason.{reason}"] = count
+
+
+def _identity_tags(identity: CohortIdentity, scope: MlflowScope) -> dict[str, str]:
+    return {
+        "crux.projection_version": PROJECTION_VERSION,
+        "crux.scope": scope,
+        "crux.cohort_id": identity.cohort_id,
+        "crux.backend_id": identity.backend_id,
+        "crux.model_id": identity.model_id,
+        "crux.model_lock_sha256": identity.model_lock_sha256,
+        "crux.backend_descriptor_sha256": identity.backend_descriptor_sha256,
+        "crux.input_view_id": identity.input_view_id,
+        "crux.reference_manifest_sha256": identity.reference_manifest_sha256,
+        "crux.reference_timing_version": identity.reference_timing_version,
+        "crux.taxonomy_version": identity.taxonomy_version,
+        "crux.lane_map_version": identity.lane_map_version,
+        "crux.prediction_map_version": identity.prediction_map_version,
+        "crux.scoring_version": identity.scoring_version,
+    }
+
+
+def _read_report_artifacts(report_dir: Path) -> tuple[PublishedArtifact, ...]:
+    artifacts: list[PublishedArtifact] = []
+    for name in REPORT_ARTIFACT_NAMES:
+        path = report_dir / name
+        try:
+            content = read_regular_file_no_follow(path)
+        except OSError as error:
+            raise MlflowProjectionError(f"cannot read report artifact {name}") from error
+        artifacts.append(PublishedArtifact(path=path, sha256=sha256_hex(content)))
+    return tuple(artifacts)
+
+
+def build_mlflow_projection(
+    reports: PublishedCohortReports,
+    report_dir: Path,
+    *,
+    scope: MlflowScope,
+) -> MlflowProjection:
+    """Project one validated cohort report into deterministic MLflow data."""
+    if not isinstance(reports, PublishedCohortReports):
+        raise TypeError("reports must be PublishedCohortReports")
+    if not isinstance(report_dir, Path):
+        raise TypeError("report_dir must be a Path")
+    actual = {(row.tolerance_ms, row.mode) for row in reports.aggregates}
+    if not REQUIRED_BASELINE_VIEWS <= actual:
+        raise MlflowProjectionError("required benchmark views are missing")
+
+    metrics: dict[str, MlflowMetricValue] = {}
+    for row in reports.aggregates:
+        _project_aggregate(metrics, row)
+    _project_population(metrics, reports.population)
+
+    artifacts = _read_report_artifacts(report_dir)
+    base_tags = _identity_tags(reports.identity, scope)
+    if any("'" in base_tags[name] for name in _SEARCH_TAG_KEYS):
+        raise MlflowProjectionError("search identity contains an unrepresentable quote")
+    run_name = (
+        f"{scope}-{reports.identity.model_id}-{reports.identity.input_view_id}"
+        f"-{reports.identity.cohort_id}"
+    )
+    payload: JsonValue = {
+        "projection_version": PROJECTION_VERSION,
+        "scope": scope,
+        "run_name": run_name,
+        "tags": base_tags,
+        "metrics": metrics,
+        "artifacts": [
+            {"path": artifact.path.name, "sha256": artifact.sha256} for artifact in artifacts
+        ],
+    }
+    tags = dict(base_tags)
+    tags[_FINGERPRINT_TAG] = sha256_hex(canonical_json_bytes(payload))
+    return MlflowProjection(
+        run_name=run_name,
+        tags=MappingProxyType(tags),
+        metrics=MappingProxyType(metrics),
+        artifacts=artifacts,
+    )
+
+
+@contextlib.contextmanager
+def staged_report_snapshot(report_dir: Path) -> Iterator[Path]:
+    """Copy the five canonical report artifacts into one private snapshot.
+
+    ``write_cohort_reports`` replaces report files in place, so loading a
+    report and hashing its artifacts as two separate reads can observe
+    different generations of the same directory.  Loading, projection, and
+    the upload-time digest re-verify must therefore all run against this
+    staged copy, whose bytes cannot change underneath them.
+
+    The copy itself is not atomic against a concurrent
+    ``write_cohort_reports``: regeneration that interleaves with these
+    reads can still produce a mixed-generation snapshot that validation
+    accepts (summary aggregates are not recomputed against the CSVs).
+    Report generation and publication must therefore run serially, same
+    as the publish calls themselves.
+    """
+    if not isinstance(report_dir, Path):
+        raise TypeError("report_dir must be a Path")
+    with tempfile.TemporaryDirectory(prefix="crux-mlflow-reports-") as stage:
+        snapshot_dir = Path(stage)
+        for name in REPORT_ARTIFACT_NAMES:
+            content = read_regular_file_no_follow(report_dir / name)
+            (snapshot_dir / name).write_bytes(content)
+        yield snapshot_dir
+
+
+__all__ = [
+    "MATCHING_RUN_LIMIT",
+    "PROJECTION_VERSION",
+    "REPORT_ARTIFACT_NAMES",
+    "REPORT_ARTIFACT_PATH",
+    "REQUIRED_BASELINE_VIEWS",
+    "MlflowErrorCode",
+    "MlflowMetricValue",
+    "MlflowProjection",
+    "MlflowProjectionError",
+    "MlflowPublication",
+    "MlflowScope",
+    "build_matching_runs_filter",
+    "mlflow_insecure_tls_configured",
+    "mlflow_redirects_disabled",
+    "publish_mlflow_projection",
+    "staged_report_snapshot",
+    "validate_tracking_uri",
+]
+
+
+# --- Publication against a real MLflow client (all mlflow imports are lazy) ---
+
+MATCHING_RUN_LIMIT = 1000
+
+MlflowErrorCode: TypeAlias = Literal[
+    "missing_optional_dependency",
+    "invalid_config",
+    "unsafe_artifact_uri",
+    "experiment_access_failed",
+    "run_search_failed",
+    "run_create_failed",
+    "metric_log_failed",
+    "artifact_upload_failed",
+    "run_finalize_failed",
+    "run_conflict",
+]
+
+_MLFLOW_ERROR_MESSAGES: Mapping[MlflowErrorCode, str] = MappingProxyType(
+    {
+        "missing_optional_dependency": "mlflow is not installed; install the 'mlflow' extra",
+        "invalid_config": (
+            "tracking URI must be an https URL with a hostname and no credentials,"
+            " query, or fragment, and certificate verification must stay enabled"
+        ),
+        "unsafe_artifact_uri": (
+            "artifact destination must be a verified https URL, a server-proxied"
+            " mlflow-artifacts path, or a local file destination"
+        ),
+        "experiment_access_failed": "could not resolve or create an active MLflow experiment",
+        "run_search_failed": "could not search for matching MLflow runs",
+        "run_create_failed": "could not create the MLflow run",
+        "metric_log_failed": "could not log MLflow metrics",
+        "artifact_upload_failed": "could not upload report artifacts to MLflow",
+        "run_finalize_failed": "could not finalize the MLflow run",
+        "run_conflict": "conflicting MLflow runs exist for this projection identity",
+    }
+)
+
+_RETRIABLE_RUN_STATUSES = frozenset({"FAILED", "KILLED"})
+_RESUMABLE_RUN_STATUSES = frozenset({"RUNNING", "SCHEDULED"})
+
+if TYPE_CHECKING:
+    from mlflow.entities import Run
+    from mlflow.tracking import MlflowClient
+
+_T = TypeVar("_T")
+
+
+class MlflowPublicationError(Exception):
+    """Publication failure with a bounded code; vendor detail stays in the cause."""
+
+    def __init__(self, code: MlflowErrorCode) -> None:
+        self.code: MlflowErrorCode = code
+        self.message = _MLFLOW_ERROR_MESSAGES[code]
+        super().__init__(code)
+
+    def __str__(self) -> str:
+        return self.message
+
+
+@dataclass(frozen=True)
+class MlflowPublication:
+    """Outcome of one publish call, shaped for direct CLI printing."""
+
+    created: bool
+    experiment_id: str
+    experiment_name: str
+    projection_sha256: str
+    run_id: str
+    status: Literal["published", "already_published"]
+
+
+_MLFLOW_INSECURE_TLS_ENV_VAR = "MLFLOW_TRACKING_INSECURE_TLS"
+
+
+def mlflow_insecure_tls_configured() -> bool:
+    """True when MLFLOW_TRACKING_INSECURE_TLS disables TLS verification."""
+    return os.environ.get(_MLFLOW_INSECURE_TLS_ENV_VAR, "").lower() in ("true", "1")
+
+
+def validate_tracking_uri(raw_uri: str, *, insecure_tls: bool = False) -> str:
+    """Accept only an https MLflow/DagsHub tracking URI safe for CLI use.
+
+    HTTPS is required unconditionally: requests attaches ``~/.netrc``
+    credentials for the target host without mlflow's involvement, so no
+    credential check can prove nothing sensitive would go out over plaintext.
+    Disabled certificate verification is rejected the same way.
+    """
+    try:
+        parts = urlsplit(raw_uri)
+    except ValueError as error:
+        raise MlflowPublicationError("invalid_config") from error
+    invalid = (
+        parts.scheme.lower() != "https"
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+        or bool(parts.query)
+        or bool(parts.fragment)
+        or insecure_tls
+    )
+    if invalid:
+        raise MlflowPublicationError("invalid_config")
+    return raw_uri
+
+
+def _validate_artifact_uri(raw_uri: str | None) -> None:
+    """Gate the run's server-provided artifact destination before upload.
+
+    ``client.log_artifact`` re-resolves ``run.info.artifact_uri`` per call: an
+    ``http`` URI puts file bytes and any resolvable credentials (environment
+    variables, ``~/.netrc``) on the wire in plaintext, and an
+    ``mlflow-artifacts://host`` URI repoints uploads at an arbitrary host.
+    Hostless ``mlflow-artifacts:`` paths stay on the already-verified tracking
+    endpoint, verified-clean ``https`` stays on TLS, and local file
+    destinations never reach the network. A ``file`` authority or a
+    ``//host``/``\\\\host`` path is not a local destination — mlflow maps
+    ``file://host/share`` to a Windows UNC share — so only authority-free and
+    ``localhost`` forms are accepted. Anything else is rejected.
+    """
+    if not raw_uri:
+        raise MlflowPublicationError("unsafe_artifact_uri")
+    try:
+        parts = urlsplit(raw_uri)
+    except ValueError as error:
+        raise MlflowPublicationError("unsafe_artifact_uri") from error
+    scheme = parts.scheme.lower()
+    if scheme in ("", "file"):
+        if parts.netloc.lower() not in ("", "localhost") or parts.path.startswith(("//", "\\\\")):
+            raise MlflowPublicationError("unsafe_artifact_uri") from ValueError(
+                f"artifact URI is not an allowed destination: {raw_uri!r}"
+            )
+        return
+    if scheme == "mlflow-artifacts" and not parts.netloc:
+        return
+    if (
+        scheme == "https"
+        and parts.hostname
+        and parts.username is None
+        and parts.password is None
+        and not parts.query
+        and not parts.fragment
+    ):
+        return
+    raise MlflowPublicationError("unsafe_artifact_uri") from ValueError(
+        f"artifact URI is not an allowed destination: {raw_uri!r}"
+    )
+
+
+def build_matching_runs_filter(tags: Mapping[str, str]) -> str:
+    """Build an MLflow filter over quote-free search-identity tag values.
+
+    MLflow strips the surrounding quotes but never unescapes the value, so a
+    tag value containing a single quote is rejected at projection time.
+    """
+    clauses = [f"tags.\"{name}\" = '{tags[name]}'" for name in _SEARCH_TAG_KEYS]
+    return " and ".join(clauses)
+
+
+def _bounded(code: MlflowErrorCode, operation: Callable[[], _T]) -> _T:
+    """Run one vendor call and bound any failure into the fixed error code."""
+    try:
+        return operation()
+    except MlflowPublicationError:
+        raise
+    except Exception as error:
+        raise MlflowPublicationError(code) from error
+
+
+def _classify_matching_runs(runs: Iterable[Run], fingerprint: str) -> Run | None:
+    finished: list[Run] = []
+    resumable: list[Run] = []
+    for run in runs:
+        status = run.info.status
+        if status in _RETRIABLE_RUN_STATUSES:
+            continue
+        if run.data.tags.get(_FINGERPRINT_TAG) != fingerprint:
+            raise MlflowPublicationError("run_conflict")
+        if status == "FINISHED":
+            finished.append(run)
+        elif status in _RESUMABLE_RUN_STATUSES:
+            resumable.append(run)
+        else:
+            raise MlflowPublicationError("run_conflict")
+    if len(finished) > 1 or (not finished and len(resumable) > 1):
+        raise MlflowPublicationError("run_conflict")
+    if finished:
+        return finished[0]
+    return resumable[0] if resumable else None
+
+
+def _resolve_experiment_id(client: MlflowClient, experiment_name: str) -> str:
+    def existing() -> str | None:
+        experiment = client.get_experiment_by_name(experiment_name)
+        if experiment is None:
+            return None
+        if experiment.lifecycle_stage == "deleted":
+            raise MlflowPublicationError("experiment_access_failed")
+        return experiment.experiment_id
+
+    experiment_id = _bounded("experiment_access_failed", existing)
+    if experiment_id is not None:
+        return experiment_id
+    return _bounded("experiment_access_failed", lambda: client.create_experiment(experiment_name))
+
+
+def _find_published_run(
+    client: MlflowClient, experiment_id: str, projection: MlflowProjection
+) -> Run | None:
+    filter_string = build_matching_runs_filter(projection.tags)
+
+    def search():
+        return client.search_runs(
+            [experiment_id], filter_string=filter_string, max_results=MATCHING_RUN_LIMIT
+        )
+
+    runs = _bounded("run_search_failed", search)
+    if runs.token:
+        raise MlflowPublicationError("run_conflict")
+    return _classify_matching_runs(runs, projection.tags[_FINGERPRINT_TAG])
+
+
+def _create_run(client: MlflowClient, experiment_id: str, projection: MlflowProjection) -> Run:
+    def create():
+        return client.create_run(
+            experiment_id, tags=dict(projection.tags), run_name=projection.run_name
+        )
+
+    return _bounded("run_create_failed", create)
+
+
+# mlflow's RestStore rejects log_batch calls carrying more than this many
+# entities; valid reports with extra canonical tolerances can exceed it.
+_LOG_BATCH_METRIC_LIMIT = 1000
+
+
+def _log_metrics(
+    client: MlflowClient, run_id: str, metrics: Mapping[str, MlflowMetricValue]
+) -> None:
+    def log() -> None:
+        from mlflow.entities import Metric
+
+        timestamp_ms = int(time.time() * 1000)
+        entries = []
+        for name, value in metrics.items():
+            number = float(value)
+            if not math.isfinite(number):
+                raise MlflowPublicationError("metric_log_failed")
+            entries.append(Metric(name, number, timestamp_ms, 0))
+        for offset in range(0, len(entries), _LOG_BATCH_METRIC_LIMIT):
+            client.log_batch(
+                run_id,
+                metrics=entries[offset : offset + _LOG_BATCH_METRIC_LIMIT],
+                synchronous=True,
+            )
+
+    _bounded("metric_log_failed", log)
+
+
+def _stage_verified_artifacts(artifacts: tuple[PublishedArtifact, ...], stage: Path) -> list[Path]:
+    staged: list[Path] = []
+    for artifact in artifacts:
+        try:
+            content = read_regular_file_no_follow(artifact.path)
+            if sha256_hex(content) != artifact.sha256:
+                raise MlflowPublicationError("artifact_upload_failed")
+            path = stage / artifact.path.name
+            path.write_bytes(content)
+        except OSError as error:
+            raise MlflowPublicationError("artifact_upload_failed") from error
+        staged.append(path)
+    return staged
+
+
+_MLFLOW_PROXY_MULTIPART_ENV = "MLFLOW_ENABLE_PROXY_MULTIPART_UPLOAD"
+
+
+@contextlib.contextmanager
+def _mlflow_proxy_multipart_disabled() -> Iterator[None]:
+    """Force artifact uploads through the verified https endpoint only.
+
+    mlflow's artifact repositories negotiate presigned multipart uploads:
+    ``mlflow-artifacts:`` repositories auto-enable them from the server's
+    ``/server-info`` capabilities, and the part uploads then go through raw
+    ``requests.put`` calls that honor neither the artifact-URI scheme check
+    nor ``MLFLOW_ALLOW_HTTP_REDIRECTS``. Setting this env var disables the
+    presigned path for both repository kinds so every artifact byte uses
+    mlflow's ``http_request`` against a destination already vetted by
+    ``_validate_artifact_uri``.
+    """
+    previous = os.environ.get(_MLFLOW_PROXY_MULTIPART_ENV)
+    os.environ[_MLFLOW_PROXY_MULTIPART_ENV] = "false"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(_MLFLOW_PROXY_MULTIPART_ENV, None)
+        else:
+            os.environ[_MLFLOW_PROXY_MULTIPART_ENV] = previous
+
+
+def _served_artifact_bytes(
+    client: MlflowClient, run_id: str, remote_path: str, dst: str
+) -> bytes | None:
+    downloaded = Path(client.download_artifacts(run_id, remote_path, dst))
+    return downloaded.read_bytes() if downloaded.is_file() else None
+
+
+def _verify_uploaded_artifacts(client: MlflowClient, run_id: str, staged: list[Path]) -> None:
+    """Confirm the store serves back the exact bytes the fingerprint covers.
+
+    mlflow's artifact PUTs treat an unfollowed 3xx response as success, and a
+    same-named leftover file cannot be told from a fresh upload by name or
+    size — only the served bytes distinguish a stored upload from a swallowed
+    one, so each staged file is downloaded back and compared.
+    """
+    with tempfile.TemporaryDirectory(prefix="crux-mlflow-verify-") as dst:
+        for path in staged:
+            remote_path = f"{REPORT_ARTIFACT_PATH}/{path.name}"
+            served = _bounded(
+                "artifact_upload_failed",
+                lambda path=path, remote_path=remote_path: _served_artifact_bytes(
+                    client, run_id, remote_path, dst
+                ),
+            )
+            if served != path.read_bytes():
+                raise MlflowPublicationError("artifact_upload_failed")
+
+
+def _log_artifacts(
+    client: MlflowClient, run_id: str, artifacts: tuple[PublishedArtifact, ...]
+) -> None:
+    # Upload the bytes the fingerprint covers, not a fresh read of the path.
+    with (
+        _mlflow_proxy_multipart_disabled(),
+        tempfile.TemporaryDirectory(prefix="crux-mlflow-artifacts-") as stage,
+    ):
+        staged = _stage_verified_artifacts(artifacts, Path(stage))
+        for path in staged:
+            _bounded(
+                "artifact_upload_failed",
+                lambda path=path: client.log_artifact(run_id, str(path), REPORT_ARTIFACT_PATH),
+            )
+        _verify_uploaded_artifacts(client, run_id, staged)
+
+
+_MLFLOW_ALLOW_REDIRECTS_ENV = "MLFLOW_ALLOW_HTTP_REDIRECTS"
+
+
+@contextlib.contextmanager
+def mlflow_redirects_disabled() -> Iterator[None]:
+    """Force mlflow's HTTP stack to not follow redirects.
+
+    Requests re-resolves ``~/.netrc`` credentials for every redirect target,
+    so a redirect could carry Basic auth to another origin or onto plaintext
+    HTTP. mlflow reads this env var per request; with redirects off a 3xx
+    surfaces as a bounded failure instead of a silent credential handoff.
+    """
+    previous = os.environ.get(_MLFLOW_ALLOW_REDIRECTS_ENV)
+    os.environ[_MLFLOW_ALLOW_REDIRECTS_ENV] = "false"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(_MLFLOW_ALLOW_REDIRECTS_ENV, None)
+        else:
+            os.environ[_MLFLOW_ALLOW_REDIRECTS_ENV] = previous
+
+
+_MLFLOW_SUPPRESS_URL_ENV = "MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT"
+
+
+@contextlib.contextmanager
+def _suppress_mlflow_url_output() -> Iterator[None]:
+    """Keep RestStore ``set_terminated`` URL prints off the CLI's JSON stdout."""
+    previous = os.environ.get(_MLFLOW_SUPPRESS_URL_ENV)
+    os.environ[_MLFLOW_SUPPRESS_URL_ENV] = "true"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(_MLFLOW_SUPPRESS_URL_ENV, None)
+        else:
+            os.environ[_MLFLOW_SUPPRESS_URL_ENV] = previous
+
+
+def _finalize_run(client: MlflowClient, run_id: str) -> None:
+    def terminate() -> None:
+        with _suppress_mlflow_url_output():
+            client.set_terminated(run_id, "FINISHED")
+
+    _bounded("run_finalize_failed", terminate)
+
+
+def _terminate_run_as_failed(client: MlflowClient, run_id: str) -> None:
+    # Best-effort cleanup only; the original error must win. A cleanup that
+    # also fails leaves a live run that the next publish resumes.
+    try:
+        with _suppress_mlflow_url_output():
+            client.set_terminated(run_id, "FAILED")
+    except Exception:
+        pass
+
+
+def publish_mlflow_projection(
+    projection: MlflowProjection,
+    *,
+    client: MlflowClient,
+    experiment_name: str,
+) -> MlflowPublication:
+    """Publish or confirm one projection; idempotent on the search-identity tags.
+
+    A single matching RUNNING/SCHEDULED run is reused so an interrupted publish
+    can complete. Serial invocations only: concurrent publishers sharing one
+    search identity can both create runs, which a later call reports as
+    ``run_conflict``.
+    """
+    if not isinstance(projection, MlflowProjection):
+        raise TypeError("projection must be MlflowProjection")
+    fingerprint = projection.tags[_FINGERPRINT_TAG]
+    with mlflow_redirects_disabled():
+        experiment_id = _resolve_experiment_id(client, experiment_name)
+        published = _find_published_run(client, experiment_id, projection)
+        if published is not None and published.info.status == "FINISHED":
+            return MlflowPublication(
+                created=False,
+                experiment_id=experiment_id,
+                experiment_name=experiment_name,
+                projection_sha256=fingerprint,
+                run_id=published.info.run_id,
+                status="already_published",
+            )
+        if published is None:
+            run = _create_run(client, experiment_id, projection)
+            run_id = run.info.run_id
+            artifact_uri = run.info.artifact_uri
+        else:
+            run_id = published.info.run_id
+            artifact_uri = published.info.artifact_uri
+        # Rejected before the log/finalize stage so the live run stays
+        # resumable once the server's artifact destination is fixed.
+        _validate_artifact_uri(artifact_uri)
+        try:
+            _log_metrics(client, run_id, projection.metrics)
+            _log_artifacts(client, run_id, projection.artifacts)
+        except BaseException:
+            _terminate_run_as_failed(client, run_id)
+            raise
+        # A finalize failure is an uncertain outcome: set_terminated can commit
+        # FINISHED before its response is lost, and a follow-up FAILED can still
+        # apply to that completed run, hiding it from the idempotent match above
+        # so the next publish creates a duplicate. Leave the run untouched; the
+        # next publish resumes it (RUNNING) or confirms it (FINISHED).
+        _finalize_run(client, run_id)
+    return MlflowPublication(
+        created=published is None,
+        experiment_id=experiment_id,
+        experiment_name=experiment_name,
+        projection_sha256=fingerprint,
+        run_id=run_id,
+        status="published",
+    )

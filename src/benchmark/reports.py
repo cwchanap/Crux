@@ -764,6 +764,16 @@ def _read_report_json(path: Path) -> Mapping[str, object]:
     return value
 
 
+def _read_summary_markdown(report_dir: Path) -> None:
+    path = report_dir / "summary.md"
+    try:
+        content = read_regular_file_no_follow(path).decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        _report_error(f"cannot read report {path.name}: {error}")
+    if not content.strip():
+        _report_error(f"{path.name} must not be empty")
+
+
 def _read_report_csv(path: Path, fields: tuple[str, ...]) -> list[dict[str, str]]:
     try:
         content = read_regular_file_no_follow(path).decode("utf-8")
@@ -908,7 +918,7 @@ def _parse_native_class_counts(value: str) -> tuple[tuple[str, int], ...]:
     return tuple(parsed)
 
 
-def _parse_summary_identity(value: object, expected: CohortIdentity) -> CohortIdentity:
+def _cohort_identity_from_summary(value: object) -> CohortIdentity:
     payload = _require_keys(value, _IDENTITY_FIELDS, "summary identity")
     for field in _IDENTITY_FIELDS:
         _json_text(payload[field], f"identity.{field}")
@@ -916,6 +926,11 @@ def _parse_summary_identity(value: object, expected: CohortIdentity) -> CohortId
         identity = CohortIdentity(**payload)  # type: ignore[arg-type]
     except (TypeError, ValueError, StrictJsonError) as error:
         _report_error(f"summary identity is malformed: {error}")
+    return identity
+
+
+def _parse_summary_identity(value: object, expected: CohortIdentity) -> CohortIdentity:
+    identity = _cohort_identity_from_summary(value)
     if identity != expected:
         _report_error("summary identity mismatch")
     return identity
@@ -1238,6 +1253,25 @@ def _parse_class_rows(
     return tuple(parsed)
 
 
+def read_cohort_report_identity(report_dir: Path) -> CohortIdentity:
+    """Read the cohort identity from one published report's canonical summary."""
+    if not isinstance(report_dir, Path):
+        raise TypeError("report_dir must be a Path")
+    summary = _read_report_json(report_dir / "summary.json")
+    _require_keys(summary, _SUMMARY_FIELDS, "summary")
+    if summary["schema"] != REPORT_SCHEMA:
+        _report_error("summary schema is invalid")
+    return _cohort_identity_from_summary(summary["identity"])
+
+
+def load_published_cohort_reports(report_dir: Path) -> PublishedCohortReports:
+    """Read one published report set, trusting its own summary identity."""
+    identity = read_cohort_report_identity(report_dir)
+    reports = read_cohort_reports(report_dir, expected_identity=identity)
+    _read_summary_markdown(report_dir)
+    return reports
+
+
 def read_cohort_reports(
     report_dir: Path,
     *,
@@ -1357,5 +1391,7 @@ __all__ = [
     "PublishedAggregate",
     "PublishedCohortReports",
     "read_cohort_reports",
+    "read_cohort_report_identity",
+    "load_published_cohort_reports",
     "write_cohort_reports",
 ]

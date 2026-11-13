@@ -18,6 +18,7 @@ from src.benchmark.published_comparison import (
     PublishedRunItem,
     pairable_success_ids,
 )
+from src.benchmark.reports import REPORT_SCHEMA
 from src.benchmark.separation_comparison import (
     SeparationComparisonOutcome,
     SeparationComparisonRequest,
@@ -385,10 +386,20 @@ def _identity_payload(identity: CohortIdentity) -> dict[str, object]:
     return {field: getattr(identity, field) for field in fields}
 
 
+def _summary_document(identity: object) -> dict[str, object]:
+    return {
+        "schema": REPORT_SCHEMA,
+        "identity": identity,
+        "tolerances_ms": [50],
+        "population": {},
+        "aggregates": [],
+    }
+
+
 def _write_summary(report_dir: Path, identity: CohortIdentity) -> None:
     report_dir.mkdir(parents=True, exist_ok=True)
     (report_dir / "summary.json").write_bytes(
-        canonical_json_bytes({"identity": _identity_payload(identity)})
+        canonical_json_bytes(_summary_document(_identity_payload(identity)))
     )
 
 
@@ -499,17 +510,26 @@ def test_strict_report_identity_rejects_non_canonical_summary(tmp_path: Path) ->
         _strict_report_identity(tmp_path)
 
 
+def test_strict_report_identity_reads_canonical_summary(tmp_path: Path) -> None:
+    identity = _identity()
+    _write_summary(tmp_path, identity)
+
+    assert _strict_report_identity(tmp_path) == identity
+
+
 def test_strict_report_identity_rejects_malformed_identity_mapping(tmp_path: Path) -> None:
-    (tmp_path / "summary.json").write_bytes(canonical_json_bytes({"identity": "not a mapping"}))
-    with pytest.raises(ComparisonIntegrityError, match="summary identity is malformed"):
+    (tmp_path / "summary.json").write_bytes(
+        canonical_json_bytes(_summary_document("not a mapping"))
+    )
+    with pytest.raises(ComparisonIntegrityError, match="cannot read HPA-325 identity"):
         _strict_report_identity(tmp_path)
 
 
 def test_strict_report_identity_rejects_unconstructable_identity(tmp_path: Path) -> None:
     payload = _identity_payload(_identity())
     payload["backend_id"] = ""
-    (tmp_path / "summary.json").write_bytes(canonical_json_bytes({"identity": payload}))
-    with pytest.raises(ComparisonIntegrityError, match="summary identity is malformed"):
+    (tmp_path / "summary.json").write_bytes(canonical_json_bytes(_summary_document(payload)))
+    with pytest.raises(ComparisonIntegrityError, match="cannot read HPA-325 identity"):
         _strict_report_identity(tmp_path)
 
 

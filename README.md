@@ -141,6 +141,8 @@ The drum transcription uses a simplified onset detection approach with:
 
 ## Development
 
+Benchmark reports can be published to an MLflow tracking server; see [docs/benchmark/mlflow.md](docs/benchmark/mlflow.md).
+
 ### Running Tests
 ```bash
 uv run pytest

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -2043,3 +2044,802 @@ def test_run_idm_pilot_rejects_smoke_options_supplied_alone(tmp_path: Path) -> N
 
     assert result.exit_code == 2
     assert "--smoke-manifest and --source-cache-dir must be supplied together" in result.output
+
+
+def _mlflow_publication_cli_args(reports_path: Path, scope: str) -> list[str]:
+    return [
+        "benchmark",
+        "publish-mlflow-cohort",
+        "--reports",
+        str(reports_path),
+        "--scope",
+        scope,
+    ]
+
+
+def _write_mlflow_report_files(reports_path: Path) -> None:
+    from src.benchmark.mlflow_export import REPORT_ARTIFACT_NAMES
+
+    for name in REPORT_ARTIFACT_NAMES:
+        (reports_path / name).write_bytes(name.encode() + b"\n")
+
+
+def test_publish_mlflow_cohort_emits_canonical_publication_summary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.mlflow_export as mlflow_module
+    import src.benchmark.reports as reports_module
+    import src.cli.benchmark as benchmark_module
+    from src.benchmark.mlflow_export import MlflowPublication
+
+    reports_path = tmp_path / "reports"
+    reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
+    sentinel_reports = object()
+    sentinel_projection = object()
+    sentinel_client = object()
+    captured: dict[str, object] = {}
+
+    def fake_load(path: Path) -> object:
+        captured["reports_path"] = path
+        captured["staged_summary"] = (path / "summary.json").read_bytes()
+        return sentinel_reports
+
+    def fake_project(reports: object, report_dir: Path, *, scope: str) -> object:
+        captured["projection"] = (reports, report_dir, scope)
+        return sentinel_projection
+
+    def fake_client(tracking_uri: str) -> object:
+        captured["client_uri"] = tracking_uri
+        return sentinel_client
+
+    def fake_publish(projection: object, *, client: object, experiment_name: str) -> object:
+        print("vendor stdout noise")
+        captured["publish"] = (projection, client, experiment_name)
+        return MlflowPublication(
+            created=True,
+            experiment_id="412",
+            experiment_name="crux-benchmark",
+            projection_sha256="a" * 64,
+            run_id="run-9",
+            status="published",
+        )
+
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.com")
+    monkeypatch.setattr(reports_module, "load_published_cohort_reports", fake_load)
+    monkeypatch.setattr(mlflow_module, "build_mlflow_projection", fake_project)
+    monkeypatch.setattr(benchmark_module, "_build_mlflow_client", fake_client)
+    monkeypatch.setattr(mlflow_module, "publish_mlflow_projection", fake_publish)
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "reviewed"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert captured["reports_path"] != reports_path
+    assert captured["staged_summary"] == b"summary.json\n"
+    assert captured["projection"] == (
+        sentinel_reports,
+        captured["reports_path"],
+        "reviewed",
+    )
+    assert captured["client_uri"] == "https://mlflow.example.com"
+    assert captured["publish"] == (sentinel_projection, sentinel_client, "crux-benchmark")
+    assert json.loads(result.stdout) == {
+        "created": True,
+        "experiment_id": "412",
+        "experiment_name": "crux-benchmark",
+        "projection_sha256": "a" * 64,
+        "run_id": "run-9",
+        "status": "published",
+    }
+
+
+def test_publish_mlflow_cohort_missing_report_dir_emits_canonical_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.mlflow_export as mlflow_module
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("MLflow work must not run for a missing report")
+
+    monkeypatch.setattr(mlflow_module, "build_mlflow_projection", unexpected)
+    monkeypatch.setattr(mlflow_module, "publish_mlflow_projection", unexpected)
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(tmp_path / "missing", "broad"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error_code": "report_invalid",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert result.stderr == "published cohort report is malformed or incomplete\n"
+
+
+def test_publish_mlflow_cohort_reports_noop_when_already_published(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.mlflow_export as mlflow_module
+    import src.benchmark.reports as reports_module
+    import src.cli.benchmark as benchmark_module
+    from src.benchmark.mlflow_export import MlflowPublication
+
+    reports_path = tmp_path / "reports"
+    reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
+    captured: dict[str, object] = {}
+
+    def fake_load(_path: Path) -> object:
+        return object()
+
+    def fake_client(tracking_uri: str) -> object:
+        captured["client_uri"] = tracking_uri
+        return object()
+
+    def fake_publish(projection: object, *, client: object, experiment_name: str) -> object:
+        captured["publish"] = (projection, client, experiment_name)
+        return MlflowPublication(
+            created=False,
+            experiment_id="7",
+            experiment_name="hosted-experiment",
+            projection_sha256="b" * 64,
+            run_id="run-1",
+            status="already_published",
+        )
+
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.com")
+    monkeypatch.setattr(reports_module, "load_published_cohort_reports", fake_load)
+    monkeypatch.setattr(
+        mlflow_module,
+        "build_mlflow_projection",
+        lambda reports, report_dir, *, scope: object(),
+    )
+    monkeypatch.setattr(benchmark_module, "_build_mlflow_client", fake_client)
+    monkeypatch.setattr(mlflow_module, "publish_mlflow_projection", fake_publish)
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "pilot") + ["--experiment", "hosted-experiment"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert captured["client_uri"] == "https://mlflow.example.com"
+    assert captured["publish"][2] == "hosted-experiment"
+    assert json.loads(result.stdout) == {
+        "created": False,
+        "experiment_id": "7",
+        "experiment_name": "hosted-experiment",
+        "projection_sha256": "b" * 64,
+        "run_id": "run-1",
+        "status": "already_published",
+    }
+
+
+def test_publish_mlflow_cohort_invalid_scope_fails_before_domain_work(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.mlflow_export as mlflow_module
+    import src.benchmark.reports as reports_module
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("domain work must not run for an invalid scope")
+
+    monkeypatch.setattr(reports_module, "load_published_cohort_reports", unexpected)
+    monkeypatch.setattr(mlflow_module, "build_mlflow_projection", unexpected)
+    monkeypatch.setattr(mlflow_module, "publish_mlflow_projection", unexpected)
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(tmp_path, "staging"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert "Invalid value" in result.output
+    assert "staging" in result.output
+
+
+def test_publish_mlflow_cohort_malformed_report_stops_before_mlflow(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.mlflow_export as mlflow_module
+    import src.benchmark.reports as reports_module
+    import src.cli.benchmark as benchmark_module
+    from src.benchmark.reports import ReportIntegrityError
+
+    reports_path = tmp_path / "reports"
+    reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("MLflow work must not run for a malformed report")
+
+    def unexpected_client(_tracking_uri: str) -> object:
+        raise AssertionError("mlflow client must not be built for a malformed report")
+
+    def failing_load(_path: Path) -> object:
+        raise ReportIntegrityError("summary schema is invalid")
+
+    monkeypatch.setattr(reports_module, "load_published_cohort_reports", failing_load)
+    monkeypatch.setattr(mlflow_module, "build_mlflow_projection", unexpected)
+    monkeypatch.setattr(benchmark_module, "_build_mlflow_client", unexpected_client)
+    monkeypatch.setattr(mlflow_module, "publish_mlflow_projection", unexpected)
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "broad"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error_code": "report_invalid",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert result.stderr == "published cohort report is malformed or incomplete\n"
+
+
+def test_publish_mlflow_cohort_projection_error_emits_canonical_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.mlflow_export as mlflow_module
+    import src.benchmark.reports as reports_module
+    import src.cli.benchmark as benchmark_module
+    from src.benchmark.mlflow_export import MlflowProjectionError
+
+    reports_path = tmp_path / "reports"
+    reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("MLflow work must not run for a projection failure")
+
+    def unexpected_client(_tracking_uri: str) -> object:
+        raise AssertionError("mlflow client must not be built for a projection failure")
+
+    def failing_project(_reports: object, _report_dir: Path, *, scope: str) -> object:
+        del scope
+        raise MlflowProjectionError("required benchmark views are missing")
+
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.com")
+    monkeypatch.setattr(reports_module, "load_published_cohort_reports", lambda _path: object())
+    monkeypatch.setattr(mlflow_module, "build_mlflow_projection", failing_project)
+    monkeypatch.setattr(benchmark_module, "_build_mlflow_client", unexpected_client)
+    monkeypatch.setattr(mlflow_module, "publish_mlflow_projection", unexpected)
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "broad"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error_code": "projection_failed",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert result.stderr == "cohort report cannot be projected for MLflow publication\n"
+
+
+def test_publish_mlflow_cohort_missing_tracking_uri_is_bounded_config_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.mlflow_export as mlflow_module
+    import src.benchmark.reports as reports_module
+    import src.cli.benchmark as benchmark_module
+    from src.benchmark.mlflow_export import MlflowPublicationError
+
+    reports_path = tmp_path / "reports"
+    reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
+    safe_message = MlflowPublicationError("invalid_config").message
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("publication must not run without a valid tracking URI")
+
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    monkeypatch.setattr(reports_module, "load_published_cohort_reports", lambda _path: object())
+    monkeypatch.setattr(
+        mlflow_module,
+        "build_mlflow_projection",
+        lambda reports, report_dir, *, scope: object(),
+    )
+    monkeypatch.setattr(benchmark_module, "_build_mlflow_client", unexpected)
+    monkeypatch.setattr(mlflow_module, "publish_mlflow_projection", unexpected)
+
+    missing = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "broad"),
+        catch_exceptions=False,
+    )
+
+    assert missing.exit_code == 2
+    assert json.loads(missing.stdout) == {
+        "error_code": "invalid_config",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert missing.stderr == safe_message + "\n"
+
+    credentialed_uri = "https://operator:hunter2@mlflow.example.com"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", credentialed_uri)
+    monkeypatch.setenv("MLFLOW_TRACKING_PASSWORD", "hunter2")
+    credentialed = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "broad"),
+        catch_exceptions=False,
+    )
+
+    assert credentialed.exit_code == 2
+    assert json.loads(credentialed.stdout) == {
+        "error_code": "invalid_config",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert credentialed.stderr == safe_message + "\n"
+    assert "hunter2" not in credentialed.stdout
+    assert "hunter2" not in credentialed.stderr
+    assert credentialed_uri not in credentialed.stdout
+    assert credentialed_uri not in credentialed.stderr
+
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "http://mlflow.example.com")
+    plain_http = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "broad"),
+        catch_exceptions=False,
+    )
+
+    assert plain_http.exit_code == 2
+    assert json.loads(plain_http.stdout) == {
+        "error_code": "invalid_config",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert plain_http.stderr == safe_message + "\n"
+
+
+def _clear_mlflow_auth_env(monkeypatch, home: Path) -> None:
+    monkeypatch.setenv("HOME", str(home))
+    for name in (
+        "MLFLOW_TRACKING_USERNAME",
+        "MLFLOW_TRACKING_PASSWORD",
+        "MLFLOW_TRACKING_TOKEN",
+        "MLFLOW_TRACKING_AWS_SIGV4",
+        "MLFLOW_TRACKING_AUTH",
+        "MLFLOW_TRACKING_INSECURE_TLS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _stub_mlflow_publication_path(monkeypatch) -> None:
+    import src.benchmark.mlflow_export as mlflow_module
+    import src.benchmark.reports as reports_module
+    import src.cli.benchmark as benchmark_module
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("publication must not run with an unsafe configuration")
+
+    monkeypatch.setattr(reports_module, "load_published_cohort_reports", lambda _path: object())
+    monkeypatch.setattr(
+        mlflow_module,
+        "build_mlflow_projection",
+        lambda reports, report_dir, *, scope: object(),
+    )
+    monkeypatch.setattr(benchmark_module, "_build_mlflow_client", unexpected)
+    monkeypatch.setattr(mlflow_module, "publish_mlflow_projection", unexpected)
+
+
+def test_publish_mlflow_cohort_rejects_plain_http_with_token_credentials(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from src.benchmark.mlflow_export import MlflowPublicationError
+
+    reports_path = tmp_path / "reports"
+    reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
+    safe_message = MlflowPublicationError("invalid_config").message
+
+    _clear_mlflow_auth_env(monkeypatch, tmp_path)
+    _stub_mlflow_publication_path(monkeypatch)
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "http://mlflow.example.com")
+    monkeypatch.setenv("MLFLOW_TRACKING_TOKEN", "token-abc")
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "broad"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error_code": "invalid_config",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert result.stderr == safe_message + "\n"
+    assert "token-abc" not in result.stdout
+    assert "token-abc" not in result.stderr
+
+
+def test_publish_mlflow_cohort_rejects_plain_http_with_credentials_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from src.benchmark.mlflow_export import MlflowPublicationError
+
+    reports_path = tmp_path / "reports"
+    reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
+    safe_message = MlflowPublicationError("invalid_config").message
+
+    _clear_mlflow_auth_env(monkeypatch, tmp_path)
+    _stub_mlflow_publication_path(monkeypatch)
+    credentials_dir = tmp_path / ".mlflow"
+    credentials_dir.mkdir()
+    (credentials_dir / "credentials").write_text(
+        "[mlflow]\nmlflow_tracking_username = operator\nmlflow_tracking_password = hunter2\n"
+    )
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "http://mlflow.example.com")
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "broad"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error_code": "invalid_config",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert result.stderr == safe_message + "\n"
+
+
+def test_publish_mlflow_cohort_rejects_plain_http_with_matching_netrc(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from src.benchmark.mlflow_export import MlflowPublicationError
+
+    reports_path = tmp_path / "reports"
+    reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
+    safe_message = MlflowPublicationError("invalid_config").message
+
+    _clear_mlflow_auth_env(monkeypatch, tmp_path)
+    _stub_mlflow_publication_path(monkeypatch)
+    # requests would attach these Basic credentials to a plaintext request
+    # without any mlflow credential source being configured.
+    (tmp_path / ".netrc").write_text("machine mlflow.example.com login operator password hunter2\n")
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "http://mlflow.example.com")
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "broad"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error_code": "invalid_config",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert result.stderr == safe_message + "\n"
+    assert "hunter2" not in result.stdout
+    assert "hunter2" not in result.stderr
+
+
+def test_publish_mlflow_cohort_rejects_insecure_tls(tmp_path: Path, monkeypatch) -> None:
+    from src.benchmark.mlflow_export import MlflowPublicationError
+
+    reports_path = tmp_path / "reports"
+    reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
+    safe_message = MlflowPublicationError("invalid_config").message
+
+    _clear_mlflow_auth_env(monkeypatch, tmp_path)
+    _stub_mlflow_publication_path(monkeypatch)
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.com")
+    monkeypatch.setenv("MLFLOW_TRACKING_INSECURE_TLS", "true")
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "broad"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error_code": "invalid_config",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert result.stderr == safe_message + "\n"
+
+
+def test_publish_mlflow_cohort_disables_redirects_for_mlflow_requests(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.mlflow_export as mlflow_module
+    import src.benchmark.reports as reports_module
+    import src.cli.benchmark as benchmark_module
+    from src.benchmark.mlflow_export import MlflowPublication
+
+    reports_path = tmp_path / "reports"
+    reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
+    captured: dict[str, object] = {}
+
+    def fake_client(tracking_uri: str) -> object:
+        captured["client_redirects"] = os.environ.get("MLFLOW_ALLOW_HTTP_REDIRECTS")
+        return object()
+
+    def fake_publish(projection: object, *, client: object, experiment_name: str) -> object:
+        captured["publish_redirects"] = os.environ.get("MLFLOW_ALLOW_HTTP_REDIRECTS")
+        return MlflowPublication(
+            created=True,
+            experiment_id="exp-1",
+            experiment_name=experiment_name,
+            projection_sha256="b" * 64,
+            run_id="run-1",
+            status="published",
+        )
+
+    _clear_mlflow_auth_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("MLFLOW_ALLOW_HTTP_REDIRECTS", raising=False)
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.com")
+    monkeypatch.setattr(reports_module, "load_published_cohort_reports", lambda _path: object())
+    monkeypatch.setattr(
+        mlflow_module,
+        "build_mlflow_projection",
+        lambda reports, report_dir, *, scope: object(),
+    )
+    monkeypatch.setattr(benchmark_module, "_build_mlflow_client", fake_client)
+    monkeypatch.setattr(mlflow_module, "publish_mlflow_projection", fake_publish)
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "broad"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert captured["client_redirects"] == "false"
+    assert captured["publish_redirects"] == "false"
+    assert "MLFLOW_ALLOW_HTTP_REDIRECTS" not in os.environ
+
+
+def test_publish_mlflow_cohort_missing_mlflow_dependency_is_bounded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import sys
+
+    import src.benchmark.mlflow_export as mlflow_module
+    import src.benchmark.reports as reports_module
+    from src.benchmark.mlflow_export import MlflowPublicationError
+
+    reports_path = tmp_path / "reports"
+    reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
+    safe_message = MlflowPublicationError("missing_optional_dependency").message
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("publication must not run without the mlflow package")
+
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.com")
+    monkeypatch.setitem(sys.modules, "mlflow", None)
+    monkeypatch.delitem(sys.modules, "mlflow.tracking", raising=False)
+    monkeypatch.setattr(reports_module, "load_published_cohort_reports", lambda _path: object())
+    monkeypatch.setattr(
+        mlflow_module,
+        "build_mlflow_projection",
+        lambda reports, report_dir, *, scope: object(),
+    )
+    monkeypatch.setattr(mlflow_module, "publish_mlflow_projection", unexpected)
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "broad"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error_code": "missing_optional_dependency",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert result.stderr == safe_message + "\n"
+
+
+def test_publish_mlflow_cohort_half_broken_mlflow_install_is_bounded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import sys
+    import types
+
+    import src.benchmark.mlflow_export as mlflow_module
+    import src.benchmark.reports as reports_module
+    from src.benchmark.mlflow_export import MlflowPublicationError
+
+    reports_path = tmp_path / "reports"
+    reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
+    safe_message = MlflowPublicationError("missing_optional_dependency").message
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("publication must not run without a usable mlflow install")
+
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.com")
+    monkeypatch.setitem(sys.modules, "mlflow", types.ModuleType("mlflow"))
+    monkeypatch.setitem(sys.modules, "mlflow.tracking", None)
+    monkeypatch.setattr(reports_module, "load_published_cohort_reports", lambda _path: object())
+    monkeypatch.setattr(
+        mlflow_module,
+        "build_mlflow_projection",
+        lambda reports, report_dir, *, scope: object(),
+    )
+    monkeypatch.setattr(mlflow_module, "publish_mlflow_projection", unexpected)
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "broad"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error_code": "missing_optional_dependency",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert result.stderr == safe_message + "\n"
+
+
+def test_publish_mlflow_cohort_client_construction_failure_is_bounded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import sys
+    import types
+
+    import src.benchmark.mlflow_export as mlflow_module
+    import src.benchmark.reports as reports_module
+    from src.benchmark.mlflow_export import MlflowPublicationError
+
+    reports_path = tmp_path / "reports"
+    reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
+    safe_message = MlflowPublicationError("invalid_config").message
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("publication must not run when the client cannot be built")
+
+    class ExplodingClient:
+        def __init__(self, tracking_uri: str) -> None:
+            raise RuntimeError("vendor client construction boom: operator:hunter2")
+
+    tracking = types.ModuleType("mlflow.tracking")
+    tracking.MlflowClient = ExplodingClient
+
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.com")
+    monkeypatch.setitem(sys.modules, "mlflow", types.ModuleType("mlflow"))
+    monkeypatch.setitem(sys.modules, "mlflow.tracking", tracking)
+    monkeypatch.setattr(reports_module, "load_published_cohort_reports", lambda _path: object())
+    monkeypatch.setattr(
+        mlflow_module,
+        "build_mlflow_projection",
+        lambda reports, report_dir, *, scope: object(),
+    )
+    monkeypatch.setattr(mlflow_module, "publish_mlflow_projection", unexpected)
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "broad"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error_code": "invalid_config",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert result.stderr == safe_message + "\n"
+    assert "hunter2" not in result.stdout
+    assert "hunter2" not in result.stderr
+
+
+def test_publish_mlflow_cohort_run_conflict_emits_bounded_code_without_secrets(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.mlflow_export as mlflow_module
+    import src.benchmark.reports as reports_module
+    import src.cli.benchmark as benchmark_module
+    from src.benchmark.mlflow_export import MlflowPublicationError
+
+    reports_path = tmp_path / "reports"
+    reports_path.mkdir()
+    _write_mlflow_report_files(reports_path)
+    safe_message = MlflowPublicationError("run_conflict").message
+
+    def failing_publish(_projection: object, **_kwargs: object) -> object:
+        raise MlflowPublicationError("run_conflict") from RuntimeError(
+            "vendor cause: GET https://operator:hunter2@mlflow.example.com rejected"
+        )
+
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.com")
+    monkeypatch.setenv("MLFLOW_TRACKING_PASSWORD", "hunter2")
+    monkeypatch.setattr(reports_module, "load_published_cohort_reports", lambda _path: object())
+    monkeypatch.setattr(
+        mlflow_module,
+        "build_mlflow_projection",
+        lambda reports, report_dir, *, scope: object(),
+    )
+    monkeypatch.setattr(benchmark_module, "_build_mlflow_client", lambda _uri: object())
+    monkeypatch.setattr(mlflow_module, "publish_mlflow_projection", failing_publish)
+
+    result = CliRunner().invoke(
+        main,
+        _mlflow_publication_cli_args(reports_path, "broad"),
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error_code": "run_conflict",
+        "exit_code": 2,
+        "status": "failed",
+    }
+    assert result.stderr == safe_message + "\n"
+    assert "hunter2" not in result.stdout
+    assert "hunter2" not in result.stderr
+
+
+def test_publish_mlflow_cohort_keeps_reports_and_mlflow_lazy() -> None:
+    import json
+    import subprocess
+    import sys
+
+    probe = """
+import json
+import sys
+
+from click.testing import CliRunner
+
+from src.cli.main import main
+
+result = CliRunner().invoke(main, ["benchmark", "publish-mlflow-cohort", "--help"])
+if result.exit_code != 0:
+    raise SystemExit(result.output)
+
+print(json.dumps({
+    "mlflow_export_imported": "src.benchmark.mlflow_export" in sys.modules,
+    "reports_imported": "src.benchmark.reports" in sys.modules,
+    "mlflow_imported": "mlflow" in sys.modules,
+}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert json.loads(result.stdout) == {
+        "mlflow_export_imported": False,
+        "reports_imported": False,
+        "mlflow_imported": False,
+    }

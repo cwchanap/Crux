@@ -2,9 +2,9 @@
 
 **Design:** [2026-11-11-hpa-856-colab-native-oaf-design.md](../specs/2026-11-11-hpa-856-colab-native-oaf-design.md)  
 **Linear:** [HPA-856](https://linear.app/cwchanap/issue/HPA-856/run-the-oaf-benchmark-pipeline-on-colab-without-docker)  
-**Related:** [HPA-86 / GitHub PR #34](https://github.com/cwchanap/Crux/pull/34) (MLflow publication only), HPA-328 (existing separation pipeline)
+**Related:** [HPA-86 / GitHub PR #34](https://github.com/cwchanap/Crux/pull/34) (**merged into main**; MLflow publication), HPA-328 (existing separation pipeline)
 
-**Delivery:** This draft PR initially carries **only design + plan**. Implement, test, and append Colab evidence on **this same PR** after plan review. One ticket, one PR. Keep the current Docker path as the default.
+**Delivery:** This draft PR initially carries **only design + plan**. Implement, test, and append Colab evidence on **this same PR** after plan review. One ticket, one PR. Keep the current Docker path as the default. **Baseline review (2026-11-13):** HPA-86 is merged at `main` commit `f5e0d182`; no publication dependency remains.
 
 ## Global constraints
 
@@ -57,15 +57,15 @@ The frozen OaF image uses Python 3.7 and TF1.15.5, whereas the Crux CLI needs Py
 
 **Create:** `notebooks/oaf_benchmark_colab.ipynb`  
 **Create:** `docs/benchmark/colab.md`  
-**Modify:** `README.md` for one link (after PR #34 merge/rebase if necessary).
+**Modify:** `README.md` to add one Colab benchmark link **alongside the existing MLflow publishing link**.
 
 - [ ] Provide a configuration cell for **pinned** repository commit, Drive-backed workspace, absolute paths, CPU/GPU availability, and R2/MLflow credential lookup from Colab Secrets. Don't print tokens.
-- [ ] Create Crux Python 3.12 (project extra `r2`, later `mlflow`), frozen OaF Python 3.7, separate Spleeter 2.4.2, and separate HTDemucs 4.1.0 environments. Use shell calls to existing tools, not a second Python orchestration package. OaF stays CPU; GPU is optional for HTDemucs.
+- [ ] Create Crux Python 3.12 with `uv sync --extra r2` for benchmark work; enable the **already merged** `mlflow` extra only for publication with `uv sync --extra r2 --extra mlflow`. Create frozen OaF Python 3.7, separate Spleeter 2.4.2, and separate HTDemucs 4.1.0 environments. Use shell calls to existing tools, not a second Python orchestration package. OaF stays CPU; GPU is optional for HTDemucs.
 - [ ] Materialize the small patched/native OaF bundle by calling the **existing** instrumentation script. Reuse the exact original `model.json` and checkpoint hash. Print non-secret checkpoint/model/commit identities before executing inference.
 - [ ] Initialize stable Drive paths for manifests, reference events, corpus cache, OaF/pilot run roots, and reports. Keep checkpoint/environment directories at stable target paths on `/content` and archive/restore them to/from Drive where the probe requires identical environment bytes/locations.
 - [ ] On every notebook rerun, require the prior pinned commit, manifest/model-lock hashes, separator lock/environment manifests, and interpreter+model-root attestation to match. Do not automatically re-freeze a changed runtime during `--resume`.
 - [ ] Keep cells resumable and independent; no general DAG, server, scheduler, CI benchmark job, or hidden background step.
-- [ ] Provide an explicit, actionable stop message at missing Colab Secret, runtime incompatibility, incomplete manual review, mismatched evidence, or missing HPA-86 publish command.
+- [ ] Provide an explicit, actionable stop message at missing Colab Secret, runtime incompatibility, incomplete manual review, mismatched evidence, or missing/invalid HTTPS MLflow configuration. The HPA-86 command is already on `main`; do not create a replacement publisher.
 
 **Check:** validate notebook JSON schema and inspect/smoke each cell on a real Colab VM. Do not rely on local Python 3.12 to execute cells intended for legacy interpreters.
 
@@ -82,15 +82,21 @@ The frozen OaF image uses Python 3.7 and TF1.15.5, whereas the Crux CLI needs Py
 
 **Check:** full mix and accepted 30-song review evidence are auditable from persisted manifests, CSV and canonical reports.
 
+## Mainline integration checkpoint (2026-11-13)
+
+- [x] Reviewed the new `main` baseline `f5e0d182` after merged PR #34: it adds the optional `mlflow` extra, `publish-mlflow-cohort` CLI, `docs/benchmark/mlflow.md`, `notebooks/mlflow_publish_colab.ipynb`, strict publication tests, and README link.
+- [x] HPA-86's merge dependency is resolved; HPA-856 now only needs to call the existing CLI.
+- [ ] In implementation, preserve the existing HPA-86 code in `src/cli/benchmark.py`, `tests/test_cli_benchmark.py`, and `README.md`. Do not duplicate the publishing notebook or exporter.
+
 ## Task 5 — Run the separation pilot on the same VM and publish to MLflow
 
-**Notebook cells only**, after Task 4 and HPA-86 publication command availability.
+**Notebook cells only**, after Task 4. HPA-86's publisher is already on `main`; no separate PR merge gate remains.
 
 - [ ] Install/restore and freeze Spleeter 2.4.2 + HTDemucs 4.1.0 from the existing standalone-Python process. Use the current `freeze-separator-runtime` CLI and fixed model-root policy. Validate v2 lock + `environment.json` + model-root probe before the pilot begins.
 - [ ] Run `crux benchmark run-oaf-separation-pilot --manifest ... --timing-manifest ... --subset-manifest ... --oaf-run ... --cache-dir ... --output-dir ... --spleeter-python ... --demucs-python ... --spleeter-model-root ... --demucs-model-root ... --resume --oaf-native-python ... --oaf-native-root ...`. Keep stem and derived OaF execution on the **same** Colab VM; do not port unverified Mac stems.
 - [ ] Inspect full-mix control, Spleeter and HTDemucs reports, recorded failures/RTF, and the paired comparison. Finalize using `finalize-oaf-separation-pilot` with a **human-provided** decision/rationale.
-- [ ] Once PR #34 has landed on the same branch, call `publish-mlflow-cohort` for the **reviewed** full-mix report (`scope=reviewed`) and each Spleeter/HTDemucs pilot report (`scope=pilot`).
-- [ ] Verify all three are visible in the same `crux-benchmark` experiment with distinct `crux.input_view_id` and expected shared reference identities. Repeat publication and verify no duplicate runs; no raw/stem/checkpoint artifact is uploaded.
+- [ ] Call the **merged** `crux benchmark publish-mlflow-cohort --reports ... --scope ... --experiment crux-benchmark` separately for the **reviewed** full-mix report (`scope=reviewed`) and each Spleeter/HTDemucs pilot report (`scope=pilot`). Do not add or modify any MLflow publisher; reuse the existing optional extra, HTTPS-only tracking URI, Colab Secret credentials, and bounded CLI results.
+- [ ] Verify all three are visible in the same `crux-benchmark` experiment with distinct `crux.input_view_id` and expected shared reference identities. Publish **only after** canonical report generation has finished (HPA-86's five-file snapshot is not atomic against concurrent writes). Re-publish each stable report, assert the same `run_id` and `created=false`, and confirm only the five allowlisted report artifacts were uploaded and read back byte-for-byte. Never upload audio, stems, predictions, or checkpoints.
 - [ ] Keep canonical Crux reports complete and usable even if MLflow cannot be reached.
 
 **Check:** canonical pilot run/comparison/handoff, both derived reports, and three MLflow run IDs with idempotency evidence (non-secret only).
@@ -101,7 +107,7 @@ The frozen OaF image uses Python 3.7 and TF1.15.5, whereas the Crux CLI needs Py
 - [ ] Run repository gates: `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check src tests`, and `uv run pylint --errors-only src`. Inspect failures and do not change unrelated code merely to increase a lint score.
 - [ ] Record one real Colab smoke pass and a full end-to-end evidence run. In particular, verify a VM reset can `--resume` using stable Drive data and the **same** runtime/environment identities. An untested VM-reset claim remains unchecked.
 - [ ] Review the PR diff for only scoped production changes, unit tests, notebook and docs; no credential or large artifact accidentally committed.
-- [ ] Update the PR description and HPA-856 with verified evidence/remaining blockers. Mark this **same** PR ready for review only after acceptance and dependent HPA-86 merge; do not create an implementation PR.
+- [ ] Update the PR description and HPA-856 with verified evidence/remaining blockers. Mark this **same** PR ready for review only after acceptance; HPA-86 is already merged. Do not create an implementation PR.
 
 ## Expected scoped implementation files
 
@@ -113,4 +119,4 @@ The frozen OaF image uses Python 3.7 and TF1.15.5, whereas the Crux CLI needs Py
 | Colab operation and documentation | `notebooks/oaf_benchmark_colab.ipynb`, `docs/benchmark/colab.md`, `README.md` |
 | Planning documentation | This plan and the linked design spec |
 
-The MLflow exporter, scoring/report publication modules, separator attestation policy, benchmark manifest schemas, and Dockerfile remain outside implementation scope.
+The **already-merged** MLflow exporter, its optional-dependency configuration, HPA-86's publication-only notebook and its tests, scoring/report publication modules, separator attestation policy, benchmark manifest schemas, and Dockerfile remain outside implementation scope. Extend `src/cli/benchmark.py` and `tests/test_cli_benchmark.py` without replacing the existing MLflow command/tests.

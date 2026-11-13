@@ -37,6 +37,8 @@ from src.benchmark.reports import (
     ReportIntegrityError,
     _csv_decimal,
     _report_decimal,
+    load_published_cohort_reports,
+    read_cohort_report_identity,
     read_cohort_reports,
     write_cohort_reports,
 )
@@ -388,6 +390,41 @@ def test_read_cohort_reports_parses_all_published_rows_and_summary_aggregates(
     assert reports.aggregates[0].event_micro.true_positives == 2
     assert reports.aggregates[0].event_micro.false_positives == 1
     assert artifacts.summary_json.exists()
+
+
+def test_read_cohort_report_identity_and_load_published_reports(tmp_path: Path) -> None:
+    write_cohort_reports(_result(), tmp_path)
+
+    identity = read_cohort_report_identity(tmp_path)
+    reports = load_published_cohort_reports(tmp_path)
+
+    assert identity == _identity()
+    assert reports == read_cohort_reports(tmp_path, expected_identity=_identity())
+
+
+def test_load_published_cohort_reports_rejects_missing_markdown_summary(
+    tmp_path: Path,
+) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    (tmp_path / "summary.md").unlink()
+
+    with pytest.raises(ReportIntegrityError, match="summary.md"):
+        load_published_cohort_reports(tmp_path)
+
+
+def test_load_published_cohort_reports_rejects_empty_markdown_summary(
+    tmp_path: Path,
+) -> None:
+    write_cohort_reports(_result(), tmp_path)
+    (tmp_path / "summary.md").write_text("", encoding="utf-8")
+
+    with pytest.raises(ReportIntegrityError, match="summary.md must not be empty"):
+        load_published_cohort_reports(tmp_path)
+
+
+def test_read_cohort_report_identity_rejects_non_path_report_dir() -> None:
+    with pytest.raises(TypeError, match="report_dir must be a Path"):
+        read_cohort_report_identity("not a path")  # type: ignore[arg-type]
 
 
 def test_read_cohort_reports_uses_summary_event_micro_without_recomputing_csv(
