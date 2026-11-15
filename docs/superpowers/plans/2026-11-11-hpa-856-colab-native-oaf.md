@@ -4,7 +4,7 @@
 **Linear:** [HPA-856](https://linear.app/cwchanap/issue/HPA-856/run-the-oaf-benchmark-pipeline-on-colab-without-docker)  
 **PR:** [#35](https://github.com/cwchanap/Crux/pull/35). **One ticket, one PR**: keep design, implementation, tests, and evidence here.  
 **Reviewed baseline:** main `f5e0d182`; HPA-86/PR #34 is merged.  
-**Status:** Planning only; real Colab Task 0 and production coding have **not** been executed.
+**Status (2026-11-15):** Task 0 **started** on an authenticated Colab VM and is **blocked at Python 3.7.17 package resolution**. Frozen dependencies, the OaF worker/oracle and Drive have **not** been tested. Production coding has not started; a single pinned Python 3.7.16 retry is the next gate.
 
 ## Scope decisions
 
@@ -16,16 +16,28 @@
 
 ## Task 0 — Real-Colab legacy OaF compatibility gate (must precede coding)
 
-**Evidence only:** Colab console/redacted logs, VM version, exact checked-out commit, interpreter/wheel versions and smoke output. Do **not** treat a CI fake as Colab feasibility.
+**Observed 2026-11-15:** authenticated Colab CPU VM at `5fc05db4`, Linux x86-64, glibc 2.39, notebook Python 3.13.18, two CPUs, 242381135872 free bytes, and `libsndfile1` 1.2.2. Exact `python=3.7.17` was **not available** from conda-forge or an Anaconda `pkgs/main` repoquery. It did **not** test TensorFlow compatibility, worker output, exact oracle, or Drive persistence. This is a *provisioning-path* failure only, not proof that the entire CPython 3.7 ABI cannot execute.
 
-- [ ] On an actual Colab VM record architecture, OS/glibc, notebook Python, CPU, available disk, and pinned repo revision. Provision a separate Python 3.7.17 via micromamba/conda without changing notebook Python.
-- [ ] Install system `libsndfile1`. Install `runtime/oaf_tf1/requirements-build.lock` followed by `requirements.lock` with their existing required hashes and binary rules. No lock regeneration or upgraded TF.
+**Smallest next attempt:** preserve Docker's Python 3.7.17 baseline but allow **only a pinned Python 3.7.16 host interpreter** from Anaconda's listed [Linux x86-64 package](https://anaconda.org/anaconda/python/files/manage?version=3.7.16). The original [TensorFlow 1.15.5 `cp37-cp37m` Linux wheel](https://pypi.org/project/tensorflow/1.15.5/) is **minor-version ABI tagged**, so the attempted patch difference is worth checking; it is not presumed numerically identical.
+
+- [x] Start a real Colab VM, record environment, and attempt the prescribed Python 3.7.17 package. Outcome: **package unavailable**, with no later stages executed.
+- [ ] On that VM, make **one** explicitly pinned retry; for example:
+
+  ```bash
+  micromamba create -y -p /content/crux-oaf-py37 \
+    --override-channels -c https://repo.anaconda.com/pkgs/main \
+    python=3.7.16 pip
+  /content/crux-oaf-py37/bin/python --version
+  ```
+
+  Do not claim this succeeds merely because the package is listed. Record the actual build, channel and interpreter version. Do not switch notebook Python or try other unspecified patches/channels.
+- [ ] The VM already reports `libsndfile1`; verify it loads. Install `runtime/oaf_tf1/requirements-build.lock` followed by `requirements.lock` using **the exact existing Dockerfile pip arguments** and required hashes. No lock regeneration, TensorFlow upgrade, or weight/model change. Verify TF1 imports and checkpoint can load before drawing conclusions about the OaF backend.
 - [ ] As a **temporary manual probe**, mirror `/opt/crux/runtime`, `/opt/crux/upstream/magenta`, and patched `runtime/vendor` from the exact committed files, using the existing instrumentation script. This is not the production bundle builder and does not go into the notebook.
 - [ ] Acquire/hash-verify the canonical OaF checkpoint using the existing `prepare-backend` path. Launch the native Python 3.7 worker and assert the ready identity (78 restored tensors) plus **exact** native-event equality to `tests/fixtures/oaf_tf1_smoke/smoke-oracle.json` using `src/benchmark/oaf_smoke_oracle.py`. Compare against the known Docker fixture/oracle, not import-only startup.
 - [ ] Prove a small Drive-backed write/restore on this VM is compatible with the report publisher's durability assumptions. Verify it persists after remount where possible.
-- [ ] **STOP if blocked:** record the actual Python/TF/patch/Drive failure in this same PR and HPA-856. Do not silently switch models or weaken parity.
+- [ ] **STOP if blocked:** if the single 3.7.16 attempt fails at solver, frozen pip dependency installation, TensorFlow import/checkpoint, exact oracle, or Drive durability, record the precise failure on this PR and HPA-856. Keep Tasks 1–6 blocked; do not spiral into source-compiling Python 3.7, broad channel searching, a TF2 rewrite, or an unreviewed OCI/PRoot alternative. Reconsider the environment/architecture within this same ticket and PR only after recording evidence.
 
-**Go/no-go:** the frozen worker and checkpoint operate and pass the exact smoke oracle on Colab.
+**Go/no-go:** a pinned Python 3.7 host interpreter (3.7.16 candidate) **installs**, runs the unmodified frozen TF1 worker/checkpoint and matches the exact smoke oracle on Colab; the Drive durability probe passes. The Docker 3.7.17 baseline remains unchanged. Package availability alone is not a pass.
 
 ## Task 1 — One native launcher and a tested bundle materializer
 
@@ -58,7 +70,7 @@
 **Modify:** `README.md` (add link beside existing HPA-86 MLflow docs).
 
 - [ ] Notebook setup: mount Drive, read R2 Secrets, pin `CORPUS_COMMIT`, check `git rev-parse HEAD`, establish stable absolute Drive-backed cache/run/manifests and env vars, print non-secret environment/commit evidence. Link `artifacts/benchmark/model-cache` to the Drive checkpoint cache **without** replacing an existing populated local directory; ensure both the smoke command's resolved path and `CRUX_OAF_CHECKPOINT_CACHE` point at that same root. Do not clone moving `main` on resume.
-- [ ] Install four **separate** environments: Crux Python 3.12 with `uv sync --extra r2`, frozen Python 3.7 OaF, Spleeter 2.4.2, HTDemucs 4.1.0. OaF CPU; HTDemucs GPU optional.
+- [ ] **Only after Task 0 passes**, install four **separate** environments: Crux Python 3.12 with `uv sync --extra r2`, pinned and **smoke-validated** OaF Python 3.7.16, Spleeter 2.4.2, HTDemucs 4.1.0. OaF CPU; HTDemucs GPU optional. Record exact interpreter version in run evidence; do not assume 3.7.16 equals Docker 3.7.17 without the oracle and broad-report parity.
 - [ ] **Do not** build the OaF bundle in the notebook: the production backend does that on first worker launch. The notebook has no duplicate file-layout logic.
 - [ ] Resumable manual cells for R2 sync, chart selection, timing, reference set, full mix, reviewed-subset preparation/human pause, separator freeze/commit/repin, pilot run/human finalize, and three Drive report-folder handoff. Do **not** call MLflow here.
 - [ ] Save source and reference artifacts exactly. For separator venvs/model roots, archive them privately on Drive, restore at the **same absolute paths** on a later VM, and let current CLI v2 attestation verify their bytes; do not add an independent notebook hash gate.

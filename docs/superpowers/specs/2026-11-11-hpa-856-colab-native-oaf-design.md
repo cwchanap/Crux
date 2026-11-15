@@ -3,7 +3,7 @@
 **Linear:** [HPA-856](https://linear.app/cwchanap/issue/HPA-856/run-the-oaf-benchmark-pipeline-on-colab-without-docker)  
 **PR:** [#35](https://github.com/cwchanap/Crux/pull/35), one ticket / one PR; this revision resolves the 2026-11-13 design review.  
 **Baseline reviewed:** main `f5e0d182`, including merged HPA-86 / PR #34.  
-**Status:** Design only; no real Colab runtime or benchmark verification yet.
+**Status (2026-11-15):** A real Colab CPU VM ran, but Task 0 stopped during Python **3.7.17 provisioning**, before TensorFlow, worker, oracle, or Drive checks. A single Python 3.7.16 provisioning retry is planned; **no native runtime parity is established**.
 
 ## Goal and constraints
 
@@ -49,12 +49,23 @@ After the corpus run, require the same `cohort_id = oaf-2d67684ad190163e`, popul
 
 The checked-in `tests/fixtures/oaf_tf1_smoke/smoke-oracle.json` and `src/benchmark/oaf_smoke_oracle.py` provide the earlier, cheaper **exact-event** native smoke gate.
 
+## Task 0 evidence and narrow provisioning alternative (2026-11-15)
+
+An authenticated Colab CPU VM was reached and measured at `5fc05db4`: Linux x86-64, glibc 2.39, notebook Python 3.13.18, two CPUs, 242381135872 bytes free, and Ubuntu's `libsndfile1` 1.2.2. The prescribed `micromamba ... python=3.7.17 pip` solve failed on conda-forge; a query against Anaconda `pkgs/main` also found **no Python 3.7.17**. This is a **package availability failure**, not a failed import, failed TensorFlow wheel, or failed OaF oracle.
+
+Keep the Docker baseline at Python 3.7.17. For the Colab **host-only** worker, permit exactly one bounded alternative:
+
+- Try **Python 3.7.16**, pinned to the available [Anaconda `pkgs/main` Linux x86-64 package](https://anaconda.org/anaconda/python/files/manage?version=3.7.16), using an explicitly selected channel and the same locked pip dependency files. This package is **listed**, not yet proven installable on the target VM.
+- The [TensorFlow 1.15.5 PyPI Linux wheel](https://pypi.org/project/tensorflow/1.15.5/) uses `cp37-cp37m` rather than a particular CPython 3.7 patch release; **ABI compatibility makes a test reasonable but does not prove runtime or bit-exact inference compatibility**. Preserve the checked-in TensorFlow, NumPy and other hashes, Magenta patch, checkpoint and model descriptor; record the exact host interpreter version in evidence.
+- Start at the environment solve and frozen dependency installation. If they work, run the same **exact smoke oracle** and subsequently the six-file broad report comparison before allowing shared benchmark identity. If they fail, stop and capture precise diagnostics; do not auto-try unbounded channels, compile an obsolete Python, port TF1 to TF2, modify the model identity, or implement a rootless-container alternative without revising this **same PR's** architecture.
+- Real Colab Drive storage/durability and all OaF numerical/parity checks remain **unexecuted** until the interpreter is working. Task 1 production coding stays gated.
+
 ## Colab workflow: four isolated interpreters and two pins
 
 Create `notebooks/oaf_benchmark_colab.ipynb` for benchmark **generation only**; use clear manual cells, no workflow engine.
 
-- **Task 0 gate (before production coding):** on a real current Colab VM, provision Python 3.7.17 and frozen TF1.15.5 hashed requirements plus `libsndfile1`, manually mirror the existing Docker layout for this *temporary feasibility probe*, and run exact smoke-oracle parity. Also probe a small Drive-backed atomic write/restore. If Python 3.7/TF1 cannot run, stop and record diagnostics; do not rewrite the model.
-- **Environment setup:** separate Crux Python 3.12 (`uv sync --extra r2`), OaF Python 3.7, Spleeter 2.4.2, HTDemucs 4.1.0. OaF uses CPU. Optional GPU only for HTDemucs. Do not downgrade the notebook interpreter. Credentials come from Colab Secrets.
+- **Task 0 gate (before production coding):** the first real Colab attempt could not resolve Python 3.7.17. On the same kind of VM, try the **single pinned 3.7.16 host-only alternative** above, then install the frozen TF1.15.5 hashed requirements plus `libsndfile1`, temporarily mirror the Docker layout, and run exact smoke-oracle parity. Verify Drive-backed write/restore. If interpreter provisioning, frozen imports, smoke, or Drive fail, stop and record diagnostics. The unchanged Docker image remains Python 3.7.17; no runtime equivalence is assumed before proof.
+- **Environment setup (only after the Task 0 gate passes):** separate Crux Python 3.12 (`uv sync --extra r2`), OaF exact pinned Python **3.7.16 if successfully validated**, Spleeter 2.4.2, HTDemucs 4.1.0. OaF uses CPU. Optional GPU only for HTDemucs. Do not downgrade the notebook interpreter. Credentials come from Colab Secrets.
 - **Corpus stage:** pin a concrete `CORPUS_COMMIT` after the code changes are stable, record it in the notebook/workspace, check `git rev-parse HEAD`, and mount Drive at the same path on every VM. Place the checkpoint cache on Drive, and create the **single** symlink `artifacts/benchmark/model-cache -> <absolute Drive checkpoint-cache root>` inside the checkout. Set `CRUX_OAF_CHECKPOINT_CACHE` to that same Drive root and `CRUX_OAF_NATIVE_PYTHON` to the frozen Python 3.7 interpreter; retain stable absolute paths for the remaining artifacts. This accommodates `smoke-backend`'s explicit default checkpoint path without changing the CLI. Run R2 sync and reference commands, fail early on reference drift, then run `run-oaf-corpus --resume` and exact report parity.
 - **Human review stage:** produce `review-candidates.csv`; **stop** for the 30-song listening review, accept only human-filled decisions, `finalize-reviewed-subset`, and score the reviewed full-mix cohort.
 - **Separator/pilot stage:** build isolated separator environments and fixed model roots. Freeze both environments **once**, then commit **four small provenance files** to **this same HPA-856 PR**: `runtime/separators/{spleeter,htdemucs}/{model.json,environment.json}`. These are versioned **identities**, not venv archives/weights or stem data. Record the resulting `PILOT_COMMIT` and use that exact checkout for the pilot and all resumes. The corpus run's earlier commit remains recorded; the pilot includes its own `crux_commit` in the deterministic run ID. Never advance the pilot checkout partway through a partial run.
@@ -74,7 +85,7 @@ The merged CLI owns HTTPS/TLS/redirect checks, staged five-file snapshot, artifa
 
 ## Acceptance (real target + CI)
 
-- [ ] Task 0 on the target Colab VM: real Python 3.7/TF1 smoke matches the full checked-in native-event oracle. A failing compatibility gate is documented, not bypassed.
+- [ ] Task 0 on the target Colab VM: after the unsuccessful 3.7.17 package solve, prove the pinned 3.7.16 candidate installs the **unchanged** TF1.15.5 runtime and matches the full checked-in native-event oracle exactly. Prove Drive durability. A failed provisioning/import/oracle gate is documented, not bypassed.
 - [ ] The normal macOS/CI Docker path remains unchanged. Native opt-in works via one environment setting, builds/cleans its own bundle, resolves absolute paths, and isolates Python import environment variables. The Colab smoke command reads the **Drive-backed checkpoint** via its existing `artifacts/benchmark/model-cache` path; `verify-backend` and `transcribe-one` remain out of scope.
 - [ ] Colab reference manifest/timing identities match the immutable baseline **before** inference; all six full-mix canonical report files match the baseline **exactly** afterward.
 - [ ] The 30-song review and final pilot disposition remain human; both frozen separator lock+environment pairs are versioned in this PR **before** pilot scoring. Pilot resumes after a VM reset using the same pinned commit and attested restored runtimes.
