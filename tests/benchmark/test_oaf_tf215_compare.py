@@ -529,8 +529,43 @@ def test_driver_reports_a_checkpoint_acquisition_failure_as_blocked(
     assert factory.calls == []
 
 
-def test_driver_reports_a_checkpoint_validation_failure_as_failed(
-    compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    ("reason", "status", "failed_stage", "stage_name"),
+    [
+        (
+            "checkpoint component hash differs",
+            "failed",
+            "checkpoint_validation",
+            "checkpoint_validation",
+        ),
+        (
+            "checkpoint cache entries differ",
+            "failed",
+            "checkpoint_validation",
+            "checkpoint_validation",
+        ),
+        (
+            "checkpoint cache component is unavailable",
+            "blocked",
+            "checkpoint",
+            "checkpoint",
+        ),
+        (
+            "checkpoint cache destination is unavailable",
+            "blocked",
+            "checkpoint",
+            "checkpoint",
+        ),
+    ],
+)
+def test_driver_classifies_a_populated_cache_failure_by_reason(
+    compare: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    reason: str,
+    status: str,
+    failed_stage: str,
+    stage_name: str,
 ) -> None:
     paths = _paths(tmp_path)
     archive = load_model_config(compare.MODEL_CONFIG_PATH).checkpoint.archive_sha256
@@ -538,7 +573,7 @@ def test_driver_reports_a_checkpoint_validation_failure_as_failed(
 
     def _fail(_config: object, _cache_root: Path, *, download: bool) -> Path:
         assert download is False
-        raise CheckpointAcquisitionError("checkpoint component hash differs")
+        raise CheckpointAcquisitionError(reason)
 
     monkeypatch.setattr(compare, "prepare_oaf_checkpoint", _fail)
     factory = _FakeFactory()
@@ -552,10 +587,10 @@ def test_driver_reports_a_checkpoint_validation_failure_as_failed(
         process_factory=factory,
     )
 
-    assert record["status"] == "failed"
-    assert record["state"]["failed_stage"] == "checkpoint_validation"
-    assert [stage["name"] for stage in record["stages"]] == ["config", "checkpoint_validation"]
-    assert "checkpoint component hash differs" in record["stages"][-1]["error"]
+    assert record["status"] == status
+    assert record["state"]["failed_stage"] == failed_stage
+    assert [stage["name"] for stage in record["stages"]] == ["config", stage_name]
+    assert reason in record["stages"][-1]["error"]
     assert factory.calls == []
 
 
@@ -794,6 +829,28 @@ def test_driver_reports_a_fresh_worker_host_failure_as_blocked(
     assert record["status"] == "blocked"
     assert record["state"]["failed_stage"] == "host"
     assert record["stages"][-1]["name"] == "host"
+    assert "worker could not be started" in record["stages"][-1]["error"]
+    assert len(factory.workers) == 1
+    assert factory.workers[0].close_count == 1
+    assert len(record["inference"]["runs"]) == 2
+
+
+def test_driver_keeps_a_worker_close_failure_over_a_later_host_blocker(
+    compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = _paths(tmp_path)
+    plans = [
+        _FakeWorker([_response(), _response()], close_error=WorkerProcessError("close failed")),
+        _host_error(),
+    ]
+    factory = _FakeFactory(plans)
+
+    record = _run(compare, monkeypatch, paths, factory)
+
+    assert record["status"] == "failed"
+    assert record["state"]["failed_stage"] == "worker_close"
+    assert [stage["name"] for stage in record["stages"][-2:]] == ["worker_close", "host"]
+    assert "close failed" in record["stages"][-2]["error"]
     assert "worker could not be started" in record["stages"][-1]["error"]
     assert len(factory.workers) == 1
     assert factory.workers[0].close_count == 1
