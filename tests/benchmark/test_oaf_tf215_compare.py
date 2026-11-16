@@ -1,22 +1,34 @@
-"""Host-driver tests for the scratch TF 2.15 OaF worker (HPA-856 Task 3).
+"""Host-driver tests for the scratch TF 2.15 OaF worker (HPA-856 Tasks 3-4).
 
 The driver runs on the Crux Python 3.12 environment and only launches the
 Python 3.11 scratch worker. These tests use a fake process factory: they check
-the launched command/environment and the restore accounting, never the frozen
-tensor inventory or a real checkpoint.
+the launched command/environment, restore accounting, the two-same-worker plus
+one-fresh-worker inference boundary and the derived result label. They never
+run the frozen tensor inventory, a real checkpoint or a real inference.
+
+Expected native events are derived from the existing smoke-oracle fixture at
+test time; no oracle golden is copied into this module.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
+import struct
+from dataclasses import asdict
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
 from runtime.oaf_tf1.model import OafModelConfigError
+from src.benchmark.backends.oaf import _decode_native_event
 from src.benchmark.checkpoint_acquisition import CheckpointAcquisitionError
+from src.benchmark.oaf_smoke_oracle import (
+    SmokeOracleEvent,
+    _event_from_native,
+    read_smoke_oracle,
+)
 from src.benchmark.worker_process import WorkerProcessError
 
 REPO_ROOT = Path(__file__).parents[2]
@@ -52,33 +64,124 @@ def compare_fixture() -> ModuleType:
     return _load_compare()
 
 
+def _binary64(value: str) -> float:
+    return struct.unpack(">d", bytes.fromhex(value))[0]
+
+
+def _worker_event(event: SmokeOracleEvent) -> dict[str, object]:
+    """Render one oracle event exactly as the worker protocol reports it."""
+    return {
+        "time_sec": _binary64(event.time_sec_binary64),
+        "native_class_id": event.native_class_id,
+        "model_output_bin": event.model_output_bin,
+        "native_midi_note": event.native_midi_note,
+        "upstream_8hit_group_id": event.upstream_8hit_group_id,
+        "confidence": (
+            None if event.confidence_binary64 is None else _binary64(event.confidence_binary64)
+        ),
+        "velocity_midi": event.velocity_midi,
+    }
+
+
+ORACLE_EVENTS = tuple(read_smoke_oracle(ORACLE.read_bytes()).native_events)
+EXACT_EVENTS = [_worker_event(event) for event in ORACLE_EVENTS]
+
+
+def _response(events: list[dict[str, object]] | None = None) -> dict[str, object]:
+    return {"id": "fake-request", "events": EXACT_EVENTS if events is None else events}
+
+
+def _converted(events: list[dict[str, object]]) -> list[SmokeOracleEvent]:
+    """Convert worker payloads to oracle events through the real decoder path."""
+    return [_event_from_native(_decode_native_event(event)) for event in events]
+
+
+def _divergent_events() -> list[dict[str, object]]:
+    events = [dict(event) for event in EXACT_EVENTS]
+    events[0]["native_midi_note"] = 39
+    return events
+
+
+def _synthetic_events(count: int) -> list[dict[str, object]]:
+    return [
+        {
+            "time_sec": (index + 1) / 10,
+            "native_class_id": "midi_38",
+            "model_output_bin": 17,
+            "native_midi_note": 38,
+            "upstream_8hit_group_id": "snare",
+            "confidence": 0.5,
+            "velocity_midi": 100,
+        }
+        for index in range(count)
+    ]
+
+
 class _FakeWorker:
-    def __init__(self, ready: object) -> None:
+    """One fake worker process with a shared boundary log."""
+
+    def __init__(
+        self,
+        responses: list[object],
+        *,
+        ready: object = READY,
+        log: list[str] | None = None,
+    ) -> None:
         self.ready = ready
         self.requests: list[str] = []
         self.close_count = 0
+        self.closed = False
+        self.log = [] if log is None else log
+        self._responses = list(responses)
 
     def request(self, path: str, **_kwargs: object) -> dict[str, object]:
+        if self.closed:
+            raise AssertionError("request after close")
         self.requests.append(path)
-        raise AssertionError("Task 3 must not issue an inference request")
+        self.log.append("request")
+        result = self._responses.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result  # type: ignore[return-value]
 
     def close(self) -> None:
         self.close_count += 1
+        self.closed = True
+        self.log.append("close")
 
 
 class _FakeFactory:
-    def __init__(self, ready: object = READY, error: Exception | None = None) -> None:
+    """Process factory: one worker per call, with shared ordering evidence."""
+
+    def __init__(
+        self,
+        plans: list[object] | None = None,
+        *,
+        ready: object = READY,
+        error: Exception | None = None,
+    ) -> None:
+        self._plans = list(plans or [])
         self._ready = ready
         self._error = error
         self.calls: list[dict[str, object]] = []
-        self.worker: _FakeWorker | None = None
+        self.workers: list[_FakeWorker] = []
+        self.log: list[str] = []
 
     def __call__(self, command: list[str], **kwargs: object) -> _FakeWorker:
         self.calls.append({"command": list(command), **kwargs})
+        self.log.append("start")
         if self._error is not None:
             raise self._error
-        self.worker = _FakeWorker(self._ready)
-        return self.worker
+        plan = self._plans.pop(0) if self._plans else [_response() for _ in range(3)]
+        if isinstance(plan, Exception):
+            raise plan
+        if isinstance(plan, _FakeWorker):
+            worker = plan
+            worker.log = self.log
+        else:
+            worker = _FakeWorker(plan, ready=self._ready, log=self.log)  # type: ignore[arg-type]
+        self.workers.append(worker)
+        return worker
 
 
 def _paths(tmp_path: Path, *, fixture: Path = FIXTURE) -> dict[str, Path]:
@@ -154,16 +257,19 @@ def test_driver_launches_the_scratch_worker_with_an_isolated_environment(
 
     record = _run(compare, monkeypatch, paths, factory)
 
-    assert record["status"] == "passed"
-    assert record["failed_stage"] is None
+    assert record["status"] == "smoke_exact"
+    assert record["state"]["failed_stage"] is None
     assert [stage["name"] for stage in record["stages"]] == [
         "config",
         "checkpoint",
         "input",
         "worker_start",
         "restore",
+        "inference",
     ]
-    (call,) = factory.calls
+    assert len(factory.calls) == 2
+    assert factory.calls[0] == factory.calls[1]
+    call = factory.calls[0]
     assert call["command"] == [
         str(paths["python311"]),
         "-s",
@@ -179,12 +285,12 @@ def test_driver_launches_the_scratch_worker_with_an_isolated_environment(
     assert environment["TMPDIR"] == "/sentinel/tmp"
     assert all(key not in environment for key in SANITIZED_VARIABLES)
     assert {key: environment[key] for key in WORKER_FLAGS} == WORKER_FLAGS
-    assert factory.worker is not None
-    assert factory.worker.requests == []
-    assert factory.worker.close_count == 1
+    assert factory.log == ["start", "request", "request", "close", "start", "request", "close"]
+    assert [worker.requests for worker in factory.workers] == [[FIXTURE.name] * 2, [FIXTURE.name]]
+    assert [worker.close_count for worker in factory.workers] == [1, 1]
 
 
-def test_driver_writes_a_passed_record_and_exits_zero(
+def test_driver_writes_a_smoke_exact_record_and_exits_zero(
     compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     paths = _paths(tmp_path)
@@ -195,11 +301,50 @@ def test_driver_writes_a_passed_record_and_exits_zero(
 
     assert code == 0
     record = json.loads(paths["output"].read_text(encoding="utf-8"))
-    assert record["schema"] == "oaf-tf215-compare/v1"
-    assert record["status"] == "passed"
-    restore = record["stages"][-1]
+    assert record["schema"] == "oaf-tf215-compare/v2"
+    assert record["status"] == "smoke_exact"
+    assert record["state"] == {
+        "inference_completed": True,
+        "repeatable": True,
+        "oracle_exact": True,
+        "failed_stage": None,
+    }
+    assert set(record["state"]) == {
+        "inference_completed",
+        "repeatable",
+        "oracle_exact",
+        "failed_stage",
+    }
+    restore = record["stages"][-2]
     assert restore["name"] == "restore"
     assert restore["details"]["restored_tensor_count"] == 78
+    inference = record["stages"][-1]
+    assert inference["name"] == "inference"
+    assert inference["details"]["event_counts"] == [3, 3, 3]
+
+
+def test_driver_retains_full_events_for_two_runs_and_a_fresh_worker(
+    compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = _paths(tmp_path)
+
+    record = _run(compare, monkeypatch, paths, _FakeFactory())
+
+    expected_events = [asdict(event) for event in ORACLE_EVENTS]
+    inference = record["inference"]
+    assert inference["relative_wav"] == FIXTURE.name
+    assert inference["oracle_events"] == expected_events
+    assert [(run["run"], run["worker"]) for run in inference["runs"]] == [
+        (1, 1),
+        (2, 1),
+        (3, 2),
+    ]
+    assert [run["events"] for run in inference["runs"]] == [expected_events] * 3
+    assert inference["fresh_worker"] == {
+        "restored_tensor_count": 78,
+        "backend_id": WORKER_BACKEND_ID,
+    }
+    assert inference["deltas"] == []
 
 
 @pytest.mark.parametrize(
@@ -229,7 +374,7 @@ def test_driver_requires_a_real_restored_tensor_count(
     record = _run(compare, monkeypatch, paths, factory)
 
     assert record["status"] == "failed"
-    assert record["failed_stage"] == "restore"
+    assert record["state"]["failed_stage"] == "restore"
     assert [stage["name"] for stage in record["stages"]] == [
         "config",
         "checkpoint",
@@ -238,8 +383,9 @@ def test_driver_requires_a_real_restored_tensor_count(
         "restore",
     ]
     assert record["stages"][-1]["status"] == "failed"
-    assert factory.worker is not None
-    assert factory.worker.close_count == 1
+    (worker,) = factory.workers
+    assert worker.requests == []
+    assert worker.close_count == 1
 
 
 def test_driver_writes_the_failure_record_and_exits_nonzero(
@@ -254,27 +400,29 @@ def test_driver_writes_the_failure_record_and_exits_nonzero(
     assert code == 1
     record = json.loads(paths["output"].read_text(encoding="utf-8"))
     assert record["status"] == "failed"
-    assert record["failed_stage"] == "restore"
+    assert record["state"]["failed_stage"] == "restore"
     assert "restored tensor count" in record["stages"][-1]["error"]
 
 
-def test_driver_reports_a_worker_start_failure(
+def test_driver_reports_a_worker_start_failure_as_blocked(
     compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     paths = _paths(tmp_path)
-    factory = _FakeFactory(error=WorkerProcessError("worker exited before ready: import failed"))
+    factory = _FakeFactory(
+        error=WorkerProcessError("worker could not be started: permission denied")
+    )
 
     record = _run(compare, monkeypatch, paths, factory)
 
-    assert record["status"] == "failed"
-    assert record["failed_stage"] == "worker_start"
+    assert record["status"] == "blocked"
+    assert record["state"]["failed_stage"] == "worker_start"
     assert [stage["name"] for stage in record["stages"]] == [
         "config",
         "checkpoint",
         "input",
         "worker_start",
     ]
-    assert "import failed" in record["stages"][-1]["error"]
+    assert "permission denied" in record["stages"][-1]["error"]
 
 
 def test_driver_rejects_a_fixture_that_is_not_the_oracle_input(
@@ -290,12 +438,12 @@ def test_driver_rejects_a_fixture_that_is_not_the_oracle_input(
     record = _run(compare, monkeypatch, paths, factory)
 
     assert record["status"] == "failed"
-    assert record["failed_stage"] == "input"
+    assert record["state"]["failed_stage"] == "input"
     assert "input_audio_sha256" in record["stages"][-1]["error"]
     assert factory.calls == []
 
 
-def test_driver_reports_a_checkpoint_acquisition_failure(
+def test_driver_reports_a_checkpoint_acquisition_failure_as_blocked(
     compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     paths = _paths(tmp_path)
@@ -316,8 +464,8 @@ def test_driver_reports_a_checkpoint_acquisition_failure(
         process_factory=factory,
     )
 
-    assert record["status"] == "failed"
-    assert record["failed_stage"] == "checkpoint"
+    assert record["status"] == "blocked"
+    assert record["state"]["failed_stage"] == "checkpoint"
     assert "checkpoint cache is missing" in record["stages"][-1]["error"]
     assert factory.calls == []
 
@@ -338,10 +486,207 @@ def test_driver_records_a_model_configuration_failure(
     assert code == 1
     record = json.loads(paths["output"].read_text(encoding="utf-8"))
     assert record["status"] == "failed"
-    assert record["failed_stage"] == "config"
+    assert record["state"]["failed_stage"] == "config"
     assert [stage["name"] for stage in record["stages"]] == ["config"]
     assert "model configuration is invalid" in record["stages"][-1]["error"]
     assert factory.calls == []
+
+
+@pytest.mark.parametrize(
+    ("inference_completed", "repeatable", "oracle_exact", "failed_stage", "expected"),
+    [
+        (None, None, None, "config", "failed"),
+        (None, None, None, "checkpoint", "blocked"),
+        (None, None, None, "worker_start", "blocked"),
+        (None, None, None, "restore", "failed"),
+        (None, None, None, "input", "failed"),
+        (None, None, None, "inference", "failed"),
+        (None, None, None, "worker_close", "failed"),
+        (None, None, None, None, "environment_only_passed"),
+        (False, None, None, None, "failed"),
+        (True, None, None, None, "failed"),
+        (True, False, None, None, "non_repeatable"),
+        (True, False, False, None, "non_repeatable"),
+        (True, True, None, None, "failed"),
+        (True, True, False, None, "oracle_divergent"),
+        (True, True, True, None, "smoke_exact"),
+        (True, True, True, "worker_close", "failed"),
+    ],
+)
+def test_classify_result_labels(
+    compare: ModuleType,
+    inference_completed: bool | None,
+    repeatable: bool | None,
+    oracle_exact: bool | None,
+    failed_stage: str | None,
+    expected: str,
+) -> None:
+    assert (
+        compare.classify_result(inference_completed, repeatable, oracle_exact, failed_stage)
+        == expected
+    )
+
+
+def test_driver_reports_non_repeatable_runs(
+    compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = _paths(tmp_path)
+    divergent = _divergent_events()
+    plans = [
+        _FakeWorker([_response(), _response()]),
+        _FakeWorker([_response(divergent)]),
+    ]
+    _install_checkpoint(monkeypatch, compare, paths["checkpoint_cache"] / "sha256" / "checkpoint")
+
+    code = compare.main(_cli(paths), process_factory=_FakeFactory(plans))
+
+    assert code == 1
+    record = json.loads(paths["output"].read_text(encoding="utf-8"))
+    assert record["status"] == "non_repeatable"
+    assert record["state"] == {
+        "inference_completed": True,
+        "repeatable": False,
+        "oracle_exact": None,
+        "failed_stage": None,
+    }
+    assert record["inference"]["runs"][2]["events"] == [
+        asdict(event) for event in _converted(divergent)
+    ]
+
+
+def test_driver_reports_a_repeatable_oracle_divergence(
+    compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = _paths(tmp_path)
+    divergent = _divergent_events()
+    plans = [
+        _FakeWorker([_response(divergent), _response(divergent)]),
+        _FakeWorker([_response(divergent)]),
+    ]
+    _install_checkpoint(monkeypatch, compare, paths["checkpoint_cache"] / "sha256" / "checkpoint")
+
+    code = compare.main(_cli(paths), process_factory=_FakeFactory(plans))
+
+    assert code == 1
+    record = json.loads(paths["output"].read_text(encoding="utf-8"))
+    assert record["status"] == "oracle_divergent"
+    assert record["state"] == {
+        "inference_completed": True,
+        "repeatable": True,
+        "oracle_exact": False,
+        "failed_stage": None,
+    }
+    deltas = record["inference"]["deltas"]
+    assert deltas == [
+        {
+            "run": run,
+            "index": 0,
+            "fields": {"native_midi_note": {"actual": 39, "expected": 38}},
+        }
+        for run in (1, 2, 3)
+    ]
+
+
+def test_driver_caps_recorded_field_deltas(
+    compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = _paths(tmp_path)
+    events = _synthetic_events(20)
+    plans = [
+        _FakeWorker([_response(events), _response(events)]),
+        _FakeWorker([_response(events)]),
+    ]
+
+    record = _run(compare, monkeypatch, paths, _FakeFactory(plans))
+
+    assert record["status"] == "oracle_divergent"
+    deltas = record["inference"]["deltas"]
+    assert len(deltas) == compare.MAX_RECORDED_DELTAS
+    assert deltas[0] == {
+        "run": 1,
+        "event_count": {"actual": 20, "expected": 3},
+    }
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        (WorkerProcessError("inference failed"), "inference failed"),
+        (
+            {
+                "id": "fake-request",
+                "error": {"code": "inference_failed", "message": "inference failed"},
+            },
+            "worker inference failed",
+        ),
+        ({"id": "fake-request", "events": [{"not": "an event"}]}, "worker event is invalid"),
+    ],
+)
+def test_driver_records_an_inference_failure_and_closes_the_first_worker(
+    compare: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: object,
+    message: str,
+) -> None:
+    paths = _paths(tmp_path)
+    plans = [[_response(), failure]]
+    factory = _FakeFactory(plans)
+    _install_checkpoint(monkeypatch, compare, paths["checkpoint_cache"] / "sha256" / "checkpoint")
+
+    code = compare.main(_cli(paths), process_factory=factory)
+
+    assert code == 1
+    record = json.loads(paths["output"].read_text(encoding="utf-8"))
+    assert record["status"] == "failed"
+    assert record["state"] == {
+        "inference_completed": False,
+        "repeatable": None,
+        "oracle_exact": None,
+        "failed_stage": "inference",
+    }
+    assert message in record["stages"][-1]["error"]
+    (worker,) = factory.workers
+    assert worker.close_count == 1
+    assert len(record["inference"]["runs"]) == 1
+
+
+def test_driver_reports_a_fresh_worker_start_failure_after_closing_the_first(
+    compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = _paths(tmp_path)
+    plans = [
+        _FakeWorker([_response(), _response()]),
+        WorkerProcessError("worker could not be started"),
+    ]
+    factory = _FakeFactory(plans)
+
+    record = _run(compare, monkeypatch, paths, factory)
+
+    assert record["status"] == "failed"
+    assert record["state"]["failed_stage"] == "inference"
+    assert "worker could not be started" in record["stages"][-1]["error"]
+    assert len(factory.workers) == 1
+    assert factory.workers[0].close_count == 1
+
+
+def test_driver_validates_the_fresh_worker_restore_count(
+    compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = _paths(tmp_path)
+    plans = [
+        _FakeWorker([_response(), _response()]),
+        _FakeWorker([_response()], ready={"type": "ready", "restored_tensor_count": 77}),
+    ]
+    factory = _FakeFactory(plans)
+
+    record = _run(compare, monkeypatch, paths, factory)
+
+    assert record["status"] == "failed"
+    assert record["state"]["inference_completed"] is False
+    assert record["state"]["failed_stage"] == "inference"
+    assert "restored tensor count" in record["stages"][-1]["error"]
+    assert [worker.close_count for worker in factory.workers] == [1, 1]
 
 
 def test_driver_requires_absolute_input_paths(compare: ModuleType, tmp_path: Path) -> None:
