@@ -20,10 +20,14 @@ check does not by itself establish model parity.
 | `graph_check.py` | Executes real Slim Conv2D + batch-normalization and legacy LSTM sessions and records stage-specific diagnostics. |
 | `build_runtime.py` | Creates one scratch `runtime/` + `upstream/` from the frozen TF1 source, applies the instrumentation patch first and then `patches/tf215-compat.patch`. |
 | `patches/tf215-compat.patch` | The single reviewed TF 2.15 compatibility patch (drum `tf_slim`, HParams/RNN, Estimator, unused package-initializer imports). |
+| `compare.py` | Python 3.12 driver: verifies the checkpoint and fixture, then runs two requests through one loaded Python 3.11 scratch worker plus one through a fresh worker and compares the exact native events with the frozen binary64 smoke oracle. |
 | `check_workflow_result_fallback.py` | Stdlib-only local check: the workflow's always-on result step writes a failed sync/check/build/graph/environment record when no graph output exists. |
 | `README.md` | This file. Reproduction commands and evidence scope. |
+| `RESULTS.md` | Recorded CI, graph, restore and inference evidence; not a parity claim. |
 
-`compare.py` and `RESULTS.md` land in later tasks of the same plan and PR.
+`tests/runtime/test_oaf_tf215_builder.py` (stdlib only) and
+`tests/benchmark/test_oaf_tf215_compare.py` / `test_oaf_tf215_workflow.py`
+(project Python 3.12) cover the builder and the driver/workflow behavior.
 
 ## Target platform
 
@@ -35,17 +39,39 @@ has no macOS ARM64 wheel, and the lock is compiled explicitly for
 
 ## Reproduce locally / on Colab (x86-64 Linux only)
 
+Run all commands from the repository root. On Colab, keep the notebook kernel
+and the Crux Python 3.12 project environment unchanged: the Python 3.11 venv is
+only the scratch worker/TensorFlow environment, and `uv run` is the existing
+3.12 host driver. The workflow's manual `model` job runs this sequence; the
+native Linux x86-64 confirmation run used the same scripts and lock with
+Colab paths (`/content/oaf-tf215-*`).
+
+### 1. Provision the Python 3.11 environment
+
 ```bash
 uv python install 3.11
 uv venv --python 3.11 /tmp/oaf-tf215-venv
-uv pip sync --python /tmp/oaf-tf215-venv/bin/python --require-hashes \
+export PY311=/tmp/oaf-tf215-venv/bin/python
+uv pip sync --python "$PY311" --require-hashes \
   experiments/oaf_tf215/requirements.lock
-uv pip check --python /tmp/oaf-tf215-venv/bin/python
+uv pip check --python "$PY311"
+```
 
+### 2. Build the scratch runtime
+
+```bash
+SCRATCH=/tmp/oaf-tf215-scratch
+"$PY311" experiments/oaf_tf215/build_runtime.py --output "$SCRATCH"
+# -> /tmp/oaf-tf215-scratch/runtime
+```
+
+### 3. Execute the graph sessions
+
+```bash
 mkdir -p /tmp/numba-cache
 CUDA_VISIBLE_DEVICES=-1 PYTHONHASHSEED=0 TF_ENABLE_ONEDNN_OPTS=0 \
 NUMBA_CACHE_DIR=/tmp/numba-cache \
-  /tmp/oaf-tf215-venv/bin/python experiments/oaf_tf215/graph_check.py \
+  "$PY311" experiments/oaf_tf215/graph_check.py \
   --output artifacts/experiments/oaf-tf215/graph-check.json
 ```
 
@@ -53,6 +79,45 @@ NUMBA_CACHE_DIR=/tmp/numba-cache \
 the process that launches `graph_check.py`; setting it inside the script has no
 effect. `graph_check.py` validates all four values before importing TensorFlow
 and fails the `environment` stage when they do not match.
+
+### 4. Prepare the public checkpoint (network, no secrets)
+
+```bash
+uv run crux benchmark prepare-backend --backend oaf --download
+# -> artifacts/benchmark/model-cache/sha256/<archive sha256>
+```
+
+This is the command the existing `oaf-smoke.yml` job uses. `compare.py` only
+verifies the populated cache and never downloads; a missing or unavailable
+cache is recorded as a `checkpoint` stage and blocked, not as an inference
+result.
+
+### 5. Run the full-model comparison
+
+```bash
+uv run experiments/oaf_tf215/compare.py \
+  --python311 "$PY311" \
+  --runtime-root "$SCRATCH/runtime" \
+  --checkpoint-cache "$PWD/artifacts/benchmark/model-cache" \
+  --fixture "$PWD/tests/fixtures/oaf_tf1_smoke/canonical.wav" \
+  --oracle "$PWD/tests/fixtures/oaf_tf1_smoke/smoke-oracle.json" \
+  --output artifacts/experiments/oaf-tf215/compare.json
+```
+
+The driver writes `compare.json` **before** it returns, then exits `0` only for
+`smoke_exact`. Every other label exits `1`, including `oracle_divergent`, which
+is repeatable but different from the frozen oracle. Preserve the record on a
+divergent run instead of discarding it:
+
+```bash
+rc=0
+uv run experiments/oaf_tf215/compare.py ... --output artifacts/experiments/oaf-tf215/compare.json \
+  || rc=$?
+echo "compare exit: $rc"
+```
+
+The recorded divergence from this candidate is quantified in `RESULTS.md`; a
+nonzero exit is evidence, not a flaky failure to retry away.
 
 ## Regenerate the lock
 
@@ -210,50 +275,104 @@ allows one only on a demonstrated fix, and none exists for this wheel set.
 
 ## CI
 
-`.github/workflows/oaf-tf215-probe.yml` runs on path-filtered pull requests
-(`experiments/oaf_tf215/**`, `tests/runtime/test_oaf_tf215_builder.py` and the
-workflow itself), including draft PRs, unlike the root `ci.yml` which skips
-drafts. On `ubuntu-24.04` it installs Python 3.11 with `uv python install 3.11`,
-creates the venv with `uv venv --python 3.11`, installs the hash lock with
+`.github/workflows/oaf-tf215-probe.yml` has a routine pull-request job and a
+manual full-model job.
+
+### PR graph job (checkpoint-free, runs on draft PRs)
+
+The `graph` job runs on path-filtered pull requests
+(`experiments/oaf_tf215/**`, the three scoped test modules and the workflow
+itself), including draft PRs, unlike the root `ci.yml` which skips drafts. On
+`ubuntu-24.04` it installs Python 3.11 with `uv python install 3.11`, creates
+the venv with `uv venv --python 3.11`, installs the hash lock with
 `uv pip sync --require-hashes` and runs `uv pip check`. The fresh runner
 install *is* the clean-reinstall proof; do not repeat it in a second manual
 venv.
 
 The next step (`build`) runs the stdlib-only builder tests with a `pytest`
-install added after the lock checks, executes the real
-`build_runtime.py`, and then imports the generated drum configuration and the
-scratch worker in two separate Python 3.11 interpreters. The drum import
-asserts `spec_hop_length=512`, `hop_length=441`, `sample_rate=44100` and that
-the piano config is gone; the worker import asserts the frozen backend ID. A
-failure at any of those points is a `build` stage failure. No checkpoint is
-downloaded by any of these steps.
+install added after the lock checks, executes the real `build_runtime.py`, and
+then imports the generated drum configuration and the scratch worker in two
+separate Python 3.11 interpreters. The drum import asserts
+`spec_hop_length=512`, `hop_length=441`, `sample_rate=44100` and that the piano
+config is gone; the worker import asserts the frozen backend ID. A failure at
+any of those points is a `build` stage failure. No checkpoint is downloaded by
+any of these steps.
 
-After the build stage, `graph_check.py` runs with the four environment
+The `driver` step then runs `tests/benchmark/test_oaf_tf215_compare.py` and
+`tests/benchmark/test_oaf_tf215_workflow.py` in the Python 3.12 project
+environment (fake worker only).
+
+After the driver stage, `graph_check.py` runs with the four environment
 controls. The compact `artifacts/experiments/oaf-tf215/graph-check.json` result
 and job summary are kept on success and failure. Installation happens in two
 named steps (`sync`, then `check`); graph failures name their own stage. If a
 step fails before `graph_check.py` writes its record (setup, `sync`, `check`,
-`build`, or the graph process being killed), the always-running result step
-writes a minimal failed JSON naming `environment`, `sync`, `check`, `build` or
-`graph` plus all step outcomes, so the artifact and summary are never absent.
-Existing stage records are never overwritten, and the passed record is never
-replaced. The routine PR job is checkpoint-free. A manual full-model
-`workflow_dispatch` job is added by a later task, not here.
+`build`, `driver`, or the graph process being killed), the always-running
+result step writes a minimal failed JSON naming `environment`, `sync`, `check`,
+`build`, `driver` or `graph` plus all step outcomes, so the artifact and
+summary are never absent. Existing stage records are never overwritten, and
+the passed record is never replaced.
 
-`check_workflow_result_fallback.py` is the focused local check for that
-fallback: it extracts the step's shell block from the workflow and exercises
-the sync, check, build, graph, setup, existing-failure and passed paths.
+### Manual full-model job (`workflow_dispatch`)
+
+The `model` job is gated by
+`if: github.event_name == 'workflow_dispatch'`, so a pull request never
+downloads the checkpoint. It uses the same hash lock and `build_runtime.py`
+builder, prepares the public checkpoint with the identical
+`uv run crux benchmark prepare-backend --backend oaf --download` command from
+`oaf-smoke.yml` (no secrets), and runs the Python 3.12 `compare.py` driver
+against the Python 3.11 scratch worker.
+
+The compare step captures the driver's exit status with
+`... | tee compare.log || rc=$?`, records `COMPARE_EXIT` and then re-exits with
+that status. `compare.py` writes `compare.json` before returning, so a
+divergent run keeps its full record and log while the job stays red; the
+always-on summary and upload steps run afterwards. `oracle_divergent` is never
+turned into a pass. The model job uploads `oaf-tf215-compare` (`compare.json`,
+`compare.log`); the PR graph job uploads `oaf-tf215-graph-check`.
+
+### Dispatch availability (recorded as unavailable, not passed)
+
+This workflow is added by PR #36 and is absent from the default branch. During
+the Task 5 preflight, GitHub's contents API returned 404 for
+`.github/workflows/oaf-tf215-probe.yml` at `main`, and GitHub only offers
+`workflow_dispatch` for workflows present on the default branch. The dispatch
+
+```bash
+gh workflow run oaf-tf215-probe.yml \
+  --ref docs/hpa-856-python311-tf215-prototype
+```
+
+is therefore **unavailable before merge and is not recorded as a pass**. Until
+merge, the identical command sequence above is executed on an authenticated
+Linux x86-64 Colab CPU VM (`RESULTS.md` records host, interpreter builds,
+hashes and the actual graph/restore/inference output). No GitHub model-job
+artifact exists for a pre-merge commit.
+
+`check_workflow_result_fallback.py` is the focused local check for the graph
+job's fallback: it extracts the step's shell block from the workflow and
+exercises the sync, check, build, driver, graph, setup, existing-failure and
+passed paths. `tests/benchmark/test_oaf_tf215_workflow.py` checks both jobs:
+the graph job stays checkpoint-free, the model job uses the same public
+checkpoint command as the smoke workflow with no secrets, and a divergent
+driver exit still leaves and uploads its record.
 
 ## What this does and does not prove
 
-Proves: the candidate hash lock resolves and installs on a fresh Linux x86-64
-runner, TensorFlow 2.15 can execute a TF1-compatibility Slim batch-norm graph
-and a legacy LSTM graph under the configured controls, and the generated drum
-configuration and scratch worker import under Python 3.11 without the unused
-notebook/NADE packages.
+Proves on Linux x86-64 (GitHub Actions and native Colab CPU, recorded with
+commit and host in `RESULTS.md`): the candidate hash lock resolves and installs,
+TensorFlow 2.15 executes the TF1-compatibility Slim batch-norm and legacy LSTM
+graphs under the configured controls, the generated drum configuration and
+scratch worker import under Python 3.11 without the unused notebook/NADE
+packages, the public checkpoint cache verifies, the frozen 130/78/52 partition
+checks run before the worker reports ready with 78 restored inference tensors,
+and three inferences (two same-worker, one fresh-worker) are repeatable.
 
-Does not prove: checkpoint restore, 130/78/52 tensor coverage, inference,
-repeatability, or equality with the frozen TF1 oracle. Those are separate,
-later gate results. The builder itself is verified locally by the stdlib tests;
-the TensorFlow imports of the scratch tree are proven only by the Linux CI job
-(or an emulated x86-64 pre-check), not by a local aarch64 interpreter.
+Does not prove: equality with the frozen TF1 oracle. The recorded native run is
+repeatable but `oracle_divergent` (see `RESULTS.md` for the exact event deltas),
+so no TF1 parity, cache/identity reuse or production equivalence is claimed.
+That result is also host-specific: it does not establish behaviour on other
+CPUs, TF1, a broad corpus, or any downstream production path. The builder
+itself is verified locally by the stdlib tests; the TensorFlow imports of the
+scratch tree are proven only on Linux x86-64 (GitHub or native Colab), not by a
+local aarch64 interpreter.

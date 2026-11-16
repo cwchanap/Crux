@@ -2,8 +2,8 @@ name: OaF TF2.15 probe
 
 # Path-filtered, checkpoint-free graph job for the Python 3.11 / TensorFlow 2.15
 # experiment. Unlike the root CI it intentionally runs for draft pull requests.
-# Task 5 of the HPA-856 plan extends this file with builder/import/driver checks
-# and a separate workflow_dispatch full-model job.
+# The separate `model` job is manual-only (`workflow_dispatch`); it downloads the
+# public checkpoint and never runs for a pull request.
 
 on:
   pull_request:
@@ -12,7 +12,9 @@ on:
       - "experiments/oaf_tf215/**"
       - "tests/runtime/test_oaf_tf215_builder.py"
       - "tests/benchmark/test_oaf_tf215_compare.py"
+      - "tests/benchmark/test_oaf_tf215_workflow.py"
       - ".github/workflows/oaf-tf215-probe.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -113,15 +115,17 @@ jobs:
           print("worker-import ok:", worker.DEFAULT_BACKEND_ID)
           PY
 
-      # Driver stage: the host-side restore driver runs on the Python 3.12
-      # project environment while Python 3.11 is only the scratch worker. This
-      # job uses a fake worker, so it stays checkpoint-free; the real scratch
-      # worker launch is the separate manual model job.
-      - name: Run host driver tests (driver stage)
+      # Driver stage: the host-side restore driver and the workflow checks run
+      # on the Python 3.12 project environment while Python 3.11 is only the
+      # scratch worker. This job uses a fake worker, so it stays checkpoint-free;
+      # the real scratch worker launch is the separate manual model job.
+      - name: Run host driver and workflow tests (driver stage)
         id: driver
         run: |
           set -euo pipefail
-          uv run pytest -q -o addopts=-ra tests/benchmark/test_oaf_tf215_compare.py
+          uv run pytest -q -o addopts=-ra \
+            tests/benchmark/test_oaf_tf215_compare.py \
+            tests/benchmark/test_oaf_tf215_workflow.py
 
       # The four controls must exist before the interpreter starts, because
       # PYTHONHASHSEED is only read at startup. graph_check.py validates them.
@@ -210,4 +214,124 @@ jobs:
         with:
           name: oaf-tf215-graph-check
           path: artifacts/experiments/oaf-tf215/graph-check.json
+          if-no-files-found: warn
+
+  # Manual full-model proof. It uses the same hash lock, builder and Python 3.11
+  # worker as the graph job, the public checkpoint command from oaf-smoke.yml
+  # (no secrets) and the Python 3.12 compare.py driver. compare.py writes its
+  # record before exiting 1 on `oracle_divergent`, so the output is kept and
+  # uploaded while the job stays red: a divergence is never downgraded to a pass.
+  model:
+    name: Manual full-model comparison
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up bootstrap Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: python -m pip install "uv==0.13.8"
+
+      - name: Install target Python 3.11
+        run: uv python install 3.11
+
+      - name: Create Python 3.11 environment
+        run: |
+          set -euo pipefail
+          uv venv --python 3.11 "$RUNNER_TEMP/tf215-venv"
+          echo "PY311=$RUNNER_TEMP/tf215-venv/bin/python" >> "$GITHUB_ENV"
+
+      # Same clean-install proof as the graph job: the fresh runner installs the
+      # committed hash lock, so no second manual venv is needed.
+      - name: Install hash lock (sync stage)
+        id: sync
+        run: |
+          set -euo pipefail
+          uv pip sync --python "$PY311" --require-hashes \
+            experiments/oaf_tf215/requirements.lock
+
+      - name: Check dependency consistency (check stage)
+        id: check
+        run: uv pip check --python "$PY311"
+
+      - name: Build scratch runtime (build stage)
+        id: build
+        run: |
+          set -euo pipefail
+          "$PY311" experiments/oaf_tf215/build_runtime.py \
+            --output "$RUNNER_TEMP/oaf-tf215-scratch"
+
+      # Public checkpoint acquisition, identical to oaf-smoke.yml. The driver
+      # verifies the cache and never downloads.
+      - name: Prepare public OaF checkpoint (checkpoint stage)
+        id: checkpoint
+        run: |
+          set -euo pipefail
+          uv run crux benchmark prepare-backend --backend oaf --download
+
+      # tee keeps the driver's full stdout in compare.log; the captured exit
+      # status is re-raised after it is recorded, so a divergent run fails the
+      # job without losing the JSON record the driver wrote first.
+      - name: Run full-model comparison (model stage)
+        id: compare
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts/experiments/oaf-tf215
+          log="artifacts/experiments/oaf-tf215/compare.log"
+          rc=0
+          uv run experiments/oaf_tf215/compare.py \
+            --python311 "$PY311" \
+            --runtime-root "$RUNNER_TEMP/oaf-tf215-scratch/runtime" \
+            --checkpoint-cache "$GITHUB_WORKSPACE/artifacts/benchmark/model-cache" \
+            --fixture "$GITHUB_WORKSPACE/tests/fixtures/oaf_tf1_smoke/canonical.wav" \
+            --oracle "$GITHUB_WORKSPACE/tests/fixtures/oaf_tf1_smoke/smoke-oracle.json" \
+            --output artifacts/experiments/oaf-tf215/compare.json 2>&1 | tee "$log" || rc=$?
+          echo "COMPARE_EXIT=$rc" >> "$GITHUB_ENV"
+          exit "$rc"
+
+      # Summarize, never rewrite: an existing compare.json is the driver's own
+      # record, including a divergent one.
+      - name: Record full-model result in job summary
+        if: always()
+        env:
+          SYNC_OUTCOME: ${{ steps.sync.outcome }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          CHECKPOINT_OUTCOME: ${{ steps.checkpoint.outcome }}
+          COMPARE_OUTCOME: ${{ steps.compare.outcome }}
+        run: |
+          set -euo pipefail
+          result="artifacts/experiments/oaf-tf215/compare.json"
+          {
+            echo "## OaF TF2.15 full-model comparison"
+            echo
+            echo "runner: ${RUNNER_OS} ${RUNNER_ARCH}, commit: ${GITHUB_SHA}"
+            echo "compare exit: ${COMPARE_EXIT:-not-run}"
+            echo
+            if [ -f "$result" ]; then
+              echo '```json'
+              cat "$result"
+              echo '```'
+            else
+              echo "No comparison record was produced; step outcomes: sync=${SYNC_OUTCOME} check=${CHECK_OUTCOME} build=${BUILD_OUTCOME} checkpoint=${CHECKPOINT_OUTCOME} compare=${COMPARE_OUTCOME}."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full-model result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oaf-tf215-compare
+          path: |
+            artifacts/experiments/oaf-tf215/compare.json
+            artifacts/experiments/oaf-tf215/compare.log
           if-no-files-found: warn
