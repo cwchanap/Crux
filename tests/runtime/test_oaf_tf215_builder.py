@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import os
 import re
+import subprocess
 from pathlib import Path
 from types import ModuleType
 
@@ -48,6 +49,16 @@ LOCKED_IMPLEMENTATIONS = (
     "_build_coverage_graph",
     "transcribe",
 )
+
+_GIT_TEST_ENV = {
+    "PATH": os.environ.get("PATH", ""),
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_AUTHOR_NAME": "OaF builder test",
+    "GIT_AUTHOR_EMAIL": "test@example.invalid",
+    "GIT_COMMITTER_NAME": "OaF builder test",
+    "GIT_COMMITTER_EMAIL": "test@example.invalid",
+}
 
 
 def _load_builder() -> ModuleType:
@@ -158,6 +169,49 @@ def test_builder_refuses_an_existing_destination(tmp_path: Path) -> None:
     with pytest.raises(builder.ScratchRuntimeError, match="already exists"):
         builder.build_runtime(REPO_ROOT, destination)
     assert builder.build_runtime(REPO_ROOT, tmp_path / "another").is_dir()
+
+
+def test_builder_refuses_a_dangling_destination_symlink(tmp_path: Path) -> None:
+    builder = _load_builder()
+    target = tmp_path / "target"
+    destination = tmp_path / "scratch"
+    destination.symlink_to(target, target_is_directory=True)
+    with pytest.raises(builder.ScratchRuntimeError, match="already exists"):
+        builder.build_runtime(REPO_ROOT, destination)
+    assert destination.is_symlink()
+    assert not target.exists()
+
+
+def test_builder_applies_the_patch_inside_a_git_checkout(
+    tmp_path: Path,
+) -> None:
+    builder = _load_builder()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _run_git_for_test(checkout, "init", "--quiet")
+    _run_git_for_test(checkout, "commit", "--allow-empty", "--quiet", "-m", "base")
+
+    runtime = builder.build_runtime(REPO_ROOT, checkout / "scratch")
+
+    configs = (
+        runtime / "vendor" / "magenta" / "models" / "onsets_frames_transcription" / "configs.py"
+    ).read_text(encoding="utf-8")
+    assert "from magenta.contrib import training as contrib_training" in configs
+    assert "tensorflow.contrib" not in configs
+    assert (runtime / "vendor" / "magenta" / "contrib" / "training.py").is_file()
+    assert "_initialize_tf_compat" in (runtime / "model.py").read_text(encoding="utf-8")
+
+
+def _run_git_for_test(repository: Path, *arguments: str) -> None:
+    subprocess.run(
+        ["git", *arguments],
+        cwd=repository,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_GIT_TEST_ENV,
+    )
 
 
 def test_instrumentation_runs_before_the_compatibility_patch(
