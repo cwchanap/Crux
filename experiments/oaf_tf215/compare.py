@@ -1,11 +1,12 @@
 # ruff: noqa: E402 - the repository root is on sys.path before first-party imports.
-"""Launch the scratch TF 2.15 OaF worker and prove checkpoint restoration.
+"""Run three real inferences through the scratch TF 2.15 OaF worker.
 
 This is an experimental host driver, not a production entry point. It runs under
-the Crux Python 3.12 environment, reuses the frozen checkpoint and fixture
-validation modules, and launches only the Python 3.11 scratch worker created by
-``build_runtime.py``. This task covers acquisition, fixture identity, worker
-startup and the restored-tensor gate; inference and oracle comparison follow.
+the Crux Python 3.12 environment, reuses the frozen checkpoint, fixture, worker
+protocol and oracle modules, and launches only the Python 3.11 scratch worker
+created by ``build_runtime.py``. Two requests run through one loaded worker and
+a third through a fresh worker, so run repeatability and identity with the
+authoritative binary64 smoke oracle are measured, not assumed.
 
 The checkpoint cache is verified here, never downloaded. Populate it with the
 existing public command first::
@@ -20,7 +21,7 @@ Usage::
         --checkpoint-cache /abs/path/artifacts/benchmark/model-cache \
         --fixture /abs/path/tests/fixtures/oaf_tf1_smoke/canonical.wav \
         --oracle /abs/path/tests/fixtures/oaf_tf1_smoke/smoke-oracle.json \
-        --output artifacts/experiments/oaf-tf215/restore.json
+        --output artifacts/experiments/oaf-tf215/compare.json
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ import platform
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any
 
@@ -42,12 +44,18 @@ if os.fspath(REPOSITORY_ROOT) not in sys.path:
 from runtime.oaf_tf1.model import REQUIRED_INFERENCE_COUNT, OafModelConfig, load_model_config
 from src.benchmark.artifact_io import read_regular_file_no_follow
 from src.benchmark.backends.idm import _isolated_worker_environment
+from src.benchmark.backends.oaf import _decode_native_event
 from src.benchmark.checkpoint_acquisition import prepare_oaf_checkpoint
 from src.benchmark.input_view import load_direct_audio
-from src.benchmark.oaf_smoke_oracle import read_smoke_oracle
+from src.benchmark.oaf_smoke_oracle import (
+    SmokeOracle,
+    SmokeOracleEvent,
+    _event_from_native,
+    read_smoke_oracle,
+)
 from src.benchmark.worker_process import WorkerProcess
 
-SCHEMA = "oaf-tf215-compare/v1"
+SCHEMA = "oaf-tf215-compare/v2"
 MODEL_CONFIG_PATH = REPOSITORY_ROOT / "runtime" / "oaf_tf1" / "model.json"
 SOURCE_AUDIO_ID = "oaf-smoke-canonical-v1"
 # A cold TensorFlow import plus a real checkpoint restore can exceed one minute.
@@ -58,6 +66,13 @@ WORKER_ENVIRONMENT = {
     "TF_ENABLE_ONEDNN_OPTS": "0",
     "NUMBA_CACHE_DIR": "/tmp/numba-cache",
 }
+# Pre-inference failures mean the experiment could not reach a loaded model on
+# this host, so they are blocked (not proven incompatible), never a pass.
+# Everything after a loaded worker is a real experiment failure.
+BLOCKED_STAGES = frozenset({"checkpoint", "worker_start"})
+# Diagnostics stay small: only the first differing event fields are recorded.
+MAX_RECORDED_DELTAS = 8
+EVENT_FIELDS = tuple(field.name for field in fields(SmokeOracleEvent))
 
 ProcessFactory = Callable[..., Any]
 
@@ -72,6 +87,34 @@ class StageFailure(RuntimeError):
     def __init__(self, stage: str) -> None:
         super().__init__(stage)
         self.stage = stage
+
+
+def classify_result(
+    inference_completed: bool | None,
+    repeatable: bool | None,
+    oracle_exact: bool | None,
+    failed_stage: str | None,
+) -> str:
+    """Derive the one result label from the nullable tri-state record.
+
+    ``blocked`` means the run never reached a loaded model (external checkpoint
+    or host access); ``failed`` is any experiment failure with its stage.
+    ``oracle_divergent`` is repeatable but differs from the frozen oracle, and
+    ``non_repeatable`` means the candidate runs differ among themselves.
+    """
+    if failed_stage is not None:
+        return "blocked" if failed_stage in BLOCKED_STAGES else "failed"
+    if inference_completed is None:
+        return "environment_only_passed"
+    if inference_completed is not True:
+        return "failed"
+    if repeatable is False:
+        return "non_repeatable"
+    if repeatable is not True:
+        return "failed"
+    if oracle_exact is True:
+        return "smoke_exact"
+    return "oracle_divergent" if oracle_exact is False else "failed"
 
 
 def _load_config(holder: dict[str, Any]) -> dict[str, Any]:
@@ -97,6 +140,7 @@ def _validate_input(
     config: OafModelConfig,
     fixture: Path,
     oracle_path: Path,
+    holder: dict[str, Any],
 ) -> dict[str, Any]:
     audio = load_direct_audio(
         fixture,
@@ -107,6 +151,7 @@ def _validate_input(
     oracle = read_smoke_oracle(read_regular_file_no_follow(oracle_path))
     if audio.input_audio_sha256 != oracle.input_audio_sha256:
         raise CompareError("fixture input_audio_sha256 differs from the smoke oracle")
+    holder["oracle"] = oracle
     return {
         "fixture": os.fspath(fixture),
         "input_audio_sha256": audio.input_audio_sha256,
@@ -163,6 +208,111 @@ def _validate_worker_ready(ready: object) -> dict[str, Any]:
     return {"restored_tensor_count": count, "backend_id": ready.get("backend_id")}
 
 
+def _request_events(process: Any, relative_wav: str) -> tuple[SmokeOracleEvent, ...]:
+    """Decode one worker response into the frozen oracle event representation."""
+    response = process.request(relative_wav)
+    if not isinstance(response, Mapping):
+        raise CompareError("worker response is invalid")
+    error = response.get("error")
+    if isinstance(error, Mapping) and isinstance(error.get("message"), str):
+        raise CompareError(f"worker inference failed: {error['message']}")
+    if "error" in response:
+        raise CompareError("worker response is invalid")
+    raw_events = response.get("events")
+    if not isinstance(raw_events, (list, tuple)):
+        raise CompareError("worker response is invalid")
+    return tuple(_event_from_native(_decode_native_event(value)) for value in raw_events)
+
+
+def _oracle_deltas(
+    attempts: Sequence[tuple[SmokeOracleEvent, ...]],
+    oracle_events: Sequence[SmokeOracleEvent],
+) -> list[dict[str, Any]]:
+    """Record the first differing fields of every attempt, capped in size."""
+    deltas: list[dict[str, Any]] = []
+    for run, events in enumerate(attempts, start=1):
+        if len(events) != len(oracle_events):
+            deltas.append(
+                {
+                    "run": run,
+                    "event_count": {"actual": len(events), "expected": len(oracle_events)},
+                }
+            )
+        for index, (actual, expected) in enumerate(zip(events, oracle_events, strict=False)):
+            changed = {
+                name: {"actual": getattr(actual, name), "expected": getattr(expected, name)}
+                for name in EVENT_FIELDS
+                if getattr(actual, name) != getattr(expected, name)
+            }
+            if changed:
+                deltas.append({"run": run, "index": index, "fields": changed})
+            if len(deltas) >= MAX_RECORDED_DELTAS:
+                return deltas
+    return deltas
+
+
+def _run_inference(
+    record: dict[str, Any],
+    holder: dict[str, Any],
+    process_factory: ProcessFactory,
+    python311: Path,
+    runtime_root: Path,
+    checkpoint: Path,
+    fixture: Path,
+) -> dict[str, Any]:
+    """Two runs through the loaded worker, then one through a fresh worker."""
+    state = record["state"]
+    oracle: SmokeOracle = holder["oracle"]
+    oracle_events = tuple(oracle.native_events)
+    relative_wav = fixture.name
+    record["inference"]["relative_wav"] = relative_wav
+    record["inference"]["oracle_events"] = [asdict(event) for event in oracle_events]
+    state["inference_completed"] = False
+    attempts: list[tuple[SmokeOracleEvent, ...]] = []
+    runs = record["inference"]["runs"]
+
+    first = holder.pop("process")
+    try:
+        for run in (1, 2):
+            events = _request_events(first, relative_wav)
+            attempts.append(events)
+            runs.append(
+                {
+                    "run": run,
+                    "worker": 1,
+                    "event_count": len(events),
+                    "events": [asdict(event) for event in events],
+                }
+            )
+    finally:
+        first.close()
+
+    _start_worker(process_factory, python311, runtime_root, checkpoint, fixture, holder)
+    fresh = holder["process"]
+    try:
+        record["inference"]["fresh_worker"] = _validate_worker_ready(fresh.ready)
+        events = _request_events(fresh, relative_wav)
+        attempts.append(events)
+        runs.append(
+            {
+                "run": 3,
+                "worker": 2,
+                "event_count": len(events),
+                "events": [asdict(event) for event in events],
+            }
+        )
+    finally:
+        fresh.close()
+        holder.pop("process", None)
+
+    state["inference_completed"] = True
+    repeatable = attempts[0] == attempts[1] == attempts[2]
+    state["repeatable"] = repeatable
+    state["oracle_exact"] = attempts[0] == oracle_events if repeatable else None
+    record["inference"]["deltas"] = _oracle_deltas(attempts, oracle_events)
+    return {"event_counts": [run["event_count"] for run in runs]}
+
+
 def run_stage(record: dict[str, Any], name: str, action: Callable[[], Any]) -> Any:
     """Run one named stage, recording duration, details and the failure."""
     started = time.monotonic()
@@ -200,17 +350,21 @@ def _close_worker(process: Any, record: dict[str, Any]) -> None:
                 "error": f"{type(error).__name__}: {error}",
             }
         )
-        if record["status"] == "passed":
-            record["status"] = "failed"
-            record["failed_stage"] = "worker_close"
+        if record["state"]["failed_stage"] is None:
+            record["state"]["failed_stage"] = "worker_close"
 
 
 def build_record(inputs: Mapping[str, str]) -> dict[str, Any]:
     """Create the result skeleton, including non-secret provenance only."""
     return {
         "schema": SCHEMA,
-        "status": "failed",
-        "failed_stage": None,
+        "status": None,
+        "state": {
+            "inference_completed": None,
+            "repeatable": None,
+            "oracle_exact": None,
+            "failed_stage": None,
+        },
         "host": {
             "system": platform.system(),
             "machine": platform.machine(),
@@ -223,7 +377,20 @@ def build_record(inputs: Mapping[str, str]) -> dict[str, Any]:
         },
         "inputs": dict(inputs),
         "stages": [],
+        "inference": {
+            "relative_wav": None,
+            "oracle_events": [],
+            "runs": [],
+            "fresh_worker": None,
+            "deltas": [],
+        },
     }
+
+
+def finalize_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Derive the single result label from the recorded state."""
+    record["status"] = classify_result(**record["state"])
+    return record
 
 
 def write_result(path: Path, record: Mapping[str, Any]) -> None:
@@ -240,7 +407,7 @@ def run_comparison(
     oracle_path: Path,
     process_factory: ProcessFactory | None = None,
 ) -> dict[str, Any]:
-    """Verify the checkpoint and fixture, then prove a real worker restore."""
+    """Verify checkpoint and fixture, then run three real inferences."""
     factory = WorkerProcess.start if process_factory is None else process_factory
     record = build_record(
         {
@@ -258,7 +425,7 @@ def run_comparison(
         checkpoint = run_stage(
             record, "checkpoint", lambda: _prepare_checkpoint(config, checkpoint_cache)
         )
-        run_stage(record, "input", lambda: _validate_input(config, fixture, oracle_path))
+        run_stage(record, "input", lambda: _validate_input(config, fixture, oracle_path, holder))
         run_stage(
             record,
             "worker_start",
@@ -272,15 +439,26 @@ def run_comparison(
             ),
         )
         run_stage(record, "restore", lambda: _validate_worker_ready(holder["process"].ready))
+        run_stage(
+            record,
+            "inference",
+            lambda: _run_inference(
+                record,
+                holder,
+                factory,
+                python311,
+                runtime_root,
+                Path(checkpoint["checkpoint"]),
+                fixture,
+            ),
+        )
     except StageFailure as failure:
-        record["failed_stage"] = failure.stage
-    else:
-        record["status"] = "passed"
+        record["state"]["failed_stage"] = failure.stage
     finally:
         process = holder.pop("process", None)
         if process is not None:
             _close_worker(process, record)
-    return record
+    return finalize_record(record)
 
 
 def _absolute_path(value: str) -> Path:
@@ -293,8 +471,9 @@ def _absolute_path(value: str) -> Path:
 def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Verify the public OaF checkpoint and fixture, then launch the "
-            "scratch Python 3.11 TF 2.15 worker and prove its restore count."
+            "Verify the public OaF checkpoint and fixture, launch the scratch "
+            "Python 3.11 TF 2.15 worker and compare two same-worker plus one "
+            "fresh-worker inference with the frozen binary64 smoke oracle."
         )
     )
     parser.add_argument(
@@ -331,7 +510,8 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--output",
         required=True,
         type=Path,
-        help="path for the compact redacted JSON result",
+        help="path for the experimental JSON result, normally "
+        "artifacts/experiments/oaf-tf215/compare.json",
     )
     return parser.parse_args(argv)
 
@@ -352,7 +532,7 @@ def main(
     )
     write_result(arguments.output, record)
     print(json.dumps(record, indent=2, sort_keys=True))
-    return 0 if record["status"] == "passed" else 1
+    return 0 if record["status"] == "smoke_exact" else 1
 
 
 if __name__ == "__main__":
