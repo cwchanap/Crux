@@ -50,18 +50,21 @@ jobs:
       # Stage: sync. A fresh runner installing the hash lock is the clean-install
       # proof for the candidate environment; do not repeat it in another venv.
       - name: Install hash lock (sync stage)
+        id: sync
         run: |
           set -euo pipefail
           uv pip sync --python "$PY311" --require-hashes \
             experiments/oaf_tf215/requirements.lock
 
       - name: Check dependency consistency (check stage)
+        id: check
         run: uv pip check --python "$PY311"
 
       # The four controls must exist before the interpreter starts, because
       # PYTHONHASHSEED is only read at startup. graph_check.py validates them.
       # Named stages: environment, import, slim_batchnorm, legacy_lstm.
       - name: Run graph sessions
+        id: graph
         env:
           CUDA_VISIBLE_DEVICES: "-1"
           PYTHONHASHSEED: "0"
@@ -73,11 +76,51 @@ jobs:
           "$PY311" experiments/oaf_tf215/graph_check.py \
             --output artifacts/experiments/oaf-tf215/graph-check.json
 
+      # Always produce the compact result. graph_check.py writes its own
+      # stage-specific record; when it never ran (sync/check/setup failed) or was
+      # killed before writing, synthesize a minimal failed record here so the
+      # artifact and summary never disappear behind a failed install step.
       - name: Record result in job summary
         if: always()
+        env:
+          SYNC_OUTCOME: ${{ steps.sync.outcome }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          GRAPH_OUTCOME: ${{ steps.graph.outcome }}
         run: |
           set -euo pipefail
           result="artifacts/experiments/oaf-tf215/graph-check.json"
+          if [ ! -f "$result" ]; then
+            if [ "$SYNC_OUTCOME" = "failure" ]; then
+              stage="sync"
+            elif [ "$CHECK_OUTCOME" = "failure" ]; then
+              stage="check"
+            elif [ "$GRAPH_OUTCOME" = "failure" ] || [ "$GRAPH_OUTCOME" = "cancelled" ]; then
+              stage="graph"
+            else
+              stage="environment"
+            fi
+            mkdir -p "$(dirname "$result")"
+            cat > "$result" <<JSON
+          {
+            "schema": "oaf-tf215-graph-check/v1",
+            "status": "failed",
+            "failed_stage": "${stage}",
+            "ci": {
+              "GITHUB_SHA": "${GITHUB_SHA:-}",
+              "GITHUB_RUN_ID": "${GITHUB_RUN_ID:-}",
+              "RUNNER_OS": "${RUNNER_OS:-}",
+              "RUNNER_ARCH": "${RUNNER_ARCH:-}"
+            },
+            "stages": [
+              {
+                "name": "${stage}",
+                "status": "failed",
+                "error": "no graph result was produced; step outcomes: sync=${SYNC_OUTCOME} check=${CHECK_OUTCOME} graph=${GRAPH_OUTCOME}"
+              }
+            ]
+          }
+          JSON
+          fi
           {
             echo "## OaF TF2.15 graph check"
             echo
