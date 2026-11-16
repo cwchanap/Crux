@@ -73,6 +73,11 @@ def _apply_instrumentation(repo_root: Path, upstream: Path, vendor: Path, patch_
 
 
 def _run_git(root: Path, *arguments: str) -> None:
+    # A scratch root inside a Git checkout would make `git apply` resolve patch
+    # paths against the enclosing repository and silently skip them; the ceiling
+    # forces Git to treat `root` as the top level.
+    environment = dict(os.environ)
+    environment["GIT_CEILING_DIRECTORIES"] = os.fspath(root.parent)
     result = subprocess.run(
         ["git", *arguments],
         cwd=root,
@@ -80,6 +85,7 @@ def _run_git(root: Path, *arguments: str) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=environment,
     )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "git failed"
@@ -89,9 +95,12 @@ def _run_git(root: Path, *arguments: str) -> None:
 def build_runtime(repo_root: Path, output_root: Path) -> Path:
     """Create a new scratch runtime and return its ``runtime/`` directory."""
     repo_root = Path(repo_root).resolve()
-    output_root = Path(output_root).resolve()
+    output_root = Path(output_root)
+    # Check the supplied path before resolve(): resolve() follows a dangling
+    # symlink to a nonexistent target, which would then pass both checks.
     if output_root.is_symlink() or output_root.exists():
-        raise ScratchRuntimeError("scratch runtime destination already exists")
+        raise ScratchRuntimeError("scratch runtime destination already exists or is a symlink")
+    output_root = output_root.resolve()
     compatibility_patch = repo_root / COMPATIBILITY_PATCH
     _require_regular_file(compatibility_patch)
     if hashlib.sha256(compatibility_patch.read_bytes()).hexdigest() != COMPATIBILITY_PATCH_SHA256:
