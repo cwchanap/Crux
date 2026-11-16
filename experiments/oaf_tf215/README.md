@@ -18,6 +18,7 @@ check does not by itself establish model parity.
 | `requirements.in` | Candidate pins (TF CPU 2.15.1, Estimator/Keras 2.15, tf-slim, and the frozen numerical/audio/MIDI stack). |
 | `requirements.lock` | Hashed lock resolved for the frozen runtime's target: Python 3.11, `x86_64-manylinux_2_17`. |
 | `graph_check.py` | Executes real Slim Conv2D + batch-normalization and legacy LSTM sessions and records stage-specific diagnostics. |
+| `check_workflow_result_fallback.py` | Stdlib-only local check: the workflow's always-on result step writes a failed sync/check/graph/environment record when no graph output exists. |
 | `README.md` | This file. Reproduction commands and evidence scope. |
 
 `build_runtime.py`, `compare.py`, the compatibility patch and `RESULTS.md` land
@@ -130,9 +131,18 @@ Python 3.11 with `uv python install 3.11`, creates the venv with
 
 The compact `artifacts/experiments/oaf-tf215/graph-check.json` result and job
 summary are kept on success and failure. Installation happens in two named
-steps (`sync`, then `check`); graph failures name their own stage. The routine
-PR job is checkpoint-free. A manual full-model `workflow_dispatch` job is added
-by a later task, not here.
+steps (`sync`, then `check`); graph failures name their own stage. If a step
+fails before `graph_check.py` writes its record (setup, `sync`, `check`, or the
+graph process being killed), the always-running result step writes a minimal
+failed JSON naming `environment`, `sync`, `check` or `graph` plus all step
+outcomes, so the artifact and summary are never absent. Existing stage records
+are never overwritten, and the passed record is never replaced. The routine PR
+job is checkpoint-free. A manual full-model `workflow_dispatch` job is added by
+a later task, not here.
+
+`check_workflow_result_fallback.py` is the focused local check for that
+fallback: it extracts the step's shell block from the workflow and exercises
+the sync, check, graph, setup, existing-failure and passed paths.
 
 ## What this does and does not prove
 
