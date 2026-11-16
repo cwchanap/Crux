@@ -1,0 +1,101 @@
+name: OaF TF2.15 probe
+
+# Path-filtered, checkpoint-free graph job for the Python 3.11 / TensorFlow 2.15
+# experiment. Unlike the root CI it intentionally runs for draft pull requests.
+# Task 5 of the HPA-856 plan extends this file with builder/import/driver checks
+# and a separate workflow_dispatch full-model job.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "experiments/oaf_tf215/**"
+      - ".github/workflows/oaf-tf215-probe.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oaf-tf215-probe-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  graph:
+    name: Python 3.11 / TF 2.15 graph check
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up bootstrap Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: python -m pip install "uv==0.13.8"
+
+      - name: Install target Python 3.11
+        run: uv python install 3.11
+
+      - name: Create Python 3.11 environment
+        run: |
+          set -euo pipefail
+          uv venv --python 3.11 "$RUNNER_TEMP/tf215-venv"
+          echo "PY311=$RUNNER_TEMP/tf215-venv/bin/python" >> "$GITHUB_ENV"
+
+      # Stage: sync. A fresh runner installing the hash lock is the clean-install
+      # proof for the candidate environment; do not repeat it in another venv.
+      - name: Install hash lock (sync stage)
+        run: |
+          set -euo pipefail
+          uv pip sync --python "$PY311" --require-hashes \
+            experiments/oaf_tf215/requirements.lock
+
+      - name: Check dependency consistency (check stage)
+        run: uv pip check --python "$PY311"
+
+      # The four controls must exist before the interpreter starts, because
+      # PYTHONHASHSEED is only read at startup. graph_check.py validates them.
+      # Named stages: environment, import, slim_batchnorm, legacy_lstm.
+      - name: Run graph sessions
+        env:
+          CUDA_VISIBLE_DEVICES: "-1"
+          PYTHONHASHSEED: "0"
+          TF_ENABLE_ONEDNN_OPTS: "0"
+          NUMBA_CACHE_DIR: /tmp/numba-cache
+        run: |
+          set -euo pipefail
+          mkdir -p "$NUMBA_CACHE_DIR"
+          "$PY311" experiments/oaf_tf215/graph_check.py \
+            --output artifacts/experiments/oaf-tf215/graph-check.json
+
+      - name: Record result in job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          result="artifacts/experiments/oaf-tf215/graph-check.json"
+          {
+            echo "## OaF TF2.15 graph check"
+            echo
+            echo "runner: ${RUNNER_OS} ${RUNNER_ARCH}, commit: ${GITHUB_SHA}"
+            echo
+            if [ -f "$result" ]; then
+              echo '```json'
+              cat "$result"
+              echo '```'
+            else
+              echo "No graph result was produced; see the CI log for the failed sync/check stage."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload compact result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oaf-tf215-graph-check
+          path: artifacts/experiments/oaf-tf215/graph-check.json
+          if-no-files-found: warn
