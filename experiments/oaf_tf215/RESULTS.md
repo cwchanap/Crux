@@ -43,7 +43,7 @@ equality is claimed. No TF1 cache or runtime identity is reused.
 | `experiments/oaf_tf215/patches/tf215-compat.patch` | `554527246744662d914ea45973b93dd23aa6a31e5270a36b729589327da4e041` | Reviewed TF 2.15 compatibility patch |
 | `tests/fixtures/oaf_tf1_smoke/smoke-oracle.json` | `6262da200dafbabe74f72d5108f9fe0244087f8a31b3a05d6a6c55c1aa615c69` | Frozen `crux.oaf-smoke-oracle/v2` |
 | `tests/fixtures/oaf_tf1_smoke/canonical.wav` | `8ec2aed65945b7002e17b51818495ca754a519c39940f739cdcd1403eb661673` | Canonical smoke input (`input_audio_sha256`) |
-| OaF checkpoint archive | `09765ae0ff19c7d769a3c20e158eba3b9cd279429b02e498b1e911d16f82e2c0` | `https://storage.googleapis.com/magenta/models/onsets_frames_transcription/e-gmd_checkpoint.zip` |
+| OaF checkpoint archive | `09765ae0ff19c7d769a3c20e158eba3b9cd279429b02e498b1e911d16f82e2c0` | `https://storage.googleapis.com/magentadata/models/onsets_frames_transcription/e-gmd_checkpoint.zip` |
 | `model.ckpt-569400.data-00000-of-00001` | `6312cd6f8e29ee6f21f4a763822d554f46393e0e336812ba4a8cb324d2e8b0b5` | Frozen `runtime/oaf_tf1/model.json` |
 | `model.ckpt-569400.index` | `475ca21993e102d52e2e6c7066b598b9b9e9a097bfb2fa6b770d40eedaa6139a` | Frozen `runtime/oaf_tf1/model.json` |
 | `model.ckpt-569400.meta` | `e36105b27c17f2367292682df825b8ad16eb887ccad465bbb5ddf955ef75d422` | Frozen `runtime/oaf_tf1/model.json` |
