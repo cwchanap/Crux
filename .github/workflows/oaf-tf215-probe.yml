@@ -125,6 +125,7 @@ jobs:
           set -euo pipefail
           uv run pytest -q -o addopts=-ra \
             tests/benchmark/test_oaf_tf215_compare.py \
+            tests/benchmark/test_oaf_tf215_graph_check.py \
             tests/benchmark/test_oaf_tf215_workflow.py
 
       # The four controls must exist before the interpreter starts, because

@@ -126,6 +126,25 @@ def import_stack(stack: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def validate_slim_statistics(np: Any, output: Any, moving_mean: Any, moving_variance: Any) -> None:
+    """Reject non-finite results, and moving statistics the session never updated.
+
+    The moving variables initialize to 0 (mean) and 1 (variance); an executed
+    update has to move both. Variance is compared with its initial ones rather
+    than against zero so an unchanged update cannot hide behind a plausible sum.
+    """
+    if not np.isfinite(output).all():
+        raise ValueError("Slim batch-normalization output is not finite")
+    if not np.isfinite(moving_mean).all():
+        raise ValueError("Slim batch-normalization moving mean is not finite")
+    if not np.isfinite(moving_variance).all():
+        raise ValueError("Slim batch-normalization moving variance is not finite")
+    if not float(np.abs(moving_mean).sum()):
+        raise ValueError("Slim batch-normalization moving mean was never updated")
+    if np.array_equal(moving_variance, np.ones_like(moving_variance)):
+        raise ValueError("Slim batch-normalization moving variance was never updated")
+
+
 def execute_slim_batch_norm(tf: Any, slim: Any, np: Any) -> dict[str, Any]:
     """Run a real Slim Conv2D + batch-normalization session, updates included."""
     rng = np.random.RandomState(0)
@@ -154,10 +173,7 @@ def execute_slim_batch_norm(tf: Any, slim: Any, np: Any) -> dict[str, Any]:
             output = session.run(net, feed_dict={inputs: inputs_value})
             mean_value, variance_value = session.run([moving_mean, moving_variance])
 
-    if not np.isfinite(output).all():
-        raise ValueError("Slim batch-normalization output is not finite")
-    if not float(np.abs(mean_value).sum()):
-        raise ValueError("Slim batch-normalization moving mean was never updated")
+    validate_slim_statistics(np, output, mean_value, variance_value)
     return {
         "output_shape": list(output.shape),
         "output_sum": round(float(output.sum()), 6),

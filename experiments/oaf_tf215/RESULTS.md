@@ -97,8 +97,9 @@ checkpoint archive digest, restored **78** inference tensors and reported
 `backend_id=magenta-egmd-tf1-94529798-8hit-v1`. The frozen coverage checks
 (130-tensor partition, 52 non-inference tensors and the 78 required
 names/shapes/dtypes) execute before the worker sends `ready`. The first native
-restore at `bcb9c95a36029d301ada5b85a4bd234fec0a8b3a` established this count;
-the `c3ffbef` GitHub model job and Colab run report the same 78.
+restore at `4490ab7271df3f22dc8e5ea9b9229b385b45ed0c` established this count; it
+was repeated at `bcb9c95a36029d301ada5b85a4bd234fec0a8b3a`, and the `c3ffbef`
+GitHub model job and Colab run report the same 78.
 
 ## Inference and exactness — both hosts
 
