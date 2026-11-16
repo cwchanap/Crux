@@ -26,3 +26,12 @@ llvmlite==0.40.1
 librosa==0.8.1
 soundfile==0.12.1
 pretty-midi==0.2.10
+# Imported by the frozen drum source closure and installed by the frozen TF1
+# runtime: magenta.music.performance_lib (attrs), metrics (mir_eval), and
+# audio_transform (sox). They are required by the Python 3.11 drum-config import.
+attrs==21.4.0
+mir_eval==0.8.2
+sox==1.4.1
+# librosa 0.8.1 imports pkg_resources at module import; setuptools >= 81 no
+# longer ships it. Match the frozen runtime's direct pin.
+setuptools==68.0.0
