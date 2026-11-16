@@ -1,131 +1,114 @@
-# HPA-856 — Docker-free OaF Benchmark on Colab: Implementation Plan
+# HPA-856 — Python 3.11 / TensorFlow 2.15 Prototype Implementation Plan
 
-**Design:** [2026-11-11-hpa-856-colab-native-oaf-design.md](../specs/2026-11-11-hpa-856-colab-native-oaf-design.md)  
-**Linear:** [HPA-856](https://linear.app/cwchanap/issue/HPA-856/run-the-oaf-benchmark-pipeline-on-colab-without-docker)  
-**PR:** [#35](https://github.com/cwchanap/Crux/pull/35). **One ticket, one PR**: keep design, implementation, tests, and evidence here.  
-**Reviewed baseline:** main `f5e0d182`; HPA-86/PR #34 is merged.  
-**Status (2026-11-15):** Task 0 **started** on an authenticated Colab VM and is **blocked at Python 3.7.17 package resolution**. Frozen dependencies, the OaF worker/oracle and Drive have **not** been tested. Production coding has not started; a single pinned Python 3.7.16 retry is the next gate.
+> **For agentic workers:** Use `superpowers:executing-plans` (or subagent-driven development when available) to execute these tasks in order. Steps use checkbox syntax for tracking. This is a bounded experiment, not authorization for production integration.
 
-## Scope decisions
+**Goal:** Reproduce installation, graph execution, checkpoint restoration and native-event comparison for the existing OaF drum model under Python 3.11 / TF CPU 2.15.1.
+**Architecture:** One isolated experiment directory builds a patched scratch runtime from the frozen TF1 source and selectively reused upstream compatibility code. A standalone probe emits diagnostic evidence only. Keep production runners, locks, schemas and goldens unchanged until the evidence-based integration gate.
+**Tech stack:** Python 3.11, TensorFlow CPU 2.15.1, TF1 compatibility graph mode, Estimator 2.15, tf-slim, existing NumPy/Librosa frontend, pytest.
+**Spec:** [2026-11-11-hpa-856-colab-native-oaf-design.md](../specs/2026-11-11-hpa-856-colab-native-oaf-design.md).
+**Delivery:** HPA-856 / [PR #35](https://github.com/cwchanap/Crux/pull/35), **one ticket / one PR**. Multiple commits are fine; no second implementation PR. Replace the previous 3.7 retry plan with this sequence.
+**Status:** Planning only. Source research and stdlib comparator checks exist; none of the TF-dependent gates below has executed successfully.
 
-- Docker remains default, with a **single** `CRUX_OAF_NATIVE_PYTHON` opt-in read in `create_backend()`. **No new CLI options, request fields, runner factories, or schema changes.**
-- One backend-owned native temporary bundle, generated using existing `apply_reviewed_patch()`, not duplicated in a Colab cell. Reuse worker JSON-line protocol and common worker process utilities.
-- Keep two reproducibility pins: `CORPUS_COMMIT` (after code stabilized) and `PILOT_COMMIT` (after the four v2 separator lock/companion files have been committed). The pilot's deterministic run ID includes its `crux_commit`; never advance the pilot checkout after starting it.
-- One Colab notebook generates benchmark evidence; modify the already-merged publication-only notebook slightly to consume the results. No MLflow integration rewrite.
-- Keep human review and final separation decision manual; no score-based model selection or trial-and-error tuning.
+## Global constraints
 
-## Task 0 — Real-Colab legacy OaF compatibility gate (must precede coding)
+- Target Python **3.11**, `tensorflow-cpu==2.15.1`; record the exact interpreter build after successful provisioning. Do not change notebook Python or Crux's Python 3.12 project environment.
+- Preserve `runtime/oaf_tf1/`, `src/`, original checkpoint bytes, emitted-frame instrumentation and oracle; perform adaptations only in an experimental scratch copy.
+- Source compatibility reference: Magenta `c15687ebd1c1cc12658cd468c737d3c24c02b918`. Selective source reuse with licenses, no wholesale Magenta install or neural-network rewrite.
+- Set `CUDA_VISIBLE_DEVICES=-1`, `PYTHONHASHSEED=0`, `TF_ENABLE_ONEDNN_OPTS=0` before TF import; enable TF1 compatibility before constructing objects. Numerical equality remains a measured result.
+- Separate experiment artifacts from all production prediction/run/report caches. No new CLI flags, `CRUX_OAF_NATIVE_PYTHON` wiring, shared-helper refactor, checkpoint conversion, R2 corpus run, separator install, MLflow change, or notebook UI in the immediate scope.
 
-**Observed 2026-11-15:** authenticated Colab CPU VM at `5fc05db4`, Linux x86-64, glibc 2.39, notebook Python 3.13.18, two CPUs, 242381135872 free bytes, and `libsndfile1` 1.2.2. Exact `python=3.7.17` was **not available** from conda-forge or an Anaconda `pkgs/main` repoquery. It did **not** test TensorFlow compatibility, worker output, exact oracle, or Drive persistence. This is a *provisioning-path* failure only, not proof that the entire CPython 3.7 ABI cannot execute.
+## Review focus
 
-**Smallest next attempt:** preserve Docker's Python 3.7.17 baseline but allow **only a pinned Python 3.7.16 host interpreter** from Anaconda's listed [Linux x86-64 package](https://anaconda.org/anaconda/python/files/manage?version=3.7.16). The original [TensorFlow 1.15.5 `cp37-cp37m` Linux wheel](https://pypi.org/project/tensorflow/1.15.5/) is **minor-version ABI tagged**, so the attempted patch difference is worth checking; it is not presumed numerically identical.
+1. Package install/import can succeed while Slim normalization or legacy RNN graph execution fails: Task 1 executes both graphs.
+2. Compatibility patches can change graph scopes or preprocessing despite a loadable checkpoint: Tasks 2–3 preserve the frontend and validate required tensor names/shapes/dtypes, not merely counts.
+3. Exact time/confidence bits can differ while note counts/F1 match: Task 4 compares the entire native event sequence and repeat runs.
+4. A partial probe can look like a pass or write into a canonical cache: Tasks 1 and 4 distinguish unexecuted stages and reject canonical output destinations.
+5. A successful first environment can rely on ambient packages/files: Task 5 repeats from the lock and a fresh bundle, and verifies no tracked TF1 source changed.
 
-- [x] Start a real Colab VM, record environment, and attempt the prescribed Python 3.7.17 package. Outcome: **package unavailable**, with no later stages executed.
-- [ ] On that VM, make **one** explicitly pinned retry; for example:
+## Files and ownership
 
-  ```bash
-  micromamba create -y -p /content/crux-oaf-py37 \
-    --override-channels -c https://repo.anaconda.com/pkgs/main \
-    python=3.7.16 pip
-  /content/crux-oaf-py37/bin/python --version
-  ```
-
-  Do not claim this succeeds merely because the package is listed. Record the actual build, channel and interpreter version. Do not switch notebook Python or try other unspecified patches/channels.
-- [ ] The VM already reports `libsndfile1`; verify it loads. Install `runtime/oaf_tf1/requirements-build.lock` followed by `requirements.lock` using **the exact existing Dockerfile pip arguments** and required hashes. No lock regeneration, TensorFlow upgrade, or weight/model change. Verify TF1 imports and checkpoint can load before drawing conclusions about the OaF backend.
-- [ ] As a **temporary manual probe**, mirror `/opt/crux/runtime`, `/opt/crux/upstream/magenta`, and patched `runtime/vendor` from the exact committed files, using the existing instrumentation script. This is not the production bundle builder and does not go into the notebook.
-- [ ] Acquire/hash-verify the canonical OaF checkpoint using the existing `prepare-backend` path. Launch the native Python 3.7 worker and assert the ready identity (78 restored tensors) plus **exact** native-event equality to `tests/fixtures/oaf_tf1_smoke/smoke-oracle.json` using `src/benchmark/oaf_smoke_oracle.py`. Compare against the known Docker fixture/oracle, not import-only startup.
-- [ ] Prove a small Drive-backed write/restore on this VM is compatible with the report publisher's durability assumptions. Verify it persists after remount where possible.
-- [ ] **STOP if blocked:** if the single 3.7.16 attempt fails at solver, frozen pip dependency installation, TensorFlow import/checkpoint, exact oracle, or Drive durability, record the precise failure on this PR and HPA-856. Keep Tasks 1–6 blocked; do not spiral into source-compiling Python 3.7, broad channel searching, a TF2 rewrite, or an unreviewed OCI/PRoot alternative. Reconsider the environment/architecture within this same ticket and PR only after recording evidence.
-
-**Go/no-go:** a pinned Python 3.7 host interpreter (3.7.16 candidate) **installs**, runs the unmodified frozen TF1 worker/checkpoint and matches the exact smoke oracle on Colab; the Drive durability probe passes. The Docker 3.7.17 baseline remains unchanged. Package availability alone is not a pass.
-
-## Task 1 — One native launcher and a tested bundle materializer
-
-**Modify:** `src/benchmark/backends/oaf.py`, `runtime/oaf_tf1/model.py`, `src/benchmark/worker_process.py`, `src/benchmark/backends/idm.py`.  
-**Tests:** `tests/benchmark/test_task_d_contract.py`, `tests/benchmark/test_worker_process.py`, `tests/benchmark/test_idm_backend.py`, `tests/runtime/oaf_tf1/test_model.py`. A focused materializer test can live in the existing OaF contract test module.
-
-- [ ] Move IDM's `_isolated_worker_environment()` and `_factory_accepts_keyword()` into the shared worker-process module; have IDM import them without changing observable behavior. Reuse OaF's existing `_build_factory_kwargs()` for timeout keywords.
-- [ ] Add `native_python: Path | None` as one optional `OafBackend` constructor field; `create_backend()` reads `CRUX_OAF_NATIVE_PYTHON` when not explicitly supplied. Unset -> existing `build_docker_command` and original process kwargs. Invalid native setting -> an actionable backend startup failure, never Docker fallback.
-- [ ] Add one small function that materializes `<tmp>/runtime/{worker.py,model.py,model.json,vendor/magenta/...}` and `<tmp>/upstream/magenta/...` from checked-in files. Create **`<tmp>/runtime` before calling** `apply_reviewed_patch(source_root=<tmp>/upstream, destination_root=<tmp>/runtime/vendor, patch_path=...)`, but **do not create `<tmp>/runtime/vendor`**: the existing patch helper rejects an existing destination and requires its parent to be a regular directory. The backend owns a `TemporaryDirectory` for one worker lifecycle; release it in `close()` and on startup failure. Do not add a bundle path flag, manifest format, or redundant post-build file inventory.
-- [ ] Adjust `DEFAULT_UNINSTRUMENTED_SEQUENCE_LIB` to resolve relative to `model.__file__`: Docker continues to resolve `/opt/crux/upstream/magenta/music/sequences_lib.py`; the native bundle resolves its sibling `upstream`. Update `tests/runtime/oaf_tf1/test_model.py:118` to assert the relative **path formula** rather than the old literal `/opt/crux` path (the unbundled repo has no `runtime/upstream` tree).
-- [ ] Before launch, resolve checkpoint and input root to **absolute** paths. Native argv is `[native_python, "-s", "<bundle>/runtime/worker.py", "--checkpoint-dir", "<absolute checkpoint>"]` with `cwd=<absolute input root>`. Strip inherited `PYTHONPATH`, `PYTHONHOME`, and other Python discovery variables using the reused helper; set Dockerfile CPU/env values (`CUDA_VISIBLE_DEVICES=-1`, `PYTHONHASHSEED=0`, `NUMBA_CACHE_DIR=/tmp/numba-cache`). No `-I` or `-E`.
-- [ ] Forward `cwd`/`env` only when the injected factory supports those keywords, preserving existing fake factories. Keep the worker ready check, mapping, timeouts, descriptor, and error behavior. No Docker command changes.
-- [ ] Add tests asserting unchanged exact Docker argv, native argv/cwd/env, **absolute checkpoint** despite relative cache configuration, controlled factory keyword forwarding, missing native interpreter/patch error, and cleanup after close/failure. Add one real **CI** test that calls the bundle materializer on the committed source/patch, asserts `<tmp>/runtime` exists and `<tmp>/runtime/vendor` is **absent before** applying the patch, then checks the patched/pristine layout and cleanup. Run the existing IDM tests after moving helpers.
-
-**Acceptance:** unit tests pass, Docker default unchanged, one native worker can be started without exposing notebook import paths.
-
-## Task 2 — Select native mode from the existing OaF environment
-
-**No CLI code changes** in `src/cli/benchmark.py`. No new CLI-specific tests.
-
-- [ ] Set `CRUX_OAF_NATIVE_PYTHON=/absolute/path/to/python3.7` in Colab before invoking the existing commands. Use a stable absolute Drive-backed `CRUX_OAF_CHECKPOINT_CACHE` and benchmark artifact roots; clear native env var for Docker runs. **Exception:** the active `smoke-backend` currently overrides `checkpoint_dir` with the repository-relative `artifacts/benchmark/model-cache` path. In Colab, symlink **only** that default model-cache path to the same absolute Drive cache, then use the existing smoke command unchanged. Do not broaden this ticket by changing CLI cache selection.
-- [ ] Confirm `CRUX_OAF_NATIVE_PYTHON` reaches `smoke-backend`, `run-oaf-corpus`, and `run-oaf-separation-pilot` through the current factory; for smoke, first verify that the default checkpoint path resolves through the Drive symlink to the exact same cache. The pilot's existing `_bind_oaf_backend_factory` still overrides checkpoint and descriptor from its parent run. **Do not test `verify-backend` or `transcribe-one` as native flows**: both are removed stubs that unconditionally raise `ClickException`.
-- [ ] Confirm runtime mode is **not** serialized in OaF/pilot identity, and invalid native configuration fails rather than silently using Docker.
-
-**Acceptance:** active smoke/corpus/pilot command lines remain unchanged, select native mode through the single opt-in environment variable, and smoke resolves its existing hard-coded checkpoint path to the Drive cache. Removed-command stubs are excluded.
-
-## Task 3 — Build one Colab benchmark notebook and concise runbook
-
-**Create:** `notebooks/oaf_benchmark_colab.ipynb`, `docs/benchmark/colab.md`.  
-**Modify:** `README.md` (add link beside existing HPA-86 MLflow docs).
-
-- [ ] Notebook setup: mount Drive, read R2 Secrets, pin `CORPUS_COMMIT`, check `git rev-parse HEAD`, establish stable absolute Drive-backed cache/run/manifests and env vars, print non-secret environment/commit evidence. Link `artifacts/benchmark/model-cache` to the Drive checkpoint cache **without** replacing an existing populated local directory; ensure both the smoke command's resolved path and `CRUX_OAF_CHECKPOINT_CACHE` point at that same root. Do not clone moving `main` on resume.
-- [ ] **Only after Task 0 passes**, install four **separate** environments: Crux Python 3.12 with `uv sync --extra r2`, pinned and **smoke-validated** OaF Python 3.7.16, Spleeter 2.4.2, HTDemucs 4.1.0. OaF CPU; HTDemucs GPU optional. Record exact interpreter version in run evidence; do not assume 3.7.16 equals Docker 3.7.17 without the oracle and broad-report parity.
-- [ ] **Do not** build the OaF bundle in the notebook: the production backend does that on first worker launch. The notebook has no duplicate file-layout logic.
-- [ ] Resumable manual cells for R2 sync, chart selection, timing, reference set, full mix, reviewed-subset preparation/human pause, separator freeze/commit/repin, pilot run/human finalize, and three Drive report-folder handoff. Do **not** call MLflow here.
-- [ ] Save source and reference artifacts exactly. For separator venvs/model roots, archive them privately on Drive, restore at the **same absolute paths** on a later VM, and let current CLI v2 attestation verify their bytes; do not add an independent notebook hash gate.
-- [ ] Report the current commit pin on every run. Upon switching from corpus to pilot, require recorded `PILOT_COMMIT`. No hidden scheduling or background jobs.
-
-**Acceptance:** notebook JSON validates; each manual cell is readable/restartable and the CLI does the authoritative identity checking.
-
-## Task 4 — Exact reference identity + broad full-mix parity
-
-**Comparison source:** `hpa86-evidence-broad` at commit `599033663ca3bb495d8faaac13180206eaafadb4`, `evidence/oaf-broad/` (fetch that **exact** commit, not moving branch contents).
-
-- [ ] Run `sync-r2-corpus`, `select-reference-charts`, `build-reference-timing`, and `build-reference-set` using the persisted Drive workspace.
-- [ ] **Before** OaF inference, assert the regenerated `reference_manifest_sha256` is exactly `96c9971b2c9113e72cb293862badcc88d9146e689ea329f45576d7fb7349f041` and `reference_timing_version` is exactly `sha256:10868dfb1f87490692d28f6f115dfa164f20be69247115be52a76ef59c954fcf`. If a source identity changed, stop and diagnose the R2/reference input (do not hide drift by accepting approximate metrics).
-- [ ] Run the unchanged `run-oaf-corpus ... --resume` command with `CRUX_OAF_NATIVE_PYTHON` set. Assert `cohort_id=oaf-2d67684ad190163e`, 320 total / **182 success** / 138 quarantined, and raw 50 ms event-micro F1 **0.234846**.
-- [ ] Compare **exact bytes / SHA-256** for **all six** files in `evidence/oaf-broad/` to the newly scored report directory: `summary.json`, `summary.md`, `items.csv`, `per_song.csv`, `per_class.csv`, `event_diagnostics.jsonl`. No ignored rows, timestamps, tolerances, or aggregate-only match. Publish an evidence table naming every file and whether it matches.
-- [ ] Run `prepare-reviewed-subset`, **stop** for real human review, import the completed CSV from Drive, then `finalize-reviewed-subset` and `score-oaf-reviewed-subset`. Compare the 30-song slate with the existing review evidence if available; never auto-approve a modified slate.
-
-**Acceptance:** exact reference lineage and six-file full-mix parity are proven before moving to the separator pilot. Human review remains explicit.
-
-## Task 5 — Freeze, commit, pin, execute, and finalize the separator pilot
-
-**Commit new source-controlled evidence (only when real Colab environments exist):**
-- `runtime/separators/spleeter/model.json`
-- `runtime/separators/spleeter/environment.json`
-- `runtime/separators/htdemucs/model.json`
-- `runtime/separators/htdemucs/environment.json`
-
-- [ ] Install/restore both existing fixed separator environments/model roots. Use `freeze-separator-runtime` and the current v2 probe/policy; **do not** modify `src/benchmark/separators.py` or generated output schemas.
-- [ ] Commit the four lock+companion files to **this same PR**, before running any pilot scoring; do not commit venvs, checkpoint bytes, model roots, stems, or tokens. Record and push that commit as `PILOT_COMMIT`; the corpus stage used `CORPUS_COMMIT`.
-- [ ] Checkout the exact pilot commit and **keep it pinned across all pilot resumes**. The pilot run identity includes `crux_commit` plus both separator lock hashes; advancing the checkout during a partial pilot produces another run, not a continuation. The canonical parent OaF run remains on Drive and still binds the same model/reference/timing identity.
-- [ ] Run unchanged `run-oaf-separation-pilot --manifest ... --timing-manifest ... --subset-manifest ... --oaf-run ... --cache-dir ... --output-dir ... --spleeter-python ... --demucs-python ... --spleeter-model-root ... --demucs-model-root ... --resume`. All required paths absolute; the existing CLI preflights v2 companion, interpreter distributions and model-root hashes.
-- [ ] On a new Colab VM, restore the two Python environments and model roots at their same absolute locations; checkout the exact `PILOT_COMMIT`; rerun `--resume` and verify the *same* pilot run ID and preserved predictions/stems. If identity fails, stop rather than re-freeze or start a different run.
-- [ ] Inspect full-mix control, Spleeter/HTDemucs derived reports and paired comparison. Finalize using a **human-provided** `finalize-oaf-separation-pilot --decision ... --rationale ...`.
-
-**Acceptance:** both views finish, provenance locked before scoring, same-run resume verified, and the human-reviewed pilot is finalized.
-
-## Task 6 — Reuse existing publication notebook; regression and closeout
-
-**Modify:** `notebooks/mlflow_publish_colab.ipynb` only (two small behaviors). **No changes** to `src/benchmark/mlflow_export.py` or its tests unless a new defect is actually demonstrated.
-
-- [ ] Allow `REPORTS_ZIP` to be unset and `REPORTS_ROOT` to point **directly** to the three stable Drive report folders. The unzip/delete command must run **only** for the existing ZIP path and **never** remove or alter a direct Drive report directory. Keep existing ZIP behavior for HPA-86.
-- [ ] Set `REPORTS` to the reviewed full-mix / Spleeter pilot / HTDemucs pilot folder-scope mapping; repeat publication for **every** entry (not only the first), asserting each existing `run_id` is reused and `created=false`. Rely on HPA-86 for HTTPS/auth safety, five-file snapshot/upload/checksum validation, and error handling. No duplicate notebook-side API checks.
-- [ ] Ensure all report generation is complete **before** publication; HPA-86's snapshot is not atomic against concurrent writers. Evidence must show three distinct `crux.input_view_id` values under one `crux-benchmark` experiment and no raw audio/stems/predictions/checkpoints uploaded.
-- [ ] Run offline CI gates: `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check src tests`, `uv run pylint --errors-only src`, plus notebook JSON validation. Regress the unchanged macOS Docker behavior and shared IDM helper behavior.
-- [ ] Verify this **same PR** contains scoped code, tests, both notebooks/docs and the four frozen separator companion files; no credentials or large binaries. Record real Colab Task 0, exact report diff, pilot resume, and MLflow run IDs. Mark ready for review only when acceptance is met.
-
-## Scoped implementation surface
-
-| Area | Paths |
+| Planned file | Responsibility |
 | --- | --- |
-| Native worker/bundle, environment helper reuse | `src/benchmark/backends/oaf.py`, `src/benchmark/worker_process.py`, `src/benchmark/backends/idm.py`, `runtime/oaf_tf1/model.py` |
-| Tests | `tests/benchmark/test_task_d_contract.py`, `tests/benchmark/test_worker_process.py`, `tests/benchmark/test_idm_backend.py`, `tests/runtime/oaf_tf1/test_model.py` |
-| Colab run | `notebooks/oaf_benchmark_colab.ipynb`, `docs/benchmark/colab.md`, `README.md` |
-| Existing publication handoff | `notebooks/mlflow_publish_colab.ipynb` |
-| Frozen runtime identities produced at Task 5 | `runtime/separators/{spleeter,htdemucs}/{model.json,environment.json}` |
-| Planning (already in PR) | This plan and the linked design |
+| `experiments/oaf_tf215/requirements.in` | Documented starting constraints and justified compatibility dependencies. |
+| `experiments/oaf_tf215/requirements.lock` | Generated exact, hashed dependency solution for the isolated target; create after a real successful solve. |
+| `experiments/oaf_tf215/build_runtime.py` | Fresh scratch layout and ordered instrumentation/compatibility patch application. |
+| `experiments/oaf_tf215/patches/tf215-compat.patch` | Selected upstream adaptations and required support-file additions, with original licensing. |
+| `experiments/oaf_tf215/probe.py` | Version/graph/input/restore/inference/repeatability/oracle stages and diagnostic JSON. |
+| `experiments/oaf_tf215/README.md`, `RESULTS.md` | Reproduction commands/source attribution and measured outcome with remaining blockers. |
+| `tests/runtime/test_oaf_tf215_probe.py` | Small fixture-based builder, input-validation and result-classification regressions. |
+| `.github/workflows/oaf-tf215-probe.yml` | Path-filtered Python 3.11 environment/graph CI; no checkpoint, R2 or hosted-service credentials. |
 
-No new OaF CLI flags, CLI tests, scoring changes, report schemas, separator attestation policy, MLflow exporter or second PR.
+Reuse the conversation investigation's `probe_tf215.py` and candidate requirements as starting material, not finished code or a lock. Commit the adapted source in Task 1; later execution must not depend on an unavailable ZIP attachment. Avoid a second framework or generic experiment runner.
+
+## Task 1 — Establish the isolated environment and executable graph gate
+
+**Files:** create `requirements.in`, `probe.py`, `README.md`, and focused tests; generate `requirements.lock` only after validation.
+**Interface:** `probe.py --output PATH` runs environment-only checks; emits `environment_only_passed` only after actual graph execution, with `inference_completed`, `repeatable`, and `oracle_exact` null. Return nonzero with the failed stage on a genuine error.
+
+- [ ] Bring the diagnostic probe into the experiment directory. Add a focused test proving an environment-only success does not set a model-parity result, and a forced Slim failure records its stage and nonzero exit. Run the targeted test and confirm the missing behavior fails first; then implement only that behavior.
+- [ ] Seed `requirements.in` with TF CPU 2.15.1, Estimator 2.15.0, Keras 2.15.0, tf-slim 1.1.0, protobuf 3.20.3, NumPy 1.23.5, Librosa 0.8.1, Numba 0.57.1, llvmlite 0.40.1, SciPy 1.10.1 and the supplied audio/MIDI dependencies. Label it unvalidated until solved. Resolve it in a dedicated Python 3.11 environment; run `uv pip check --python "$PY311"`.
+- [ ] Execute version validation, `disable_v2_behavior()`, Estimator availability, a real Slim Conv2D + batch-normalization session and a legacy LSTM session. Preserve stage-specific exceptions. Diagnose any `tf_keras.legacy_tf_layers` failure before adding a dependency; pin/document only a demonstrated fix. Do not add a fake global `tensorflow.contrib` module.
+- [ ] Generate the exact hash lock with `uv pip compile --python "$PY311" --generate-hashes experiments/oaf_tf215/requirements.in -o experiments/oaf_tf215/requirements.lock`; install into a second clean environment with `uv pip sync --python "$CLEAN_PY311" --require-hashes experiments/oaf_tf215/requirements.lock` and repeat the graph probe. If dependency resolution or graph execution fails, capture the blocker instead of labelling the lock verified.
+- [ ] Commit the probe, validated lock (when available), tests and reproduction notes on this PR. No model checkpoint needed at this gate.
+
+**Verify:** `PYTHONHASHSEED=0 "$CLEAN_PY311" experiments/oaf_tf215/probe.py --output "$PWD/artifacts/experiments/oaf-tf215/environment.json"` exits 0 and records both executed graph checks; `uv pip check --python "$CLEAN_PY311"` passes. A no-network host remains blocked, not incompatible.
+
+## Task 2 — Build the smallest adapted drum runtime in scratch
+
+**Files:** `build_runtime.py`, `patches/tf215-compat.patch`, tests and README attribution.
+**Interface:** `build_runtime(repo_root: Path, output_root: Path) -> Path`; CLI `--repo-root PATH --output-root PATH`; returns `<output_root>/runtime`. Refuse an existing destination; callers choose a fresh scratch root.
+
+- [ ] Add a real-builder test using the retained vendor source. It must prove the original tree/model lock are unchanged, the scratch `upstream` sequence converter remains pristine, `runtime/vendor` is absent when instrumentation starts, and the completed bundle has patched decoding plus the intended compatibility imports. Confirm the test fails before the builder exists.
+- [ ] Copy retained model/worker/config and pristine vendor into scratch. Create `runtime/` and `upstream/`; call `apply_reviewed_patch()` with the **uncreated** `runtime/vendor` destination. Keep the original instrumentation patch and its preimage checks unchanged.
+- [ ] Create one compatibility patch against this generated layout. Selectively adapt `tf_slim`, HParams/RNN support and `compat.v1.estimator.tpu` using the pinned upstream revision. Include needed upstream support files/license notices in the patch rather than fetching moving source at probe runtime. Record source paths/revision in README.
+- [ ] Restrict config imports to what drums inference needs, avoiding an unnecessary piano/CuDNN port. Preserve `configs.CONFIG_MAP['drums']`, all effective hparams, variable scopes, `spec_hop_length` and the existing Librosa frontend. In the copied model only, make the pristine-converter path relative to its bundle and initialize TF1 compatibility before model imports. Leave weights/thresholds/native decoding untouched.
+- [ ] Run `git apply --check` before applying the compatibility patch, then import the generated drum configuration under the validated target interpreter. A patch/import failure stops here and produces a diagnostic; do not modify the frozen source to make the patch apply. Rerun builder tests and commit.
+
+**Verify:** target-interpreter import succeeds, real builder test passes, and both `git diff --exit-code f5e0d182 HEAD -- runtime/oaf_tf1 src` and the working-tree diff for those paths are empty. This is not yet checkpoint evidence.
+
+## Task 3 — Verify original inputs and restore every required tensor
+
+**Files:** extend `probe.py` and tests; update README commands.
+**Interface:** model mode requires all of `--runtime-root PATH --checkpoint-dir PATH --fixture PATH --oracle PATH --output PATH`. Explicit absolute inputs; no production smoke-command or cache-selector changes.
+
+- [ ] Add tests rejecting a wrong fixture digest and a modified/missing checkpoint component **before** model construction. Use tiny synthetic files/mocks; do not commit checkpoint bytes. Add a test that a mismatched required tensor name/shape/dtype cannot be accepted merely because a reported count is 78.
+- [ ] Obtain the existing released checkpoint through the existing acquisition procedure or a previously verified cache. Read component hashes from the frozen `runtime/oaf_tf1/model.json`; never redownload/rewrite weights silently. Validate the canonical WAV against the oracle input SHA.
+- [ ] Build the actual drum graph and call the copied `OafModel.load()` with the original configuration. Reuse its existing coverage logic: 130 checkpoint tensors, 78 required inference tensors and 52 classified non-inference tensors, with names/shapes/dtypes and no uninitialized required tensor. Preserve stochastic-op checks. Emit coverage details, not just a success string.
+- [ ] Record distinct graph-build, input-integrity and checkpoint-restore stages. If variable names/shapes differ, inspect the selected adaptation; do not rename weights, initialize missing tensors, or lower the coverage requirement. Rerun focused tests and commit the probe changes.
+
+**Verify:** a real model-mode run reaches `checkpoint_restore=passed` with complete coverage. A synthetic corrupt input fails before restore. No R2/full-song dataset or separator is needed.
+
+## Task 4 — Measure repeatability and exact native-event parity
+
+**Files:** extend `probe.py` and focused tests.
+**Interfaces:** retain the starting `native_payload(event)` / `compare_events(events, expected)` helpers, matching `src/benchmark/oaf_smoke_oracle.py` exactly for every retained field. Model outcomes are `failed`, `non_repeatable`, `runs_divergent`, or `smoke_exact`; environment-only mode stays separate.
+
+- [ ] Pin comparator behavior with tests: exact match passes; one-ULP confidence change, event removal, reordered distinct events, changed timestamp/class/group/pitch/velocity fail. Keep null confidence distinct from numeric zero. Match the production binary64 representation rather than rounded decimal/F1 comparison.
+- [ ] Transcribe the canonical WAV twice using one loaded model, then repeat once in a **fresh interpreter process** using the same lock/bundle/inputs. Preserve the complete native event lists. Do not change model math or thresholds between runs.
+- [ ] Compare candidate-to-candidate equality first, then each candidate to the original oracle. Store `inference_completed`, `repeatable`, `oracle_exact`, actual/expected counts, complete output digests and at most the first 20 field differences in summary JSON; retain full events separately. Classify non-repeatability independently from deterministic TF1 differences.
+- [ ] Use a separate experiment-output root and a simple guard against writes to fixture/oracle, checkpoint, frozen runtime or production benchmark-cache locations. Do not publish a production prediction/report. Record the old backend ID only as `baseline_backend_id`, with an explicit experimental candidate label and dependency/source hashes.
+- [ ] Add a forced divergent-result test showing diagnostics are saved and the process exits nonzero. Exit 0 for model mode requires repeatable exact smoke, not merely inference completion. Record repeatable divergence as useful experimental evidence without calling it parity. Run focused tests and commit.
+
+**Verify:** every run produces a stage/result record; repeatability and exactness can be independently audited. No oracle, model lock, default backend or old prediction cache changes.
+
+## Task 5 — Reproduce in CI and on the target Colab interpreter
+
+**Files:** `.github/workflows/oaf-tf215-probe.yml`, README and RESULTS; tests from prior tasks.
+
+- [ ] Add a path-filtered PR CI job for this experiment/workflow/tests, with Python 3.11, the candidate lock, dependency cache and ordinary bounded job timeout. Run focused fixture tests plus the real environment-only graph probe; upload the diagnostic on success/failure. Do not install TF2.15 into the root Python 3.12 job. No R2, checkpoint download or DagsHub secrets in automatic CI; do not claim a skipped draft job passed.
+- [ ] In an authenticated Colab CPU runtime, create a dedicated Python 3.11 environment from the lock and run the **same** builder/probe CLI through that interpreter, leaving the notebook kernel alone. Record the exact commit, interpreter/package versions, OS/architecture, source/lock hashes, checkpoint/fixture hashes and numerical environment flags. Use README shell cells, not a new custom notebook/launcher UI.
+- [ ] Repeat environment + restore + three-inference comparison from a clean bundle. Save small diagnostic JSON/full-event evidence privately and a concise redacted result summary in `RESULTS.md`. Missing authentication/network/checkpoint is explicitly blocked, not a fabricated graph or compatibility result.
+- [ ] Run `uv run pytest tests/runtime/test_oaf_tf215_probe.py -q`, the existing regression suite, `uv run ruff check .`, `uv run ruff format --check src tests`, and `uv run pylint --errors-only src`. Target TF-specific checks execute under `$PY311`, not `uv run` in the root project. Verify the frozen source/weights/oracle are unchanged and no large binaries or credentials enter the PR.
+
+**Acceptance:** CI executes the graph checks, and actual target-Colab evidence separately reaches restore/inference with an honest exact/divergent/non-repeatable classification. There is no separate Linux/Android desktop acceptance; no iOS/macOS/Windows application or UI mockup is changed by this phase.
+
+## Task 6 — Record the outcome and define the continuation on the same PR
+
+**Files:** `experiments/oaf_tf215/RESULTS.md` and these existing spec/plan files; update the PR/Linear discussion.
+
+- [ ] Summarize exact commands, environment, each completed/failed stage, coverage, repeatability and per-field differences. Distinguish “prototype produced an answer” from “migrated runtime is accepted.” Keep unsuccessful attempts concise and reproducible.
+- [ ] Apply the spec's decision table: unresolved environment/restore/non-repeatability -> stop; repeatable divergence -> describe a separately versioned runtime and quantified deltas; exact smoke -> selected-song diagnostics before broader equivalence claims. Do not auto-promote either successful path to the default backend.
+- [ ] Before any production/corpus continuation, revise **this same PR's** integration contract using the measured outcome: candidate identity/config/hash inputs, separate cache/output roots, one runtime selection seam and mapping/scorer reuse. A framework/source change must remain visible in provenance even when one oracle matches. Do not implement two possible production adapters in advance.
+- [ ] Preserve the original HPA-856 follow-on scope as gated work: reference identity, broad corpus and per-song/per-class comparison, existing reviewed inputs, same-machine separation, fixed v2 separator companions/pilot commit, Drive resume and existing MLflow publisher. HPA-856 remains open until that scope is delivered or explicitly changed; no second PR is planned.
+
+**Stop boundary:** planning this prototype does not authorize model-training/quality-tolerance changes or completion claims for the full Colab pipeline. The next executable action is Task 1's isolated Python 3.11 dependency solve and real graph probe, not another Python 3.7 retry.
