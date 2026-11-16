@@ -11,6 +11,7 @@ on:
     paths:
       - "experiments/oaf_tf215/**"
       - "tests/runtime/test_oaf_tf215_builder.py"
+      - "tests/benchmark/test_oaf_tf215_compare.py"
       - ".github/workflows/oaf-tf215-probe.yml"
 
 permissions:
@@ -112,6 +113,16 @@ jobs:
           print("worker-import ok:", worker.DEFAULT_BACKEND_ID)
           PY
 
+      # Driver stage: the host-side restore driver runs on the Python 3.12
+      # project environment while Python 3.11 is only the scratch worker. This
+      # job uses a fake worker, so it stays checkpoint-free; the real scratch
+      # worker launch is the separate manual model job.
+      - name: Run host driver tests (driver stage)
+        id: driver
+        run: |
+          set -euo pipefail
+          uv run pytest -q -o addopts=-ra tests/benchmark/test_oaf_tf215_compare.py
+
       # The four controls must exist before the interpreter starts, because
       # PYTHONHASHSEED is only read at startup. graph_check.py validates them.
       # Named stages: environment, import, slim_batchnorm, legacy_lstm.
@@ -138,6 +149,7 @@ jobs:
           SYNC_OUTCOME: ${{ steps.sync.outcome }}
           CHECK_OUTCOME: ${{ steps.check.outcome }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
+          DRIVER_OUTCOME: ${{ steps.driver.outcome }}
           GRAPH_OUTCOME: ${{ steps.graph.outcome }}
         run: |
           set -euo pipefail
@@ -149,6 +161,8 @@ jobs:
               stage="check"
             elif [ "$BUILD_OUTCOME" = "failure" ] || [ "$BUILD_OUTCOME" = "cancelled" ]; then
               stage="build"
+            elif [ "$DRIVER_OUTCOME" = "failure" ] || [ "$DRIVER_OUTCOME" = "cancelled" ]; then
+              stage="driver"
             elif [ "$GRAPH_OUTCOME" = "failure" ] || [ "$GRAPH_OUTCOME" = "cancelled" ]; then
               stage="graph"
             else
@@ -170,7 +184,7 @@ jobs:
               {
                 "name": "${stage}",
                 "status": "failed",
-                "error": "no graph result was produced; step outcomes: sync=${SYNC_OUTCOME} check=${CHECK_OUTCOME} build=${BUILD_OUTCOME} graph=${GRAPH_OUTCOME}"
+                "error": "no graph result was produced; step outcomes: sync=${SYNC_OUTCOME} check=${CHECK_OUTCOME} build=${BUILD_OUTCOME} driver=${DRIVER_OUTCOME} graph=${GRAPH_OUTCOME}"
               }
             ]
           }

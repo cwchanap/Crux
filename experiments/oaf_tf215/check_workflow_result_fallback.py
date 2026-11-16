@@ -5,7 +5,8 @@ The workflow's "Record result in job summary" step must synthesize a minimal
 failed record when an earlier stage failed before ``graph_check.py`` wrote one,
 so the compact artifact and job summary never disappear behind a failed
 install step. This script extracts that step's shell block from the committed
-workflow and runs it for the setup, sync, check, build, graph and success paths.
+workflow and runs it for the setup, sync, check, build, driver, graph and
+success paths.
 
 Local check only; it is not executed by CI (the workflow itself is the e2e
 check). Standard library only::
@@ -62,7 +63,7 @@ def extract_run_block(text: str) -> str:
 def check_workflow_wiring(text: str) -> None:
     """The outcomes are wired, the step always runs, nothing masks failures."""
     assert "continue-on-error" not in text, "a step must not mask its failure"
-    for step_id in ("sync", "check", "build", "graph"):
+    for step_id in ("sync", "check", "build", "driver", "graph"):
         assert f"        id: {step_id}" in text, f"missing id for {step_id}"
         assert f"${{{{ steps.{step_id}.outcome }}}}" in text, f"missing outcome for {step_id}"
     assert f"      - name: {STEP_NAME}\n        if: always()" in text
@@ -71,7 +72,7 @@ def check_workflow_wiring(text: str) -> None:
 
 def run_case(
     script: str,
-    outcomes: tuple[str, str, str, str],
+    outcomes: tuple[str, str, str, str, str],
     existing: str | None = None,
 ) -> tuple[dict[str, object], str, str]:
     """Run the extracted step in a temp workspace and return (result, summary, raw)."""
@@ -88,7 +89,8 @@ def run_case(
             "SYNC_OUTCOME": outcomes[0],
             "CHECK_OUTCOME": outcomes[1],
             "BUILD_OUTCOME": outcomes[2],
-            "GRAPH_OUTCOME": outcomes[3],
+            "DRIVER_OUTCOME": outcomes[3],
+            "GRAPH_OUTCOME": outcomes[4],
             "GITHUB_STEP_SUMMARY": str(summary_path),
             "GITHUB_SHA": "abc123",
             "GITHUB_RUN_ID": "42",
@@ -112,7 +114,7 @@ def run_case(
 
 
 def assert_synthesized(
-    record: dict, summary: str, stage: str, outcomes: tuple[str, str, str, str]
+    record: dict, summary: str, stage: str, outcomes: tuple[str, str, str, str, str]
 ) -> None:
     """A synthesized record must name the failed stage and never look successful."""
     assert record["schema"] == SCHEMA
@@ -123,8 +125,11 @@ def assert_synthesized(
     (stage_record,) = record["stages"]
     assert stage_record["name"] == stage
     assert stage_record["status"] == "failed"
-    sync, check, build, graph = outcomes
-    assert f"sync={sync} check={check} build={build} graph={graph}" in stage_record["error"]
+    sync, check, build, driver, graph = outcomes
+    assert (
+        f"sync={sync} check={check} build={build} driver={driver} graph={graph}"
+        in stage_record["error"]
+    )
     assert f'"failed_stage": "{stage}"' in summary
     assert '"status": "failed"' in summary
     assert "## OaF TF2.15 graph check" in summary
@@ -133,41 +138,61 @@ def assert_synthesized(
 def main() -> int:
     workflow_text = WORKFLOW.read_text(encoding="utf-8")
     check_workflow_wiring(workflow_text)
-    print("ok - workflow wires sync/check/build/graph outcomes and an always-on step")
+    print("ok - workflow wires sync/check/build/driver/graph outcomes and an always-on step")
 
     script = extract_run_block(workflow_text)
 
-    record, summary, _ = run_case(script, ("failure", "skipped", "skipped", "skipped"))
-    assert_synthesized(record, summary, "sync", ("failure", "skipped", "skipped", "skipped"))
+    record, summary, _ = run_case(script, ("failure", "skipped", "skipped", "skipped", "skipped"))
+    assert_synthesized(
+        record, summary, "sync", ("failure", "skipped", "skipped", "skipped", "skipped")
+    )
     print("ok - sync failure writes a failed sync record and summary")
 
-    record, summary, _ = run_case(script, ("success", "failure", "skipped", "skipped"))
-    assert_synthesized(record, summary, "check", ("success", "failure", "skipped", "skipped"))
+    record, summary, _ = run_case(script, ("success", "failure", "skipped", "skipped", "skipped"))
+    assert_synthesized(
+        record, summary, "check", ("success", "failure", "skipped", "skipped", "skipped")
+    )
     print("ok - check failure writes a failed check record and summary")
 
-    record, summary, _ = run_case(script, ("success", "success", "failure", "skipped"))
-    assert_synthesized(record, summary, "build", ("success", "success", "failure", "skipped"))
+    record, summary, _ = run_case(script, ("success", "success", "failure", "skipped", "skipped"))
+    assert_synthesized(
+        record, summary, "build", ("success", "success", "failure", "skipped", "skipped")
+    )
     print("ok - builder failure writes a failed build record and summary")
 
-    record, summary, _ = run_case(script, ("success", "success", "success", "failure"))
-    assert_synthesized(record, summary, "graph", ("success", "success", "success", "failure"))
+    record, summary, _ = run_case(script, ("success", "success", "success", "failure", "skipped"))
+    assert_synthesized(
+        record, summary, "driver", ("success", "success", "success", "failure", "skipped")
+    )
+    print("ok - driver failure writes a failed driver record and summary")
+
+    record, summary, _ = run_case(script, ("success", "success", "success", "success", "failure"))
+    assert_synthesized(
+        record, summary, "graph", ("success", "success", "success", "success", "failure")
+    )
     print("ok - graph crash without output writes a failed graph record")
 
-    record, summary, _ = run_case(script, ("skipped", "skipped", "skipped", "skipped"))
-    assert_synthesized(record, summary, "environment", ("skipped", "skipped", "skipped", "skipped"))
+    record, summary, _ = run_case(script, ("skipped", "skipped", "skipped", "skipped", "skipped"))
+    assert_synthesized(
+        record, summary, "environment", ("skipped", "skipped", "skipped", "skipped", "skipped")
+    )
     print("ok - setup failure writes a failed environment record")
 
     stage_record = (
         '{\n  "schema": "oaf-tf215-graph-check/v1",\n  "status": "failed",\n'
         '  "failed_stage": "slim_batchnorm",\n  "stages": []\n}\n'
     )
-    _, summary, raw = run_case(script, ("success", "success", "success", "failure"), stage_record)
+    _, summary, raw = run_case(
+        script, ("success", "success", "success", "success", "failure"), stage_record
+    )
     assert raw == stage_record, "the probe's own stage record must never be overwritten"
     assert "slim_batchnorm" in summary
     print("ok - existing graph_check stage failure record is preserved")
 
     passed = json.dumps({"schema": SCHEMA, "status": "passed", "stages": []}) + "\n"
-    _, summary, raw = run_case(script, ("success", "success", "success", "success"), passed)
+    _, summary, raw = run_case(
+        script, ("success", "success", "success", "success", "success"), passed
+    )
     assert raw == passed, "a passed result must stay passed"
     assert '"status": "passed"' in summary
     assert "failed_stage" not in summary
