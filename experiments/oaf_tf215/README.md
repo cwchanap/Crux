@@ -74,8 +74,9 @@ lock.
 `build_runtime.py` reads the frozen `runtime/oaf_tf1` tree and writes one new
 scratch directory; it refuses an existing destination or a destination symlink
 (including a dangling one) and returns the scratch `runtime/` path. It is safe
-to build under a Git checkout: the compatibility `git apply` calls run with
-`GIT_CEILING_DIRECTORIES` set to the scratch root's parent, so patch paths are
+to build under a Git checkout: the compatibility `git apply` calls remove
+inherited repository-selection variables (`GIT_DIR`, `GIT_WORK_TREE`, etc.) and
+set `GIT_CEILING_DIRECTORIES` to the scratch root's parent, so patch paths are
 never rebased against an enclosing repository and silently skipped.
 
 ```bash
