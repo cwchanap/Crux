@@ -74,6 +74,16 @@ class StageFailure(RuntimeError):
         self.stage = stage
 
 
+def _load_config(holder: dict[str, Any]) -> dict[str, Any]:
+    config = load_model_config(MODEL_CONFIG_PATH)
+    holder["config"] = config
+    return {
+        "backend_id": config.backend_id,
+        "model_id": config.model_id,
+        "archive_sha256": config.checkpoint.archive_sha256,
+    }
+
+
 def _prepare_checkpoint(config: OafModelConfig, checkpoint_cache: Path) -> dict[str, Any]:
     checkpoint = prepare_oaf_checkpoint(config, checkpoint_cache, download=False)
     return {
@@ -232,7 +242,6 @@ def run_comparison(
 ) -> dict[str, Any]:
     """Verify the checkpoint and fixture, then prove a real worker restore."""
     factory = WorkerProcess.start if process_factory is None else process_factory
-    config = load_model_config(MODEL_CONFIG_PATH)
     record = build_record(
         {
             "python311": os.fspath(python311),
@@ -244,6 +253,8 @@ def run_comparison(
     )
     holder: dict[str, Any] = {}
     try:
+        run_stage(record, "config", lambda: _load_config(holder))
+        config = holder["config"]
         checkpoint = run_stage(
             record, "checkpoint", lambda: _prepare_checkpoint(config, checkpoint_cache)
         )
