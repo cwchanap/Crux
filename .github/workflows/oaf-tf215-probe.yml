@@ -10,6 +10,7 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "experiments/oaf_tf215/**"
+      - "tests/runtime/test_oaf_tf215_builder.py"
       - ".github/workflows/oaf-tf215-probe.yml"
 
 permissions:
@@ -60,6 +61,57 @@ jobs:
         id: check
         run: uv pip check --python "$PY311"
 
+      # Builder stage: the stdlib-only tests, the real scratch build, and both
+      # imports run in separate Python 3.11 interpreters. pytest is added after
+      # the hash-lock checks so it cannot weaken the clean-install proof.
+      - name: Build scratch runtime and import it (build stage)
+        id: build
+        env:
+          CUDA_VISIBLE_DEVICES: "-1"
+          PYTHONHASHSEED: "0"
+          TF_ENABLE_ONEDNN_OPTS: "0"
+          NUMBA_CACHE_DIR: /tmp/numba-cache
+        run: |
+          set -euo pipefail
+          uv pip install --python "$PY311" pytest
+          PYTHONPATH="$GITHUB_WORKSPACE" "$PY311" -m pytest -q -o addopts=-ra \
+            --confcutdir tests/runtime tests/runtime/test_oaf_tf215_builder.py
+          mkdir -p "$NUMBA_CACHE_DIR"
+          "$PY311" experiments/oaf_tf215/build_runtime.py \
+            --output "$RUNNER_TEMP/oaf-tf215-scratch"
+          runtime="$RUNNER_TEMP/oaf-tf215-scratch/runtime"
+
+          # The generated drum configuration must import without the unused
+          # notebook/NADE packages and must keep the frozen hparams.
+          "$PY311" - "$runtime" <<'PY'
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path(sys.argv[1]) / "vendor"))
+          from magenta.models.onsets_frames_transcription import configs
+
+          hparams = configs.CONFIG_MAP["drums"].hparams
+          assert "onsets_frames" not in configs.CONFIG_MAP
+          assert hparams.spec_hop_length == 512, hparams.spec_hop_length
+          assert hparams.hop_length == 441, hparams.hop_length
+          assert hparams.sample_rate == 44100, hparams.sample_rate
+          assert hparams.drums_only and hparams.drum_data_map == "8-hit"
+          print("drum-config-import ok:", hparams.spec_hop_length, hparams.hop_length)
+          PY
+
+          # A second, isolated interpreter imports the worker and its model.
+          "$PY311" - "$runtime" <<'PY'
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path(sys.argv[1])))
+          import worker
+
+          assert worker.DEFAULT_BACKEND_ID == "magenta-egmd-tf1-94529798-8hit-v1"
+          assert (Path(sys.argv[1]) / "vendor" / "magenta").is_dir()
+          print("worker-import ok:", worker.DEFAULT_BACKEND_ID)
+          PY
+
       # The four controls must exist before the interpreter starts, because
       # PYTHONHASHSEED is only read at startup. graph_check.py validates them.
       # Named stages: environment, import, slim_batchnorm, legacy_lstm.
@@ -77,14 +129,15 @@ jobs:
             --output artifacts/experiments/oaf-tf215/graph-check.json
 
       # Always produce the compact result. graph_check.py writes its own
-      # stage-specific record; when it never ran (sync/check/setup failed) or was
-      # killed before writing, synthesize a minimal failed record here so the
-      # artifact and summary never disappear behind a failed install step.
+      # stage-specific record; when it never ran (sync/check/build/setup failed)
+      # or was killed before writing, synthesize a minimal failed record here so
+      # the artifact and summary never disappear behind a failed install step.
       - name: Record result in job summary
         if: always()
         env:
           SYNC_OUTCOME: ${{ steps.sync.outcome }}
           CHECK_OUTCOME: ${{ steps.check.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
           GRAPH_OUTCOME: ${{ steps.graph.outcome }}
         run: |
           set -euo pipefail
@@ -94,6 +147,8 @@ jobs:
               stage="sync"
             elif [ "$CHECK_OUTCOME" = "failure" ]; then
               stage="check"
+            elif [ "$BUILD_OUTCOME" = "failure" ] || [ "$BUILD_OUTCOME" = "cancelled" ]; then
+              stage="build"
             elif [ "$GRAPH_OUTCOME" = "failure" ] || [ "$GRAPH_OUTCOME" = "cancelled" ]; then
               stage="graph"
             else
@@ -115,7 +170,7 @@ jobs:
               {
                 "name": "${stage}",
                 "status": "failed",
-                "error": "no graph result was produced; step outcomes: sync=${SYNC_OUTCOME} check=${CHECK_OUTCOME} graph=${GRAPH_OUTCOME}"
+                "error": "no graph result was produced; step outcomes: sync=${SYNC_OUTCOME} check=${CHECK_OUTCOME} build=${BUILD_OUTCOME} graph=${GRAPH_OUTCOME}"
               }
             ]
           }
@@ -131,7 +186,7 @@ jobs:
               cat "$result"
               echo '```'
             else
-              echo "No graph result was produced; see the CI log for the failed sync/check stage."
+              echo "No graph result was produced; see the CI log for the failed earlier stage."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
