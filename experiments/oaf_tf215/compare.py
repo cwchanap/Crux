@@ -47,7 +47,6 @@ from src.benchmark.backends.idm import _isolated_worker_environment
 from src.benchmark.backends.oaf import _decode_native_event
 from src.benchmark.checkpoint_acquisition import (
     CheckpointAcquisitionError,
-    _is_directory,
     prepare_oaf_checkpoint,
 )
 from src.benchmark.input_view import load_direct_audio
@@ -75,6 +74,16 @@ WORKER_ENVIRONMENT = {
 # both are blocked (not proven incompatible), never a pass. A child that starts
 # but fails to become ready is a real failure under ``worker_start``.
 BLOCKED_STAGES = frozenset({"checkpoint", "host"})
+# The frozen verifier's access-vs-integrity reasons for a populated cache. A
+# component/entry mismatch is real evidence and fails; unavailable reads are
+# blocked. These are the only reasons the verify-only path can raise.
+CHECKPOINT_ACCESS_REASONS = frozenset(
+    {
+        "checkpoint cache is missing",
+        "checkpoint cache destination is unavailable",
+        "checkpoint cache component is unavailable",
+    }
+)
 # Diagnostics stay small: only the first differing event fields are recorded.
 MAX_RECORDED_DELTAS = 8
 EVENT_FIELDS = tuple(field.name for field in fields(SmokeOracleEvent))
@@ -143,17 +152,12 @@ def _load_config(holder: dict[str, Any]) -> dict[str, Any]:
 
 
 def _prepare_checkpoint(config: OafModelConfig, checkpoint_cache: Path) -> dict[str, Any]:
-    target = checkpoint_cache / "sha256" / config.checkpoint.archive_sha256
     try:
         checkpoint = prepare_oaf_checkpoint(config, checkpoint_cache, download=False)
     except CheckpointAcquisitionError as error:
-        # A populated cache that fails verification is a real validation
-        # failure; only absent or unreadable cache access is blocked.
-        try:
-            populated = _is_directory(target)
-        except CheckpointAcquisitionError:
-            populated = False
-        if not populated:
+        # Classify the verifier's reason: unavailable reads stay blocked, while
+        # component or entry mismatches are real validation failures.
+        if str(error) in CHECKPOINT_ACCESS_REASONS:
             raise
         raise StageLabel("checkpoint_validation", str(error)) from error
     return {
@@ -508,7 +512,12 @@ def run_comparison(
             ),
         )
     except StageFailure as failure:
-        record["state"]["failed_stage"] = failure.stage
+        current = record["state"]["failed_stage"]
+        # A later access blocker must not downgrade an actual failure (e.g. a
+        # failed worker close followed by a fresh-worker Popen error). Both
+        # stages stay recorded; only the label keeps the actual failure.
+        if current is None or failure.stage not in BLOCKED_STAGES or current in BLOCKED_STAGES:
+            record["state"]["failed_stage"] = failure.stage
     finally:
         process = holder.pop("process", None)
         if process is not None:
