@@ -15,6 +15,7 @@ from types import ModuleType
 
 import pytest
 
+from runtime.oaf_tf1.model import OafModelConfigError
 from src.benchmark.checkpoint_acquisition import CheckpointAcquisitionError
 from src.benchmark.worker_process import WorkerProcessError
 
@@ -156,6 +157,7 @@ def test_driver_launches_the_scratch_worker_with_an_isolated_environment(
     assert record["status"] == "passed"
     assert record["failed_stage"] is None
     assert [stage["name"] for stage in record["stages"]] == [
+        "config",
         "checkpoint",
         "input",
         "worker_start",
@@ -229,6 +231,7 @@ def test_driver_requires_a_real_restored_tensor_count(
     assert record["status"] == "failed"
     assert record["failed_stage"] == "restore"
     assert [stage["name"] for stage in record["stages"]] == [
+        "config",
         "checkpoint",
         "input",
         "worker_start",
@@ -266,6 +269,7 @@ def test_driver_reports_a_worker_start_failure(
     assert record["status"] == "failed"
     assert record["failed_stage"] == "worker_start"
     assert [stage["name"] for stage in record["stages"]] == [
+        "config",
         "checkpoint",
         "input",
         "worker_start",
@@ -315,6 +319,28 @@ def test_driver_reports_a_checkpoint_acquisition_failure(
     assert record["status"] == "failed"
     assert record["failed_stage"] == "checkpoint"
     assert "checkpoint cache is missing" in record["stages"][-1]["error"]
+    assert factory.calls == []
+
+
+def test_driver_records_a_model_configuration_failure(
+    compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = _paths(tmp_path)
+
+    def _fail(_path: Path) -> object:
+        raise OafModelConfigError("model configuration is invalid")
+
+    monkeypatch.setattr(compare, "load_model_config", _fail)
+    factory = _FakeFactory()
+
+    code = compare.main(_cli(paths), process_factory=factory)
+
+    assert code == 1
+    record = json.loads(paths["output"].read_text(encoding="utf-8"))
+    assert record["status"] == "failed"
+    assert record["failed_stage"] == "config"
+    assert [stage["name"] for stage in record["stages"]] == ["config"]
+    assert "model configuration is invalid" in record["stages"][-1]["error"]
     assert factory.calls == []
 
 
