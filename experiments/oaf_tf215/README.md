@@ -23,7 +23,7 @@ check does not by itself establish model parity.
 | `compare.py` | Python 3.12 driver: verifies the checkpoint and fixture, then runs two requests through one loaded Python 3.11 scratch worker plus one through a fresh worker and compares the exact native events with the frozen binary64 smoke oracle. |
 | `check_workflow_result_fallback.py` | Stdlib-only local check: the workflow's always-on result step writes a failed sync/check/build/graph/environment record when no graph output exists. |
 | `README.md` | This file. Reproduction commands and evidence scope. |
-| `RESULTS.md` | Recorded CI, graph, restore and inference evidence; not a parity claim. |
+| `RESULTS.md` | Recorded CI, graph, restore, inference and manual-job evidence plus the decision checkpoint; not a parity claim. |
 
 `tests/runtime/test_oaf_tf215_builder.py` (stdlib only) and
 `tests/benchmark/test_oaf_tf215_compare.py` / `test_oaf_tf215_workflow.py`
@@ -331,23 +331,26 @@ always-on summary and upload steps run afterwards. `oracle_divergent` is never
 turned into a pass. The model job uploads `oaf-tf215-compare` (`compare.json`,
 `compare.log`); the PR graph job uploads `oaf-tf215-graph-check`.
 
-### Dispatch availability (recorded as unavailable, not passed)
+### Dispatch and executed model job
 
-This workflow is added by PR #36 and is absent from the default branch. During
-the Task 5 preflight, GitHub's contents API returned 404 for
-`.github/workflows/oaf-tf215-probe.yml` at `main`, and GitHub only offers
-`workflow_dispatch` for workflows present on the default branch. The dispatch
+An earlier preflight predicted that `workflow_dispatch` would be unavailable
+before merge because the workflow file is not on `main`. That prediction was
+wrong: the dispatch
 
 ```bash
 gh workflow run oaf-tf215-probe.yml \
   --ref docs/hpa-856-python311-tf215-prototype
 ```
 
-is therefore **unavailable before merge and is not recorded as a pass**. Until
-merge, the identical command sequence above is executed on an authenticated
-Linux x86-64 Colab CPU VM (`RESULTS.md` records host, interpreter builds,
-hashes and the actual graph/restore/inference output). No GitHub model-job
-artifact exists for a pre-merge commit.
+was accepted and created run `43963725603` at `c3ffbef`. The graph job passed.
+The model job intentionally failed at the comparison step after writing
+`compare.json` with `repeatable=true`, `oracle_exact=false` and
+`status=oracle_divergent`, and after setting `COMPARE_EXIT=1`; the summary and
+upload steps then succeeded and attached `oaf-tf215-compare` and
+`oaf-tf215-graph-check`. The red job is the parity gate, not a pass. The same
+command sequence was also executed independently on a fresh native Linux x86-64
+Colab CPU VM; `RESULTS.md` records both hosts, interpreter builds, hashes and
+the actual graph/restore/inference output.
 
 `check_workflow_result_fallback.py` is the focused local check for the graph
 job's fallback: it extracts the step's shell block from the workflow and
@@ -359,20 +362,22 @@ driver exit still leaves and uploads its record.
 
 ## What this does and does not prove
 
-Proves on Linux x86-64 (GitHub Actions and native Colab CPU, recorded with
-commit and host in `RESULTS.md`): the candidate hash lock resolves and installs,
-TensorFlow 2.15 executes the TF1-compatibility Slim batch-norm and legacy LSTM
-graphs under the configured controls, the generated drum configuration and
-scratch worker import under Python 3.11 without the unused notebook/NADE
-packages, the public checkpoint cache verifies, the frozen 130/78/52 partition
-checks run before the worker reports ready with 78 restored inference tensors,
-and three inferences (two same-worker, one fresh-worker) are repeatable.
+Proves on Linux x86-64 (GitHub Actions PR and manual model jobs, and a fresh
+native Colab CPU VM, recorded with commit and host in `RESULTS.md`): the
+candidate hash lock resolves and installs, TensorFlow 2.15 executes the
+TF1-compatibility Slim batch-norm and legacy LSTM graphs under the configured
+controls, the generated drum configuration and scratch worker import under
+Python 3.11 without the unused notebook/NADE packages, the public checkpoint
+cache verifies, the frozen 130/78/52 partition checks run before the worker
+reports ready with 78 restored inference tensors, and three inferences (two
+same-worker, one fresh-worker) are repeatable within each host.
 
-Does not prove: equality with the frozen TF1 oracle. The recorded native run is
-repeatable but `oracle_divergent` (see `RESULTS.md` for the exact event deltas),
-so no TF1 parity, cache/identity reuse or production equivalence is claimed.
-That result is also host-specific: it does not establish behaviour on other
-CPUs, TF1, a broad corpus, or any downstream production path. The builder
-itself is verified locally by the stdlib tests; the TensorFlow imports of the
-scratch tree are proven only on Linux x86-64 (GitHub or native Colab), not by a
-local aarch64 interpreter.
+Does not prove: equality with the frozen TF1 oracle. The recorded runs on both
+hosts are repeatable but `oracle_divergent` (see `RESULTS.md` for the exact
+event deltas), so no TF1 parity, cache/identity reuse or production equivalence
+is claimed. The two hosts are not bit-identical to each other (event 0
+confidence differs), so cross-host equality is not claimed either. It also does
+not establish behaviour on TF1, a broad corpus, or any downstream production
+path. The builder itself is verified locally by the stdlib tests; the
+TensorFlow imports of the scratch tree are proven only on Linux x86-64 (GitHub
+or native Colab), not by a local aarch64 interpreter.
