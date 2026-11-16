@@ -15,13 +15,14 @@ from __future__ import annotations
 import importlib.util
 import json
 import struct
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
-from runtime.oaf_tf1.model import OafModelConfigError
+from runtime.oaf_tf1.model import OafModelConfigError, load_model_config
 from src.benchmark.backends.oaf import _decode_native_event
 from src.benchmark.checkpoint_acquisition import CheckpointAcquisitionError
 from src.benchmark.oaf_smoke_oracle import (
@@ -126,12 +127,14 @@ class _FakeWorker:
         *,
         ready: object = READY,
         log: list[str] | None = None,
+        close_error: Exception | None = None,
     ) -> None:
         self.ready = ready
         self.requests: list[str] = []
         self.close_count = 0
         self.closed = False
         self.log = [] if log is None else log
+        self.close_error = close_error
         self._responses = list(responses)
 
     def request(self, path: str, **_kwargs: object) -> dict[str, object]:
@@ -148,6 +151,16 @@ class _FakeWorker:
         self.close_count += 1
         self.closed = True
         self.log.append("close")
+        if self.close_error is not None:
+            raise self.close_error
+
+
+def _host_error() -> WorkerProcessError:
+    """Build the error a real Popen failure produces: a WorkerProcessError from OSError."""
+    try:
+        raise WorkerProcessError("worker could not be started") from FileNotFoundError("python3.11")
+    except WorkerProcessError as error:
+        return error
 
 
 class _FakeFactory:
@@ -404,17 +417,17 @@ def test_driver_writes_the_failure_record_and_exits_nonzero(
     assert "restored tensor count" in record["stages"][-1]["error"]
 
 
-def test_driver_reports_a_worker_start_failure_as_blocked(
+def test_driver_reports_a_child_initialization_failure_as_failed(
     compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     paths = _paths(tmp_path)
     factory = _FakeFactory(
-        error=WorkerProcessError("worker could not be started: permission denied")
+        error=WorkerProcessError("worker exited before ready: ImportError: no tensorflow")
     )
 
     record = _run(compare, monkeypatch, paths, factory)
 
-    assert record["status"] == "blocked"
+    assert record["status"] == "failed"
     assert record["state"]["failed_stage"] == "worker_start"
     assert [stage["name"] for stage in record["stages"]] == [
         "config",
@@ -422,7 +435,53 @@ def test_driver_reports_a_worker_start_failure_as_blocked(
         "input",
         "worker_start",
     ]
-    assert "permission denied" in record["stages"][-1]["error"]
+    assert "ImportError" in record["stages"][-1]["error"]
+
+
+def test_driver_reports_a_missing_interpreter_as_blocked(
+    compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = _paths(tmp_path)
+    _install_checkpoint(monkeypatch, compare, paths["checkpoint_cache"] / "sha256" / "checkpoint")
+
+    code = compare.main(_cli(paths))
+
+    assert code == 1
+    record = json.loads(paths["output"].read_text(encoding="utf-8"))
+    assert record["status"] == "blocked"
+    assert record["state"]["failed_stage"] == "host"
+    assert [stage["name"] for stage in record["stages"]] == [
+        "config",
+        "checkpoint",
+        "input",
+        "host",
+    ]
+    assert "WorkerProcessError: worker could not be started" in record["stages"][-1]["error"]
+
+
+def test_driver_reports_a_real_worker_import_failure_as_failed(
+    compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = _paths(tmp_path)
+    paths["python311"] = Path(sys.executable)
+    (paths["runtime_root"] / "worker.py").write_text(
+        "raise ImportError('tensorflow is unavailable')\n", encoding="utf-8"
+    )
+    _install_checkpoint(monkeypatch, compare, paths["checkpoint_cache"] / "sha256" / "checkpoint")
+
+    code = compare.main(_cli(paths))
+
+    assert code == 1
+    record = json.loads(paths["output"].read_text(encoding="utf-8"))
+    assert record["status"] == "failed"
+    assert record["state"]["failed_stage"] == "worker_start"
+    assert [stage["name"] for stage in record["stages"]] == [
+        "config",
+        "checkpoint",
+        "input",
+        "worker_start",
+    ]
+    assert "worker exited before ready" in record["stages"][-1]["error"]
 
 
 def test_driver_rejects_a_fixture_that_is_not_the_oracle_input(
@@ -470,6 +529,36 @@ def test_driver_reports_a_checkpoint_acquisition_failure_as_blocked(
     assert factory.calls == []
 
 
+def test_driver_reports_a_checkpoint_validation_failure_as_failed(
+    compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = _paths(tmp_path)
+    archive = load_model_config(compare.MODEL_CONFIG_PATH).checkpoint.archive_sha256
+    (paths["checkpoint_cache"] / "sha256" / archive).mkdir(parents=True)
+
+    def _fail(_config: object, _cache_root: Path, *, download: bool) -> Path:
+        assert download is False
+        raise CheckpointAcquisitionError("checkpoint component hash differs")
+
+    monkeypatch.setattr(compare, "prepare_oaf_checkpoint", _fail)
+    factory = _FakeFactory()
+
+    record = compare.run_comparison(
+        python311=paths["python311"],
+        runtime_root=paths["runtime_root"],
+        checkpoint_cache=paths["checkpoint_cache"],
+        fixture=paths["fixture"],
+        oracle_path=paths["oracle"],
+        process_factory=factory,
+    )
+
+    assert record["status"] == "failed"
+    assert record["state"]["failed_stage"] == "checkpoint_validation"
+    assert [stage["name"] for stage in record["stages"]] == ["config", "checkpoint_validation"]
+    assert "checkpoint component hash differs" in record["stages"][-1]["error"]
+    assert factory.calls == []
+
+
 def test_driver_records_a_model_configuration_failure(
     compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -497,12 +586,18 @@ def test_driver_records_a_model_configuration_failure(
     [
         (None, None, None, "config", "failed"),
         (None, None, None, "checkpoint", "blocked"),
-        (None, None, None, "worker_start", "blocked"),
+        (None, None, None, "checkpoint_validation", "failed"),
+        (None, None, None, "host", "blocked"),
+        (None, None, None, "worker_start", "failed"),
         (None, None, None, "restore", "failed"),
         (None, None, None, "input", "failed"),
         (None, None, None, "inference", "failed"),
         (None, None, None, "worker_close", "failed"),
         (None, None, None, None, "environment_only_passed"),
+        (None, True, True, None, "failed"),
+        (None, False, None, None, "failed"),
+        (None, None, True, None, "failed"),
+        (None, None, False, None, "failed"),
         (False, None, None, None, "failed"),
         (True, None, None, None, "failed"),
         (True, False, None, None, "non_repeatable"),
@@ -608,6 +703,23 @@ def test_driver_caps_recorded_field_deltas(
     }
 
 
+def test_driver_caps_a_count_delta_at_the_boundary_of_mixed_runs(
+    compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = _paths(tmp_path)
+    plans = [
+        _FakeWorker([_response(_synthetic_events(4)), _response(_synthetic_events(3))]),
+        _FakeWorker([_response(_synthetic_events(4))]),
+    ]
+
+    record = _run(compare, monkeypatch, paths, _FakeFactory(plans))
+
+    assert record["status"] == "non_repeatable"
+    deltas = record["inference"]["deltas"]
+    assert len(deltas) == compare.MAX_RECORDED_DELTAS == 8
+    assert deltas[-1] == {"run": 3, "event_count": {"actual": 4, "expected": 3}}
+
+
 @pytest.mark.parametrize(
     ("failure", "message"),
     [
@@ -657,7 +769,7 @@ def test_driver_reports_a_fresh_worker_start_failure_after_closing_the_first(
     paths = _paths(tmp_path)
     plans = [
         _FakeWorker([_response(), _response()]),
-        WorkerProcessError("worker could not be started"),
+        WorkerProcessError("worker exited before ready: ImportError: no tensorflow"),
     ]
     factory = _FakeFactory(plans)
 
@@ -665,9 +777,107 @@ def test_driver_reports_a_fresh_worker_start_failure_after_closing_the_first(
 
     assert record["status"] == "failed"
     assert record["state"]["failed_stage"] == "inference"
+    assert "worker exited before ready" in record["stages"][-1]["error"]
+    assert len(factory.workers) == 1
+    assert factory.workers[0].close_count == 1
+
+
+def test_driver_reports_a_fresh_worker_host_failure_as_blocked(
+    compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = _paths(tmp_path)
+    plans = [_FakeWorker([_response(), _response()]), _host_error()]
+    factory = _FakeFactory(plans)
+
+    record = _run(compare, monkeypatch, paths, factory)
+
+    assert record["status"] == "blocked"
+    assert record["state"]["failed_stage"] == "host"
+    assert record["stages"][-1]["name"] == "host"
     assert "worker could not be started" in record["stages"][-1]["error"]
     assert len(factory.workers) == 1
     assert factory.workers[0].close_count == 1
+    assert len(record["inference"]["runs"]) == 2
+
+
+def test_driver_retains_comparison_when_a_worker_close_fails(
+    compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = _paths(tmp_path)
+    plans = [
+        _FakeWorker([_response(), _response()], close_error=WorkerProcessError("close failed")),
+        _FakeWorker([_response()]),
+    ]
+    factory = _FakeFactory(plans)
+
+    record = _run(compare, monkeypatch, paths, factory)
+
+    assert record["status"] == "failed"
+    assert record["state"] == {
+        "inference_completed": True,
+        "repeatable": True,
+        "oracle_exact": True,
+        "failed_stage": "worker_close",
+    }
+    assert len(record["inference"]["runs"]) == 3
+    assert record["inference"]["deltas"] == []
+    assert [stage["name"] for stage in record["stages"][-2:]] == ["worker_close", "inference"]
+    assert "close failed" in record["stages"][-2]["error"]
+    assert [worker.close_count for worker in factory.workers] == [1, 1]
+
+
+def test_driver_retains_comparison_when_the_fresh_worker_close_fails(
+    compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = _paths(tmp_path)
+    plans = [
+        _FakeWorker([_response(), _response()]),
+        _FakeWorker([_response()], close_error=WorkerProcessError("fresh close failed")),
+    ]
+    factory = _FakeFactory(plans)
+
+    record = _run(compare, monkeypatch, paths, factory)
+
+    assert record["status"] == "failed"
+    assert record["state"] == {
+        "inference_completed": True,
+        "repeatable": True,
+        "oracle_exact": True,
+        "failed_stage": "worker_close",
+    }
+    assert len(record["inference"]["runs"]) == 3
+    assert record["inference"]["deltas"] == []
+    assert [stage["name"] for stage in record["stages"][-2:]] == ["worker_close", "inference"]
+    assert "fresh close failed" in record["stages"][-2]["error"]
+    assert [worker.close_count for worker in factory.workers] == [1, 1]
+
+
+def test_driver_preserves_the_primary_inference_failure_when_close_also_fails(
+    compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = _paths(tmp_path)
+    plans = [
+        _FakeWorker(
+            [_response(), WorkerProcessError("inference failed")],
+            close_error=WorkerProcessError("close failed"),
+        )
+    ]
+    factory = _FakeFactory(plans)
+
+    record = _run(compare, monkeypatch, paths, factory)
+
+    assert record["status"] == "failed"
+    assert record["state"]["failed_stage"] == "inference"
+    assert record["state"]["inference_completed"] is False
+    inference_stage = record["stages"][-1]
+    close_stage = record["stages"][-2]
+    assert inference_stage["name"] == "inference"
+    assert "inference failed" in inference_stage["error"]
+    assert close_stage["name"] == "worker_close"
+    assert "close failed" in close_stage["error"]
+    assert len(factory.workers) == 1
+    assert factory.workers[0].close_count == 1
+    assert len(record["inference"]["runs"]) == 1
 
 
 def test_driver_validates_the_fresh_worker_restore_count(

@@ -45,7 +45,11 @@ from runtime.oaf_tf1.model import REQUIRED_INFERENCE_COUNT, OafModelConfig, load
 from src.benchmark.artifact_io import read_regular_file_no_follow
 from src.benchmark.backends.idm import _isolated_worker_environment
 from src.benchmark.backends.oaf import _decode_native_event
-from src.benchmark.checkpoint_acquisition import prepare_oaf_checkpoint
+from src.benchmark.checkpoint_acquisition import (
+    CheckpointAcquisitionError,
+    _is_directory,
+    prepare_oaf_checkpoint,
+)
 from src.benchmark.input_view import load_direct_audio
 from src.benchmark.oaf_smoke_oracle import (
     SmokeOracle,
@@ -53,7 +57,7 @@ from src.benchmark.oaf_smoke_oracle import (
     _event_from_native,
     read_smoke_oracle,
 )
-from src.benchmark.worker_process import WorkerProcess
+from src.benchmark.worker_process import WorkerProcess, WorkerProcessError
 
 SCHEMA = "oaf-tf215-compare/v2"
 MODEL_CONFIG_PATH = REPOSITORY_ROOT / "runtime" / "oaf_tf1" / "model.json"
@@ -66,10 +70,11 @@ WORKER_ENVIRONMENT = {
     "TF_ENABLE_ONEDNN_OPTS": "0",
     "NUMBA_CACHE_DIR": "/tmp/numba-cache",
 }
-# Pre-inference failures mean the experiment could not reach a loaded model on
-# this host, so they are blocked (not proven incompatible), never a pass.
-# Everything after a loaded worker is a real experiment failure.
-BLOCKED_STAGES = frozenset({"checkpoint", "worker_start"})
+# Pre-inference failures mean the experiment could not reach a loaded model.
+# ``checkpoint`` is cache access and ``host`` is interpreter/host availability;
+# both are blocked (not proven incompatible), never a pass. A child that starts
+# but fails to become ready is a real failure under ``worker_start``.
+BLOCKED_STAGES = frozenset({"checkpoint", "host"})
 # Diagnostics stay small: only the first differing event fields are recorded.
 MAX_RECORDED_DELTAS = 8
 EVENT_FIELDS = tuple(field.name for field in fields(SmokeOracleEvent))
@@ -79,6 +84,14 @@ ProcessFactory = Callable[..., Any]
 
 class CompareError(RuntimeError):
     """A driver stage produced an invalid or unexpected result."""
+
+
+class StageLabel(RuntimeError):
+    """Attribute a failure to a more specific stage than the caller's."""
+
+    def __init__(self, stage: str, message: str) -> None:
+        super().__init__(message)
+        self.stage = stage
 
 
 class StageFailure(RuntimeError):
@@ -97,14 +110,16 @@ def classify_result(
 ) -> str:
     """Derive the one result label from the nullable tri-state record.
 
-    ``blocked`` means the run never reached a loaded model (external checkpoint
-    or host access); ``failed`` is any experiment failure with its stage.
+    ``blocked`` means external checkpoint or host access was unavailable;
+    ``failed`` is any other experiment failure with its stage. Environment-only
+    scope requires an entirely absent tri-state; contradictory claims are
+    rejected as ``failed`` rather than reported as success.
     ``oracle_divergent`` is repeatable but differs from the frozen oracle, and
     ``non_repeatable`` means the candidate runs differ among themselves.
     """
     if failed_stage is not None:
         return "blocked" if failed_stage in BLOCKED_STAGES else "failed"
-    if inference_completed is None:
+    if inference_completed is None and repeatable is None and oracle_exact is None:
         return "environment_only_passed"
     if inference_completed is not True:
         return "failed"
@@ -128,7 +143,19 @@ def _load_config(holder: dict[str, Any]) -> dict[str, Any]:
 
 
 def _prepare_checkpoint(config: OafModelConfig, checkpoint_cache: Path) -> dict[str, Any]:
-    checkpoint = prepare_oaf_checkpoint(config, checkpoint_cache, download=False)
+    target = checkpoint_cache / "sha256" / config.checkpoint.archive_sha256
+    try:
+        checkpoint = prepare_oaf_checkpoint(config, checkpoint_cache, download=False)
+    except CheckpointAcquisitionError as error:
+        # A populated cache that fails verification is a real validation
+        # failure; only absent or unreadable cache access is blocked.
+        try:
+            populated = _is_directory(target)
+        except CheckpointAcquisitionError:
+            populated = False
+        if not populated:
+            raise
+        raise StageLabel("checkpoint_validation", str(error)) from error
     return {
         "cache_root": os.fspath(checkpoint_cache),
         "checkpoint": os.fspath(checkpoint),
@@ -186,12 +213,19 @@ def _start_worker(
         "--checkpoint-dir",
         os.fspath(checkpoint),
     ]
-    holder["process"] = process_factory(
-        command,
-        timeout_seconds=WORKER_START_TIMEOUT_SECONDS,
-        cwd=fixture.parent,
-        env=_worker_environment(),
-    )
+    try:
+        holder["process"] = process_factory(
+            command,
+            timeout_seconds=WORKER_START_TIMEOUT_SECONDS,
+            cwd=fixture.parent,
+            env=_worker_environment(),
+        )
+    except WorkerProcessError as error:
+        # Popen failed, so the interpreter or host itself is unavailable. A
+        # child that executed and then failed is a real initialization failure.
+        if isinstance(error.__cause__, OSError):
+            raise StageLabel("host", str(error)) from error
+        raise
     return {
         "command": command,
         "cwd": os.fspath(fixture.parent),
@@ -238,6 +272,8 @@ def _oracle_deltas(
                     "event_count": {"actual": len(events), "expected": len(oracle_events)},
                 }
             )
+            if len(deltas) >= MAX_RECORDED_DELTAS:
+                return deltas
         for index, (actual, expected) in enumerate(zip(events, oracle_events, strict=False)):
             changed = {
                 name: {"actual": getattr(actual, name), "expected": getattr(expected, name)}
@@ -285,10 +321,12 @@ def _run_inference(
                 }
             )
     finally:
-        first.close()
+        # Ownership is gone, and _close_worker never raises, so a cleanup
+        # failure can neither mask the primary error nor double-close.
+        _close_worker(first, record)
 
     _start_worker(process_factory, python311, runtime_root, checkpoint, fixture, holder)
-    fresh = holder["process"]
+    fresh = holder.pop("process")
     try:
         record["inference"]["fresh_worker"] = _validate_worker_ready(fresh.ready)
         events = _request_events(fresh, relative_wav)
@@ -301,15 +339,16 @@ def _run_inference(
                 "events": [asdict(event) for event in events],
             }
         )
+        # Retain completion and comparison before cleanup: a close failure
+        # still makes the final result fail, but must not discard evidence.
+        state["inference_completed"] = True
+        repeatable = attempts[0] == attempts[1] == attempts[2]
+        state["repeatable"] = repeatable
+        state["oracle_exact"] = attempts[0] == oracle_events if repeatable else None
+        record["inference"]["deltas"] = _oracle_deltas(attempts, oracle_events)
     finally:
-        fresh.close()
-        holder.pop("process", None)
+        _close_worker(fresh, record)
 
-    state["inference_completed"] = True
-    repeatable = attempts[0] == attempts[1] == attempts[2]
-    state["repeatable"] = repeatable
-    state["oracle_exact"] = attempts[0] == oracle_events if repeatable else None
-    record["inference"]["deltas"] = _oracle_deltas(attempts, oracle_events)
     return {"event_counts": [run["event_count"] for run in runs]}
 
 
@@ -318,6 +357,22 @@ def run_stage(record: dict[str, Any], name: str, action: Callable[[], Any]) -> A
     started = time.monotonic()
     try:
         details = action()
+    except StageLabel as error:
+        cause = error.__cause__
+        detail = (
+            f"{type(cause).__name__}: {cause}"
+            if cause is not None
+            else f"{type(error).__name__}: {error}"
+        )
+        record["stages"].append(
+            {
+                "name": error.stage,
+                "status": "failed",
+                "duration_ms": round((time.monotonic() - started) * 1000),
+                "error": detail,
+            }
+        )
+        raise StageFailure(error.stage) from error
     except Exception as error:  # noqa: BLE001 - recorded as the failed stage
         record["stages"].append(
             {
