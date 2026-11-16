@@ -202,6 +202,29 @@ def test_builder_applies_the_patch_inside_a_git_checkout(
     assert "_initialize_tf_compat" in (runtime / "model.py").read_text(encoding="utf-8")
 
 
+def test_builder_ignores_inherited_git_repository_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder = _load_builder()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _run_git_for_test(checkout, "init", "--quiet")
+    _run_git_for_test(checkout, "commit", "--allow-empty", "--quiet", "-m", "base")
+    monkeypatch.setenv("GIT_DIR", os.fspath(checkout / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", os.fspath(checkout))
+    monkeypatch.setenv("GIT_COMMON_DIR", os.fspath(checkout / ".git"))
+    monkeypatch.setenv("GIT_INDEX_FILE", os.fspath(checkout / "index"))
+
+    runtime = builder.build_runtime(REPO_ROOT, checkout / "scratch")
+
+    configs = (
+        runtime / "vendor" / "magenta" / "models" / "onsets_frames_transcription" / "configs.py"
+    ).read_text(encoding="utf-8")
+    assert "from magenta.contrib import training as contrib_training" in configs
+    assert "tensorflow.contrib" not in configs
+    assert (runtime / "vendor" / "magenta" / "contrib" / "training.py").is_file()
+
+
 def _run_git_for_test(repository: Path, *arguments: str) -> None:
     subprocess.run(
         ["git", *arguments],

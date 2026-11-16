@@ -24,6 +24,20 @@ SCRATCH_FILES = ("model.py", "model.json", "worker.py")
 INSTRUMENTATION_PATCH = FROZEN_RUNTIME / "patches" / "capture-emitted-frame.patch"
 COMPATIBILITY_PATCH = Path("experiments") / "oaf_tf215" / "patches" / "tf215-compat.patch"
 COMPATIBILITY_PATCH_SHA256 = "554527246744662d914ea45973b93dd23aa6a31e5270a36b729589327da4e041"
+# Inherited values force Git into repository mode and override the discovery
+# ceiling, which makes `git apply` rebase and skip the patch paths.
+_GIT_REPOSITORY_SELECTION = frozenset(
+    {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_PREFIX",
+        "GIT_WORK_TREE",
+    }
+)
 
 
 class ScratchRuntimeError(RuntimeError):
@@ -74,9 +88,12 @@ def _apply_instrumentation(repo_root: Path, upstream: Path, vendor: Path, patch_
 
 def _run_git(root: Path, *arguments: str) -> None:
     # A scratch root inside a Git checkout would make `git apply` resolve patch
-    # paths against the enclosing repository and silently skip them; the ceiling
-    # forces Git to treat `root` as the top level.
-    environment = dict(os.environ)
+    # paths against the enclosing repository and silently skip them. Drop
+    # inherited repository selection and set a ceiling so Git treats `root` as
+    # the top level.
+    environment = {
+        key: value for key, value in os.environ.items() if key not in _GIT_REPOSITORY_SELECTION
+    }
     environment["GIT_CEILING_DIRECTORIES"] = os.fspath(root.parent)
     result = subprocess.run(
         ["git", *arguments],
