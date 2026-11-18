@@ -1,0 +1,37 @@
+# Candidate dependencies for the Python 3.11 / TensorFlow 2.15.1 OaF experiment.
+# These are starting candidates, not a validated environment. Resolve for the
+# frozen runtime's Linux x86-64 target (x86_64-manylinux_2_17) with:
+#
+#   uv pip compile --python-version 3.11 \
+#     --python-platform x86_64-manylinux_2_17 --generate-hashes \
+#     experiments/oaf_tf215/requirements.in \
+#     -o experiments/oaf_tf215/requirements.lock
+
+# TensorFlow 2.15 is the last release with an Estimator compatibility bridge.
+tensorflow-cpu==2.15.1
+tensorflow-estimator==2.15.0
+keras==2.15.0
+tf-slim==1.1.0
+# tf-slim 1.1.0 needs the two TF 2.15 call-site compatibility controls
+# documented in README.md; no tf_keras pin resolves them.
+protobuf==3.20.3
+
+# Numerical stack pinned for the frozen TF1-era wheels and Numba frontend.
+numpy==1.23.5
+scipy==1.10.1
+numba==0.57.1
+llvmlite==0.40.1
+
+# Demonstrated audio/MIDI dependencies of the drum frontend and worker.
+librosa==0.8.1
+soundfile==0.12.1
+pretty-midi==0.2.10
+# Imported by the frozen drum source closure and installed by the frozen TF1
+# runtime: magenta.music.performance_lib (attrs), metrics (mir_eval), and
+# audio_transform (sox). They are required by the Python 3.11 drum-config import.
+attrs==21.4.0
+mir_eval==0.8.2
+sox==1.4.1
+# librosa 0.8.1 imports pkg_resources at module import; setuptools >= 81 no
+# longer ships it. Match the frozen runtime's direct pin.
+setuptools==68.0.0
