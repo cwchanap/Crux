@@ -238,22 +238,87 @@ All 124 scoped tests passed, including the original smoke and workflow tests.
 Running `prepare` with the three pinned reports and a missing `run.json`
 returned blocked with exit status 2 and created no selection.
 
-Real measurement is **blocked on the archived TF1 inputs**. The Git evidence
-contains the reports. Local artifacts and the expanded connected Drive archive
-did not contain a matching bundle for `oaf-2d67684ad190163e`. The expanded
+The original October comparison remains **blocked on the archived TF1 inputs**.
+The Git evidence contains the reports. Local artifacts and the expanded
+connected Drive archive did not contain a matching bundle for
+`oaf-2d67684ad190163e`. The expanded
 Drive run is `oaf-f2dc8381e50f447f` and has a different reference digest.
 The required bundle consists of the pinned run's `run.json`, five original
 prediction-v2 bodies, matching reference/timing manifests and selected timing
-event bodies, and verified source audio. Neither fresh Colab VM executed the
-selected-song comparison.
+event bodies, and verified source audio.
+
+### Fresh September TF1 baseline
+
+The fresh comparison keeps the October-ranked membership and uses the
+September reference and timing manifests whose respective SHA-256 digests are
+`4f5d5e859650cb78a9f78697e8f19ab1ac3e7ea3c86dbea0e1f00c876357c7a3` and
+`372979d42fff94438fe8d844fca2770d430a3c0898a306a4bc46bd8b2887e38f`.
+All 180 eligible timing files and the five original OGGs recovered from Drive
+matched their manifest hashes. The frozen TF1 scope completed all five songs
+as `oaf-9dce500b62a3e24c` on an x86-64 Colab CPU VM. It used a chroot built
+from the pinned OCI image layers and the locked TF1 dependencies. The worker
+restored 78 tensors and matched the canonical smoke oracle exactly on that VM.
+The runner sealed the fresh TF1 run, prediction bodies and canonical WAV
+hashes with `prepare-fresh`.
+
+The Colab CLI ran the experiment from a snapshot of `4754086` with the
+fresh-selection code and tests applied. The TF2.15 worker used CPython 3.11.17,
+`tensorflow-cpu` 2.15.1 and the hash-locked requirements. The bootstrap ran
+`uv pip sync --require-hashes`, `uv pip check`, `build_runtime.py` and
+`graph_check.py` before the selected-song driver. It used the existing Python
+3.12 project lock for the host driver. The first VM had Linux `6.6.159+`,
+glibc 2.39 and two logical CPUs in its affinity mask.
+
+Each TF2.15 measurement completed all 15 song attempts. Each song's three
+native event arrays agreed exactly within both VMs, with two requests in
+one worker and one in a new worker. Both workers for every song restored
+78 tensors. The candidate smoke output again differed from the binary64
+oracle in time and confidence.
+
+| Simfile | TF1 events | TF2.15 events | Matched within 1 ms | Max confidence difference |
+| ---: | ---: | ---: | ---: | ---: |
+| 389 | 81 | 81 | 81 | 0.000001 |
+| 391 | 530 | 530 | 530 | 0.000001 |
+| 27 | 910 | 910 | 910 | 0.000003 |
+| 241 | 820 | 820 | 820 | 0.000009 |
+| 207 | 710 | 710 | 710 | 0.000002 |
+
+All 3,051 events had identical onset times at six-decimal artifact precision.
+The comparison observed zero one-frame shifts, additions, removals and
+rounding collisions. Velocity, model output bin, MIDI note and upstream
+group agreed on every match. Confidence differences prevented ordered event
+equality on all five songs. Median absolute confidence difference was zero
+and p95 was `0.000001` for each song.
+
+The second VM reproduced the seal and matched all 3,051 ordered TF2.15 events
+at binary64 across VMs. The execution IDs are
+`3387d5ac-c5fc-44dc-8f07-8232d6f63f69` and
+`68c5d656-d7db-4cb5-8a32-2d0814a732e9`. Both recorded runtime digest
+`865c1ea6360f95699f7b89bff340f2140901547926f3e71b3d1bc1ee02203959`
+before and after inference. Both verified seal digest
+`be7d82e42658c227f20d652bc5536bed89d6e66d0fdc8ea982d3ef2f5e6acf67`.
+The candidate descriptor digest is
+`938cbcccff5adda03f11344596e21534e178c98929098bf8327feb1e9ed4c890`.
+
+The GitHub selected-song repeat remains blocked because CI has no authorized
+delivery path for the corpus inputs. The Colab repeat measures two fresh VMs
+from one provider.
+
+The evidence archives, command logs, verified inputs and launcher scripts are
+in `artifacts/experiments/oaf-tf215/fresh-september/` in the experiment
+worktree. The archives include the TF1 corpus reports and prediction JSONL,
+the seal, the TF2.15 smoke and raw attempts, and runtime provenance. Source
+OGGs and canonical WAVs were excluded from the returned archives.
+
+After the second measurement, `uv sync --locked --extra mlflow --extra r2`
+and `uv run --no-sync pytest -q -o addopts=` passed on Colab with the Python
+3.12.3 project interpreter. All 3,726 tests passed in 470.56 seconds. Ruff
+lint and format checks passed for the three changed Python files.
 
 ## Remaining benchmark work
 
-- Only the canonical single-fixture smoke input was executed. No broad corpus,
-  reviewed subset, same-machine separation, R2 or Drive artifact was produced.
-- No cross-host bit equality and no TF1 rerun: the frozen binary64 oracle is the
-  baseline, and the two TF2.15 hosts differ from each other at event 0
-  confidence.
-- No canonical prediction, report or production cache was written; experiment
-  records stay under `artifacts/experiments/oaf-tf215/` and session-local
-  copies.
+- The measured scope covers the canonical smoke fixture and the five selected
+  songs. Broad corpus, reviewed subset and separation measurements remain open.
+- The GitHub and Colab TF2.15 smoke observations differ at event 0 confidence.
+- The TF1 prediction and report artifacts are confined to the experiment output
+  under `artifacts/experiments/oaf-tf215/`.
