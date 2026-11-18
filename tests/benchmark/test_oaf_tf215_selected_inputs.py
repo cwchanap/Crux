@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from experiments.oaf_tf215 import selected_compare
 from experiments.oaf_tf215 import selected_inputs as selected
 from runtime.oaf_tf1.model import load_model_config
 from src.benchmark.backend_identity import (
@@ -491,3 +492,121 @@ def test_prepare_rejects_paths_that_escape_the_baseline_root(archived_bundle, tm
     baseline.write_bytes(render_oaf_corpus_run(run))
     with pytest.raises(selected.SelectionError, match="unsafe relative"):
         selected.prepare_selection(**archived_bundle)
+
+
+@pytest.fixture
+def fresh_bundle(archived_bundle, monkeypatch) -> dict[str, Path]:
+    """Use the production corpus output layout with a synthetic fresh scoped run."""
+    arguments = dict(archived_bundle)
+    del arguments["baseline_evidence_dir"]
+    archive_snapshot = arguments["baseline_run"]
+    run = strict_json_loads(archive_snapshot.read_bytes())
+    run_id = build_run_id(
+        run["reference_manifest_sha256"],
+        run["reference_timing_manifest_sha256"],
+        run["backend_descriptor_sha256"],
+        run["model_lock_sha256"],
+        run["checkpoint_archive_sha256"],
+        run["inference_config_sha256"],
+        SONGS,
+    )
+    for name, value in {
+        "FRESH_RUN_ID": run_id,
+        "FRESH_REFERENCE_MANIFEST_SHA256": run["reference_manifest_sha256"],
+        "FRESH_REFERENCE_MANIFEST_VERSION": run["reference_manifest_version"],
+        "FRESH_TIMING_MANIFEST_SHA256": run["reference_timing_manifest_sha256"],
+        "FRESH_TIMING_MANIFEST_VERSION": run["reference_timing_version"],
+    }.items():
+        monkeypatch.setattr(selected, name, value, raising=False)
+    run.update(
+        run_id=run_id,
+        include_simfile_ids=list(SONGS),
+        success_count=5,
+        quarantined_count=0,
+        items=[row for row in run["items"] if row["simfile_id"] in SONGS],
+    )
+    row = next(row for row in run["items"] if row["simfile_id"] == 389)
+    path = archive_snapshot.parent / row["prediction_path"]
+    prediction = read_prediction_artifact(path.read_bytes()).prediction
+    (event,) = prediction.events
+    second = replace(event, native=replace(event.native, time_sec=0.2))
+    artifact = render_prediction_artifact(replace(prediction, events=(event, second)))
+    path.write_bytes(artifact)
+    row["prediction_artifact_sha256"] = sha256_hex(artifact)
+
+    baseline = archive_snapshot.parent / "runs" / run_id / "run.json"
+    baseline.parent.mkdir(parents=True)
+    baseline.write_bytes(render_oaf_corpus_run(run))
+    arguments["baseline_run"] = baseline
+    return arguments
+
+
+def test_prepare_fresh_cli_seals_production_layout_with_measured_counts(
+    fresh_bundle, tmp_path, capsys
+) -> None:
+    output = tmp_path / "fresh-selection.json"
+    arguments = [
+        argument
+        for key, value in (fresh_bundle | {"output": output}).items()
+        for argument in (f"--{key.replace('_', '-')}", str(value))
+    ]
+    assert selected_compare.main(["prepare-fresh", *arguments]) == 0
+    digest = capsys.readouterr().out.strip()
+    selection, bindings = selected.verify_selection(
+        selection_path=output,
+        expected_selection_sha256=digest,
+        baseline_run=fresh_bundle["baseline_run"],
+        input_root=fresh_bundle["input_root"],
+    )
+    assert selection["schema"] == "crux.oaf-tf215-fresh-selection/v1"
+    assert selection["selection_provenance"]["run_id"] == selected.ARCHIVED_RUN_ID
+    assert selection["baseline_identity"]["run_id"] == fresh_bundle["baseline_run"].parent.name
+    assert [row["simfile_id"] for row in selection["items"]] == list(SONGS)
+    assert [row["rank"] for row in selection["items"]] == list(RANKS)
+    assert "archived_f1" not in selection["items"][0]
+    assert selection["items"][0]["prediction_native_class_counts"] == {"midi_38": 2}
+    assert [artifact.event_count for _, artifact in bindings] == [2, 1, 1, 1, 1]
+
+
+@pytest.mark.parametrize(
+    ("change", "diagnostic"),
+    [
+        ({"include_simfile_ids": [27, 207, 241, 389]}, "include_simfile_ids"),
+        ({"reference_timing_manifest_sha256": "d" * 64}, "reference_timing_manifest_sha256"),
+        ({"overall_status": "partial"}, "overall_status"),
+    ],
+)
+def test_prepare_fresh_rejects_wrong_scope_or_lineage(fresh_bundle, change, diagnostic) -> None:
+    baseline = fresh_bundle["baseline_run"]
+    run = strict_json_loads(baseline.read_bytes())
+    baseline.write_bytes(render_oaf_corpus_run(run | change))
+    with pytest.raises(selected.SelectionError, match=diagnostic):
+        selected.prepare_fresh_selection(**fresh_bundle)
+    assert not fresh_bundle["input_root"].exists()
+
+
+def test_prepare_fresh_rejects_a_different_successful_song_in_same_scope(fresh_bundle) -> None:
+    baseline = fresh_bundle["baseline_run"]
+    run = strict_json_loads(baseline.read_bytes())
+    row = next(row for row in run["items"] if row["simfile_id"] == 389)
+    row["simfile_id"] = 999
+    baseline.write_bytes(render_oaf_corpus_run(run))
+    with pytest.raises(selected.SelectionError, match="selected membership"):
+        selected.prepare_fresh_selection(**fresh_bundle)
+    assert not fresh_bundle["input_root"].exists()
+
+
+def test_verify_fresh_rebinds_prediction_bytes(fresh_bundle, tmp_path) -> None:
+    selection = selected.prepare_fresh_selection(**fresh_bundle)
+    output = tmp_path / "fresh-selection.json"
+    output.write_bytes(canonical_json_bytes(selection))
+    baseline = fresh_bundle["baseline_run"]
+    prediction = baseline.parents[2] / selection["items"][0]["prediction_path"]
+    prediction.write_bytes(prediction.read_bytes() + b"\n")
+    with pytest.raises(selected.SelectionError, match="prediction"):
+        selected.verify_selection(
+            selection_path=output,
+            expected_selection_sha256=selected.selection_sha256(selection),
+            baseline_run=baseline,
+            input_root=fresh_bundle["input_root"],
+        )
