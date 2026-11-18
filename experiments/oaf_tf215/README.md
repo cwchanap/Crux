@@ -21,7 +21,7 @@ check does not by itself establish model parity.
 | `build_runtime.py` | Creates one scratch `runtime/` + `upstream/` from the frozen TF1 source, applies the instrumentation patch first and then `patches/tf215-compat.patch`. |
 | `patches/tf215-compat.patch` | The single reviewed TF 2.15 compatibility patch (drum `tf_slim`, HParams/RNN, Estimator, unused package-initializer imports). |
 | `compare.py` | Python 3.12 driver: verifies the checkpoint and fixture, then runs two requests through one loaded Python 3.11 scratch worker plus one through a fresh worker and compares the exact native events with the frozen binary64 smoke oracle. |
-| `selected_compare.py` | Prepares the five fixed archived inputs and measures TF2.15 drift with a separate runtime identity. |
+| `selected_compare.py` | Seals archived or fresh TF1 inputs for the five fixed songs and measures TF2.15 drift with a separate runtime identity. |
 | `runtime_identity.py` | Fingerprints actual source files and inventories the isolated worker environment. |
 | `check_workflow_result_fallback.py` | Stdlib-only local check: the workflow's always-on result step writes a failed sync/check/build/graph/environment record when no graph output exists. |
 | `README.md` | This file. Reproduction commands and evidence scope. |
@@ -87,6 +87,31 @@ the archived TF1 artifacts. Exit 0 confirms a completed repeatable
 measurement, exit 2 indicates blocked access, and exit 1 indicates a failed
 or non-repeatable measurement. Early failures write `comparison.json` under
 `selected/preflight/<execution-id>/` when a runtime identity is unavailable.
+
+### Fresh September baseline
+
+The fresh path uses the same five song IDs and the pinned September reference
+and timing manifests. Run the frozen TF1 corpus driver with those manifests,
+the verified source cache and one `--include-simfile-id` flag for each song.
+The stock CLI requires the built `crux-oaf-tf1:local` image and a working
+Docker runtime. The Colab experiment uses the same corpus driver with the
+pinned OCI rootfs launcher recorded in [RESULTS.md](RESULTS.md#fresh-september-tf1-baseline).
+The runner preflights all 180 eligible timing artifacts. A complete run
+produces `runs/oaf-9dce500b62a3e24c/run.json` under its output root.
+
+```bash
+SELECTION_SHA256=$(uv run experiments/oaf_tf215/selected_compare.py prepare-fresh \
+  --baseline-run "$TF1_OUTPUT/runs/oaf-9dce500b62a3e24c/run.json" \
+  --reference-manifest "$REFERENCE_MANIFEST" --timing-manifest "$TIMING_MANIFEST" \
+  --cache-dir "$CORPUS_CACHE" --input-root "$EXPERIMENT/selected-inputs" \
+  --output "$EXPERIMENT/selection.json")
+```
+
+Use the same `run` command above with the fresh `run.json` path and seal. The
+fresh seal carries the October ranking as selection provenance and derives its
+prediction counts from the fresh TF1 artifacts. For the second VM, retain the
+same TF1 run and predictions, and check the rematerialized WAVs against the
+original selection digest.
 
 ## Reproduce the smoke comparison on x86-64 Linux
 
