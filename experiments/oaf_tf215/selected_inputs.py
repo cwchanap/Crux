@@ -1,4 +1,4 @@
-"""Prepare and verify the fixed archived TF1 inputs for the TF2.15 experiment."""
+"""Prepare and verify the fixed five TF1 inputs for the TF2.15 experiment."""
 
 from __future__ import annotations
 
@@ -57,6 +57,7 @@ from src.benchmark.reference_timing_manifest import (
 from src.benchmark.taxonomy import DTX_LANE_MAP_VERSION, TAXONOMY_VERSION
 
 SELECTION_SCHEMA = "crux.oaf-tf215-selection/v1"
+FRESH_SELECTION_SCHEMA = "crux.oaf-tf215-fresh-selection/v1"
 ARCHIVED_RUN_ID = "oaf-2d67684ad190163e"
 REFERENCE_MANIFEST_SHA256 = "96c9971b2c9113e72cb293862badcc88d9146e689ea329f45576d7fb7349f041"
 REFERENCE_TIMING_VERSION = "sha256:10868dfb1f87490692d28f6f115dfa164f20be69247115be52a76ef59c954fcf"
@@ -69,6 +70,15 @@ SELECTED_SIMFILE_IDS = (389, 391, 27, 241, 207)
 ARCHIVED_SUCCESS_COUNT = 182
 ARCHIVED_QUARANTINED_COUNT = 138
 SELECTED_RANKS = tuple(q * (ARCHIVED_SUCCESS_COUNT - 1) // 4 for q in range(5))
+FRESH_RUN_ID = "oaf-9dce500b62a3e24c"
+FRESH_REFERENCE_MANIFEST_SHA256 = "4f5d5e859650cb78a9f78697e8f19ab1ac3e7ea3c86dbea0e1f00c876357c7a3"
+FRESH_REFERENCE_MANIFEST_VERSION = (
+    "sha256:14758f0da0e147539e3a94808fefeb498e9277e54dc4ab4e5af1b99563cf752e"
+)
+FRESH_TIMING_MANIFEST_SHA256 = "372979d42fff94438fe8d844fca2770d430a3c0898a306a4bc46bd8b2887e38f"
+FRESH_TIMING_MANIFEST_VERSION = (
+    "sha256:b2e88263b0c9112f273a25731870ce87cff672e54808a2fc1e7996ebeb4685f2"
+)
 _UNAVAILABLE = frozenset({errno.ENOENT, errno.EACCES, errno.EPERM})
 _BASELINE_FIELDS = (
     "run_id",
@@ -94,7 +104,7 @@ class SelectionError(ValueError):
 
 
 class SelectionBlocked(SelectionError):
-    """Required archived material is unavailable."""
+    """Required baseline material is unavailable."""
 
 
 def _io_error(path: Path, error: OSError) -> SelectionError:
@@ -212,26 +222,46 @@ def _load_reports(
     return identity, items, ranked
 
 
-def _read_run(path: Path) -> tuple[dict[str, Any], str]:
+def _read_run(path: Path, run_id: str) -> tuple[dict[str, Any], str]:
     content = _read_file(path)
     try:
-        run = parse_oaf_corpus_run(content, expected_run_id=ARCHIVED_RUN_ID)
+        run = parse_oaf_corpus_run(content, expected_run_id=run_id)
     except ValueError as error:
-        raise SelectionError(f"archived run is invalid: {error}") from error
+        raise SelectionError(f"baseline run is invalid: {error}") from error
     return run, sha256_hex(content)
 
 
+def _fresh_output_root(baseline_run: Path) -> Path:
+    relative = f"runs/{FRESH_RUN_ID}/run.json"
+    if baseline_run.parts[-3:] != Path(relative).parts:
+        raise SelectionError(
+            f"fresh baseline must use the corpus output layout <output>/{relative}"
+        )
+    root = baseline_run.parents[2]
+    _relative_file(root, relative)
+    return root
+
+
 def _run_identity(
-    run: Mapping[str, Any], config: OafModelConfig, descriptor: BackendDescriptor
+    run: Mapping[str, Any],
+    config: OafModelConfig,
+    descriptor: BackendDescriptor,
+    *,
+    fresh: bool = False,
 ) -> dict[str, Any]:
     lock_digest = compute_model_lock_sha256(_model_lock_path())
     inference = build_inference_config(config, descriptor, lock_digest)
     inference_digest = inference_config_sha256(inference)
+    run_id = FRESH_RUN_ID if fresh else ARCHIVED_RUN_ID
+    reference_digest = FRESH_REFERENCE_MANIFEST_SHA256 if fresh else REFERENCE_MANIFEST_SHA256
+    include = sorted(SELECTED_SIMFILE_IDS) if fresh else []
     expected = {
-        "run_id": ARCHIVED_RUN_ID,
+        "run_id": run_id,
         "overall_status": "complete",
-        "reference_manifest_sha256": REFERENCE_MANIFEST_SHA256,
-        "reference_timing_version": REFERENCE_TIMING_VERSION,
+        "reference_manifest_sha256": reference_digest,
+        "reference_timing_version": FRESH_TIMING_MANIFEST_VERSION
+        if fresh
+        else REFERENCE_TIMING_VERSION,
         "backend_descriptor": dict(descriptor.payload),
         "backend_descriptor_sha256": descriptor.sha256,
         "model_id": config.model_id,
@@ -242,36 +272,49 @@ def _run_identity(
         "inference_config_sha256": inference_digest,
         "adapter_revision": inference["adapter_revision"],
         "canonicalization_revision": inference["canonicalization_revision"],
-        "include_simfile_ids": [],
+        "include_simfile_ids": include,
         "exclude_simfile_ids": [],
-        "success_count": ARCHIVED_SUCCESS_COUNT,
-        "quarantined_count": ARCHIVED_QUARANTINED_COUNT,
+        "success_count": len(include) if fresh else ARCHIVED_SUCCESS_COUNT,
+        "quarantined_count": 0 if fresh else ARCHIVED_QUARANTINED_COUNT,
         "failed_count": 0,
         "skipped_count": 0,
     }
+    if fresh:
+        expected.update(
+            reference_manifest_version=FRESH_REFERENCE_MANIFEST_VERSION,
+            reference_timing_manifest_sha256=FRESH_TIMING_MANIFEST_SHA256,
+        )
     for field, value in expected.items():
         if run.get(field) != value:
-            raise SelectionError(f"archived run {field} mismatch")
+            raise SelectionError(f"baseline run {field} mismatch")
+    if fresh and {row["simfile_id"] for row in run["items"]} != set(include):
+        raise SelectionError("fresh baseline rows do not match the selected membership")
     timing_digest = _required_digest(run, "reference_timing_manifest_sha256")
     reference_version = run.get("reference_manifest_version")
     if not isinstance(reference_version, str) or not reference_version.startswith("sha256:"):
-        raise SelectionError("archived run reference manifest version is invalid")
+        raise SelectionError("baseline run reference manifest version is invalid")
     _required_digest(
         {"reference_manifest_version": reference_version[7:]}, "reference_manifest_version"
     )
     if (
         build_run_id(
-            REFERENCE_MANIFEST_SHA256,
+            reference_digest,
             timing_digest,
             descriptor.sha256,
             lock_digest,
             config.checkpoint.archive_sha256,
             inference_digest,
+            include,
         )
-        != ARCHIVED_RUN_ID
+        != run_id
     ):
-        raise SelectionError("archived run ID does not derive from its semantic identity")
-    return {field: run[field] for field in _BASELINE_FIELDS}
+        raise SelectionError("baseline run ID does not derive from its semantic identity")
+    fields = (
+        (*_BASELINE_FIELDS, "include_simfile_ids", "exclude_simfile_ids")
+        if fresh
+        else _BASELINE_FIELDS
+    )
+    return {field: run[field] for field in fields}
 
 
 def _required_digest(value: Mapping[str, Any], field: str) -> str:
@@ -316,7 +359,7 @@ def _reference_rows(
         or reference.source_reference_timing_manifest_sha256 != timing.manifest_sha256
         or reference.source_reference_timing_version != timing.corpus_version
     ):
-        raise SelectionError("archived reference and timing manifest identities disagree")
+        raise SelectionError("reference and timing manifest identities disagree")
     by_id = {row.view.simfile_id: row for row in reference.rows}
     try:
         selected = tuple(by_id[song] for song in SELECTED_SIMFILE_IDS)
@@ -325,7 +368,7 @@ def _reference_rows(
             f"selected simfile {error} is absent from the reference manifest"
         ) from error
     if any(row.view.eligibility_status != "eligible" for row in selected):
-        raise SelectionError("archived reference manifest marks a selected song ineligible")
+        raise SelectionError("reference manifest marks a selected song ineligible")
     return reference, timing, selected
 
 
@@ -349,35 +392,37 @@ def _preflight_selected_references(
             replace(reference, rows=selected), timing, timing_output_root=timing_root
         )
     except (OSError, ValueError) as error:
-        raise SelectionError(f"archived reference preflight failed: {error}") from error
+        raise SelectionError(f"reference preflight failed: {error}") from error
 
 
 def _read_prediction(
     root: Path,
     row: Mapping[str, Any],
     descriptor: BackendDescriptor,
-    expected_count: int,
-    expected_classes: Mapping[str, int],
 ) -> PredictionArtifact:
     path = _relative_file(root, row.get("prediction_path"))
     content = _read_file(path)
     try:
         artifact = read_prediction_artifact(content)
     except ValueError as error:
-        raise SelectionError(f"invalid archived prediction {path}: {error}") from error
+        raise SelectionError(f"invalid baseline prediction {path}: {error}") from error
     if artifact.prediction.descriptor != descriptor:
-        raise SelectionError(f"archived prediction descriptor mismatch: {path}")
+        raise SelectionError(f"baseline prediction descriptor mismatch: {path}")
     if not prediction_artifact_matches_run_row(
         artifact, row, expected_input_view_id=OAF_FULL_MIX_INPUT_VIEW_ID
     ):
-        raise SelectionError(f"archived prediction does not match its run row: {path}")
-    events = artifact.prediction.events
-    if any(event.prediction_map_version != OAF_PREDICTION_MAP_ID for event in events):
-        raise SelectionError(f"archived prediction map mismatch: {path}")
-    counts = Counter(event.native.native_class_id for event in events)
-    if artifact.event_count != expected_count or counts != expected_classes:
-        raise SelectionError(f"archived prediction native event or class counts mismatch: {path}")
+        raise SelectionError(f"baseline prediction does not match its run row: {path}")
+    if any(
+        event.prediction_map_version != OAF_PREDICTION_MAP_ID
+        for event in artifact.prediction.events
+    ):
+        raise SelectionError(f"baseline prediction map mismatch: {path}")
     return artifact
+
+
+def _native_counts(artifact: PredictionArtifact) -> tuple[int, dict[str, int]]:
+    counts = Counter(event.native.native_class_id for event in artifact.prediction.events)
+    return artifact.event_count, dict(counts)
 
 
 def _archived_counts(item: Mapping[str, str]) -> tuple[int, dict[str, int]]:
@@ -409,7 +454,7 @@ def _source_audio(
         audio.source_audio_sha256,
     ):
         raise SelectionError(
-            f"archived prediction source does not match reference: {loaded.view.simfile_id}"
+            f"baseline prediction source does not match reference: {loaded.view.simfile_id}"
         )
     try:
         return resolve_source_audio(
@@ -427,18 +472,40 @@ def _source_audio(
             # The cache resolver does not distinguish absent bytes from corrupt
             # bytes in its exceptions. Make that distinction on this failure path.
             if sha256_hex(_read_file(path)) != digest:
-                raise SelectionError(
-                    f"archived source audio failed its digest check: {path}"
-                ) from error
+                raise SelectionError(f"source audio failed its digest check: {path}") from error
             raise SelectionBlocked(
                 f"verified source cache binding unavailable: {audio.source_audio_id}"
             ) from error
         raise SelectionError(
-            f"invalid archived source audio {audio.source_audio_id}: {error}"
+            f"invalid baseline source audio {audio.source_audio_id}: {error}"
         ) from error
 
 
-def _load_inputs(
+def _seal_item(
+    rank: int,
+    row: Mapping[str, Any],
+    artifact: PredictionArtifact,
+    counts: tuple[int, dict[str, int]],
+) -> dict[str, Any]:
+    audio = artifact.prediction.audio
+    song = row["simfile_id"]
+    count, classes = counts
+    return {
+        "rank": rank,
+        "simfile_id": song,
+        "prediction_native_event_count": count,
+        "prediction_native_class_counts": classes,
+        "prediction_path": row["prediction_path"],
+        "prediction_artifact_sha256": artifact.artifact_sha256,
+        "wav_path": f"{song}.wav",
+        "source_audio_id": audio.source_audio_id,
+        "source_audio_sha256": audio.source_audio_sha256,
+        "input_audio_sha256": audio.input_audio_sha256,
+        "audio_frame_count": audio.audio_frame_count,
+    }
+
+
+def _load_archived_inputs(
     baseline: Path,
     run: Mapping[str, Any],
     descriptor: BackendDescriptor,
@@ -460,29 +527,33 @@ def _load_inputs(
     prepared = []
     for rank, (song, score) in zip(SELECTED_RANKS, ranked, strict=True):
         row = by_id[song]
-        count, classes = _archived_counts(report_items[song])
-        artifact = _read_prediction(baseline.parent, row, descriptor, count, classes)
-        audio = artifact.prediction.audio
+        counts = _archived_counts(report_items[song])
+        artifact = _read_prediction(baseline.parent, row, descriptor)
+        if _native_counts(artifact) != counts:
+            raise SelectionError(f"archived prediction event or class counts mismatch: {song}")
         prepared.append(
-            (
-                {
-                    "rank": rank,
-                    "simfile_id": song,
-                    "archived_f1": str(score),
-                    "prediction_native_event_count": count,
-                    "prediction_native_class_counts": classes,
-                    "prediction_path": row["prediction_path"],
-                    "prediction_artifact_sha256": artifact.artifact_sha256,
-                    "wav_path": f"{song}.wav",
-                    "source_audio_id": audio.source_audio_id,
-                    "source_audio_sha256": audio.source_audio_sha256,
-                    "input_audio_sha256": audio.input_audio_sha256,
-                    "audio_frame_count": audio.audio_frame_count,
-                },
-                artifact,
-            )
+            (_seal_item(rank, row, artifact, counts) | {"archived_f1": str(score)}, artifact)
         )
     return prepared
+
+
+def _selection_policy(*, fresh: bool) -> dict[str, Any]:
+    expected: dict[str, Any] = {
+        "schema": FRESH_SELECTION_SCHEMA if fresh else SELECTION_SCHEMA,
+        "prediction_map_version": OAF_PREDICTION_MAP_ID,
+        "taxonomy_version": TAXONOMY_VERSION,
+        "lane_map_version": DTX_LANE_MAP_VERSION,
+    }
+    if fresh:
+        expected["selection_provenance"] = {
+            "run_id": ARCHIVED_RUN_ID,
+            "report_sha256": dict(REPORT_SHA256),
+            "mode": "raw",
+            "tolerance_ms": 50,
+        }
+    else:
+        expected["report_sha256"] = dict(REPORT_SHA256)
+    return expected
 
 
 def prepare_selection(
@@ -500,7 +571,7 @@ def prepare_selection(
     identity, items, ranked = _load_reports(baseline_evidence_dir)
     config = load_model_config()
     descriptor = _expected_oaf_descriptor(config)
-    run, run_digest = _read_run(baseline_run)
+    run, run_digest = _read_run(baseline_run, ARCHIVED_RUN_ID)
     baseline = _run_identity(run, config, descriptor)
     expected_identity = {
         **{
@@ -524,13 +595,64 @@ def prepare_selection(
         raise SelectionError("archived run does not match the summary identity")
     reference, timing, selected = _reference_rows(reference_manifest, timing_manifest, run)
     _preflight_selected_references(reference, timing, selected, timing_manifest.parent.parent)
-    prepared = _load_inputs(baseline_run, run, descriptor, items, ranked)
+    prepared = _load_archived_inputs(baseline_run, run, descriptor, items, ranked)
+    _materialize_inputs(selected, prepared, cache_dir, input_root, config, descriptor)
+    return {
+        **_selection_policy(fresh=False),
+        "baseline_run_sha256": run_digest,
+        "baseline_identity": baseline,
+        "items": [row for row, _ in prepared],
+    }
+
+
+def prepare_fresh_selection(
+    *,
+    baseline_run: Path,
+    reference_manifest: Path,
+    timing_manifest: Path,
+    cache_dir: Path,
+    input_root: Path,
+) -> dict[str, Any]:
+    """Seal a new TF1 run over the pinned September inputs and five October-ranked IDs."""
+    if input_root.exists() or input_root.is_symlink():
+        raise SelectionError(f"the experimental input directory must be new: {input_root}")
+    root = _fresh_output_root(baseline_run)
+    config = load_model_config()
+    descriptor = _expected_oaf_descriptor(config)
+    run, run_digest = _read_run(baseline_run, FRESH_RUN_ID)
+    baseline = _run_identity(run, config, descriptor, fresh=True)
+    reference, timing, selected = _reference_rows(reference_manifest, timing_manifest, run)
+    _preflight_selected_references(reference, timing, selected, timing_manifest.parent.parent)
+
+    by_id = {row["simfile_id"]: row for row in run["items"]}
+    prepared = []
+    for rank, song in zip(SELECTED_RANKS, SELECTED_SIMFILE_IDS, strict=True):
+        row = by_id[song]
+        artifact = _read_prediction(root, row, descriptor)
+        prepared.append((_seal_item(rank, row, artifact, _native_counts(artifact)), artifact))
+    _materialize_inputs(selected, prepared, cache_dir, input_root, config, descriptor)
+    return {
+        **_selection_policy(fresh=True),
+        "baseline_run_sha256": run_digest,
+        "baseline_identity": baseline,
+        "items": [row for row, _ in prepared],
+    }
+
+
+def _materialize_inputs(
+    selected: tuple[LoadedReferenceSetRow, ...],
+    prepared: list[tuple[dict[str, Any], PredictionArtifact]],
+    cache_dir: Path,
+    input_root: Path,
+    config: OafModelConfig,
+    descriptor: BackendDescriptor,
+) -> None:
     try:
         index = CacheIndexStore.load(cache_dir)
     except OSError as error:
         raise _io_error(cache_dir, error) from error
     except ValueError as error:
-        raise SelectionError(f"invalid archived source cache index: {error}") from error
+        raise SelectionError(f"invalid source cache index: {error}") from error
 
     input_root.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".selected-wavs-", dir=input_root.parent) as staging:
@@ -555,17 +677,6 @@ def prepare_selection(
         input_root.mkdir()
         for row, _ in prepared:
             (temporary / row["wav_path"]).rename(input_root / row["wav_path"])
-
-    return {
-        "schema": SELECTION_SCHEMA,
-        "report_sha256": dict(REPORT_SHA256),
-        "baseline_run_sha256": run_digest,
-        "baseline_identity": baseline,
-        "prediction_map_version": OAF_PREDICTION_MAP_ID,
-        "taxonomy_version": TAXONOMY_VERSION,
-        "lane_map_version": DTX_LANE_MAP_VERSION,
-        "items": [row for row, _ in prepared],
-    }
 
 
 def _check_audio(
@@ -602,7 +713,7 @@ def verify_selection(
     baseline_run: Path,
     input_root: Path,
 ) -> tuple[dict[str, Any], tuple[tuple[CanonicalAudio, PredictionArtifact], ...]]:
-    """Recheck the seal, archived predictions, and WAVs without source access."""
+    """Recheck the seal, TF1 run and prediction bytes, and WAVs without source access."""
     content = _read_file(selection_path).removesuffix(b"\n")
     try:
         selection = strict_json_loads(content, require_canonical=True)
@@ -610,13 +721,8 @@ def verify_selection(
         raise SelectionError(f"invalid selection document: {error}") from error
     if not isinstance(selection, dict) or selection_sha256(selection) != expected_selection_sha256:
         raise SelectionError("selection digest does not match")
-    expected = {
-        "schema": SELECTION_SCHEMA,
-        "report_sha256": REPORT_SHA256,
-        "prediction_map_version": OAF_PREDICTION_MAP_ID,
-        "taxonomy_version": TAXONOMY_VERSION,
-        "lane_map_version": DTX_LANE_MAP_VERSION,
-    }
+    fresh = selection.get("schema") == FRESH_SELECTION_SCHEMA
+    expected = _selection_policy(fresh=fresh)
     if any(selection.get(key) != value for key, value in expected.items()):
         raise SelectionError("selection does not match the pinned report or scoring identities")
     rows = selection.get("items")
@@ -629,21 +735,22 @@ def verify_selection(
         )
     ):
         raise SelectionError("selection does not match the pinned membership")
-    run, digest = _read_run(baseline_run)
+    prediction_root = _fresh_output_root(baseline_run) if fresh else baseline_run.parent
+    run, digest = _read_run(baseline_run, FRESH_RUN_ID if fresh else ARCHIVED_RUN_ID)
     if digest != selection.get("baseline_run_sha256"):
-        raise SelectionError("archived run digest no longer matches the selection")
+        raise SelectionError("baseline run digest no longer matches the selection")
     config = load_model_config()
     descriptor = _expected_oaf_descriptor(config)
-    if _run_identity(run, config, descriptor) != selection.get("baseline_identity"):
-        raise SelectionError("archived run no longer matches the sealed lineage")
+    if _run_identity(run, config, descriptor, fresh=fresh) != selection.get("baseline_identity"):
+        raise SelectionError("baseline run no longer matches the sealed lineage")
 
     run_rows = {row["simfile_id"]: row for row in run["items"]}
     inputs = []
     for value in rows:
         row = cast(dict[str, Any], value)
-        archive = run_rows.get(row["simfile_id"])
-        if archive is None or archive.get("execution_disposition") not in {"inferred", "resumed"}:
-            raise SelectionError("sealed song is not successful in the archived run")
+        run_row = run_rows.get(row["simfile_id"])
+        if run_row is None or run_row.get("execution_disposition") not in {"inferred", "resumed"}:
+            raise SelectionError("sealed song is not successful in the baseline run")
         for key in (
             "prediction_path",
             "prediction_artifact_sha256",
@@ -651,7 +758,7 @@ def verify_selection(
             "source_audio_sha256",
             "input_audio_sha256",
         ):
-            if key not in row or row[key] != archive.get(key):
+            if key not in row or row[key] != run_row.get(key):
                 raise SelectionError(f"sealed song {row['simfile_id']} has a different {key}")
         classes = row.get("prediction_native_class_counts")
         count = row.get("prediction_native_event_count")
@@ -666,7 +773,11 @@ def verify_selection(
             or sum(classes.values()) != count
         ):
             raise SelectionError(f"invalid counts for sealed song {row['simfile_id']}")
-        artifact = _read_prediction(baseline_run.parent, row, descriptor, count, classes)
+        artifact = _read_prediction(prediction_root, run_row, descriptor)
+        if _native_counts(artifact) != (count, classes):
+            raise SelectionError(
+                f"baseline prediction event or class counts mismatch: {row['simfile_id']}"
+            )
         wav = _relative_file(input_root, row.get("wav_path"))
         _regular_file(wav)
         try:

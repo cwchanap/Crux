@@ -28,6 +28,7 @@ from experiments.oaf_tf215.selected_inputs import (
     SELECTED_SIMFILE_IDS,
     SelectionBlocked,
     SelectionError,
+    prepare_fresh_selection,
     prepare_selection,
     selection_sha256,
     verify_selection,
@@ -335,8 +336,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
     prepare = subcommands.add_parser("prepare", help="verify and seal the five archived inputs")
+    prepare_fresh = subcommands.add_parser(
+        "prepare-fresh", help="verify and seal a fresh, scoped September TF1 run"
+    )
+    prepare.add_argument("--baseline-evidence-dir", required=True, type=Path)
     for flag in (
-        "baseline-evidence-dir",
         "baseline-run",
         "reference-manifest",
         "timing-manifest",
@@ -345,6 +349,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "output",
     ):
         prepare.add_argument(f"--{flag}", required=True, type=Path)
+        prepare_fresh.add_argument(f"--{flag}", required=True, type=Path)
     run = subcommands.add_parser("run", help="measure a verified, sealed five-song selection")
     for flag in (
         "selection-path",
@@ -364,11 +369,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         for key, value in arguments.items()
     }
     try:
-        if command == "prepare":
+        if command in {"prepare", "prepare-fresh"}:
             output = arguments.pop("output")
             if output.exists() or output.is_symlink():
                 raise SelectionError("selection output already exists")
-            selection = prepare_selection(**arguments)
+            prepare_inputs = (
+                prepare_fresh_selection if command == "prepare-fresh" else prepare_selection
+            )
+            selection = prepare_inputs(**arguments)
             _write_json(output, selection)
             print(selection_sha256(selection))
             return 0
