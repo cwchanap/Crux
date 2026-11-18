@@ -206,6 +206,10 @@ def _start_worker(
     checkpoint: Path,
     fixture: Path,
     holder: dict[str, Any],
+    *,
+    timeout_seconds: float = WORKER_START_TIMEOUT_SECONDS,
+    close_timeout_seconds: float | None = None,
+    worker_environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     worker = runtime_root / "worker.py"
     if worker.is_symlink() or not worker.is_file():
@@ -218,11 +222,17 @@ def _start_worker(
         os.fspath(checkpoint),
     ]
     try:
+        close_options = (
+            {}
+            if close_timeout_seconds is None
+            else {"close_timeout_seconds": close_timeout_seconds}
+        )
         holder["process"] = process_factory(
             command,
-            timeout_seconds=WORKER_START_TIMEOUT_SECONDS,
+            timeout_seconds=timeout_seconds,
             cwd=fixture.parent,
-            env=_worker_environment(),
+            env=_worker_environment() if worker_environment is None else worker_environment,
+            **close_options,
         )
     except WorkerProcessError as error:
         # Popen failed, so the interpreter or host itself is unavailable. A

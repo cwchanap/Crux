@@ -21,6 +21,8 @@ check does not by itself establish model parity.
 | `build_runtime.py` | Creates one scratch `runtime/` + `upstream/` from the frozen TF1 source, applies the instrumentation patch first and then `patches/tf215-compat.patch`. |
 | `patches/tf215-compat.patch` | The single reviewed TF 2.15 compatibility patch (drum `tf_slim`, HParams/RNN, Estimator, unused package-initializer imports). |
 | `compare.py` | Python 3.12 driver: verifies the checkpoint and fixture, then runs two requests through one loaded Python 3.11 scratch worker plus one through a fresh worker and compares the exact native events with the frozen binary64 smoke oracle. |
+| `selected_compare.py` | Prepares the five fixed archived inputs and measures TF2.15 drift with a separate runtime identity. |
+| `runtime_identity.py` | Fingerprints actual source files and inventories the isolated worker environment. |
 | `check_workflow_result_fallback.py` | Stdlib-only local check: the workflow's always-on result step writes a failed sync/check/build/graph/environment record when no graph output exists. |
 | `README.md` | This file. Reproduction commands and evidence scope. |
 | `RESULTS.md` | Recorded CI, graph, restore, inference and manual-job evidence plus the decision checkpoint; not a parity claim. |
@@ -37,7 +39,56 @@ or run this lock on macOS/ARM64 and call it evidence: `tensorflow-cpu==2.15.1`
 has no macOS ARM64 wheel, and the lock is compiled explicitly for
 `x86_64-manylinux_2_17`.
 
-## Reproduce locally / on Colab (x86-64 Linux only)
+## Five-song comparison
+
+The selected comparison uses the TF1 reports pinned in the
+[design](../../docs/superpowers/specs/2026-11-17-hpa-856-tf215-identity-comparison-design.md)
+and the original archived predictions for simfiles 389, 391, 27, 241 and 207.
+The [results](RESULTS.md#five-song-continuation) track access to that archive.
+
+Export the three pinned reports from Git to `$TF1_REPORTS`. Stage a byte-for-byte
+copy of the matching TF1 `run.json` at `$TF1_BUNDLE/run.json`, with its original
+`predictions/…` paths underneath the same directory. In the original corpus
+output the run lives under `runs/<run-id>/`, while its prediction paths are
+relative to the corpus output root. Keep the original manifest layout for the
+reference and timing manifests and their native event bodies. Preparation also
+requires the verified source audio cache.
+
+Run preparation once with those inputs. Use its printed digest for each
+execution. Copy the sealed selection, canonical WAVs and archived prediction
+bundle to each fresh Linux x86-64 Colab CPU VM through an authorized data source.
+
+```bash
+EXPERIMENT=artifacts/experiments/oaf-tf215
+SELECTION_SHA256=$(uv run experiments/oaf_tf215/selected_compare.py prepare \
+  --baseline-evidence-dir "$TF1_REPORTS" --baseline-run "$TF1_BUNDLE/run.json" \
+  --reference-manifest "$REFERENCE_MANIFEST" --timing-manifest "$TIMING_MANIFEST" \
+  --cache-dir "$CORPUS_CACHE" --input-root "$EXPERIMENT/selected-inputs" \
+  --output "$EXPERIMENT/selection.json")
+```
+
+On each VM, provision the locked worker, build the scratch runtime, run the
+graph checks and populate the public checkpoint cache using steps 1–4 below.
+
+```bash
+uv run experiments/oaf_tf215/selected_compare.py run \
+  --selection-path "$EXPERIMENT/selection.json" --selection-sha256 "$SELECTION_SHA256" \
+  --baseline-run "$TF1_BUNDLE/run.json" --input-root "$EXPERIMENT/selected-inputs" \
+  --python311 "$PY311" --runtime-root "$SCRATCH/runtime" \
+  --checkpoint-cache artifacts/benchmark/model-cache --output-root "$EXPERIMENT/selected"
+```
+
+Each invocation prints its status and output directory. A completed run
+contains the sealed selection, the binary64 smoke result, all 15 raw song
+attempts, and the comparison report. The report covers strict 1 ms agreement,
+possible shifts within one emitted frame (about 11.61 ms), and remaining
+additions and removals. Selected-song metrics use the six-decimal precision of
+the archived TF1 artifacts. Exit 0 confirms a completed repeatable
+measurement, exit 2 indicates blocked access, and exit 1 indicates a failed
+or non-repeatable measurement. Early failures write `comparison.json` under
+`selected/preflight/<execution-id>/` when a runtime identity is unavailable.
+
+## Reproduce the smoke comparison on x86-64 Linux
 
 Run all commands from the repository root. On Colab, keep the notebook kernel
 and the Crux Python 3.12 project environment unchanged: the Python 3.11 venv is
