@@ -81,7 +81,7 @@ def _run_script(
     uv.write_text(f"#!/usr/bin/env bash\n{uv_body}\n", encoding="utf-8")
     uv.chmod(0o755)
     completed = subprocess.run(
-        ["bash", "-c", script],
+        ["bash", "--noprofile", "--norc", "-c", script],
         cwd=workdir,
         env={"PATH": f"{bin_dir}:{os.environ['PATH']}", **env},
         capture_output=True,
@@ -176,6 +176,10 @@ def test_probe_workflow_runs_the_graph_job_on_drafts_and_the_model_job_manually(
     assert "tests/runtime/test_oaf_tf215_builder.py" in graph
     assert "tests/benchmark/test_oaf_tf215_compare.py" in graph
     assert "tests/benchmark/test_oaf_tf215_workflow.py" in graph
+    for name in ("runtime_identity", "selected_inputs", "selected_metrics", "selected_compare"):
+        path = f"tests/benchmark/test_oaf_tf215_{name}.py"
+        assert path in _run_block(graph, "Run host driver and workflow tests (driver stage)")
+        assert path in content.split("\n  workflow_dispatch:", maxsplit=1)[0]
     assert "graph_check.py" in graph
     assert "prepare-backend" not in graph
     assert "--download" not in graph

@@ -12,6 +12,10 @@ on:
       - "experiments/oaf_tf215/**"
       - "tests/runtime/test_oaf_tf215_builder.py"
       - "tests/benchmark/test_oaf_tf215_compare.py"
+      - "tests/benchmark/test_oaf_tf215_runtime_identity.py"
+      - "tests/benchmark/test_oaf_tf215_selected_inputs.py"
+      - "tests/benchmark/test_oaf_tf215_selected_metrics.py"
+      - "tests/benchmark/test_oaf_tf215_selected_compare.py"
       - "tests/benchmark/test_oaf_tf215_workflow.py"
       - ".github/workflows/oaf-tf215-probe.yml"
   workflow_dispatch:
@@ -126,6 +130,10 @@ jobs:
           uv run pytest -q -o addopts=-ra \
             tests/benchmark/test_oaf_tf215_compare.py \
             tests/benchmark/test_oaf_tf215_graph_check.py \
+            tests/benchmark/test_oaf_tf215_runtime_identity.py \
+            tests/benchmark/test_oaf_tf215_selected_inputs.py \
+            tests/benchmark/test_oaf_tf215_selected_metrics.py \
+            tests/benchmark/test_oaf_tf215_selected_compare.py \
             tests/benchmark/test_oaf_tf215_workflow.py
 
       # The four controls must exist before the interpreter starts, because

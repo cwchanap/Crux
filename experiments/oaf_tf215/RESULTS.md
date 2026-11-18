@@ -214,8 +214,8 @@ hosts is useful research evidence, not accepted TF1 equivalence:
 - Before broad science, the TF2.15 candidate needs its own runtime/output
   descriptor and cache identity so TF2.15 events are never presented as the
   frozen `magenta-egmd-tf1-94529798-8hit-v1` baseline, plus quantified deltas on
-  more than this single fixture. The exact descriptor/identity policy is not
-  designed or implemented here; deciding it is the next scoping question.
+  more than this single fixture. The five-song continuation below records the
+  implementation and the inputs required to measure it.
 - The frozen TF1 sources, checkpoint, oracle, root dependencies and Docker
   runtime are unchanged and remain the scientific baseline.
 
@@ -227,7 +227,27 @@ subset, same-machine Spleeter/HTDemucs separation, frozen v2 separator
 companions, Drive resume and the existing MLflow publisher — is not implemented
 and stays conditional on a decision after review.
 
-## Not done
+## Five-song continuation
+
+The experimental driver implements the
+[design](../../docs/superpowers/specs/2026-11-17-hpa-856-tf215-identity-comparison-design.md)
+for simfiles `389`, `391`, `27`, `241`, `207`. The pinned Git reports
+were verified by SHA-256. The Python 3.11 probe returned
+`unsupported_platform` on the local Linux aarch64 host as expected.
+All 124 scoped tests passed, including the original smoke and workflow tests.
+Running `prepare` with the three pinned reports and a missing `run.json`
+returned blocked with exit status 2 and created no selection.
+
+Real measurement is **blocked on the archived TF1 inputs**. The Git evidence
+contains the reports. Local artifacts and the expanded connected Drive archive
+did not contain a matching bundle for `oaf-2d67684ad190163e`. The expanded
+Drive run is `oaf-f2dc8381e50f447f` and has a different reference digest.
+The required bundle consists of the pinned run's `run.json`, five original
+prediction-v2 bodies, matching reference/timing manifests and selected timing
+event bodies, and verified source audio. Neither fresh Colab VM executed the
+selected-song comparison.
+
+## Remaining benchmark work
 
 - Only the canonical single-fixture smoke input was executed. No broad corpus,
   reviewed subset, same-machine separation, R2 or Drive artifact was produced.
