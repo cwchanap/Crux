@@ -58,6 +58,29 @@ from src.benchmark.taxonomy import DTX_LANE_MAP_VERSION, TAXONOMY_VERSION
 
 SONGS = (389, 391, 27, 241, 207)
 RANKS = (0, 45, 90, 135, 181)
+PANEL_IDS = (
+    131,
+    384,
+    329,
+    209,
+    112,
+    68,
+    56,
+    201,
+    298,
+    364,
+    194,
+    216,
+    138,
+    187,
+    225,
+    294,
+    154,
+    262,
+    148,
+    200,
+)
+PANEL_PROTOCOL_DIGEST = "9ecdd8e12a0033203ddbdc6b974d201436426a00fac80398c1853cdd47bf622b"
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -68,7 +91,9 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 @pytest.fixture
-def archived_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
+def archived_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> dict[str, Path]:
     """Use real run, prediction and WAV bytes with synthetic manifest/cache access."""
     archive, reports = tmp_path / "archive", tmp_path / "reports"
     archive.mkdir()
@@ -100,6 +125,9 @@ def archived_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str
     success_ids = list(range(1000, 1182))
     for rank, song in zip(RANKS, SONGS, strict=True):
         success_ids[rank] = song
+    extra_ids = getattr(request, "param", ())
+    success_ids[1 : len(extra_ids) + 1] = extra_ids
+    bound_ids = (*SONGS, *extra_ids)
     quarantined_ids = list(range(2000, 2138))
     report_identity = {
         "cohort_id": run_id,
@@ -172,7 +200,7 @@ def archived_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str
     source = Path("tests/fixtures/oaf_tf1_smoke/canonical.wav").resolve()
     source_sha = sha256_hex(source.read_bytes())
     sources = {
-        song: ResolvedSourceAudio(source, f"{song}/mix.wav", source_sha, 1.0) for song in SONGS
+        song: ResolvedSourceAudio(source, f"{song}/mix.wav", source_sha, 1.0) for song in bound_ids
     }
     bindings: dict[int, dict[str, object]] = {}
     for song, resolved in sources.items():
@@ -236,7 +264,7 @@ def archived_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str
         )
     )
     manifest_rows, timing_rows = [], []
-    for song in SONGS:
+    for song in bound_ids:
         event = NativeReferenceEvent(
             simfile_id=song,
             selected_chart_key=f"{song}/chart.dtx",
@@ -610,3 +638,74 @@ def test_verify_fresh_rebinds_prediction_bytes(fresh_bundle, tmp_path) -> None:
             baseline_run=baseline,
             input_root=fresh_bundle["input_root"],
         )
+
+
+@pytest.fixture
+def panel_bundle(archived_bundle, monkeypatch):
+    arguments = dict(archived_bundle)
+    del arguments["baseline_evidence_dir"]
+    snapshot = arguments["baseline_run"]
+    run = strict_json_loads(snapshot.read_bytes())
+    run_id = build_run_id(
+        run["reference_manifest_sha256"],
+        run["reference_timing_manifest_sha256"],
+        run["backend_descriptor_sha256"],
+        run["model_lock_sha256"],
+        run["checkpoint_archive_sha256"],
+        run["inference_config_sha256"],
+        PANEL_IDS,
+    )
+    for name, value in {
+        "PANEL_RUN_ID": run_id,
+        "FRESH_REFERENCE_MANIFEST_SHA256": run["reference_manifest_sha256"],
+        "FRESH_REFERENCE_MANIFEST_VERSION": run["reference_manifest_version"],
+        "FRESH_TIMING_MANIFEST_SHA256": run["reference_timing_manifest_sha256"],
+        "FRESH_TIMING_MANIFEST_VERSION": run["reference_timing_version"],
+    }.items():
+        monkeypatch.setattr(selected, name, value, raising=False)
+    run.update(
+        run_id=run_id,
+        include_simfile_ids=sorted(PANEL_IDS),
+        success_count=len(PANEL_IDS),
+        quarantined_count=0,
+        items=[row for row in run["items"] if row["simfile_id"] in PANEL_IDS],
+    )
+    baseline = snapshot.parent / "runs" / run_id / "run.json"
+    baseline.parent.mkdir(parents=True)
+    baseline.write_bytes(render_oaf_corpus_run(run))
+    arguments["baseline_run"] = baseline
+    return arguments
+
+
+@pytest.mark.parametrize("archived_bundle", [PANEL_IDS], indirect=True)
+def test_panel_seal_binds_all_members_and_requires_opt_in(panel_bundle, tmp_path) -> None:
+    selection = selected.prepare_panel_selection(**panel_bundle)
+    assert selection["schema"] == "crux.oaf-tf215-panel-selection/v1"
+    assert selection["panel_protocol_sha256"] == PANEL_PROTOCOL_DIGEST
+    assert selection["baseline_identity"]["include_simfile_ids"] == sorted(PANEL_IDS)
+    assert [row["simfile_id"] for row in selection["items"]] == list(PANEL_IDS)
+    assert [row["panel_ordinal"] for row in selection["items"]] == list(range(1, 21))
+    assert all("rank" not in row for row in selection["items"])
+    path = tmp_path / "panel-selection.json"
+    path.write_bytes(canonical_json_bytes(selection))
+    arguments = {
+        "selection_path": path,
+        "expected_selection_sha256": selected.selection_sha256(selection),
+        "baseline_run": panel_bundle["baseline_run"],
+        "input_root": panel_bundle["input_root"],
+    }
+    verified, bindings = selected.verify_selection(**arguments, panel=True)
+    assert verified == selection
+    assert [audio.path.name for audio, _ in bindings] == [f"{song}.wav" for song in PANEL_IDS]
+    with pytest.raises(selected.SelectionError):
+        selected.verify_selection(**arguments)
+
+
+@pytest.mark.parametrize("archived_bundle", [PANEL_IDS], indirect=True)
+def test_panel_seal_rejects_changed_protocol(panel_bundle, tmp_path, monkeypatch) -> None:
+    protocol = tmp_path / "PANEL.md"
+    protocol.write_text("Changed panel protocol\n", encoding="utf-8")
+    monkeypatch.setattr(selected, "PANEL_PROTOCOL_PATH", protocol, raising=False)
+    with pytest.raises(selected.SelectionError, match="panel protocol"):
+        selected.prepare_panel_selection(**panel_bundle)
+    assert not panel_bundle["input_root"].exists()

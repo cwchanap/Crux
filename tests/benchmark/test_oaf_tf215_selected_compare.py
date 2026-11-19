@@ -155,6 +155,66 @@ def test_run_retains_binary64_attempts_and_accepts_a_divergent_smoke(fake_experi
     assert len(list(fake_experiment["output_root"].rglob("comparison.json"))) == 2
 
 
+@pytest.mark.parametrize("nonregression", [True, False])
+def test_panel_uses_persistent_worker_and_replays_only_anchors(
+    fake_experiment, monkeypatch, nonregression
+):
+    inputs = fake_experiment
+    root = inputs["input_root"]
+    identifiers = selected.PANEL_SIMFILE_IDS
+    baseline = b"sealed test run"
+    inputs["baseline_run"].write_bytes(baseline)
+    selection = {
+        "baseline_identity": {"run_id": "panel-test"},
+        "baseline_run_sha256": sha256_hex(baseline),
+        "items": [{"simfile_id": song} for song in identifiers],
+    }
+    bindings = tuple(
+        (
+            SimpleNamespace(path=root / f"{song}.wav", audio_frame_count=44100, sample_rate=44100),
+            SimpleNamespace(prediction=SimpleNamespace(events=())),
+        )
+        for song in identifiers
+    )
+    monkeypatch.setattr(
+        selected, "verify_selection", lambda *, panel, **_: (selection, bindings) if panel else None
+    )
+    monkeypatch.setattr(selected, "_panel_references", lambda *_: dict.fromkeys(identifiers))
+    monkeypatch.setattr(
+        selected,
+        "parse_oaf_corpus_run",
+        lambda *_, **__: {
+            "items": [
+                {"simfile_id": song, "wall_time_sec": 2, "execution_disposition": "inferred"}
+                for song in identifiers
+            ]
+        },
+    )
+    monkeypatch.setattr(selected, "score_panel_song", lambda *_: {"scored": True})
+
+    def aggregate(scores):
+        assert list(scores) == [{"scored": True}] * len(identifiers)
+        return {"micro_f1_nonregression": nonregression}
+
+    monkeypatch.setattr(selected, "aggregate_panel_scores", aggregate)
+    workers, start = _worker_factory(inputs)
+    result = selected.run_selected_comparison(
+        **inputs, process_factory=start, panel_manifests=(root / "reference", root / "timing")
+    )
+    assert result["status"] == "complete"
+    assert result["panel_gate_passed"] is nonregression
+    anchors = [f"{song}.wav" for song in selected.PANEL_ANCHORS]
+    assert workers[2].requests == [f"{song}.wav" for song in sorted(identifiers)] + anchors
+    assert workers[3].requests == anchors
+    assert all(worker.closed for worker in workers)
+    assert result["panel_runtime"]["all_matched"]["baseline_rtf"] == 2
+    assert result["panel_runtime"]["after_first_scheduled_song"]["songs"] == len(identifiers) - 1
+    for row in result["items"]:
+        anchor = row["simfile_id"] in selected.PANEL_ANCHORS
+        assert row["completed_attempts"] == (3 if anchor else 1)
+        assert row["repeatable"] is (True if anchor else None)
+
+
 @pytest.mark.parametrize(
     ("status", "options", "saved"),
     [

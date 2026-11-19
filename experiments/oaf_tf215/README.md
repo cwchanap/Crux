@@ -113,6 +113,20 @@ prediction counts from the fresh TF1 artifacts. For the second VM, retain the
 same TF1 run and predictions, and check the rematerialized WAVs against the
 original selection digest.
 
+### Twenty-song panel
+
+The [panel protocol](PANEL.md) fixes the membership, exact-input policy and
+evaluation gate. Run TF1 with that scope to produce
+`runs/oaf-ec9176f5c314b5b6/run.json`. Use the fresh September preparation
+command with `prepare-panel`, the panel's TF1 run and a new input directory.
+Run `run-panel` with the same options as `run` above plus the same
+`--reference-manifest` and `--timing-manifest` paths.
+
+The resulting comparison records raw 50 ms F1, native drift, warm and
+startup-inclusive RTF, and exact repeats for the two stress anchors. The
+measurement status records whether the run finished. The separate
+`panel_gate_passed` field records the evaluation outcome.
+
 ## Reproduce the smoke comparison on x86-64 Linux
 
 Run all commands from the repository root. On Colab, keep the notebook kernel

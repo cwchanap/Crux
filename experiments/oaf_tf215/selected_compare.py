@@ -9,8 +9,10 @@ import os
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from decimal import Decimal
 from pathlib import Path
+from time import perf_counter
 from typing import Any, BinaryIO
 from uuid import uuid4
 
@@ -19,16 +21,19 @@ if os.fspath(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, os.fspath(REPOSITORY_ROOT))
 
 from experiments.oaf_tf215 import compare
+from experiments.oaf_tf215.panel_metrics import aggregate_panel_scores, score_panel_song
 from experiments.oaf_tf215.runtime_identity import (
     build_candidate_descriptor,
     build_runtime_identity,
     collect_probe,
 )
 from experiments.oaf_tf215.selected_inputs import (
+    PANEL_SIMFILE_IDS,
     SELECTED_SIMFILE_IDS,
     SelectionBlocked,
     SelectionError,
     prepare_fresh_selection,
+    prepare_panel_selection,
     prepare_selection,
     selection_sha256,
     verify_selection,
@@ -39,9 +44,12 @@ from experiments.oaf_tf215.selected_metrics import (
     compare_events,
 )
 from runtime.oaf_tf1.model import load_model_config
-from src.benchmark.artifact_io import publish_immutable_file
+from src.benchmark.artifact_io import publish_immutable_file, read_regular_file_no_follow
 from src.benchmark.backend_identity import (
+    SIX_PLACES,
+    BackendDescriptor,
     canonical_json_bytes,
+    quantize_six,
     sha256_hex,
     strict_json_loads,
 )
@@ -49,12 +57,21 @@ from src.benchmark.backends.base import CanonicalAudio
 from src.benchmark.oaf_corpus_run import (
     OAF_CORPUS_REQUEST_TIMEOUT_SECONDS,
     OAF_WORKER_CLOSE_TIMEOUT_SECONDS,
+    parse_oaf_corpus_run,
 )
 from src.benchmark.oaf_smoke_oracle import SmokeOracleEvent
 from src.benchmark.prediction_artifact import PredictionArtifact
+from src.benchmark.reference_set import ReferenceMappingResult
+from src.benchmark.reference_set_manifest import (
+    load_reference_set_manifest,
+    preflight_reference_mappings,
+)
+from src.benchmark.reference_timing_manifest import load_reference_timing_manifest
 from src.benchmark.worker_process import WorkerProcess
 
 SCHEMA = "crux.oaf-tf215-selected-comparison/v1"
+PANEL_SCHEMA = "crux.oaf-tf215-panel-comparison/v1"
+PANEL_ANCHORS = (194, 384)
 SMOKE_ROOT = REPOSITORY_ROOT / "tests/fixtures/oaf_tf1_smoke"
 EXPERIMENT_MODULES = (
     "build_runtime.py",
@@ -66,11 +83,12 @@ EXPERIMENT_MODULES = (
 )
 
 
-def _driver_source_files(root: Path) -> tuple[Path, ...]:
+def _driver_source_files(root: Path, *, panel: bool = False) -> tuple[Path, ...]:
     experiment = Path("experiments/oaf_tf215")
     benchmark = root / "src/benchmark"
     return (
         *(experiment / filename for filename in EXPERIMENT_MODULES),
+        *((experiment / "panel_metrics.py", experiment / "PANEL.md") if panel else ()),
         *(path.relative_to(root) for path in sorted(benchmark.rglob("*.py"))),
         Path("runtime/oaf_tf1/model.py"),
     )
@@ -112,6 +130,29 @@ def _write_json(path: Path, value: Any) -> None:
     publish_immutable_file(path, canonical_json_bytes(value, trailing_newline=True))
 
 
+def _write_attempt(
+    stream: BinaryIO,
+    row: dict[str, Any],
+    worker: int,
+    ready: dict[str, Any],
+    events: tuple[SmokeOracleEvent, ...],
+) -> None:
+    row["completed_attempts"] += 1
+    stream.write(
+        canonical_json_bytes(
+            {
+                "simfile_id": row["simfile_id"],
+                "attempt": row["completed_attempts"],
+                "worker": worker,
+                "worker_ready": ready,
+                "events": [asdict(event) for event in events],
+            },
+            trailing_newline=True,
+        )
+    )
+    stream.flush()
+
+
 def _run_song(
     row: dict[str, Any],
     audio: CanonicalAudio,
@@ -134,20 +175,7 @@ def _run_song(
             for _ in range(request_count):
                 events = compare._request_events(process, audio.path.name)
                 attempts.append(events)
-                row["completed_attempts"] = len(attempts)
-                stream.write(
-                    canonical_json_bytes(
-                        {
-                            "simfile_id": row["simfile_id"],
-                            "attempt": len(attempts),
-                            "worker": worker_number,
-                            "worker_ready": ready,
-                            "events": [asdict(event) for event in events],
-                        },
-                        trailing_newline=True,
-                    )
-                )
-                stream.flush()
+                _write_attempt(stream, row, worker_number, ready, events)
         except (OSError, RuntimeError, ValueError) as error:
             blocked = isinstance(error, compare.StageLabel) and error.stage == "host"
             _set_failure(row, stage, error, blocked=blocked)
@@ -177,6 +205,165 @@ def _run_song(
         row["status"] = "complete"
 
 
+def _panel_references(
+    manifests: tuple[Path, Path], baseline: dict[str, Any]
+) -> dict[int, ReferenceMappingResult]:
+    reference_path, timing_path = manifests
+    reference = load_reference_set_manifest(reference_path)
+    timing = load_reference_timing_manifest(timing_path)
+    if (
+        reference.manifest_sha256 != baseline["reference_manifest_sha256"]
+        or timing.manifest_sha256 != baseline["reference_timing_manifest_sha256"]
+    ):
+        raise SelectionError("panel scoring manifests do not match the seal")
+    scoped_rows = tuple(row for row in reference.rows if row.view.simfile_id in PANEL_SIMFILE_IDS)
+    mappings = preflight_reference_mappings(
+        replace(reference, rows=scoped_rows),
+        timing,
+        timing_output_root=timing_path.parent.parent,
+    )
+    if set(mappings) != set(PANEL_SIMFILE_IDS) or any(
+        not isinstance(mapping, ReferenceMappingResult) for mapping in mappings.values()
+    ):
+        raise SelectionError("panel reference mapping is incomplete")
+    return {song: mapping for song, mapping in mappings.items() if mapping is not None}
+
+
+def _run_panel(
+    record: dict[str, Any],
+    bindings: tuple[tuple[CanonicalAudio, PredictionArtifact], ...],
+    references: dict[int, ReferenceMappingResult],
+    baseline_run: Path,
+    descriptor: BackendDescriptor,
+    *,
+    launch: Callable[[Path, dict[str, Any]], Any],
+    stream: BinaryIO,
+) -> None:
+    scheduled = {
+        row["simfile_id"]: (row, audio, artifact)
+        for row, (audio, artifact) in zip(record["items"], bindings, strict=True)
+    }
+    run = read_regular_file_no_follow(baseline_run)
+    if sha256_hex(run) != record["baseline"]["baseline_run_sha256"]:
+        raise SelectionError("baseline run changed after the seal was checked")
+    baseline_rows = {
+        row["simfile_id"]: row
+        for row in parse_oaf_corpus_run(
+            run, expected_run_id=record["baseline"]["baseline_identity"]["run_id"]
+        )["items"]
+    }
+    if any(
+        row["execution_disposition"] != "inferred"
+        or not isinstance(row.get("wall_time_sec"), (int, Decimal))
+        for row in baseline_rows.values()
+    ):
+        raise SelectionError("panel requires freshly inferred TF1 timing rows")
+    primary: dict[int, tuple[SmokeOracleEvent, ...]] = {}
+    replay: dict[int, list[tuple[SmokeOracleEvent, ...]]] = {song: [] for song in PANEL_ANCHORS}
+    started_workers = []
+    record["panel_workers"] = started_workers
+
+    for worker, songs in ((1, sorted(scheduled)), (2, PANEL_ANCHORS)):
+        holder: dict[str, Any] = {}
+        started = perf_counter()
+        try:
+            launch(scheduled[songs[0]][1].path, holder)
+            process = holder["process"]
+            ready = compare._validate_worker_ready(process.ready)
+            started_workers.append(
+                {
+                    "worker": worker,
+                    "startup_wall_time_sec": quantize_six(perf_counter() - started),
+                    **ready,
+                }
+            )
+            requests = (*songs, *PANEL_ANCHORS) if worker == 1 else songs
+            for song in requests:
+                row, audio, artifact = scheduled[song]
+                # Preserve a failed primary row and replay only successful anchors.
+                if row["status"] == "failed" or (worker == 2 and song not in primary):
+                    continue
+                stage = "inference"
+                try:
+                    started = perf_counter()
+                    events = compare._request_events(process, audio.path.name)
+                    elapsed = perf_counter() - started
+                    _write_attempt(stream, row, worker, ready, events)
+                    if song in primary:
+                        replay[song].append(events)
+                        continue
+                    stage = "metrics"
+                    row["metrics"] = compare_events(
+                        baseline_native_events(artifact), candidate_native_events(events)
+                    )
+                    row["reference_scores"] = score_panel_song(
+                        artifact, events, references[song], descriptor
+                    )
+                    row["duration_sec"] = quantize_six(audio.audio_frame_count / audio.sample_rate)
+                    row["candidate_wall_time_sec"] = quantize_six(elapsed)
+                    row["baseline_wall_time_sec"] = baseline_rows[song]["wall_time_sec"]
+                    primary[song] = events
+                    row["status"] = "complete"
+                except (OSError, RuntimeError, ValueError) as error:
+                    _set_failure(row, stage, error)
+        finally:
+            if process := holder.get("process"):
+                process.close()
+
+    for song, attempts in replay.items():
+        row, _, _ = scheduled[song]
+        if row["status"] == "complete":
+            row["repeatable"] = len(attempts) == 2 and all(
+                events == primary[song] for events in attempts
+            )
+            if not row["repeatable"]:
+                _set_failure(row, "repeatability", "panel anchor events changed")
+                row["status"] = "non_repeatable"
+    record["panel_scores"] = aggregate_panel_scores(
+        row["reference_scores"] for row in record["items"] if "reference_scores" in row
+    )
+    _panel_runtime_times(record)
+
+
+def _panel_runtime_times(record: dict[str, Any]) -> None:
+    measured = sorted(
+        (row for row in record["items"] if "candidate_wall_time_sec" in row),
+        key=lambda row: row["simfile_id"],
+    )
+    if not measured:
+        return
+    with_startup = measured[0]["simfile_id"] == min(PANEL_SIMFILE_IDS)
+    totals = {}
+    for label, rows in (
+        ("all_matched", measured),
+        (
+            "after_first_scheduled_song",
+            [row for row in measured if row["simfile_id"] != min(PANEL_SIMFILE_IDS)],
+        ),
+    ):
+        if not rows:
+            continue
+        duration = sum(row["duration_sec"] for row in rows)
+        baseline = sum(row["baseline_wall_time_sec"] for row in rows)
+        candidate = sum(row["candidate_wall_time_sec"] for row in rows)
+        totals[label] = {
+            "songs": len(rows),
+            "duration_sec": duration,
+            "baseline_rtf": (baseline / duration).quantize(SIX_PLACES),
+            "candidate_request_rtf": (candidate / duration).quantize(SIX_PLACES),
+        }
+    totals["baseline_total_includes_startup"] = with_startup
+    if with_startup:
+        totals["candidate_total_rtf_with_startup"] = (
+            (
+                sum(row["candidate_wall_time_sec"] for row in measured)
+                + record["panel_workers"][0]["startup_wall_time_sec"]
+            )
+            / sum(row["duration_sec"] for row in measured)
+        ).quantize(SIX_PLACES)
+    record["panel_runtime"] = totals
+
+
 def run_selected_comparison(
     *,
     selection_path: Path,
@@ -188,11 +375,13 @@ def run_selected_comparison(
     input_root: Path,
     output_root: Path,
     process_factory: Callable[..., Any] | None = None,
+    panel_manifests: tuple[Path, Path] | None = None,
 ) -> dict[str, Any]:
+    panel = panel_manifests is not None
     execution_id = str(uuid4())
     directory = output_root / "preflight" / execution_id
     record: dict[str, Any] = {
-        "schema": SCHEMA,
+        "schema": PANEL_SCHEMA if panel else SCHEMA,
         "execution_id": execution_id,
         "descriptor": None,
         "descriptor_sha256": None,
@@ -220,9 +409,11 @@ def run_selected_comparison(
                 "completed_attempts": 0,
                 "worker_ready": [],
             }
-            for identifier in SELECTED_SIMFILE_IDS
+            for identifier in (PANEL_SIMFILE_IDS if panel else SELECTED_SIMFILE_IDS)
         ],
     }
+    if panel:
+        record["panel_gate_passed"] = False
     stage = "selection"
     try:
         selection, bindings = verify_selection(
@@ -230,8 +421,12 @@ def run_selected_comparison(
             expected_selection_sha256=expected_selection_sha256,
             baseline_run=baseline_run,
             input_root=input_root,
+            panel=panel,
         )
         record["baseline"] = {key: value for key, value in selection.items() if key != "items"}
+        if panel_manifests is not None:
+            stage = "references"
+            references = _panel_references(panel_manifests, selection["baseline_identity"])
         stage = "runtime"
         config = load_model_config(compare.MODEL_CONFIG_PATH)
         descriptor = build_candidate_descriptor(config)
@@ -243,7 +438,7 @@ def run_selected_comparison(
             _set_failure(record, stage, "runtime probe is blocked", blocked=True)
             return record
 
-        driver_files = _driver_source_files(REPOSITORY_ROOT)
+        driver_files = _driver_source_files(REPOSITORY_ROOT, panel=panel)
         runtime = build_runtime_identity(
             REPOSITORY_ROOT, runtime_root, probe, driver_files=driver_files
         )
@@ -297,8 +492,19 @@ def run_selected_comparison(
 
         stage = "inference"
         with (directory / "native-events.jsonl").open("xb") as stream:
-            for row, (audio, baseline) in zip(record["items"], bindings, strict=True):
-                _run_song(row, audio, baseline, launch=launch, stream=stream)
+            if panel_manifests is not None:
+                _run_panel(
+                    record,
+                    bindings,
+                    references,
+                    baseline_run,
+                    descriptor,
+                    launch=launch,
+                    stream=stream,
+                )
+            else:
+                for row, (audio, baseline) in zip(record["items"], bindings, strict=True):
+                    _run_song(row, audio, baseline, launch=launch, stream=stream)
 
         stage = "runtime_recheck"
         after_probe = collect_probe(python311, worker_environment=environment)
@@ -306,7 +512,7 @@ def run_selected_comparison(
             REPOSITORY_ROOT,
             runtime_root,
             after_probe,
-            driver_files=_driver_source_files(REPOSITORY_ROOT),
+            driver_files=_driver_source_files(REPOSITORY_ROOT, panel=panel),
         )
         after_sha = sha256_hex(canonical_json_bytes(after))
         record["runtime_after_sha256"] = after_sha
@@ -320,6 +526,10 @@ def run_selected_comparison(
         )
         if record["status"] != "complete":
             record["failed_stage"] = "selected_items"
+        if panel:
+            record["panel_gate_passed"] = record["status"] == "complete" and (
+                record["panel_scores"]["micro_f1_nonregression"] is True
+            )
     except SelectionBlocked as error:
         _set_failure(record, stage, error, blocked=True)
     except compare.CheckpointAcquisitionError as error:
@@ -339,6 +549,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare_fresh = subcommands.add_parser(
         "prepare-fresh", help="verify and seal a fresh, scoped September TF1 run"
     )
+    prepare_panel = subcommands.add_parser(
+        "prepare-panel", help="verify and seal the predeclared twenty-song TF1 panel"
+    )
     prepare.add_argument("--baseline-evidence-dir", required=True, type=Path)
     for flag in (
         "baseline-run",
@@ -348,9 +561,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "input-root",
         "output",
     ):
-        prepare.add_argument(f"--{flag}", required=True, type=Path)
-        prepare_fresh.add_argument(f"--{flag}", required=True, type=Path)
+        for parser_ in (prepare, prepare_fresh, prepare_panel):
+            parser_.add_argument(f"--{flag}", required=True, type=Path)
     run = subcommands.add_parser("run", help="measure a verified, sealed five-song selection")
+    run_panel = subcommands.add_parser("run-panel", help="measure the sealed twenty-song panel")
+    run_panel.add_argument("--reference-manifest", required=True, type=Path)
+    run_panel.add_argument("--timing-manifest", required=True, type=Path)
     for flag in (
         "selection-path",
         "baseline-run",
@@ -360,8 +576,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "input-root",
         "output-root",
     ):
-        run.add_argument(f"--{flag}", required=True, type=Path)
-    run.add_argument("--selection-sha256", dest="expected_selection_sha256", required=True)
+        for parser_ in (run, run_panel):
+            parser_.add_argument(f"--{flag}", required=True, type=Path)
+    for parser_ in (run, run_panel):
+        parser_.add_argument("--selection-sha256", dest="expected_selection_sha256", required=True)
     arguments = vars(parser.parse_args(argv))
     command = arguments.pop("command")
     arguments = {
@@ -369,17 +587,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         for key, value in arguments.items()
     }
     try:
-        if command in {"prepare", "prepare-fresh"}:
+        preparations = {
+            "prepare": prepare_selection,
+            "prepare-fresh": prepare_fresh_selection,
+            "prepare-panel": prepare_panel_selection,
+        }
+        if command in preparations:
             output = arguments.pop("output")
             if output.exists() or output.is_symlink():
                 raise SelectionError("selection output already exists")
-            prepare_inputs = (
-                prepare_fresh_selection if command == "prepare-fresh" else prepare_selection
-            )
-            selection = prepare_inputs(**arguments)
+            selection = preparations[command](**arguments)
             _write_json(output, selection)
             print(selection_sha256(selection))
             return 0
+        if command == "run-panel":
+            arguments["panel_manifests"] = (
+                arguments.pop("reference_manifest"),
+                arguments.pop("timing_manifest"),
+            )
         result = run_selected_comparison(**arguments)
     except (OSError, SelectionError) as error:
         blocked = isinstance(error, SelectionBlocked)
