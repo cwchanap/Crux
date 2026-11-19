@@ -315,10 +315,74 @@ and `uv run --no-sync pytest -q -o addopts=` passed on Colab with the Python
 3.12.3 project interpreter. All 3,726 tests passed in 470.56 seconds. Ruff
 lint and format checks passed for the three changed Python files.
 
+## Twenty-song panel
+
+The [preregistered panel](PANEL.md) used 20 additional songs and 6,237.24
+seconds of source audio. All 20 Drive originals matched the September
+manifest hashes. The TF1 baseline `oaf-ec9176f5c314b5b6` and the TF2.15
+candidate both completed every song using the same sealed WAVs on one
+two-vCPU x86-64 Colab VM. The frozen TF1 smoke matched exactly. TF2.15
+completed its repeatable smoke with binary64 differences from the oracle.
+
+The panel **passed its preregistered gate**. At raw 50 ms and zero offset,
+the two backends agreed on every song's TP, FP and FN counts. Both produced
+macro F1 **0.217898** and micro-F1 **0.238997** (exactly `4241/17745`).
+
+| Simfile | TP | FP | FN | F1 |
+| ---: | ---: | ---: | ---: | ---: |
+| 131 | 204 | 1,051 | 5,284 | 0.060507 |
+| 384 | 37 | 34 | 4,080 | 0.017670 |
+| 329 | 24 | 10 | 1,504 | 0.030730 |
+| 209 | 72 | 224 | 1,129 | 0.096192 |
+| 112 | 274 | 654 | 2,924 | 0.132816 |
+| 68 | 780 | 702 | 6,422 | 0.179641 |
+| 56 | 541 | 373 | 5,172 | 0.163271 |
+| 201 | 224 | 1,235 | 962 | 0.169376 |
+| 298 | 110 | 141 | 838 | 0.183486 |
+| 364 | 220 | 183 | 1,537 | 0.203704 |
+| 194 | 1,869 | 3,462 | 7,776 | 0.249599 |
+| 216 | 509 | 712 | 2,039 | 0.270098 |
+| 138 | 1,278 | 3,088 | 4,673 | 0.247746 |
+| 187 | 270 | 52 | 1,503 | 0.257757 |
+| 225 | 186 | 102 | 845 | 0.282032 |
+| 294 | 3,096 | 6,656 | 4,322 | 0.360629 |
+| 154 | 614 | 813 | 1,453 | 0.351460 |
+| 262 | 1,456 | 2,778 | 3,148 | 0.329486 |
+| 148 | 749 | 542 | 1,965 | 0.374032 |
+| 200 | 210 | 73 | 563 | 0.397727 |
+| Pooled | 12,723 | 22,885 | 58,139 | 0.238997 |
+
+Every one of the 35,608 native events matched within 1 ms, and onset times
+agreed at six-decimal precision. The run observed zero frame shifts,
+additions, removals or rounding collisions. Velocity, MIDI note, model
+output bin and upstream group agreed on every match. The largest confidence
+difference was `0.000097` on simfile 262. Each of the two stress anchors
+(194 and 384) produced identical raw events on its primary, same-worker
+replay and fresh-worker replay.
+
+Pooled inference RTF including worker startup was 0.189538 for TF1 and
+0.180042 for TF2.15. Across the 19 songs after the first scheduled song,
+RTF was 0.184232 and 0.178518 respectively. The TF2.15 worker took
+14.424165 seconds to start for the primary pass. These are measurements
+from one VM. The RTF excludes provisioning, canonicalization, scoring and
+anchor replay time.
+
+The experiment ran from `ed1df1a` with the panel changes applied, using
+CPython 3.12.3 for the driver and CPython 3.11.17 with TensorFlow CPU 2.15.1
+for the candidate. `prepare-panel` sealed the TF1 artifacts and WAVs, and
+`run-panel` measured the candidate. The candidate fingerprint
+`349a19bf89de0b7349372e5079aa874d95171fd7499a5068f3cdaa17f009fc36`
+matched before and after inference. The seal is
+`ece2a444fff7c1e33ad3e2dc31f571ae53deab9ffec4b5f08a9db419a2bfb7d6`.
+The archive and recomputed verification are in
+`artifacts/experiments/oaf-tf215/twenty-song-panel/`. Its archive SHA-256 is
+`ba7892ed54a9d5b71bd39873ffee959d54fd9b2ca0fa79991a2250fd72adff1c`.
+The local OaF verification suite passed 183 tests.
+
 ## Remaining benchmark work
 
-- The measured scope covers the canonical smoke fixture and the five selected
-  songs. Broad corpus, reviewed subset and separation measurements remain open.
+- The measured scope covers the canonical smoke fixture and 25 songs.
+  Broad corpus, reviewed subset and separation measurements remain open.
 - The GitHub and Colab TF2.15 smoke observations differ at event 0 confidence.
 - The TF1 prediction and report artifacts are confined to the experiment output
   under `artifacts/experiments/oaf-tf215/`.

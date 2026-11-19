@@ -1,4 +1,4 @@
-"""Prepare and verify the fixed five TF1 inputs for the TF2.15 experiment."""
+"""Prepare and verify the fixed TF1 inputs for the TF2.15 experiments."""
 
 from __future__ import annotations
 
@@ -58,6 +58,33 @@ from src.benchmark.taxonomy import DTX_LANE_MAP_VERSION, TAXONOMY_VERSION
 
 SELECTION_SCHEMA = "crux.oaf-tf215-selection/v1"
 FRESH_SELECTION_SCHEMA = "crux.oaf-tf215-fresh-selection/v1"
+PANEL_SELECTION_SCHEMA = "crux.oaf-tf215-panel-selection/v1"
+PANEL_PROTOCOL_PATH = Path(__file__).with_name("PANEL.md")
+PANEL_PROTOCOL_SHA256 = "9ecdd8e12a0033203ddbdc6b974d201436426a00fac80398c1853cdd47bf622b"
+PANEL_RUN_ID = "oaf-ec9176f5c314b5b6"
+# Table order from the pinned protocol. The runner schedules ascending IDs separately.
+PANEL_SIMFILE_IDS = (
+    131,
+    384,
+    329,
+    209,
+    112,
+    68,
+    56,
+    201,
+    298,
+    364,
+    194,
+    216,
+    138,
+    187,
+    225,
+    294,
+    154,
+    262,
+    148,
+    200,
+)
 ARCHIVED_RUN_ID = "oaf-2d67684ad190163e"
 REFERENCE_MANIFEST_SHA256 = "96c9971b2c9113e72cb293862badcc88d9146e689ea329f45576d7fb7349f041"
 REFERENCE_TIMING_VERSION = "sha256:10868dfb1f87490692d28f6f115dfa164f20be69247115be52a76ef59c954fcf"
@@ -231,8 +258,8 @@ def _read_run(path: Path, run_id: str) -> tuple[dict[str, Any], str]:
     return run, sha256_hex(content)
 
 
-def _fresh_output_root(baseline_run: Path) -> Path:
-    relative = f"runs/{FRESH_RUN_ID}/run.json"
+def _fresh_output_root(baseline_run: Path, run_id: str) -> Path:
+    relative = f"runs/{run_id}/run.json"
     if baseline_run.parts[-3:] != Path(relative).parts:
         raise SelectionError(
             f"fresh baseline must use the corpus output layout <output>/{relative}"
@@ -248,13 +275,15 @@ def _run_identity(
     descriptor: BackendDescriptor,
     *,
     fresh: bool = False,
+    panel: bool = False,
 ) -> dict[str, Any]:
     lock_digest = compute_model_lock_sha256(_model_lock_path())
     inference = build_inference_config(config, descriptor, lock_digest)
     inference_digest = inference_config_sha256(inference)
-    run_id = FRESH_RUN_ID if fresh else ARCHIVED_RUN_ID
+    fresh = fresh or panel
+    run_id = PANEL_RUN_ID if panel else FRESH_RUN_ID if fresh else ARCHIVED_RUN_ID
     reference_digest = FRESH_REFERENCE_MANIFEST_SHA256 if fresh else REFERENCE_MANIFEST_SHA256
-    include = sorted(SELECTED_SIMFILE_IDS) if fresh else []
+    include = sorted(PANEL_SIMFILE_IDS if panel else SELECTED_SIMFILE_IDS) if fresh else []
     expected = {
         "run_id": run_id,
         "overall_status": "complete",
@@ -328,7 +357,11 @@ def _required_digest(value: Mapping[str, Any], field: str) -> str:
 
 
 def _reference_rows(
-    reference_path: Path, timing_path: Path, run: Mapping[str, Any]
+    reference_path: Path,
+    timing_path: Path,
+    run: Mapping[str, Any],
+    *,
+    simfile_ids: tuple[int, ...] = SELECTED_SIMFILE_IDS,
 ) -> tuple[
     LoadedReferenceSetManifest, LoadedReferenceTimingManifest, tuple[LoadedReferenceSetRow, ...]
 ]:
@@ -362,7 +395,7 @@ def _reference_rows(
         raise SelectionError("reference and timing manifest identities disagree")
     by_id = {row.view.simfile_id: row for row in reference.rows}
     try:
-        selected = tuple(by_id[song] for song in SELECTED_SIMFILE_IDS)
+        selected = tuple(by_id[song] for song in simfile_ids)
     except KeyError as error:
         raise SelectionError(
             f"selected simfile {error} is absent from the reference manifest"
@@ -482,7 +515,6 @@ def _source_audio(
 
 
 def _seal_item(
-    rank: int,
     row: Mapping[str, Any],
     artifact: PredictionArtifact,
     counts: tuple[int, dict[str, int]],
@@ -491,7 +523,6 @@ def _seal_item(
     song = row["simfile_id"]
     count, classes = counts
     return {
-        "rank": rank,
         "simfile_id": song,
         "prediction_native_event_count": count,
         "prediction_native_class_counts": classes,
@@ -532,12 +563,15 @@ def _load_archived_inputs(
         if _native_counts(artifact) != counts:
             raise SelectionError(f"archived prediction event or class counts mismatch: {song}")
         prepared.append(
-            (_seal_item(rank, row, artifact, counts) | {"archived_f1": str(score)}, artifact)
+            (
+                _seal_item(row, artifact, counts) | {"rank": rank, "archived_f1": str(score)},
+                artifact,
+            )
         )
     return prepared
 
 
-def _selection_policy(*, fresh: bool) -> dict[str, Any]:
+def _selection_policy(*, fresh: bool, panel: bool = False) -> dict[str, Any]:
     expected: dict[str, Any] = {
         "schema": FRESH_SELECTION_SCHEMA if fresh else SELECTION_SCHEMA,
         "prediction_map_version": OAF_PREDICTION_MAP_ID,
@@ -553,6 +587,11 @@ def _selection_policy(*, fresh: bool) -> dict[str, Any]:
         }
     else:
         expected["report_sha256"] = dict(REPORT_SHA256)
+    if panel:
+        protocol_sha = sha256_hex(_read_file(PANEL_PROTOCOL_PATH))
+        if protocol_sha != PANEL_PROTOCOL_SHA256:
+            raise SelectionError("panel protocol digest does not match")
+        expected.update(schema=PANEL_SELECTION_SCHEMA, panel_protocol_sha256=protocol_sha)
     return expected
 
 
@@ -614,29 +653,81 @@ def prepare_fresh_selection(
     input_root: Path,
 ) -> dict[str, Any]:
     """Seal a new TF1 run over the pinned September inputs and five October-ranked IDs."""
+    return _prepare_fresh_selection(
+        baseline_run=baseline_run,
+        reference_manifest=reference_manifest,
+        timing_manifest=timing_manifest,
+        cache_dir=cache_dir,
+        input_root=input_root,
+        panel=False,
+    )
+
+
+def prepare_panel_selection(
+    *,
+    baseline_run: Path,
+    reference_manifest: Path,
+    timing_manifest: Path,
+    cache_dir: Path,
+    input_root: Path,
+) -> dict[str, Any]:
+    """Seal a newly measured TF1 run for the pinned twenty-song panel."""
+    return _prepare_fresh_selection(
+        baseline_run=baseline_run,
+        reference_manifest=reference_manifest,
+        timing_manifest=timing_manifest,
+        cache_dir=cache_dir,
+        input_root=input_root,
+        panel=True,
+    )
+
+
+def _prepare_fresh_selection(
+    *,
+    baseline_run: Path,
+    reference_manifest: Path,
+    timing_manifest: Path,
+    cache_dir: Path,
+    input_root: Path,
+    panel: bool,
+) -> dict[str, Any]:
+    policy = _selection_policy(fresh=True, panel=panel)
     if input_root.exists() or input_root.is_symlink():
         raise SelectionError(f"the experimental input directory must be new: {input_root}")
-    root = _fresh_output_root(baseline_run)
+    run_id = PANEL_RUN_ID if panel else FRESH_RUN_ID
+    simfile_ids = PANEL_SIMFILE_IDS if panel else SELECTED_SIMFILE_IDS
+    root = _fresh_output_root(baseline_run, run_id)
     config = load_model_config()
     descriptor = _expected_oaf_descriptor(config)
-    run, run_digest = _read_run(baseline_run, FRESH_RUN_ID)
-    baseline = _run_identity(run, config, descriptor, fresh=True)
-    reference, timing, selected = _reference_rows(reference_manifest, timing_manifest, run)
+    run, run_digest = _read_run(baseline_run, run_id)
+    baseline = _run_identity(run, config, descriptor, fresh=True, panel=panel)
+    reference, timing, selected = _reference_rows(
+        reference_manifest, timing_manifest, run, simfile_ids=simfile_ids
+    )
     _preflight_selected_references(reference, timing, selected, timing_manifest.parent.parent)
 
     by_id = {row["simfile_id"]: row for row in run["items"]}
     prepared = []
-    for rank, song in zip(SELECTED_RANKS, SELECTED_SIMFILE_IDS, strict=True):
+    position_field, positions = _selection_positions(panel=panel)
+    for song, position in zip(simfile_ids, positions, strict=True):
         row = by_id[song]
         artifact = _read_prediction(root, row, descriptor)
-        prepared.append((_seal_item(rank, row, artifact, _native_counts(artifact)), artifact))
+        sealed_row = _seal_item(row, artifact, _native_counts(artifact))
+        sealed_row[position_field] = position
+        prepared.append((sealed_row, artifact))
     _materialize_inputs(selected, prepared, cache_dir, input_root, config, descriptor)
     return {
-        **_selection_policy(fresh=True),
+        **policy,
         "baseline_run_sha256": run_digest,
         "baseline_identity": baseline,
         "items": [row for row, _ in prepared],
     }
+
+
+def _selection_positions(*, panel: bool) -> tuple[str, tuple[int, ...]]:
+    if panel:
+        return "panel_ordinal", tuple(range(1, len(PANEL_SIMFILE_IDS) + 1))
+    return "rank", SELECTED_RANKS
 
 
 def _materialize_inputs(
@@ -673,7 +764,7 @@ def _materialize_inputs(
                 ) from error
             _check_audio(audio, row, artifact, descriptor)
         # A fresh directory makes setup retryable without replacing any prior
-        # selection. Validation above finishes before moving the five WAVs.
+        # selection. Validation above finishes before moving the WAVs.
         input_root.mkdir()
         for row, _ in prepared:
             (temporary / row["wav_path"]).rename(input_root / row["wav_path"])
@@ -712,6 +803,7 @@ def verify_selection(
     expected_selection_sha256: str,
     baseline_run: Path,
     input_root: Path,
+    panel: bool = False,
 ) -> tuple[dict[str, Any], tuple[tuple[CanonicalAudio, PredictionArtifact], ...]]:
     """Recheck the seal, TF1 run and prediction bytes, and WAVs without source access."""
     content = _read_file(selection_path).removesuffix(b"\n")
@@ -721,27 +813,34 @@ def verify_selection(
         raise SelectionError(f"invalid selection document: {error}") from error
     if not isinstance(selection, dict) or selection_sha256(selection) != expected_selection_sha256:
         raise SelectionError("selection digest does not match")
-    fresh = selection.get("schema") == FRESH_SELECTION_SCHEMA
-    expected = _selection_policy(fresh=fresh)
+    fresh = panel or selection.get("schema") == FRESH_SELECTION_SCHEMA
+    expected = _selection_policy(fresh=fresh, panel=panel)
     if any(selection.get(key) != value for key, value in expected.items()):
         raise SelectionError("selection does not match the pinned report or scoring identities")
     rows = selection.get("items")
+    simfile_ids = PANEL_SIMFILE_IDS if panel else SELECTED_SIMFILE_IDS
+    position_field, positions = _selection_positions(panel=panel)
     if (
         not isinstance(rows, list)
-        or len(rows) != len(SELECTED_SIMFILE_IDS)
+        or len(rows) != len(simfile_ids)
         or any(
-            not isinstance(row, dict) or row.get("simfile_id") != song or row.get("rank") != rank
-            for row, song, rank in zip(rows, SELECTED_SIMFILE_IDS, SELECTED_RANKS, strict=True)
+            not isinstance(row, dict)
+            or row.get("simfile_id") != song
+            or row.get(position_field) != position
+            for row, song, position in zip(rows, simfile_ids, positions, strict=True)
         )
     ):
         raise SelectionError("selection does not match the pinned membership")
-    prediction_root = _fresh_output_root(baseline_run) if fresh else baseline_run.parent
-    run, digest = _read_run(baseline_run, FRESH_RUN_ID if fresh else ARCHIVED_RUN_ID)
+    run_id = PANEL_RUN_ID if panel else FRESH_RUN_ID if fresh else ARCHIVED_RUN_ID
+    prediction_root = _fresh_output_root(baseline_run, run_id) if fresh else baseline_run.parent
+    run, digest = _read_run(baseline_run, run_id)
     if digest != selection.get("baseline_run_sha256"):
         raise SelectionError("baseline run digest no longer matches the selection")
     config = load_model_config()
     descriptor = _expected_oaf_descriptor(config)
-    if _run_identity(run, config, descriptor, fresh=fresh) != selection.get("baseline_identity"):
+    if _run_identity(run, config, descriptor, fresh=fresh, panel=panel) != selection.get(
+        "baseline_identity"
+    ):
         raise SelectionError("baseline run no longer matches the sealed lineage")
 
     run_rows = {row["simfile_id"]: row for row in run["items"]}
