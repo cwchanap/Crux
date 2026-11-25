@@ -7,9 +7,11 @@ import hashlib
 import importlib.util
 import os
 import re
+import shutil
 import subprocess
+import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -77,6 +79,16 @@ def scratch_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
     runtime = builder.build_runtime(REPO_ROOT, output)
     assert runtime == output.resolve() / "runtime"
     return output.resolve()
+
+
+@pytest.fixture
+def copied_repo(tmp_path: Path) -> Path:
+    checkout = tmp_path / "checkout"
+    shutil.copytree(FROZEN_RUNTIME, checkout / FROZEN_RUNTIME.relative_to(REPO_ROOT))
+    patch = checkout / PATCH_PATH.relative_to(REPO_ROOT)
+    patch.parent.mkdir(parents=True)
+    shutil.copyfile(PATCH_PATH, patch)
+    return checkout
 
 
 def _tree_digest(root: Path) -> str:
@@ -182,16 +194,33 @@ def test_builder_refuses_a_dangling_destination_symlink(tmp_path: Path) -> None:
     assert not target.exists()
 
 
-def test_builder_applies_the_patch_inside_a_git_checkout(
-    tmp_path: Path,
+@pytest.mark.parametrize("path_kind", ["direct", "linked_destination", "linked_frozen_tree"])
+def test_builder_refuses_destinations_under_the_frozen_tree(
+    copied_repo: Path, path_kind: str
 ) -> None:
     builder = _load_builder()
-    checkout = tmp_path / "checkout"
-    checkout.mkdir()
-    _run_git_for_test(checkout, "init", "--quiet")
-    _run_git_for_test(checkout, "commit", "--allow-empty", "--quiet", "-m", "base")
+    frozen_tree = copied_repo / FROZEN_RUNTIME.relative_to(REPO_ROOT)
+    parent = frozen_tree
+    if path_kind == "linked_destination":
+        parent = copied_repo / "runtime-alias"
+        parent.symlink_to(frozen_tree, target_is_directory=True)
+    elif path_kind == "linked_frozen_tree":
+        parent = copied_repo / "frozen-tree"
+        frozen_tree.rename(parent)
+        frozen_tree.symlink_to(parent, target_is_directory=True)
 
-    runtime = builder.build_runtime(REPO_ROOT, checkout / "scratch")
+    with pytest.raises(builder.ScratchRuntimeError, match="frozen runtime"):
+        builder.build_runtime(copied_repo, parent / "missing" / "scratch")
+
+    assert not (frozen_tree / "missing").exists()
+
+
+def test_builder_applies_the_patch_inside_a_git_checkout(copied_repo: Path) -> None:
+    builder = _load_builder()
+    _run_git_for_test(copied_repo, "init", "--quiet")
+    _run_git_for_test(copied_repo, "commit", "--allow-empty", "--quiet", "-m", "base")
+
+    runtime = builder.build_runtime(copied_repo, copied_repo / "runtime" / "oaf_tf1-scratch")
 
     configs = (
         runtime / "vendor" / "magenta" / "models" / "onsets_frames_transcription" / "configs.py"
@@ -254,10 +283,10 @@ def test_instrumentation_runs_before_the_compatibility_patch(
         events.append(("instrumentation-done", vendor.is_dir()))
         return result
 
-    def spy_git(root: Path, *arguments: str) -> None:
+    def spy_git(root: Path, *arguments: str, patch: bytes) -> None:
         git_calls.append(tuple(arguments))
         events.append(("compat", (root / "runtime" / "vendor").is_dir()))
-        return original_git(root, *arguments)
+        return original_git(root, *arguments, patch=patch)
 
     monkeypatch.setattr(builder, "_apply_instrumentation", spy_instrumentation)
     monkeypatch.setattr(builder, "_run_git", spy_git)
@@ -267,9 +296,26 @@ def test_instrumentation_runs_before_the_compatibility_patch(
     assert events[0] == ("instrumentation", False)
     assert events[1] == ("instrumentation-done", True)
     assert events[2:] == [("compat", True), ("compat", True)]
-    assert git_calls[0][:2] == ("apply", "--check")
-    assert git_calls[1][0] == "apply"
-    assert git_calls[0][-1] == os.fspath(PATCH_PATH)
+    assert git_calls == [("apply", "--check", "-"), ("apply", "-")]
+
+
+def test_builder_uses_verified_bytes_for_check_and_apply(
+    copied_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder = _load_builder()
+    patch_path = copied_repo / PATCH_PATH.relative_to(REPO_ROOT)
+    original_git = builder._run_git
+
+    def replace_patch_before_check(root: Path, *arguments: str, patch: bytes) -> None:
+        if "--check" in arguments:
+            patch_path.write_bytes(b"this is no longer a valid patch\n")
+        original_git(root, *arguments, patch=patch)
+
+    monkeypatch.setattr(builder, "_run_git", replace_patch_before_check)
+
+    runtime = builder.build_runtime(copied_repo, copied_repo / "scratch")
+
+    assert (runtime / "vendor" / "magenta" / "contrib" / "training.py").is_file()
 
 
 def test_compatibility_patch_is_scoped_to_the_reviewed_paths() -> None:
@@ -297,23 +343,52 @@ def test_copied_model_allows_only_compat_initialization_and_paths(
     patched = patched_source.decode("utf-8")
     for name in LOCKED_IMPLEMENTATIONS:
         assert f"def {name}(" in patched
-    tree = ast.parse(patched_source)
-    compat_calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == TF_COMPAT_FUNCTION
-    ]
-    assert len(compat_calls) == 1
-    function = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == TF_COMPAT_FUNCTION
-    )
-    function_text = ast.unparse(function)
-    assert "ops.Tensor = tensor.Tensor" in function_text
-    assert "disable_v2_behavior()" in function_text
+
+
+@pytest.mark.parametrize("has_tensor_alias", [False, True])
+def test_copied_model_enables_tf1_compatibility_before_loading_config(
+    scratch_root: Path, monkeypatch: pytest.MonkeyPatch, has_tensor_alias: bool
+) -> None:
+    model_path = scratch_root / "runtime" / "model.py"
+    spec = importlib.util.spec_from_file_location("crux_oaf_tf215_model", model_path)
+    assert spec is not None and spec.loader is not None
+    model = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, model)
+    spec.loader.exec_module(model)
+
+    tensor_type = object()
+    ops = SimpleNamespace()
+    if has_tensor_alias:
+        ops.Tensor = object()
+    graph_disable_calls = []
+
+    def disable_v2_behavior() -> None:
+        graph_disable_calls.append(True)
+
+    tf_v1 = SimpleNamespace(disable_v2_behavior=disable_v2_behavior)
+    tf_compat = SimpleNamespace(v1=tf_v1)
+    for name, module in {
+        "tensorflow": SimpleNamespace(compat=tf_compat),
+        "tensorflow.compat": tf_compat,
+        "tensorflow.compat.v1": tf_v1,
+        "tensorflow.python.framework": SimpleNamespace(
+            ops=ops, tensor=SimpleNamespace(Tensor=tensor_type)
+        ),
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    class ConfigLoadReached(Exception):
+        """Stop before checkpoint or graph operations."""
+
+    def stop_at_config_load() -> None:
+        raise ConfigLoadReached
+
+    monkeypatch.setattr(model, "load_model_config", stop_at_config_load)
+    with pytest.raises(ConfigLoadReached):
+        model.OafModel.load(scratch_root)
+
+    assert getattr(ops, "Tensor", None) is tensor_type
+    assert graph_disable_calls == [True]
 
 
 def test_package_initializers_and_configs_drop_only_unused_imports(

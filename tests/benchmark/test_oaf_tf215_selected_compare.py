@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import struct
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,8 +12,15 @@ import pytest
 
 from experiments.oaf_tf215 import compare
 from experiments.oaf_tf215 import selected_compare as selected
+from runtime.oaf_tf1.model import load_model_config
 from src.benchmark.backend_identity import canonical_json_bytes, sha256_hex
+from src.benchmark.backends.base import CanonicalAudio, NativeEvent, NativePrediction
+from src.benchmark.input_view import load_direct_audio
+from src.benchmark.mapping import map_oaf_prediction
+from src.benchmark.oaf_corpus_run import _expected_oaf_descriptor
+from src.benchmark.oaf_smoke_oracle import read_smoke_oracle
 from src.benchmark.oaf_tf215_runtime import PROBE_SCHEMA
+from src.benchmark.prediction_artifact import render_prediction_artifact
 
 
 def _inputs(tmp_path):
@@ -27,6 +36,14 @@ def _inputs(tmp_path):
     }
 
 
+def _test_audio(root, song):
+    path = root / f"{song}.wav"
+    content = path.name.encode()
+    path.write_bytes(content)
+    digest = sha256_hex(content)
+    return CanonicalAudio(path, str(song), digest, "test", digest, len(content), 44100, 1, 2, 44100)
+
+
 @pytest.fixture
 def fake_experiment(monkeypatch, tmp_path):
     inputs = _inputs(tmp_path)
@@ -40,7 +57,7 @@ def fake_experiment(monkeypatch, tmp_path):
     inputs["expected_selection_sha256"] = sha256_hex(canonical_json_bytes(selection))
     bindings = tuple(
         (
-            SimpleNamespace(path=tmp_path / f"{item['simfile_id']}.wav"),
+            _test_audio(tmp_path, item["simfile_id"]),
             SimpleNamespace(prediction=SimpleNamespace(events=())),
         )
         for item in selection["items"]
@@ -56,7 +73,7 @@ def fake_experiment(monkeypatch, tmp_path):
     return inputs
 
 
-def _worker_factory(inputs, *, fail_second=False, vary_fresh=False):
+def _worker_factory(inputs, *, fail_second=False, vary_fresh=False, check_audio=None):
     workers = []
 
     class Worker:
@@ -76,6 +93,8 @@ def _worker_factory(inputs, *, fail_second=False, vary_fresh=False):
         def request(self, filename):
             assert not self.closed
             self.requests.append(filename)
+            if filename != "canonical.wav" and check_audio is not None:
+                check_audio(self.cwd / filename)
             if filename == "389.wav":
                 if fail_second and len(self.requests) == 2:
                     return {"error": {"message": "synthetic request failure"}}
@@ -155,9 +174,100 @@ def test_run_retains_binary64_attempts_and_accepts_a_divergent_smoke(fake_experi
     assert len(list(fake_experiment["output_root"].rglob("comparison.json"))) == 2
 
 
-@pytest.mark.parametrize("nonregression", [True, False])
+def test_selected_replays_read_the_snapshot_after_source_replacement(fake_experiment):
+    root = fake_experiment["input_root"]
+
+    def check_audio(path):
+        (root / path.name).write_bytes(b"x" * len(path.name))
+        assert path.read_bytes() == path.name.encode()
+
+    _, start = _worker_factory(fake_experiment, check_audio=check_audio)
+    result = selected.run_selected_comparison(**fake_experiment, process_factory=start)
+    assert result["status"] == "complete"
+    output = Path(result["output_dir"])
+    assert not list(output.glob("sealed-wavs-*"))
+
+
+def test_selected_rejects_modified_wav_before_song_requests(fake_experiment):
+    (fake_experiment["input_root"] / "389.wav").write_bytes(b"xxxxxxx")
+    workers, start = _worker_factory(fake_experiment)
+    result = selected.run_selected_comparison(**fake_experiment, process_factory=start)
+    assert result["status"] == "failed"
+    assert result["failed_stage"] == "sealed_wavs"
+    assert len(workers) == 2
+
+
+@pytest.mark.parametrize("smoke", ["exact", "divergent", "stale"])
+def test_panel_tf1_smoke_verifies_a_fresh_local_prediction(tmp_path, monkeypatch, smoke):
+    oracle_content = (selected.SMOKE_ROOT / "smoke-oracle.json").read_bytes()
+    config = load_model_config(compare.MODEL_CONFIG_PATH)
+    audio = load_direct_audio(
+        selected.SMOKE_ROOT / "canonical.wav",
+        source_audio_id=compare.SOURCE_AUDIO_ID,
+        input_view_id=compare.SOURCE_AUDIO_ID,
+        max_input_audio_frames=config.max_input_audio_frames,
+    )
+
+    def value(hex_value):
+        return struct.unpack(">d", bytes.fromhex(hex_value))[0]
+
+    events = tuple(
+        NativeEvent(
+            value(row.time_sec_binary64),
+            row.native_class_id,
+            row.model_output_bin,
+            row.native_midi_note,
+            {"upstream_8hit_group_id": row.upstream_8hit_group_id},
+            None if row.confidence_binary64 is None else value(row.confidence_binary64),
+            row.velocity_midi,
+        )
+        for row in read_smoke_oracle(oracle_content).native_events
+    )
+    if smoke == "divergent":
+        events = events[:-1]
+    prediction = NativePrediction(audio, _expected_oaf_descriptor(config), events)
+    content = render_prediction_artifact(map_oaf_prediction(prediction)[0])
+    source = tmp_path / "fixture.jsonl"
+    source.write_bytes(content)
+    output = tmp_path / "fresh.jsonl"
+    execution = tmp_path / "execution"
+    boot_id = tmp_path / "boot_id"
+    boot_id.write_text("dfcab66e-1856-4b3e-b361-450357d3e936\n")
+    monkeypatch.setattr(selected, "BOOT_ID_PATH", boot_id, raising=False)
+    command = (
+        sys.executable,
+        "-c",
+        "import shutil, sys; shutil.copyfile(*sys.argv[1:])",
+        str(source),
+        str(output),
+    )
+    if smoke == "stale":
+        output.write_bytes(content)
+    if smoke != "exact":
+        reason = "already exists" if smoke == "stale" else "oracle native event count mismatch"
+        with pytest.raises(selected.SelectionError, match=reason):
+            selected._verify_panel_tf1_smoke(command, output, execution)
+        assert not execution.exists()
+        return
+    proof = selected._verify_panel_tf1_smoke(command, output, execution)
+    assert proof["status"] == "exact"
+    assert proof["boot_id"] == boot_id.read_text().strip()
+    assert proof["oracle_sha256"] == sha256_hex(oracle_content)
+    assert proof["prediction_sha256"] == sha256_hex(content)
+    assert (execution / "tf1-smoke-prediction.jsonl").read_bytes() == content
+
+
+@pytest.mark.parametrize(
+    ("nonregression", "exact_tf1", "disposition"),
+    [
+        (True, True, "inferred"),
+        (False, True, "inferred"),
+        (True, False, "inferred"),
+        (True, False, "resumed"),
+    ],
+)
 def test_panel_uses_persistent_worker_and_replays_only_anchors(
-    fake_experiment, monkeypatch, nonregression
+    fake_experiment, monkeypatch, nonregression, exact_tf1, disposition
 ):
     inputs = fake_experiment
     root = inputs["input_root"]
@@ -171,7 +281,7 @@ def test_panel_uses_persistent_worker_and_replays_only_anchors(
     }
     bindings = tuple(
         (
-            SimpleNamespace(path=root / f"{song}.wav", audio_frame_count=44100, sample_rate=44100),
+            _test_audio(root, song),
             SimpleNamespace(prediction=SimpleNamespace(events=())),
         )
         for song in identifiers
@@ -185,7 +295,7 @@ def test_panel_uses_persistent_worker_and_replays_only_anchors(
         "parse_oaf_corpus_run",
         lambda *_, **__: {
             "items": [
-                {"simfile_id": song, "wall_time_sec": 2, "execution_disposition": "inferred"}
+                {"simfile_id": song, "wall_time_sec": 2, "execution_disposition": disposition}
                 for song in identifiers
             ]
         },
@@ -198,11 +308,27 @@ def test_panel_uses_persistent_worker_and_replays_only_anchors(
 
     monkeypatch.setattr(selected, "aggregate_panel_scores", aggregate)
     workers, start = _worker_factory(inputs)
+    smoke_options = {}
+    if exact_tf1:
+        smoke_path = root / "frozen-smoke.jsonl"
+        smoke_options = {"tf1_smoke_command": (sys.executable,), "tf1_smoke_prediction": smoke_path}
+        monkeypatch.setattr(
+            selected, "_verify_panel_tf1_smoke", lambda *args: {"status": "exact"}, raising=False
+        )
     result = selected.run_selected_comparison(
-        **inputs, process_factory=start, panel_manifests=(root / "reference", root / "timing")
+        **inputs,
+        process_factory=start,
+        panel_manifests=(root / "reference", root / "timing"),
+        **smoke_options,
     )
+    if disposition == "resumed":
+        assert result["status"] == "failed"
+        assert result["failed_stage"] == "selection"
+        assert not workers
+        assert not result["panel_gate_passed"]
+        return
     assert result["status"] == "complete"
-    assert result["panel_gate_passed"] is nonregression
+    assert result["panel_gate_passed"] is (nonregression and exact_tf1)
     anchors = [f"{song}.wav" for song in selected.PANEL_ANCHORS]
     assert workers[2].requests == [f"{song}.wav" for song in sorted(identifiers)] + anchors
     assert workers[3].requests == anchors
@@ -279,3 +405,28 @@ def test_cli_exit_follows_measurement_completion(fake_experiment, monkeypatch, c
     )
     assert selected.main(argv) == 2
     assert json.loads(capsys.readouterr().out)["status"] == "blocked"
+
+
+def test_prepare_cli_can_retry_after_a_seal_publication_failure(tmp_path, monkeypatch, capsys):
+    input_root = tmp_path / "wavs"
+    output_parent = tmp_path / "reports"
+    output_parent.write_bytes(b"not a directory")
+    output = output_parent / "selection.json"
+
+    def prepare(**options):
+        options["input_root"].mkdir()
+        (options["input_root"] / "27.wav").write_bytes(b"canonical audio")
+        return {"seal": "test"}
+
+    monkeypatch.setattr(selected, "prepare_fresh_selection", prepare)
+    args = ["prepare-fresh", "--input-root", str(input_root), "--output", str(output)]
+    for flag in ("baseline-run", "reference-manifest", "timing-manifest", "cache-dir"):
+        args.extend([f"--{flag}", str(tmp_path / flag)])
+    assert selected.main(args) == 1
+    assert json.loads(capsys.readouterr().out)["status"] == "failed"
+    assert not input_root.exists()
+
+    output_parent.unlink()
+    assert selected.main(args) == 0
+    assert json.loads(output.read_text()) == {"seal": "test"}
+    assert (input_root / "27.wav").exists()

@@ -23,6 +23,7 @@ COMPARE_PATH = REPO_ROOT / "experiments/oaf_tf215/compare.py"
 COMPARE_SCRIPT = "experiments/oaf_tf215/compare.py"
 COMPARE_RESULT = "artifacts/experiments/oaf-tf215/compare.json"
 COMPARE_LOG = "artifacts/experiments/oaf-tf215/compare.log"
+BUILD_STEP = "Build scratch runtime and import it (build stage)"
 COMPARE_STEP = "Run full-model comparison (model stage)"
 SUMMARY_STEP = "Record full-model result in job summary"
 PREPARE_CHECKPOINT = "uv run crux benchmark prepare-backend --backend oaf --download"
@@ -176,7 +177,13 @@ def test_probe_workflow_runs_the_graph_job_on_drafts_and_the_model_job_manually(
     assert "tests/runtime/test_oaf_tf215_builder.py" in graph
     assert "tests/benchmark/test_oaf_tf215_compare.py" in graph
     assert "tests/benchmark/test_oaf_tf215_workflow.py" in graph
-    for name in ("runtime_identity", "selected_inputs", "selected_metrics", "selected_compare"):
+    for name in (
+        "graph_check",
+        "runtime_identity",
+        "selected_inputs",
+        "selected_metrics",
+        "selected_compare",
+    ):
         path = f"tests/benchmark/test_oaf_tf215_{name}.py"
         assert path in _run_block(graph, "Run host driver and workflow tests (driver stage)")
         assert path in content.split("\n  workflow_dispatch:", maxsplit=1)[0]
@@ -192,6 +199,47 @@ def test_probe_workflow_runs_the_graph_job_on_drafts_and_the_model_job_manually(
     assert '--checkpoint-cache "$GITHUB_WORKSPACE/artifacts/benchmark/model-cache"' in model
     assert "secrets." not in model
     assert "continue-on-error" not in content
+
+
+def test_probe_workflow_triggers_when_frozen_runtime_changes() -> None:
+    content = WORKFLOW.read_text(encoding="utf-8")
+    pull_request = content.split("\n  workflow_dispatch:", maxsplit=1)[0]
+    assert '      - "runtime/oaf_tf1/**"' in pull_request
+
+
+def test_graph_job_runs_builder_tests_outside_the_locked_worker(tmp_path: Path) -> None:
+    worker = tmp_path / "worker-python"
+    worker.write_text(
+        '#!/usr/bin/env bash\nprintf \'%s\\0\' "$@" >> "$FAKE_WORKER_COMMANDS"\n',
+        encoding="utf-8",
+    )
+    worker.chmod(0o755)
+    worker_commands = tmp_path / "worker-commands"
+    env = {
+        **_env(tmp_path),
+        "PY311": str(worker),
+        "NUMBA_CACHE_DIR": str(tmp_path / "numba-cache"),
+        "FAKE_WORKER_COMMANDS": str(worker_commands),
+    }
+    graph = _job_text(WORKFLOW.read_text(encoding="utf-8"), "graph")
+    completed = _run_script(
+        _run_block(graph, BUILD_STEP),
+        tmp_path,
+        env,
+        'printf \'%s\\0\' "$@" >> "$FAKE_UV_ARGV"',
+    )
+    assert completed.returncode == 0, completed.stderr
+    uv_args = _recorded_arguments(tmp_path)
+    assert uv_args[0] == "run"
+    assert "--isolated" in uv_args
+    assert "--no-project" in uv_args
+    assert uv_args[uv_args.index("--python") + 1] == "3.11"
+    assert uv_args[uv_args.index("--with") + 1] == "pytest"
+    assert uv_args[-1] == "tests/runtime/test_oaf_tf215_builder.py"
+    assert env["PY311"] not in uv_args
+    worker_args = worker_commands.read_bytes().split(b"\0")
+    assert b"experiments/oaf_tf215/build_runtime.py" in worker_args
+    assert b"pytest" not in worker_args
 
 
 def test_model_job_uses_the_public_checkpoint_command_from_the_smoke_workflow() -> None:

@@ -34,6 +34,7 @@ import json
 import os
 import platform
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -71,9 +72,8 @@ def validate_environment() -> dict[str, Any]:
         )
     cache_dir = Path(REQUIRED_ENVIRONMENT["NUMBA_CACHE_DIR"])
     cache_dir.mkdir(parents=True, exist_ok=True)
-    probe = cache_dir / ".graph-check-write-probe"
-    probe.write_text("ok", encoding="utf-8")
-    probe.unlink()
+    with tempfile.NamedTemporaryFile(dir=cache_dir, prefix=".graph-check-write-probe-") as probe:
+        probe.write(b"ok")
     return {
         "flags": observed,
         "hash_randomization": sys.flags.hash_randomization,

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import locale
 import os
 import shutil
 import subprocess
@@ -86,7 +87,7 @@ def _apply_instrumentation(repo_root: Path, upstream: Path, vendor: Path, patch_
     module.apply_reviewed_patch(upstream, vendor, patch_path)
 
 
-def _run_git(root: Path, *arguments: str) -> None:
+def _run_git(root: Path, *arguments: str, patch: bytes) -> None:
     # A scratch root inside a Git checkout would make `git apply` resolve patch
     # paths against the enclosing repository and silently skip them. Drop
     # inherited repository selection and set a ceiling so Git treats `root` as
@@ -99,13 +100,14 @@ def _run_git(root: Path, *arguments: str) -> None:
         ["git", *arguments],
         cwd=root,
         check=False,
+        input=patch,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
         env=environment,
     )
     if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "git failed"
+        output = result.stderr.strip() or result.stdout.strip()
+        detail = output.decode(locale.getpreferredencoding(False), errors="replace") or "git failed"
         raise ScratchRuntimeError(f"compatibility patch rejected: {detail}")
 
 
@@ -118,9 +120,14 @@ def build_runtime(repo_root: Path, output_root: Path) -> Path:
     if output_root.is_symlink() or output_root.exists():
         raise ScratchRuntimeError("scratch runtime destination already exists or is a symlink")
     output_root = output_root.resolve()
+    frozen_runtime = repo_root / FROZEN_RUNTIME
+    if output_root.is_relative_to(frozen_runtime.resolve()):
+        raise ScratchRuntimeError("scratch runtime destination is inside the frozen runtime tree")
+
     compatibility_patch = repo_root / COMPATIBILITY_PATCH
     _require_regular_file(compatibility_patch)
-    if hashlib.sha256(compatibility_patch.read_bytes()).hexdigest() != COMPATIBILITY_PATCH_SHA256:
+    patch = compatibility_patch.read_bytes()
+    if hashlib.sha256(patch).hexdigest() != COMPATIBILITY_PATCH_SHA256:
         raise ScratchRuntimeError("compatibility patch is not the reviewed revision")
 
     runtime_dir = output_root / "runtime"
@@ -130,9 +137,9 @@ def build_runtime(repo_root: Path, output_root: Path) -> Path:
     runtime_dir.mkdir()
     upstream_dir.mkdir()
     for name in SCRATCH_FILES:
-        _copy_regular_file(repo_root / FROZEN_RUNTIME / name, runtime_dir / name)
-    _copy_regular_tree(repo_root / FROZEN_RUNTIME / "vendor" / "magenta", upstream_dir / "magenta")
-    _copy_regular_file(repo_root / FROZEN_RUNTIME / "vendor" / "LICENSE", upstream_dir / "LICENSE")
+        _copy_regular_file(frozen_runtime / name, runtime_dir / name)
+    _copy_regular_tree(frozen_runtime / "vendor" / "magenta", upstream_dir / "magenta")
+    _copy_regular_file(frozen_runtime / "vendor" / "LICENSE", upstream_dir / "LICENSE")
     if vendor_dir.exists() or vendor_dir.is_symlink():
         raise ScratchRuntimeError("runtime/vendor must not exist before instrumentation")
 
@@ -142,8 +149,8 @@ def build_runtime(repo_root: Path, output_root: Path) -> Path:
         vendor_dir,
         repo_root / INSTRUMENTATION_PATCH,
     )
-    _run_git(output_root, "apply", "--check", os.fspath(compatibility_patch))
-    _run_git(output_root, "apply", os.fspath(compatibility_patch))
+    _run_git(output_root, "apply", "--check", "-", patch=patch)
+    _run_git(output_root, "apply", "-", patch=patch)
     return runtime_dir
 
 

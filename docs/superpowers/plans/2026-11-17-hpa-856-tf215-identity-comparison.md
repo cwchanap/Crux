@@ -41,7 +41,7 @@ the matching archived TF1 inputs. See [recorded results](../../../experiments/oa
 | Create `experiments/oaf_tf215/selected_inputs.py` and `selected_metrics.py` | Verify seals and inputs, and calculate the comparison metrics. |
 | Create `tests/benchmark/test_oaf_tf215_runtime_identity.py` | Host-side identity tests using fake probe data and temporary trees. |
 | Create `tests/benchmark/test_oaf_tf215_selected_{compare,inputs,metrics}.py` | Selection, binding, measurement and fake-worker execution tests. |
-| Modify `.github/workflows/oaf-tf215-probe.yml` | Include both test modules in paths and the existing host-test step. |
+| Modify `.github/workflows/oaf-tf215-probe.yml` | Include the runtime identity and three selected-comparison test modules in the path filters and host-test step. |
 | Modify `tests/benchmark/test_oaf_tf215_workflow.py` | Verify checkpoint-free PR execution includes the new modules. |
 | Modify `experiments/oaf_tf215/README.md`, `RESULTS.md` | Document executed commands, provenance and actual new outcomes. |
 
@@ -81,10 +81,10 @@ input directory; write no selection artifact until all five bindings validate.
 
 - [ ] Write synthetic report/run/artifact tests for the fixed rank rule, Decimal score ordering and integer-ID tie breaks. A fixture may exercise the general rank selector with fewer rows; the real preparation path requires the pinned 182-success evidence and exact five IDs.
 - [ ] Add tests for missing prediction/source bodies, changed report digest, wrong cohort/reference/timing identity, duplicate score IDs, changed baseline descriptor/model lock/inference config, artifact/run-row mismatch and canonical WAV hash mismatch. Include a valid prediction body from another registered backend, a body with the wrong TF1 descriptor digest, and changed event/class counts while other run-row fields agree. Missing access is blocked; integrity mismatches fail. Assert no worker starts and no alternate song is selected.
-- [ ] Run `uv run pytest -q tests/benchmark/test_oaf_tf215_selected_compare.py -k 'selection or prepare'`; expect missing-interface failure.
+- [ ] Run `uv run pytest -q tests/benchmark/test_oaf_tf215_selected_inputs.py` to exercise rank selection and input preparation. Expect a missing-interface failure before implementation.
 - [ ] Implement preparation using `parse_oaf_corpus_run()`, `load_reference_set_manifest()`, the timing-manifest loader/preflight, `read_prediction_artifact()`, `prediction_artifact_matches_run_row()`, `resolve_source_audio()` and `materialize_full_mix_audio()`. Use `_expected_oaf_descriptor(config)` in the spec's full baseline-lineage checks: descriptor payload/digest, model/checkpoint/inference identity, rederived run ID, complete population, shared reference/timing identity, and each body's descriptor/map/event-count/class-count agreement with the pinned reports. The named readers do not enforce that chain by themselves. Require the known OaF full-mix view, frozen frame limit and exact archived input hash.
 - [ ] Seal the verified descriptor/model/inference/reference/timing identities, per-song event/class counts, relative WAV/prediction paths and every required digest. Prediction paths resolve beneath `baseline_run.parent`; WAV paths resolve beneath `input_root`. Reject absolute paths, traversal and symlinks. Hash canonical JSON without a trailing newline; print that digest for the run command's required `--selection-sha256` flag, outside the hashed document. Test portable root relocation with unchanged digests and rejection of escaping paths.
-- [ ] Rerun the targeted tests; expect all to pass. Recompute membership from Git commit `599033663ca3bb495d8faaac13180206eaafadb4` and confirm IDs/ranks/F1/counts against the spec's table without running inference.
+- [ ] Rerun `uv run pytest -q tests/benchmark/test_oaf_tf215_selected_inputs.py` and expect all tests to pass. Recompute membership from Git commit `599033663ca3bb495d8faaac13180206eaafadb4` and confirm IDs/ranks/F1/counts against the spec's table without running inference.
 - [ ] Commit as `feat(experiments): seal the five-song TF2.15 comparison`.
 
 ### Task 3: Measure drift and preserve failures
@@ -113,8 +113,21 @@ unmodified smoke result, five row outcomes and the precision/matching policy.
 - [ ] Run `uv run pytest -q tests/benchmark/test_oaf_tf215_selected_compare.py`; expect the new behavior tests to fail before implementation.
 - [ ] Implement the interfaces and CLI. Supply Task 1 with the live source set from the design. Reuse Task 2's sealed bindings and the spec's explicit event adapters. Keep original binary64 arrays for repeatability and use `quantize_six()` for archived-precision views, preserving rounded collisions. Match first at 1 ms and then only strict residuals within one emitted frame plus the rounding allowance. Retain indexes, metadata, distinct metric buckets, missing-confidence counts and every failed row.
 - [ ] Write the four artifacts specified by the design under the fresh execution directory. The raw event file retains every completed attempt; a complete run has 15 song attempts. Never publish them as canonical prediction-v2 bodies. Recollect the interpreter/host probe and recompute the runtime fingerprint before marking measurement complete.
-- [ ] Add both new test modules to the existing workflow's path filters and host-test command, updating its workflow tests. Keep routine PR CI checkpoint-free and add no corpus credentials or selected-song model job.
-- [ ] Run `uv run pytest -q tests/benchmark/test_oaf_tf215_runtime_identity.py tests/benchmark/test_oaf_tf215_selected_compare.py tests/benchmark/test_oaf_tf215_compare.py tests/benchmark/test_oaf_tf215_workflow.py tests/runtime/test_oaf_tf215_builder.py`. Expect all to pass; run `uv run ruff check .`, `uv run ruff format --check src tests` and `uv run pylint --errors-only src`.
+- [ ] Add the runtime identity, selected inputs, selected metrics and selected comparison test modules to the workflow's path filters and host-test command, updating its workflow tests. Keep routine PR CI checkpoint-free and add no corpus credentials or selected-song model job.
+- [ ] Run the experiment tests and expect all to pass.
+
+  ```bash
+  uv run pytest -q \
+    tests/benchmark/test_oaf_tf215_runtime_identity.py \
+    tests/benchmark/test_oaf_tf215_selected_inputs.py \
+    tests/benchmark/test_oaf_tf215_selected_metrics.py \
+    tests/benchmark/test_oaf_tf215_selected_compare.py \
+    tests/benchmark/test_oaf_tf215_compare.py \
+    tests/benchmark/test_oaf_tf215_workflow.py \
+    tests/runtime/test_oaf_tf215_builder.py
+  ```
+
+  Run `uv run ruff check .`, `uv run ruff format --check src tests` and `uv run pylint --errors-only src`.
 - [ ] Commit as `feat(experiments): measure bounded TF2.15 prediction drift`.
 
 ### Task 4: Execute the bounded comparison and record the decision

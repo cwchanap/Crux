@@ -1,4 +1,4 @@
-"""Focused checks for the graph-check probe's moving-statistics validation.
+"""Focused checks for the graph probe's environment and moving statistics.
 
 TensorFlow 2.15 only executes under the isolated Python 3.11 runtime, so these
 tests feed the validator the same kind of NumPy arrays the real Slim session
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -31,6 +31,25 @@ def _load_graph_check() -> ModuleType:
 @pytest.fixture(scope="module")
 def graph_check() -> ModuleType:
     return _load_graph_check()
+
+
+def test_environment_probe_leaves_other_cache_files_intact(
+    graph_check: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(graph_check.REQUIRED_ENVIRONMENT, "NUMBA_CACHE_DIR", str(tmp_path))
+    for name, value in graph_check.REQUIRED_ENVIRONMENT.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        graph_check, "sys", SimpleNamespace(flags=SimpleNamespace(hash_randomization=0))
+    )
+    existing_probe = tmp_path / ".graph-check-write-probe"
+    existing_probe.write_bytes(b"another process's file")
+
+    result = graph_check.validate_environment()
+
+    assert result["numba_cache_dir"] == str(tmp_path)
+    assert list(tmp_path.iterdir()) == [existing_probe]
+    assert existing_probe.read_bytes() == b"another process's file"
 
 
 def _arrays(output: object = MISSING, mean: object = MISSING, variance: object = MISSING) -> dict:
