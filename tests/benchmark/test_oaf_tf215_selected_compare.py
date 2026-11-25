@@ -4,23 +4,20 @@ from __future__ import annotations
 
 import json
 import struct
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from experiments.oaf_tf215 import compare
+from experiments.oaf_tf215 import compare, panel_tf1
 from experiments.oaf_tf215 import selected_compare as selected
 from runtime.oaf_tf1.model import load_model_config
 from src.benchmark.backend_identity import canonical_json_bytes, sha256_hex
 from src.benchmark.backends.base import CanonicalAudio, NativeEvent, NativePrediction
 from src.benchmark.input_view import load_direct_audio
-from src.benchmark.mapping import map_oaf_prediction
 from src.benchmark.oaf_corpus_run import _expected_oaf_descriptor
 from src.benchmark.oaf_smoke_oracle import read_smoke_oracle
 from src.benchmark.oaf_tf215_runtime import PROBE_SCHEMA
-from src.benchmark.prediction_artifact import render_prediction_artifact
 
 
 def _inputs(tmp_path):
@@ -197,8 +194,29 @@ def test_selected_rejects_modified_wav_before_song_requests(fake_experiment):
     assert len(workers) == 2
 
 
-@pytest.mark.parametrize("smoke", ["exact", "divergent", "stale"])
-def test_panel_tf1_smoke_verifies_a_fresh_local_prediction(tmp_path, monkeypatch, smoke):
+def test_run_panel_rejects_an_arbitrary_smoke_command(fake_experiment, monkeypatch):
+    monkeypatch.setattr(
+        selected,
+        "run_selected_comparison",
+        lambda **_: {"status": "complete", "output_dir": "unused"},
+    )
+    argv = ["run-panel"]
+    for key, value in fake_experiment.items():
+        flag = key.removeprefix("expected_").replace("_", "-")
+        argv.extend((f"--{flag}", str(value)))
+    argv.extend(("--reference-manifest", "reference.jsonl", "--timing-manifest", "timing.jsonl"))
+    argv.extend(
+        ("--tf1-smoke-prediction", "copied.jsonl", "--tf1-smoke-command", "cp", "saved.jsonl")
+    )
+    with pytest.raises(SystemExit) as error:
+        selected.main(argv)
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize("outcome", ["exact", "divergent", "changed_boot"])
+def test_paired_tf1_uses_the_reviewed_launcher_for_smoke_and_baseline(
+    tmp_path, monkeypatch, outcome
+):
     oracle_content = (selected.SMOKE_ROOT / "smoke-oracle.json").read_bytes()
     config = load_model_config(compare.MODEL_CONFIG_PATH)
     audio = load_direct_audio(
@@ -223,60 +241,174 @@ def test_panel_tf1_smoke_verifies_a_fresh_local_prediction(tmp_path, monkeypatch
         )
         for row in read_smoke_oracle(oracle_content).native_events
     )
-    if smoke == "divergent":
+    if outcome == "divergent":
         events = events[:-1]
     prediction = NativePrediction(audio, _expected_oaf_descriptor(config), events)
-    content = render_prediction_artifact(map_oaf_prediction(prediction)[0])
-    source = tmp_path / "fixture.jsonl"
-    source.write_bytes(content)
-    output = tmp_path / "fresh.jsonl"
-    execution = tmp_path / "execution"
-    boot_id = tmp_path / "boot_id"
-    boot_id.write_text("dfcab66e-1856-4b3e-b361-450357d3e936\n")
-    monkeypatch.setattr(selected, "BOOT_ID_PATH", boot_id, raising=False)
-    command = (
-        sys.executable,
-        "-c",
-        "import shutil, sys; shutil.copyfile(*sys.argv[1:])",
-        str(source),
-        str(output),
+
+    launcher = tmp_path / "launcher.py"
+    launcher.write_text(
+        "from pathlib import Path\n"
+        "def install(root, repo):\n"
+        "    assert root.parent == Path(__file__).parent\n"
+        "    root.mkdir()\n"
+        "def chroot_process_factory(root):\n"
+        "    assert root.is_dir()\n"
+        "    return lambda _: root\n"
     )
-    if smoke == "stale":
-        output.write_bytes(content)
-    if smoke != "exact":
-        reason = "already exists" if smoke == "stale" else "oracle native event count mismatch"
-        with pytest.raises(selected.SelectionError, match=reason):
-            selected._verify_panel_tf1_smoke(command, output, execution)
-        assert not execution.exists()
+    launcher_sha = sha256_hex(launcher.read_bytes())
+    monkeypatch.setattr(panel_tf1, "TF1_LAUNCHER_SHA256", launcher_sha)
+    reference = tmp_path / "reference.jsonl"
+    timing = tmp_path / "timing.jsonl"
+    for path, digest_attr in (
+        (reference, "FRESH_REFERENCE_MANIFEST_SHA256"),
+        (timing, "FRESH_TIMING_MANIFEST_SHA256"),
+    ):
+        path.write_bytes(path.name.encode())
+        monkeypatch.setattr(panel_tf1, digest_attr, sha256_hex(path.read_bytes()))
+    boot_path = tmp_path / "boot_id"
+    boot_id = "dfcab66e-1856-4b3e-b361-450357d3e936"
+    boot_path.write_text(boot_id + "\n")
+    monkeypatch.setattr(panel_tf1, "BOOT_ID_PATH", boot_path)
+    monkeypatch.setattr(compare, "_prepare_checkpoint", lambda *_: {"checkpoint": tmp_path})
+    factories = []
+
+    def create_backend(*, process_factory, checkpoint_dir, **options):
+        assert process_factory(None).is_dir()
+        assert checkpoint_dir == tmp_path
+        factories.append(process_factory)
+        return SimpleNamespace(transcribe=lambda _: prediction, close=lambda: None)
+
+    def run_oaf_corpus(request, *, backend_factory):
+        assert request.include_simfile_ids == tuple(sorted(selected.PANEL_SIMFILE_IDS))
+        assert request.backend == "oaf"
+        assert not request.resume
+        backend_factory(input_root=tmp_path).close()
+        path = request.output_dir / "run.json"
+        path.parent.mkdir()
+        path.write_bytes(b"fresh measurements")
+        if outcome == "changed_boot":
+            boot_path.write_text("00000000-0000-0000-0000-000000000001\n")
+        return SimpleNamespace(exit_code=0, run_id=panel_tf1.PANEL_RUN_ID, run_path=path)
+
+    monkeypatch.setattr(panel_tf1, "create_backend", create_backend)
+    monkeypatch.setattr(panel_tf1, "run_oaf_corpus", run_oaf_corpus)
+    arguments = {
+        "launcher_path": launcher,
+        "reference_manifest": reference,
+        "timing_manifest": timing,
+        "cache_dir": tmp_path,
+        "checkpoint_cache": tmp_path,
+        "directory": tmp_path,
+    }
+    if outcome == "divergent":
+        with pytest.raises(selected.SelectionError, match="oracle native event count mismatch"):
+            panel_tf1.measure_tf1_panel(**arguments)
+        assert len(factories) == 1
+        assert not (tmp_path / panel_tf1.SMOKE_PREDICTION_NAME).exists()
         return
-    proof = selected._verify_panel_tf1_smoke(command, output, execution)
-    assert proof["status"] == "exact"
-    assert proof["boot_id"] == boot_id.read_text().strip()
-    assert proof["oracle_sha256"] == sha256_hex(oracle_content)
-    assert proof["prediction_sha256"] == sha256_hex(content)
-    assert (execution / "tf1-smoke-prediction.jsonl").read_bytes() == content
+    if outcome == "changed_boot":
+        with pytest.raises(selected.SelectionError, match="boot ID changed during the TF1 panel"):
+            panel_tf1.measure_tf1_panel(**arguments)
+        return
+    proof = panel_tf1.measure_tf1_panel(**arguments)
+    assert len(factories) == 2 and factories[0] is factories[1]
+    assert proof.boot_id == boot_id
+    assert proof.launcher_sha256 == launcher_sha
+    assert proof.run_sha256 == sha256_hex(b"fresh measurements")
+    assert proof.smoke_oracle_sha256 == sha256_hex(oracle_content)
+    assert proof.smoke_prediction_sha256 == sha256_hex(
+        (tmp_path / panel_tf1.SMOKE_PREDICTION_NAME).read_bytes()
+    )
+
+
+def test_paired_runner_rejects_unreviewed_launcher_before_loading_it(tmp_path):
+    launcher = tmp_path / "copy-prediction.py"
+    launcher.write_text("raise AssertionError('the unreviewed launcher ran')\n")
+    with pytest.raises(selected.SelectionError, match="launcher digest does not match"):
+        panel_tf1.measure_tf1_panel(
+            launcher_path=launcher,
+            reference_manifest=tmp_path / "reference",
+            timing_manifest=tmp_path / "timing",
+            cache_dir=tmp_path,
+            checkpoint_cache=tmp_path,
+            directory=tmp_path,
+        )
+
+
+def test_measure_panel_cli_seals_boot_and_run_digest_before_candidate(
+    tmp_path, monkeypatch, capsys
+):
+    def measure_tf1_panel(**options):
+        run_path = options["directory"] / "run.json"
+        run_path.write_bytes(b"fresh TF1 panel")
+        return panel_tf1.Tf1PanelMeasurement(
+            run_path, "same-boot", sha256_hex(run_path.read_bytes()), "1" * 64, "2" * 64, "3" * 64
+        )
+
+    def prepare_panel_selection(*, baseline_run, **options):
+        return {"baseline_run_sha256": sha256_hex(baseline_run.read_bytes()), "items": []}
+
+    def run_selected_comparison(**options):
+        seal = json.loads(options["selection_path"].read_bytes())
+        assert seal["tf1_measurement"]["boot_id"] == "same-boot"
+        assert seal["tf1_measurement"]["baseline_run_sha256"] == seal["baseline_run_sha256"]
+        assert seal["baseline_run_sha256"] == sha256_hex(options["baseline_run"].read_bytes())
+        assert selected.selection_sha256(seal) == options["expected_selection_sha256"]
+        assert options["_tf1_measurement"].run_path == options["baseline_run"]
+        return {"status": "complete", "output_dir": "candidate", "panel_gate_passed": True}
+
+    monkeypatch.setattr(panel_tf1, "measure_tf1_panel", measure_tf1_panel)
+    monkeypatch.setattr(selected, "prepare_panel_selection", prepare_panel_selection)
+    monkeypatch.setattr(selected, "run_selected_comparison", run_selected_comparison)
+    argv = ["measure-panel"]
+    for flag in (
+        "tf1-rootfs-launcher",
+        "reference-manifest",
+        "timing-manifest",
+        "cache-dir",
+        "python311",
+        "runtime-root",
+        "checkpoint-cache",
+        "output-root",
+    ):
+        argv.extend((f"--{flag}", str(tmp_path / flag)))
+    assert selected.main(argv) == 0
+    assert json.loads(capsys.readouterr().out)["panel_gate_passed"] is True
 
 
 @pytest.mark.parametrize(
-    ("nonregression", "exact_tf1", "disposition"),
+    ("nonregression", "evidence", "disposition"),
     [
-        (True, True, "inferred"),
-        (False, True, "inferred"),
-        (True, False, "inferred"),
-        (True, False, "resumed"),
+        (True, "same_boot", "inferred"),
+        (False, "same_boot", "inferred"),
+        (True, "other_boot", "inferred"),
+        (True, "sealed_only", "inferred"),
+        (True, "wrong_run", "inferred"),
+        (True, "sealed_only", "resumed"),
     ],
 )
 def test_panel_uses_persistent_worker_and_replays_only_anchors(
-    fake_experiment, monkeypatch, nonregression, exact_tf1, disposition
+    fake_experiment, monkeypatch, nonregression, evidence, disposition
 ):
     inputs = fake_experiment
     root = inputs["input_root"]
     identifiers = selected.PANEL_SIMFILE_IDS
     baseline = b"sealed test run"
     inputs["baseline_run"].write_bytes(baseline)
+    measurement = panel_tf1.Tf1PanelMeasurement(
+        inputs["baseline_run"],
+        "tf1-boot",
+        sha256_hex(b"another run" if evidence == "wrong_run" else baseline),
+        panel_tf1.TF1_LAUNCHER_SHA256,
+        "2" * 64,
+        "3" * 64,
+    )
+    candidate_boot = "different-boot" if evidence == "other_boot" else measurement.boot_id
+    monkeypatch.setattr(panel_tf1, "read_boot_id", lambda: candidate_boot)
     selection = {
         "baseline_identity": {"run_id": "panel-test"},
         "baseline_run_sha256": sha256_hex(baseline),
+        "tf1_measurement": measurement.binding(),
         "items": [{"simfile_id": song} for song in identifiers],
     }
     bindings = tuple(
@@ -308,27 +440,23 @@ def test_panel_uses_persistent_worker_and_replays_only_anchors(
 
     monkeypatch.setattr(selected, "aggregate_panel_scores", aggregate)
     workers, start = _worker_factory(inputs)
-    smoke_options = {}
-    if exact_tf1:
-        smoke_path = root / "frozen-smoke.jsonl"
-        smoke_options = {"tf1_smoke_command": (sys.executable,), "tf1_smoke_prediction": smoke_path}
-        monkeypatch.setattr(
-            selected, "_verify_panel_tf1_smoke", lambda *args: {"status": "exact"}, raising=False
-        )
     result = selected.run_selected_comparison(
         **inputs,
         process_factory=start,
         panel_manifests=(root / "reference", root / "timing"),
-        **smoke_options,
+        _tf1_measurement=None if evidence == "sealed_only" else measurement,
     )
-    if disposition == "resumed":
+    if disposition == "resumed" or evidence == "wrong_run":
         assert result["status"] == "failed"
         assert result["failed_stage"] == "selection"
         assert not workers
         assert not result["panel_gate_passed"]
         return
     assert result["status"] == "complete"
-    assert result["panel_gate_passed"] is (nonregression and exact_tf1)
+    assert result["panel_gate_passed"] is (nonregression and evidence == "same_boot")
+    if evidence != "sealed_only":
+        assert result["candidate_boot_id"] == candidate_boot
+        assert result["tf1_smoke"]["boot_id"] == measurement.boot_id
     anchors = [f"{song}.wav" for song in selected.PANEL_ANCHORS]
     assert workers[2].requests == [f"{song}.wav" for song in sorted(identifiers)] + anchors
     assert workers[3].requests == anchors
