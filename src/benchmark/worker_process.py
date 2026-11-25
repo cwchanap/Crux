@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 _MAX_STDERR_DIAGNOSTIC_BYTES = 4096
+_STDERR_HEAD_BYTES = _MAX_STDERR_DIAGNOSTIC_BYTES // 2
+_STDERR_TAIL_BYTES = _MAX_STDERR_DIAGNOSTIC_BYTES - _STDERR_HEAD_BYTES
 _STDERR_READ_CHUNK_BYTES = 4096
 
 
@@ -43,7 +45,8 @@ class WorkerProcess:
         self._closed = False
         self._ready = dict(ready)
         self._stdout_buffer = bytearray()
-        self._stderr_buffer = bytearray()
+        self._stderr_head = bytearray()
+        self._stderr_tail = bytearray()
         self._stderr_truncated = False
         self._stderr_lock = threading.Lock()
         self._stderr_thread: threading.Thread | None = None
@@ -211,23 +214,23 @@ class WorkerProcess:
             if not chunk:
                 return
             with self._stderr_lock:
-                remaining = _MAX_STDERR_DIAGNOSTIC_BYTES - len(self._stderr_buffer)
-                if remaining > 0:
-                    self._stderr_buffer.extend(chunk[:remaining])
-                if len(chunk) > remaining:
+                remaining = _STDERR_HEAD_BYTES - len(self._stderr_head)
+                self._stderr_head.extend(chunk[:remaining])
+                self._stderr_tail.extend(chunk[remaining:])
+                overflow = len(self._stderr_tail) - _STDERR_TAIL_BYTES
+                if overflow > 0:
+                    del self._stderr_tail[:overflow]
                     self._stderr_truncated = True
 
     def _with_stderr_diagnostic(self, error: WorkerProcessError) -> WorkerProcessError:
         if str(error) != "worker exited before ready":
             return error
         with self._stderr_lock:
-            content = bytes(self._stderr_buffer)
-            truncated = self._stderr_truncated
+            marker = b"\n... [stderr truncated] ...\n" if self._stderr_truncated else b""
+            content = bytes(self._stderr_head) + marker + bytes(self._stderr_tail)
         diagnostic = content.decode("utf-8", errors="replace").strip()
         if not diagnostic:
             return error
-        if truncated:
-            diagnostic += " ... [stderr truncated]"
         return WorkerProcessError(f"{error}: {diagnostic}")
 
     def _read_record(self, timeout_seconds: float) -> dict[str, Any]:

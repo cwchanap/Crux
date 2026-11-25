@@ -229,7 +229,7 @@ def test_tf215_corpus_preserves_bounded_startup_diagnostics(tmp_path, monkeypatc
     runtime.python311.symlink_to(sys.executable)
     runtime.runtime_root.mkdir(parents=True)
     (runtime.runtime_root / "worker.py").write_text(
-        "import sys\nprint('startup context ' * 70, file=sys.stderr)\n"
+        "import sys\nprint('startup context ' * 500, file=sys.stderr)\n"
         "raise ImportError('missing TensorFlow dependency')\n",
         encoding="utf-8",
     )

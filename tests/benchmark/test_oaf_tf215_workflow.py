@@ -118,7 +118,7 @@ def _model_job() -> str:
     return _job_text(WORKFLOW.read_text(encoding="utf-8"), "model")
 
 
-def _graph_job() -> str:
+def _read_graph_job() -> str:
     return _job_text(WORKFLOW.read_text(encoding="utf-8"), "graph")
 
 
@@ -235,7 +235,7 @@ def test_graph_job_runs_builder_tests_outside_the_locked_worker(tmp_path: Path) 
         "FAKE_WORKER_COMMANDS": str(worker_commands),
     }
     completed = _run_script(
-        _run_block(_graph_job(), BUILD_STEP),
+        _run_block(_read_graph_job(), BUILD_STEP),
         tmp_path,
         env,
         'printf \'%s\\0\' "$@" >> "$FAKE_UV_ARGV"',
@@ -255,7 +255,7 @@ def test_graph_job_runs_builder_tests_outside_the_locked_worker(tmp_path: Path) 
 
 
 def test_graph_job_always_records_and_uploads_the_result_with_stage_outcomes() -> None:
-    graph = _graph_job()
+    graph = _read_graph_job()
     summary = graph.split(f"      - name: {GRAPH_SUMMARY_STEP}\n", maxsplit=1)[1]
     summary, upload = summary.split("      - name: Upload compact result\n", maxsplit=1)
     assert summary.startswith("        if: always()\n")
@@ -274,7 +274,7 @@ def _run_graph_summary(workdir: Path, outcomes: tuple[str, ...]) -> str:
         for step, outcome in zip(GRAPH_STEPS, outcomes, strict=True)
     }
     completed = _run_script(
-        _run_block(_graph_job(), GRAPH_SUMMARY_STEP),
+        _run_block(_read_graph_job(), GRAPH_SUMMARY_STEP),
         workdir,
         {**_env(workdir), "GITHUB_RUN_ID": "42", **outcome_env},
         "exit 127",

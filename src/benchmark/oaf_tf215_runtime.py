@@ -27,7 +27,6 @@ RUNTIME_SCHEMA = "crux.oaf-tf215-runtime/v1"
 EXPERIMENT = Path("experiments/oaf_tf215")
 FROZEN = Path("runtime/oaf_tf1")
 PRISTINE_CONVERTER = Path("upstream/magenta/music/sequences_lib.py")
-_NUMBA_CACHE_PARENT = Path("/tmp")
 WORKER_ENVIRONMENT = MappingProxyType(
     {
         "CUDA_VISIBLE_DEVICES": "-1",
@@ -63,8 +62,21 @@ def build_tf215_worker_environment() -> dict[str, str]:
 
     if not hasattr(os, "geteuid"):
         raise ValueError("TF2.15 worker cache requires POSIX user identity")
+    from pwd import getpwuid
+
     uid = os.geteuid()
-    cache = _NUMBA_CACHE_PARENT / f"crux-oaf-tf215-numba-{uid}"
+    try:
+        home = Path(getpwuid(uid).pw_dir).resolve(strict=True)
+    except KeyError as error:
+        raise ValueError("TF2.15 worker cache requires a local account home") from error
+    home_metadata = home.lstat()
+    if (
+        not stat.S_ISDIR(home_metadata.st_mode)
+        or home_metadata.st_uid != uid
+        or home_metadata.st_mode & 0o022
+    ):
+        raise ValueError(f"expected a private Numba cache parent owned by the current user: {home}")
+    cache = home / ".crux-oaf-tf215-numba"
     try:
         cache.mkdir(mode=0o700)
     except FileExistsError:

@@ -377,7 +377,7 @@ def test_measure_panel_cli_seals_boot_and_run_digest_before_candidate(
     assert json.loads(capsys.readouterr().out)["panel_gate_passed"] is True
 
 
-def _panel_experiment(inputs, monkeypatch, *, evidence="same_boot", disposition="inferred"):
+def _prepare_panel_experiment(inputs, monkeypatch, *, evidence="same_boot", disposition="inferred"):
     root = inputs["input_root"]
     identifiers = selected.PANEL_SIMFILE_IDS
     baseline = b"sealed test run"
@@ -444,7 +444,7 @@ def _panel_experiment(inputs, monkeypatch, *, evidence="same_boot", disposition=
 def test_panel_uses_persistent_worker_and_replays_only_anchors(
     fake_experiment, monkeypatch, nonregression, evidence, disposition
 ):
-    inputs, candidate_boot = _panel_experiment(
+    inputs, candidate_boot = _prepare_panel_experiment(
         fake_experiment, monkeypatch, evidence=evidence, disposition=disposition
     )
     identifiers = selected.PANEL_SIMFILE_IDS
@@ -480,19 +480,25 @@ def test_panel_uses_persistent_worker_and_replays_only_anchors(
 
 
 @pytest.mark.parametrize(
-    ("worker_number", "stage", "error", "anchor_attempts"),
+    ("worker_number", "stage", "error", "anchor_attempts", "runtime_changed"),
     [
-        (1, "worker_start", "panel interpreter could not be started", 0),
-        (1, "worker_close", "panel worker close timed out", 2),
-        (2, "worker_start", "panel interpreter could not be started", 2),
-        (2, "restore", "worker restored tensor count is invalid", 2),
-        (2, "worker_close", "panel worker close timed out", 3),
+        (1, "worker_start", "panel interpreter could not be started", 0, False),
+        (1, "worker_close", "panel worker close timed out", 2, False),
+        (2, "worker_start", "panel interpreter could not be started", 2, False),
+        (2, "restore", "worker restored tensor count is invalid", 2, False),
+        (2, "worker_close", "panel worker close timed out", 3, False),
+        (2, "worker_close", "panel worker close timed out", 3, True),
     ],
 )
 def test_panel_retains_completed_evidence_when_a_worker_fails(
-    fake_experiment, monkeypatch, worker_number, stage, error, anchor_attempts
+    fake_experiment, monkeypatch, worker_number, stage, error, anchor_attempts, runtime_changed
 ):
-    inputs, _ = _panel_experiment(fake_experiment, monkeypatch)
+    inputs, _ = _prepare_panel_experiment(fake_experiment, monkeypatch)
+    if runtime_changed:
+        identities = iter(({"schema": "test-runtime/v1"}, {"schema": "test-runtime/v1", "cpu": 2}))
+        monkeypatch.setattr(
+            selected, "build_runtime_identity", lambda *args, **kwargs: next(identities)
+        )
     workers, start = _worker_factory(inputs)
 
     def start_with_failure(*args, **kwargs):
@@ -529,6 +535,16 @@ def test_panel_retains_completed_evidence_when_a_worker_fails(
         assert result["panel_scores"]["micro_f1_nonregression"] is True
         assert result["panel_runtime"]["all_matched"]["songs"] == scored_songs
         assert result["panel_runtime"]["all_matched"]["baseline_rtf"] == 2
+        if runtime_changed:
+            assert result["runtime_after_sha256"] != result["runtime_sha256"]
+            assert (
+                result["runtime_recheck_error"] == "runtime fingerprint changed during measurement"
+            )
+        else:
+            assert result["runtime_after_sha256"] == result["runtime_sha256"]
+            assert "runtime_recheck_error" not in result
+    else:
+        assert "runtime_after_sha256" not in result
     for row in result["items"]:
         anchor = row["simfile_id"] in selected.PANEL_ANCHORS
         expected_attempts = anchor_attempts if anchor else int(scored_songs > 0)

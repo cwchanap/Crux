@@ -557,7 +557,7 @@ def run_selected_comparison(
                     for row, (audio, baseline) in zip(record["items"], snapshots, strict=True):
                         _run_song(row, audio, baseline, launch=launch, stream=stream)
 
-        if record["status"] == "failed":
+        if record["status"] == "failed" and not record["panel_scores"]["scored_song_count"]:
             return record
 
         stage = "runtime_recheck"
@@ -572,6 +572,8 @@ def run_selected_comparison(
         record["runtime_after_sha256"] = after_sha
         if after_sha != runtime_sha:
             raise ValueError("runtime fingerprint changed during measurement")
+        if record["status"] == "failed":
+            return record
 
         statuses = {row["status"] for row in record["items"]}
         record["status"] = next(
@@ -593,7 +595,10 @@ def run_selected_comparison(
     except compare.CheckpointAcquisitionError as error:
         _set_failure(record, stage, error, blocked=str(error) in compare.CHECKPOINT_ACCESS_REASONS)
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
-        _set_failure(record, stage, error)
+        if stage == "runtime_recheck" and record["status"] == "failed":
+            record["runtime_recheck_error"] = str(error)[:1024]
+        else:
+            _set_failure(record, stage, error)
     finally:
         record["output_dir"] = os.fspath(directory)
         _write_json(directory / "comparison.json", record)
