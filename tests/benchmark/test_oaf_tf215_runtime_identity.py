@@ -11,9 +11,9 @@ from pathlib import Path
 
 import pytest
 
-from experiments.oaf_tf215 import runtime_identity as identity
-from experiments.oaf_tf215.compare import MODEL_CONFIG_PATH, _worker_environment
+from experiments.oaf_tf215.compare import MODEL_CONFIG_PATH
 from runtime.oaf_tf1.model import load_model_config
+from src.benchmark import oaf_tf215_runtime as identity
 from src.benchmark.backend_identity import (
     canonical_json_bytes,
     normalize_known_backend_descriptor,
@@ -30,8 +30,8 @@ def test_candidate_changes_only_backend_identity():
         "backend_id": "magenta-egmd-tf215-94529798-8hit-experimental-v1",
     }
     assert descriptor.sha256 != baseline.sha256
-    assert normalize_known_backend_descriptor(baseline.payload) == baseline.payload
     assert descriptor.sha256 == "938cbcccff5adda03f11344596e21534e178c98929098bf8327feb1e9ed4c890"
+    assert normalize_known_backend_descriptor(baseline.payload) == baseline.payload
     assert normalize_known_backend_descriptor(descriptor.payload) == descriptor.payload
 
 
@@ -89,7 +89,8 @@ def test_probe_launch_uses_worker_arguments_and_environment(tmp_path):
     )
     shim.chmod(0o755)
     result = identity.collect_probe(
-        shim, worker_environment={**_worker_environment(), "OPENBLAS_NUM_THREADS": "3"}
+        shim,
+        worker_environment={**identity.tf215_worker_environment(), "OPENBLAS_NUM_THREADS": "3"},
     )
     assert result["status"] == "blocked"
 
@@ -119,27 +120,187 @@ def test_x86_probe_requires_affinity(monkeypatch):
     assert "unavailable_affinity" in identity.probe_runtime()["reasons"]
 
 
+def _runtime_tree(root: Path) -> Path:
+    relative_files = (
+        "src/cli/benchmark.py",
+        "experiments/oaf_tf215/requirements.lock",
+        "experiments/oaf_tf215/patches/tf215-compat.patch",
+        "runtime/oaf_tf1/patches/capture-emitted-frame.patch",
+        "runtime/oaf_tf1/model.json",
+        "scratch/worker.py",
+        "scratch/model.json",
+        "upstream/magenta/music/sequences_lib.py",
+    )
+    for relative in relative_files:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_bytes(
+                MODEL_CONFIG_PATH.read_bytes() if path.name == "model.json" else b"fixture"
+            )
+    return root / "scratch"
+
+
+@pytest.fixture
+def preparation(tmp_path, monkeypatch):
+    from src.benchmark import checkpoint_acquisition
+
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / "repo"
+    scratch = _runtime_tree(root)
+    python = tmp_path / "venv/python"
+    python.parent.mkdir()
+    python.symlink_to(sys.executable)
+    environment = identity.tf215_worker_environment()
+    probe = {
+        "schema": identity.PROBE_SCHEMA,
+        "status": "ok",
+        "host": {
+            "system": "Linux",
+            "machine": "x86_64",
+            "release": "6.1.0",
+            "libc_name": "glibc",
+            "libc_version": "2.31",
+            "cpu_count": 2,
+            "affinity_cpu_count": 2,
+            "cpu_model": "example",
+            "cpu_vendor": "GenuineIntel",
+            "cpu_flags": ["sse2"],
+        },
+        "python": {"sha256": "2" * 64, "version": "3.11.9", "implementation": "CPython"},
+        "worker_environment": {key: environment.get(key) for key in identity.ENV_KEYS},
+        "distributions": [{"name": "tensorflow-cpu", "version": "2.15.1"}],
+    }
+    seen = []
+
+    def run(command, **kwargs):
+        assert command == [str(python), "-s", str(Path(identity.__file__).resolve()), "--probe"]
+        seen.append(kwargs["env"])
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(probe))
+
+    def verify(config, cache_root, *, download):
+        assert config == load_model_config(MODEL_CONFIG_PATH)
+        assert not download
+        return cache_root / "sha256" / config.checkpoint.archive_sha256
+
+    monkeypatch.setattr(identity.subprocess, "run", run)
+    monkeypatch.setattr(checkpoint_acquisition, "prepare_oaf_checkpoint", verify)
+
+    def prepare():
+        return identity.prepare_tf215_runtime(
+            root,
+            python311=python.relative_to(tmp_path),
+            runtime_root=scratch.relative_to(tmp_path),
+            checkpoint_cache=Path("cache"),
+        )
+
+    return root, scratch, python, probe, seen, prepare
+
+
+def test_candidate_preparation_fingerprints_worker_and_invokes_venv_path(preparation, monkeypatch):
+    root, scratch, python, probe, seen, prepare = preparation
+    monkeypatch.setenv("PYTHONPATH", "/unrelated/imports")
+    first = prepare()
+    assert first.python311 == python
+    assert first.runtime_root == scratch
+    assert first.checkpoint_dir.is_absolute()
+    assert seen == [dict(first.worker_environment)]
+    assert "PYTHONPATH" not in first.worker_environment
+    assert first.worker_environment["TF_ENABLE_ONEDNN_OPTS"] == "0"
+    assert first.sha256 == hashlib.sha256(canonical_json_bytes(first.identity)).hexdigest()
+
+    (root / "src/cli/benchmark.py").write_text("changed host driver")
+    assert prepare().sha256 == first.sha256
+    probe["host"]["cpu_count"] = 4
+    assert prepare().sha256 != first.sha256
+    probe["host"]["cpu_count"] = 2
+    (scratch / "worker.py").write_text("changed worker")
+    assert prepare().sha256 != first.sha256
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("host", "runtime probe host identity is invalid"),
+        ("python", "runtime probe interpreter identity is invalid"),
+        ("worker_environment", "runtime probe environment differs"),
+    ],
+)
+def test_candidate_preparation_rejects_empty_success_fields(preparation, field, message):
+    _, _, _, probe, _, prepare = preparation
+    probe[field].clear()
+    with pytest.raises(ValueError, match=message):
+        prepare()
+
+
+def test_candidate_preparation_rejects_environment_mismatch(preparation):
+    _, _, _, probe, _, prepare = preparation
+    probe["worker_environment"]["CUDA_VISIBLE_DEVICES"] = "0"
+    with pytest.raises(ValueError, match="runtime probe environment differs"):
+        prepare()
+
+
+@pytest.mark.parametrize(
+    ("problem", "message"),
+    [
+        ("blocked", "unsupported_platform"),
+        ("timeout", "runtime probe timed out"),
+        ("malformed", "runtime probe package inventory is invalid"),
+        ("wrong_tensorflow", "tensorflow-cpu==2.15.1"),
+        ("changed_config", "scratch model configuration differs"),
+        ("missing_worker", "scratch worker is unavailable"),
+        ("symlink_worker", "symlink"),
+        ("symlink_scratch", "scratch root is unavailable or is a symlink"),
+    ],
+)
+def test_candidate_preparation_rejects_unavailable_runtime(
+    preparation, monkeypatch, problem, message
+):
+    _, scratch, _, probe, _, prepare = preparation
+    if problem == "blocked":
+        monkeypatch.setattr(
+            identity.subprocess,
+            "run",
+            lambda command, **_: subprocess.CompletedProcess(
+                command,
+                2,
+                stdout=json.dumps(
+                    {
+                        "schema": identity.PROBE_SCHEMA,
+                        "status": "blocked",
+                        "reasons": ["unsupported_platform"],
+                    }
+                ),
+            ),
+        )
+    elif problem == "timeout":
+
+        def timeout(command, **_):
+            raise subprocess.TimeoutExpired(command, 60)
+
+        monkeypatch.setattr(identity.subprocess, "run", timeout)
+    elif problem == "malformed":
+        probe["distributions"] = [{}]
+    elif problem == "wrong_tensorflow":
+        probe["distributions"][0]["version"] = "2.16.0"
+    elif problem == "changed_config":
+        (scratch / "model.json").write_text("changed model configuration")
+    elif problem in {"missing_worker", "symlink_worker"}:
+        worker = scratch / "worker.py"
+        worker.unlink()
+        if problem == "symlink_worker":
+            worker.symlink_to(MODEL_CONFIG_PATH)
+    elif problem == "symlink_scratch":
+        target = scratch.rename(scratch.with_name("scratch-target"))
+        scratch.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match=message):
+        prepare()
+
+
 def test_identity_hashes_actual_source_and_worker_environment(tmp_path):
     def fingerprint(root, *, worker_setting=None, core_count=2, tensorflow_version="2.15.1"):
-        runtime = root / "scratch"
-        driver = Path("src/benchmark/scoring.py")
-        fixture_files = [
-            driver,
-            Path("experiments/oaf_tf215/requirements.lock"),
-            Path("experiments/oaf_tf215/patches/tf215-compat.patch"),
-            Path("runtime/oaf_tf1/patches/capture-emitted-frame.patch"),
-            Path("runtime/oaf_tf1/model.json"),
-            Path("scratch/worker.py"),
-            Path("scratch/model.json"),
-            Path("upstream/magenta/music/sequences_lib.py"),
-        ]
-        for relative in fixture_files:
-            path = root / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if not path.exists():
-                path.write_bytes(
-                    MODEL_CONFIG_PATH.read_bytes() if path.name == "model.json" else b"fixture"
-                )
+        runtime = _runtime_tree(root)
         probe = {
             "schema": "crux.oaf-tf215-probe/v1",
             "status": "ok",
@@ -148,7 +309,9 @@ def test_identity_hashes_actual_source_and_worker_environment(tmp_path):
             "host": {"cpu_count": core_count, "affinity_cpu_count": 2},
             "worker_environment": {"OPENBLAS_NUM_THREADS": worker_setting},
         }
-        value = identity.build_runtime_identity(root, runtime, probe, driver_files=[driver])
+        value = identity.build_runtime_identity(
+            root, runtime, probe, driver_files=[Path("src/cli/benchmark.py")]
+        )
         return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
     first = tmp_path / "one"
@@ -166,11 +329,11 @@ def test_identity_hashes_actual_source_and_worker_environment(tmp_path):
     converter.write_bytes(b"changed pristine converter")
     assert fingerprint(second) != initial
     converter.write_bytes(b"fixture")
-    (second / "src/benchmark/scoring.py").write_bytes(b"changed host scoring")
+    (second / "src/cli/benchmark.py").write_bytes(b"changed host driver")
     assert fingerprint(second) != initial
     (second / "scratch/model.json").write_bytes(b"changed worker configuration")
     with pytest.raises(ValueError, match="scratch model configuration"):
         fingerprint(second)
-    (first / "scratch/link.py").symlink_to(second / "src/benchmark/scoring.py")
+    (first / "scratch/link.py").symlink_to(second / "src/cli/benchmark.py")
     with pytest.raises(ValueError, match="symlink"):
         fingerprint(first)

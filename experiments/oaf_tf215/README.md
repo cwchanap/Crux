@@ -22,7 +22,7 @@ check does not by itself establish model parity.
 | `patches/tf215-compat.patch` | The single reviewed TF 2.15 compatibility patch (drum `tf_slim`, HParams/RNN, Estimator, unused package-initializer imports). |
 | `compare.py` | Python 3.12 driver: verifies the checkpoint and fixture, then runs two requests through one loaded Python 3.11 scratch worker plus one through a fresh worker and compares the exact native events with the frozen binary64 smoke oracle. |
 | `selected_compare.py` | Seals archived or fresh TF1 inputs for the five fixed songs and measures TF2.15 drift with a separate runtime identity. |
-| `runtime_identity.py` | Fingerprints actual source files and inventories the isolated worker environment. |
+| [`src/benchmark/oaf_tf215_runtime.py`](../../src/benchmark/oaf_tf215_runtime.py) | Fingerprints source files and inventories the isolated worker environment. |
 | `check_workflow_result_fallback.py` | Stdlib-only local check: the workflow's always-on result step writes a failed sync/check/build/graph/environment record when no graph output exists. |
 | `README.md` | This file. Reproduction commands and evidence scope. |
 | `RESULTS.md` | Recorded CI, graph, restore, inference and manual-job evidence plus the decision checkpoint; not a parity claim. |

@@ -1,4 +1,4 @@
-"""Fingerprint the experimental host driver and isolated OaF worker."""
+"""Prepare and fingerprint the isolated TF2.15 OaF worker."""
 
 from __future__ import annotations
 
@@ -8,22 +8,32 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from runtime.oaf_tf1.model import OafModelConfig
-    from src.benchmark.backend_identity import BackendDescriptor
+    from src.benchmark.backend_identity import BackendDescriptor, JsonValue
 
-BACKEND_ID = "magenta-egmd-tf215-94529798-8hit-experimental-v1"
 PROBE_SCHEMA = "crux.oaf-tf215-probe/v1"
 RUNTIME_SCHEMA = "crux.oaf-tf215-runtime/v1"
 EXPERIMENT = Path("experiments/oaf_tf215")
 FROZEN = Path("runtime/oaf_tf1")
 PRISTINE_CONVERTER = Path("upstream/magenta/music/sequences_lib.py")
+WORKER_ENVIRONMENT = MappingProxyType(
+    {
+        "CUDA_VISIBLE_DEVICES": "-1",
+        "PYTHONHASHSEED": "0",
+        "TF_ENABLE_ONEDNN_OPTS": "0",
+        "NUMBA_CACHE_DIR": "/tmp/numba-cache",
+    }
+)
 ENV_KEYS = (
     "CUDA_VISIBLE_DEVICES PYTHONHASHSEED TF_ENABLE_ONEDNN_OPTS NUMBA_CACHE_DIR "
     "OMP_NUM_THREADS OMP_THREAD_LIMIT OMP_DYNAMIC OMP_PROC_BIND OMP_PLACES "
@@ -33,6 +43,23 @@ ENV_KEYS = (
     "TF_DETERMINISTIC_OPS TF_CUDNN_DETERMINISTIC TF_USE_LEGACY_KERAS "
     "ONEDNN_MAX_CPU_ISA DNNL_MAX_CPU_ISA LD_PRELOAD LD_LIBRARY_PATH"
 ).split()
+
+
+@dataclass(frozen=True)
+class OafTf215Runtime:
+    python311: Path
+    runtime_root: Path
+    checkpoint_dir: Path
+    worker_environment: Mapping[str, str]
+    descriptor: BackendDescriptor
+    identity: dict[str, JsonValue]
+    sha256: str
+
+
+def tf215_worker_environment() -> dict[str, str]:
+    from src.benchmark.backends.idm import _isolated_worker_environment
+
+    return {**_isolated_worker_environment(), **WORKER_ENVIRONMENT}
 
 
 def _file_sha256(path: Path) -> str:
@@ -131,6 +158,40 @@ def probe_runtime() -> dict[str, Any]:
     }
 
 
+def _require_probe_identity(record: Mapping[str, Any], environment: Mapping[str, str]) -> None:
+    host = record.get("host")
+    if (
+        not isinstance(host, dict)
+        or host.get("system") != "Linux"
+        or host.get("machine") != "x86_64"
+        or not all(
+            isinstance(host.get(field), str) and host[field]
+            for field in ("release", "libc_name", "libc_version", "cpu_model", "cpu_vendor")
+        )
+        or not all(
+            type(host.get(field)) is int and host[field] > 0
+            for field in ("cpu_count", "affinity_cpu_count")
+        )
+        or not isinstance(host.get("cpu_flags"), list)
+        or not host["cpu_flags"]
+        or not all(isinstance(flag, str) and flag for flag in host["cpu_flags"])
+    ):
+        raise ValueError("runtime probe host identity is invalid")
+    python = record.get("python")
+    if (
+        not isinstance(python, dict)
+        or not isinstance(python.get("implementation"), str)
+        or not python["implementation"]
+        or not isinstance(python.get("version"), str)
+        or not re.fullmatch(r"3\.11\.\d+.*", python["version"])
+        or not isinstance(python.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", python["sha256"])
+    ):
+        raise ValueError("runtime probe interpreter identity is invalid")
+    if record.get("worker_environment") != {key: environment.get(key) for key in ENV_KEYS}:
+        raise ValueError("runtime probe environment differs from the worker launch environment")
+
+
 def collect_probe(python311: Path, *, worker_environment: Mapping[str, str]) -> dict[str, Any]:
     try:
         completed = subprocess.run(
@@ -141,6 +202,8 @@ def collect_probe(python311: Path, *, worker_environment: Mapping[str, str]) -> 
             check=False,
             timeout=60,
         )
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("runtime probe timed out") from error
     except OSError:
         return {
             "schema": PROBE_SCHEMA,
@@ -154,9 +217,12 @@ def collect_probe(python311: Path, *, worker_environment: Mapping[str, str]) -> 
     if (
         not isinstance(record, dict)
         or record.get("schema") != PROBE_SCHEMA
+        or not isinstance(record.get("status"), str)
         or completed.returncode != {"ok": 0, "blocked": 2}.get(record.get("status"))
     ):
         raise ValueError("runtime probe returned an invalid diagnostic")
+    if record["status"] == "ok":
+        _require_probe_identity(record, worker_environment)
     return record
 
 
@@ -164,11 +230,12 @@ def build_candidate_descriptor(config: OafModelConfig) -> BackendDescriptor:
     from src.benchmark.backend_identity import (
         OAF_DESCRIPTOR_KEYS,
         OAF_DESCRIPTOR_SCHEMA,
+        OAF_TF215_BACKEND_ID,
         build_descriptor,
     )
     from src.benchmark.oaf_corpus_run import _expected_oaf_descriptor
 
-    payload = {**_expected_oaf_descriptor(config).payload, "backend_id": BACKEND_ID}
+    payload = {**_expected_oaf_descriptor(config).payload, "backend_id": OAF_TF215_BACKEND_ID}
     return build_descriptor(payload, OAF_DESCRIPTOR_KEYS, OAF_DESCRIPTOR_SCHEMA)
 
 
@@ -217,18 +284,30 @@ def build_runtime_identity(
 ) -> dict[str, Any]:
     from runtime.oaf_tf1.model import load_model_config
 
-    fields = ("host", "python", "distributions", "worker_environment")
-    if (
-        probe.get("schema") != PROBE_SCHEMA
-        or probe.get("status") != "ok"
-        or any(field not in probe for field in fields)
-    ):
+    mappings = ("host", "python", "worker_environment")
+    if probe.get("schema") != PROBE_SCHEMA:
+        raise ValueError("runtime probe schema is invalid")
+    if probe.get("status") == "blocked":
+        reasons = probe.get("reasons")
+        if (
+            isinstance(reasons, list)
+            and reasons
+            and all(isinstance(reason, str) for reason in reasons)
+        ):
+            raise ValueError(f"runtime probe is blocked: {', '.join(reasons)[:512]}")
+        raise ValueError("runtime probe is blocked")
+    if probe.get("status") != "ok" or not all(isinstance(probe.get(key), dict) for key in mappings):
         raise ValueError("a complete successful runtime probe is required")
-    if not driver_files:
-        raise ValueError("driver source files are required")
+    packages = probe.get("distributions")
+    if not isinstance(packages, list) or not all(
+        isinstance(package, dict)
+        and all(isinstance(package.get(key), str) and package[key] for key in ("name", "version"))
+        for package in packages
+    ):
+        raise ValueError("runtime probe package inventory is invalid")
     tensorflow_versions = [
         package["version"]
-        for package in probe["distributions"]
+        for package in packages
         if package["name"].lower().replace("_", "-") == "tensorflow-cpu"
     ]
     if tensorflow_versions != ["2.15.1"]:
@@ -236,11 +315,14 @@ def build_runtime_identity(
     config_path = FROZEN / "model.json"
     config_sha = _source_digest(repo_root, config_path)
     scratch = _scratch_inventory(runtime_root)
+    if "worker.py" not in scratch:
+        raise ValueError("scratch worker is unavailable")
     if scratch.get("model.json") != config_sha:
         raise ValueError("scratch model configuration differs from frozen model.json")
     return {
         "schema": RUNTIME_SCHEMA,
-        **{field: probe[field] for field in fields},
+        **{field: probe[field] for field in mappings},
+        "distributions": packages,
         "requirements_lock_sha256": _source_digest(repo_root, EXPERIMENT / "requirements.lock"),
         "model_config_sha256": config_sha,
         "checkpoint_archive_sha256": load_model_config(
@@ -258,6 +340,38 @@ def build_runtime_identity(
             path.as_posix(): _source_digest(repo_root, path) for path in sorted(set(driver_files))
         },
     }
+
+
+def prepare_tf215_runtime(
+    repo_root: Path,
+    *,
+    python311: Path,
+    runtime_root: Path,
+    checkpoint_cache: Path,
+) -> OafTf215Runtime:
+    """Verify local runtime inputs and capture the environment used by the worker."""
+    from runtime.oaf_tf1.model import load_model_config
+    from src.benchmark.backend_identity import canonical_json_bytes, sha256_hex
+    from src.benchmark.checkpoint_acquisition import prepare_oaf_checkpoint
+
+    # The executable symlink is part of virtualenv discovery. Resolve its target
+    # only inside the probe when hashing the interpreter binary.
+    python311 = python311.absolute()
+    runtime_root = runtime_root.absolute()
+    environment = tf215_worker_environment()
+    probe = collect_probe(python311, worker_environment=environment)
+    identity = build_runtime_identity(repo_root, runtime_root, probe, driver_files=())
+    config = load_model_config(repo_root / FROZEN / "model.json")
+    checkpoint_dir = prepare_oaf_checkpoint(config, checkpoint_cache.absolute(), download=False)
+    return OafTf215Runtime(
+        python311=python311,
+        runtime_root=runtime_root,
+        checkpoint_dir=checkpoint_dir,
+        worker_environment=MappingProxyType(environment),
+        descriptor=build_candidate_descriptor(config),
+        identity=identity,
+        sha256=sha256_hex(canonical_json_bytes(identity)),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
