@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import click
+import pytest
 from click.testing import CliRunner
 
 from src.benchmark.backend_identity import (
@@ -458,6 +459,104 @@ def test_run_oaf_corpus_preserves_domain_preflight_exit_code(tmp_path: Path, mon
     assert summary["quarantined_count"] == 0
     assert summary["aggregate_rtf"] is None
     assert summary["projected_full_wall_time_sec"] is None
+
+
+def _oaf_corpus_cli_args(tmp_path: Path) -> list[str]:
+    return [
+        "benchmark",
+        "run-oaf-corpus",
+        "--manifest",
+        str(tmp_path / "reference.jsonl"),
+        "--timing-manifest",
+        str(tmp_path / "timing.jsonl"),
+        "--cache-dir",
+        str(tmp_path / "cache"),
+        "--output-dir",
+        str(tmp_path / "output"),
+    ]
+
+
+@pytest.mark.parametrize("backend", ["oaf", "oaf-tf215"])
+def test_run_oaf_corpus_emits_bounded_preflight_failure(
+    tmp_path: Path, monkeypatch, backend
+) -> None:
+    import src.benchmark.oaf_corpus_run as runner_module
+
+    def bad_manifest(_):
+        raise ValueError("broken\x00manifest " + "x" * 540)
+
+    monkeypatch.setattr(runner_module, "load_reference_set_manifest", bad_manifest)
+    args = [*_oaf_corpus_cli_args(tmp_path), "--backend", backend]
+    if backend == "oaf-tf215":
+        args.extend(["--python311", "venv/bin/python", "--runtime-root", "scratch/runtime"])
+    result = CliRunner().invoke(main, args, catch_exceptions=False)
+    assert result.exit_code == 2
+    assert result.stderr == ""
+    summary = json.loads(result.stdout)
+    assert summary["status"] == "failed"
+    assert summary["failure_code"] == "preflight_failed"
+    assert summary["failure_detail"].startswith("broken manifest ")
+    assert len(summary["failure_detail"]) == 512
+    assert summary["run_path"] is None
+
+
+def test_run_oaf_corpus_dispatches_candidate_with_checkpoint_override(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.benchmark.oaf_corpus_run as runner_module
+
+    def run(request):
+        assert request.backend == "oaf-tf215"
+        assert request.python311 == Path("venv/bin/python")
+        assert request.runtime_root == Path("scratch/runtime")
+        assert request.checkpoint_cache == Path("checkpoints")
+        return runner_module._fatal_outcome()
+
+    monkeypatch.setattr(runner_module, "run_oaf_corpus", run)
+    result = CliRunner().invoke(
+        main,
+        [
+            *_oaf_corpus_cli_args(tmp_path),
+            "--backend",
+            "oaf-tf215",
+            "--python311",
+            "venv/bin/python",
+            "--runtime-root",
+            "scratch/runtime",
+            "--checkpoint-cache",
+            "checkpoints",
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 2
+    assert result.stderr == ""
+    assert json.loads(result.stdout)["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "extra_flags, detail",
+    [
+        (["--backend", "oaf-tf215", "--runtime-root", "scratch/runtime"], "--python311"),
+        (["--backend", "oaf-tf215", "--python311", "venv/bin/python"], "--runtime-root"),
+        (["--checkpoint-cache", "checkpoints"], "--backend oaf-tf215"),
+    ],
+)
+def test_run_oaf_corpus_rejects_incomplete_or_incompatible_backend_flags(
+    tmp_path: Path, monkeypatch, extra_flags, detail
+) -> None:
+    import src.benchmark.oaf_corpus_run as runner_module
+
+    def unexpected_run(_):
+        pytest.fail("invalid backend flags must be rejected before dispatch")
+
+    monkeypatch.setattr(runner_module, "run_oaf_corpus", unexpected_run)
+    result = CliRunner().invoke(
+        main, [*_oaf_corpus_cli_args(tmp_path), *extra_flags], catch_exceptions=False
+    )
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert "Usage:" in result.stderr
+    assert detail in result.stderr
 
 
 def test_run_oaf_corpus_overlap_scope_is_canonical_fatal(tmp_path: Path, monkeypatch) -> None:

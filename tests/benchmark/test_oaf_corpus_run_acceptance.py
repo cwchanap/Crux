@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
 
 from runtime.oaf_tf1.model import load_model_config
-from src.benchmark.backend_identity import BackendDescriptor
+from src.benchmark.backend_identity import BackendDescriptor, build_descriptor, canonical_json_bytes
 from src.benchmark.backends.base import CanonicalAudio, NativeEvent, NativePrediction
 from src.benchmark.backends.oaf import OafBackendError
 from src.benchmark.cohort_scoring import score_cohort
@@ -23,6 +24,7 @@ from src.benchmark.oaf_corpus_run import (
     build_oaf_cohort_from_snapshot,
     run_oaf_corpus,
 )
+from src.benchmark.oaf_tf215_runtime import OafTf215Runtime
 from src.benchmark.prediction_artifact import read_prediction_artifact, render_prediction_artifact
 from src.benchmark.reference_set import (
     ReferenceMappingResult,
@@ -164,6 +166,177 @@ def _request(tmp_path: Path, *, resume: bool = False) -> OafCorpusRunRequest:
         output_dir=tmp_path / "output",
         resume=resume,
     )
+
+
+def _install_tf215_run_seams(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[OafCorpusRunRequest, OafTf215Runtime, list[str]]:
+    import src.benchmark.oaf_corpus_run as run_module
+
+    _, baseline, _ = _install_fake_run_seams(monkeypatch, tmp_path)
+    payload = {**baseline.payload, "backend_id": "magenta-egmd-tf215-94529798-8hit-experimental-v1"}
+    descriptor = build_descriptor(
+        payload, baseline.payload.keys(), baseline.payload["descriptor_schema"]
+    )
+    identity = {"python": {"version": "3.11.17"}, "scratch_files": {"worker.py": SHA_A}}
+    runtime = OafTf215Runtime(
+        python311=tmp_path / "python3.11",
+        runtime_root=tmp_path / "scratch" / "runtime",
+        checkpoint_dir=tmp_path / "checkpoint",
+        worker_environment={},
+        descriptor=descriptor,
+        identity=identity,
+        sha256=sha256(canonical_json_bytes(identity)).hexdigest(),
+    )
+    probes: list[str] = []
+
+    def prepare(repo_root, *, python311, runtime_root, checkpoint_cache):
+        assert (repo_root / "runtime" / "oaf_tf1" / "model.json").is_file()
+        assert python311 == runtime.python311
+        assert runtime_root == runtime.runtime_root
+        assert checkpoint_cache == Path("artifacts/benchmark/model-cache")
+        probes.append(runtime.sha256)
+        return runtime
+
+    monkeypatch.setattr(run_module, "prepare_tf215_runtime", prepare)
+    request = replace(
+        _request(tmp_path),
+        backend="oaf-tf215",
+        python311=runtime.python311,
+        runtime_root=runtime.runtime_root,
+        include_simfile_ids=(10, 20),
+    )
+    return request, runtime, probes
+
+
+def _candidate_kick(time_sec: float) -> NativeEvent:
+    return NativeEvent(
+        time_sec=time_sec,
+        native_class_id="midi_36",
+        model_output_bin=15,
+        native_midi_note=36,
+        native_metadata={"upstream_8hit_group_id": "kick"},
+        confidence=0.9,
+        velocity_midi=100,
+    )
+
+
+def test_tf215_corpus_infers_then_resumes_both_rows_with_no_worker_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.benchmark.oaf_corpus_run as run_module
+
+    request, runtime, probes = _install_tf215_run_seams(monkeypatch, tmp_path)
+    calls = []
+
+    class CandidateBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return runtime.descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            calls.append(audio.source_audio_id)
+            return NativePrediction(audio, runtime.descriptor, (_candidate_kick(0.25),))
+
+        def close(self) -> None:
+            return None
+
+    def create(candidate_runtime, *, input_root, timeout_seconds, close_timeout_seconds):
+        assert candidate_runtime is runtime
+        assert input_root.is_dir()
+        assert timeout_seconds == OAF_CORPUS_REQUEST_TIMEOUT_SECONDS
+        assert close_timeout_seconds == OAF_WORKER_CLOSE_TIMEOUT_SECONDS
+        return CandidateBackend()
+
+    monkeypatch.setattr(run_module, "create_tf215_backend", create)
+    first = run_oaf_corpus(replace(request, resume=True))
+    assert first.exit_code == 0
+    assert calls == ["10/audio.wav", "20/audio.wav"]
+    assert first.run_path is not None
+    assert first.reports_path is not None
+    first_snapshot = run_module.parse_oaf_corpus_run(first.run_path.read_bytes())
+    assert first_snapshot["runtime_identity"] == runtime.identity
+    assert first_snapshot["inference_config"]["runtime_sha256"] == runtime.sha256
+    assert first_snapshot["backend_descriptor"] == dict(runtime.descriptor.payload)
+    first_rows = first_snapshot["items"]
+    assert [row["execution_disposition"] for row in first_rows] == ["inferred", "inferred"]
+    paths = [request.output_dir / row["prediction_path"] for row in first_rows]
+    for path in paths:
+        prediction = read_prediction_artifact(path.read_bytes()).prediction
+        assert prediction.descriptor == runtime.descriptor
+        assert (
+            prediction.events[0].prediction_map_version
+            == "crux.prediction-map/oaf-egmd-tf215-8hit-v1"
+        )
+    report = first.reports_path / "per_song.csv"
+    first_scores = report.read_bytes()
+    report.unlink()
+
+    def unexpected_factory(**_):
+        pytest.fail("resume must not construct a backend for reusable artifacts")
+
+    resumed = run_oaf_corpus(replace(request, resume=True), backend_factory=unexpected_factory)
+    assert resumed.exit_code == 0
+    assert resumed.run_id == first.run_id
+    assert report.read_bytes() == first_scores
+    assert probes == [runtime.sha256, runtime.sha256]
+    resumed_rows = run_module.parse_oaf_corpus_run(first.run_path.read_bytes())["items"]
+    assert [row["execution_disposition"] for row in resumed_rows] == ["resumed", "resumed"]
+    for initial, resumed_row in zip(first_rows, resumed_rows, strict=True):
+        assert resumed_row["prediction_path"] == initial["prediction_path"]
+        assert resumed_row["prediction_artifact_sha256"] == initial["prediction_artifact_sha256"]
+
+    prediction = read_prediction_artifact(paths[0].read_bytes()).prediction
+    event = prediction.events[0]
+    tampered = replace(
+        prediction, events=(replace(event, native=replace(event.native, time_sec=0.26)),)
+    )
+    paths[0].write_bytes(render_prediction_artifact(tampered))
+    before_retry = [path.read_bytes() for path in paths]
+    materialize = run_module._materialize_oaf_full_mix
+
+    def changed_materializer(*args, **kwargs):
+        audio = materialize(*args, **kwargs)
+        if audio.source_audio_id == "20/audio.wav":
+            audio.path.write_bytes(b"changed canonical wav")
+            return replace(audio, input_audio_sha256="c" * 64)
+        return audio
+
+    monkeypatch.setattr(run_module, "_materialize_oaf_full_mix", changed_materializer)
+    failed = run_oaf_corpus(replace(request, resume=True), backend_factory=unexpected_factory)
+    assert failed.exit_code == 1
+    failed_rows = run_module.parse_oaf_corpus_run(first.run_path.read_bytes())["items"]
+    assert [row["runner_failure_code"] for row in failed_rows] == [
+        "prediction_artifact_invalid"
+    ] * 2
+    assert [path.read_bytes() for path in paths] == before_retry
+
+
+def test_tf215_duplicate_canonical_key_fails_only_its_prediction_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.benchmark.oaf_corpus_run as run_module
+
+    request, runtime, _ = _install_tf215_run_seams(monkeypatch, tmp_path)
+
+    class CandidateBackend:
+        def descriptor(self) -> BackendDescriptor:
+            return runtime.descriptor
+
+        def transcribe(self, audio: CanonicalAudio) -> NativePrediction:
+            times = (0.25, 0.2500001) if audio.source_audio_id == "10/audio.wav" else (0.25,)
+            return NativePrediction(audio, runtime.descriptor, tuple(map(_candidate_kick, times)))
+
+        def close(self) -> None:
+            return None
+
+    outcome = run_oaf_corpus(request, backend_factory=lambda **_: CandidateBackend())
+    assert outcome.exit_code == 1
+    assert outcome.run_path is not None
+    rows = run_module.parse_oaf_corpus_run(outcome.run_path.read_bytes())["items"]
+    assert rows[0]["execution_disposition"] == "failed"
+    assert rows[0]["runner_failure_code"] == "prediction_publish_failed"
+    assert rows[0]["failure_detail"] == "duplicate_native_event"
+    assert rows[1]["execution_disposition"] == "inferred"
 
 
 def test_run_oaf_corpus_public_entry_point_is_available(tmp_path: Path) -> None:
