@@ -471,3 +471,38 @@ not establish behaviour on TF1, a broad corpus, or any downstream production
 path. The builder itself is verified locally by the stdlib tests; the
 TensorFlow imports of the scratch tree are proven only on Linux x86-64 (GitHub
 or native Colab), not by a local aarch64 interpreter.
+
+## Opt-in corpus benchmark
+
+Run from the repository checkout on Linux x86-64. Set `WORKER` and `SCRATCH`
+to fresh directories, and `CHECKPOINT_CACHE` to a local checkpoint cache.
+Prepare the locked project and worker environments.
+
+```bash
+uv sync --locked --python 3.12 --no-dev
+uv venv --python 3.11 "$WORKER"
+uv pip sync --python "$WORKER/bin/python" --require-hashes experiments/oaf_tf215/requirements.lock
+uv pip check --python "$WORKER/bin/python"
+"$WORKER/bin/python" experiments/oaf_tf215/build_runtime.py --output "$SCRATCH"
+mkdir -p /tmp/numba-cache
+uv run --no-sync crux benchmark prepare-backend --backend oaf --download --cache-root "$CHECKPOINT_CACHE"
+```
+
+Set `REF` and `TIMING` to the September manifests and `CACHE` to the indexed
+audio cache. The timing root must include all 180 eligible event bodies. The
+verified digests and two-song scope are in the [implementation plan](../../docs/superpowers/plans/2026-11-25-hpa-856-opt-in-corpus-backend.md#task-4--prove-the-normal-cli-on-colab-and-record-results).
+
+```bash
+run_pilot=(uv run --no-sync crux benchmark run-oaf-corpus
+  --backend oaf-tf215 --python311 "$WORKER/bin/python"
+  --runtime-root "$SCRATCH/runtime" --checkpoint-cache "$CHECKPOINT_CACHE"
+  --manifest "$REF" --timing-manifest "$TIMING" --cache-dir "$CACHE"
+  --output-dir "$OUT" --include-simfile-id 200 --include-simfile-id 209)
+"${run_pilot[@]}"
+```
+
+Start with a fresh output directory. Save the first `run.json`, reports and
+CLI summary, then append `--resume` to the same command. Keep the worker assets
+fixed throughout the two invocations. The run snapshot records the preflight
+runtime identity and the inference configuration includes its SHA-256.
+[Pilot results](RESULTS.md#opt-in-corpus-pilot)

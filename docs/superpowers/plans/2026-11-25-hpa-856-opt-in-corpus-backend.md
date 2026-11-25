@@ -129,8 +129,8 @@ def prepare_tf215_runtime(
 
 **Inputs** Use the existing verified `artifacts/experiments/oaf-tf215/fresh-september/` reference-set and reference-timing roots, including **all 180** eligible event bodies. Read source bytes for IDs **200** and **209** from `artifacts/experiments/oaf-tf215/twenty-song-panel/audio-cache/` with the cache index. Use a fresh output root for the pilot, since the prediction cache key does not include the run scope. Adapt the prior tooling under `twenty-song-panel/tools/` for the tested implementation revision, two manifests, 180 timing bodies, cache index and two verified audio blobs. Keep segmented upload, streamed heartbeats, archive verification and shutdown on exit. The pilot uses the normal checkout entry point and native worker.
 
-- [ ] Run `uv run ruff check` and `uv run ruff format --check` on the changed Python files. Run the full-suite gate from Global constraints again **before building the bundle**. Record the exact source revision or overlay digests and test result.
-- [ ] Start one fresh CPU VM using the authenticated Colab CLI. Provision a clean project environment at Python 3.12 and a separate worker environment with the existing lock. Preserve setup logs:
+- [x] Run `uv run ruff check` and `uv run ruff format --check` on the changed Python files. Run the full-suite gate from Global constraints again **before building the bundle**. Record the exact source revision or overlay digests and test result.
+- [x] Start one fresh CPU VM using the authenticated Colab CLI. Provision a clean project environment at Python 3.12 and a separate worker environment with the existing lock. Preserve setup logs:
 
   ```bash
   uv sync --locked --no-dev
@@ -142,7 +142,7 @@ def prepare_tf215_runtime(
   uv run --no-sync crux benchmark prepare-backend --backend oaf --download --cache-root "$CHECKPOINT_CACHE"
   ```
 
-- [ ] Execute the normal command in that VM. Set `REF` and `TIMING` to the files under `reference-set/manifests/` and `reference-timing/manifests/` with the respective digest filenames below and the `.jsonl` extension. Set `CACHE` to the verified panel audio cache.
+- [x] Execute the normal command in that VM. Set `REF` and `TIMING` to the files under `reference-set/manifests/` and `reference-timing/manifests/` with the respective digest filenames below and the `.jsonl` extension. Set `CACHE` to the verified panel audio cache.
 
   ```bash
   run_pilot=(uv run --no-sync crux benchmark run-oaf-corpus
@@ -160,8 +160,10 @@ def prepare_tf215_runtime(
   | 200 | `29d4dedbad0360dce060ec3ecdc5ee09a03bc87b1e5bb197cc9d26cc8dc92977` | 283 | 210 / 73 / 563 | 0.397727 |
   | 209 | `78fe085e51b407eed57ff592812f796cf1f8311d5f0c200b970dcfbf3bb91841` | 296 | 72 / 224 / 1,129 | 0.096192 |
 
-- [ ] Save the first `run.json` byte-for-byte and move its reports to the first-run evidence directory. Invoke `"${run_pilot[@]}" --resume` against the same root and runtime. Expect the same run ID, both rows `resumed`, the same prediction paths, identities and hashes, and regenerated reports. Preserve both report sets, both snapshots, and both CLI summaries and exit statuses. Compare the scientific report fields. The fake-factory acceptance test checks that all-resumed runs bypass model worker construction.
-- [ ] After both measurements, run `uv sync --locked --extra mlflow --extra r2` and `PRELOAD_MODEL=0 uv run --no-sync pytest -q -o addopts=` on the supported Colab host. Capture the test count, result and duration.
-- [ ] Retrieve the reports, prediction artifacts, runtime evidence, setup logs and command summaries to `artifacts/experiments/oaf-tf215/opt-in-corpus/`. Verify the downloaded archive and terminate the VM.
-- [ ] Update the experiment README and RESULTS with the actual pilot commands, runtime fingerprint, dispositions, report metrics and test outcome. Record any failed stage or unavailable data with its specific reason.
-- [ ] Commit the evidence narrative as `docs(experiments): record the opt-in OaF corpus pilot`.
+- [x] Save the first `run.json` byte-for-byte and move its reports to the first-run evidence directory. Invoke `"${run_pilot[@]}" --resume` against the same root and runtime. Expect the same run ID, both rows `resumed`, the same prediction paths, identities and hashes, and regenerated reports. Preserve both report sets, both snapshots, and both CLI summaries and exit statuses. Compare the scientific report fields. The fake-factory acceptance test checks that all-resumed runs bypass model worker construction.
+- [x] After both measurements, run `uv sync --locked --extra mlflow --extra r2` and `PRELOAD_MODEL=0 uv run --no-sync pytest -q -o addopts=` on the supported Colab host. Capture the test count, result and duration.
+- [x] Retrieve the reports, prediction artifacts, runtime evidence, setup logs and command summaries to `artifacts/experiments/oaf-tf215/opt-in-corpus/`. Verify the downloaded archive and terminate the VM.
+- [x] Update the experiment README and RESULTS with the actual pilot commands, runtime fingerprint, dispositions, report metrics and test outcome. Record any failed stage or unavailable data with its specific reason.
+- [x] Commit the evidence narrative as `docs(experiments): record the opt-in OaF corpus pilot`.
+
+The pilot passed on implementation revision `1648da2`. [Measured results](../../../experiments/oaf_tf215/RESULTS.md#opt-in-corpus-pilot)

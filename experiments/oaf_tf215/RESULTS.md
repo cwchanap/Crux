@@ -379,10 +379,61 @@ The archive and recomputed verification are in
 `ba7892ed54a9d5b71bd39873ffee959d54fd9b2ca0fa79991a2250fd72adff1c`.
 The local OaF verification suite passed 183 tests.
 
+## Opt-in corpus pilot
+
+On November 25, 2026, the normal `crux benchmark run-oaf-corpus` command
+ran with `--backend oaf-tf215` on a fresh Linux x86-64 Colab CPU VM. The
+VM had two CPUs available to the worker. The measured revision was
+`1648da206224a5e08ba9ddbb9811ff14975145e2`, and the worker used CPython
+3.11.17 with `tensorflow-cpu==2.15.1`. The [README](README.md#opt-in-corpus-benchmark)
+records the setup and CLI commands.
+
+The initial command inferred both songs. The second command used `--resume`
+with the same runtime and output root, and both rows resumed. Both commands
+exited 0 with run ID `oaf-7ef17a2b51959fdf`. The prediction paths and SHA-256
+digests matched. The verifier read both canonical prediction artifacts and
+checked them against both snapshots. All six regenerated reports matched the
+saved first-run reports byte-for-byte.
+
+| Simfile | Native events | Raw 50 ms TP / FP / FN | F1 |
+| ---: | ---: | --- | ---: |
+| 200 | 283 | 210 / 73 / 563 | 0.397727 |
+| 209 | 296 | 72 / 224 / 1,129 | 0.096192 |
+
+The canonical WAV digests, event counts and scores matched the corresponding
+panel rows. The CLI took 192.397 seconds on the initial run and 102.266 seconds
+on resume. The initial aggregate inference RTF was 0.332062. Resume retained
+the original inference timings.
+
+The run header records the candidate runtime identity with SHA-256
+`82a27dacc8c67e1576406d2c2d8948bd5baa310286db9c717158c1cd95d73907`.
+Its inference config SHA-256 is
+`3246fe067371d24fa78139b8397f9b202d11b1ae6b301c3b14eb2b6ba3c32070`.
+The verified evidence archive and `verification.json` are in
+`artifacts/experiments/oaf-tf215/opt-in-corpus/`. The archive SHA-256 is
+`c3b0ef086961b984d89feafe555e642be7a46490419b010ea6e51020c325cb37`.
+It contains both run snapshots, both report sets, both CLI summaries and
+exit statuses, canonical predictions, runtime provenance and setup logs.
+
+Every gate used `PRELOAD_MODEL=0 uv run --no-sync pytest -q -o addopts=`
+with the locked Python 3.12 project environment on x86-64 Colab.
+
+| Gate | Revision | Passed | Pytest seconds |
+| --- | --- | ---: | ---: |
+| Artifact contracts | `a7d6e09` | 3,738 | 510.90 |
+| Runtime and native launcher | `078e19e` | 3,758 | 521.18 |
+| Corpus runner and CLI | `1648da2` | 3,768 | 512.10 |
+| Before bundling | `1648da2` | 3,768 | 510.63 |
+| After the pilot | `1648da2` | 3,768 | 438.74 |
+
+Ruff lint and format checks passed for all 22 changed Python files. Both
+the test VM and pilot VM were terminated after verification.
+
 ## Remaining benchmark work
 
 - The measured scope covers the canonical smoke fixture and 25 songs.
-  Broad corpus, reviewed subset and separation measurements remain open.
+  The opt-in corpus CLI and same-VM resume were verified on two of those
+  songs. Broad corpus, reviewed subset and separation measurements remain open.
 - The GitHub and Colab TF2.15 smoke observations differ at event 0 confidence.
 - The TF1 prediction and report artifacts are confined to the experiment output
   under `artifacts/experiments/oaf-tf215/`.
