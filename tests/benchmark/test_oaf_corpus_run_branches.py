@@ -391,6 +391,11 @@ def test_inference_config_sha256_rejects_wrong_key_set() -> None:
         inference_config_sha256({"schema": OAF_INFERENCE_CONFIG_SCHEMA})
 
 
+def test_inference_config_sha256_rejects_non_mapping() -> None:
+    with pytest.raises(StrictJsonError, match="exact key set"):
+        inference_config_sha256(None)  # type: ignore[arg-type]
+
+
 def test_inference_config_sha256_rejects_non_string_values() -> None:
     payload = build_inference_config(load_model_config(), _descriptor(), SHA_B)
     payload["adapter_revision"] = 123  # type: ignore[assignment]

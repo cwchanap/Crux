@@ -43,6 +43,7 @@ from src.benchmark.oaf_corpus_run import (
     OAF_INFERENCE_CONFIG_SCHEMA,
     OAF_WORKER_CLOSE_TIMEOUT_SECONDS,
     RUNNER_FAILURE_TO_COHORT_REASON,
+    OafCorpusBackendOptionsError,
     OafCorpusRunOutcome,
     OafCorpusRunRequest,
     _cohort_item_from_run_row,
@@ -1103,6 +1104,8 @@ def test_oaf_corpus_request_validates_candidate_paths_and_applies_cache_default(
         output_dir=Path("output"),
     )
     assert request.checkpoint_cache is None
+    with pytest.raises(OafCorpusBackendOptionsError, match="backend must be oaf or oaf-tf215"):
+        replace(request, backend="unknown")
     with pytest.raises(ValueError, match="python311"):
         replace(request, backend="oaf-tf215", runtime_root=Path("runtime"))
     with pytest.raises(ValueError, match="runtime_root"):
@@ -1116,6 +1119,8 @@ def test_oaf_corpus_request_validates_candidate_paths_and_applies_cache_default(
         runtime_root=Path("runtime"),
     )
     assert candidate.checkpoint_cache == Path("artifacts/benchmark/model-cache")
+    with pytest.raises(TypeError, match="checkpoint_cache must be a Path or None"):
+        replace(candidate, checkpoint_cache="checkpoints")
     assert replace(candidate, checkpoint_cache=Path("checkpoints")).checkpoint_cache == Path(
         "checkpoints"
     )
