@@ -9,6 +9,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
+      - "src/benchmark/oaf_tf215_runtime.py"
       - "experiments/oaf_tf215/**"
       - "tests/runtime/test_oaf_tf215_builder.py"
       - "tests/benchmark/test_oaf_tf215_compare.py"

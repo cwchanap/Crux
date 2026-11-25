@@ -22,11 +22,6 @@ if os.fspath(REPOSITORY_ROOT) not in sys.path:
 
 from experiments.oaf_tf215 import compare
 from experiments.oaf_tf215.panel_metrics import aggregate_panel_scores, score_panel_song
-from experiments.oaf_tf215.runtime_identity import (
-    build_candidate_descriptor,
-    build_runtime_identity,
-    collect_probe,
-)
 from experiments.oaf_tf215.selected_inputs import (
     PANEL_SIMFILE_IDS,
     SELECTED_SIMFILE_IDS,
@@ -60,6 +55,12 @@ from src.benchmark.oaf_corpus_run import (
     parse_oaf_corpus_run,
 )
 from src.benchmark.oaf_smoke_oracle import SmokeOracleEvent
+from src.benchmark.oaf_tf215_runtime import (
+    build_candidate_descriptor,
+    build_runtime_identity,
+    collect_probe,
+    tf215_worker_environment,
+)
 from src.benchmark.prediction_artifact import PredictionArtifact
 from src.benchmark.reference_set import ReferenceMappingResult
 from src.benchmark.reference_set_manifest import (
@@ -76,7 +77,6 @@ SMOKE_ROOT = REPOSITORY_ROOT / "tests/fixtures/oaf_tf1_smoke"
 EXPERIMENT_MODULES = (
     "build_runtime.py",
     "compare.py",
-    "runtime_identity.py",
     "selected_compare.py",
     "selected_inputs.py",
     "selected_metrics.py",
@@ -431,7 +431,7 @@ def run_selected_comparison(
         config = load_model_config(compare.MODEL_CONFIG_PATH)
         descriptor = build_candidate_descriptor(config)
         record.update(descriptor=dict(descriptor.payload), descriptor_sha256=descriptor.sha256)
-        environment = compare._worker_environment()
+        environment = tf215_worker_environment()
         probe = collect_probe(python311, worker_environment=environment)
         record["probe"] = probe
         if probe["status"] == "blocked":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import io
 import struct
+import sys
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 
@@ -321,6 +322,74 @@ def test_task_d_oaf_adapter_validates_ready_reuses_worker_and_closes(tmp_path: P
     assert worker.close_count == 1
 
 
+def _tf215_runtime(tmp_path: Path):
+    from runtime.oaf_tf1.model import load_model_config
+    from src.benchmark.oaf_tf215_runtime import OafTf215Runtime, build_candidate_descriptor
+
+    config = load_model_config(Path(__file__).parents[2] / "runtime/oaf_tf1/model.json")
+    python = tmp_path / "python"
+    python.symlink_to(sys.executable)
+    return OafTf215Runtime(
+        python311=python,
+        runtime_root=tmp_path / "runtime",
+        checkpoint_dir=tmp_path / "checkpoint",
+        worker_environment={"CUDA_VISIBLE_DEVICES": "-1"},
+        descriptor=build_candidate_descriptor(config),
+        identity={},
+        sha256="1" * 64,
+    )
+
+
+def test_task_d_tf215_worker_reuses_native_launch_and_keeps_candidate_identity(tmp_path: Path):
+    from src.benchmark.backends.oaf import create_tf215_backend
+
+    runtime = _tf215_runtime(tmp_path)
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    audio = _audio(input_root / "song.wav")
+    worker = _FakeWorker(
+        {"type": "ready", "backend_id": OAF_BACKEND_ID, "restored_tensor_count": 78},
+        {"events": []},
+    )
+    launches = []
+
+    def start(command, **kwargs):
+        launches.append((command, kwargs))
+        return worker
+
+    with pytest.raises(OafBackendError, match="descriptor backend id is invalid"):
+        OafBackend(runtime.checkpoint_dir, input_root, descriptor=runtime.descriptor)
+    backend = create_tf215_backend(
+        runtime,
+        input_root=input_root,
+        process_factory=start,
+        timeout_seconds=120,
+        close_timeout_seconds=7,
+    )
+    assert backend.transcribe(audio).descriptor == runtime.descriptor
+    assert backend.transcribe(audio).descriptor == runtime.descriptor
+    backend.close()
+    assert worker.requests == ["song.wav", "song.wav"]
+    assert worker.close_count == 1
+    assert launches == [
+        (
+            [
+                str(runtime.python311),
+                "-s",
+                str(runtime.runtime_root / "worker.py"),
+                "--checkpoint-dir",
+                str(runtime.checkpoint_dir),
+            ],
+            {
+                "cwd": input_root.resolve(),
+                "env": runtime.worker_environment,
+                "timeout_seconds": 120,
+                "close_timeout_seconds": 7,
+            },
+        )
+    ]
+
+
 def test_task_d_oaf_adapter_forwards_only_factory_accepted_timeout_keywords(
     tmp_path: Path,
 ) -> None:
@@ -433,13 +502,17 @@ def test_task_d_oaf_adapter_rejects_ready_override_keyword() -> None:
     [
         ("wrong-backend", 78, "worker_identity_invalid"),
         (OAF_BACKEND_ID, 77, "worker_identity_invalid"),
+        (OAF_BACKEND_ID, 78.0, "worker_identity_invalid"),
+        (OAF_BACKEND_ID, True, "worker_identity_invalid"),
     ],
 )
+@pytest.mark.parametrize("mode", ["docker", "native"])
 def test_task_d_oaf_adapter_rejects_process_ready_identity(
     tmp_path: Path,
     backend_id: str,
-    restored_tensor_count: int,
+    restored_tensor_count: object,
     error_code: str,
+    mode: str,
 ) -> None:
     input_root = tmp_path / "input"
     checkpoint = tmp_path / "checkpoint"
@@ -454,15 +527,23 @@ def test_task_d_oaf_adapter_rejects_process_ready_identity(
         },
         {"events": []},
     )
-    backend = OafBackend(
-        checkpoint,
-        input_root,
-        process_factory=lambda *_args, **_kwargs: worker,
-    )
+
+    def start(*_args, **_kwargs):
+        return worker
+
+    if mode == "native":
+        from src.benchmark.backends.oaf import create_tf215_backend
+
+        backend = create_tf215_backend(
+            _tf215_runtime(tmp_path), input_root=input_root, process_factory=start
+        )
+    else:
+        backend = OafBackend(checkpoint, input_root, process_factory=start)
     with pytest.raises(OafBackendError) as raised:
         backend.transcribe(audio)
     assert raised.value.code == error_code
     assert worker.close_count == 1
+    assert worker.requests == []
 
 
 def test_task_d_oaf_adapter_rejects_outside_input(tmp_path: Path) -> None:

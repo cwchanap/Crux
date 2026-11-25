@@ -10,8 +10,8 @@ import pytest
 
 from experiments.oaf_tf215 import compare
 from experiments.oaf_tf215 import selected_compare as selected
-from experiments.oaf_tf215.runtime_identity import PROBE_SCHEMA
 from src.benchmark.backend_identity import canonical_json_bytes, sha256_hex
+from src.benchmark.oaf_tf215_runtime import PROBE_SCHEMA
 
 
 def _inputs(tmp_path):

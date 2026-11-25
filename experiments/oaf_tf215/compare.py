@@ -43,7 +43,6 @@ if os.fspath(REPOSITORY_ROOT) not in sys.path:
 
 from runtime.oaf_tf1.model import REQUIRED_INFERENCE_COUNT, OafModelConfig, load_model_config
 from src.benchmark.artifact_io import read_regular_file_no_follow
-from src.benchmark.backends.idm import _isolated_worker_environment
 from src.benchmark.backends.oaf import _decode_native_event
 from src.benchmark.checkpoint_acquisition import (
     CheckpointAcquisitionError,
@@ -56,6 +55,7 @@ from src.benchmark.oaf_smoke_oracle import (
     _event_from_native,
     read_smoke_oracle,
 )
+from src.benchmark.oaf_tf215_runtime import WORKER_ENVIRONMENT, tf215_worker_environment
 from src.benchmark.worker_process import WorkerProcess, WorkerProcessError
 
 SCHEMA = "oaf-tf215-compare/v2"
@@ -63,12 +63,6 @@ MODEL_CONFIG_PATH = REPOSITORY_ROOT / "runtime" / "oaf_tf1" / "model.json"
 SOURCE_AUDIO_ID = "oaf-smoke-canonical-v1"
 # A cold TensorFlow import plus a real checkpoint restore can exceed one minute.
 WORKER_START_TIMEOUT_SECONDS = 300.0
-WORKER_ENVIRONMENT = {
-    "CUDA_VISIBLE_DEVICES": "-1",
-    "PYTHONHASHSEED": "0",
-    "TF_ENABLE_ONEDNN_OPTS": "0",
-    "NUMBA_CACHE_DIR": "/tmp/numba-cache",
-}
 # Pre-inference failures mean the experiment could not reach a loaded model.
 # ``checkpoint`` is cache access and ``host`` is interpreter/host availability;
 # both are blocked (not proven incompatible), never a pass. A child that starts
@@ -193,12 +187,6 @@ def _validate_input(
     }
 
 
-def _worker_environment() -> dict[str, str]:
-    environment = _isolated_worker_environment()
-    environment.update(WORKER_ENVIRONMENT)
-    return environment
-
-
 def _start_worker(
     process_factory: ProcessFactory,
     python311: Path,
@@ -231,7 +219,7 @@ def _start_worker(
             command,
             timeout_seconds=timeout_seconds,
             cwd=fixture.parent,
-            env=_worker_environment() if worker_environment is None else worker_environment,
+            env=tf215_worker_environment() if worker_environment is None else worker_environment,
             **close_options,
         )
     except WorkerProcessError as error:

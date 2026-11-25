@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from experiments.oaf_tf215.runtime_identity import build_candidate_descriptor
 from runtime.oaf_tf1.model import load_model_config
 from src.benchmark.backends.base import NativeEvent
 from src.benchmark.oaf_smoke_oracle import _event_from_native
+from src.benchmark.oaf_tf215_runtime import build_candidate_descriptor
 from src.benchmark.prediction_artifact import read_prediction_artifact
 from src.benchmark.reference_set import map_reference_events
 from src.benchmark.reference_timing import NativeReferenceEvent
