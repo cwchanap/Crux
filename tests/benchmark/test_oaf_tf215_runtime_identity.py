@@ -95,29 +95,112 @@ def test_probe_launch_uses_worker_arguments_and_environment(tmp_path):
     assert result["status"] == "blocked"
 
 
-def test_x86_probe_requires_affinity(monkeypatch):
+def test_x86_probe_collects_cpu_and_package_identity(tmp_path, monkeypatch):
+    cpuinfo = (
+        "processor : 0\n"
+        "vendor_id : GenuineIntel\n"
+        "model name : Test CPU\n"
+        "flags : sse2 avx\n\n"
+        "processor : 1\n"
+        "vendor_id : GenuineIntel\n"
+        "model name : Test CPU\n"
+        "flags : avx sse2 avx2\n"
+    )
+    read_text = Path.read_text
+
+    def read_cpuinfo(path, *args, **kwargs):
+        if path == Path("/proc/cpuinfo"):
+            return cpuinfo
+        return read_text(path, *args, **kwargs)
+
+    for name, version in (("tensorflow-cpu", "2.15.1"), ("numpy", "1.26.4")):
+        metadata = tmp_path / f"{name.replace('-', '_')}-{version}.dist-info" / "METADATA"
+        metadata.parent.mkdir()
+        metadata.write_text(f"Name: {name}\nVersion: {version}\n", encoding="utf-8")
+    distributions = identity.importlib.metadata.distributions
+    monkeypatch.setattr(Path, "read_text", read_cpuinfo)
+    monkeypatch.setattr(
+        identity.importlib.metadata, "distributions", lambda: distributions(path=[str(tmp_path)])
+    )
     monkeypatch.setattr(identity.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(identity.platform, "system", lambda: "Linux")
     monkeypatch.setattr(identity.sys, "version_info", (3, 11, 9))
     monkeypatch.setattr(identity.os, "cpu_count", lambda: 8)
-    monkeypatch.setattr(
-        identity,
-        "_cpu_fields",
-        lambda: {
-            "cpu_vendor": "GenuineIntel",
-            "cpu_model": "example",
-            "cpu_flags": ["sse2"],
-        },
-    )
     monkeypatch.setattr(identity.platform, "libc_ver", lambda: ("glibc", "2.31"))
     monkeypatch.setattr(identity.os, "sched_getaffinity", lambda _: {0, 1})
-    monkeypatch.setattr(identity, "_version_inventory", lambda: [])
     probe = identity.probe_runtime()
     assert probe["status"] == "ok"
     assert probe["host"]["cpu_count"] == 8
     assert probe["host"]["affinity_cpu_count"] == 2
+    assert probe["host"]["cpu_vendor"] == "GenuineIntel"
+    assert probe["host"]["cpu_model"] == "Test CPU"
+    assert probe["host"]["cpu_flags"] == ["avx", "avx2", "sse2"]
+    assert probe["distributions"] == [
+        {"name": "numpy", "version": "1.26.4"},
+        {"name": "tensorflow-cpu", "version": "2.15.1"},
+    ]
     monkeypatch.setattr(identity.os, "sched_getaffinity", lambda _: set())
     assert "unavailable_affinity" in identity.probe_runtime()["reasons"]
+
+
+def test_probe_command_reports_unavailable_runtime_facts(tmp_path, monkeypatch, capsys):
+    def unavailable(*_args):
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(identity.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(identity.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(identity.platform, "libc_ver", lambda: ("", ""))
+    monkeypatch.setattr(identity.sys, "version_info", (3, 12, 0))
+    monkeypatch.setattr(identity.sys, "executable", str(tmp_path / "missing-python"))
+    monkeypatch.setattr(identity.os, "cpu_count", lambda: None)
+    monkeypatch.setattr(identity.os, "sched_getaffinity", unavailable)
+    monkeypatch.setattr(identity, "_cpu_fields", unavailable)
+    monkeypatch.setattr(identity, "_version_inventory", unavailable)
+
+    assert identity.main(["--probe"]) == 2
+    record = json.loads(capsys.readouterr().out)
+    assert record["status"] == "blocked"
+    assert set(record["reasons"]) == {
+        "unsupported_interpreter",
+        "unavailable_libc",
+        "unavailable_cpu_count",
+        "unavailable_affinity",
+        "unavailable_cpu_fields",
+        "unavailable_interpreter_digest",
+        "unavailable_distribution_inventory",
+    }
+    assert record["host"]["affinity_cpu_count"] is None
+    assert record["python"]["sha256"] is None
+    assert record["distributions"] == []
+
+
+def test_collect_probe_reports_missing_interpreter(tmp_path):
+    record = identity.collect_probe(tmp_path / "missing-python", worker_environment={})
+
+    assert record == {
+        "schema": "crux.oaf-tf215-probe/v1",
+        "status": "blocked",
+        "reasons": ["interpreter_start_unavailable"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "message"),
+    [
+        (0, "unexpected startup log", "did not produce a JSON diagnostic"),
+        (0, '{"schema":"foreign","status":"ok"}', "invalid diagnostic"),
+        (0, '{"schema":"crux.oaf-tf215-probe/v1","status":{}}', "invalid diagnostic"),
+        (0, '{"schema":"crux.oaf-tf215-probe/v1","status":"blocked"}', "invalid diagnostic"),
+    ],
+)
+def test_collect_probe_rejects_invalid_diagnostic(monkeypatch, returncode, stdout, message):
+    def run(command, **_kwargs):
+        return subprocess.CompletedProcess(command, returncode, stdout=stdout)
+
+    monkeypatch.setattr(identity.subprocess, "run", run)
+
+    with pytest.raises(ValueError, match=message):
+        identity.collect_probe(Path(sys.executable), worker_environment={})
 
 
 def _runtime_tree(root: Path) -> Path:
