@@ -9,10 +9,12 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
+      - "runtime/oaf_tf1/**"
       - "src/benchmark/oaf_tf215_runtime.py"
       - "experiments/oaf_tf215/**"
       - "tests/runtime/test_oaf_tf215_builder.py"
       - "tests/benchmark/test_oaf_tf215_compare.py"
+      - "tests/benchmark/test_oaf_tf215_graph_check.py"
       - "tests/benchmark/test_oaf_tf215_runtime_identity.py"
       - "tests/benchmark/test_oaf_tf215_selected_inputs.py"
       - "tests/benchmark/test_oaf_tf215_selected_metrics.py"
@@ -69,9 +71,8 @@ jobs:
         id: check
         run: uv pip check --python "$PY311"
 
-      # Builder stage: the stdlib-only tests, the real scratch build, and both
-      # imports run in separate Python 3.11 interpreters. pytest is added after
-      # the hash-lock checks so it cannot weaken the clean-install proof.
+      # Builder tests use their own Python 3.11 environment for pytest. The
+      # scratch build and both imports use the hash-locked worker environment.
       - name: Build scratch runtime and import it (build stage)
         id: build
         env:
@@ -81,8 +82,9 @@ jobs:
           NUMBA_CACHE_DIR: /tmp/numba-cache
         run: |
           set -euo pipefail
-          uv pip install --python "$PY311" pytest
-          PYTHONPATH="$GITHUB_WORKSPACE" "$PY311" -m pytest -q -o addopts=-ra \
+          PYTHONPATH="$GITHUB_WORKSPACE" \
+          uv run --isolated --no-project --python 3.11 --with pytest \
+            python -m pytest -q -o addopts=-ra \
             --confcutdir tests/runtime tests/runtime/test_oaf_tf215_builder.py
           mkdir -p "$NUMBA_CACHE_DIR"
           "$PY311" experiments/oaf_tf215/build_runtime.py \

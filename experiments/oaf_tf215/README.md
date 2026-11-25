@@ -5,11 +5,11 @@ existing OaF drum checkpoint install, execute its graph, restore and transcribe
 under Python 3.11 / TensorFlow CPU 2.15.1, and how does that output compare with
 the frozen TF1 oracle?
 
-**This is an experiment, not production integration.** `runtime/oaf_tf1/`,
-`src/`, the root `pyproject.toml`/`uv.lock`, the frozen checkpoint, its
-instrumentation patch and the canonical smoke oracle stay untouched. Nothing
-here is wired into Crux's CLI, backend factory or caches, and a successful graph
-check does not by itself establish model parity.
+The probes use a scratch runtime built from the frozen TF1 source. The corpus
+benchmark opts in through `crux benchmark run-oaf-corpus --backend oaf-tf215`
+and binds prediction paths to the candidate descriptor and runtime identity.
+Graph checks cover the exercised TensorFlow compatibility sessions. The
+full-model smoke comparison checks exact parity against the frozen TF1 oracle.
 
 ## Files
 
@@ -122,10 +122,28 @@ command with `prepare-panel`, the panel's TF1 run and a new input directory.
 Run `run-panel` with the same options as `run` above plus the same
 `--reference-manifest` and `--timing-manifest` paths.
 
+To evaluate the gate, run the panel on the TF1 measurement VM and pass a local
+frozen TF1 smoke launcher as the final option. For the Docker-backed launcher,
+append these arguments to `run-panel`:
+
+```bash
+--tf1-smoke-prediction "$PWD/artifacts/benchmark/oaf-smoke/prediction.jsonl" \
+--tf1-smoke-command uv run crux benchmark smoke-backend --backend oaf \
+  --oracle tests/fixtures/oaf_tf1_smoke/smoke-oracle.json
+```
+
+On Docker-free Colab, pass the pinned TF1 rootfs launcher's `smoke` command
+and the path it writes. Start with a fresh prediction output path in either
+case. `run-panel` runs the command locally and checks the new prediction
+against the frozen oracle. The record retains the prediction, its digest,
+the oracle digest, and the VM boot ID.
+
 The resulting comparison records raw 50 ms F1, native drift, warm and
 startup-inclusive RTF, and exact repeats for the two stress anchors. The
 measurement status records whether the run finished. The separate
-`panel_gate_passed` field records the evaluation outcome.
+`panel_gate_passed` field requires an exact TF1 smoke match, successful paired
+measurements and repeats, and candidate micro-F1 at least as high as TF1.
+Omitting the smoke command allows measurement and leaves the gate false.
 
 ## Reproduce the smoke comparison on x86-64 Linux
 

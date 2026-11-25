@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import csv
+import ctypes
 import errno
 import io
+import os
 import stat
+import sys
 import tempfile
 from collections import Counter
 from collections.abc import Iterable, Mapping
@@ -269,6 +272,22 @@ def _fresh_output_root(baseline_run: Path, run_id: str) -> Path:
     return root
 
 
+def _validate_panel_timings(rows: Iterable[Mapping[str, Any]]) -> dict[int, int | Decimal]:
+    timings = {}
+    for row in rows:
+        wall_time = row.get("wall_time_sec")
+        if (
+            row.get("execution_disposition") != "inferred"
+            or isinstance(wall_time, bool)
+            or not isinstance(wall_time, (int, Decimal))
+            or (isinstance(wall_time, Decimal) and not wall_time.is_finite())
+            or wall_time < 0
+        ):
+            raise SelectionError("panel requires freshly inferred TF1 timing rows")
+        timings[row["simfile_id"]] = wall_time
+    return timings
+
+
 def _run_identity(
     run: Mapping[str, Any],
     config: OafModelConfig,
@@ -318,6 +337,8 @@ def _run_identity(
             raise SelectionError(f"baseline run {field} mismatch")
     if fresh and {row["simfile_id"] for row in run["items"]} != set(include):
         raise SelectionError("fresh baseline rows do not match the selected membership")
+    if panel:
+        _validate_panel_timings(run["items"])
     timing_digest = _required_digest(run, "reference_timing_manifest_sha256")
     reference_version = run.get("reference_manifest_version")
     if not isinstance(reference_version, str) or not reference_version.startswith("sha256:"):
@@ -416,15 +437,19 @@ def _preflight_selected_references(
         match = timing_rows.get(row.view.simfile_id)
         if match is None or match.view.timing_status != "ready":
             raise SelectionError(f"selected simfile {row.view.simfile_id} has no ready timing row")
-        # Preflight folds missing and malformed native artifacts into one error.
-        # Check availability first so the experiment can distinguish blockers.
         path = _relative_file(timing_root, match.view.reference_events_cache_path)
         _regular_file(path)
     try:
         preflight_reference_mappings(
-            replace(reference, rows=selected), timing, timing_output_root=timing_root
+            replace(reference, rows=selected),
+            timing,
+            timing_output_root=timing_root,
+            propagate_io_errors=True,
         )
-    except (OSError, ValueError) as error:
+    except OSError as error:
+        path = Path(error.filename) if error.filename is not None else timing_root
+        raise _io_error(path, error) from error
+    except ValueError as error:
         raise SelectionError(f"reference preflight failed: {error}") from error
 
 
@@ -608,7 +633,7 @@ def prepare_selection(
     if input_root.exists() or input_root.is_symlink():
         raise SelectionError(f"the experimental input directory must be new: {input_root}")
     identity, items, ranked = _load_reports(baseline_evidence_dir)
-    config = load_model_config()
+    config = load_model_config(_model_lock_path())
     descriptor = _expected_oaf_descriptor(config)
     run, run_digest = _read_run(baseline_run, ARCHIVED_RUN_ID)
     baseline = _run_identity(run, config, descriptor)
@@ -697,7 +722,7 @@ def _prepare_fresh_selection(
     run_id = PANEL_RUN_ID if panel else FRESH_RUN_ID
     simfile_ids = PANEL_SIMFILE_IDS if panel else SELECTED_SIMFILE_IDS
     root = _fresh_output_root(baseline_run, run_id)
-    config = load_model_config()
+    config = load_model_config(_model_lock_path())
     descriptor = _expected_oaf_descriptor(config)
     run, run_digest = _read_run(baseline_run, run_id)
     baseline = _run_identity(run, config, descriptor, fresh=True, panel=panel)
@@ -730,6 +755,33 @@ def _selection_positions(*, panel: bool) -> tuple[str, tuple[int, ...]]:
     return "rank", SELECTED_RANKS
 
 
+def _rename_directory_no_replace(source: Path, destination: Path) -> None:
+    """Publish a staged directory in one operation with an exclusive destination."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_name, destination_name = os.fsencode(source), os.fsencode(destination)
+    if sys.platform == "linux" and hasattr(libc, "renameat2"):
+        rename = libc.renameat2
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        at_fdcwd, rename_noreplace = -100, 1
+        result = rename(at_fdcwd, source_name, at_fdcwd, destination_name, rename_noreplace)
+    elif sys.platform == "darwin" and hasattr(libc, "renamex_np"):
+        rename = libc.renamex_np
+        rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        rename_excl = 0x4
+        result = rename(source_name, destination_name, rename_excl)
+    else:
+        raise OSError(errno.ENOTSUP, "atomic directory publication is unavailable", destination)
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), destination)
+
+
 def _materialize_inputs(
     selected: tuple[LoadedReferenceSetRow, ...],
     prepared: list[tuple[dict[str, Any], PredictionArtifact]],
@@ -747,7 +799,8 @@ def _materialize_inputs(
 
     input_root.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".selected-wavs-", dir=input_root.parent) as staging:
-        temporary = Path(staging)
+        temporary = Path(staging) / "inputs"
+        temporary.mkdir()
         for loaded, (row, artifact) in zip(selected, prepared, strict=True):
             source = _source_audio(loaded, artifact, cache_dir, index)
             try:
@@ -763,11 +816,7 @@ def _materialize_inputs(
                     f"could not materialize simfile {row['simfile_id']}: {error}"
                 ) from error
             _check_audio(audio, row, artifact, descriptor)
-        # A fresh directory makes setup retryable without replacing any prior
-        # selection. Validation above finishes before moving the WAVs.
-        input_root.mkdir()
-        for row, _ in prepared:
-            (temporary / row["wav_path"]).rename(input_root / row["wav_path"])
+        _rename_directory_no_replace(temporary, input_root)
 
 
 def _check_audio(
@@ -836,7 +885,7 @@ def verify_selection(
     run, digest = _read_run(baseline_run, run_id)
     if digest != selection.get("baseline_run_sha256"):
         raise SelectionError("baseline run digest no longer matches the selection")
-    config = load_model_config()
+    config = load_model_config(_model_lock_path())
     descriptor = _expected_oaf_descriptor(config)
     if _run_identity(run, config, descriptor, fresh=fresh, panel=panel) != selection.get(
         "baseline_identity"

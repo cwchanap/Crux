@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import errno
+import os
 import shutil
 from dataclasses import replace
 from decimal import Decimal
@@ -11,6 +13,7 @@ import pytest
 from experiments.oaf_tf215 import selected_compare
 from experiments.oaf_tf215 import selected_inputs as selected
 from runtime.oaf_tf1.model import load_model_config
+from src.benchmark import reference_set_manifest
 from src.benchmark.backend_identity import (
     MUSCRIPTOR_DESCRIPTOR_IDENTITIES,
     MUSCRIPTOR_DESCRIPTOR_KEYS,
@@ -358,8 +361,9 @@ def test_rank_scores_breaks_decimal_ties_by_integer_id() -> None:
 
 
 def test_prepares_selection_and_verifies_it_after_root_relocation(
-    archived_bundle, tmp_path
+    archived_bundle, tmp_path, monkeypatch
 ) -> None:
+    monkeypatch.chdir(tmp_path)
     selection = selected.prepare_selection(**archived_bundle)
     selection_path = tmp_path / "selection.json"
     selection_path.write_bytes(canonical_json_bytes(selection))
@@ -404,6 +408,24 @@ def test_preparation_distinguishes_corrupt_native_reference_from_missing_file(
     path.unlink()
     with pytest.raises(selected.SelectionBlocked, match="required input unavailable"):
         selected.prepare_selection(**archived_bundle)
+
+
+@pytest.mark.parametrize("read_errno", [errno.EACCES, errno.EPERM, errno.ENOENT])
+def test_preparation_blocks_unavailable_native_reference_at_read(
+    archived_bundle, monkeypatch, read_errno
+) -> None:
+    event_root = archived_bundle["timing_manifest"].parent.parent / "events"
+    original = reference_set_manifest.read_regular_file_no_follow
+
+    def unavailable_body(path: Path) -> bytes:
+        if path.parent == event_root:
+            raise OSError(read_errno, os.strerror(read_errno), path)
+        return original(path)
+
+    monkeypatch.setattr(reference_set_manifest, "read_regular_file_no_follow", unavailable_body)
+    with pytest.raises(selected.SelectionBlocked, match="required input unavailable: .*events/"):
+        selected.prepare_selection(**archived_bundle)
+    assert not archived_bundle["input_root"].exists()
 
 
 @pytest.mark.parametrize(
@@ -480,6 +502,49 @@ def test_preparation_does_not_publish_a_partial_selection_after_source_blocker(
     with pytest.raises(selected.SelectionBlocked, match="required input unavailable"):
         selected.prepare_selection(**archived_bundle)
     assert not archived_bundle["input_root"].exists()
+
+
+def test_preparation_never_exposes_a_partially_populated_input_directory(
+    archived_bundle, monkeypatch
+) -> None:
+    input_root = archived_bundle["input_root"]
+    original = Path.mkdir
+    observed = []
+
+    def observe_new_directory(path, *args, **kwargs):
+        original(path, *args, **kwargs)
+        if path == input_root:
+            observed.append({file.name for file in path.iterdir()})
+
+    monkeypatch.setattr(Path, "mkdir", observe_new_directory)
+    selected.prepare_selection(**archived_bundle)
+
+    expected = {f"{song}.wav" for song in SONGS}
+    assert {file.name for file in input_root.iterdir()} == expected
+    assert all(files == expected for files in observed)
+
+
+def test_preparation_preserves_a_competing_empty_input_directory(
+    archived_bundle, monkeypatch
+) -> None:
+    input_root = archived_bundle["input_root"]
+    original = selected._check_audio
+    competing_root = None
+
+    def create_competing_directory(audio, row, artifact, descriptor):
+        nonlocal competing_root
+        original(audio, row, artifact, descriptor)
+        if row["simfile_id"] == SONGS[-1]:
+            input_root.mkdir()
+            competing_root = input_root.stat()
+
+    monkeypatch.setattr(selected, "_check_audio", create_competing_directory)
+    with pytest.raises((FileExistsError, selected.SelectionError), match=".*input"):
+        selected.prepare_selection(**archived_bundle)
+
+    assert competing_root is not None
+    assert input_root.stat().st_ino == competing_root.st_ino
+    assert list(input_root.iterdir()) == []
 
 
 def test_verify_rejects_changed_seal_wav_and_symlink(archived_bundle, tmp_path) -> None:
@@ -570,8 +635,9 @@ def fresh_bundle(archived_bundle, monkeypatch) -> dict[str, Path]:
 
 
 def test_prepare_fresh_cli_seals_production_layout_with_measured_counts(
-    fresh_bundle, tmp_path, capsys
+    fresh_bundle, tmp_path, capsys, monkeypatch
 ) -> None:
+    monkeypatch.chdir(tmp_path)
     output = tmp_path / "fresh-selection.json"
     arguments = [
         argument
@@ -670,6 +736,8 @@ def panel_bundle(archived_bundle, monkeypatch):
         quarantined_count=0,
         items=[row for row in run["items"] if row["simfile_id"] in PANEL_IDS],
     )
+    for row in run["items"]:
+        row["wall_time_sec"] = Decimal("0.75")
     baseline = snapshot.parent / "runs" / run_id / "run.json"
     baseline.parent.mkdir(parents=True)
     baseline.write_bytes(render_oaf_corpus_run(run))
@@ -678,7 +746,10 @@ def panel_bundle(archived_bundle, monkeypatch):
 
 
 @pytest.mark.parametrize("archived_bundle", [PANEL_IDS], indirect=True)
-def test_panel_seal_binds_all_members_and_requires_opt_in(panel_bundle, tmp_path) -> None:
+def test_panel_seal_binds_all_members_and_requires_opt_in(
+    panel_bundle, tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
     selection = selected.prepare_panel_selection(**panel_bundle)
     assert selection["schema"] == "crux.oaf-tf215-panel-selection/v1"
     assert selection["panel_protocol_sha256"] == PANEL_PROTOCOL_DIGEST
@@ -699,6 +770,45 @@ def test_panel_seal_binds_all_members_and_requires_opt_in(panel_bundle, tmp_path
     assert [audio.path.name for audio, _ in bindings] == [f"{song}.wav" for song in PANEL_IDS]
     with pytest.raises(selected.SelectionError):
         selected.verify_selection(**arguments)
+
+
+@pytest.mark.parametrize("archived_bundle", [PANEL_IDS], indirect=True)
+@pytest.mark.parametrize(
+    "invalid_row",
+    [
+        {"execution_disposition": "resumed"},
+        {"wall_time_sec": None},
+        {"wall_time_sec": True},
+        {"wall_time_sec": -1},
+    ],
+)
+@pytest.mark.parametrize("preparation", [True, False], ids=["prepare", "verify"])
+def test_panel_selection_rejects_rows_without_new_measurements(
+    panel_bundle, tmp_path, invalid_row, preparation
+) -> None:
+    baseline = panel_bundle["baseline_run"]
+    if not preparation:
+        selection = selected.prepare_panel_selection(**panel_bundle)
+    run = strict_json_loads(baseline.read_bytes())
+    run["items"][0].update(invalid_row)
+    invalid_run = render_oaf_corpus_run(run)
+    baseline.write_bytes(invalid_run)
+    if preparation:
+        with pytest.raises(selected.SelectionError, match="freshly inferred TF1 timing"):
+            selected.prepare_panel_selection(**panel_bundle)
+        assert not panel_bundle["input_root"].exists()
+    else:
+        selection["baseline_run_sha256"] = sha256_hex(invalid_run)
+        seal = tmp_path / "invalid-panel-selection.json"
+        seal.write_bytes(canonical_json_bytes(selection))
+        with pytest.raises(selected.SelectionError, match="freshly inferred TF1 timing"):
+            selected.verify_selection(
+                selection_path=seal,
+                expected_selection_sha256=selected.selection_sha256(selection),
+                baseline_run=baseline,
+                input_root=panel_bundle["input_root"],
+                panel=True,
+            )
 
 
 @pytest.mark.parametrize("archived_bundle", [PANEL_IDS], indirect=True)

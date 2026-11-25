@@ -625,8 +625,13 @@ def preflight_reference_mappings(
     timing_manifest: LoadedReferenceTimingManifest,
     *,
     timing_output_root: Path,
+    propagate_io_errors: bool = False,
 ) -> dict[int, ReferenceMappingResult | None]:
-    """Reconstruct eligible native references before any backend work."""
+    """Reconstruct eligible native references before any backend work.
+
+    Enable ``propagate_io_errors`` to recover filesystem errors when reading
+    eligible native event artifacts.
+    """
     if not isinstance(reference_manifest, LoadedReferenceSetManifest):
         raise TypeError("reference_manifest must be LoadedReferenceSetManifest")
     if not isinstance(timing_manifest, LoadedReferenceTimingManifest):
@@ -672,8 +677,10 @@ def preflight_reference_mappings(
                 timing_output_root=timing_output_root,
             )
             mappings[simfile_id] = map_reference_events(events)
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError, ValueError) as error:
             if loaded.view.eligibility_status == "eligible":
+                if propagate_io_errors and isinstance(error, OSError):
+                    raise
                 raise ValueError("eligible reference event artifact invalid") from None
             mappings[simfile_id] = None
     return mappings
