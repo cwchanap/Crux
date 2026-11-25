@@ -57,6 +57,10 @@ requires the verified source audio cache.
 Run preparation once with those inputs. Use its printed digest for each
 execution. Copy the sealed selection, canonical WAVs and archived prediction
 bundle to each fresh Linux x86-64 Colab CPU VM through an authorized data source.
+On Colab, give `prepare`, `prepare-fresh`, and `prepare-panel` a VM-local
+`--input-root` under `/content`. Preparation publishes the complete WAV
+directory with an exclusive atomic rename. Copy the completed artifacts to
+Drive after preparation.
 
 ```bash
 EXPERIMENT=artifacts/experiments/oaf-tf215
@@ -116,34 +120,38 @@ original selection digest.
 ### Twenty-song panel
 
 The [panel protocol](PANEL.md) fixes the membership, exact-input policy and
-evaluation gate. Run TF1 with that scope to produce
-`runs/oaf-ec9176f5c314b5b6/run.json`. Use the fresh September preparation
-command with `prepare-panel`, the panel's TF1 run and a new input directory.
-Run `run-panel` with the same options as `run` above plus the same
-`--reference-manifest` and `--timing-manifest` paths.
-
-To evaluate the gate, run the panel on the TF1 measurement VM and pass a local
-frozen TF1 smoke launcher as the final option. For the Docker-backed launcher,
-append these arguments to `run-panel`:
+evaluation gate. To evaluate it, use `measure-panel` on the x86-64 Colab CPU VM
+with the locked TF2.15 worker and verified checkpoint cache. Set
+`TF1_ROOTFS_LAUNCHER` to the `tf1_rootfs.py` from the fresh September evidence.
+The command checks its SHA-256
+(`c503911ca6eab92b93fff71f76c4e397209ed3cf43105d306ee28c5591d1553c`)
+and installs a fresh TF1 rootfs from that launcher.
 
 ```bash
---tf1-smoke-prediction "$PWD/artifacts/benchmark/oaf-smoke/prediction.jsonl" \
---tf1-smoke-command uv run crux benchmark smoke-backend --backend oaf \
-  --oracle tests/fixtures/oaf_tf1_smoke/smoke-oracle.json
+uv run experiments/oaf_tf215/selected_compare.py measure-panel \
+  --tf1-rootfs-launcher "$TF1_ROOTFS_LAUNCHER" \
+  --reference-manifest "$REFERENCE_MANIFEST" --timing-manifest "$TIMING_MANIFEST" \
+  --cache-dir "$CORPUS_CACHE" --python311 "$PY311" --runtime-root "$SCRATCH/runtime" \
+  --checkpoint-cache artifacts/benchmark/model-cache --output-root /content/oaf-panel-results
 ```
 
-On Docker-free Colab, pass the pinned TF1 rootfs launcher's `smoke` command
-and the path it writes. Start with a fresh prediction output path in either
-case. `run-panel` runs the command locally and checks the new prediction
-against the frozen oracle. The record retains the prediction, its digest,
-the oracle digest, and the VM boot ID.
+Keep `--output-root` on VM-local storage so the paired run can stage and
+publish the WAVs there. Each invocation creates a new directory with the
+frozen smoke prediction, TF1 run, sealed selection, and candidate comparison.
+The same verified TF1 worker launcher runs the smoke and baseline. The seal
+binds the VM boot ID to the exact baseline run and smoke digests. The gate
+checks that the candidate boot matches the TF1 measurement boot.
 
-The resulting comparison records raw 50 ms F1, native drift, warm and
-startup-inclusive RTF, and exact repeats for the two stress anchors. The
-measurement status records whether the run finished. The separate
-`panel_gate_passed` field requires an exact TF1 smoke match, successful paired
-measurements and repeats, and candidate micro-F1 at least as high as TF1.
-Omitting the smoke command allows measurement and leaves the gate false.
+For an existing TF1 baseline, use the fresh September preparation command
+with `prepare-panel` and the panel's `runs/oaf-ec9176f5c314b5b6/run.json`.
+Run `run-panel` with the same options as `run` above plus the same reference
+and timing manifest paths. This compares a sealed baseline, with
+`panel_gate_passed` set to `false`.
+
+Both commands report raw 50 ms F1, native drift, warm and startup-inclusive
+RTF, and exact repeats for the two stress anchors. Gate approval requires
+an exact TF1 smoke match, same-VM measurements, successful repeats, and
+candidate micro-F1 at least as high as TF1.
 
 ## Reproduce the smoke comparison on x86-64 Linux
 

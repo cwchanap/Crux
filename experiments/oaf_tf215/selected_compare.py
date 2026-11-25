@@ -17,13 +17,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
 from typing import Any, BinaryIO
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if os.fspath(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, os.fspath(REPOSITORY_ROOT))
 
-from experiments.oaf_tf215 import compare
+from experiments.oaf_tf215 import compare, panel_tf1
 from experiments.oaf_tf215.panel_metrics import aggregate_panel_scores, score_panel_song
 from experiments.oaf_tf215.selected_inputs import (
     PANEL_SIMFILE_IDS,
@@ -58,18 +58,14 @@ from src.benchmark.oaf_corpus_run import (
     OAF_WORKER_CLOSE_TIMEOUT_SECONDS,
     parse_oaf_corpus_run,
 )
-from src.benchmark.oaf_smoke_oracle import (
-    SmokeOracleEvent,
-    assert_smoke_oracle_matches,
-    read_smoke_oracle,
-)
+from src.benchmark.oaf_smoke_oracle import SmokeOracleEvent
 from src.benchmark.oaf_tf215_runtime import (
     build_candidate_descriptor,
     build_runtime_identity,
     collect_probe,
     tf215_worker_environment,
 )
-from src.benchmark.prediction_artifact import PredictionArtifact, read_prediction_artifact
+from src.benchmark.prediction_artifact import PredictionArtifact
 from src.benchmark.reference_set import ReferenceMappingResult
 from src.benchmark.reference_set_manifest import (
     load_reference_set_manifest,
@@ -81,9 +77,7 @@ from src.benchmark.worker_process import WorkerProcess
 SCHEMA = "crux.oaf-tf215-selected-comparison/v1"
 PANEL_SCHEMA = "crux.oaf-tf215-panel-comparison/v1"
 PANEL_ANCHORS = (194, 384)
-SMOKE_ROOT = REPOSITORY_ROOT / "tests/fixtures/oaf_tf1_smoke"
-BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
-TF1_SMOKE_TIMEOUT_SECONDS = 600
+SMOKE_ROOT = panel_tf1.SMOKE_ROOT
 EXPERIMENT_MODULES = (
     "build_runtime.py",
     "compare.py",
@@ -98,7 +92,11 @@ def _driver_source_files(root: Path, *, panel: bool = False) -> tuple[Path, ...]
     benchmark = root / "src/benchmark"
     return (
         *(experiment / filename for filename in EXPERIMENT_MODULES),
-        *((experiment / "panel_metrics.py", experiment / "PANEL.md") if panel else ()),
+        *(
+            (experiment / "panel_metrics.py", experiment / "panel_tf1.py", experiment / "PANEL.md")
+            if panel
+            else ()
+        ),
         *(path.relative_to(root) for path in sorted(benchmark.rglob("*.py"))),
         Path("runtime/oaf_tf1/model.py"),
     )
@@ -237,46 +235,6 @@ def _panel_references(
     ):
         raise SelectionError("panel reference mapping is incomplete")
     return {song: mapping for song, mapping in mappings.items() if mapping is not None}
-
-
-def _verify_panel_tf1_smoke(
-    command: Sequence[str], prediction_path: Path, directory: Path
-) -> dict[str, str]:
-    if prediction_path.exists() or prediction_path.is_symlink():
-        raise SelectionError("TF1 smoke prediction already exists; use a fresh output path")
-    boot_id = UUID(BOOT_ID_PATH.read_text(encoding="ascii").strip())
-    result = subprocess.run(
-        command,
-        cwd=REPOSITORY_ROOT,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        errors="replace",
-        timeout=TF1_SMOKE_TIMEOUT_SECONDS,
-    )
-    if result.returncode:
-        raise SelectionError(
-            f"local TF1 smoke failed ({result.returncode}): {result.stdout[-768:]}"
-        )
-    if UUID(BOOT_ID_PATH.read_text(encoding="ascii").strip()) != boot_id:
-        raise SelectionError("measurement VM boot ID changed during TF1 smoke")
-
-    content = read_regular_file_no_follow(prediction_path)
-    oracle = read_regular_file_no_follow(SMOKE_ROOT / "smoke-oracle.json")
-    try:
-        assert_smoke_oracle_matches(
-            read_prediction_artifact(content).prediction, read_smoke_oracle(oracle)
-        )
-    except AssertionError as error:
-        raise SelectionError(f"TF1 smoke did not match the frozen oracle: {error}") from error
-    artifact = publish_immutable_file(directory / "tf1-smoke-prediction.jsonl", content)
-    return {
-        "status": "exact",
-        "boot_id": str(boot_id),
-        "prediction_sha256": artifact.sha256,
-        "oracle_sha256": sha256_hex(oracle),
-    }
 
 
 def _stage_wavs(
@@ -426,8 +384,7 @@ def run_selected_comparison(
     output_root: Path,
     process_factory: Callable[..., Any] | None = None,
     panel_manifests: tuple[Path, Path] | None = None,
-    tf1_smoke_command: Sequence[str] | None = None,
-    tf1_smoke_prediction: Path | None = None,
+    _tf1_measurement: panel_tf1.Tf1PanelMeasurement | None = None,
 ) -> dict[str, Any]:
     panel = panel_manifests is not None
     execution_id = str(uuid4())
@@ -478,6 +435,19 @@ def run_selected_comparison(
         )
         record["baseline"] = {key: value for key, value in selection.items() if key != "items"}
         if panel_manifests is not None:
+            if _tf1_measurement is not None:
+                if (
+                    selection.get("tf1_measurement") != _tf1_measurement.binding()
+                    or selection.get("baseline_run_sha256") != _tf1_measurement.run_sha256
+                    or _tf1_measurement.launcher_sha256 != panel_tf1.TF1_LAUNCHER_SHA256
+                ):
+                    raise SelectionError("panel seal does not bind the measured TF1 run")
+                record["tf1_smoke"] = {
+                    "status": "exact",
+                    "boot_id": _tf1_measurement.boot_id,
+                    "prediction_sha256": _tf1_measurement.smoke_prediction_sha256,
+                    "oracle_sha256": _tf1_measurement.smoke_oracle_sha256,
+                }
             run = read_regular_file_no_follow(baseline_run)
             if sha256_hex(run) != selection["baseline_run_sha256"]:
                 raise SelectionError("baseline run changed after the seal was checked")
@@ -507,16 +477,6 @@ def run_selected_comparison(
         directory = output_root / descriptor.sha256 / runtime_sha / execution_id
         directory.mkdir(parents=True, exist_ok=False)
         _write_json(directory / "selection.json", selection)
-
-        if tf1_smoke_command is not None or tf1_smoke_prediction is not None:
-            stage = "tf1_smoke"
-            if not panel or not tf1_smoke_command or tf1_smoke_prediction is None:
-                raise SelectionError(
-                    "panel TF1 smoke requires both a command and a prediction path"
-                )
-            record["tf1_smoke"] = _verify_panel_tf1_smoke(
-                tf1_smoke_command, tf1_smoke_prediction, directory
-            )
 
         stage = "smoke"
         factory = WorkerProcess.start if process_factory is None else process_factory
@@ -599,11 +559,12 @@ def run_selected_comparison(
         )
         if record["status"] != "complete":
             record["failed_stage"] = "selected_items"
-        if panel:
+        if panel and _tf1_measurement is not None:
+            stage = "measurement_boot"
+            record["candidate_boot_id"] = panel_tf1.read_boot_id()
             record["panel_gate_passed"] = (
                 record["status"] == "complete"
-                and record["tf1_smoke"] is not None
-                and record["tf1_smoke"]["status"] == "exact"
+                and record["candidate_boot_id"] == _tf1_measurement.boot_id
                 and record["panel_scores"]["micro_f1_nonregression"] is True
             )
     except SelectionBlocked as error:
@@ -616,6 +577,55 @@ def run_selected_comparison(
         record["output_dir"] = os.fspath(directory)
         _write_json(directory / "comparison.json", record)
     return record
+
+
+def measure_panel(
+    *,
+    launcher_path: Path,
+    reference_manifest: Path,
+    timing_manifest: Path,
+    cache_dir: Path,
+    python311: Path,
+    runtime_root: Path,
+    checkpoint_cache: Path,
+    output_root: Path,
+) -> dict[str, Any]:
+    """Measure the TF1 and TF2.15 panels on one boot and evaluate the gate."""
+    directory = output_root / str(uuid4())
+    directory.mkdir(parents=True, exist_ok=False)
+    baseline = panel_tf1.measure_tf1_panel(
+        launcher_path=launcher_path,
+        reference_manifest=reference_manifest,
+        timing_manifest=timing_manifest,
+        cache_dir=cache_dir,
+        checkpoint_cache=checkpoint_cache,
+        directory=directory,
+    )
+    input_root = directory / "sealed-wavs"
+    selection = prepare_panel_selection(
+        baseline_run=baseline.run_path,
+        reference_manifest=reference_manifest,
+        timing_manifest=timing_manifest,
+        cache_dir=cache_dir,
+        input_root=input_root,
+    )
+    if selection["baseline_run_sha256"] != baseline.run_sha256:
+        raise SelectionError("TF1 run changed before the panel was sealed")
+    selection["tf1_measurement"] = baseline.binding()
+    selection_path = directory / "selection.json"
+    _write_json(selection_path, selection)
+    return run_selected_comparison(
+        selection_path=selection_path,
+        expected_selection_sha256=selection_sha256(selection),
+        baseline_run=baseline.run_path,
+        python311=python311,
+        runtime_root=runtime_root,
+        checkpoint_cache=checkpoint_cache,
+        input_root=input_root,
+        output_root=directory / "candidate",
+        panel_manifests=(reference_manifest, timing_manifest),
+        _tf1_measurement=baseline,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -640,24 +650,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         for parser_ in (prepare, prepare_fresh, prepare_panel):
             parser_.add_argument(f"--{flag}", required=True, type=Path)
     run = subcommands.add_parser("run", help="measure a verified, sealed five-song selection")
-    run_panel = subcommands.add_parser("run-panel", help="measure the sealed twenty-song panel")
-    run_panel.add_argument("--reference-manifest", required=True, type=Path)
-    run_panel.add_argument("--timing-manifest", required=True, type=Path)
-    run_panel.add_argument("--tf1-smoke-prediction", type=Path, help="fresh TF1 smoke output path")
-    run_panel.add_argument(
-        "--tf1-smoke-command",
-        nargs=argparse.REMAINDER,
-        help="local frozen TF1 smoke command and its arguments; give this option last",
+    run_panel = subcommands.add_parser("run-panel", help="compare against a sealed TF1 panel")
+    paired = subcommands.add_parser(
+        "measure-panel", help="measure both backends on one VM and evaluate the panel gate"
     )
-    for flag in (
-        "selection-path",
-        "baseline-run",
-        "python311",
-        "runtime-root",
-        "checkpoint-cache",
-        "input-root",
-        "output-root",
-    ):
+    for parser_ in (run_panel, paired):
+        parser_.add_argument("--reference-manifest", required=True, type=Path)
+        parser_.add_argument("--timing-manifest", required=True, type=Path)
+    paired.add_argument("--cache-dir", required=True, type=Path)
+    paired.add_argument("--tf1-rootfs-launcher", dest="launcher_path", required=True, type=Path)
+    for flag in ("python311", "runtime-root", "checkpoint-cache", "output-root"):
+        for parser_ in (run, run_panel, paired):
+            parser_.add_argument(f"--{flag}", required=True, type=Path)
+    for flag in ("selection-path", "baseline-run", "input-root"):
         for parser_ in (run, run_panel):
             parser_.add_argument(f"--{flag}", required=True, type=Path)
     for parser_ in (run, run_panel):
@@ -694,18 +699,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise
             print(selection_sha256(selection))
             return 0
-        if command == "run-panel":
-            arguments["panel_manifests"] = (
-                arguments.pop("reference_manifest"),
-                arguments.pop("timing_manifest"),
-            )
-        result = run_selected_comparison(**arguments)
-    except (OSError, SelectionError) as error:
+        if command == "measure-panel":
+            result = measure_panel(**arguments)
+        else:
+            if command == "run-panel":
+                arguments["panel_manifests"] = (
+                    arguments.pop("reference_manifest"),
+                    arguments.pop("timing_manifest"),
+                )
+            result = run_selected_comparison(**arguments)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         blocked = isinstance(error, SelectionBlocked)
         print(json.dumps({"status": "blocked" if blocked else "failed", "error": str(error)}))
         return 2 if blocked else 1
 
-    print(json.dumps({"status": result["status"], "output_dir": result["output_dir"]}))
+    result_fields = {"status", "output_dir", "panel_gate_passed"}
+    print(json.dumps({key: value for key, value in result.items() if key in result_fields}))
     return {"complete": 0, "blocked": 2}.get(result["status"], 1)
 
 
