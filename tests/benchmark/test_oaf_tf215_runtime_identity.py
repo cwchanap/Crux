@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -90,9 +91,60 @@ def test_probe_launch_uses_worker_arguments_and_environment(tmp_path):
     shim.chmod(0o755)
     result = identity.collect_probe(
         shim,
-        worker_environment={**identity.tf215_worker_environment(), "OPENBLAS_NUM_THREADS": "3"},
+        worker_environment={
+            **identity.build_tf215_worker_environment(),
+            "OPENBLAS_NUM_THREADS": "3",
+        },
     )
     assert result["status"] == "blocked"
+
+
+def test_worker_cache_is_private_and_stable_across_launches(tmp_path, monkeypatch):
+    monkeypatch.setattr(identity, "_NUMBA_CACHE_PARENT", tmp_path)
+    monkeypatch.setenv("NUMBA_CACHE_DIR", str(tmp_path / "inherited-cache"))
+
+    environment = identity.build_tf215_worker_environment()
+    cache = Path(environment["NUMBA_CACHE_DIR"])
+
+    assert cache.parent == tmp_path
+    assert cache.name != "inherited-cache"
+    assert cache.stat().st_uid == os.geteuid()
+    assert stat.S_IMODE(cache.stat().st_mode) == 0o700
+    assert identity.build_tf215_worker_environment()["NUMBA_CACHE_DIR"] == str(cache)
+
+
+@pytest.mark.parametrize("unsafe", ["shared", "symlink", "foreign"])
+def test_worker_cache_rejects_an_unsafe_existing_path(tmp_path, monkeypatch, unsafe):
+    monkeypatch.setattr(identity, "_NUMBA_CACHE_PARENT", tmp_path)
+    uid = os.geteuid()
+    if unsafe == "foreign":
+        uid += 1
+        monkeypatch.setattr(identity.os, "geteuid", lambda: uid)
+    cache = tmp_path / f"crux-oaf-tf215-numba-{uid}"
+    if unsafe == "symlink":
+        target = tmp_path / "real-cache"
+        target.mkdir(mode=0o700)
+        cache.symlink_to(target, target_is_directory=True)
+    else:
+        cache.mkdir(mode=0o700)
+        if unsafe == "shared":
+            cache.chmod(0o755)
+
+    with pytest.raises(ValueError, match="private Numba cache"):
+        identity.build_tf215_worker_environment()
+
+
+def test_sourceless_bytecode_is_included_in_the_runtime_inventory(tmp_path):
+    bytecode = tmp_path / "worker_helper.pyc"
+    bytecode.write_bytes(b"first implementation")
+    cache = tmp_path / "__pycache__"
+    cache.mkdir()
+    (cache / "source.cpython-311.pyc").write_bytes(b"ordinary Python cache")
+
+    first = identity._scratch_inventory(tmp_path)
+    assert first == {"worker_helper.pyc": hashlib.sha256(b"first implementation").hexdigest()}
+    bytecode.write_bytes(b"changed implementation")
+    assert identity._scratch_inventory(tmp_path) != first
 
 
 def test_x86_probe_collects_cpu_and_package_identity(tmp_path, monkeypatch):
@@ -234,7 +286,7 @@ def preparation(tmp_path, monkeypatch):
     python = tmp_path / "venv/python"
     python.parent.mkdir()
     python.symlink_to(sys.executable)
-    environment = identity.tf215_worker_environment()
+    environment = identity.build_tf215_worker_environment()
     probe = {
         "schema": identity.PROBE_SCHEMA,
         "status": "ok",

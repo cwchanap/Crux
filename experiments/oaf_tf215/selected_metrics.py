@@ -31,12 +31,12 @@ CHANGE_FIELDS = (
 )
 
 
-def baseline_native_events(artifact: PredictionArtifact) -> tuple[NativeEvent, ...]:
+def extract_baseline_native_events(artifact: PredictionArtifact) -> tuple[NativeEvent, ...]:
     """Extract native events from the verified archive, preserving its recorded order."""
     return tuple(event.native for event in artifact.prediction.events)
 
 
-def candidate_native_events(events: tuple[SmokeOracleEvent, ...]) -> tuple[NativeEvent, ...]:
+def decode_candidate_native_events(events: tuple[SmokeOracleEvent, ...]) -> tuple[NativeEvent, ...]:
     """Decode the experiment's exact native event records for comparison."""
     return tuple(
         _decode_native_event(
@@ -56,6 +56,11 @@ def candidate_native_events(events: tuple[SmokeOracleEvent, ...]) -> tuple[Nativ
         )
         for event in events
     )
+
+
+# Archived evidence verifiers import the earlier names.
+baseline_native_events = extract_baseline_native_events
+candidate_native_events = decode_candidate_native_events
 
 
 @dataclass(frozen=True)

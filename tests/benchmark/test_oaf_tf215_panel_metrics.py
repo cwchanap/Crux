@@ -1,5 +1,6 @@
 """Score the TF2.15 panel using the production common drum taxonomy."""
 
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from src.benchmark.oaf_tf215_runtime import build_candidate_descriptor
 from src.benchmark.prediction_artifact import read_prediction_artifact
 from src.benchmark.reference_set import map_reference_events
 from src.benchmark.reference_timing import NativeReferenceEvent
+from src.benchmark.taxonomy import OAF_TF215_PREDICTION_MAP
 
 
 def test_panel_score_rounds_before_raw_matching_and_preserves_extra_events() -> None:
@@ -64,6 +66,31 @@ def test_panel_score_rounds_before_raw_matching_and_preserves_extra_events() -> 
     }
     with pytest.raises(ValueError, match="candidate backend"):
         score_panel_song(baseline, events, mapping, baseline.prediction.descriptor)
+
+
+def test_panel_score_uses_candidate_prediction_map(monkeypatch: pytest.MonkeyPatch) -> None:
+    from experiments.oaf_tf215 import panel_metrics
+
+    monkeypatch.setattr(
+        panel_metrics,
+        "OAF_TF215_PREDICTION_MAP",
+        replace(OAF_TF215_PREDICTION_MAP, classes={}),
+        raising=False,
+    )
+    path = Path(__file__).parent / "schema_goldens" / "crux.drum-prediction-events-v2.jsonl"
+    baseline = read_prediction_artifact(path.read_bytes())
+    event = _event_from_native(
+        NativeEvent(0.5, "midi_42", 21, 42, {"upstream_8hit_group_id": "hihat"}, 0.5, 80)
+    )
+
+    score = panel_metrics.score_panel_song(
+        baseline,
+        (event,),
+        map_reference_events(()),
+        build_candidate_descriptor(load_model_config()),
+    )
+
+    assert score["candidate"] == {"tp": 0, "fp": 0, "fn": 0, "f1": None, "unmapped": 1}
 
 
 def test_panel_aggregates_macro_f1_separately_from_pooled_counts() -> None:

@@ -841,9 +841,13 @@ def _check_audio(
         raise SelectionError(f"canonical WAV identity mismatch for simfile {row['simfile_id']}")
 
 
-def selection_sha256(selection: Mapping[str, object]) -> str:
+def compute_selection_sha256(selection: Mapping[str, object]) -> str:
     """Hash the canonical selection object without a file newline."""
     return sha256_hex(canonical_json_bytes(cast(JsonValue, dict(selection))))
+
+
+# Archived evidence verifiers import the earlier name.
+selection_sha256 = compute_selection_sha256
 
 
 def verify_selection(
@@ -860,7 +864,10 @@ def verify_selection(
         selection = strict_json_loads(content, require_canonical=True)
     except ValueError as error:
         raise SelectionError(f"invalid selection document: {error}") from error
-    if not isinstance(selection, dict) or selection_sha256(selection) != expected_selection_sha256:
+    if (
+        not isinstance(selection, dict)
+        or compute_selection_sha256(selection) != expected_selection_sha256
+    ):
         raise SelectionError("selection digest does not match")
     fresh = panel or selection.get("schema") == FRESH_SELECTION_SCHEMA
     expected = _selection_policy(fresh=fresh, panel=panel)

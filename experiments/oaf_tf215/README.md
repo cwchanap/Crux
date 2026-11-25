@@ -23,7 +23,6 @@ full-model smoke comparison checks exact parity against the frozen TF1 oracle.
 | `compare.py` | Python 3.12 driver: verifies the checkpoint and fixture, then runs two requests through one loaded Python 3.11 scratch worker plus one through a fresh worker and compares the exact native events with the frozen binary64 smoke oracle. |
 | `selected_compare.py` | Seals archived or fresh TF1 inputs for the five fixed songs and measures TF2.15 drift with a separate runtime identity. |
 | [`src/benchmark/oaf_tf215_runtime.py`](../../src/benchmark/oaf_tf215_runtime.py) | Fingerprints source files and inventories the isolated worker environment. |
-| `check_workflow_result_fallback.py` | Stdlib-only local check: the workflow's always-on result step writes a failed sync/check/build/graph/environment record when no graph output exists. |
 | `README.md` | This file. Reproduction commands and evidence scope. |
 | `RESULTS.md` | Recorded CI, graph, restore, inference and manual-job evidence plus the decision checkpoint; not a parity claim. |
 
@@ -396,9 +395,8 @@ manual full-model job.
 
 ### PR graph job (checkpoint-free, runs on draft PRs)
 
-The `graph` job runs on path-filtered pull requests
-(`experiments/oaf_tf215/**`, the three scoped test modules and the workflow
-itself), including draft PRs, unlike the root `ci.yml` which skips drafts. On
+The `graph` job runs on pull requests, including drafts, that change files
+matched by the path filters in `.github/workflows/oaf-tf215-probe.yml`. On
 `ubuntu-24.04` it installs Python 3.11 with `uv python install 3.11`, creates
 the venv with `uv venv --python 3.11`, installs the hash lock with
 `uv pip sync --require-hashes` and runs `uv pip check`. The fresh runner
@@ -414,9 +412,9 @@ config is gone; the worker import asserts the frozen backend ID. A failure at
 any of those points is a `build` stage failure. No checkpoint is downloaded by
 any of these steps.
 
-The `driver` step then runs `tests/benchmark/test_oaf_tf215_compare.py` and
-`tests/benchmark/test_oaf_tf215_workflow.py` in the Python 3.12 project
-environment (fake worker only).
+The `driver` step runs the comparison, graph check, panel metrics, runtime
+identity, selected-input, selected-metrics, selected-comparison and workflow
+tests in the Python 3.12 project environment. The tests use fake workers.
 
 After the driver stage, `graph_check.py` runs with the four environment
 controls. The compact `artifacts/experiments/oaf-tf215/graph-check.json` result
@@ -468,13 +466,12 @@ command sequence was also executed independently on a fresh native Linux x86-64
 Colab CPU VM; `RESULTS.md` records both hosts, interpreter builds, hashes and
 the actual graph/restore/inference output.
 
-`check_workflow_result_fallback.py` is the focused local check for the graph
-job's fallback: it extracts the step's shell block from the workflow and
-exercises the sync, check, build, driver, graph, setup, existing-failure and
-passed paths. `tests/benchmark/test_oaf_tf215_workflow.py` checks both jobs:
-the graph job stays checkpoint-free, the model job uses the same public
-checkpoint command as the smoke workflow with no secrets, and a divergent
-driver exit still leaves and uploads its record.
+`tests/benchmark/test_oaf_tf215_workflow.py` runs the graph job's summary step
+for failures during setup, sync, check, build, driver and graph execution.
+It also verifies that the step preserves existing failed and passed results.
+The tests check that the graph job stays checkpoint-free, the model job uses
+the same public checkpoint command as the smoke workflow, and a divergent
+driver exit still leaves its record available for upload.
 
 ## What this does and does not prove
 
@@ -501,8 +498,10 @@ or native Colab), not by a local aarch64 interpreter.
 ## Opt-in corpus benchmark
 
 Run from the repository checkout on Linux x86-64. Set `WORKER` and `SCRATCH`
-to fresh directories, and `CHECKPOINT_CACHE` to a local checkpoint cache.
-Prepare the locked project and worker environments.
+to fresh directories, and `CHECKPOINT_CACHE` to a local checkpoint cache. The
+worker launcher creates and verifies an owner-only Numba cache under `/tmp`.
+Its path is part of the runtime fingerprint. Prepare the locked project and
+worker environments.
 
 ```bash
 uv sync --locked --python 3.12 --no-dev
@@ -510,7 +509,6 @@ uv venv --python 3.11 "$WORKER"
 uv pip sync --python "$WORKER/bin/python" --require-hashes experiments/oaf_tf215/requirements.lock
 uv pip check --python "$WORKER/bin/python"
 "$WORKER/bin/python" experiments/oaf_tf215/build_runtime.py --output "$SCRATCH"
-mkdir -p /tmp/numba-cache
 uv run --no-sync crux benchmark prepare-backend --backend oaf --download --cache-root "$CHECKPOINT_CACHE"
 ```
 

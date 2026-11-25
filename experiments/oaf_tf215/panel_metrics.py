@@ -8,7 +8,7 @@ from decimal import Decimal
 from fractions import Fraction
 from typing import Literal, TypedDict
 
-from experiments.oaf_tf215.selected_metrics import candidate_native_events
+from experiments.oaf_tf215.selected_metrics import decode_candidate_native_events
 from src.benchmark.backend_identity import (
     OAF_TF215_BACKEND_ID,
     BackendDescriptor,
@@ -27,7 +27,7 @@ from src.benchmark.scorer_input import (
     reference_to_benchmark_events,
 )
 from src.benchmark.scoring import score_events
-from src.benchmark.taxonomy import OAF_PREDICTION_MAP
+from src.benchmark.taxonomy import OAF_TF215_PREDICTION_MAP
 
 RAW_TOLERANCE_SEC = 0.05
 
@@ -72,18 +72,18 @@ def score_panel_song(
     mapping: ReferenceMappingResult,
     descriptor: BackendDescriptor,
 ) -> PanelSongScore:
-    """Use the frozen OaF taxonomy and raw 50 ms production scoring policy."""
+    """Use the production OaF taxonomy and raw 50 ms scoring policy."""
     if descriptor.payload.get("backend_id") != OAF_TF215_BACKEND_ID:
         raise ValueError("panel scoring requires the TF2.15 candidate backend")
 
     audio = baseline.prediction.audio
     native = tuple(
         replace(event, time_sec=float(quantize_six(event.time_sec)))
-        for event in candidate_native_events(events)
+        for event in decode_candidate_native_events(events)
     )
     mapped, diagnostics = map_oaf_prediction(
         NativePrediction(audio, descriptor, native),
-        replace(OAF_PREDICTION_MAP, backend_id=OAF_TF215_BACKEND_ID),
+        OAF_TF215_PREDICTION_MAP,
     )
     # Keep multiplicity after rounding, including candidates that share an artifact key.
     candidate_predictions = [

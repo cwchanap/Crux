@@ -55,7 +55,7 @@ from src.benchmark.oaf_smoke_oracle import (
     _event_from_native,
     read_smoke_oracle,
 )
-from src.benchmark.oaf_tf215_runtime import WORKER_ENVIRONMENT, tf215_worker_environment
+from src.benchmark.oaf_tf215_runtime import WORKER_ENVIRONMENT, build_tf215_worker_environment
 from src.benchmark.worker_process import WorkerProcess, WorkerProcessError
 
 SCHEMA = "oaf-tf215-compare/v2"
@@ -198,6 +198,7 @@ def _start_worker(
     timeout_seconds: float = WORKER_START_TIMEOUT_SECONDS,
     close_timeout_seconds: float | None = None,
     worker_environment: Mapping[str, str] | None = None,
+    host_unavailable_is_blocked: bool = True,
 ) -> dict[str, Any]:
     worker = runtime_root / "worker.py"
     if worker.is_symlink() or not worker.is_file():
@@ -209,6 +210,9 @@ def _start_worker(
         "--checkpoint-dir",
         os.fspath(checkpoint),
     ]
+    environment = (
+        build_tf215_worker_environment() if worker_environment is None else worker_environment
+    )
     try:
         close_options = (
             {}
@@ -219,19 +223,23 @@ def _start_worker(
             command,
             timeout_seconds=timeout_seconds,
             cwd=fixture.parent,
-            env=tf215_worker_environment() if worker_environment is None else worker_environment,
+            env=environment,
             **close_options,
         )
     except WorkerProcessError as error:
-        # Popen failed, so the interpreter or host itself is unavailable. A
-        # child that executed and then failed is a real initialization failure.
-        if isinstance(error.__cause__, OSError):
+        # An initial Popen failure can block the experiment. Once the host ran
+        # the first worker, a restart failure is part of the experiment result.
+        if host_unavailable_is_blocked and isinstance(error.__cause__, OSError):
             raise StageLabel("host", str(error)) from error
         raise
     return {
         "command": command,
         "cwd": os.fspath(fixture.parent),
-        "flags": dict(WORKER_ENVIRONMENT),
+        "flags": {
+            key: environment[key]
+            for key in (*WORKER_ENVIRONMENT, "NUMBA_CACHE_DIR")
+            if key in environment
+        },
     }
 
 
@@ -327,7 +335,15 @@ def _run_inference(
         # failure can neither mask the primary error nor double-close.
         _close_worker(first, record)
 
-    _start_worker(process_factory, python311, runtime_root, checkpoint, fixture, holder)
+    _start_worker(
+        process_factory,
+        python311,
+        runtime_root,
+        checkpoint,
+        fixture,
+        holder,
+        host_unavailable_is_blocked=False,
+    )
     fresh = holder.pop("process")
     try:
         record["inference"]["fresh_worker"] = _validate_worker_ready(fresh.ready)
@@ -510,12 +526,7 @@ def run_comparison(
             ),
         )
     except StageFailure as failure:
-        current = record["state"]["failed_stage"]
-        # A later access blocker must not downgrade an actual failure (e.g. a
-        # failed worker close followed by a fresh-worker Popen error). Both
-        # stages stay recorded; only the label keeps the actual failure.
-        if current is None or failure.stage not in BLOCKED_STAGES or current in BLOCKED_STAGES:
-            record["state"]["failed_stage"] = failure.stage
+        record["state"]["failed_stage"] = failure.stage
     finally:
         process = holder.pop("process", None)
         if process is not None:

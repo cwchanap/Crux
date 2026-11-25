@@ -367,7 +367,7 @@ def test_prepares_selection_and_verifies_it_after_root_relocation(
     selection = selected.prepare_selection(**archived_bundle)
     selection_path = tmp_path / "selection.json"
     selection_path.write_bytes(canonical_json_bytes(selection))
-    digest = selected.selection_sha256(selection)
+    digest = selected.compute_selection_sha256(selection)
     baseline = archived_bundle["baseline_run"]
     archive = shutil.move(baseline.parent, tmp_path / "moved-archive")
     audio_root = shutil.move(archived_bundle["input_root"], tmp_path / "moved-inputs")
@@ -551,7 +551,7 @@ def test_verify_rejects_changed_seal_wav_and_symlink(archived_bundle, tmp_path) 
     selection = selected.prepare_selection(**archived_bundle)
     path = tmp_path / "selection.json"
     path.write_bytes(canonical_json_bytes(selection))
-    digest = selected.selection_sha256(selection)
+    digest = selected.compute_selection_sha256(selection)
     arguments = {
         "selection_path": path,
         "expected_selection_sha256": digest,
@@ -700,7 +700,7 @@ def test_verify_fresh_rebinds_prediction_bytes(fresh_bundle, tmp_path) -> None:
     with pytest.raises(selected.SelectionError, match="prediction"):
         selected.verify_selection(
             selection_path=output,
-            expected_selection_sha256=selected.selection_sha256(selection),
+            expected_selection_sha256=selected.compute_selection_sha256(selection),
             baseline_run=baseline,
             input_root=fresh_bundle["input_root"],
         )
@@ -761,7 +761,7 @@ def test_panel_seal_binds_all_members_and_requires_opt_in(
     path.write_bytes(canonical_json_bytes(selection))
     arguments = {
         "selection_path": path,
-        "expected_selection_sha256": selected.selection_sha256(selection),
+        "expected_selection_sha256": selected.compute_selection_sha256(selection),
         "baseline_run": panel_bundle["baseline_run"],
         "input_root": panel_bundle["input_root"],
     }
@@ -804,7 +804,7 @@ def test_panel_selection_rejects_rows_without_new_measurements(
         with pytest.raises(selected.SelectionError, match="freshly inferred TF1 timing"):
             selected.verify_selection(
                 selection_path=seal,
-                expected_selection_sha256=selected.selection_sha256(selection),
+                expected_selection_sha256=selected.compute_selection_sha256(selection),
                 baseline_run=baseline,
                 input_root=panel_bundle["input_root"],
                 panel=True,
