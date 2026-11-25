@@ -22,6 +22,7 @@ from src.benchmark.backend_identity import (
     IDM_NATIVE_METADATA_SCHEMA_ID,
     MUSCRIPTOR_BACKEND_ID,
     OAF_BACKEND_ID,
+    OAF_TF215_BACKEND_ID,
     BackendDescriptor,
     JsonValue,
     StrictJsonError,
@@ -436,7 +437,7 @@ def _normalize_event(
     _require_optional_int_range(native.velocity_midi, "velocity_midi", 0, 127)
     confidence = _normalize_confidence(native.confidence)
     metadata = _validate_metadata(native.native_metadata, metadata_schema)
-    if backend_id == OAF_BACKEND_ID:
+    if backend_id in {OAF_BACKEND_ID, OAF_TF215_BACKEND_ID}:
         if (
             native.model_output_bin is None
             or native.native_midi_note is None

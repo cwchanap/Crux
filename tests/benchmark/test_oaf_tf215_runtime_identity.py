@@ -15,7 +15,6 @@ from experiments.oaf_tf215 import runtime_identity as identity
 from experiments.oaf_tf215.compare import MODEL_CONFIG_PATH, _worker_environment
 from runtime.oaf_tf1.model import load_model_config
 from src.benchmark.backend_identity import (
-    StrictJsonError,
     canonical_json_bytes,
     normalize_known_backend_descriptor,
 )
@@ -32,8 +31,8 @@ def test_candidate_changes_only_backend_identity():
     }
     assert descriptor.sha256 != baseline.sha256
     assert normalize_known_backend_descriptor(baseline.payload) == baseline.payload
-    with pytest.raises(StrictJsonError, match="unknown"):
-        normalize_known_backend_descriptor(descriptor.payload)
+    assert descriptor.sha256 == "938cbcccff5adda03f11344596e21534e178c98929098bf8327feb1e9ed4c890"
+    assert normalize_known_backend_descriptor(descriptor.payload) == descriptor.payload
 
 
 def test_arm_probe_describes_platform_without_importing_project_code():
