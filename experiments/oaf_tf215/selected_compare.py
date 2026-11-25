@@ -31,16 +31,16 @@ from experiments.oaf_tf215.selected_inputs import (
     SelectionBlocked,
     SelectionError,
     _validate_panel_timings,
+    compute_selection_sha256,
     prepare_fresh_selection,
     prepare_panel_selection,
     prepare_selection,
-    selection_sha256,
     verify_selection,
 )
 from experiments.oaf_tf215.selected_metrics import (
-    baseline_native_events,
-    candidate_native_events,
     compare_events,
+    decode_candidate_native_events,
+    extract_baseline_native_events,
 )
 from runtime.oaf_tf1.model import load_model_config
 from src.benchmark.artifact_io import publish_immutable_file, read_regular_file_no_follow
@@ -62,8 +62,8 @@ from src.benchmark.oaf_smoke_oracle import SmokeOracleEvent
 from src.benchmark.oaf_tf215_runtime import (
     build_candidate_descriptor,
     build_runtime_identity,
+    build_tf215_worker_environment,
     collect_probe,
-    tf215_worker_environment,
 )
 from src.benchmark.prediction_artifact import PredictionArtifact
 from src.benchmark.reference_set import ReferenceMappingResult
@@ -205,7 +205,7 @@ def _run_song(
         return
     try:
         row["metrics"] = compare_events(
-            baseline_native_events(baseline), candidate_native_events(attempts[0])
+            extract_baseline_native_events(baseline), decode_candidate_native_events(attempts[0])
         )
     except (RuntimeError, ValueError) as error:
         _set_failure(row, "metrics", error)
@@ -274,9 +274,11 @@ def _run_panel(
     for worker, songs in ((1, sorted(scheduled)), (2, PANEL_ANCHORS)):
         holder: dict[str, Any] = {}
         started = perf_counter()
+        worker_stage = "worker_start"
         try:
             launch(scheduled[songs[0]][1].path, holder)
             process = holder["process"]
+            worker_stage = "restore"
             ready = compare._validate_worker_ready(process.ready)
             started_workers.append(
                 {
@@ -285,6 +287,7 @@ def _run_panel(
                     **ready,
                 }
             )
+            worker_stage = "inference"
             requests = (*songs, *PANEL_ANCHORS) if worker == 1 else songs
             for song in requests:
                 row, audio, artifact = scheduled[song]
@@ -302,7 +305,8 @@ def _run_panel(
                         continue
                     stage = "metrics"
                     row["metrics"] = compare_events(
-                        baseline_native_events(artifact), candidate_native_events(events)
+                        extract_baseline_native_events(artifact),
+                        decode_candidate_native_events(events),
                     )
                     row["reference_scores"] = score_panel_song(
                         artifact, events, references[song], descriptor
@@ -314,19 +318,32 @@ def _run_panel(
                     row["status"] = "complete"
                 except (OSError, RuntimeError, ValueError) as error:
                     _set_failure(row, stage, error)
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            _set_failure(record, worker_stage, error)
         finally:
-            if process := holder.get("process"):
-                process.close()
+            process = holder.get("process")
+            if process is not None:
+                try:
+                    process.close()
+                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                    if record["status"] == "failed":
+                        record["close_error"] = str(error)[:1024]
+                    else:
+                        _set_failure(record, "worker_close", error)
+        if record["status"] == "failed":
+            record["failed_worker"] = worker
+            break
 
     for song, attempts in replay.items():
         row, _, _ = scheduled[song]
-        if row["status"] == "complete":
-            row["repeatable"] = len(attempts) == 2 and all(
-                events == primary[song] for events in attempts
-            )
-            if not row["repeatable"]:
-                _set_failure(row, "repeatability", "panel anchor events changed")
-                row["status"] = "non_repeatable"
+        if row["status"] != "complete":
+            continue
+        if any(events != primary[song] for events in attempts):
+            row["repeatable"] = False
+            _set_failure(row, "repeatability", "panel anchor events changed")
+            row["status"] = "non_repeatable"
+        elif len(attempts) == 2:
+            row["repeatable"] = True
     record["panel_scores"] = aggregate_panel_scores(
         row["reference_scores"] for row in record["items"] if "reference_scores" in row
     )
@@ -461,7 +478,7 @@ def run_selected_comparison(
         config = load_model_config(compare.MODEL_CONFIG_PATH)
         descriptor = build_candidate_descriptor(config)
         record.update(descriptor=dict(descriptor.payload), descriptor_sha256=descriptor.sha256)
-        environment = tf215_worker_environment()
+        environment = build_tf215_worker_environment()
         probe = collect_probe(python311, worker_environment=environment)
         record["probe"] = probe
         if probe["status"] == "blocked":
@@ -518,6 +535,7 @@ def run_selected_comparison(
                 timeout_seconds=OAF_CORPUS_REQUEST_TIMEOUT_SECONDS,
                 close_timeout_seconds=OAF_WORKER_CLOSE_TIMEOUT_SECONDS,
                 worker_environment=environment,
+                host_unavailable_is_blocked=False,
             )
 
         stage = "sealed_wavs"
@@ -538,6 +556,9 @@ def run_selected_comparison(
                 else:
                     for row, (audio, baseline) in zip(record["items"], snapshots, strict=True):
                         _run_song(row, audio, baseline, launch=launch, stream=stream)
+
+        if record["status"] == "failed":
+            return record
 
         stage = "runtime_recheck"
         after_probe = collect_probe(python311, worker_environment=environment)
@@ -616,7 +637,7 @@ def measure_panel(
     _write_json(selection_path, selection)
     return run_selected_comparison(
         selection_path=selection_path,
-        expected_selection_sha256=selection_sha256(selection),
+        expected_selection_sha256=compute_selection_sha256(selection),
         baseline_run=baseline.run_path,
         python311=python311,
         runtime_root=runtime_root,
@@ -697,7 +718,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 except OSError as cleanup_error:
                     error.add_note(f"WAV directory cleanup failed: {cleanup_error}")
                 raise
-            print(selection_sha256(selection))
+            print(compute_selection_sha256(selection))
             return 0
         if command == "measure-panel":
             result = measure_panel(**arguments)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import replace
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -219,6 +220,29 @@ def _candidate_kick(time_sec: float) -> NativeEvent:
         confidence=0.9,
         velocity_midi=100,
     )
+
+
+def test_tf215_corpus_preserves_bounded_startup_diagnostics(tmp_path, monkeypatch):
+    from src.benchmark.oaf_corpus_run import parse_oaf_corpus_run
+
+    request, runtime, _ = _install_tf215_run_seams(monkeypatch, tmp_path)
+    runtime.python311.symlink_to(sys.executable)
+    runtime.runtime_root.mkdir(parents=True)
+    (runtime.runtime_root / "worker.py").write_text(
+        "import sys\nprint('startup context ' * 70, file=sys.stderr)\n"
+        "raise ImportError('missing TensorFlow dependency')\n",
+        encoding="utf-8",
+    )
+
+    outcome = run_oaf_corpus(request)
+
+    assert outcome.run_path is not None
+    row = parse_oaf_corpus_run(outcome.run_path.read_bytes())["items"][0]
+    assert row["runner_failure_code"] == "backend_unavailable"
+    detail = row["failure_detail"]
+    assert detail.startswith("worker could not be started")
+    assert "ImportError: missing TensorFlow dependency" in detail
+    assert len(detail) <= 512
 
 
 def test_tf215_corpus_infers_then_resumes_both_rows_with_no_worker_start(

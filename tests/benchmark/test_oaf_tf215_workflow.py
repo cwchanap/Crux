@@ -1,10 +1,12 @@
-"""The probe workflow's PR/manual wiring and its extracted model step.
+"""The probe workflow's PR/manual wiring and extracted shell steps.
 
 The compare step is executed from the committed workflow with a fake ``uv``
 that records its argv and writes to the requested ``--output``. The recorded
 argv is parsed by the real ``compare.py`` parser and compared with the expected
 resolved paths, so dropping a required flag or writing elsewhere cannot stay
 green.
+
+The graph summary step is executed for early failures and existing results.
 """
 
 from __future__ import annotations
@@ -16,9 +18,15 @@ import subprocess
 from pathlib import Path
 from types import ModuleType
 
+import pytest
+
 REPO_ROOT = Path(__file__).parents[2]
 WORKFLOW = REPO_ROOT / ".github/workflows/oaf-tf215-probe.yml"
 SMOKE_WORKFLOW = REPO_ROOT / ".github/workflows/oaf-smoke.yml"
+GRAPH_RESULT = "artifacts/experiments/oaf-tf215/graph-check.json"
+GRAPH_SCHEMA = "oaf-tf215-graph-check/v1"
+GRAPH_SUMMARY_STEP = "Record result in job summary"
+GRAPH_STEPS = ("sync", "check", "build", "driver", "graph")
 COMPARE_PATH = REPO_ROOT / "experiments/oaf_tf215/compare.py"
 COMPARE_SCRIPT = "experiments/oaf_tf215/compare.py"
 COMPARE_RESULT = "artifacts/experiments/oaf-tf215/compare.json"
@@ -110,6 +118,10 @@ def _model_job() -> str:
     return _job_text(WORKFLOW.read_text(encoding="utf-8"), "model")
 
 
+def _graph_job() -> str:
+    return _job_text(WORKFLOW.read_text(encoding="utf-8"), "graph")
+
+
 def _load_compare() -> ModuleType:
     spec = importlib.util.spec_from_file_location("crux_oaf_tf215_compare_workflow", COMPARE_PATH)
     if spec is None or spec.loader is None:
@@ -180,6 +192,7 @@ def test_probe_workflow_runs_the_graph_job_on_drafts_and_the_model_job_manually(
     for name in (
         "graph_check",
         "runtime_identity",
+        "panel_metrics",
         "selected_inputs",
         "selected_metrics",
         "selected_compare",
@@ -221,9 +234,8 @@ def test_graph_job_runs_builder_tests_outside_the_locked_worker(tmp_path: Path) 
         "NUMBA_CACHE_DIR": str(tmp_path / "numba-cache"),
         "FAKE_WORKER_COMMANDS": str(worker_commands),
     }
-    graph = _job_text(WORKFLOW.read_text(encoding="utf-8"), "graph")
     completed = _run_script(
-        _run_block(graph, BUILD_STEP),
+        _run_block(_graph_job(), BUILD_STEP),
         tmp_path,
         env,
         'printf \'%s\\0\' "$@" >> "$FAKE_UV_ARGV"',
@@ -240,6 +252,102 @@ def test_graph_job_runs_builder_tests_outside_the_locked_worker(tmp_path: Path) 
     worker_args = worker_commands.read_bytes().split(b"\0")
     assert b"experiments/oaf_tf215/build_runtime.py" in worker_args
     assert b"pytest" not in worker_args
+
+
+def test_graph_job_always_records_and_uploads_the_result_with_stage_outcomes() -> None:
+    graph = _graph_job()
+    summary = graph.split(f"      - name: {GRAPH_SUMMARY_STEP}\n", maxsplit=1)[1]
+    summary, upload = summary.split("      - name: Upload compact result\n", maxsplit=1)
+    assert summary.startswith("        if: always()\n")
+    for step in GRAPH_STEPS:
+        assert f"        id: {step}\n" in graph
+        assert f"          {step.upper()}_OUTCOME: ${{{{ steps.{step}.outcome }}}}" in summary
+    assert upload.startswith("        if: always()\n")
+    assert "actions/upload-artifact@v4" in upload
+    assert f"path: {GRAPH_RESULT}" in upload
+    assert "if-no-files-found: warn" in upload
+
+
+def _run_graph_summary(workdir: Path, outcomes: tuple[str, ...]) -> str:
+    outcome_env = {
+        f"{step.upper()}_OUTCOME": outcome
+        for step, outcome in zip(GRAPH_STEPS, outcomes, strict=True)
+    }
+    completed = _run_script(
+        _run_block(_graph_job(), GRAPH_SUMMARY_STEP),
+        workdir,
+        {**_env(workdir), "GITHUB_RUN_ID": "42", **outcome_env},
+        "exit 127",
+    )
+    assert completed.returncode == 0, completed.stderr
+    return (workdir / "summary.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("stage", "outcomes"),
+    [
+        ("sync", ("failure", "skipped", "skipped", "skipped", "skipped")),
+        ("check", ("success", "failure", "skipped", "skipped", "skipped")),
+        ("build", ("success", "success", "failure", "skipped", "skipped")),
+        ("driver", ("success", "success", "success", "failure", "skipped")),
+        ("graph", ("success", "success", "success", "success", "failure")),
+        ("environment", ("skipped", "skipped", "skipped", "skipped", "skipped")),
+    ],
+)
+def test_graph_summary_records_failure_when_result_is_missing(
+    tmp_path: Path, stage: str, outcomes: tuple[str, ...]
+) -> None:
+    summary = _run_graph_summary(tmp_path, outcomes)
+    raw = (tmp_path / GRAPH_RESULT).read_text(encoding="utf-8")
+    record = json.loads(raw)
+    assert record["schema"] == GRAPH_SCHEMA
+    assert record["status"] == "failed"
+    assert record["failed_stage"] == stage
+    assert record["ci"] == {
+        "GITHUB_SHA": "abc123",
+        "GITHUB_RUN_ID": "42",
+        "RUNNER_OS": "Linux",
+        "RUNNER_ARCH": "X64",
+    }
+    (stage_record,) = record["stages"]
+    assert stage_record["name"] == stage
+    assert stage_record["status"] == "failed"
+    expected_outcomes = " ".join(
+        f"{step}={outcome}" for step, outcome in zip(GRAPH_STEPS, outcomes, strict=True)
+    )
+    assert expected_outcomes in stage_record["error"]
+    assert "## OaF TF2.15 graph check" in summary
+    assert f"```json\n{raw}```" in summary
+
+
+@pytest.mark.parametrize(
+    ("graph_outcome", "record"),
+    [
+        (
+            "failure",
+            {
+                "schema": GRAPH_SCHEMA,
+                "status": "failed",
+                "failed_stage": "slim_batchnorm",
+                "stages": [],
+            },
+        ),
+        ("success", {"schema": GRAPH_SCHEMA, "status": "passed", "stages": []}),
+    ],
+)
+def test_graph_summary_preserves_an_existing_record(
+    tmp_path: Path, graph_outcome: str, record: dict[str, object]
+) -> None:
+    result = tmp_path / GRAPH_RESULT
+    result.parent.mkdir(parents=True)
+    raw = json.dumps(record, indent=2) + "\n"
+    result.write_text(raw, encoding="utf-8")
+
+    summary = _run_graph_summary(
+        tmp_path, ("success", "success", "success", "success", graph_outcome)
+    )
+    assert result.read_text(encoding="utf-8") == raw
+    assert f"```json\n{raw}```" in summary
 
 
 def test_model_job_uses_the_public_checkpoint_command_from_the_smoke_workflow() -> None:

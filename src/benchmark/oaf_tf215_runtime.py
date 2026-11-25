@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import re
+import stat
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -26,12 +27,12 @@ RUNTIME_SCHEMA = "crux.oaf-tf215-runtime/v1"
 EXPERIMENT = Path("experiments/oaf_tf215")
 FROZEN = Path("runtime/oaf_tf1")
 PRISTINE_CONVERTER = Path("upstream/magenta/music/sequences_lib.py")
+_NUMBA_CACHE_PARENT = Path("/tmp")
 WORKER_ENVIRONMENT = MappingProxyType(
     {
         "CUDA_VISIBLE_DEVICES": "-1",
         "PYTHONHASHSEED": "0",
         "TF_ENABLE_ONEDNN_OPTS": "0",
-        "NUMBA_CACHE_DIR": "/tmp/numba-cache",
     }
 )
 ENV_KEYS = (
@@ -56,10 +57,29 @@ class OafTf215Runtime:
     sha256: str
 
 
-def tf215_worker_environment() -> dict[str, str]:
+def build_tf215_worker_environment() -> dict[str, str]:
+    """Build the worker environment with a stable owner-only Numba cache."""
     from src.benchmark.backends.idm import _isolated_worker_environment
 
-    return {**_isolated_worker_environment(), **WORKER_ENVIRONMENT}
+    if not hasattr(os, "geteuid"):
+        raise ValueError("TF2.15 worker cache requires POSIX user identity")
+    uid = os.geteuid()
+    cache = _NUMBA_CACHE_PARENT / f"crux-oaf-tf215-numba-{uid}"
+    try:
+        cache.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    metadata = cache.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != uid
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise ValueError(f"expected a private Numba cache owned by the current user: {cache}")
+    return {**_isolated_worker_environment(), **WORKER_ENVIRONMENT, "NUMBA_CACHE_DIR": str(cache)}
+
+
+tf215_worker_environment = build_tf215_worker_environment
 
 
 def _file_sha256(path: Path) -> str:
@@ -257,14 +277,9 @@ def _scratch_inventory(root: Path) -> dict[str, str]:
         for path in sorted(directory.iterdir()):
             if path.is_symlink():
                 raise ValueError(f"scratch path is a symlink: {path.relative_to(root)}")
-            if (
-                path.name == "__pycache__"
-                or path.suffix == ".pyc"
-                or path == root / "model-scratch"
-            ):
-                continue
             if path.is_dir():
-                yield from entries(path)
+                if path.name != "__pycache__" and path != root / "model-scratch":
+                    yield from entries(path)
             elif path.is_file():
                 yield path.relative_to(root).as_posix(), _file_sha256(path)
             else:
@@ -358,7 +373,7 @@ def prepare_tf215_runtime(
     # only inside the probe when hashing the interpreter binary.
     python311 = python311.absolute()
     runtime_root = runtime_root.absolute()
-    environment = tf215_worker_environment()
+    environment = build_tf215_worker_environment()
     probe = collect_probe(python311, worker_environment=environment)
     identity = build_runtime_identity(repo_root, runtime_root, probe, driver_files=())
     config = load_model_config(repo_root / FROZEN / "model.json")

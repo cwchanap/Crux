@@ -15,6 +15,7 @@ on:
       - "tests/runtime/test_oaf_tf215_builder.py"
       - "tests/benchmark/test_oaf_tf215_compare.py"
       - "tests/benchmark/test_oaf_tf215_graph_check.py"
+      - "tests/benchmark/test_oaf_tf215_panel_metrics.py"
       - "tests/benchmark/test_oaf_tf215_runtime_identity.py"
       - "tests/benchmark/test_oaf_tf215_selected_inputs.py"
       - "tests/benchmark/test_oaf_tf215_selected_metrics.py"
@@ -133,6 +134,7 @@ jobs:
           uv run pytest -q -o addopts=-ra \
             tests/benchmark/test_oaf_tf215_compare.py \
             tests/benchmark/test_oaf_tf215_graph_check.py \
+            tests/benchmark/test_oaf_tf215_panel_metrics.py \
             tests/benchmark/test_oaf_tf215_runtime_identity.py \
             tests/benchmark/test_oaf_tf215_selected_inputs.py \
             tests/benchmark/test_oaf_tf215_selected_metrics.py \

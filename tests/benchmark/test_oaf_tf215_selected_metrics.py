@@ -7,9 +7,9 @@ from pathlib import Path
 import pytest
 
 from experiments.oaf_tf215.selected_metrics import (
-    baseline_native_events,
-    candidate_native_events,
     compare_events,
+    decode_candidate_native_events,
+    extract_baseline_native_events,
 )
 from src.benchmark.backend_identity import canonical_json_bytes, strict_json_loads
 from src.benchmark.backends.base import NativeEvent
@@ -25,14 +25,14 @@ def _event(time_sec: float, native_class_id: str = "midi_38") -> NativeEvent:
 
 def test_event_adapters_recover_native_fields_and_candidate_bits() -> None:
     path = Path(__file__).parent / "schema_goldens" / "crux.drum-prediction-events-v2.jsonl"
-    baseline = baseline_native_events(read_prediction_artifact(path.read_bytes()))
+    baseline = extract_baseline_native_events(read_prediction_artifact(path.read_bytes()))
     assert baseline == (
         NativeEvent(0.5, "midi_46", 25, 46, {"upstream_8hit_group_id": "hihat"}, 0.75, 96),
     )
 
     native = (_event(0.09287981859410431), replace(_event(-0.0), confidence=None))
     raw = tuple(_event_from_native(event) for event in native)
-    assert tuple(_event_from_native(event) for event in candidate_native_events(raw)) == raw
+    assert tuple(_event_from_native(event) for event in decode_candidate_native_events(raw)) == raw
 
 
 def test_inserted_event_does_not_shift_later_pairing() -> None:

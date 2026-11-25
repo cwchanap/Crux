@@ -18,6 +18,7 @@ from src.benchmark.input_view import load_direct_audio
 from src.benchmark.oaf_corpus_run import _expected_oaf_descriptor
 from src.benchmark.oaf_smoke_oracle import read_smoke_oracle
 from src.benchmark.oaf_tf215_runtime import PROBE_SCHEMA
+from src.benchmark.worker_process import WorkerProcessError
 
 
 def _inputs(tmp_path):
@@ -353,7 +354,7 @@ def test_measure_panel_cli_seals_boot_and_run_digest_before_candidate(
         assert seal["tf1_measurement"]["boot_id"] == "same-boot"
         assert seal["tf1_measurement"]["baseline_run_sha256"] == seal["baseline_run_sha256"]
         assert seal["baseline_run_sha256"] == sha256_hex(options["baseline_run"].read_bytes())
-        assert selected.selection_sha256(seal) == options["expected_selection_sha256"]
+        assert selected.compute_selection_sha256(seal) == options["expected_selection_sha256"]
         assert options["_tf1_measurement"].run_path == options["baseline_run"]
         return {"status": "complete", "output_dir": "candidate", "panel_gate_passed": True}
 
@@ -376,21 +377,7 @@ def test_measure_panel_cli_seals_boot_and_run_digest_before_candidate(
     assert json.loads(capsys.readouterr().out)["panel_gate_passed"] is True
 
 
-@pytest.mark.parametrize(
-    ("nonregression", "evidence", "disposition"),
-    [
-        (True, "same_boot", "inferred"),
-        (False, "same_boot", "inferred"),
-        (True, "other_boot", "inferred"),
-        (True, "sealed_only", "inferred"),
-        (True, "wrong_run", "inferred"),
-        (True, "sealed_only", "resumed"),
-    ],
-)
-def test_panel_uses_persistent_worker_and_replays_only_anchors(
-    fake_experiment, monkeypatch, nonregression, evidence, disposition
-):
-    inputs = fake_experiment
+def _panel_experiment(inputs, monkeypatch, *, evidence="same_boot", disposition="inferred"):
     root = inputs["input_root"]
     identifiers = selected.PANEL_SIMFILE_IDS
     baseline = b"sealed test run"
@@ -432,20 +419,43 @@ def test_panel_uses_persistent_worker_and_replays_only_anchors(
             ]
         },
     )
-    monkeypatch.setattr(selected, "score_panel_song", lambda *_: {"scored": True})
+    score = {"tp": 1, "fp": 0, "fn": 0, "unmapped": 0}
+    monkeypatch.setattr(
+        selected, "score_panel_song", lambda *_: {"baseline": score, "candidate": score}
+    )
+    return {
+        **inputs,
+        "panel_manifests": (root / "reference", root / "timing"),
+        "_tf1_measurement": None if evidence == "sealed_only" else measurement,
+    }, candidate_boot
+
+
+@pytest.mark.parametrize(
+    ("nonregression", "evidence", "disposition"),
+    [
+        (True, "same_boot", "inferred"),
+        (False, "same_boot", "inferred"),
+        (True, "other_boot", "inferred"),
+        (True, "sealed_only", "inferred"),
+        (True, "wrong_run", "inferred"),
+        (True, "sealed_only", "resumed"),
+    ],
+)
+def test_panel_uses_persistent_worker_and_replays_only_anchors(
+    fake_experiment, monkeypatch, nonregression, evidence, disposition
+):
+    inputs, candidate_boot = _panel_experiment(
+        fake_experiment, monkeypatch, evidence=evidence, disposition=disposition
+    )
+    identifiers = selected.PANEL_SIMFILE_IDS
 
     def aggregate(scores):
-        assert list(scores) == [{"scored": True}] * len(identifiers)
+        assert len(list(scores)) == len(identifiers)
         return {"micro_f1_nonregression": nonregression}
 
     monkeypatch.setattr(selected, "aggregate_panel_scores", aggregate)
     workers, start = _worker_factory(inputs)
-    result = selected.run_selected_comparison(
-        **inputs,
-        process_factory=start,
-        panel_manifests=(root / "reference", root / "timing"),
-        _tf1_measurement=None if evidence == "sealed_only" else measurement,
-    )
+    result = selected.run_selected_comparison(**inputs, process_factory=start)
     if disposition == "resumed" or evidence == "wrong_run":
         assert result["status"] == "failed"
         assert result["failed_stage"] == "selection"
@@ -456,7 +466,7 @@ def test_panel_uses_persistent_worker_and_replays_only_anchors(
     assert result["panel_gate_passed"] is (nonregression and evidence == "same_boot")
     if evidence != "sealed_only":
         assert result["candidate_boot_id"] == candidate_boot
-        assert result["tf1_smoke"]["boot_id"] == measurement.boot_id
+        assert result["tf1_smoke"]["boot_id"] == inputs["_tf1_measurement"].boot_id
     anchors = [f"{song}.wav" for song in selected.PANEL_ANCHORS]
     assert workers[2].requests == [f"{song}.wav" for song in sorted(identifiers)] + anchors
     assert workers[3].requests == anchors
@@ -467,6 +477,68 @@ def test_panel_uses_persistent_worker_and_replays_only_anchors(
         anchor = row["simfile_id"] in selected.PANEL_ANCHORS
         assert row["completed_attempts"] == (3 if anchor else 1)
         assert row["repeatable"] is (True if anchor else None)
+
+
+@pytest.mark.parametrize(
+    ("worker_number", "stage", "error", "anchor_attempts"),
+    [
+        (1, "worker_start", "panel interpreter could not be started", 0),
+        (1, "worker_close", "panel worker close timed out", 2),
+        (2, "worker_start", "panel interpreter could not be started", 2),
+        (2, "restore", "worker restored tensor count is invalid", 2),
+        (2, "worker_close", "panel worker close timed out", 3),
+    ],
+)
+def test_panel_retains_completed_evidence_when_a_worker_fails(
+    fake_experiment, monkeypatch, worker_number, stage, error, anchor_attempts
+):
+    inputs, _ = _panel_experiment(fake_experiment, monkeypatch)
+    workers, start = _worker_factory(inputs)
+
+    def start_with_failure(*args, **kwargs):
+        # Two smoke workers start before the first panel worker.
+        if len(workers) != worker_number + 1:
+            return start(*args, **kwargs)
+        if stage == "worker_start":
+            raise WorkerProcessError(error) from FileNotFoundError(inputs["python311"])
+        worker = start(*args, **kwargs)
+        if stage == "restore":
+            worker.ready = {**worker.ready, "restored_tensor_count": 77}
+        else:
+            close = worker.close
+
+            def close_with_failure():
+                close()
+                raise WorkerProcessError(error)
+
+            worker.close = close_with_failure
+        return worker
+
+    result = selected.run_selected_comparison(**inputs, process_factory=start_with_failure)
+
+    assert result["status"] == "failed"
+    assert result["failed_stage"] == stage
+    assert result["failed_worker"] == worker_number
+    assert error in result["error"]
+    assert result["panel_gate_passed"] is False
+    assert all(worker.closed for worker in workers)
+    assert len(workers) == worker_number + 2 - (stage == "worker_start")
+    scored_songs = len(selected.PANEL_SIMFILE_IDS) if anchor_attempts else 0
+    assert result["panel_scores"]["scored_song_count"] == scored_songs
+    if scored_songs:
+        assert result["panel_scores"]["micro_f1_nonregression"] is True
+        assert result["panel_runtime"]["all_matched"]["songs"] == scored_songs
+        assert result["panel_runtime"]["all_matched"]["baseline_rtf"] == 2
+    for row in result["items"]:
+        anchor = row["simfile_id"] in selected.PANEL_ANCHORS
+        expected_attempts = anchor_attempts if anchor else int(scored_songs > 0)
+        assert row["completed_attempts"] == expected_attempts
+        assert row["repeatable"] is (True if anchor and anchor_attempts == 3 else None)
+    directory = _execution_dir(inputs["output_root"])
+    replay_attempts = max(0, anchor_attempts - 1) * len(selected.PANEL_ANCHORS)
+    assert len((directory / "native-events.jsonl").read_text().splitlines()) == (
+        scored_songs + replay_attempts
+    )
 
 
 @pytest.mark.parametrize(

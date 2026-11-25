@@ -390,6 +390,47 @@ def test_task_d_tf215_worker_reuses_native_launch_and_keeps_candidate_identity(t
     ]
 
 
+def test_task_d_tf215_worker_start_error_preserves_stderr(tmp_path: Path) -> None:
+    from src.benchmark.backends.oaf import create_tf215_backend
+
+    runtime = _tf215_runtime(tmp_path)
+    runtime.runtime_root.mkdir()
+    (runtime.runtime_root / "worker.py").write_text(
+        "import sys\nprint('candidate runtime import failed', file=sys.stderr)\nsys.exit(1)\n",
+        encoding="utf-8",
+    )
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    audio = _audio(input_root / "song.wav")
+    backend = create_tf215_backend(runtime, input_root=input_root)
+
+    with pytest.raises(
+        OafBackendError, match=r"^worker could not be started: .*candidate runtime import failed"
+    ) as raised:
+        backend.transcribe(audio)
+    assert raised.value.code == "worker_start_failed"
+
+
+def test_task_d_tf215_worker_rejects_factory_without_native_keywords(tmp_path: Path) -> None:
+    from src.benchmark.backends.oaf import create_tf215_backend
+
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    audio = _audio(input_root / "song.wav")
+
+    def start(_command):
+        pytest.fail("native factory must receive cwd and env")
+
+    backend = create_tf215_backend(
+        _tf215_runtime(tmp_path), input_root=input_root, process_factory=start
+    )
+
+    with pytest.raises(OafBackendError, match=r"^worker could not be started") as raised:
+        backend.transcribe(audio)
+    assert raised.value.code == "worker_start_failed"
+    assert isinstance(raised.value.__cause__, TypeError)
+
+
 def test_task_d_oaf_adapter_forwards_only_factory_accepted_timeout_keywords(
     tmp_path: Path,
 ) -> None:

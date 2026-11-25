@@ -146,10 +146,15 @@ class OafBackend:
             kwargs.update(cwd=self._input_root.resolve(strict=True), env=native.worker_environment)
         try:
             process = self._process_factory(command, **kwargs)
-        except (OSError, RuntimeError, ValueError) as error:
-            raise OafBackendError(
-                "worker could not be started", code="worker_start_failed"
-            ) from error
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            if native is None and isinstance(error, TypeError):
+                raise
+            message = "worker could not be started"
+            if isinstance(error, WorkerProcessError):
+                detail = str(error)
+                if detail and detail != message:
+                    message = f"{message}: {detail}"
+            raise OafBackendError(message, code="worker_start_failed") from error
         try:
             _validate_ready(process.ready)
         except OafBackendError:

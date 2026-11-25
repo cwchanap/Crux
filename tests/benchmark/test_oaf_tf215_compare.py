@@ -47,7 +47,6 @@ WORKER_FLAGS = {
     "CUDA_VISIBLE_DEVICES": "-1",
     "PYTHONHASHSEED": "0",
     "TF_ENABLE_ONEDNN_OPTS": "0",
-    "NUMBA_CACHE_DIR": "/tmp/numba-cache",
 }
 
 
@@ -298,6 +297,10 @@ def test_driver_launches_the_scratch_worker_with_an_isolated_environment(
     assert environment["TMPDIR"] == "/sentinel/tmp"
     assert all(key not in environment for key in SANITIZED_VARIABLES)
     assert {key: environment[key] for key in WORKER_FLAGS} == WORKER_FLAGS
+    cache = Path(environment["NUMBA_CACHE_DIR"])
+    assert cache.is_dir() and cache != Path("/tmp/numba-cache")
+    worker_start = next(stage for stage in record["stages"] if stage["name"] == "worker_start")
+    assert worker_start["details"]["flags"] == {**WORKER_FLAGS, "NUMBA_CACHE_DIR": str(cache)}
     assert factory.log == ["start", "request", "request", "close", "start", "request", "close"]
     assert [worker.requests for worker in factory.workers] == [[FIXTURE.name] * 2, [FIXTURE.name]]
     assert [worker.close_count for worker in factory.workers] == [1, 1]
@@ -817,7 +820,7 @@ def test_driver_reports_a_fresh_worker_start_failure_after_closing_the_first(
     assert factory.workers[0].close_count == 1
 
 
-def test_driver_reports_a_fresh_worker_host_failure_as_blocked(
+def test_driver_reports_a_fresh_worker_host_failure_as_failed(
     compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     paths = _paths(tmp_path)
@@ -826,16 +829,16 @@ def test_driver_reports_a_fresh_worker_host_failure_as_blocked(
 
     record = _run(compare, monkeypatch, paths, factory)
 
-    assert record["status"] == "blocked"
-    assert record["state"]["failed_stage"] == "host"
-    assert record["stages"][-1]["name"] == "host"
+    assert record["status"] == "failed"
+    assert record["state"]["failed_stage"] == "inference"
+    assert record["stages"][-1]["name"] == "inference"
     assert "worker could not be started" in record["stages"][-1]["error"]
     assert len(factory.workers) == 1
     assert factory.workers[0].close_count == 1
     assert len(record["inference"]["runs"]) == 2
 
 
-def test_driver_keeps_a_worker_close_failure_over_a_later_host_blocker(
+def test_driver_records_a_worker_close_failure_and_a_fresh_worker_start_failure(
     compare: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     paths = _paths(tmp_path)
@@ -848,8 +851,8 @@ def test_driver_keeps_a_worker_close_failure_over_a_later_host_blocker(
     record = _run(compare, monkeypatch, paths, factory)
 
     assert record["status"] == "failed"
-    assert record["state"]["failed_stage"] == "worker_close"
-    assert [stage["name"] for stage in record["stages"][-2:]] == ["worker_close", "host"]
+    assert record["state"]["failed_stage"] == "inference"
+    assert [stage["name"] for stage in record["stages"][-2:]] == ["worker_close", "inference"]
     assert "close failed" in record["stages"][-2]["error"]
     assert "worker could not be started" in record["stages"][-1]["error"]
     assert len(factory.workers) == 1

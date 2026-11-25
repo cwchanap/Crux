@@ -664,6 +664,16 @@ def _bounded_error(error: BaseException, *, limit: int = 512) -> str:
     detail = str(error).replace("\x00", " ").strip()
     if not detail:
         detail = type(error).__name__
+    marker = " ... "
+    if (
+        isinstance(error, OafBackendError)
+        and error.code == "worker_start_failed"
+        and len(marker) < limit < len(detail)
+    ):
+        # A startup traceback usually names the failing import on its final line.
+        available = limit - len(marker)
+        head = available // 2
+        return detail[:head] + marker + detail[-(available - head) :]
     return detail[:limit]
 
 
