@@ -37,6 +37,7 @@ from src.benchmark.artifact_io import (
     read_regular_file_no_follow,
 )
 from src.benchmark.backend_identity import (
+    OAF_BACKEND_ID,
     BackendDescriptor,
     JsonValue,
     StrictJsonError,
@@ -63,6 +64,7 @@ from src.benchmark.oaf_corpus_run import (
     OAF_CORPUS_REQUEST_TIMEOUT_SECONDS,
     OAF_CORPUS_RUN_SCHEMA,
     OAF_FULL_MIX_INPUT_VIEW_ID,
+    OAF_INFERENCE_CONFIG_SCHEMA,
     OAF_PREDICTION_MAP_ID,
     OAF_WORKER_CLOSE_TIMEOUT_SECONDS,
     _model_lock_path,
@@ -611,6 +613,8 @@ def _validate_parent_identity(
         normalized_descriptor = normalize_known_backend_descriptor(descriptor)
     except (StrictJsonError, TypeError, ValueError) as error:
         raise SeparationRunError("parent OaF descriptor is invalid") from error
+    if normalized_descriptor["backend_id"] != OAF_BACKEND_ID:
+        raise SeparationRunError("parent OaF descriptor must use the frozen TF1 backend")
     if (
         sha256(canonical_json_bytes(normalized_descriptor)).hexdigest()
         != parent["backend_descriptor_sha256"]
@@ -621,6 +625,8 @@ def _validate_parent_identity(
     config = parent.get("inference_config")
     if not isinstance(config, Mapping) or config.get("input_view_id") != OAF_FULL_MIX_INPUT_VIEW_ID:
         raise SeparationRunError("parent inference config has mixed OaF identity")
+    if config.get("schema") != OAF_INFERENCE_CONFIG_SCHEMA:
+        raise SeparationRunError("parent inference config must use the frozen TF1 schema")
     for field in (
         "backend_descriptor_sha256",
         "model_lock_sha256",

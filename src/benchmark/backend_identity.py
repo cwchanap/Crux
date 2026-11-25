@@ -14,6 +14,7 @@ JsonScalar: TypeAlias = None | bool | int | str | Decimal
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 SIX_PLACES = Decimal("0.000001")
 OAF_BACKEND_ID = "magenta-egmd-tf1-94529798-8hit-v1"
+OAF_TF215_BACKEND_ID = "magenta-egmd-tf215-94529798-8hit-experimental-v1"
 OAF_DESCRIPTOR_SCHEMA = "crux.transcription-backend-descriptor/v2"
 OAF_DESCRIPTOR_KEYS = frozenset(
     {
@@ -73,6 +74,11 @@ IDM_DESCRIPTOR_IDENTITIES = {
 
 _DESCRIPTOR_POLICIES = {
     OAF_BACKEND_ID: (OAF_DESCRIPTOR_KEYS, OAF_DESCRIPTOR_IDENTITIES, {}),
+    OAF_TF215_BACKEND_ID: (
+        OAF_DESCRIPTOR_KEYS,
+        {**OAF_DESCRIPTOR_IDENTITIES, "backend_id": OAF_TF215_BACKEND_ID},
+        {},
+    ),
     MUSCRIPTOR_BACKEND_ID: (
         MUSCRIPTOR_DESCRIPTOR_KEYS,
         MUSCRIPTOR_DESCRIPTOR_IDENTITIES,

@@ -1451,6 +1451,44 @@ def test_parent_mixed_oaf_identity_is_fatal(
     assert outcome.exit_code == 2  # type: ignore[attr-defined]
 
 
+@pytest.mark.parametrize("candidate_field", ["descriptor", "config"])
+def test_separation_rejects_tf215_parent_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    candidate_field: str,
+) -> None:
+    from src.benchmark import separation_pilot
+
+    fixture = build_reviewed_subset_oaf_fixture(tmp_path, eligible_count=20)
+    parent = parse_oaf_corpus_run(fixture.run_path.read_bytes())
+    if candidate_field == "descriptor":
+        descriptor = parent["backend_descriptor"]
+        assert isinstance(descriptor, dict)
+        descriptor["backend_id"] = "magenta-egmd-tf215-94529798-8hit-experimental-v1"
+        parent["backend_descriptor_sha256"] = hashlib.sha256(
+            canonical_json_bytes(descriptor)
+        ).hexdigest()
+        expected_error = "parent OaF descriptor must use the frozen TF1 backend"
+    else:
+        config = parent["inference_config"]
+        assert isinstance(config, dict)
+        config["schema"] = "crux.oaf-tf215-inference-config/v1"
+        config["runtime_sha256"] = "a" * 64
+        expected_error = "parent inference config must use the frozen TF1 schema"
+
+    monkeypatch.setattr(
+        separation_pilot,
+        "inference_config_sha256",
+        lambda _config: pytest.fail("candidate parent identity must fail before config hashing"),
+    )
+    with pytest.raises(separation_pilot.SeparationRunError, match=expected_error):
+        separation_pilot._validate_parent_identity(
+            parent,
+            load_reference_set_manifest(fixture.reference_manifest_path),
+            load_reference_timing_manifest(fixture.timing_manifest_path),
+        )
+
+
 def test_forged_parent_run_id_is_fatal_before_execution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

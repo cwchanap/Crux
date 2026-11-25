@@ -1926,6 +1926,34 @@ def test_empty_idm_artifact_uses_its_closed_zero_hit_map_identity(
     assert validate_cohort_items(identity, (item,)) is None
 
 
+def test_zero_hit_tf215_artifact_uses_candidate_map(tmp_path: Path) -> None:
+    backend_id = "magenta-egmd-tf215-94529798-8hit-experimental-v1"
+    map_id = "crux.prediction-map/oaf-egmd-tf215-8hit-v1"
+    payload = {**build_descriptor_payload().payload, "backend_id": backend_id}
+    descriptor = build_descriptor(payload, frozenset(payload), OAF_DESCRIPTOR_SCHEMA)
+    empty = _empty_artifact_for_song(tmp_path, "42").prediction
+    artifact = read_prediction_artifact(
+        render_prediction_artifact(dataclasses.replace(empty, descriptor=descriptor))
+    )
+    identity = dataclasses.replace(
+        build_identity(),
+        backend_id=backend_id,
+        backend_descriptor_sha256=descriptor.sha256,
+        prediction_map_version=map_id,
+    )
+    mapping = map_reference_events((build_native_reference("12", 1.0, 0),))
+
+    item = cohort_scoring.cohort_item_from_validated_prediction_artifact(
+        identity, "42", mapping, artifact
+    )
+    result = score_cohort(identity, (item,), tolerances_ms=(50,))
+
+    assert item.artifact_identity is not None
+    assert item.artifact_identity.prediction_map_version == map_id
+    raw_score = next(row for row in result.song_scores if row.mode == "raw")
+    assert raw_score.summary == ScoreSummary(0, 0, 1)
+
+
 def test_empty_muscriptor_artifact_uses_only_its_closed_zero_hit_map_identity(
     tmp_path: Path,
 ) -> None:

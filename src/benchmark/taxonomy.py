@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal, TypeAlias
 
-from src.benchmark.backend_identity import IDM_BACKEND_ID, MUSCRIPTOR_BACKEND_ID, OAF_BACKEND_ID
+from src.benchmark.backend_identity import (
+    IDM_BACKEND_ID,
+    MUSCRIPTOR_BACKEND_ID,
+    OAF_BACKEND_ID,
+    OAF_TF215_BACKEND_ID,
+)
 
 DetailedDrumClass: TypeAlias = Literal[
     "kick",
@@ -30,6 +35,7 @@ CommonDrumClass: TypeAlias = Literal[
 TAXONOMY_VERSION = "crux.drum-taxonomy/v1"
 DTX_LANE_MAP_VERSION = "crux.dtx-lane-map/v1"
 OAF_PREDICTION_MAP_ID = "crux.prediction-map/oaf-egmd-8hit-v1"
+OAF_TF215_PREDICTION_MAP_ID = "crux.prediction-map/oaf-egmd-tf215-8hit-v1"
 MUSCRIPTOR_PREDICTION_MAP_ID = "crux.prediction-map/muscriptor-drums-v1"
 IDM_PREDICTION_MAP_ID = "crux.prediction-map/idm-44-train-kits-v1"
 
@@ -105,6 +111,13 @@ OAF_PREDICTION_MAP = PredictionMap(
             "sticks": ClassMapping(None, None),
         }
     ),
+)
+
+OAF_TF215_PREDICTION_MAP = PredictionMap(
+    map_id=OAF_TF215_PREDICTION_MAP_ID,
+    backend_id=OAF_TF215_BACKEND_ID,
+    native_output_space_id=OAF_PREDICTION_MAP.native_output_space_id,
+    classes=OAF_PREDICTION_MAP.classes,
 )
 
 MUSCRIPTOR_PREDICTION_MAP = PredictionMap(

@@ -13,6 +13,7 @@ from src.benchmark.backend_identity import (
     IDM_BACKEND_ID,
     MUSCRIPTOR_BACKEND_ID,
     OAF_BACKEND_ID,
+    OAF_TF215_BACKEND_ID,
     require_sha256,
 )
 from src.benchmark.models import BenchmarkEvent, ScoreSummary
@@ -36,6 +37,7 @@ from src.benchmark.taxonomy import (
     IDM_PREDICTION_MAP_ID,
     MUSCRIPTOR_PREDICTION_MAP_ID,
     OAF_PREDICTION_MAP_ID,
+    OAF_TF215_PREDICTION_MAP_ID,
     TAXONOMY_VERSION,
     project_to_common,
 )
@@ -45,6 +47,7 @@ DEFAULT_TOLERANCES_MS = (30, 50, 100)
 SCORE_MODES = ("raw", "aligned")
 ZERO_HIT_PREDICTION_MAPS = {
     OAF_BACKEND_ID: OAF_PREDICTION_MAP_ID,
+    OAF_TF215_BACKEND_ID: OAF_TF215_PREDICTION_MAP_ID,
     MUSCRIPTOR_BACKEND_ID: MUSCRIPTOR_PREDICTION_MAP_ID,
     IDM_BACKEND_ID: IDM_PREDICTION_MAP_ID,
 }

@@ -5,13 +5,15 @@ from pathlib import Path
 
 import pytest
 
+from src.benchmark import taxonomy
 from src.benchmark.backend_identity import (
     OAF_BACKEND_ID,
     OAF_DESCRIPTOR_SCHEMA,
     StrictJsonError,
     build_descriptor,
 )
-from src.benchmark.backends import CanonicalAudio, NativeEvent
+from src.benchmark.backends import CanonicalAudio, NativeEvent, NativePrediction
+from src.benchmark.mapping import map_oaf_prediction
 from src.benchmark.prediction_artifact import (
     MappedPrediction,
     MappedPredictionEvent,
@@ -34,10 +36,10 @@ SHA_B = "b" * 64
 SHA_C = "c" * 64
 
 
-def _oaf_descriptor():
+def _oaf_descriptor(backend_id: str = OAF_BACKEND_ID):
     payload = {
         "architecture_id": "magenta-oaf-model-tpu-drums-v1",
-        "backend_id": OAF_BACKEND_ID,
+        "backend_id": backend_id,
         "descriptor_schema": OAF_DESCRIPTOR_SCHEMA,
         "model_id": "magenta-egmd-ckpt-569400-v1",
         "native_metadata_schema_id": "magenta-oaf-native-metadata-v1",
@@ -86,6 +88,52 @@ def _oaf_prediction(native: NativeEvent | None = None) -> MappedPrediction:
             ),
         ),
     )
+
+
+def _tf215_prediction() -> MappedPrediction:
+    source = _oaf_prediction()
+    event = replace(
+        _oaf_native_event(),
+        native_class_id="midi_38",
+        model_output_bin=17,
+        native_midi_note=38,
+        native_metadata={"upstream_8hit_group_id": "snare"},
+    )
+    prediction = NativePrediction(
+        source.audio,
+        _oaf_descriptor("magenta-egmd-tf215-94529798-8hit-experimental-v1"),
+        (event,),
+    )
+    mapped, _ = map_oaf_prediction(prediction, taxonomy.OAF_TF215_PREDICTION_MAP)
+    return mapped
+
+
+def test_tf215_round_trip_preserves_candidate_identity_and_oaf_native_event() -> None:
+    prediction = _tf215_prediction()
+    content = render_prediction_artifact(prediction)
+    artifact = read_prediction_artifact(content)
+    (event,) = artifact.prediction.events
+
+    assert render_prediction_artifact(artifact.prediction) == content
+    assert artifact.prediction.descriptor.sha256 == (
+        "938cbcccff5adda03f11344596e21534e178c98929098bf8327feb1e9ed4c890"
+    )
+    assert event.native.model_output_bin == 17
+    assert event.native.native_midi_note == 38
+    assert event.common_class == "snare"
+    assert event.prediction_map_version == "crux.prediction-map/oaf-egmd-tf215-8hit-v1"
+
+
+def test_tf215_artifact_rejects_wrong_bin_and_rounded_collision() -> None:
+    prediction = _tf215_prediction()
+    (event,) = prediction.events
+    wrong_bin = replace(event, native=replace(event.native, model_output_bin=16))
+    rounded_collision = replace(event, native=replace(event.native, time_sec=0.5000002))
+
+    with pytest.raises(PredictionArtifactError, match="oaf_native_identity"):
+        render_prediction_artifact(replace(prediction, events=(wrong_bin,)))
+    with pytest.raises(PredictionArtifactError, match="duplicate_native_event"):
+        render_prediction_artifact(replace(prediction, events=(event, rounded_collision)))
 
 
 def _idm_prediction(native: NativeEvent | None = None) -> MappedPrediction:
