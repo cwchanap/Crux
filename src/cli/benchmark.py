@@ -19,6 +19,7 @@ from runtime.oaf_tf1.model import load_model_config
 
 if TYPE_CHECKING:
     from src.benchmark.idm_pilot_run import IdmFullMixSmokeOutcome, IdmPilotRunOutcome
+    from src.benchmark.oaf_corpus_run import OafCorpusBackend
 
 from src.benchmark.artifact_io import read_regular_file_no_follow
 from src.benchmark.backend_identity import canonical_json_bytes, quantize_six
@@ -646,6 +647,28 @@ def build_reference_set_command(
 
 @benchmark.command("run-oaf-corpus")
 @click.option(
+    "--backend",
+    type=click.Choice(("oaf", "oaf-tf215")),
+    default="oaf",
+    show_default=True,
+    help="Use the frozen Docker worker or opt into the native TF2.15 worker.",
+)
+@click.option(
+    "--python311",
+    type=click.Path(path_type=Path, dir_okay=False),
+    help="Path to the Python 3.11 venv interpreter for oaf-tf215.",
+)
+@click.option(
+    "--runtime-root",
+    type=click.Path(path_type=Path, file_okay=False),
+    help="Built TF2.15 scratch runtime directory containing worker.py.",
+)
+@click.option(
+    "--checkpoint-cache",
+    type=click.Path(path_type=Path, file_okay=False),
+    help="Verified checkpoint cache for oaf-tf215. Defaults to artifacts/benchmark/model-cache.",
+)
+@click.option(
     "--manifest",
     "reference_manifest_path",
     type=click.Path(path_type=Path, dir_okay=False),
@@ -694,11 +717,16 @@ def run_oaf_corpus_command(
     include_simfile_ids: tuple[int, ...],
     exclude_simfile_ids: tuple[int, ...],
     resume: bool,
+    backend: OafCorpusBackend,
+    python311: Path | None,
+    runtime_root: Path | None,
+    checkpoint_cache: Path | None,
 ) -> None:
     """Run the validated OaF backend over an HPA-324 corpus scope."""
     from src.benchmark.oaf_corpus_run import (
-        OafCorpusRunOutcome,
+        OafCorpusBackendOptionsError,
         OafCorpusRunRequest,
+        _fatal_outcome,
         run_oaf_corpus,
     )
 
@@ -711,21 +739,15 @@ def run_oaf_corpus_command(
             include_simfile_ids=include_simfile_ids,
             exclude_simfile_ids=exclude_simfile_ids,
             resume=resume,
+            backend=backend,
+            python311=python311,
+            runtime_root=runtime_root,
+            checkpoint_cache=checkpoint_cache,
         )
-    except (TypeError, ValueError):
-        outcome = OafCorpusRunOutcome(
-            overall_status="failed",
-            exit_code=2,
-            run_id=None,
-            run_path=None,
-            reports_path=None,
-            success_count=0,
-            failed_count=0,
-            skipped_count=0,
-            quarantined_count=0,
-            aggregate_rtf=None,
-            projected_full_wall_time_sec=None,
-        )
+    except OafCorpusBackendOptionsError as error:
+        raise click.UsageError(str(error)) from error
+    except (TypeError, ValueError) as error:
+        outcome = _fatal_outcome(failure_code="request_invalid", failure_detail=error)
     else:
         outcome = run_oaf_corpus(request)
     payload = {
@@ -747,6 +769,10 @@ def run_oaf_corpus_command(
         "status": outcome.overall_status,
         "success_count": outcome.success_count,
     }
+    if outcome.failure_code is not None:
+        payload["failure_code"] = outcome.failure_code
+    if outcome.failure_detail is not None:
+        payload["failure_detail"] = outcome.failure_detail
     standard_output = click.get_binary_stream("stdout")
     standard_output.write(canonical_json_bytes(payload, trailing_newline=True))
     standard_output.flush()

@@ -1038,6 +1038,89 @@ def test_inference_config_has_exact_keys_and_deterministic_hash() -> None:
     assert inference_config_sha256(derived_payload) != first_hash
 
 
+def test_tf215_inference_config_binds_runtime_to_run_and_prediction_paths(tmp_path: Path) -> None:
+    config = load_model_config()
+    descriptor = BackendDescriptor(
+        payload={"backend_id": "magenta-egmd-tf215-94529798-8hit-experimental-v1"},
+        sha256=SHA_A,
+    )
+    payload = build_inference_config(config, descriptor, SHA_B, runtime_sha256=SHA_C)
+    assert payload == {
+        "schema": "crux.oaf-tf215-inference-config/v1",
+        "backend_descriptor_sha256": SHA_A,
+        "model_lock_sha256": SHA_B,
+        "checkpoint_archive_sha256": config.checkpoint.archive_sha256,
+        "adapter_revision": OAF_ADAPTER_REVISION,
+        "prediction_map_version": "crux.prediction-map/oaf-egmd-tf215-8hit-v1",
+        "input_view_id": OAF_FULL_MIX_INPUT_VIEW_ID,
+        "canonicalization_revision": OAF_CANONICALIZATION_REVISION,
+        "runtime_sha256": SHA_C,
+    }
+    digest = inference_config_sha256(payload)
+    assert digest == sha256(canonical_json_bytes(payload)).hexdigest()
+    changed_digest = inference_config_sha256({**payload, "runtime_sha256": SHA_B})
+    assert changed_digest != digest
+
+    def identities(config_sha: str) -> tuple[str, Path]:
+        return (
+            build_run_id(SHA_A, SHA_B, descriptor.sha256, SHA_B, SHA_C, config_sha, (), ()),
+            prediction_path(
+                tmp_path,
+                simfile_id=10,
+                source_audio_sha256=SHA_A,
+                backend_descriptor_sha256=descriptor.sha256,
+                inference_config_sha256=config_sha,
+            ),
+        )
+
+    run_id, path = identities(digest)
+    changed_run_id, changed_path = identities(changed_digest)
+    assert run_id != changed_run_id
+    assert path.name == f"{digest}.jsonl"
+    assert changed_path.name == f"{changed_digest}.jsonl"
+
+    with pytest.raises(StrictJsonError, match="exact key set"):
+        inference_config_sha256(
+            {key: value for key, value in payload.items() if key != "runtime_sha256"}
+        )
+    with pytest.raises(StrictJsonError, match="runtime_sha256"):
+        inference_config_sha256({**payload, "runtime_sha256": "malformed"})
+    with pytest.raises(StrictJsonError, match="exact key set"):
+        inference_config_sha256({**payload, "schema": OAF_INFERENCE_CONFIG_SCHEMA})
+    with pytest.raises(StrictJsonError, match="runtime_sha256"):
+        build_inference_config(config, descriptor, SHA_B)
+    with pytest.raises(StrictJsonError, match="runtime_sha256"):
+        build_inference_config(
+            config, BackendDescriptor(payload={}, sha256=SHA_A), SHA_B, runtime_sha256=SHA_C
+        )
+
+
+def test_oaf_corpus_request_validates_candidate_paths_and_applies_cache_default() -> None:
+    request = OafCorpusRunRequest(
+        reference_manifest_path=Path("reference.jsonl"),
+        timing_manifest_path=Path("timing.jsonl"),
+        cache_dir=Path("cache"),
+        output_dir=Path("output"),
+    )
+    assert request.checkpoint_cache is None
+    with pytest.raises(ValueError, match="python311"):
+        replace(request, backend="oaf-tf215", runtime_root=Path("runtime"))
+    with pytest.raises(ValueError, match="runtime_root"):
+        replace(request, backend="oaf-tf215", python311=Path("python3.11"))
+    with pytest.raises(ValueError, match="oaf-tf215"):
+        replace(request, checkpoint_cache=Path("checkpoints"))
+    candidate = replace(
+        request,
+        backend="oaf-tf215",
+        python311=Path("python3.11"),
+        runtime_root=Path("runtime"),
+    )
+    assert candidate.checkpoint_cache == Path("artifacts/benchmark/model-cache")
+    assert replace(candidate, checkpoint_cache=Path("checkpoints")).checkpoint_cache == Path(
+        "checkpoints"
+    )
+
+
 def test_run_id_is_deterministic_and_binds_reference_and_scope() -> None:
     common = dict(
         reference_manifest_sha256=SHA_A,

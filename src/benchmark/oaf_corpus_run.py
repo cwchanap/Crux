@@ -17,6 +17,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from typing import Callable, Literal, TypeAlias
 
@@ -30,6 +31,7 @@ from src.benchmark.backend_identity import (
     OAF_DESCRIPTOR_IDENTITIES,
     OAF_DESCRIPTOR_KEYS,
     OAF_DESCRIPTOR_SCHEMA,
+    OAF_TF215_BACKEND_ID,
     BackendDescriptor,
     JsonValue,
     StrictJsonError,
@@ -46,6 +48,7 @@ from src.benchmark.backends.oaf import (
     OafBackend,
     OafBackendError,
     create_backend,
+    create_tf215_backend,
 )
 from src.benchmark.cohort_scoring import (
     COHORT_FAILURE_REASONS,
@@ -59,6 +62,7 @@ from src.benchmark.corpus_cache import CacheIndexStore, ResolvedSourceAudio, res
 from src.benchmark.durability import atomic_replace_bytes
 from src.benchmark.input_view import materialize_full_mix_audio
 from src.benchmark.mapping import map_oaf_prediction
+from src.benchmark.oaf_tf215_runtime import prepare_tf215_runtime
 from src.benchmark.prediction_artifact import (
     PredictionArtifactError,
     prediction_artifact_matches_audio,
@@ -79,18 +83,32 @@ from src.benchmark.reference_timing_manifest import (
     load_reference_timing_manifest,
 )
 from src.benchmark.reports import write_cohort_reports
-from src.benchmark.taxonomy import DTX_LANE_MAP_VERSION, OAF_PREDICTION_MAP_ID, TAXONOMY_VERSION
+from src.benchmark.taxonomy import (
+    DTX_LANE_MAP_VERSION,
+    OAF_PREDICTION_MAP,
+    OAF_PREDICTION_MAP_ID,
+    OAF_TF215_PREDICTION_MAP,
+    OAF_TF215_PREDICTION_MAP_ID,
+    TAXONOMY_VERSION,
+)
 
 OAF_CORPUS_RUN_SCHEMA = "crux.oaf-corpus-run/v1"
 OAF_INFERENCE_CONFIG_SCHEMA = "crux.oaf-inference-config/v1"
+OAF_TF215_INFERENCE_CONFIG_SCHEMA = "crux.oaf-tf215-inference-config/v1"
 OAF_FULL_MIX_INPUT_VIEW_ID = "crux.oaf-full-mix-mono44k1-pcm16/v1"
 OAF_CANONICALIZATION_REVISION = "librosa-soxr-hq-mono44k1-soundfile-pcm16/v1"
 OAF_CORPUS_REQUEST_TIMEOUT_SECONDS = 3600.0
 OAF_WORKER_CLOSE_TIMEOUT_SECONDS = 30.0
+_DEFAULT_CHECKPOINT_CACHE = Path("artifacts/benchmark/model-cache")
 
 
 OafRunStatus: TypeAlias = Literal["complete", "partial", "failed"]
 OafRunExitCode: TypeAlias = Literal[0, 1, 2]
+OafCorpusBackend: TypeAlias = Literal["oaf", "oaf-tf215"]
+
+
+class OafCorpusBackendOptionsError(ValueError):
+    """The selected backend and its options are incompatible."""
 
 
 # pylint: disable=too-many-instance-attributes
@@ -106,6 +124,10 @@ class OafCorpusRunRequest:
     exclude_simfile_ids: tuple[int, ...] = ()
     resume: bool = False
     crux_commit: str | None = None
+    backend: OafCorpusBackend = "oaf"
+    python311: Path | None = None
+    runtime_root: Path | None = None
+    checkpoint_cache: Path | None = None
 
     def __post_init__(self) -> None:
         for field in (
@@ -125,6 +147,25 @@ class OafCorpusRunRequest:
             raise TypeError("resume must be a bool")
         if self.crux_commit is not None:
             _require_commit(self.crux_commit)
+        self._validate_backend_options()
+
+    def _validate_backend_options(self) -> None:
+        if self.backend not in ("oaf", "oaf-tf215"):
+            raise OafCorpusBackendOptionsError("backend must be oaf or oaf-tf215")
+        for field, option in (
+            ("python311", "--python311"),
+            ("runtime_root", "--runtime-root"),
+            ("checkpoint_cache", "--checkpoint-cache"),
+        ):
+            value = getattr(self, field)
+            if value is not None and not isinstance(value, Path):
+                raise TypeError(f"{field} must be a Path or None")
+            if self.backend == "oaf" and value is not None:
+                raise OafCorpusBackendOptionsError(f"{option} requires --backend oaf-tf215")
+            if self.backend == "oaf-tf215" and value is None and field != "checkpoint_cache":
+                raise OafCorpusBackendOptionsError(f"{option} ({field}) is required for oaf-tf215")
+        if self.backend == "oaf-tf215" and self.checkpoint_cache is None:
+            object.__setattr__(self, "checkpoint_cache", _DEFAULT_CHECKPOINT_CACHE)
 
 
 @dataclass(frozen=True)
@@ -142,6 +183,8 @@ class OafCorpusRunOutcome:
     quarantined_count: int
     aggregate_rtf: float | None
     projected_full_wall_time_sec: float | None
+    failure_code: str | None = None
+    failure_detail: str | None = None
 
     def __post_init__(self) -> None:
         if self.overall_status not in {"complete", "partial", "failed"}:
@@ -214,6 +257,7 @@ _SHA256_FIELDS = frozenset(
         "reference_manifest_sha256",
         "reference_timing_manifest_sha256",
         "inference_config_sha256",
+        "runtime_sha256",
     }
 )
 _INFERENCE_CONFIG_FIELDS = frozenset(
@@ -258,6 +302,7 @@ def build_inference_config(
     model_lock_sha256: str,
     *,
     input_view_id: str = OAF_FULL_MIX_INPUT_VIEW_ID,
+    runtime_sha256: str | None = None,
 ) -> dict[str, str]:
     """Build the closed, inference-semantic identity payload."""
     if not isinstance(config, OafModelConfig):
@@ -272,7 +317,7 @@ def build_inference_config(
         config.checkpoint.archive_sha256,
         "checkpoint_archive_sha256",
     )
-    return {
+    payload = {
         "schema": OAF_INFERENCE_CONFIG_SCHEMA,
         "backend_descriptor_sha256": descriptor_sha256,
         "model_lock_sha256": model_lock,
@@ -282,20 +327,35 @@ def build_inference_config(
         "input_view_id": input_view_id,
         "canonicalization_revision": OAF_CANONICALIZATION_REVISION,
     }
+    if descriptor.payload.get("backend_id") == OAF_TF215_BACKEND_ID:
+        payload["schema"] = OAF_TF215_INFERENCE_CONFIG_SCHEMA
+        payload["prediction_map_version"] = OAF_TF215_PREDICTION_MAP_ID
+        payload["runtime_sha256"] = _require_hash(runtime_sha256, "runtime_sha256")
+    elif runtime_sha256 is not None:
+        raise StrictJsonError("runtime_sha256 is only valid for the TF2.15 backend")
+    return payload
 
 
 def inference_config_sha256(payload: Mapping[str, object]) -> str:
     """Hash exactly one canonical inference configuration payload."""
-    if not isinstance(payload, Mapping) or set(payload) != _INFERENCE_CONFIG_FIELDS:
+    if not isinstance(payload, Mapping):
+        raise StrictJsonError("inference config must contain the exact key set")
+    fields = _INFERENCE_CONFIG_FIELDS
+    if payload.get("schema") == OAF_TF215_INFERENCE_CONFIG_SCHEMA:
+        fields = fields | {"runtime_sha256"}
+    if set(payload) != fields:
         raise StrictJsonError("inference config must contain the exact key set")
     normalized: dict[str, str] = {}
     for key, value in payload.items():
         if not isinstance(value, str) or not value:
             raise StrictJsonError(f"inference config {key} must be a nonempty string")
         normalized[key] = value
-    if normalized["schema"] != OAF_INFERENCE_CONFIG_SCHEMA:
-        raise StrictJsonError(f"inference config schema must be {OAF_INFERENCE_CONFIG_SCHEMA}")
-    for field in _SHA256_FIELDS & _INFERENCE_CONFIG_FIELDS:
+    if normalized["schema"] not in (OAF_INFERENCE_CONFIG_SCHEMA, OAF_TF215_INFERENCE_CONFIG_SCHEMA):
+        raise StrictJsonError(
+            f"inference config schema must be {OAF_INFERENCE_CONFIG_SCHEMA} or "
+            f"{OAF_TF215_INFERENCE_CONFIG_SCHEMA}"
+        )
+    for field in _SHA256_FIELDS & fields:
         _require_hash(normalized[field], field)
     return sha256_hex(canonical_json_bytes(normalized))
 
@@ -1008,7 +1068,9 @@ def _build_run_header(
     }
 
 
-def _fatal_outcome() -> OafCorpusRunOutcome:
+def _fatal_outcome(
+    *, failure_code: str | None = None, failure_detail: BaseException | None = None
+) -> OafCorpusRunOutcome:
     return OafCorpusRunOutcome(
         overall_status="failed",
         exit_code=2,
@@ -1021,6 +1083,8 @@ def _fatal_outcome() -> OafCorpusRunOutcome:
         quarantined_count=0,
         aggregate_rtf=None,
         projected_full_wall_time_sec=None,
+        failure_code=failure_code,
+        failure_detail=None if failure_detail is None else _bounded_error(failure_detail),
     )
 
 
@@ -1126,7 +1190,7 @@ def _finalize_scoring_and_outcome(
 def run_oaf_corpus(
     request: OafCorpusRunRequest,
     *,
-    backend_factory: Callable[..., OafBackend] = create_backend,
+    backend_factory: Callable[..., OafBackend] | None = None,
     perf_counter: Callable[[], float] = time.perf_counter,
     clock: Callable[[], datetime] = _utc_now,
 ) -> OafCorpusRunOutcome:
@@ -1151,10 +1215,35 @@ def run_oaf_corpus(
             timing_manifest,
             timing_output_root=request.timing_manifest_path.parent.parent,
         )
-        config = load_model_config(_model_lock_path())
-        model_lock_sha = compute_model_lock_sha256(_model_lock_path())
-        descriptor = _expected_oaf_descriptor(config)
-        inference_payload = build_inference_config(config, descriptor, model_lock_sha)
+        model_lock_path = _model_lock_path()
+        config = load_model_config(model_lock_path)
+        model_lock_sha = compute_model_lock_sha256(model_lock_path)
+        if request.backend == "oaf-tf215":
+            assert request.python311 is not None
+            assert request.runtime_root is not None
+            assert request.checkpoint_cache is not None
+            runtime = prepare_tf215_runtime(
+                model_lock_path.parents[2],
+                python311=request.python311,
+                runtime_root=request.runtime_root,
+                checkpoint_cache=request.checkpoint_cache,
+            )
+            descriptor = runtime.descriptor
+            prediction_map = OAF_TF215_PREDICTION_MAP
+            default_factory = partial(create_tf215_backend, runtime)
+        else:
+            runtime = None
+            descriptor = _expected_oaf_descriptor(config)
+            prediction_map = OAF_PREDICTION_MAP
+            default_factory = create_backend
+        if backend_factory is None:
+            backend_factory = default_factory
+        inference_payload = build_inference_config(
+            config,
+            descriptor,
+            model_lock_sha,
+            runtime_sha256=None if runtime is None else runtime.sha256,
+        )
         config_sha = inference_config_sha256(inference_payload)
         run_id = build_run_id(
             reference_manifest.manifest_sha256,
@@ -1166,8 +1255,8 @@ def run_oaf_corpus(
             include_ids,
             exclude_ids,
         )
-    except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError):
-        return _fatal_outcome()
+    except (OSError, RuntimeError, TypeError, ValueError, StrictJsonError) as error:
+        return _fatal_outcome(failure_code="preflight_failed", failure_detail=error)
 
     run_dir = request.output_dir / "runs" / run_id
     run_path = run_dir / "run.json"
@@ -1189,6 +1278,8 @@ def run_oaf_corpus(
         run_id=run_id,
         started_at=started_at,
     )
+    if runtime is not None:
+        header["runtime_identity"] = runtime.identity
 
     resume_rows: dict[int, Mapping[str, object]] = {}
     if request.resume and run_path.exists():
@@ -1357,6 +1448,8 @@ def run_oaf_corpus(
                     )
                     continue
                 if exists and request.resume:
+                    # A present artifact must validate before reuse. Inference only
+                    # publishes a prediction when its immutable path is absent.
                     if content is None:
                         _set_failed(
                             item, "prediction_artifact_invalid", "prediction artifact is unreadable"
@@ -1396,7 +1489,7 @@ def run_oaf_corpus(
                         source_audio_sha256=state.source.source_audio_sha256,
                         audio=audio,
                         descriptor=backend_descriptor,
-                        prediction_map_version=OAF_PREDICTION_MAP_ID,
+                        prediction_map_version=prediction_map.map_id,
                     ):
                         _set_failed(
                             item,
@@ -1459,7 +1552,7 @@ def run_oaf_corpus(
                     elapsed / state.source.duration_sec if state.source.duration_sec > 0 else None
                 )
                 try:
-                    mapped, _ = map_oaf_prediction(native)
+                    mapped, _ = map_oaf_prediction(native, prediction_map=prediction_map)
                 except Exception as error:  # pylint: disable=broad-exception-caught
                     raise OafBackendError(
                         "worker response mapping failed", code="worker_response_invalid"
@@ -1607,10 +1700,12 @@ __all__ = [
     "OAF_FULL_MIX_INPUT_VIEW_ID",
     "OAF_INFERENCE_CONFIG_SCHEMA",
     "OAF_PREDICTION_MAP_ID",
+    "OAF_TF215_INFERENCE_CONFIG_SCHEMA",
     "OAF_WORKER_CLOSE_TIMEOUT_SECONDS",
     "RUNNER_FAILURE_TO_COHORT_REASON",
     "OafCorpusRunOutcome",
     "OafCorpusRunRequest",
+    "OafCorpusBackendOptionsError",
     "build_inference_config",
     "build_run_id",
     "classify_oaf_backend_error",
