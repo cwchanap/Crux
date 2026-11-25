@@ -212,7 +212,7 @@ def test_worker_process_surfaces_bounded_stderr_when_exiting_before_ready(
     script = tmp_path / "failing_worker.py"
     script.write_text(
         "import sys\n"
-        "sys.stderr.write('checkpoint load failed\\n' + ('x' * 10000))\n"
+        "sys.stderr.write('checkpoint load failed\\n' + ('x' * 10000) + '\\nImportError: missing module\\n')\n"
         "sys.stderr.flush()\n"
         "raise SystemExit(1)\n",
         encoding="utf-8",
@@ -223,6 +223,8 @@ def test_worker_process_surfaces_bounded_stderr_when_exiting_before_ready(
 
     message = str(caught.value)
     assert message.startswith("worker exited before ready: checkpoint load failed")
+    assert "[stderr truncated]" in message
+    assert message.endswith("ImportError: missing module")
     assert len(message) < 5_000
 
 
@@ -269,16 +271,11 @@ def test_worker_process_reports_wrong_response_id(tmp_path: Path) -> None:
 
 
 def test_worker_process_poisoned_after_timeout(tmp_path: Path) -> None:
-    script = tmp_path / "slow_worker.py"
+    script = tmp_path / "silent_worker.py"
     script.write_text(
-        "import json, sys, time\n"
-        "print(json.dumps({'type':'ready'}), flush=True)\n"
-        "for line in sys.stdin:\n"
-        "    request = json.loads(line)\n"
-        "    time.sleep(0.2)\n"
-        "    print(json.dumps({'id':request['id'],'events':[]}), flush=True)\n"
+        "import json, sys\nprint(json.dumps({'type': 'ready'}), flush=True)\nsys.stdin.read()\n"
     )
-    process = WorkerProcess.start([sys.executable, str(script)], timeout_seconds=0.05)
+    process = WorkerProcess.start([sys.executable, str(script)], timeout_seconds=1)
     try:
         with pytest.raises(WorkerProcessError, match="worker response timed out"):
             process.request("one.wav")

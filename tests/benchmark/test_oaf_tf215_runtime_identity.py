@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pwd
 import stat
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -100,13 +102,13 @@ def test_probe_launch_uses_worker_arguments_and_environment(tmp_path):
 
 
 def test_worker_cache_is_private_and_stable_across_launches(tmp_path, monkeypatch):
-    monkeypatch.setattr(identity, "_NUMBA_CACHE_PARENT", tmp_path)
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path)))
     monkeypatch.setenv("NUMBA_CACHE_DIR", str(tmp_path / "inherited-cache"))
 
     environment = identity.build_tf215_worker_environment()
     cache = Path(environment["NUMBA_CACHE_DIR"])
 
-    assert cache.parent == tmp_path
+    assert cache.parent == tmp_path.resolve()
     assert cache.name != "inherited-cache"
     assert cache.stat().st_uid == os.geteuid()
     assert stat.S_IMODE(cache.stat().st_mode) == 0o700
@@ -115,23 +117,36 @@ def test_worker_cache_is_private_and_stable_across_launches(tmp_path, monkeypatc
 
 @pytest.mark.parametrize("unsafe", ["shared", "symlink", "foreign"])
 def test_worker_cache_rejects_an_unsafe_existing_path(tmp_path, monkeypatch, unsafe):
-    monkeypatch.setattr(identity, "_NUMBA_CACHE_PARENT", tmp_path)
-    uid = os.geteuid()
-    if unsafe == "foreign":
-        uid += 1
-        monkeypatch.setattr(identity.os, "geteuid", lambda: uid)
-    cache = tmp_path / f"crux-oaf-tf215-numba-{uid}"
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path)))
+    cache = Path(identity.build_tf215_worker_environment()["NUMBA_CACHE_DIR"])
     if unsafe == "symlink":
         target = tmp_path / "real-cache"
-        target.mkdir(mode=0o700)
+        cache.rename(target)
         cache.symlink_to(target, target_is_directory=True)
+    elif unsafe == "shared":
+        cache.chmod(0o755)
     else:
-        cache.mkdir(mode=0o700)
-        if unsafe == "shared":
-            cache.chmod(0o755)
+        real_lstat = Path.lstat
+
+        def stat_with_foreign_owner(path):
+            metadata = real_lstat(path)
+            if path == cache:
+                return SimpleNamespace(st_uid=metadata.st_uid + 1, st_mode=metadata.st_mode)
+            return metadata
+
+        monkeypatch.setattr(Path, "lstat", stat_with_foreign_owner)
 
     with pytest.raises(ValueError, match="private Numba cache"):
         identity.build_tf215_worker_environment()
+
+
+def test_worker_cache_rejects_a_shared_account_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path)))
+    tmp_path.chmod(0o777)
+
+    with pytest.raises(ValueError, match="private Numba cache"):
+        identity.build_tf215_worker_environment()
+    assert not list(tmp_path.iterdir())
 
 
 def test_sourceless_bytecode_is_included_in_the_runtime_inventory(tmp_path):

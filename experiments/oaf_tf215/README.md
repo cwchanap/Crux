@@ -499,9 +499,10 @@ or native Colab), not by a local aarch64 interpreter.
 
 Run from the repository checkout on Linux x86-64. Set `WORKER` and `SCRATCH`
 to fresh directories, and `CHECKPOINT_CACHE` to a local checkpoint cache. The
-worker launcher creates and verifies an owner-only Numba cache under `/tmp`.
-Its path is part of the runtime fingerprint. Prepare the locked project and
-worker environments.
+worker launcher creates and verifies an owner-only `.crux-oaf-tf215-numba`
+directory in the effective user's home. Its path is part of the runtime
+fingerprint. Start a fresh run if the previous run used the `/tmp` cache.
+Prepare the locked project and worker environments.
 
 ```bash
 uv sync --locked --python 3.12 --no-dev
