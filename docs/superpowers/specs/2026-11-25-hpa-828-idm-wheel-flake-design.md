@@ -1,106 +1,36 @@
-# HPA-828 — Revalidate the intermittent IDM wheel-builder test
+# HPA-828 — IDM wheel-builder flake: diagnosis and existing fix
 
-- Linear: [HPA-828](https://linear.app/cwchanap/issue/HPA-828/revalidate-intermittent-idm-wheel-builder-test-failure)
-- Original report: [GitHub #28](https://github.com/cwchanap/Crux/issues/28)
-- Design base: `282586003c17923b97d8b0f33ac062b5f5328b90` (main)
-- Status: proposed; execution evidence not yet collected.
+- [Linear HPA-828](https://linear.app/cwchanap/issue/HPA-828/revalidate-intermittent-idm-wheel-builder-test-failure) · [Original report #28](https://github.com/cwchanap/Crux/issues/28) · [Design review](https://github.com/cwchanap/Crux/pull/37#pullrequestreview-6067735175)
+- Reviewed main: `282586003c17923b97d8b0f33ac062b5f5328b90`
+- Disposition: existing fix; documentation and focused confirmation only.
 
-## Problem and current evidence
+## Diagnosis
 
-The HPA-396 full suite failed the single test
-`tests/runtime/test_idm_wheel_builder.py::test_commit_blobs_ignore_staged_and_unstaged_source_edits`
-once (3,143 other passes). It then passed alone and the full rerun passed
-(3,144 tests). The original Git/index-lock explanation was a hypothesis,
-not a diagnosed root cause. The original issue is closed because tracking
-moved to Linear, not because the flake was experimentally eliminated.
+The historical [7975d80 test](https://github.com/cwchanap/Crux/blob/7975d80/tests/runtime/test_idm_wheel_builder.py) wrote a synthetic wheel using `writestr(relative.as_posix(), blob)`, which assigns a wall-clock ZIP entry timestamp, then asserted byte equality of two wheels. Several Git subprocesses ran between writes. Crossing a DOS timestamp's two-second boundary changes archive bytes even if every source blob is identical. This explains the intermittent nature and sensitivity to elapsed time.
 
-Two relevant changes are already present:
-[ef43d758](https://github.com/cwchanap/Crux/commit/ef43d75813615bb0097b016fafb5d6ea597ab754)
-and [8dc072c](https://github.com/cwchanap/Crux/commit/8dc072c16d8fcff892a6a47225a290eaa64b90fa).
-The current test constructs ZIP entries with a fixed 1980 timestamp and
-uses an isolated environment for fixture Git commands. The builder itself
-reads pinned commit blobs through Git subprocesses, not the dirty worktree;
-its Git calls inherit the process environment. That distinction is an
-observation, not a reason to change production behavior preemptively.
+[ef43d75](https://github.com/cwchanap/Crux/commit/ef43d75813615bb0097b016fafb5d6ea597ab754) replaced the helper's entry timestamp with fixed `ZipInfo(date_time=(1980, 1, 1, 0, 0, 0))`, explicitly preserved DEFLATE compression, and added an assertion for that timestamp before the wheel-byte comparison. The [current test](https://github.com/cwchanap/Crux/blob/282586003c17923b97d8b0f33ac062b5f5328b90/tests/runtime/test_idm_wheel_builder.py) still has both guards. The tampered-wheel fixture may use a wall-clock timestamp, but it is not compared byte-for-byte. The production builder uses pinned Git blobs and delegates the real wheel build to uv with `SOURCE_DATE_EPOCH=0`; this reproduced defect is in the synthetic test helper, not the production build path.
 
-## Decision: evidence first, no speculative fix
+The original Git/index-lock suggestion was unsupported. Each test invocation creates its own Git repository under `tmp_path`; the later [8dc072c](https://github.com/cwchanap/Crux/commit/8dc072c16d8fcff892a6a47225a290eaa64b90fa) also isolated fixture Git configuration and added the Python 3.11 runtime CI lane. There is no demonstrated shared-index contention, so do not serialize Git operations. The timestamp defect is conclusively reproducible and fixed by construction; the original one-off failure's traceback is unavailable, so historical attribution is strongly supported, not independently proven for that exact occurrence.
 
-Use the current regression test, runtime-only Python 3.11 CI lane and
-normal Python 3.12 suite. Repeated independent pytest processes exercise
-the existing scenario under ordinary and modest parallel load. A clean
-bounded run supports closing the revalidation issue without code changes;
-it does not prove the failure is impossible or establish a root cause.
-If a failure recurs, retain the failed attempt and diagnose it before
-choosing a minimal change.
+## Evidence
 
-| Approach | Decision |
-| --- | --- |
-| Revalidate existing code and record results | Selected: low cost, tests the current contract directly. |
-| Add retries, sleeps, Git serialization or timestamp changes now | Rejected: masks failures or duplicates changes already landed. |
-| Build a permanent stress-test harness or rerun the model benchmark | Rejected: unrelated cost and infrastructure. |
+The linked reviewer ran the actual historical and current tests in scratch copies (macOS); these are reviewer-reported results:
 
-## Existing contract and scope
+| Revision | Forced 2 s clock step | Natural clock |
+| --- | --- | --- |
+| 7975d80 | Fails at wheel-byte assertion | 28/300 failed |
+| 2825860 | Passes | Passes in the reported control |
 
-- `tests/runtime/test_idm_wheel_builder.py`: reuse the named test and
-  its committed/staged/unstaged fixture, deterministic ZIP construction,
-  source-manifest and wheel-byte equality, and tampered-wheel rejection.
-- `runtime/idm/build_pinned_wheel.py`: retain commit-based extraction,
-  source verification, pinned upstream and build/provenance behavior.
-  Change only a demonstrated production bug; prefer a test-only fix
-  for a proven fixture problem.
-- `.github/workflows/ci.yml`: existing `idm-runtime` job uses Python
-  3.11 and the runtime test directory; the main test job uses Python
-  3.12 with coverage. No permanent CI or dependency changes are planned.
+During review resolution, source and commit diffs were independently checked and a minimal scratch ZIP experiment (Python 3.13.5) confirmed that identical committed payloads with timestamps two seconds apart produce unequal old-style wheel bytes, while fixed timestamps give identical bytes. This experiment isolates the mechanism; it is not a full regression run.
 
-## Evidence and disposition
+The reviewer also reports 53 successful CI runs since August 23, 2026, with both test lanes. That aggregate was not independently enumerated. GitHub MCP independently confirmed [PR #36 CI run 45673844492](https://github.com/cwchanap/Crux/actions/runs/45673844492) on head `88edbdb1e6012904d9e10bf2177224fda5e7cd10` passed both the Python 3.11 runtime and Python 3.12 full test jobs (PR merged as `2825860`). The [historical failed run 42980232928](https://github.com/cwchanap/Crux/actions/runs/42980232928) had a successful runtime job and a failed full-suite job; the reviewer reports unrelated failing tests. CI is corroboration, not proof of the mechanism.
 
-Use a clean checkout of the candidate revision. Record exact revision,
-OS/filesystem type where available, Python/Git/pytest versions, commands,
-attempt counts, concurrency, exit statuses, and elapsed time. Keep per-run
-logs outside the checkout, including failures; publish a concise evidence
-summary and link retained logs/CI runs in the same PR. Avoid logging
-credentials or the full process environment.
+## Scope and acceptance
 
-Baseline: 20 independent focused attempts on each of Python 3.11 and
-3.12, the existing Python 3.11 runtime suite, and two Python 3.12 full
-suite runs (one ordinary and one alongside four independent focused
-workers, five attempts per worker). The concurrent workers use distinct
-temporary directories and no coverage; do not run two coverage-producing
-full suites together. This is a finite engineering sample, not a
-statistical guarantee. Stop and investigate the first genuine failure;
-record partial counts and distinguish dependency/runner problems from
-test failures. Infrastructure failures do not count as successful runs.
+One PR, evidence-only. Do not change the production builder, add a duplicate regression, retry, sleep, serialize Git, add CI jobs, or run a stress matrix. Reuse the existing focused end-to-end regression with real local Git and ZIP operations, checking committed/staged/unstaged source extraction, manifest equality, fixed timestamp, byte equality and tamper rejection. Run it once on each Python 3.11 and 3.12; no model, upstream build, R2 or UI work.
 
-- **No reproduced failure:** report exact clean counts, acknowledge
-  residual uncertainty, and close the issue with evidence only.
-- **Reproduced failure:** preserve traceback, Git command/exit/stderr
-  when applicable, and expected vs actual artifact/assertion details.
-  Add focused diagnostics only where needed, isolate the demonstrated
-  cause, add a regression if not already covered, and repeat the matrix
-  on the final revision. Do not hide failed attempts with automatic
-  retry. If still unexplained, document the blocker and leave the issue
-  open rather than claiming a fix.
+- [ ] Record exact source revision, Python versions, pytest commands and exit results for the two focused runs; retain output or CI links. Perform automated end-to-end verification through MCP (e.g. execution-capable runner or GitHub Actions with MCP-verified job evidence). Evidence format is not dependent on a particular server; if MCP is unavailable, record the missing verification rather than silently waive it.
+- [ ] Record the deterministic historical failure mechanism, existing fix, and reviewer evidence separately from independently verified results. The plan includes a small reproducible scratch recipe; do not commit a new test/harness.
+- [ ] Update Linear to replace the unsupported Git-lock hypothesis and superseded stress matrix. Close as the diagnosed timestamp defect already fixed after focused confirmation; retain the caveat about the original missing traceback. If a fresh failure appears, preserve it and keep the issue open; investigate only that demonstrated symptom.
 
-No UI, model inference, R2 access, gated weights, upstream wheel rebuild,
-model locks, or benchmark score changes are required. No user
-acceptance or visual parity check is applicable to this test-only task.
-
-## Acceptance
-
-- [ ] Existing focused test and runtime CI lane pass on the recorded
-  revision, with the specified independent-attempt counts.
-- [ ] Both full-suite runs and all concurrent focused attempts complete
-  without unexplained failures on the final revision; any original
-  reproduction remains documented.
-- [ ] End-to-end automated evidence executes the real local Git fixture
-  through committed source extraction, staged/unstaged mutation,
-  manifest and deterministic wheel verification, and tamper rejection;
-  use an execution-capable MCP test runner and verify available
-  GitHub Actions results/logs through GitHub MCP. This is the offline
-  regression scenario, not a claim of real upstream model inference.
-- [ ] If production builder code changes, add an end-to-end regression
-  for the affected build/verification path (using local fixture inputs
-  where sufficient) and rerun the same suite; no speculative change.
-- [ ] Evidence records the outcome, residual uncertainty or diagnosed
-  cause; no blanket retries, unnecessary dependencies, or unrelated
-  changes. One PR contains the plan, evidence, and any justified fix.
+No visual acceptance applies.
