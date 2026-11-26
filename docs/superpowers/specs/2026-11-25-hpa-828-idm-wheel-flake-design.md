@@ -2,7 +2,7 @@
 
 - [Linear HPA-828](https://linear.app/cwchanap/issue/HPA-828/revalidate-intermittent-idm-wheel-builder-test-failure) · [Original report #28](https://github.com/cwchanap/Crux/issues/28) · [Design review](https://github.com/cwchanap/Crux/pull/37#pullrequestreview-6067735175)
 - Reviewed main: `282586003c17923b97d8b0f33ac062b5f5328b90`
-- Disposition: existing fix; documentation and focused confirmation only.
+- Disposition: existing fix; technical verification complete on main; documentation-only closeout.
 
 ## Diagnosis
 
@@ -21,16 +21,19 @@ The linked reviewer ran the actual historical and current tests in scratch copie
 | 7975d80 | Fails at wheel-byte assertion | 28/300 failed |
 | 2825860 | Passes | Passes in the reported control |
 
-During review resolution, source and commit diffs were independently checked and a minimal scratch ZIP experiment (Python 3.13.5) confirmed that identical committed payloads with timestamps two seconds apart produce unequal old-style wheel bytes, while fixed timestamps give identical bytes. This experiment isolates the mechanism; it is not a full regression run.
+During review resolution, source and commit diffs were independently checked and a minimal scratch ZIP experiment (Python 3.13.5, repeated during round 2) confirmed that identical committed payloads with timestamps two seconds apart produce unequal old-style wheel bytes, while fixed timestamps give identical bytes. This experiment isolates the mechanism; it is not a full regression run.
 
-The reviewer also reports 53 successful CI runs since August 23, 2026, with both test lanes. That aggregate was not independently enumerated. GitHub MCP independently confirmed [PR #36 CI run 45673844492](https://github.com/cwchanap/Crux/actions/runs/45673844492) on head `88edbdb1e6012904d9e10bf2177224fda5e7cd10` passed both the Python 3.11 runtime and Python 3.12 full test jobs (PR merged as `2825860`). The [historical failed run 42980232928](https://github.com/cwchanap/Crux/actions/runs/42980232928) had a successful runtime job and a failed full-suite job; the reviewer reports unrelated failing tests. CI is corroboration, not proof of the mechanism.
+The reviewer reports 53 successful CI runs since August 23, 2026, with both test lanes; that aggregate was not independently enumerated. The earlier PR #36 branch run also passed. More importantly, [main push CI run 45741055726](https://github.com/cwchanap/Crux/actions/runs/45741055726) supplies exact-revision evidence. Both job logs independently confirm checkout of `282586003c17923b97d8b0f33ac062b5f5328b90`.
 
-## Scope and acceptance
+| CI lane | Command | Result |
+| --- | --- | --- |
+| [idm-runtime, Python 3.11](https://github.com/cwchanap/Crux/actions/runs/45741055726/job/139645873722) | `python -m pytest -q -o addopts=-ra --confcutdir tests/runtime tests/runtime/` | 32 passed in 0.33 s |
+| [test, Python 3.12](https://github.com/cwchanap/Crux/actions/runs/45741055726/job/139645874023) | `python -m pytest -q --cov=src --cov-report=xml:coverage.xml --cov-report=term-missing` | 3,835 passed in 369.13 s |
 
-One PR, evidence-only. Do not change the production builder, add a duplicate regression, retry, sleep, serialize Git, add CI jobs, or run a stress matrix. Reuse the existing focused end-to-end regression with real local Git and ZIP operations, checking committed/staged/unstaged source extraction, manifest equality, fixed timestamp, byte equality and tamper rejection. Run it once on each Python 3.11 and 3.12; no model, upstream build, R2 or UI work.
+The existing runtime regression is in both suites. Its real local Git/ZIP operations cover committed/staged/unstaged source extraction, manifest equality, fixed timestamp, byte equality and tamper rejection. This is sufficient automated end-to-end acceptance for the diagnosed test defect; separate local runs would duplicate green CI on the identical code. The round-two reviewer also ran the scratch recipe against the old and fixed revisions and reports the expected historical assertion failure and current pass.
 
-- [ ] Record exact source revision, Python versions, pytest commands and exit results for the two focused runs; retain output or CI links. Perform automated end-to-end verification through MCP (e.g. execution-capable runner or GitHub Actions with MCP-verified job evidence). Evidence format is not dependent on a particular server; if MCP is unavailable, record the missing verification rather than silently waive it.
-- [ ] Record the deterministic historical failure mechanism, existing fix, and reviewer evidence separately from independently verified results. The plan includes a small reproducible scratch recipe; do not commit a new test/harness.
-- [ ] Update Linear to replace the unsupported Git-lock hypothesis and superseded stress matrix. Close as the diagnosed timestamp defect already fixed after focused confirmation; retain the caveat about the original missing traceback. If a fresh failure appears, preserve it and keep the issue open; investigate only that demonstrated symptom.
+## Disposition
 
-No visual acceptance applies.
+Technical acceptance is complete. The existing fix and guard are sufficient. This PR documents the diagnosis and evidence; it changes no production/test code. No new test, retry, sleep, serialization, load matrix, dependencies, CI jobs, model inference, upstream build, R2 work or visual acceptance is required. The missing original traceback remains a caveat, not a reason to keep revalidating the reproduced timestamp defect.
+
+The remaining repository workflow is normal documentation PR CI and merge, then close HPA-828 with the recorded evidence. If unrelated failures appear, investigate their actual symptoms rather than reopen the unsupported index-lock hypothesis.
