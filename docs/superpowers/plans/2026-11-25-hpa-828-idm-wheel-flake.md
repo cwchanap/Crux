@@ -10,10 +10,11 @@
 
 ## Reproduction reference
 
-Optional reproducibility recipe (adapted from the linked review; scratch only, not a committed test). Use the existing project environment (Python 3.12 with pytest and Git installed) from a clone with the historical revision available. The recipe is a one-off shell command; no permanent harness is required:
+This optional scratch recipe is adapted from the linked review. Run it from a clone that contains the historical revision, with Git and `uv` installed and pytest available in the project's Python 3.12 environment.
 
 ```sh
-S=$(mktemp -d)
+(
+S=$(mktemp -d) || exit 1
 trap 'rm -rf "$S"' EXIT
 for rev in 7975d80 282586003c17923b97d8b0f33ac062b5f5328b90; do
   mkdir -p "$S/$rev/runtime/idm" "$S/$rev/tests/runtime"
@@ -61,6 +62,7 @@ for rev in ("7975d80", "282586003c17923b97d8b0f33ac062b5f5328b90"):
     finally:
         zipfile.time = real
 PY
+)
 ```
 
 The reviewer's original script and 300-run historical sample are already linked in the design. Repeating that sample or adding the clock-step script to the test suite is unnecessary. The recipe only shifts ZIP's clock, not the host clock; the current fixed-timestamp entries are unaffected.
