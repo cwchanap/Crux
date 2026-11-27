@@ -1,96 +1,105 @@
 # HPA-627 — implementation and acceptance plan
 
-> Execute in the same draft PR. This is an operational freeze with a small Git diff, not a new benchmark subsystem.
+> Keep this ticket in the same draft PR. Follow the [design](../specs/2026-11-26-hpa-627-muscriptor-model-lock-design.md) and [Linear HPA-627](https://linear.app/cwchanap/issue/HPA-627/commit-frozen-muscriptor-model-lock-runtimemuscriptormodeljson).
 
-[Design specification](../specs/2026-11-26-hpa-627-muscriptor-model-lock-design.md) · [Linear](https://linear.app/cwchanap/issue/HPA-627/commit-frozen-muscriptor-model-lock-runtimemuscriptormodeljson)
+**Files:** `src/benchmark/checkpoint_acquisition.py`, `scripts/freeze_muscriptor_model.py`, `src/cli/benchmark.py`, existing acquisition/CLI/model tests, generated `runtime/muscriptor/model.json`, these docs. No new dependencies, model schema, adapter, runner, or CI infrastructure.
 
-**Expected implementation files:** `runtime/muscriptor/model.json` (generated, not hand-authored); this plan's execution record. Only if HF HEAD differs from the chosen revision: `scripts/freeze_muscriptor_model.py` and a focused freeze-script test. Existing `pyproject.toml`, `uv.lock`, strict loader, backend, runner and smoke manifest otherwise stay unchanged.
+## Task 0 — Establish the actual corpus host and authenticated access
 
-## Task 0 — Establish access and pre-score identity
+- [ ] Confirm main has no canonical model lock; otherwise inspect the existing lock instead of replacing it. Confirm the intended medium revision `f32236969308476e01fd3aae67357de5feb05a2d` is still HF HEAD with the two expected files and CC BY-NC 4.0 metadata. Public metadata is not download evidence. If HEAD changes, stop and reassess; no new revision flag in this ticket.
+- [ ] Provision the proposed HPA-395 corpus host: Linux x86-64 Colab GPU (prefer T4-class), Python 3.12, explicit `cuda`/`float32`. Run `uv sync --locked --extra muscriptor`; confirm installed package and CUDA usability, device memory, RAM and disk. Do not publish a lock while the target runtime is unverified. No MPS/CPU fallback or dependency upgrade.
+- [ ] Account owner accepts the terms at [MuScriptor/muscriptor-medium](https://huggingface.co/MuScriptor/muscriptor-medium); authenticate via `hf auth login` with a read credential or an injected secret on the execution host. Use the CLI installed with the locked environment if available, otherwise supported HF authentication tooling. Never log tokens or commit secrets. The reviewer reports automatic access after acceptance, but verify actual authenticated file download before claiming the gate passed. If permission, host or package prerequisites fail, record the blocker; no production lock.
 
-- [ ] On the PR branch from current main, verify `runtime/muscriptor/model.json` is absent, `runtime/muscriptor/smoke.json` is present, and `artifacts/` is ignored. If a canonical lock has since landed, inspect it instead of overwriting or making a second lock.
-- [ ] Use the existing Python 3.12 environment and optional dependency: `uv sync --locked --extra muscriptor`. Confirm host device/dtype and available memory/storage before downloading; use one affordable execution host. Do not change the root dependency constraints just to work around an unmeasured failure.
-- [ ] In an authorized runtime, confirm access to [MuScriptor/muscriptor-medium](https://huggingface.co/MuScriptor/muscriptor-medium). Account terms/access must already be accepted; use a read credential provided through the execution environment, not through committed files or command output. Public model metadata alone is insufficient.
-- [ ] Compare metadata for repo HEAD and revision `f32236969308476e01fd3aae67357de5feb05a2d`. Confirm the official repo, exact revision, two expected files and CC BY-NC 4.0 metadata. Confirm the package is `muscriptor==0.3.0` and MIT. If exact historical revision cannot be verified/downloaded, stop and record it. No moving-HEAD substitution and no score-informed selection.
+## Task 1 — Reuse acquisition in freeze and consumer paths
 
-**Conditional minimal change only if HEAD moved:** extend the existing freeze script with optional `--revision <40-lowercase-hex>` (default existing resolution). Feed that revision into `HfApi().model_info(repo_id, revision=...)`; require returned SHA equality, retain existing file/license checks, and pass the exact revision to both existing download calls. Focused offline tests mock HF metadata/download calls and check exact revision propagation, invalid or mismatched revision rejection before downloads, and existing no-argument behavior. No second script, schema change or API beyond this selector. If HEAD remains the intended revision, skip this entirely.
+- [ ] Extract the HF fetch portion of `_download_immutable` into a small MuScriptor-specific byte-download helper in `checkpoint_acquisition.py` (repo ID, revision, filename). Lazily import HF and surface safe `CheckpointAcquisitionError` messages; keep the freeze script's immutable publication and error/exit contract. Do not change the freeze's metadata checks, hash/model ID derivation or canonical publication.
+- [ ] Add `prepare_muscriptor_checkpoint(lock, checkpoint_dir, *, download)` returning the verified weight path from `verify_muscriptor_checkpoint`. Verify-only calls the existing verifier without network. Download mode checks existing files; download only missing files from the lock's exact repo/revision/filenames. Check locked length and SHA-256 before using `publish_immutable_file`; reject conflicts without replacing bytes, and finally verify both files through the existing verifier. Existing valid files are reusable, including after a partial download. Use the existing regular-file reader/immutable publisher, not a generic cache manager. Keep HF optional; OaF must not import it.
+- [ ] Extend existing `prepare-backend` in `src/cli/benchmark.py`: dispatch MuScriptor to the lock reader and preparation function, use `CRUX_MUSCRIPTOR_MODEL_LOCK` and `CRUX_MUSCRIPTOR_CHECKPOINT_DIR` defaults consistent with the current runner/backend, and reject `--archive` in MuScriptor mode. Resolve omitted `--cache-root` to the backend-specific default (OaF unchanged); an explicit MuScriptor root is the checkpoint directory itself. Keep existing JSON summary fields and error conventions: invalid selection/lock integrity -> exit 2; acquisition/verification failure -> exit 1; success -> ready/exit 0. Preserve the existing OaF path and option behavior.
+- [ ] Extend `tests/benchmark/test_checkpoint_acquisition.py` with small locked fixture bytes and mocked HF downloads: both calls use exact repo/revision/filenames, bytes are restored and verified, repeat/verify-only makes no network call, invalid downloaded bytes are not published, existing mismatches are rejected, missing verify-only fails. Use existing test fixtures/helpers where available. Exercise freeze download-helper wiring using mocked metadata/downloads (no actual token); retain no-network OaF tests.
+- [ ] Add focused Click tests in the existing CLI test harness: default and explicit MuScriptor path including environment, verify-only vs download, unsupported archive, lock/load errors and acquisition errors; existing OaF defaults/summary and unsupported backend behavior remain. Run the acquisition and relevant CLI tests before authenticated work. No need to write additional smoke infrastructure.
 
-## Task 1 — Authenticate and freeze once
+## Task 2 — Authenticated freeze and commit the canonical lock
 
-- [ ] Run existing offline tests first:
-
-```bash
-uv run --locked pytest tests/benchmark/test_muscriptor_model.py \
-  tests/benchmark/test_muscriptor_backend.py -q
-```
-
-- [ ] Create a new empty ignored staging directory (never reuse partial files from another attempt). From repo root:
+- [ ] From repo root, in the verified target environment, create an empty ignored staging area. The freeze may run on another host only after the intended corpus host is established; explicit device/dtype are required.
 
 ```bash
+mkdir -p artifacts
 STAGE="$(mktemp -d "$PWD/artifacts/muscriptor-freeze.XXXXXX")"
 uv run --locked --extra muscriptor python scripts/freeze_muscriptor_model.py \
-  --variant medium --device auto --dtype auto \
+  --variant medium --device cuda --dtype float32 \
   --checkpoint-dir "$STAGE/checkpoint" \
   --output "$STAGE/model.json"
 ```
 
-Create the ignored `artifacts/` parent before `mktemp`. If Task 0 required the selector, append `--revision f32236969308476e01fd3aae67357de5feb05a2d`. The existing auto choices must resolve to the selected host; explicit device/dtype are acceptable if chosen and recorded before real inference. No CPU/GPU or variant change after result inspection.
+- [ ] Require successful exit, then load the staged lock through the existing loader; assert medium, exact historical revision, cuda/float32; record model ID, lock SHA-256 and actual locked file hashes/lengths. The script already verifies actual bytes, model ID and canonical serialization; don't duplicate that work. On mismatch, failed download or host failure, stop without publishing.
+- [ ] Copy exact validated staged lock bytes to absent `runtime/muscriptor/model.json`. Add a direct non-skipping test in `tests/benchmark/test_muscriptor_model.py` that loads the repo's actual lock and asserts medium, exact revision, cuda and float32. The strict loader checks canonical form and all frozen settings. Add the test and generated lock in the same commit. Do not commit weights, config, source audio or tokens. Only publish the lock when the host/access gate succeeded; leave draft if later real smoke fails.
 
-- [ ] Validate the actual output rather than trusting script exit alone. Use existing `load_muscriptor_model_lock`, `derive_muscriptor_model_id`, `model_lock_payload`, `canonical_json_bytes`, and `verify_muscriptor_checkpoint` to confirm selected revision, medium, actual weight/config byte hashes and lengths, canonical serialization including final newline, derived ID, MIT/CC BY-NC, drums-only/no-sampling settings, and actual device/dtype. Record lock file SHA-256. The two checkpoint downloads must be authenticated and verified; no placeholder or hash copied from public metadata.
-- [ ] Only after validation, publish the exact staged lock bytes as `runtime/muscriptor/model.json` (destination must be absent); leave checkpoint bytes under ignored artifacts. Stage only the lock and intended docs/test changes. Verify the lock is not ignored and no checkpoint/config blobs or credentials are staged. Commit to this same PR branch.
+## Task 3 — Fresh-checkout real smoke and feasibility
 
-**Stop:** no lock publication on gated-download failure, incomplete bytes, unavailable selected revision, environment failure or identity mismatch. Preserve only sanitized diagnosis in the PR/ticket; a failed run is not acceptance.
-
-## Task 2 — Reproduce from a fresh checkout and exercise the real backend
-
-- [ ] Create a fresh detached worktree at the commit containing the generated lock. Use the locked Python environment with MuScriptor extra. Restore the two files using the committed identity, not another freeze (run inside that checkout):
+- [ ] On the selected corpus host, create a fresh worktree at the lock commit, with an empty checkpoint destination and no lock/checkpoint overrides. Install the locked MuScriptor extra; keep authenticated HF session/cache available without copying a prior prepared checkpoint directory. From the worktree root run:
 
 ```bash
-uv run --locked --extra muscriptor python - <<'PY'
-from pathlib import Path
-from shutil import copyfile
-from huggingface_hub import hf_hub_download
-from src.benchmark.muscriptor_model import (
-    load_muscriptor_model_lock, verify_muscriptor_checkpoint,
-)
-lock = load_muscriptor_model_lock(Path("runtime/muscriptor/model.json"))
-target = Path("artifacts/muscriptor/checkpoint")
-target.mkdir(parents=True, exist_ok=True)
-for name in (lock.checkpoint_filename, lock.checkpoint_config_filename):
-    cached = hf_hub_download(
-        repo_id=lock.checkpoint_repo_id,
-        revision=lock.checkpoint_revision,
-        filename=name,
-    )
-    copyfile(cached, target / name)
-verify_muscriptor_checkpoint(lock, target)
-print(lock.model_id)
-PY
+uv run --locked --extra muscriptor crux benchmark prepare-backend \
+  --backend muscriptor --download
+uv run --locked crux benchmark prepare-backend --backend muscriptor
 ```
 
-Use a clean checkout without any old checkpoint destination; HF's verified cache may avoid a redundant large download. Compare committed lock SHA to Task 1; verify both actual restored files. Ensure no environment variable overrides the canonical model lock or checkpoint directory during the smoke.
+Both commands must report ready at the default MuScriptor checkpoint path; second is local verification, no network. This is the independent restore/verification of actual bytes against the committed lock, not another freeze. Record the lock SHA and compare to Task 2.
 
-- [ ] Exercise the actual upstream package through the real `create_backend()` default path with one deterministic short 44.1 kHz mono PCM16 WAV (e.g. six seconds with brief periodic clicks, created under ignored artifacts). Use no scored chart data. Construct `CanonicalAudio` from its true byte SHA-256, byte count, frame count, sample rate/channel/sample width, source ID and existing full-mix input-view ID `crux.oaf-full-mix-mono44k1-pcm16/v1`. Run `backend.transcribe(audio)` in a try/finally that closes the backend. Assert descriptor model ID equals the committed lock, returned prediction refers to the same audio, every emitted event is drums-only with finite nonnegative onset, integer MIDI pitch in 0–127, and no fabricated velocity. Report event count (including zero if the input produces no valid hits), duration and completion, not a score. Use the exact locked device/dtype; no mock, heuristic, MIDI-only path or alternative model. This verifies actual authenticated lock -> restored bytes -> adapter inference, and does not claim full HPA-395 production evidence.
-- [ ] If the actual loader or inference fails, stop and capture the exact sanitized failure. Do not change the model or schema to make a smoke pass. Any nontrivial integration repair is a separately scoped follow-up; do not claim completion.
+- [ ] On the same target GPU, exercise the real existing backend using the existing canonical drum-active WAV (three snare hits in OaF oracle, not an expected MuScriptor count):
 
-## Task 3 — Regression and final acceptance evidence
+```python
+from pathlib import Path
+from time import perf_counter
 
-- [ ] Run the existing strict model/backend and persisted corpus E2E acceptance on the exact branch:
+from src.benchmark.backends.muscriptor import create_backend, descriptor_for_lock
+from src.benchmark.input_view import load_direct_audio
+from src.benchmark.muscriptor_model import load_muscriptor_model_lock
+
+lock = load_muscriptor_model_lock(Path("runtime/muscriptor/model.json"))
+audio = load_direct_audio(
+    Path("tests/fixtures/oaf_tf1_smoke/canonical.wav"),
+    source_audio_id="muscriptor-lock-smoke",
+    input_view_id="crux.oaf-full-mix-mono44k1-pcm16/v1",
+    max_input_audio_frames=None,
+)
+backend = create_backend()
+try:
+    start = perf_counter()
+    prediction = backend.transcribe(audio)
+    elapsed = perf_counter() - start
+    assert prediction.descriptor == descriptor_for_lock(lock)
+    assert prediction.audio == audio
+    assert prediction.events, "smoke emitted no native drum events"
+    duration = audio.audio_frame_count / audio.sample_rate
+    print({"model_id": lock.model_id, "audio_sha256": audio.input_audio_sha256,
+           "events": len(prediction.events), "elapsed_sec": elapsed,
+           "rtf": elapsed / duration})
+finally:
+    backend.close()
+```
+
+Run with `uv run --locked --extra muscriptor python` on the real target. The adapter already rejects invalid drum events and preserves null velocity. Do not reproduce its per-event validators. Record target GPU/VRAM, Torch/CUDA versions, device/dtype, exact commit, exit status, elapsed time, duration/RTF and event count. Time the inference only (model initialization separate); this short smoke is not a corpus projection. Zero events, loading errors, unavailable GPU or infeasible medium runtime fail the gate; report evidence and stop, not model retuning. Any variant/device/dtype change requires a documented pre-score reassessment of this ticket. Full five-song smoke/repeatability and scored corpus remain HPA-395 obligations.
+
+## Task 4 — Offline regression and acceptance evidence
+
+- [ ] Execute acquisition, model, backend, corpus and CLI regression:
 
 ```bash
 uv run --locked pytest \
+  tests/benchmark/test_checkpoint_acquisition.py \
   tests/benchmark/test_muscriptor_model.py \
   tests/benchmark/test_muscriptor_backend.py \
   tests/benchmark/test_muscriptor_corpus_run.py \
   tests/benchmark/test_muscriptor_corpus_run_acceptance.py -q
-uv run --locked pytest tests/test_cli_benchmark.py -k muscriptor -q
+uv run --locked pytest tests/test_cli_benchmark.py -k 'muscriptor or prepare' -q
 ```
 
-If the conditional selector was implemented, run its focused tests as well. The corpus test reconstructs HPA-325 reports from persisted predictions; it complements, but does not replace, the real smoke. Use normal GitHub CI for the complete offline suite and lint. Verify the exact PR head and CI job results via GitHub MCP.
+Run any other existing CLI tests covering prepare-backend and added focused tests by their exact path. Normal CI runs full offline suite and lint; ensure no gated download or optional HF import is required in ordinary CI. Verify the committed-lock test fails for missing/malformed/wrong identity (not skipped). Confirm final diff is limited to scoped files.
 
-- [ ] Agentic acceptance: use available execution MCP for Task 1 and fresh-checkout Task 2, and GitHub MCP for committed lock diff/CI verification. Retain a compact Markdown evidence record in this plan with revision, lock SHA, actual checkpoint/config SHA and lengths, resolved device/dtype, exact runtime/commands, exits and native smoke summary. Do not include credentials, checkpoint bodies or raw artifact dumps. If execution MCP/authenticated runtime is unavailable, record the blocker and leave acceptance unchecked. No human acceptance gate; no visual/UI acceptance because this is backend-only.
-- [ ] Confirm final PR diff contains only the generated canonical lock, plan/spec/evidence and conditional selector/test if needed. Confirm `git status --short` / `git ls-files` show no tracked model artifacts or credentials. Update the original [PR #24 finding](https://github.com/cwchanap/Crux/pull/24#issuecomment-5318296815) and Linear with actual lock and evidence references or continued operational blocker. Keep HPA-627 open until accepted; do not automatically close the HPA-319 epic or claim full corpus comparison. No separate PR for the lock.
+- [ ] End-to-end acceptance by the agent through available execution MCP: Task 2 actual freeze and Task 3 real CLI restore, verify-only and nonempty inference on selected host. GitHub MCP verifies committed lock, PR head and CI job evidence. Local `gh` may assist with execution but does not replace MCP acceptance. Record command, commit, lock SHA, checkpoint/config hashes/lengths, GPU/versions, output/exit and RTF here, excluding secrets/artifact bodies. If runtime or credentials unavailable, retain blocker and unchecked gate. No human acceptance or UI/screenshot criterion applies.
+- [ ] Update original [PR #24 finding](https://github.com/cwchanap/Crux/pull/24#issuecomment-5318296815) and Linear with actual evidence or continued blocker. Keep this PR draft until all acceptance gates pass. Do not close HPA-319 or claim HPA-395 broad scoring is complete. One ticket, one PR.
 
 ## Execution record
 
-Planning inspection (2026-11-26): main has the existing freeze script, optional package, strict loader, backend and corpus acceptance tests; the canonical lock is absent. The recorded gated-access failure from PR #24 has not been retested with authorized credentials in this session. No freeze, model execution or tests have been run as part of planning. All implementation acceptance items remain unchecked.
+2026-11-26 planning: inspected existing code and tests; lock absent. Round-one design review incorporated. Proposed CUDA/float32 Colab target is not yet provisioned or verified. The review reports unchanged HF HEAD and auto-gating; independent public API retrieval in this review was unavailable and the authorized download remains untested. No code implementation, model freeze, smoke or test execution claimed.
