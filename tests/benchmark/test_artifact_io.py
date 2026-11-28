@@ -122,6 +122,19 @@ def test_publish_immutable_file_at_cleans_temporary_file_on_fill_failure(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_publish_immutable_file_cleans_partial_write_on_interrupt(tmp_path, monkeypatch):
+    def interrupt_write(descriptor: int, _content: bytes) -> None:
+        os.write(descriptor, b"partial")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(artifact_io, "_write_all", interrupt_write)
+
+    with pytest.raises(KeyboardInterrupt):
+        publish_immutable_file(tmp_path / "model.safetensors", b"payload")
+
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_publish_immutable_file_at_rejects_lost_race_with_different_bytes(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

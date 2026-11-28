@@ -179,17 +179,15 @@ def _create_temporary_file_at(directory_fd: int, name: str, content: bytes) -> s
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
-        except OSError as write_error:
-            # The caller's unlink finally only runs once this function returns
-            # the temporary name, so a write/fsync failure must clean up the
-            # partial file here.  Wrap the failure so callers see the helper's
-            # established ArtifactPublicationError contract rather than a raw
-            # OSError leaking through the pre-try call site.
+        except BaseException as write_error:
+            # This function owns cleanup until it returns the temporary name.
             try:
                 os.unlink(temporary_name, dir_fd=directory_fd)
             except OSError:
                 pass
-            raise ArtifactPublicationError("artifact publication failed") from write_error
+            if isinstance(write_error, OSError):
+                raise ArtifactPublicationError("artifact publication failed") from write_error
+            raise
         return temporary_name
     raise ArtifactPublicationError("artifact publication failed")
 
