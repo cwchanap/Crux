@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import math
-import os
 import re
 import resource
 import sys
@@ -40,8 +39,6 @@ from src.benchmark.backend_identity import (
 )
 from src.benchmark.backends.base import CanonicalAudio, NativePrediction
 from src.benchmark.backends.muscriptor import (
-    DEFAULT_CHECKPOINT_DIR,
-    DEFAULT_MODEL_LOCK_PATH,
     MuscriptorBackend,
     MuscriptorBackendError,
     create_backend,
@@ -63,6 +60,12 @@ from src.benchmark.muscriptor_model import (
     MuscriptorModelLock,
     load_muscriptor_model_lock,
     verify_muscriptor_checkpoint,
+)
+from src.benchmark.muscriptor_model import (
+    resolve_muscriptor_checkpoint_dir as _checkpoint_dir,
+)
+from src.benchmark.muscriptor_model import (
+    resolve_muscriptor_model_lock_path as _model_lock_path,
 )
 from src.benchmark.prediction_artifact import (
     PredictionArtifactError,
@@ -626,19 +629,6 @@ class _MuscriptorExecutionState:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _model_lock_path() -> Path:
-    configured = os.environ.get("CRUX_MUSCRIPTOR_MODEL_LOCK")
-    return (
-        Path(configured)
-        if configured
-        else Path(__file__).resolve().parents[2] / DEFAULT_MODEL_LOCK_PATH
-    )
-
-
-def _checkpoint_dir() -> Path:
-    return Path(os.environ.get("CRUX_MUSCRIPTOR_CHECKPOINT_DIR", str(DEFAULT_CHECKPOINT_DIR)))
 
 
 def _expected_muscriptor_descriptor(lock: MuscriptorModelLock) -> BackendDescriptor:

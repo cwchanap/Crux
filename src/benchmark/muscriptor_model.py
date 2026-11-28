@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
+import stat
 from dataclasses import dataclass, fields
 from decimal import Decimal
 from pathlib import Path
@@ -25,7 +27,10 @@ MUSCRIPTOR_WEIGHT_LICENSE = "CC BY-NC 4.0"
 MUSCRIPTOR_NATIVE_OUTPUT_SPACE_ID = "muscriptor-drums-midi128-v1"
 MUSCRIPTOR_NATIVE_METADATA_SCHEMA_ID = "muscriptor-note-start-metadata-v1"
 MUSCRIPTOR_TRAINING_DATA_MAP_ID = "muscriptor-training-data-v0.3.0"
+DEFAULT_MODEL_LOCK_PATH = Path("runtime/muscriptor/model.json")
+DEFAULT_CHECKPOINT_DIR = Path("artifacts/muscriptor/checkpoint")
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 _CHECKPOINT_VARIANTS = frozenset({"medium", "small"})
 _DEVICE_RE = re.compile(r"(?:cpu|mps|cuda(?::[0-9]+)?)\Z")
 _DTYPES = frozenset({"float16", "float32", "bfloat16"})
@@ -76,6 +81,22 @@ class MuscriptorModelLock:
 
 
 _MODEL_KEYS = frozenset(field.name for field in fields(MuscriptorModelLock)) | {"schema"}
+
+
+def resolve_muscriptor_model_lock_path(path: Path | None = None) -> Path:
+    """Resolve the lock path, defaulting to the canonical file in the checkout."""
+    if path is not None:
+        return path
+    configured = os.environ.get("CRUX_MUSCRIPTOR_MODEL_LOCK")
+    return Path(configured) if configured else _REPO_ROOT / DEFAULT_MODEL_LOCK_PATH
+
+
+def resolve_muscriptor_checkpoint_dir(path: Path | None = None) -> Path:
+    """Resolve the checkpoint directory, defaulting relative to the working directory."""
+    if path is not None:
+        return path
+    configured = os.environ.get("CRUX_MUSCRIPTOR_CHECKPOINT_DIR")
+    return Path(configured) if configured else DEFAULT_CHECKPOINT_DIR
 
 
 def derive_muscriptor_model_id(lock: MuscriptorModelLock) -> str:
@@ -274,9 +295,20 @@ def _numeric_float(value: object, field: str) -> float:
 
 def _verify_file(path: Path, *, expected_sha256: str, expected_length: int, field: str) -> None:
     try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            raise MuscriptorModelLockError(f"{field} file is unavailable")
         content = read_regular_file_no_follow(path)
     except (OSError, TypeError):
         raise MuscriptorModelLockError(f"{field} file is unavailable") from None
+    verify_muscriptor_checkpoint_bytes(
+        content, expected_sha256=expected_sha256, expected_length=expected_length, field=field
+    )
+
+
+def verify_muscriptor_checkpoint_bytes(
+    content: bytes, *, expected_sha256: str, expected_length: int, field: str
+) -> None:
+    """Check one checkpoint component against its locked byte length and SHA-256."""
     if len(content) != expected_length:
         raise MuscriptorModelLockError(f"{field} file byte length differs")
     if hashlib.sha256(content).hexdigest() != expected_sha256:
@@ -332,6 +364,8 @@ def _require_exact_number(value: object, field: str, expected: float) -> None:
 
 
 __all__ = [
+    "DEFAULT_CHECKPOINT_DIR",
+    "DEFAULT_MODEL_LOCK_PATH",
     "MUSCRIPTOR_MODEL_ID_RE",
     "MUSCRIPTOR_MODEL_SCHEMA",
     "MUSCRIPTOR_NATIVE_METADATA_SCHEMA_ID",
@@ -344,5 +378,8 @@ __all__ = [
     "derive_muscriptor_model_id",
     "load_muscriptor_model_lock",
     "model_lock_payload",
+    "resolve_muscriptor_checkpoint_dir",
+    "resolve_muscriptor_model_lock_path",
     "verify_muscriptor_checkpoint",
+    "verify_muscriptor_checkpoint_bytes",
 ]

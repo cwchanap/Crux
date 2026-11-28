@@ -5,11 +5,14 @@ import os
 import struct
 from dataclasses import dataclass, replace
 from pathlib import Path
+from unittest.mock import Mock
 
 import click
 import pytest
 from click.testing import CliRunner
 
+from runtime.oaf_tf1 import model as oaf_model
+from src.benchmark import checkpoint_acquisition
 from src.benchmark.backend_identity import (
     OAF_BACKEND_ID,
     OAF_DESCRIPTOR_SCHEMA,
@@ -31,6 +34,179 @@ from src.benchmark.reviewed_subset import (
     ScoreReviewedSubsetOutcome,
 )
 from src.cli.main import main
+from tests.benchmark.muscriptor_run_fixtures import _write_lock as _write_muscriptor_lock
+
+
+@pytest.mark.parametrize(
+    ("options", "cache_root", "download", "archive"),
+    [
+        ([], Path("artifacts/benchmark/model-cache"), False, None),
+        (["--download"], Path("artifacts/benchmark/model-cache"), True, None),
+        (
+            ["--cache-root", "custom-cache", "--archive", "checkpoint.zip"],
+            Path("custom-cache"),
+            False,
+            Path("checkpoint.zip"),
+        ),
+    ],
+)
+def test_prepare_backend_oaf_preserves_cache_and_acquisition_modes(
+    monkeypatch, options, cache_root, download, archive
+) -> None:
+    config = oaf_model.load_model_config()
+    checkpoint_dir = cache_root / "sha256" / config.checkpoint.archive_sha256
+    prepare = Mock(return_value=checkpoint_dir)
+    monkeypatch.setattr(checkpoint_acquisition, "prepare_oaf_checkpoint", prepare)
+
+    result = CliRunner().invoke(main, ["benchmark", "prepare-backend", *options])
+
+    assert result.exit_code == 0, result.output
+    prepare.assert_called_once_with(config, cache_root, download=download, archive_path=archive)
+    assert json.loads(result.stdout) == {
+        "backend": "oaf",
+        "checkpoint_path": str(checkpoint_dir),
+        "status": "ready",
+    }
+
+
+def test_prepare_backend_oaf_rejects_download_with_archive() -> None:
+    result = CliRunner().invoke(
+        main, ["benchmark", "prepare-backend", "--download", "--archive", "checkpoint.zip"]
+    )
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert "--download and --archive are mutually exclusive" in result.stderr
+
+
+def test_prepare_backend_oaf_rejects_file_at_default_cache_root(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    cache_root = Path("artifacts/benchmark/model-cache")
+    cache_root.parent.mkdir(parents=True)
+    cache_root.touch()
+
+    result = CliRunner().invoke(main, ["benchmark", "prepare-backend"])
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert "--cache-root" in result.stderr
+    assert "is a file" in result.stderr
+
+
+def test_prepare_backend_rejects_unknown_backend() -> None:
+    result = CliRunner().invoke(main, ["benchmark", "prepare-backend", "--backend", "unknown"])
+
+    assert result.exit_code == 2
+    assert "backend_selection_invalid" in result.stderr
+    assert json.loads(result.stdout) == {
+        "backend": "unknown",
+        "checkpoint_path": None,
+        "status": "integrity_failed",
+    }
+
+
+@pytest.mark.parametrize("status", ["integrity_failed", "acquisition_failed"])
+def test_prepare_backend_oaf_preserves_error_status(monkeypatch, status) -> None:
+    prepare = Mock(side_effect=checkpoint_acquisition.CheckpointAcquisitionError("invalid cache"))
+    monkeypatch.setattr(checkpoint_acquisition, "prepare_oaf_checkpoint", prepare)
+    if status == "integrity_failed":
+        load = Mock(side_effect=oaf_model.OafModelConfigError("invalid model config"))
+        monkeypatch.setattr(oaf_model, "load_model_config", load)
+
+    result = CliRunner().invoke(main, ["benchmark", "prepare-backend"])
+
+    assert result.exit_code == (2 if status == "integrity_failed" else 1)
+    assert json.loads(result.stdout) == {
+        "backend": "oaf",
+        "checkpoint_path": None,
+        "status": status,
+    }
+    assert prepare.call_count == (0 if status == "integrity_failed" else 1)
+
+
+@pytest.mark.parametrize(
+    ("options", "configured_dir", "expected_dir", "download"),
+    [
+        ([], None, "artifacts/muscriptor/checkpoint", False),
+        ([], "", "artifacts/muscriptor/checkpoint", False),
+        ([], "env-checkpoint", "env-checkpoint", False),
+        (["--download", "--cache-root", "explicit"], "env-checkpoint", "explicit", True),
+    ],
+)
+def test_prepare_backend_muscriptor_resolves_checkpoint_directory(
+    tmp_path, monkeypatch, options, configured_dir, expected_dir, download
+) -> None:
+    lock_path, _, lock = _write_muscriptor_lock(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CRUX_MUSCRIPTOR_MODEL_LOCK", lock_path.name)
+    if configured_dir is None:
+        monkeypatch.delenv("CRUX_MUSCRIPTOR_CHECKPOINT_DIR", raising=False)
+    else:
+        monkeypatch.setenv("CRUX_MUSCRIPTOR_CHECKPOINT_DIR", configured_dir)
+    prepare = Mock(return_value=Path(expected_dir))
+    monkeypatch.setattr(
+        checkpoint_acquisition, "prepare_muscriptor_checkpoint", prepare, raising=False
+    )
+
+    result = CliRunner().invoke(
+        main, ["benchmark", "prepare-backend", "--backend", "muscriptor", *options]
+    )
+
+    assert result.exit_code == 0, result.output
+    prepare.assert_called_once_with(lock, Path(expected_dir), download=download)
+    assert json.loads(result.stdout) == {
+        "backend": "muscriptor",
+        "checkpoint_path": expected_dir,
+        "status": "ready",
+    }
+
+
+@pytest.mark.parametrize(
+    ("state", "exit_code", "status"),
+    [
+        ("valid", 0, "ready"),
+        ("missing-lock", 2, "integrity_failed"),
+        ("malformed-lock", 2, "integrity_failed"),
+        ("missing-checkpoint", 1, "acquisition_failed"),
+        ("corrupt-checkpoint", 1, "acquisition_failed"),
+    ],
+)
+def test_prepare_backend_muscriptor_distinguishes_lock_and_checkpoint_errors(
+    tmp_path, monkeypatch, state, exit_code, status
+) -> None:
+    lock_path, checkpoint_dir, lock = _write_muscriptor_lock(tmp_path)
+    if state == "missing-lock":
+        lock_path.unlink()
+    elif state == "malformed-lock":
+        lock_path.write_bytes(b"invalid lock")
+    elif state == "missing-checkpoint":
+        checkpoint_dir = tmp_path / "missing"
+    elif state == "corrupt-checkpoint":
+        (checkpoint_dir / lock.checkpoint_config_filename).write_bytes(b"corrupt")
+    monkeypatch.setenv("CRUX_MUSCRIPTOR_MODEL_LOCK", str(lock_path))
+    monkeypatch.setenv("CRUX_MUSCRIPTOR_CHECKPOINT_DIR", str(checkpoint_dir))
+
+    result = CliRunner().invoke(main, ["benchmark", "prepare-backend", "--backend", "muscriptor"])
+
+    assert result.exit_code == exit_code, result.output
+    assert "backend_selection_invalid" not in result.stderr
+    assert json.loads(result.stdout) == {
+        "backend": "muscriptor",
+        "checkpoint_path": str(checkpoint_dir) if status == "ready" else None,
+        "status": status,
+    }
+
+
+def test_prepare_backend_muscriptor_rejects_archive() -> None:
+    result = CliRunner().invoke(
+        main,
+        ["benchmark", "prepare-backend", "--backend", "muscriptor", "--archive", "checkpoint.zip"],
+    )
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert "--archive" in result.stderr
+    assert "muscriptor" in result.stderr
 
 
 def _descriptor() -> object:

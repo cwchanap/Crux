@@ -1,4 +1,4 @@
-"""Model-driven OaF checkpoint acquisition and immutable cache preparation."""
+"""Acquire and verify immutable benchmark checkpoints."""
 
 from __future__ import annotations
 
@@ -14,10 +14,16 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from src.benchmark.artifact_io import read_regular_file_no_follow
+from src.benchmark.artifact_io import publish_immutable_file_at, read_regular_file_no_follow
+from src.benchmark.muscriptor_model import (
+    MuscriptorModelLockError,
+    verify_muscriptor_checkpoint,
+    verify_muscriptor_checkpoint_bytes,
+)
 
 if TYPE_CHECKING:
     from runtime.oaf_tf1.model import OafModelConfig
+    from src.benchmark.muscriptor_model import MuscriptorModelLock
 
 
 class CheckpointAcquisitionError(ValueError):
@@ -103,6 +109,86 @@ def prepare_oaf_checkpoint(
     finally:
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
+
+
+def prepare_muscriptor_checkpoint(
+    lock: MuscriptorModelLock, checkpoint_dir: Path, *, download: bool
+) -> Path:
+    """Restore missing locked components when allowed and return the verified directory."""
+    try:
+        if download:
+            _restore_muscriptor_checkpoint(lock, checkpoint_dir)
+        verify_muscriptor_checkpoint(lock, checkpoint_dir)
+    except (MuscriptorModelLockError, OSError) as error:
+        raise CheckpointAcquisitionError(
+            f"MuScriptor checkpoint preparation failed ({error})"
+        ) from error
+    return checkpoint_dir
+
+
+def _restore_muscriptor_checkpoint(lock: MuscriptorModelLock, checkpoint_dir: Path) -> None:
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if not stat.S_ISDIR(checkpoint_dir.lstat().st_mode):
+        raise CheckpointAcquisitionError("MuScriptor checkpoint directory is unavailable")
+
+    components = (
+        (lock.checkpoint_filename, lock.checkpoint_sha256, lock.checkpoint_byte_length),
+        (
+            lock.checkpoint_config_filename,
+            lock.checkpoint_config_sha256,
+            lock.checkpoint_config_byte_length,
+        ),
+    )
+    missing = []
+    for filename, sha256, length in components:
+        path = checkpoint_dir / filename
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            missing.append((filename, sha256, length))
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise CheckpointAcquisitionError(f"{filename} is not a regular file")
+        verify_muscriptor_checkpoint_bytes(
+            read_regular_file_no_follow(path),
+            expected_sha256=sha256,
+            expected_length=length,
+            field=filename,
+        )
+
+    publish_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    for filename, sha256, length in missing:
+        content = download_muscriptor_checkpoint_file(
+            lock.checkpoint_repo_id, lock.checkpoint_revision, filename
+        )
+        verify_muscriptor_checkpoint_bytes(
+            content, expected_sha256=sha256, expected_length=length, field=filename
+        )
+        # Open without following symlinks again after the potentially long download.
+        directory_fd = os.open(checkpoint_dir, publish_flags)
+        try:
+            publish_immutable_file_at(directory_fd, filename, content)
+        finally:
+            os.close(directory_fd)
+
+
+def download_muscriptor_checkpoint_file(repo_id: str, revision: str, filename: str) -> bytes:
+    """Read one exact-revision file through the optional Hugging Face client."""
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as error:
+        raise CheckpointAcquisitionError(
+            "huggingface_hub is unavailable. Install with --extra muscriptor."
+        ) from error
+    try:
+        downloaded = hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
+        return Path(downloaded).read_bytes()
+    except Exception as error:
+        status = getattr(getattr(error, "response", None), "status_code", None)
+        detail = f" (HTTP {status})" if type(status) is int and 400 <= status <= 599 else ""
+        raise CheckpointAcquisitionError(
+            f"Hugging Face download failed for {repo_id}/{filename} at {revision}{detail}"
+        ) from error
 
 
 def _download_checkpoint_archive(url: str) -> bytes:
@@ -215,4 +301,9 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-__all__ = ["CheckpointAcquisitionError", "prepare_oaf_checkpoint"]
+__all__ = [
+    "CheckpointAcquisitionError",
+    "download_muscriptor_checkpoint_file",
+    "prepare_muscriptor_checkpoint",
+    "prepare_oaf_checkpoint",
+]
