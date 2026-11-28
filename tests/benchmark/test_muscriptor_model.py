@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from src.benchmark import muscriptor_model
 from src.benchmark.backend_identity import canonical_json_bytes
 from src.benchmark.muscriptor_model import (
     MUSCRIPTOR_MODEL_ID_RE,
@@ -69,6 +70,44 @@ def _write_lock(tmp_path: Path, **overrides: object) -> Path:
     path = tmp_path / "model.json"
     path.write_bytes(canonical_json_bytes(_payload(**overrides), trailing_newline=True))
     return path
+
+
+@pytest.mark.parametrize("configured", [None, "", "relative", "absolute"])
+def test_muscriptor_paths_resolve_consistently_outside_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, configured: str | None
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    overrides = (
+        ("CRUX_MUSCRIPTOR_MODEL_LOCK", Path("custom-model.json")),
+        ("CRUX_MUSCRIPTOR_CHECKPOINT_DIR", Path("custom-checkpoint")),
+    )
+    for name, path in overrides:
+        if configured is None:
+            monkeypatch.delenv(name, raising=False)
+        elif configured == "absolute":
+            monkeypatch.setenv(name, str(tmp_path / path))
+        else:
+            monkeypatch.setenv(name, str(path) if configured else "")
+
+    repo_root = Path(__file__).resolve().parents[2]
+    expected_lock = repo_root / "runtime/muscriptor/model.json"
+    expected_checkpoint = Path("artifacts/muscriptor/checkpoint")
+    if configured == "relative":
+        expected_lock = Path("custom-model.json")
+        expected_checkpoint = Path("custom-checkpoint")
+    elif configured == "absolute":
+        expected_lock = tmp_path / "custom-model.json"
+        expected_checkpoint = tmp_path / "custom-checkpoint"
+
+    assert muscriptor_model.resolve_muscriptor_model_lock_path() == expected_lock
+    assert muscriptor_model.resolve_muscriptor_checkpoint_dir() == expected_checkpoint
+    explicit_lock = Path("explicit-model.json")
+    explicit_checkpoint = tmp_path / "explicit-checkpoint"
+    assert muscriptor_model.resolve_muscriptor_model_lock_path(explicit_lock) == explicit_lock
+    assert (
+        muscriptor_model.resolve_muscriptor_checkpoint_dir(explicit_checkpoint)
+        == explicit_checkpoint
+    )
 
 
 def test_loads_closed_lock_and_freezes_deterministic_settings(tmp_path: Path) -> None:

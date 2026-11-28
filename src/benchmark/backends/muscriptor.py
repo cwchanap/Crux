@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import math
-import os
 from pathlib import Path
 from typing import Any
 
@@ -20,13 +19,14 @@ from src.benchmark.backend_identity import (
 )
 from src.benchmark.backends.base import CanonicalAudio, NativeEvent, NativePrediction
 from src.benchmark.muscriptor_model import (
+    DEFAULT_CHECKPOINT_DIR,
+    DEFAULT_MODEL_LOCK_PATH,
     MuscriptorModelLock,
     load_muscriptor_model_lock,
+    resolve_muscriptor_checkpoint_dir,
+    resolve_muscriptor_model_lock_path,
     verify_muscriptor_checkpoint,
 )
-
-DEFAULT_MODEL_LOCK_PATH = Path("runtime/muscriptor/model.json")
-DEFAULT_CHECKPOINT_DIR = Path("artifacts/muscriptor/checkpoint")
 
 
 class MuscriptorBackendError(RuntimeError):
@@ -50,10 +50,7 @@ class MuscriptorBackend:
         descriptor: BackendDescriptor | None = None,
     ) -> None:
         lock = _load_lock(model_lock_path)
-        if checkpoint_dir is None:
-            checkpoint_dir = Path(
-                os.environ.get("CRUX_MUSCRIPTOR_CHECKPOINT_DIR", str(DEFAULT_CHECKPOINT_DIR))
-            )
+        checkpoint_dir = resolve_muscriptor_checkpoint_dir(checkpoint_dir)
         if not isinstance(checkpoint_dir, Path):
             raise TypeError("checkpoint_dir must be a Path")
         selected_device = lock.device if device is None else device
@@ -132,10 +129,6 @@ def create_backend(
     descriptor: BackendDescriptor | None = None,
 ) -> MuscriptorBackend:
     """Construct one verified MuScriptor backend from local frozen artifacts."""
-    if model_lock_path is None:
-        model_lock_path = Path(
-            os.environ.get("CRUX_MUSCRIPTOR_MODEL_LOCK", str(DEFAULT_MODEL_LOCK_PATH))
-        )
     return MuscriptorBackend(
         model_lock_path=model_lock_path,
         checkpoint_dir=checkpoint_dir,
@@ -148,11 +141,7 @@ def create_backend(
 def _load_lock(model_lock_path: Path | MuscriptorModelLock | None) -> MuscriptorModelLock:
     if isinstance(model_lock_path, MuscriptorModelLock):
         return model_lock_path
-    if model_lock_path is None:
-        model_lock_path = Path(
-            os.environ.get("CRUX_MUSCRIPTOR_MODEL_LOCK", str(DEFAULT_MODEL_LOCK_PATH))
-        )
-    return load_muscriptor_model_lock(model_lock_path)
+    return load_muscriptor_model_lock(resolve_muscriptor_model_lock_path(model_lock_path))
 
 
 def descriptor_for_lock(lock: MuscriptorModelLock) -> BackendDescriptor:

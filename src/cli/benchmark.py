@@ -49,6 +49,7 @@ from src.cli.options import (
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
+_DEFAULT_OAF_CACHE_ROOT = Path("artifacts/benchmark/model-cache")
 
 
 def _current_crux_commit() -> str:
@@ -85,8 +86,7 @@ def benchmark() -> None:
 @click.option(
     "--cache-root",
     type=click.Path(path_type=Path, file_okay=False),
-    default=Path("artifacts/benchmark/model-cache"),
-    show_default=True,
+    help=f"OaF cache root (default {_DEFAULT_OAF_CACHE_ROOT}) or MuScriptor checkpoint directory.",
 )
 @click.pass_context
 def prepare_backend_command(
@@ -94,13 +94,21 @@ def prepare_backend_command(
     backend: str,
     download: bool,
     archive: Path | None,
-    cache_root: Path,
+    cache_root: Path | None,
 ) -> None:
-    """Acquire or verify the immutable OaF checkpoint cache."""
+    """Acquire or verify an immutable OaF or MuScriptor checkpoint."""
+    if backend == "oaf" and cache_root is None:
+        # Validate the backend-specific default the same way as an explicit option.
+        option = next(
+            parameter for parameter in ctx.command.params if parameter.name == "cache_root"
+        )
+        cache_root = option.type.convert(_DEFAULT_OAF_CACHE_ROOT, option, ctx)
     if download and archive is not None:
         raise click.UsageError("--download and --archive are mutually exclusive.")
+    if backend == "muscriptor" and archive is not None:
+        raise click.UsageError("--archive is unavailable for the muscriptor backend.")
 
-    if backend != "oaf":
+    if backend not in {"oaf", "muscriptor"}:
         click.echo("backend_selection_invalid", err=True)
         _emit_prepare_backend_summary(
             backend=backend, checkpoint_path=None, status="integrity_failed"
@@ -110,17 +118,30 @@ def prepare_backend_command(
     from runtime.oaf_tf1.model import OafModelConfigError, load_model_config
     from src.benchmark.checkpoint_acquisition import (
         CheckpointAcquisitionError,
+        prepare_muscriptor_checkpoint,
         prepare_oaf_checkpoint,
+    )
+    from src.benchmark.muscriptor_model import (
+        MuscriptorModelLockError,
+        load_muscriptor_model_lock,
+        resolve_muscriptor_checkpoint_dir,
+        resolve_muscriptor_model_lock_path,
     )
 
     try:
-        checkpoint_path = prepare_oaf_checkpoint(
-            load_model_config(),
-            cache_root,
-            download=download,
-            archive_path=archive,
-        )
-    except OafModelConfigError:
+        if backend == "muscriptor":
+            lock = load_muscriptor_model_lock(resolve_muscriptor_model_lock_path())
+            checkpoint_path = prepare_muscriptor_checkpoint(
+                lock, resolve_muscriptor_checkpoint_dir(cache_root), download=download
+            )
+        else:
+            checkpoint_path = prepare_oaf_checkpoint(
+                load_model_config(),
+                cache_root,
+                download=download,
+                archive_path=archive,
+            )
+    except (OafModelConfigError, MuscriptorModelLockError):
         _emit_prepare_backend_summary(
             backend=backend,
             checkpoint_path=None,

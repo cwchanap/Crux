@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
+import sys
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -14,10 +17,15 @@ from runtime.oaf_tf1.model import (
     OafModelConfigError,
     load_model_config,
 )
+from scripts import freeze_muscriptor_model
+from src.benchmark import checkpoint_acquisition
+from src.benchmark.artifact_io import ArtifactPublicationError
 from src.benchmark.checkpoint_acquisition import (
     CheckpointAcquisitionError,
     prepare_oaf_checkpoint,
 )
+from src.benchmark.muscriptor_model import MuscriptorModelLockError
+from tests.benchmark.muscriptor_run_fixtures import CONFIG, WEIGHTS, _lock
 
 EXPECTED_ARCHIVE_SHA256 = "09765ae0ff19c7d769a3c20e158eba3b9cd279429b02e498b1e911d16f82e2c0"
 EXPECTED_COMPONENT_SHA256 = {
@@ -243,3 +251,213 @@ def test_checkpoint_acquisition_has_no_legacy_request_or_evidence_api() -> None:
 
     assert not hasattr(acquisition, "load_checkpoint_acquisition_request")
     assert not hasattr(acquisition, "load_checkpoint_acquisition_evidence")
+
+
+@pytest.fixture
+def hf_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "model.safetensors").write_bytes(WEIGHTS)
+    (snapshot / "config.json").write_bytes(CONFIG)
+    download = Mock(side_effect=lambda *, filename, **_kwargs: str(snapshot / filename))
+    hub = SimpleNamespace(hf_hub_download=download)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    return SimpleNamespace(path=snapshot, download=download, hub=hub)
+
+
+@pytest.mark.parametrize("has_config", [False, True])
+def test_prepare_muscriptor_restores_only_missing_files_by_locked_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hf_snapshot, has_config: bool
+) -> None:
+    lock = _lock()
+    checkpoint_dir = tmp_path / "checkpoint"
+    if has_config:
+        checkpoint_dir.mkdir()
+        (checkpoint_dir / lock.checkpoint_config_filename).write_bytes(CONFIG)
+
+    assert (
+        checkpoint_acquisition.prepare_muscriptor_checkpoint(lock, checkpoint_dir, download=True)
+        == checkpoint_dir
+    )
+    filenames = [lock.checkpoint_filename]
+    if not has_config:
+        filenames.append(lock.checkpoint_config_filename)
+    assert hf_snapshot.download.call_args_list == [
+        call(repo_id=lock.checkpoint_repo_id, revision=lock.checkpoint_revision, filename=filename)
+        for filename in filenames
+    ]
+    assert (checkpoint_dir / lock.checkpoint_filename).read_bytes() == WEIGHTS
+    assert (checkpoint_dir / lock.checkpoint_config_filename).read_bytes() == CONFIG
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", None)
+    for download in (False, True):
+        assert (
+            checkpoint_acquisition.prepare_muscriptor_checkpoint(
+                lock, checkpoint_dir, download=download
+            )
+            == checkpoint_dir
+        )
+
+
+@pytest.mark.parametrize("bad_bytes", [b"short", b"?" * len(WEIGHTS)])
+def test_prepare_muscriptor_rejects_wrong_bytes_before_publication(
+    tmp_path: Path, hf_snapshot, bad_bytes: bytes
+) -> None:
+    lock = _lock()
+    (hf_snapshot.path / lock.checkpoint_filename).write_bytes(bad_bytes)
+    checkpoint_dir = tmp_path / "checkpoint"
+
+    with pytest.raises(CheckpointAcquisitionError, match="byte length|SHA-256"):
+        checkpoint_acquisition.prepare_muscriptor_checkpoint(lock, checkpoint_dir, download=True)
+
+    assert not (checkpoint_dir / lock.checkpoint_filename).exists()
+
+
+@pytest.mark.parametrize("filename", ["config.json", "model.safetensors"])
+def test_prepare_muscriptor_checks_both_existing_files_before_download(
+    tmp_path: Path, hf_snapshot, filename: str
+) -> None:
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    conflicting_file = checkpoint_dir / filename
+    conflicting_file.write_bytes(b"conflict")
+
+    with pytest.raises(CheckpointAcquisitionError):
+        checkpoint_acquisition.prepare_muscriptor_checkpoint(_lock(), checkpoint_dir, download=True)
+
+    hf_snapshot.download.assert_not_called()
+    assert conflicting_file.read_bytes() == b"conflict"
+
+
+@pytest.mark.parametrize("destination", ["symlink", "dangling-symlink", "file", "symlink-file"])
+def test_prepare_muscriptor_rejects_unsafe_destinations_before_download(
+    tmp_path: Path, hf_snapshot, destination: str
+) -> None:
+    checkpoint_dir = tmp_path / "checkpoint"
+    other = tmp_path / "other"
+    if destination == "symlink":
+        other.mkdir()
+        checkpoint_dir.symlink_to(other, target_is_directory=True)
+    elif destination == "dangling-symlink":
+        checkpoint_dir.symlink_to(other, target_is_directory=True)
+    elif destination == "file":
+        checkpoint_dir.touch()
+    else:
+        checkpoint_dir.mkdir()
+        (checkpoint_dir / "config.json").symlink_to(other)
+
+    with pytest.raises(CheckpointAcquisitionError):
+        checkpoint_acquisition.prepare_muscriptor_checkpoint(_lock(), checkpoint_dir, download=True)
+
+    hf_snapshot.download.assert_not_called()
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_prepare_muscriptor_maps_verify_only_failures_to_acquisition_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corrupt: bool
+) -> None:
+    lock = _lock()
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    if corrupt:
+        (checkpoint_dir / lock.checkpoint_filename).write_bytes(b"corrupt")
+    monkeypatch.setitem(sys.modules, "huggingface_hub", None)
+
+    with pytest.raises(CheckpointAcquisitionError, match="checkpoint") as exc_info:
+        checkpoint_acquisition.prepare_muscriptor_checkpoint(lock, checkpoint_dir, download=False)
+
+    assert isinstance(exc_info.value.__cause__, MuscriptorModelLockError)
+
+
+def test_prepare_muscriptor_keeps_bytes_on_publication_conflict(
+    tmp_path: Path, hf_snapshot
+) -> None:
+    lock = _lock()
+    checkpoint_dir = tmp_path / "checkpoint"
+    weights = checkpoint_dir / lock.checkpoint_filename
+
+    def conflicting_download(*, filename, **_kwargs):
+        checkpoint_dir.mkdir(exist_ok=True)
+        weights.write_bytes(b"other writer")
+        return str(hf_snapshot.path / filename)
+
+    hf_snapshot.download.side_effect = conflicting_download
+    with pytest.raises(CheckpointAcquisitionError) as exc_info:
+        checkpoint_acquisition.prepare_muscriptor_checkpoint(lock, checkpoint_dir, download=True)
+
+    assert isinstance(exc_info.value.__cause__, ArtifactPublicationError)
+    assert weights.read_bytes() == b"other writer"
+
+
+def test_prepare_muscriptor_never_publishes_through_a_replaced_directory(
+    tmp_path: Path, hf_snapshot
+) -> None:
+    checkpoint_dir = tmp_path / "checkpoint"
+    other = tmp_path / "other"
+    other.mkdir()
+
+    def replace_directory(*, filename, **_kwargs):
+        checkpoint_dir.rmdir()
+        checkpoint_dir.symlink_to(other, target_is_directory=True)
+        return str(hf_snapshot.path / filename)
+
+    hf_snapshot.download.side_effect = replace_directory
+    with pytest.raises(CheckpointAcquisitionError):
+        checkpoint_acquisition.prepare_muscriptor_checkpoint(_lock(), checkpoint_dir, download=True)
+
+    assert list(other.iterdir()) == []
+
+
+@pytest.fixture
+def freeze_args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hf_snapshot) -> dict:
+    lock = _lock()
+    info = SimpleNamespace(
+        id=lock.checkpoint_repo_id,
+        sha=lock.checkpoint_revision,
+        siblings=[
+            SimpleNamespace(rfilename=name)
+            for name in (lock.checkpoint_filename, lock.checkpoint_config_filename)
+        ],
+        card_data={"license": "cc-by-nc-4.0"},
+    )
+    hf_snapshot.hub.HfApi = Mock(return_value=SimpleNamespace(model_info=Mock(return_value=info)))
+    monkeypatch.setattr(freeze_muscriptor_model, "_verify_package", lambda: "MIT")
+    return {
+        "variant": "medium",
+        "device": "cpu",
+        "dtype": "float32",
+        "checkpoint_dir": tmp_path / "freeze-checkpoint",
+        "output": tmp_path / "model.json",
+    }
+
+
+def test_freeze_uses_resolved_revision_and_publishes_a_loadable_lock(
+    freeze_args, hf_snapshot
+) -> None:
+    lock = freeze_muscriptor_model.freeze_model(**freeze_args)
+
+    assert lock == _lock()
+    hf_snapshot.hub.HfApi.return_value.model_info.assert_called_once_with(lock.checkpoint_repo_id)
+    assert hf_snapshot.download.call_args_list == [
+        call(repo_id=lock.checkpoint_repo_id, revision=lock.checkpoint_revision, filename=filename)
+        for filename in (lock.checkpoint_filename, lock.checkpoint_config_filename)
+    ]
+    assert freeze_args["output"].is_file()
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_freeze_preserves_http_status_and_cause_without_exposing_raw_error(
+    freeze_args, hf_snapshot, status: int
+) -> None:
+    hub_error = RuntimeError("credential-bearing exception detail")
+    hub_error.response = SimpleNamespace(status_code=status)
+    hf_snapshot.download.side_effect = hub_error
+
+    with pytest.raises(freeze_muscriptor_model.FreezeError, match=f"HTTP {status}") as exc_info:
+        freeze_muscriptor_model.freeze_model(**freeze_args)
+
+    assert str(hub_error) not in str(exc_info.value)
+    cause = exc_info.value.__cause__
+    assert isinstance(cause, CheckpointAcquisitionError)
+    assert cause.__cause__ is hub_error
+    assert not freeze_args["output"].exists()

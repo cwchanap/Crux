@@ -13,6 +13,10 @@ from typing import Any
 
 from src.benchmark.artifact_io import publish_immutable_file, read_regular_file_no_follow
 from src.benchmark.backend_identity import canonical_json_bytes
+from src.benchmark.checkpoint_acquisition import (
+    CheckpointAcquisitionError,
+    download_muscriptor_checkpoint_file,
+)
 from src.benchmark.muscriptor_model import (
     MUSCRIPTOR_NATIVE_METADATA_SCHEMA_ID,
     MUSCRIPTOR_NATIVE_OUTPUT_SPACE_ID,
@@ -164,16 +168,9 @@ def _resolve_huggingface_model(repo_id: str) -> tuple[str, str]:
 
 def _download_immutable(repo_id: str, revision: str, filename: str, destination: Path) -> Path:
     try:
-        from huggingface_hub import hf_hub_download
-    except ImportError as error:
-        raise FreezeError("huggingface_hub is unavailable; use --extra muscriptor") from error
-    try:
-        downloaded = hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
-        content = Path(downloaded).read_bytes()
-    except Exception as error:  # noqa: BLE001 - preserve auth/license/network details
-        raise FreezeError(
-            f"Hugging Face download failed for {repo_id}/{filename} at {revision}: {error}"
-        ) from error
+        content = download_muscriptor_checkpoint_file(repo_id, revision, filename)
+    except CheckpointAcquisitionError as error:
+        raise FreezeError(str(error)) from error
     publish_immutable_file(destination, content)
     return destination
 
