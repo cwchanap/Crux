@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import secrets
 import shutil
 import stat
 import tempfile
@@ -32,6 +33,9 @@ class CheckpointAcquisitionError(ValueError):
 
 _CHECKPOINT_DIRECTORY_MODE = 0o755
 _CHECKPOINT_COMPONENT_MODE = 0o644
+_MUSCRIPTOR_CHECKPOINT_DIRECTORY_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+)
 
 
 def prepare_oaf_checkpoint(
@@ -158,11 +162,8 @@ def _restore_muscriptor_checkpoint(lock: MuscriptorModelLock, checkpoint_dir: Pa
 
     if not missing:
         return
-    # Check that the destination accepts new files before fetching the checkpoint.
-    with tempfile.TemporaryFile(dir=checkpoint_dir):
-        pass
+    _check_checkpoint_directory_writable(checkpoint_dir)
 
-    publish_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     for filename, sha256, length in missing:
         content = download_muscriptor_checkpoint_file(
             lock.checkpoint_repo_id, lock.checkpoint_revision, filename
@@ -171,11 +172,26 @@ def _restore_muscriptor_checkpoint(lock: MuscriptorModelLock, checkpoint_dir: Pa
             content, expected_sha256=sha256, expected_length=length, field=filename
         )
         # Open without following symlinks again after the potentially long download.
-        directory_fd = os.open(checkpoint_dir, publish_flags)
+        directory_fd = os.open(checkpoint_dir, _MUSCRIPTOR_CHECKPOINT_DIRECTORY_FLAGS)
         try:
             publish_immutable_file_at(directory_fd, filename, content)
         finally:
             os.close(directory_fd)
+
+
+def _check_checkpoint_directory_writable(checkpoint_dir: Path) -> None:
+    """Check file creation in the directory that publication would open."""
+    directory_fd = os.open(checkpoint_dir, _MUSCRIPTOR_CHECKPOINT_DIRECTORY_FLAGS)
+    try:
+        name = f".write-probe.{secrets.token_hex(16)}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        probe_fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        finally:
+            os.close(probe_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def download_muscriptor_checkpoint_file(repo_id: str, revision: str, filename: str) -> bytes:
@@ -190,13 +206,13 @@ def download_muscriptor_checkpoint_file(repo_id: str, revision: str, filename: s
         downloaded = hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
         return Path(downloaded).read_bytes()
     except Exception as error:
-        detail = huggingface_error_detail(error)
+        detail = describe_huggingface_error(error)
         raise CheckpointAcquisitionError(
             f"Hugging Face download failed for {repo_id}/{filename} at {revision} ({detail})"
         ) from error
 
 
-def huggingface_error_detail(error: Exception) -> str:
+def describe_huggingface_error(error: Exception) -> str:
     """Describe the failure using only its HTTP status or exception class."""
     status = getattr(getattr(error, "response", None), "status_code", None)
     if type(status) is int and 400 <= status <= 599:
@@ -316,8 +332,8 @@ def _fsync_directory(path: Path) -> None:
 
 __all__ = [
     "CheckpointAcquisitionError",
+    "describe_huggingface_error",
     "download_muscriptor_checkpoint_file",
-    "huggingface_error_detail",
     "prepare_muscriptor_checkpoint",
     "prepare_oaf_checkpoint",
 ]

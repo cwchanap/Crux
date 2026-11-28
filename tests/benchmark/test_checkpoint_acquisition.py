@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import sys
 import zipfile
@@ -291,7 +292,7 @@ def test_prepare_muscriptor_restores_only_missing_files_by_locked_revision(
 
     monkeypatch.setitem(sys.modules, "huggingface_hub", None)
     probe = Mock(side_effect=PermissionError("read-only checkpoint directory"))
-    monkeypatch.setattr(checkpoint_acquisition.tempfile, "TemporaryFile", probe)
+    monkeypatch.setattr(checkpoint_acquisition, "_check_checkpoint_directory_writable", probe)
     for download in (False, True):
         assert (
             checkpoint_acquisition.prepare_muscriptor_checkpoint(
@@ -320,14 +321,42 @@ def test_prepare_muscriptor_checks_destination_write_access_before_download(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hf_snapshot
 ) -> None:
     checkpoint_dir = tmp_path / "checkpoint"
-    probe = Mock(side_effect=PermissionError("read-only checkpoint directory"))
-    monkeypatch.setattr(checkpoint_acquisition.tempfile, "TemporaryFile", probe)
+    open_file = os.open
+
+    def deny_creation(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None and flags & os.O_CREAT:
+            raise PermissionError("read-only checkpoint directory")
+        return open_file(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", deny_creation)
 
     with pytest.raises(CheckpointAcquisitionError, match="read-only checkpoint directory"):
         checkpoint_acquisition.prepare_muscriptor_checkpoint(_lock(), checkpoint_dir, download=True)
 
-    probe.assert_called_once_with(dir=checkpoint_dir)
     hf_snapshot.download.assert_not_called()
+
+
+def test_prepare_muscriptor_probes_actual_destination_after_symlink_and_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hf_snapshot
+) -> None:
+    data = tmp_path / "real" / "data"
+    data.mkdir(parents=True)
+    mount = tmp_path / "mount"
+    mount.symlink_to(data, target_is_directory=True)
+    checkpoint_dir = mount / ".." / "checkpoint"
+    # Exercise the named-file fallback on filesystems that support O_TMPFILE.
+    monkeypatch.setattr(checkpoint_acquisition.tempfile, "_O_TMPFILE_WORKS", False, raising=False)
+
+    assert (
+        checkpoint_acquisition.prepare_muscriptor_checkpoint(_lock(), checkpoint_dir, download=True)
+        == checkpoint_dir
+    )
+
+    assert {path.name: path.read_bytes() for path in (data.parent / "checkpoint").iterdir()} == {
+        "model.safetensors": WEIGHTS,
+        "config.json": CONFIG,
+    }
+    assert not (tmp_path / "checkpoint").exists()
 
 
 @pytest.mark.parametrize("filename", ["config.json", "model.safetensors"])
