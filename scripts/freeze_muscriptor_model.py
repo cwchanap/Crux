@@ -16,6 +16,7 @@ from src.benchmark.backend_identity import canonical_json_bytes
 from src.benchmark.checkpoint_acquisition import (
     CheckpointAcquisitionError,
     download_muscriptor_checkpoint_file,
+    huggingface_error_detail,
 )
 from src.benchmark.muscriptor_model import (
     MUSCRIPTOR_NATIVE_METADATA_SCHEMA_ID,
@@ -144,7 +145,8 @@ def _resolve_huggingface_model(repo_id: str) -> tuple[str, str]:
         info = HfApi().model_info(repo_id)
     except Exception as error:  # noqa: BLE001 - preserve the operational HF failure
         raise FreezeError(
-            f"Hugging Face model metadata unavailable for {repo_id}: {error}"
+            f"Hugging Face model metadata unavailable for {repo_id} "
+            f"({huggingface_error_detail(error)})"
         ) from error
     revision = getattr(info, "sha", None)
     if not isinstance(revision, str) or _REVISION_RE.fullmatch(revision) is None:

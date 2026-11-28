@@ -44,6 +44,7 @@ from tests.benchmark.muscriptor_run_fixtures import _write_lock as _write_muscri
     [
         ([], Path("artifacts/benchmark/model-cache"), False, None),
         (["--download"], Path("artifacts/benchmark/model-cache"), True, None),
+        (["--cache-root", ""], Path("artifacts/benchmark/model-cache"), False, None),
         (
             ["--cache-root", "custom-cache", "--archive", "checkpoint.zip"],
             Path("custom-cache"),
@@ -135,6 +136,14 @@ def test_prepare_backend_oaf_preserves_error_status(monkeypatch, status) -> None
         ([], None, "artifacts/muscriptor/checkpoint", False),
         ([], "", "artifacts/muscriptor/checkpoint", False),
         ([], "env-checkpoint", "env-checkpoint", False),
+        (
+            ["--download", "--cache-root", ""],
+            None,
+            "artifacts/muscriptor/checkpoint",
+            True,
+        ),
+        (["--download", "--cache-root", ""], "env-checkpoint", "env-checkpoint", True),
+        (["--cache-root", "."], "env-checkpoint", ".", False),
         (["--download", "--cache-root", "explicit"], "env-checkpoint", "explicit", True),
     ],
 )
@@ -195,6 +204,8 @@ def test_prepare_backend_muscriptor_distinguishes_lock_and_checkpoint_errors(
 
     assert result.exit_code == exit_code, result.output
     assert "backend_selection_invalid" not in result.stderr
+    if status == "integrity_failed":
+        assert str(lock_path) in result.stderr
     if state == "corrupt-checkpoint":
         assert "checkpoint config file byte length differs" in result.stderr
     assert json.loads(result.stdout) == {

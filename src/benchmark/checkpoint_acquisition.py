@@ -156,6 +156,12 @@ def _restore_muscriptor_checkpoint(lock: MuscriptorModelLock, checkpoint_dir: Pa
             field=filename,
         )
 
+    if not missing:
+        return
+    # Check that the destination accepts new files before fetching the checkpoint.
+    with tempfile.TemporaryFile(dir=checkpoint_dir):
+        pass
+
     publish_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     for filename, sha256, length in missing:
         content = download_muscriptor_checkpoint_file(
@@ -184,11 +190,18 @@ def download_muscriptor_checkpoint_file(repo_id: str, revision: str, filename: s
         downloaded = hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
         return Path(downloaded).read_bytes()
     except Exception as error:
-        status = getattr(getattr(error, "response", None), "status_code", None)
-        detail = f" (HTTP {status})" if type(status) is int and 400 <= status <= 599 else ""
+        detail = huggingface_error_detail(error)
         raise CheckpointAcquisitionError(
-            f"Hugging Face download failed for {repo_id}/{filename} at {revision}{detail}"
+            f"Hugging Face download failed for {repo_id}/{filename} at {revision} ({detail})"
         ) from error
+
+
+def huggingface_error_detail(error: Exception) -> str:
+    """Describe the failure using only its HTTP status or exception class."""
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    if type(status) is int and 400 <= status <= 599:
+        return f"HTTP {status}"
+    return type(error).__name__
 
 
 def _download_checkpoint_archive(url: str) -> bytes:
@@ -304,6 +317,7 @@ def _fsync_directory(path: Path) -> None:
 __all__ = [
     "CheckpointAcquisitionError",
     "download_muscriptor_checkpoint_file",
+    "huggingface_error_detail",
     "prepare_muscriptor_checkpoint",
     "prepare_oaf_checkpoint",
 ]

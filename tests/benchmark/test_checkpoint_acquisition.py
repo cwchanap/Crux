@@ -290,6 +290,8 @@ def test_prepare_muscriptor_restores_only_missing_files_by_locked_revision(
     assert (checkpoint_dir / lock.checkpoint_config_filename).read_bytes() == CONFIG
 
     monkeypatch.setitem(sys.modules, "huggingface_hub", None)
+    probe = Mock(side_effect=PermissionError("read-only checkpoint directory"))
+    monkeypatch.setattr(checkpoint_acquisition.tempfile, "TemporaryFile", probe)
     for download in (False, True):
         assert (
             checkpoint_acquisition.prepare_muscriptor_checkpoint(
@@ -297,6 +299,7 @@ def test_prepare_muscriptor_restores_only_missing_files_by_locked_revision(
             )
             == checkpoint_dir
         )
+    probe.assert_not_called()
 
 
 @pytest.mark.parametrize("bad_bytes", [b"short", b"?" * len(WEIGHTS)])
@@ -311,6 +314,20 @@ def test_prepare_muscriptor_rejects_wrong_bytes_before_publication(
         checkpoint_acquisition.prepare_muscriptor_checkpoint(lock, checkpoint_dir, download=True)
 
     assert not (checkpoint_dir / lock.checkpoint_filename).exists()
+
+
+def test_prepare_muscriptor_checks_destination_write_access_before_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hf_snapshot
+) -> None:
+    checkpoint_dir = tmp_path / "checkpoint"
+    probe = Mock(side_effect=PermissionError("read-only checkpoint directory"))
+    monkeypatch.setattr(checkpoint_acquisition.tempfile, "TemporaryFile", probe)
+
+    with pytest.raises(CheckpointAcquisitionError, match="read-only checkpoint directory"):
+        checkpoint_acquisition.prepare_muscriptor_checkpoint(_lock(), checkpoint_dir, download=True)
+
+    probe.assert_called_once_with(dir=checkpoint_dir)
+    hf_snapshot.download.assert_not_called()
 
 
 @pytest.mark.parametrize("filename", ["config.json", "model.safetensors"])
@@ -445,19 +462,45 @@ def test_freeze_uses_resolved_revision_and_publishes_a_loadable_lock(
     assert freeze_args["output"].is_file()
 
 
-@pytest.mark.parametrize("status", [401, 403])
-def test_freeze_preserves_http_status_and_cause_without_exposing_raw_error(
-    freeze_args, hf_snapshot, status: int
+@pytest.mark.parametrize("status", [401, 403, None])
+def test_freeze_preserves_safe_download_details_and_cause(
+    freeze_args, hf_snapshot, status: int | None
 ) -> None:
-    hub_error = RuntimeError("credential-bearing exception detail")
-    hub_error.response = SimpleNamespace(status_code=status)
+    if status is None:
+        hub_error = TimeoutError("credential-bearing exception detail")
+        detail = "TimeoutError"
+    else:
+        hub_error = RuntimeError("credential-bearing exception detail")
+        hub_error.response = SimpleNamespace(status_code=status)
+        detail = f"HTTP {status}"
     hf_snapshot.download.side_effect = hub_error
 
-    with pytest.raises(freeze_muscriptor_model.FreezeError, match=f"HTTP {status}") as exc_info:
+    with pytest.raises(freeze_muscriptor_model.FreezeError, match=detail) as exc_info:
         freeze_muscriptor_model.freeze_model(**freeze_args)
 
     assert str(hub_error) not in str(exc_info.value)
     cause = exc_info.value.__cause__
     assert isinstance(cause, CheckpointAcquisitionError)
     assert cause.__cause__ is hub_error
+    assert not freeze_args["output"].exists()
+
+
+def test_freeze_metadata_failure_preserves_status_without_exposing_raw_error(
+    freeze_args, hf_snapshot, capsys
+) -> None:
+    hub_error = RuntimeError("credential-bearing metadata detail")
+    hub_error.response = SimpleNamespace(status_code=403)
+    hf_snapshot.hub.HfApi.return_value.model_info.side_effect = hub_error
+    args = [
+        option
+        for name, value in freeze_args.items()
+        for option in (f"--{name.replace('_', '-')}", str(value))
+    ]
+
+    assert freeze_muscriptor_model.main(args) == 1
+    captured = capsys.readouterr()
+    assert "model metadata unavailable" in captured.err
+    assert "HTTP 403" in captured.err
+    assert str(hub_error) not in captured.err
+    hf_snapshot.download.assert_not_called()
     assert not freeze_args["output"].exists()
