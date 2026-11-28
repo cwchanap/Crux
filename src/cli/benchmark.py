@@ -85,7 +85,7 @@ def benchmark() -> None:
 )
 @click.option(
     "--cache-root",
-    type=click.Path(path_type=Path, file_okay=False),
+    type=click.Path(path_type=Path, readable=False),
     help=f"OaF cache root (default {_DEFAULT_OAF_CACHE_ROOT}) or MuScriptor checkpoint directory.",
 )
 @click.pass_context
@@ -98,11 +98,13 @@ def prepare_backend_command(
 ) -> None:
     """Acquire or verify an immutable OaF or MuScriptor checkpoint."""
     if backend == "oaf" and cache_root is None:
-        # Validate the backend-specific default the same way as an explicit option.
+        cache_root = _DEFAULT_OAF_CACHE_ROOT
+    if backend != "muscriptor" and cache_root is not None:
+        # Keep the directory check here so MuScriptor can load its lock first.
         option = next(
             parameter for parameter in ctx.command.params if parameter.name == "cache_root"
         )
-        cache_root = option.type.convert(_DEFAULT_OAF_CACHE_ROOT, option, ctx)
+        cache_root = click.Path(path_type=Path, file_okay=False).convert(cache_root, option, ctx)
     if download and archive is not None:
         raise click.UsageError("--download and --archive are mutually exclusive.")
     if backend == "muscriptor" and archive is not None:
@@ -148,7 +150,9 @@ def prepare_backend_command(
             status="integrity_failed",
         )
         ctx.exit(2)
-    except CheckpointAcquisitionError:
+    except CheckpointAcquisitionError as error:
+        if backend == "muscriptor":
+            click.echo(str(error), err=True)
         _emit_prepare_backend_summary(
             backend=backend,
             checkpoint_path=None,
