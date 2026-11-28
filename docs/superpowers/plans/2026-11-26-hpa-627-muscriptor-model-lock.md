@@ -22,15 +22,16 @@
 
 ## Task 2 — Authenticated freeze and commit the canonical lock
 
-- [ ] From repo root, in the verified target environment, create an empty ignored staging area. The freeze may run on another host only after the intended corpus host is established; explicit device/dtype are required.
+- [ ] From repo root, in the verified target environment, create an empty ignored staging area. Point the Hub and Xet caches at new paths inside it while using the existing Hugging Face login or injected credential. This freeze is the authenticated download check. The freeze may run on another host only after the intended corpus host is established; explicit device/dtype are required.
 
 ```bash
 mkdir -p artifacts
 STAGE="$(mktemp -d "$PWD/artifacts/muscriptor-freeze.XXXXXX")"
-uv run --no-sync python scripts/freeze_muscriptor_model.py \
-  --variant medium --device cuda --dtype float32 \
-  --checkpoint-dir "$STAGE/checkpoint" \
-  --output "$STAGE/model.json"
+HF_HUB_CACHE="$STAGE/hub" HF_XET_CACHE="$STAGE/xet" \
+  uv run --no-sync python scripts/freeze_muscriptor_model.py \
+    --variant medium --device cuda --dtype float32 \
+    --checkpoint-dir "$STAGE/checkpoint" \
+    --output "$STAGE/model.json"
 ```
 
 - [ ] Require successful exit, then load the staged lock through the existing loader; assert medium, exact historical revision, cuda/float32; record model ID, lock SHA-256 and actual locked file hashes/lengths. The script already verifies actual bytes, model ID and canonical serialization; don't duplicate that work. On mismatch, failed download or host failure, stop without publishing.
@@ -38,15 +39,14 @@ uv run --no-sync python scripts/freeze_muscriptor_model.py \
 
 ## Task 3 — Fresh-checkout real smoke and feasibility
 
-- [ ] On the selected corpus host, create a fresh worktree at the lock commit, with an empty checkpoint destination and no lock/checkpoint overrides. Reuse the absolute `UV_PROJECT_ENVIRONMENT` from Task 1 (no second multi-GB venv). From the fresh worktree root run `uv sync --locked --extra muscriptor` against that same environment, ensuring the editable project is rebound to the new checkout; verify `src.cli.benchmark.__file__` resolves inside the fresh worktree, reinstall only the editable project if needed. Do not run the old checkout concurrently in the shared environment. Keep authenticated HF session/cache available without copying a prior prepared checkpoint directory. With the environment synced once for this worktree, run:
+- [ ] On the selected corpus host, create a fresh worktree at the lock commit, with an empty checkpoint destination and no lock/checkpoint overrides. Reuse the absolute `UV_PROJECT_ENVIRONMENT` from Task 1 (no second multi-GB venv). From the fresh worktree root run `uv sync --locked --extra muscriptor` against that same environment, ensuring the editable project is rebound to the new checkout; verify `src.cli.benchmark.__file__` resolves inside the fresh worktree, reinstall only the editable project if needed. Do not run the old checkout concurrently in the shared environment. Keep the authenticated HF session available. If the freeze ran on this host, reuse its caches by prefixing the download command with `HF_HUB_CACHE="$STAGE/hub" HF_XET_CACHE="$STAGE/xet"`, using the absolute `STAGE` path from Task 2. With the environment synced once for this worktree, run:
 
 ```bash
-uv run --no-sync crux benchmark prepare-backend \
-  --backend muscriptor --download
+uv run --no-sync crux benchmark prepare-backend --backend muscriptor --download
 uv run --no-sync crux benchmark prepare-backend --backend muscriptor
 ```
 
-Both commands must report ready at the default MuScriptor checkpoint path; second is local verification, no network. This is the independent restore/verification of actual bytes against the committed lock, not another freeze. Record the lock SHA and compare to Task 2.
+Both commands must report ready at the default MuScriptor checkpoint path. Verify-only checks local bytes without network access. Record the lock SHA and compare it to Task 2.
 
 - [ ] On the same target GPU, exercise the real existing backend using the existing canonical drum-active WAV (three snare hits in OaF oracle, not an expected MuScriptor count):
 

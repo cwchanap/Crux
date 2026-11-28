@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 import struct
+import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import click
@@ -79,13 +81,15 @@ def test_prepare_backend_oaf_rejects_download_with_archive() -> None:
     assert "--download and --archive are mutually exclusive" in result.stderr
 
 
-def test_prepare_backend_oaf_rejects_file_at_default_cache_root(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("explicit", [False, True])
+def test_prepare_backend_oaf_rejects_file_as_cache_root(tmp_path, monkeypatch, explicit) -> None:
     monkeypatch.chdir(tmp_path)
     cache_root = Path("artifacts/benchmark/model-cache")
     cache_root.parent.mkdir(parents=True)
     cache_root.touch()
 
-    result = CliRunner().invoke(main, ["benchmark", "prepare-backend"])
+    options = ["--cache-root", str(cache_root)] if explicit else []
+    result = CliRunner().invoke(main, ["benchmark", "prepare-backend", *options])
 
     assert result.exit_code == 2
     assert result.stdout == ""
@@ -116,6 +120,7 @@ def test_prepare_backend_oaf_preserves_error_status(monkeypatch, status) -> None
     result = CliRunner().invoke(main, ["benchmark", "prepare-backend"])
 
     assert result.exit_code == (2 if status == "integrity_failed" else 1)
+    assert result.stderr == ""
     assert json.loads(result.stdout) == {
         "backend": "oaf",
         "checkpoint_path": None,
@@ -190,11 +195,73 @@ def test_prepare_backend_muscriptor_distinguishes_lock_and_checkpoint_errors(
 
     assert result.exit_code == exit_code, result.output
     assert "backend_selection_invalid" not in result.stderr
+    if state == "corrupt-checkpoint":
+        assert "checkpoint config file byte length differs" in result.stderr
     assert json.loads(result.stdout) == {
         "backend": "muscriptor",
         "checkpoint_path": str(checkpoint_dir) if status == "ready" else None,
         "status": status,
     }
+
+
+@pytest.mark.parametrize(("explicit", "valid_lock"), [(True, True), (False, True), (True, False)])
+def test_prepare_backend_muscriptor_validates_file_destination_after_lock(
+    tmp_path, monkeypatch, explicit, valid_lock
+) -> None:
+    lock_path, _, _ = _write_muscriptor_lock(tmp_path)
+    checkpoint_file = tmp_path / "existing-file"
+    checkpoint_file.touch()
+    if not valid_lock:
+        lock_path.write_bytes(b"invalid lock")
+    monkeypatch.setenv("CRUX_MUSCRIPTOR_MODEL_LOCK", str(lock_path))
+    options = []
+    if explicit:
+        options = ["--cache-root", str(checkpoint_file)]
+    else:
+        monkeypatch.setenv("CRUX_MUSCRIPTOR_CHECKPOINT_DIR", str(checkpoint_file))
+
+    result = CliRunner().invoke(
+        main, ["benchmark", "prepare-backend", "--backend", "muscriptor", *options]
+    )
+
+    assert result.exit_code == (1 if valid_lock else 2), result.output
+    assert json.loads(result.stdout) == {
+        "backend": "muscriptor",
+        "checkpoint_path": None,
+        "status": "acquisition_failed" if valid_lock else "integrity_failed",
+    }
+
+
+@pytest.mark.parametrize("http_status", [None, 401, 403])
+def test_prepare_backend_muscriptor_reports_safe_download_error(
+    tmp_path, monkeypatch, http_status
+) -> None:
+    lock_path, _, _ = _write_muscriptor_lock(tmp_path)
+    monkeypatch.setenv("CRUX_MUSCRIPTOR_MODEL_LOCK", str(lock_path))
+    monkeypatch.setenv("CRUX_MUSCRIPTOR_CHECKPOINT_DIR", str(tmp_path / "missing"))
+    raw_detail = "private authorization detail"
+    if http_status is None:
+        monkeypatch.setitem(sys.modules, "huggingface_hub", None)
+        expected = "Install with --extra muscriptor."
+    else:
+        error = RuntimeError(raw_detail)
+        error.response = SimpleNamespace(status_code=http_status)
+        hub = SimpleNamespace(hf_hub_download=Mock(side_effect=error))
+        monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+        expected = f"HTTP {http_status}"
+
+    result = CliRunner().invoke(
+        main, ["benchmark", "prepare-backend", "--backend", "muscriptor", "--download"]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert json.loads(result.stdout) == {
+        "backend": "muscriptor",
+        "checkpoint_path": None,
+        "status": "acquisition_failed",
+    }
+    assert expected in result.stderr
+    assert raw_detail not in result.output
 
 
 def test_prepare_backend_muscriptor_rejects_archive() -> None:
